@@ -29,8 +29,8 @@ pub use auth::{
 };
 pub use auth_store::*;
 pub use error::{
-    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, if_match,
-    precondition_failed,
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
+    if_none_match_matches, precondition_failed,
 };
 
 use crate::engine::Engine;

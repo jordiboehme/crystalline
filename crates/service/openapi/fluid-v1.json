@@ -1481,7 +1481,7 @@
           "engrams"
         ],
         "summary": "One engram in full.",
-        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back.",
+        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.",
         "operationId": "get_engram",
         "parameters": [
           {
@@ -1502,12 +1502,31 @@
               "type": "string"
             },
             "example": "notes/deep/gamma"
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "The quoted checksum of a version already held. A match answers 304 with no body.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "\"3f8a1c05e2\""
           }
         ],
         "responses": {
           "200": {
             "description": "The engine's own read payload, unchanged.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `no-cache`: store it, but revalidate before every use."
+              },
               "etag": {
                 "schema": {
                   "type": "string"
@@ -1540,6 +1559,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "`If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
           },
           "401": {
             "description": "No identity.",
@@ -2296,7 +2318,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -2307,12 +2329,31 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "The quoted checksum of a version already held. A match answers 304 with no body.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "\"3f8a1c05e2\""
           }
         ],
         "responses": {
           "200": {
             "description": "The manifest source beside the domain it belongs to.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `no-cache`: store it, but revalidate before every use."
+              },
               "etag": {
                 "schema": {
                   "type": "string"
@@ -2332,6 +2373,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "`If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
           },
           "401": {
             "description": "No identity.",

@@ -36,7 +36,10 @@ use crystalline_core::attachment::is_inline_attachment_mime;
 use crystalline_index::AttachmentRow;
 
 use super::auth::Identity;
-use super::{ApiError, ApiPath, ProblemDetail, RestState, refuse_read_only};
+use super::{
+    ApiError, ApiPath, ProblemDetail, REVALIDATE, RestState, if_none_match_matches,
+    refuse_read_only,
+};
 use crate::engine::EngineError;
 
 /// The `Content-Security-Policy` every attachment is served under: no origin
@@ -44,22 +47,6 @@ use crate::engine::EngineError;
 /// opaque origin so a scriptable payload cannot touch the instance it came
 /// from.
 const ATTACHMENT_CSP: &str = "default-src 'none'; sandbox";
-
-/// The `Cache-Control` every attachment read carries: store it, but come back
-/// and ask before using it.
-///
-/// Caching an attachment is worth having - the bytes are immutable for as long
-/// as the path holds them, and the strong `ETag` makes the revalidation one
-/// cheap 304 - but this response carries no freshness information of its own,
-/// no `Expires` and no `Last-Modified`. RFC 9111 section 4.2.2 lets a cache
-/// invent a lifetime for exactly that response and reuse it with **no request
-/// to this server at all**, which would skip `If-None-Match` rather than skip
-/// the body. Since a PUT to the same path is a legitimate replace-in-place,
-/// that is a page rendering last week's diagram with no way to notice. So the
-/// directive is `no-cache`, which despite its name means "store it, revalidate
-/// it every time" rather than "do not store it": the round trip stays, the body
-/// does not.
-const REVALIDATE: &str = "no-cache";
 
 /// One attachment's metadata, the row a file browser draws.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -500,31 +487,6 @@ fn malformed_path_is_a_bad_request(e: EngineError) -> ApiError {
     }
 }
 
-/// Whether the request's `If-None-Match` covers the stored checksum.
-///
-/// Deliberately more forgiving than [`super::if_match`], which guards a write:
-/// this one only decides whether to send bytes a client already has, so a list
-/// of candidates, a `*` wildcard and a weak validator are all honoured rather
-/// than refused. Nothing is lost by being wrong in the permissive direction
-/// either, since the worst outcome is a full response the client discards.
-fn if_none_match_matches(headers: &HeaderMap, sha256: &str) -> bool {
-    let Some(raw) = headers
-        .get(header::IF_NONE_MATCH)
-        .and_then(|value| value.to_str().ok())
-    else {
-        return false;
-    };
-    raw.split(',').any(|candidate| {
-        let candidate = candidate.trim();
-        candidate == "*"
-            || candidate
-                .strip_prefix("W/")
-                .unwrap_or(candidate)
-                .trim_matches('"')
-                == sha256
-    })
-}
-
 /// The `Content-Disposition` for one attachment: `inline` when a browser should
 /// render it where it stands, a named download otherwise.
 fn disposition(row: &AttachmentRow) -> String {
@@ -605,24 +567,5 @@ mod tests {
         assert_eq!(download_filename("assets/my deck.pptx"), "my-deck.pptx");
         assert_eq!(download_filename("assets/schöne.pptx"), "sch-ne.pptx");
         assert_eq!(download_filename("assets/"), "attachment");
-    }
-
-    #[test]
-    fn if_none_match_honours_the_forms_a_cache_sends() {
-        let with = |value: &str| {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::IF_NONE_MATCH, value.parse().unwrap());
-            if_none_match_matches(&headers, "abc123")
-        };
-        assert!(with("\"abc123\""));
-        assert!(with("*"), "a wildcard asks about any version at all");
-        assert!(with("W/\"abc123\""), "a weak validator still identifies it");
-        assert!(with("\"other\", \"abc123\""), "one of a list is enough");
-        assert!(!with("\"other\""));
-        assert!(!with(""));
-        assert!(
-            !if_none_match_matches(&HeaderMap::new(), "abc123"),
-            "no header asks for the bytes"
-        );
     }
 }

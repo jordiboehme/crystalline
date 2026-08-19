@@ -347,6 +347,47 @@ pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
     Ok(token.to_string())
 }
 
+/// `Cache-Control` for every conditional single-resource read, sent on both
+/// the 200 and the 304: store it, but revalidate before every use.
+///
+/// With no `Cache-Control`, no `Expires` and no `Last-Modified`, RFC 9111
+/// section 4.2.2 lets a cache invent a heuristic freshness lifetime and reuse a
+/// stored response with no request to this server at all - which skips
+/// `If-None-Match` entirely rather than skipping only the body, so a save
+/// elsewhere would go unnoticed by an already-cached reader. `no-cache`
+/// despite its name means "store it, revalidate it every time", not "do not
+/// store it": with the strong `ETag` these reads already carry, the
+/// revalidation costs one cheap 304 and no body. The 304 repeats the header
+/// too, since a 304 updates the stored response's own headers and dropping it
+/// there would let the very response it refreshes go heuristically fresh.
+pub const REVALIDATE: &str = "no-cache";
+
+/// Whether the request's `If-None-Match` covers the given strong validator.
+///
+/// Deliberately more forgiving than [`if_match`], which guards a write: this
+/// one only decides whether to resend bytes the client may already have, so a
+/// list of candidates, a `*` wildcard and a weak validator are all honoured
+/// rather than refused. Nothing is lost by being wrong in the permissive
+/// direction either, since the worst outcome is a full response the client
+/// discards.
+pub fn if_none_match_matches(headers: &axum::http::HeaderMap, checksum: &str) -> bool {
+    let Some(raw) = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || candidate
+                .strip_prefix("W/")
+                .unwrap_or(candidate)
+                .trim_matches('"')
+                == checksum
+    })
+}
+
 /// The wire form of a 412: a problem detail carrying the version the server
 /// holds now, so a client can show a merge view instead of just failing.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -551,6 +592,30 @@ mod tests {
             err.detail.contains("one") && err.detail.to_lowercase().contains("if-match"),
             "the detail says one ETag is expected: {}",
             err.detail
+        );
+    }
+
+    /// `if_none_match_matches` honours every form a real cache sends, unlike
+    /// `if_match`'s strict contract - a list, a wildcard and a weak validator
+    /// all count, since the worst outcome of being wrong here is a full
+    /// response the client discards rather than a clobbered write.
+    #[test]
+    fn if_none_match_honours_the_forms_a_cache_sends() {
+        use axum::http::{HeaderMap, header};
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, value.parse().unwrap());
+            if_none_match_matches(&headers, "abc123")
+        };
+        assert!(with("\"abc123\""));
+        assert!(with("*"), "a wildcard asks about any version at all");
+        assert!(with("W/\"abc123\""), "a weak validator still identifies it");
+        assert!(with("\"other\", \"abc123\""), "one of a list is enough");
+        assert!(!with("\"other\""));
+        assert!(!with(""));
+        assert!(
+            !if_none_match_matches(&HeaderMap::new(), "abc123"),
+            "no header asks for the bytes"
         );
     }
 

@@ -339,7 +339,7 @@ export interface paths {
          * One engram in full.
          * @description Its frontmatter, its markdown as written and the references the engine resolves around it.
          *
-         *     The response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back.
+         *     The response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          */
         get: operations["get_engram"];
         /**
@@ -427,7 +427,7 @@ export interface paths {
          * The domain's MANIFEST markdown as written.
          * @description The source, not a reduction of it, so a client can render or edit it directly.
          *
-         *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.
+         *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          */
         get: operations["get_domain_manifest"];
         /**
@@ -2699,7 +2699,13 @@ export interface operations {
     get_engram: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description The quoted checksum of a version already held. A match answers 304 with no body.
+                 * @example "3f8a1c05e2"
+                 */
+                "If-None-Match"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;
@@ -2716,6 +2722,8 @@ export interface operations {
             /** @description The engine's own read payload, unchanged. */
             200: {
                 headers: {
+                    /** @description Always `no-cache`: store it, but revalidate before every use. */
+                    "cache-control"?: string;
                     /** @description The quoted checksum of the engram as read, the same token a later write compares an `expected_checksum` against. */
                     etag?: string;
                     [name: string]: unknown;
@@ -2743,6 +2751,13 @@ export interface operations {
                      */
                     "application/json": Record<string, never>;
                 };
+            };
+            /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description No identity. */
             401: {
@@ -3327,7 +3342,13 @@ export interface operations {
     get_domain_manifest: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description The quoted checksum of a version already held. A match answers 304 with no body.
+                 * @example "3f8a1c05e2"
+                 */
+                "If-None-Match"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;
@@ -3339,6 +3360,8 @@ export interface operations {
             /** @description The manifest source beside the domain it belongs to. */
             200: {
                 headers: {
+                    /** @description Always `no-cache`: store it, but revalidate before every use. */
+                    "cache-control"?: string;
                     /** @description The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`. */
                     etag?: string;
                     [name: string]: unknown;
@@ -3353,6 +3376,13 @@ export interface operations {
                      */
                     "application/json": Record<string, never>;
                 };
+            };
+            /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description No identity. */
             401: {

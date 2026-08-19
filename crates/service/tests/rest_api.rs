@@ -316,6 +316,30 @@ async fn get(addr: std::net::SocketAddr, path: &str) -> reqwest::Response {
         .unwrap()
 }
 
+/// GET a path off the test server, carrying an `If-None-Match` header.
+async fn get_if_none_match(
+    addr: std::net::SocketAddr,
+    path: &str,
+    if_none_match: &str,
+) -> reqwest::Response {
+    client()
+        .get(format!("http://{addr}{path}"))
+        .header("if-none-match", if_none_match)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// A header as a string, failing by name when it is missing.
+fn header(resp: &reqwest::Response, name: &str) -> String {
+    resp.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("the response carries `{name}`: {:?}", resp.headers()))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
 /// A request carrying a session's cookie and its CSRF token, the shape every
 /// mutating request from the browser client has. The caller adds a body and
 /// sends it.
@@ -1208,6 +1232,12 @@ async fn domain_manifest_returns_the_markdown_source() {
     let fixture = serve_anonymous().await;
     let resp = get(fixture.addr, "/api/v1/domains/eng/manifest").await;
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        header(&resp, "cache-control"),
+        "no-cache",
+        "the ETag is this response's whole freshness story, so a cache has to \
+         come back and ask rather than guess a lifetime for it"
+    );
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["domain"], "eng");
     let markdown = body["markdown"].as_str().expect("markdown is a string");
@@ -1220,6 +1250,42 @@ async fn domain_manifest_returns_the_markdown_source() {
         markdown.contains("Route here for eng questions"),
         "{markdown}"
     );
+}
+
+/// A client that already holds the manifest's checksum is answered 304 with no
+/// body, and a stale token still serves the full markdown. Both statuses carry
+/// `Cache-Control: no-cache`, the same pairing the attachment reads ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_manifest_honours_if_none_match() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/manifest").await;
+    let etag = header(&resp, "etag");
+
+    let resp = get_if_none_match(fixture.addr, "/api/v1/domains/eng/manifest", &etag).await;
+    assert_eq!(resp.status(), 304);
+    assert_eq!(header(&resp, "etag"), etag, "a 304 still names the version");
+    assert_eq!(
+        header(&resp, "cache-control"),
+        "no-cache",
+        "and it repeats the directive, so the stored response keeps having to \
+         revalidate rather than becoming heuristically fresh on this answer"
+    );
+    assert!(
+        resp.bytes().await.unwrap().is_empty(),
+        "a 304 carries no body"
+    );
+
+    // A stale token is not a match, so the manifest comes back in full.
+    let resp = get_if_none_match(
+        fixture.addr,
+        "/api/v1/domains/eng/manifest",
+        "\"0000000000\"",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-control"), "no-cache");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["domain"], "eng");
 }
 
 /// The listing is `search_engrams` with no query behind a query string: the
@@ -1538,6 +1604,7 @@ async fn engram_detail_carries_the_source_and_a_strong_etag() {
         .to_str()
         .unwrap()
         .to_string();
+    let cache_control = header(&resp, "cache-control");
     let body: serde_json::Value = resp.json().await.unwrap();
 
     assert_eq!(body["domain"], "eng");
@@ -1565,6 +1632,47 @@ async fn engram_detail_carries_the_source_and_a_strong_etag() {
         etag.starts_with('"') && etag.ends_with('"') && !etag.starts_with("W/"),
         "a strong validator, quoted: {etag}"
     );
+    assert_eq!(
+        cache_control, "no-cache",
+        "the ETag is this response's whole freshness story, so a cache has to \
+         come back and ask rather than guess a lifetime for it"
+    );
+}
+
+/// A client that already holds the engram's checksum is answered 304 with no
+/// body, and a stale token still serves the full engram. Both statuses carry
+/// `Cache-Control: no-cache`, the same pairing the attachment reads ship.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn engram_detail_honours_if_none_match() {
+    let fixture = serve_anonymous().await;
+    let resp = get(fixture.addr, "/api/v1/domains/eng/engrams/alpha").await;
+    let etag = header(&resp, "etag");
+
+    let resp = get_if_none_match(fixture.addr, "/api/v1/domains/eng/engrams/alpha", &etag).await;
+    assert_eq!(resp.status(), 304);
+    assert_eq!(header(&resp, "etag"), etag, "a 304 still names the version");
+    assert_eq!(
+        header(&resp, "cache-control"),
+        "no-cache",
+        "and it repeats the directive, so the stored response keeps having to \
+         revalidate rather than becoming heuristically fresh on this answer"
+    );
+    assert!(
+        resp.bytes().await.unwrap().is_empty(),
+        "a 304 carries no body"
+    );
+
+    // A stale token is not a match, so the engram comes back in full.
+    let resp = get_if_none_match(
+        fixture.addr,
+        "/api/v1/domains/eng/engrams/alpha",
+        "\"0000000000\"",
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert_eq!(header(&resp, "cache-control"), "no-cache");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["permalink"], "alpha");
 }
 
 /// A permalink is a path, not a segment: the route captures the rest of the URL
