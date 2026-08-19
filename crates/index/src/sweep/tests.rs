@@ -1333,3 +1333,243 @@ fn engram_facts_defaults_are_quiet() {
     assert_eq!(f.address(), "engineering/alpha");
     assert_eq!(f.token_budget, DEFAULT_TOKEN_BUDGET);
 }
+
+// ---------------------------------------------------------------------------
+// Acknowledgments
+// ---------------------------------------------------------------------------
+
+/// An acknowledgment for `rule`, scoped or not, with a note.
+fn ack(rule: &str, scope: Option<&str>, note: &str) -> AckEntry {
+    AckEntry {
+        rule: rule.to_string(),
+        scope: scope.map(str::to_string),
+        note: Some(note.to_string()),
+    }
+}
+
+/// The V101 fixture the acknowledgment tests work: one live engram linking to
+/// one retired one, so the scope is a single address.
+fn v101_fixture() -> SweepInput {
+    let live = fact(1, "onboarding-guide");
+    let mut retired = fact(2, "old-runbook");
+    retired.status = "deprecated".to_string();
+    let mut sweep = input(vec![live, retired]);
+    sweep.graph.edges = vec![wikilink(1, 2)];
+    sweep
+}
+
+#[test]
+fn a_scoped_ack_suppresses_its_finding_and_is_counted() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+
+    let report = detect(&sweep);
+    assert!(
+        !fired(&report).contains(&"V101"),
+        "{:?}",
+        fired(&report)
+    );
+    assert_eq!(report.acknowledged.total, 1);
+    assert_eq!(report.acknowledged.structure, 1);
+    assert_eq!(report.acknowledged.temporal, 0);
+    assert_eq!(report.acknowledged.redundancy, 0);
+}
+
+#[test]
+fn a_second_retired_link_changes_the_scope_and_the_ack_goes_stale() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+    let mut also_retired = fact(3, "older-runbook");
+    also_retired.status = "deprecated".to_string();
+    sweep.graph.nodes.push(node_of(&also_retired));
+    sweep.engrams.push(also_retired);
+    sweep.graph.edges.push(wikilink(1, 3));
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V101");
+    assert!(finding.ack_stale, "the acknowledged evidence changed");
+    assert!(!finding.acknowledged);
+    assert_eq!(finding.ack_note.as_deref(), Some("lineage citation; keep"));
+    assert_eq!(report.acknowledged.total, 0);
+}
+
+#[test]
+fn a_scopeless_ack_matches_whatever_the_evidence_becomes() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack("V101", None, "hand written")];
+    let mut also_retired = fact(3, "older-runbook");
+    also_retired.status = "deprecated".to_string();
+    sweep.graph.nodes.push(node_of(&also_retired));
+    sweep.engrams.push(also_retired);
+    sweep.graph.edges.push(wikilink(1, 3));
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn a_prose_edit_that_leaves_the_links_alone_keeps_the_ack_matching() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+    sweep.engrams[0].body = format!("{}\nA new paragraph nobody linked from.", short_body(3));
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn include_acknowledged_returns_the_suppressed_finding_marked() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+    sweep.include_acknowledged = true;
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V101");
+    assert!(finding.acknowledged);
+    assert!(!finding.ack_stale);
+    assert_eq!(finding.ack_note.as_deref(), Some("lineage citation; keep"));
+    assert_eq!(finding.scope, "engineering/old-runbook");
+    assert_eq!(
+        report.acknowledged.total, 1,
+        "the count is what it suppressed, whether or not the row came back"
+    );
+}
+
+#[test]
+fn an_ack_for_a_rule_that_never_fires_counts_nothing() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack("V104", None, "standalone on purpose")];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged, AckCounts::default());
+    let finding = only(&report, "V101");
+    assert!(!finding.ack_stale);
+    assert_eq!(finding.ack_note, None);
+}
+
+#[test]
+fn an_ack_on_one_engram_never_silences_another() {
+    let mut sweep = v101_fixture();
+    let mut second = fact(3, "second-guide");
+    second.acks = vec![ack("V101", None, "not mine to give")];
+    sweep.graph.nodes.push(node_of(&second));
+    sweep.engrams.push(second);
+    sweep.graph.edges.push(wikilink(3, 2));
+
+    let report = detect(&sweep);
+    assert_eq!(
+        fired_on(&report, "onboarding-guide"),
+        vec!["V101"],
+        "the unacknowledged engram keeps its finding"
+    );
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn the_generous_entry_wins_over_a_stale_one() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![
+        ack("V101", Some("engineering/somewhere-else"), "outdated"),
+        ack("V101", None, "hand written catch-all"),
+    ];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn an_attachment_ack_is_scoped_to_its_path() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+    shown.acks = vec![ack("V007", Some("assets/deck.png"), "decorative")];
+    let mut sweep = input(vec![shown]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+    sweep.include_acknowledged = true;
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V007");
+    assert!(finding.acknowledged);
+    assert_eq!(finding.scope, "assets/deck.png");
+    assert_eq!(report.acknowledged.total, 1);
+    assert_eq!(report.acknowledged.temporal, 1);
+}
+
+#[test]
+fn an_anchorless_finding_takes_no_ack() {
+    let mut holder = fact(1, "unrelated-note");
+    holder.acks = vec![ack("V108", None, "cannot reach it")];
+    let mut sweep = input(vec![holder]);
+    sweep.attachments = vec![attachment("assets/stray.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).contains(&"V108"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged, AckCounts::default());
+}
+
+#[test]
+fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
+    let unsorted = vec![
+        "engineering/beta".to_string(),
+        "engineering/alpha".to_string(),
+        "engineering/beta".to_string(),
+    ];
+    for rule in ["V101", "V103", "V107", "V201", "V202"] {
+        assert_eq!(
+            scope_for(rule, unsorted.clone()),
+            "engineering/alpha, engineering/beta",
+            "{rule} scopes a set"
+        );
+    }
+    for rule in ["V007", "V008"] {
+        assert_eq!(
+            scope_for(rule, vec!["assets/deck.png".to_string()]),
+            "assets/deck.png",
+            "{rule} scopes one path"
+        );
+    }
+    for rule in ["V001", "V002", "V003", "V004", "V005", "V006", "V102", "V104", "V105", "V106",
+        "V108", "V203"]
+    {
+        assert_eq!(
+            scope_for(rule, unsorted.clone()),
+            "",
+            "{rule}'s identity is the engram and the rule"
+        );
+    }
+}
+
+#[test]
+fn every_rule_in_the_catalog_has_a_decided_scope() {
+    // The match is exhaustive by construction: a new rule id lands in the
+    // empty-scope arm, which is the safe default, and this pins that the
+    // catalog and the scope function are read together.
+    let scoped = ["V007", "V008", "V101", "V103", "V107", "V201", "V202"];
+    for info in RULES {
+        let produced = scope_for(info.id, vec!["one".to_string()]);
+        if scoped.contains(&info.id) {
+            assert_eq!(produced, "one", "{} carries a scope", info.id);
+        } else {
+            assert!(produced.is_empty(), "{} carries no scope", info.id);
+        }
+    }
+}

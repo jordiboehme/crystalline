@@ -43,8 +43,8 @@ pub use attachment::{
 };
 pub use emit::emit_engram;
 pub use engram::{
-    Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES,
-    RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
+    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget, Observation,
+    RECOMMENDED_STATUSES, RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
 };
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use index::{

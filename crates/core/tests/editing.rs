@@ -7,10 +7,10 @@ use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, set_frontmatter_number,
-    set_stale_after, set_verified, touch_generated,
+    remove_frontmatter_field, replace_section, set_evolve_ack, set_frontmatter_field,
+    set_frontmatter_number, set_stale_after, set_verified, touch_generated,
 };
-use crystalline_core::{Verified, parse_engram};
+use crystalline_core::{EvolveAck, Verified, parse_engram};
 
 fn nested_headings() -> String {
     read(&fixtures_dir().join("canonical/nested-headings.md"))
@@ -329,4 +329,89 @@ fn set_frontmatter_field_quotes_ambiguous_values() {
     // The value is an ambiguous scalar and must be quoted so it stays a string.
     let e = parse_engram(&out).unwrap();
     assert_eq!(e.frontmatter.status.as_deref(), Some("true"));
+}
+
+// --- evolve_ack --------------------------------------------------------------
+
+fn ack(rule: &str, scope: Option<&str>, note: Option<&str>) -> EvolveAck {
+    EvolveAck {
+        rule: rule.to_string(),
+        scope: scope.map(str::to_string),
+        note: note.map(str::to_string),
+        by: "human:jordi".to_string(),
+        at: DateTime::parse_from_rfc3339("2026-08-20T09:00:00+00:00").ok(),
+    }
+}
+
+/// An engram carrying acknowledgments parses, emits and parses again with the
+/// list intact - the round trip the frontmatter convention rests on.
+#[test]
+fn evolve_ack_round_trips_through_the_frontmatter() {
+    let source = "---\ntitle: Lineage\ntype: engram\nstatus: stable\n---\n\nBody.\n";
+    let entries = vec![
+        ack("V101", Some("eng/old-runbook"), Some("lineage citation, keep")),
+        ack("V007", None, None),
+    ];
+    let out = set_evolve_ack(source, &entries);
+    assert!(out.contains("evolve_ack:\n- { rule: V101"), "{out}");
+    assert!(out.contains("scope: eng/old-runbook"), "{out}");
+    assert!(out.contains("note: \"lineage citation, keep\""), "{out}");
+    assert!(out.contains("by: human:jordi"), "{out}");
+    assert!(out.contains("Body."), "{out}");
+
+    let engram = parse_engram(&out).expect("an engram with acknowledgments parses");
+    let value = engram
+        .frontmatter
+        .extra
+        .get("evolve_ack")
+        .expect("the key survives into extra");
+    assert_eq!(EvolveAck::parse_list(value), entries);
+}
+
+/// One entry stays on the key's own line, and replacing the list replaces the
+/// whole block rather than orphaning the old sequence.
+#[test]
+fn a_single_ack_is_one_line_and_a_rewrite_replaces_the_block() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let one = set_evolve_ack(source, &[ack("V101", Some("eng/old"), None)]);
+    assert!(one.contains("evolve_ack: { rule: V101, scope: eng/old, by: human:jordi"), "{one}");
+
+    let two = set_evolve_ack(&one, &[ack("V101", Some("eng/old"), None), ack("V104", None, None)]);
+    assert_eq!(two.matches("rule: V101").count(), 1, "{two}");
+    assert!(two.contains("rule: V104"), "{two}");
+    assert!(two.contains("status: stable"), "{two}");
+
+    let back = set_evolve_ack(&two, &[ack("V104", None, None)]);
+    assert!(!back.contains("V101"), "{back}");
+    assert_eq!(back.matches("evolve_ack").count(), 1, "{back}");
+}
+
+/// Withdrawing the last acknowledgment removes the key and its continuation
+/// lines, leaving every other byte alone.
+#[test]
+fn an_empty_ack_list_removes_the_key_whole() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let two = set_evolve_ack(source, &[ack("V101", None, None), ack("V104", None, None)]);
+    let cleared = set_evolve_ack(&two, &[]);
+    assert_eq!(cleared, source, "the source is byte-identical again");
+}
+
+/// A hand-written entry survives its neighbours being malformed, and an entry
+/// with no rule is skipped rather than failing the read.
+#[test]
+fn malformed_ack_entries_are_skipped_never_an_error() {
+    let source = "---\ntitle: Lineage\nstatus: stable\nevolve_ack:\n- { note: no rule here }\n- { rule: V101, note: keep }\n- just a string\n---\n\nBody.\n";
+    let engram = parse_engram(source).expect("a malformed entry never breaks the parse");
+    let parsed = EvolveAck::parse_list(
+        engram
+            .frontmatter
+            .extra
+            .get("evolve_ack")
+            .expect("the key is there"),
+    );
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].rule, "V101");
+    assert_eq!(parsed[0].note.as_deref(), Some("keep"));
+    assert_eq!(parsed[0].scope, None);
+    assert_eq!(parsed[0].by, "");
 }

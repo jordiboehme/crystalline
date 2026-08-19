@@ -85,7 +85,7 @@ pub struct ReadParams {
 }
 
 /// Parameters for `edit_engram`.
-#[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
 pub struct EditParams {
     /// A bare permalink, title or `crystalline://` URL. Without the scheme
     /// the identifier is domain-relative: never prefix it with a domain name.
@@ -100,8 +100,8 @@ pub struct EditParams {
     #[serde(default)]
     pub content: Option<String>,
     /// The frontmatter field to assign, for set_frontmatter. One of status,
-    /// valid_from, valid_to, stale_after, source_date, salience or verified.
-    /// No other key is settable here: type, title, permalink, tags,
+    /// valid_from, valid_to, stale_after, source_date, salience, verified or
+    /// evolve_ack. No other key is settable here: type, title, permalink, tags,
     /// recorded_at and the generated provenance block carry identity and
     /// provenance and are owned by their own tools.
     #[serde(default)]
@@ -113,7 +113,10 @@ pub struct EditParams {
     /// from 0 to 10. verified is the exception: it never removes, it stamps a
     /// verification record `{ by, at }` with the current instant, taking the
     /// value as the verifying actor and falling back to the caller's own
-    /// identity when it is omitted.
+    /// identity when it is omitted. evolve_ack takes a rule id optionally
+    /// followed by a note ("V101" or "V101 lineage citation, keep") and records
+    /// that the finding is intentional; the server computes what evidence it
+    /// was given for.
     #[serde(default)]
     pub value: Option<String>,
     /// The section heading path for the *_section operations, for example
@@ -389,6 +392,12 @@ pub struct EvolveParams {
     /// else about the sweep changes.
     #[serde(default)]
     pub today: Option<String>,
+    /// Include the findings acknowledgments suppressed, each marked
+    /// acknowledged with the note that silenced it. Off by default: the queue
+    /// is what still needs deciding, and this is the audit view of what was
+    /// already decided.
+    #[serde(default)]
+    pub include_acknowledged: bool,
 }
 
 /// Parameters for `configure`. Omit everything to see the current settings,

@@ -55,6 +55,12 @@ pub struct EvolveQuery {
     #[serde(default)]
     #[param(example = 1)]
     page: Option<usize>,
+    /// Include the findings acknowledgments suppressed, each marked
+    /// `acknowledged` with the note that silenced it. Off by default: the queue
+    /// is what still needs deciding.
+    #[serde(default)]
+    #[param(example = true)]
+    include_acknowledged: Option<bool>,
 }
 
 /// `GET /evolve` - the consolidation queue: the ranked list of what the
@@ -78,6 +84,12 @@ pub struct EvolveQuery {
 /// `families` counts the whole filtered result rather than the page, which is
 /// what section headings are drawn from, and `truncations` names any per-domain
 /// cap that fired so a short queue is never mistaken for a finished one.
+///
+/// `acknowledged` counts what acknowledgments kept out of the queue, whole and
+/// per family, so a short queue is never mistaken for a healthy one; a row whose
+/// acknowledgment was given for evidence that has since changed comes back
+/// carrying `ack_stale` and the old `ack_note`. Pass `include_acknowledged` to
+/// see the suppressed rows themselves, each marked `acknowledged`.
 ///
 /// `today` is not exposed. The temporal rules are evaluated as of now, which is
 /// the only question a page asks; the tool takes a pinned date for a run that
@@ -112,6 +124,10 @@ pub struct EvolveQuery {
                 "limit": 10,
                 "count": 2,
                 "families": [{ "family": "temporal", "findings": 2 }],
+                "acknowledged": {
+                    "total": 1,
+                    "by_family": { "temporal": 0, "structure": 1, "redundancy": 0 }
+                },
                 "queue": [{
                     "n": 1,
                     "priority": 58,
@@ -179,6 +195,7 @@ pub async fn queue(
             min_priority: query.min_priority,
             limit: query.limit,
             page: query.page,
+            include_acknowledged: query.include_acknowledged.unwrap_or(false),
             // Never from the caller: see the type and the operation doc above.
             today: None,
         })

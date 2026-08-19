@@ -12,7 +12,7 @@
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::engram::{Engram, Frontmatter, Generated, SchemaDef, Verified};
+use crate::engram::{EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, SchemaDef, Verified};
 use crate::parse::{locate, parse_heading};
 
 /// The stand-in scalar the `generated` key carries through YAML serialization,
@@ -342,6 +342,51 @@ pub fn set_verified(source: &str, entries: &[Verified]) -> String {
     set_frontmatter_block(source, "verified", verified_block(entries))
 }
 
+/// Record the acknowledged findings in the original source: replace the
+/// `evolve_ack` value with `entries`, leaving every other byte untouched. An
+/// empty `entries` removes the key, which is how the last acknowledgment is
+/// withdrawn.
+///
+/// Shaped like [`set_verified`]: one entry on the key's own line as a flow
+/// mapping, several as a block sequence, so the frontmatter stays as readable
+/// by hand as it is meant to be edited by hand.
+pub fn set_evolve_ack(source: &str, entries: &[EvolveAck]) -> String {
+    if entries.is_empty() {
+        return remove_frontmatter_block(source, EVOLVE_ACK_KEY);
+    }
+    set_frontmatter_block(source, EVOLVE_ACK_KEY, evolve_ack_block(entries))
+}
+
+fn evolve_ack_block(entries: &[EvolveAck]) -> String {
+    if let [only] = entries {
+        return format!("{EVOLVE_ACK_KEY}: {}", evolve_ack_flow(only));
+    }
+    let mut out = format!("{EVOLVE_ACK_KEY}:");
+    for entry in entries {
+        out.push_str(&format!("\n- {}", evolve_ack_flow(entry)));
+    }
+    out
+}
+
+/// Render one `evolve_ack` entry as a flow mapping, without the key. The
+/// optional halves are written only when they carry something, so a scope-less
+/// hand-written entry reads back the way it was written.
+fn evolve_ack_flow(ack: &EvolveAck) -> String {
+    let mut out = format!("{{ rule: {}", flow_scalar(&ack.rule));
+    if let Some(scope) = ack.scope.as_deref().filter(|s| !s.is_empty()) {
+        out.push_str(&format!(", scope: {}", flow_scalar(scope)));
+    }
+    if let Some(note) = ack.note.as_deref().filter(|n| !n.is_empty()) {
+        out.push_str(&format!(", note: {}", flow_scalar(note)));
+    }
+    out.push_str(&format!(", by: {}", flow_scalar(&ack.by)));
+    if let Some(at) = ack.at {
+        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+    }
+    out.push_str(" }");
+    out
+}
+
 /// Replace the frontmatter value of `key` with `new_block`, which may span
 /// several lines and carries the key itself. Continuation lines belonging to
 /// the old value - a block sequence item or an indented nested mapping - are
@@ -380,6 +425,44 @@ fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
         }
         new_raw.push_str(&new_block);
         new_raw.push('\n');
+    }
+    format!(
+        "{}{}{}",
+        &source[..fm_span.start],
+        new_raw,
+        &source[fm_span.end..]
+    )
+}
+
+/// Remove a frontmatter key whose value may span several lines, the
+/// counterpart of [`set_frontmatter_block`]. The key line and every
+/// continuation line under it go together, so nothing is orphaned. A no-op when
+/// the key or the frontmatter block is absent.
+fn remove_frontmatter_block(source: &str, key: &str) -> String {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return source.to_string();
+    }
+
+    let raw = &source[fm_span.clone()];
+    let mut new_raw = String::with_capacity(raw.len());
+    // 0: the key has not been seen; 1: it was dropped and continuation lines
+    // are going with it; 2: the old value is fully behind us.
+    let mut phase = 0u8;
+    for line in raw.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        match phase {
+            0 if line_sets_key(content, key) => phase = 1,
+            1 if is_value_continuation(content) => {}
+            1 => {
+                phase = 2;
+                new_raw.push_str(line);
+            }
+            _ => new_raw.push_str(line),
+        }
+    }
+    if phase == 0 {
+        return source.to_string();
     }
     format!(
         "{}{}{}",

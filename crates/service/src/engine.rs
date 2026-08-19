@@ -26,20 +26,20 @@ use crystalline_core::config::{
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, set_frontmatter_number,
-    set_stale_after, set_verified, touch_generated,
+    remove_frontmatter_field, replace_section, set_evolve_ack, set_frontmatter_field,
+    set_frontmatter_number, set_stale_after, set_verified, touch_generated,
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
-    is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
+    CrystallineUrl, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind, LinkTarget,
+    Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
-    AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
+    AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
     DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor,
     EngramFacts, EngramId, EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice,
     HostClaim, InboundQuery, RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput,
-    SweepOptions, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
+    SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
     order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, retired_factor,
     rule_info, salience_prior, scan_domain, scan_paths,
 };
@@ -160,6 +160,7 @@ pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "source_date",
     "salience",
     "verified",
+    "evolve_ack",
 ];
 
 /// [`SETTABLE_FRONTMATTER_KEYS`] rendered for an error message.
@@ -2997,15 +2998,59 @@ impl Engine {
         }
         let actor = self.actor(client);
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // An `evolve_ack` assignment is the one set_frontmatter key whose value
+        // the server completes rather than takes: the scope comes from running
+        // detection over this engram's domain, which needs the store and so
+        // cannot happen inside the pure text edit below. Computed before the
+        // write lock is taken, so a sweep never runs while a file is held.
+        let ack = self.ack_draft(p, &desc, &actor).await?;
 
-        match &source {
+        self.apply_source_edit(
+            &desc,
+            &source,
+            p.expected_checksum.as_deref(),
+            &actor,
+            |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
+        )
+        .await?;
+
+        let mut response = json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "path": desc.path,
+            "operation": p.operation,
+        });
+        if let Some(entry) = &ack {
+            response["evolve_ack"] = ack_json(entry);
+        }
+        Ok(response)
+    }
+
+    /// Read an engram's source, hand it to `apply`, and write the result back:
+    /// the shared body of every edit that rewrites content in place.
+    ///
+    /// Kind-agnostic and lock-correct, which is why it is one function rather
+    /// than repeated per caller. For a file domain the write lock is held
+    /// across the read, the compare, the edit and the write; without an
+    /// `expected_checksum` that serialization is the whole guarantee, since two
+    /// unguarded edits must each apply to what the other wrote rather than
+    /// silently dropping it. For a virtual domain the store's own compare and
+    /// swap plays that part, with the checksum of what was just read standing
+    /// in when the caller presents none.
+    async fn apply_source_edit<F>(
+        &self,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+        expected_checksum: Option<&str>,
+        actor: &str,
+        apply: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&str) -> Result<String>,
+    {
+        match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
-                // Held across the read, the compare, the edit and the write.
-                // With an expected_checksum the compare below refuses a stale
-                // edit; without one, serializing is the whole guarantee: two
-                // unguarded edits each apply to what the other wrote rather
-                // than silently dropping it. See `Engine::write_lock`.
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
                 let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
@@ -3014,16 +3059,15 @@ impl Engine {
                 })?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
-                // compares. Absent stays last-write-wins - the serialized
-                // read-modify-write below is then the whole guarantee.
-                if let Some(expected) = &p.expected_checksum {
+                // compares.
+                if let Some(expected) = expected_checksum {
                     let found = sha256_hex(current.as_bytes());
-                    if found != *expected {
+                    if found != expected {
                         return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
                     }
                 }
-                let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
-                let edited = touch_generated(&edited, &actor, now_offset());
+                let edited = apply(&current)?;
+                let edited = touch_generated(&edited, actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 write_file(&abs, &edited)?;
                 let store = self.store.lock().await;
@@ -3043,16 +3087,11 @@ impl Engine {
                             ))
                         })?
                 };
-                // The CAS token: the caller's expected_checksum when supplied
-                // (guarding against a change since their read), else the sha of
-                // what we just read (last-write-wins, matching the settled
-                // semantics).
-                let expected = p
-                    .expected_checksum
-                    .clone()
+                let expected = expected_checksum
+                    .map(str::to_string)
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
-                let edited = touch_generated(&edited, &actor, now_offset());
+                let edited = apply(&current)?;
+                let edited = touch_generated(&edited, actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 let stamp = virtual_stamp(&edited);
                 let store = self.store.lock().await;
@@ -3077,13 +3116,7 @@ impl Engine {
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;
-
-        Ok(json!({
-            "domain": desc.domain,
-            "permalink": desc.permalink,
-            "path": desc.path,
-            "operation": p.operation,
-        }))
+        Ok(())
     }
 
     /// Apply one edit operation to an engram's markdown, returning the edited
@@ -3096,6 +3129,7 @@ impl Engine {
         p: &EditParams,
         permalink: &str,
         actor: &str,
+        ack: Option<&EvolveAck>,
     ) -> Result<String> {
         Ok(match p.operation.as_str() {
             "append" => append_body(source, self.require_content(p)?),
@@ -3139,7 +3173,7 @@ impl Engine {
                 let section = self.require_section(p)?;
                 insert_after_section(source, section, content).map_err(section_err)?
             }
-            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor)?,
+            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor, ack)?,
             other => {
                 return Err(EngineError::Invalid(format!(
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
@@ -3156,7 +3190,12 @@ impl Engine {
     ///
     /// An absent or empty value clears the field, except on `status`, which is
     /// required, and on `verified`, which stamps a verification instead.
-    fn apply_set_frontmatter(source: &str, p: &EditParams, actor: &str) -> Result<String> {
+    fn apply_set_frontmatter(
+        source: &str,
+        p: &EditParams,
+        actor: &str,
+        ack: Option<&EvolveAck>,
+    ) -> Result<String> {
         let key = p
             .key
             .as_deref()
@@ -3258,6 +3297,17 @@ impl Engine {
                 entries.retain(|e| e.by != entry.by);
                 entries.push(entry);
                 Ok(set_verified(source, &entries))
+            }
+            EVOLVE_ACK_KEY => {
+                // The entry was completed before the lock (see
+                // `Engine::ack_draft`), because its scope is the sweep's
+                // verdict about this engram and no text edit can know it.
+                let entry = ack.ok_or_else(|| {
+                    EngineError::Invalid(format!(
+                        "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
+                    ))
+                })?;
+                Ok(set_evolve_ack(source, &merged_acks(source, entry.clone())))
             }
             other => Err(EngineError::Invalid(format!(
                 "set_frontmatter cannot set '{other}'; the settable keys are {}",
@@ -4934,115 +4984,37 @@ impl Engine {
         let mut truncations: Vec<String> = Vec::new();
         let mut engrams_scanned = 0usize;
         let mut unparsed = 0usize;
+        let mut acknowledged = AckCounts::default();
 
         // One domain at a time: `SweepInput` is domain-scoped (two rules are
         // domain-relative) and processing them in turn bounds the memory an
         // unscoped sweep needs to whatever the largest domain costs.
         for name in &scope {
-            let source = self.content_source(name)?;
-            let store = self.store.lock().await;
-            let descs = store.list_engrams(name, None, None).await?;
-            drop(store);
-            // No engrams means no domain row to query against and nothing to
-            // detect. An empty domain is quiet, not an error.
-            let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
+            let Some(swept) = self
+                .sweep_domain(name, today, &known_domains, p.include_acknowledged)
+                .await?
+            else {
                 continue;
             };
-
-            let graph = self.sweep_graph(&descs).await?;
-            let mut inbound: HashMap<i64, usize> = HashMap::new();
-            let mut outbound: HashMap<i64, usize> = HashMap::new();
-            for edge in &graph.edges {
-                *outbound.entry(edge.from.0).or_default() += 1;
-                *inbound.entry(edge.to.0).or_default() += 1;
-            }
-
-            let store = self.store.lock().await;
-            let unresolved = store.unresolved_refs(domain_id).await?;
-            let vocab = store.vocabulary(Some(name)).await?;
-            // Metadata only, one query: the attachment rules compare paths,
-            // sizes and hashes and never read a byte of any file.
-            let attachments = store.list_attachments(domain_id).await?;
-            drop(store);
-
-            let verify_config = domain_verify_config(&source);
-            let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
-            for d in &descs {
-                // Files-are-truth for a file domain, the stored content for a
-                // virtual one. An engram that no longer parses is counted and
-                // skipped rather than failing the whole sweep, since one broken
-                // file must not hide every finding behind it.
-                let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
-                    unparsed += 1;
-                    continue;
-                };
-                let fm = &engram.frontmatter;
-                let status = match fm
-                    .status
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(s) => s.to_ascii_lowercase(),
-                    None => d.status.trim().to_ascii_lowercase(),
-                };
-                let title = if fm.title.trim().is_empty() {
-                    d.title.clone()
-                } else {
-                    fm.title.clone()
-                };
-                let tokens = engram.body.chars().count() / 4;
-                facts.push(EngramFacts {
-                    id: d.id,
-                    domain: d.domain.clone(),
-                    permalink: d.permalink.clone(),
-                    title,
-                    path: d.path.clone(),
-                    status,
-                    engram_type: fm.engram_type.trim().to_ascii_lowercase(),
-                    tags: fm.tags.clone(),
-                    salience: yaml_number(fm.extra.get("salience")),
-                    recorded_at: fm.recorded_at,
-                    valid_from: fm.valid_from,
-                    valid_to: fm.valid_to,
-                    stale_on: fm.stale_on(),
-                    verified_on: fm.latest_verified().map(|v| v.at.date_naive()),
-                    tokens,
-                    token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
-                    inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
-                    outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
-                    generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
-                    analyzes: asset_claim(fm),
-                    analyzed_hash: fm
-                        .extra
-                        .get("analyzed_hash")
-                        .and_then(|v| v.as_str())
-                        .map(str::trim)
-                        .filter(|h| !h.is_empty())
-                        .map(str::to_string),
-                    asset_refs: crystalline_core::find_asset_refs(&engram.body),
-                    body: engram.body,
-                });
-            }
-
-            let input = SweepInput {
-                domain: name.clone(),
-                today,
-                engrams: facts,
-                graph,
-                unresolved,
-                tags: vocab.tags,
-                tag_aliases: vocab.aliases,
-                known_domains: known_domains.clone(),
-                attachments,
-                options: SweepOptions::default(),
-            };
-            let report = detect(&input);
-            engrams_scanned += report.engrams_scanned;
+            engrams_scanned += swept.report.engrams_scanned;
+            unparsed += swept.unparsed;
             // A cap that fired is domain-local, so the merged list names the
             // domain it fired in.
-            truncations.extend(report.truncations.iter().map(|t| format!("{name} - {t}")));
-            findings.extend(report.findings);
+            truncations.extend(
+                swept
+                    .report
+                    .truncations
+                    .iter()
+                    .map(|t| format!("{name} - {t}")),
+            );
+            // Counted before the family and rule filters below, because what an
+            // acknowledgment suppressed is a fact about the domain rather than
+            // about the slice of it this call asked for.
+            acknowledged.total += swept.report.acknowledged.total;
+            acknowledged.temporal += swept.report.acknowledged.temporal;
+            acknowledged.structure += swept.report.acknowledged.structure;
+            acknowledged.redundancy += swept.report.acknowledged.redundancy;
+            findings.extend(swept.report.findings);
         }
 
         findings.retain(|f| {
@@ -5084,7 +5056,7 @@ impl Engine {
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                json!({
+                let mut row = json!({
                     "n": offset + i + 1,
                     "priority": f.priority,
                     "rule": f.rule,
@@ -5096,7 +5068,20 @@ impl Engine {
                     "finding": f.finding,
                     "evidence": f.evidence,
                     "fix": f.fix,
-                })
+                });
+                // The acknowledgment columns ride along only when they say
+                // something, so an ordinary queue row stays the flat shape every
+                // renderer already knows.
+                if f.acknowledged {
+                    row["acknowledged"] = Value::Bool(true);
+                }
+                if f.ack_stale {
+                    row["ack_stale"] = Value::Bool(true);
+                }
+                if let Some(note) = &f.ack_note {
+                    row["ack_note"] = Value::String(note.clone());
+                }
+                row
             })
             .collect();
 
@@ -5124,11 +5109,312 @@ impl Engine {
             "limit": limit,
             "count": queue.len(),
             "families": family_counts,
+            "acknowledged": {
+                "total": acknowledged.total,
+                "by_family": {
+                    "temporal": acknowledged.temporal,
+                    "structure": acknowledged.structure,
+                    "redundancy": acknowledged.redundancy,
+                },
+            },
             "queue": queue,
             "actions": actions,
             "guidance": EVOLVE_GUIDANCE,
             "truncations": truncations,
         }))
+    }
+
+    // --- acknowledgments -----------------------------------------------------
+
+    /// The acknowledgment an `evolve_ack` assignment is asking for, completed
+    /// with the scope only the sweep can supply, or `None` when this edit is
+    /// not one.
+    ///
+    /// The value is the rule id optionally followed by a note, split at the
+    /// first whitespace: `V101` or `V101 lineage citation, keep`. The rule has
+    /// to be one the catalog knows, because an acknowledgment of a rule that
+    /// does not exist can never suppress anything and silently storing it would
+    /// read as work done.
+    ///
+    /// The scope is the firing finding's, and its absence is meaningful: a rule
+    /// that is not currently firing for this engram is acknowledged scope-less,
+    /// which matches whatever it finds later. That is the honest reading of
+    /// "acknowledge this before it appears".
+    async fn ack_draft(
+        &self,
+        p: &EditParams,
+        desc: &EngramDescriptor,
+        actor: &str,
+    ) -> Result<Option<EvolveAck>> {
+        if p.operation != "set_frontmatter"
+            || p.key.as_deref().map(str::trim) != Some(EVOLVE_ACK_KEY)
+        {
+            return Ok(None);
+        }
+        let raw = p.value.as_deref().map(str::trim).unwrap_or_default();
+        let (rule, note) = parse_ack_value(raw)?;
+        Ok(Some(EvolveAck {
+            scope: self.firing_scope(&desc.domain, &desc.permalink, &rule).await?,
+            rule,
+            note,
+            by: actor.to_string(),
+            at: Some(now_offset()),
+        }))
+    }
+
+    /// What `rule` is currently firing on `permalink` for, as the scope an
+    /// acknowledgment is matched against later. `None` when the rule is not
+    /// firing, or when it fires with an empty scope because its identity is
+    /// just the engram and the rule.
+    ///
+    /// Detection runs with the suppressed findings included, so
+    /// re-acknowledging a finding an older entry already silences still sees
+    /// the evidence it fires on and records the current scope rather than
+    /// dropping to a scope-less entry.
+    async fn firing_scope(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+    ) -> Result<Option<String>> {
+        let mut known_domains = self.known_domain_names();
+        known_domains.sort();
+        known_domains.dedup();
+        let today = Utc::now().date_naive();
+        let Some(swept) = self
+            .sweep_domain(domain, today, &known_domains, true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(swept
+            .report
+            .findings
+            .into_iter()
+            .find(|f| f.rule == rule && f.permalink == permalink)
+            .map(|f| f.scope)
+            .filter(|scope| !scope.is_empty()))
+    }
+
+    /// Acknowledge a finding: record on the engram that this rule's finding was
+    /// read and ruled intentional, so future sweeps count it rather than
+    /// raising it. The Fluid half of the same act
+    /// [`Engine::edit_engram_as`]'s `set_frontmatter` performs for an agent,
+    /// through the one edit path, with the scope computed the one way.
+    pub async fn acknowledge_finding_as(
+        &self,
+        domain: &str,
+        identifier: &str,
+        rule: &str,
+        note: Option<&str>,
+        client: Option<&str>,
+    ) -> Result<Value> {
+        let value = match note.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(note) => format!("{} {note}", rule.trim()),
+            None => rule.trim().to_string(),
+        };
+        let params = EditParams {
+            identifier: identifier.to_string(),
+            domain: domain.to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(EVOLVE_ACK_KEY.to_string()),
+            value: Some(value),
+            ..EditParams::default()
+        };
+        let result = self.edit_engram_as(&params, client).await?;
+        Ok(result
+            .get("evolve_ack")
+            .cloned()
+            .unwrap_or(Value::Null))
+    }
+
+    /// Withdraw an acknowledgment, leaving the engram's other entries alone.
+    /// `false` when the engram carries none for that rule, which the surface
+    /// answers as a 404 rather than pretending a removal happened.
+    ///
+    /// Deliberately not offered over MCP: an agent silences a finding a person
+    /// ruled intentional, and un-silencing it is the person's call, in Fluid or
+    /// in the file.
+    pub async fn unacknowledge_finding_as(
+        &self,
+        domain: &str,
+        identifier: &str,
+        rule: &str,
+        client: Option<&str>,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let rule = rule.trim().to_ascii_uppercase();
+        if rule_info(&rule).is_none() {
+            return Err(EngineError::Invalid(unknown_rule_message(&rule)));
+        }
+        let actor = self.actor(client);
+        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        // Checked before the write so an engram carrying no such entry answers
+        // "nothing to withdraw" without a rewrite, a reindex or a touched
+        // generated block.
+        let current = self.load_source(&source, &desc).await?;
+        if !acks_of(&current).iter().any(|a| a.rule == rule) {
+            return Ok(false);
+        }
+        self.apply_source_edit(&desc, &source, None, &actor, |current| {
+            let kept: Vec<EvolveAck> = acks_of(current)
+                .into_iter()
+                .filter(|a| a.rule != rule)
+                .collect();
+            Ok(set_evolve_ack(current, &kept))
+        })
+        .await?;
+        Ok(true)
+    }
+
+    /// An engram's markdown as its domain holds it, whichever kind that is.
+    async fn load_source(
+        &self,
+        source: &ContentSource,
+        desc: &EngramDescriptor,
+    ) -> Result<String> {
+        match source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, &desc.path);
+                std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                    path: abs.display().to_string(),
+                    source,
+                })
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                store
+                    .engram_content(desc.domain_id, &desc.path)
+                    .await?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "no content stored for '{}' in domain '{}'",
+                            desc.permalink, desc.domain
+                        ))
+                    })
+            }
+        }
+    }
+
+    /// One domain's assembled facts, detected: the sweep's whole per-domain
+    /// half, shared by [`Engine::evolve_detect`] and the acknowledgment write
+    /// path, which needs the same verdict about one engram before it can record
+    /// what a finding was acknowledged for.
+    ///
+    /// `Ok(None)` for a domain with no engrams: no domain row to query against
+    /// and nothing to detect. An empty domain is quiet, not an error.
+    async fn sweep_domain(
+        &self,
+        name: &str,
+        today: NaiveDate,
+        known_domains: &[String],
+        include_acknowledged: bool,
+    ) -> Result<Option<DomainSweep>> {
+        let mut unparsed = 0usize;
+        let source = self.content_source(name)?;
+        let store = self.store.lock().await;
+        let descs = store.list_engrams(name, None, None).await?;
+        drop(store);
+        // No engrams means no domain row to query against and nothing to
+        // detect. An empty domain is quiet, not an error.
+        let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
+            return Ok(None);
+        };
+
+        let graph = self.sweep_graph(&descs).await?;
+        let mut inbound: HashMap<i64, usize> = HashMap::new();
+        let mut outbound: HashMap<i64, usize> = HashMap::new();
+        for edge in &graph.edges {
+            *outbound.entry(edge.from.0).or_default() += 1;
+            *inbound.entry(edge.to.0).or_default() += 1;
+        }
+
+        let store = self.store.lock().await;
+        let unresolved = store.unresolved_refs(domain_id).await?;
+        let vocab = store.vocabulary(Some(name)).await?;
+        // Metadata only, one query: the attachment rules compare paths,
+        // sizes and hashes and never read a byte of any file.
+        let attachments = store.list_attachments(domain_id).await?;
+        drop(store);
+
+        let verify_config = domain_verify_config(&source);
+        let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
+        for d in &descs {
+            // Files-are-truth for a file domain, the stored content for a
+            // virtual one. An engram that no longer parses is counted and
+            // skipped rather than failing the whole sweep, since one broken
+            // file must not hide every finding behind it.
+            let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
+                unparsed += 1;
+                continue;
+            };
+            let fm = &engram.frontmatter;
+            let status = match fm
+                .status
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(s) => s.to_ascii_lowercase(),
+                None => d.status.trim().to_ascii_lowercase(),
+            };
+            let title = if fm.title.trim().is_empty() {
+                d.title.clone()
+            } else {
+                fm.title.clone()
+            };
+            let tokens = engram.body.chars().count() / 4;
+            facts.push(EngramFacts {
+                id: d.id,
+                domain: d.domain.clone(),
+                permalink: d.permalink.clone(),
+                title,
+                path: d.path.clone(),
+                status,
+                engram_type: fm.engram_type.trim().to_ascii_lowercase(),
+                tags: fm.tags.clone(),
+                salience: yaml_number(fm.extra.get("salience")),
+                recorded_at: fm.recorded_at,
+                valid_from: fm.valid_from,
+                valid_to: fm.valid_to,
+                stale_on: fm.stale_on(),
+                verified_on: fm.latest_verified().map(|v| v.at.date_naive()),
+                tokens,
+                token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
+                inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
+                outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
+                generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
+                analyzes: asset_claim(fm),
+                analyzed_hash: fm
+                    .extra
+                    .get("analyzed_hash")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string),
+                asset_refs: crystalline_core::find_asset_refs(&engram.body),
+                acks: ack_entries(fm),
+                body: engram.body,
+            });
+        }
+
+        let input = SweepInput {
+            domain: name.to_string(),
+            today,
+            engrams: facts,
+            graph,
+            unresolved,
+            tags: vocab.tags,
+            tag_aliases: vocab.aliases,
+            known_domains: known_domains.to_vec(),
+            attachments,
+            include_acknowledged,
+            options: SweepOptions::default(),
+        };
+        let report = detect(&input);
+        Ok(Some(DomainSweep { report, unparsed }))
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every
@@ -9442,9 +9728,120 @@ fn asset_tail(path: &str) -> &str {
 /// `./` is stripped and the folder segment is folded to its canonical
 /// spelling, and anything that does not address the reserved folder at all is
 /// not a claim.
+/// One domain's sweep: its report and how many of its engrams no longer parse.
+struct DomainSweep {
+    /// The ranked findings for that domain, acknowledgments already applied.
+    report: SweepReport,
+    /// Engrams that failed to parse and were skipped rather than failing the
+    /// run.
+    unparsed: usize,
+}
+
+/// Split an `evolve_ack` value into the rule id and the note: the rule up to
+/// the first whitespace, everything after it the note. The id is uppercased, so
+/// `v101 keep` records the same acknowledgment `V101 keep` does.
+fn parse_ack_value(raw: &str) -> Result<(String, Option<String>)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(EngineError::Invalid(format!(
+            "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
+        )));
+    }
+    let (rule, note) = match raw.split_once(char::is_whitespace) {
+        Some((rule, note)) => (rule, note.trim()),
+        None => (raw, ""),
+    };
+    let rule = rule.trim().to_ascii_uppercase();
+    if rule_info(&rule).is_none() {
+        return Err(EngineError::Invalid(unknown_rule_message(&rule)));
+    }
+    Ok((
+        rule,
+        (!note.is_empty()).then(|| note.to_string()),
+    ))
+}
+
+/// What a caller hears when it names a rule the catalog does not have.
+fn unknown_rule_message(rule: &str) -> String {
+    format!(
+        "'{rule}' is not a rule the sweep knows; the catalog holds {}",
+        RULES
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+/// The acknowledgments an engram's markdown carries.
+fn acks_of(source: &str) -> Vec<EvolveAck> {
+    parse_engram(source)
+        .ok()
+        .and_then(|e| e.frontmatter.extra.get(EVOLVE_ACK_KEY).map(EvolveAck::parse_list))
+        .unwrap_or_default()
+}
+
+/// The engram's acknowledgments with `entry` folded in: one entry per rule, so
+/// re-acknowledging a finding replaces what it said rather than stacking a
+/// second line nobody reads. The replacement keeps the original position, which
+/// keeps a hand-ordered list hand-ordered.
+fn merged_acks(source: &str, entry: EvolveAck) -> Vec<EvolveAck> {
+    let mut entries = acks_of(source);
+    let mut replaced = false;
+    entries.retain_mut(|existing| {
+        if !existing.rule.eq_ignore_ascii_case(&entry.rule) {
+            return true;
+        }
+        // A hand-edited file may name one rule twice; the entry just written is
+        // the survivor and the rest go, so the list stays one entry per rule.
+        if replaced {
+            return false;
+        }
+        *existing = entry.clone();
+        replaced = true;
+        true
+    });
+    if !replaced {
+        entries.push(entry);
+    }
+    entries
+}
+
+/// One acknowledgment as a surface renders it.
+fn ack_json(entry: &EvolveAck) -> Value {
+    json!({
+        "rule": entry.rule,
+        "scope": entry.scope,
+        "note": entry.note,
+        "by": entry.by,
+        "at": entry.at.map(|at| at.to_rfc3339()),
+    })
+}
+
 fn asset_claim(fm: &Frontmatter) -> Option<String> {
     let raw = fm.extra.get("analyzes")?.as_str()?.trim();
     crystalline_core::canonical_asset_path(raw.trim_start_matches("./"))
+}
+
+/// The acknowledgments an engram carries, as the sweep reads them.
+///
+/// The provenance the file records (`by`, `at`) is left behind here on purpose:
+/// the detectors decide whether an acknowledgment still matches its evidence,
+/// never who gave it. Malformed entries are skipped by
+/// [`EvolveAck::parse_list`], so a hand-edited line costs its own entry and
+/// nothing else.
+fn ack_entries(fm: &Frontmatter) -> Vec<AckEntry> {
+    let Some(value) = fm.extra.get(EVOLVE_ACK_KEY) else {
+        return Vec::new();
+    };
+    EvolveAck::parse_list(value)
+        .into_iter()
+        .map(|a| AckEntry {
+            rule: a.rule,
+            scope: a.scope,
+            note: a.note,
+        })
+        .collect()
 }
 
 /// `assets/deck.pptx` as `assets/deck-2.pptx`: the name an attachment takes
