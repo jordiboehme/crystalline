@@ -11,6 +11,14 @@
 //! time keeps the two numbers in agreement - a comment beside the directive
 //! names this fact, and this test is what actually enforces it.
 //!
+//! There are two numbers to keep now, not one. The archive preview and import
+//! carry a whole domain rather than one document, so the daemon gives those
+//! two routes their own [`crystalline_service::rest::ARCHIVE_BODY_BYTES`]
+//! (64 MiB) and the template gives the same paths their own regex location
+//! with a matching directive. A proxy that kept the server-level 10 MiB for
+//! them would refuse an archive the deployment behind it had just produced,
+//! and the failure would look like a Fluid bug rather than a proxy one.
+//!
 //! Reads the template at RUNTIME through `CARGO_MANIFEST_DIR` rather than
 //! `include_str!`: this crate does not own `fluid/`, and a checkout that
 //! does not carry it (or a future split of the two trees) should skip this
@@ -47,15 +55,37 @@ fn parse_nginx_size(value: &str) -> Option<usize> {
     n.checked_mul(multiplier)
 }
 
+/// The value of the `client_max_body_size` directive on `line`, in bytes.
+fn directive_bytes(line: &str) -> usize {
+    let value = line
+        .trim()
+        .trim_start_matches("client_max_body_size")
+        .trim()
+        .trim_end_matches(';')
+        .trim();
+    parse_nginx_size(value)
+        .unwrap_or_else(|| panic!("could not parse client_max_body_size value {value:?}"))
+}
+
+/// The template, or `None` on a checkout that does not carry `fluid/`.
+fn template() -> Option<String> {
+    let path = template_path();
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Some(text),
+        Err(_) => {
+            eprintln!(
+                "note: skipping the nginx body cap guard ({} not found); \
+                 this checkout does not carry fluid/",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
 #[test]
 fn nginx_body_cap_is_at_least_the_daemons() {
-    let path = template_path();
-    let Ok(template) = std::fs::read_to_string(&path) else {
-        eprintln!(
-            "note: skipping the nginx body cap guard ({} not found); \
-             this checkout does not carry fluid/",
-            path.display()
-        );
+    let Some(template) = template() else {
         return;
     };
 
@@ -75,13 +105,7 @@ fn nginx_body_cap_is_at_least_the_daemons() {
             )
         });
 
-    let value = directive
-        .trim_start_matches("client_max_body_size")
-        .trim()
-        .trim_end_matches(';')
-        .trim();
-    let bytes = parse_nginx_size(value)
-        .unwrap_or_else(|| panic!("could not parse client_max_body_size value {value:?}"));
+    let bytes = directive_bytes(directive);
 
     assert!(
         bytes >= crystalline_service::rest::MAX_BODY_BYTES,
@@ -89,6 +113,66 @@ fn nginx_body_cap_is_at_least_the_daemons() {
          crystalline_service::rest::MAX_BODY_BYTES ({} bytes); the proxy would refuse \
          a body the daemon behind it accepts",
         crystalline_service::rest::MAX_BODY_BYTES
+    );
+}
+
+/// The archive routes have their own, larger directive, and it is inside the
+/// location that matches them.
+///
+/// Two assertions rather than one, because the split is the point: the archive
+/// location must cover `ARCHIVE_BODY_BYTES`, and the server-level value must
+/// NOT have been raised to cover it - a proxy that let every route take 64 MiB
+/// would undo the reason the daemon keeps the two numbers apart.
+#[test]
+fn the_archive_location_carries_the_archive_cap() {
+    let Some(template) = template() else {
+        return;
+    };
+    let archive_cap = crystalline_service::rest::ARCHIVE_BODY_BYTES;
+
+    let mut lines = template.lines().map(str::trim);
+    lines
+        .find(|line| line.starts_with("location ") && line.contains("/archive"))
+        .unwrap_or_else(|| {
+            panic!(
+                "fluid/nginx.conf.template has no location matching the archive routes; \
+                 the server-level client_max_body_size would then cap an archive import \
+                 at crystalline_service::rest::MAX_BODY_BYTES ({} bytes) while the daemon \
+                 behind it accepts ARCHIVE_BODY_BYTES ({archive_cap} bytes). Add a regex \
+                 location for ^/api/v1/domains/[^/]+/archive with its own directive.",
+                crystalline_service::rest::MAX_BODY_BYTES
+            )
+        });
+    // The block's own directive: everything up to the closing brace of the
+    // location, so a directive further down the file cannot stand in for it.
+    let directive = lines
+        .take_while(|line| *line != "}")
+        .find(|line| line.starts_with("client_max_body_size"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the archive location in fluid/nginx.conf.template sets no \
+                 client_max_body_size of its own, so it inherits the server-level one \
+                 and refuses a body the daemon accepts ({archive_cap} bytes)"
+            )
+        });
+    let bytes = directive_bytes(directive);
+    assert!(
+        bytes >= archive_cap,
+        "the archive location's client_max_body_size ({bytes} bytes) is below \
+         crystalline_service::rest::ARCHIVE_BODY_BYTES ({archive_cap} bytes); the proxy \
+         would refuse an archive the deployment behind it just produced"
+    );
+
+    let server_level = template
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("client_max_body_size"))
+        .expect("the server-level directive is asserted by the test above");
+    assert!(
+        directive_bytes(server_level) < archive_cap,
+        "the server-level client_max_body_size covers the archive cap, so every route \
+         behind this proxy accepts an archive-sized body; the split exists so only the \
+         two archive routes do"
     );
 }
 

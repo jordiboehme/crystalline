@@ -353,7 +353,33 @@ impl RestState {
 /// by `tests/nginx_body_cap.rs` because nginx cannot read a Rust constant.
 /// Changing this value moves the first two by construction; the third is the
 /// one that needs the template edited with it.
+///
+/// Two routes are deliberately exempt, and only two: the archive preview and
+/// import carry a whole domain rather than one document. See
+/// [`ARCHIVE_BODY_BYTES`].
 pub const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+/// The largest request body the archive preview and import accept, 64 MiB.
+///
+/// A separate number because those two routes carry a different kind of body:
+/// not one person's document but a whole domain, MANIFEST, engrams and
+/// `assets/` attachments together, as one zip. Under [`MAX_BODY_BYTES`] the
+/// archive was a one-way door - a single incompressible attachment at the
+/// attachment ceiling (10 MiB, `crystalline_core::MAX_ATTACHMENT_BYTES`)
+/// exports to a zip just past 10 MiB and could then never be imported again,
+/// which is exactly the round trip the attachment feature promises.
+///
+/// Applied per route with `DefaultBodyLimit` rather than by raising the number
+/// above: axum takes the innermost limit, so every other route, the MCP
+/// streamable-HTTP transport and the collab socket keep the general ceiling
+/// untouched. The route is admin-only and CSRF-guarded, the decompression it
+/// feeds is metered against the archive module's own `MAX_TOTAL_BYTES` and
+/// runs on the blocking pool, so the cost of the larger body is bounded memory
+/// on a route nobody anonymous can reach.
+///
+/// `fluid/nginx.conf.template` gives the same two paths their own
+/// `client_max_body_size`, guarded by `tests/nginx_body_cap.rs`.
+pub const ARCHIVE_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Build the REST router. Mounted with `nest("/api/v1", ...)`, so the paths
 /// here are relative to that prefix and the fallback below only ever answers
@@ -391,8 +417,21 @@ pub fn router(state: RestState) -> Router {
         // The upload half, and the exception to the line above: both are
         // writes (a preview is the first half of one), so both are admin-only
         // AND refused on a read-only instance.
-        .route("/domains/{domain}/archive/preview", post(archive::preview))
-        .route("/domains/{domain}/archive/import", post(archive::import))
+        //
+        // Their own body limit, and the only two routes that have one: an
+        // archive is a whole domain rather than one document, so the general
+        // ceiling would refuse an export this same instance produced. Layered
+        // on the method router, which puts it INSIDE the router-wide limit
+        // below, and axum reads the innermost - so nothing else moves. See
+        // [`ARCHIVE_BODY_BYTES`].
+        .route(
+            "/domains/{domain}/archive/preview",
+            post(archive::preview).layer(DefaultBodyLimit::max(ARCHIVE_BODY_BYTES)),
+        )
+        .route(
+            "/domains/{domain}/archive/import",
+            post(archive::import).layer(DefaultBodyLimit::max(ARCHIVE_BODY_BYTES)),
+        )
         // The attachment surface, beside the archive because both move bytes
         // rather than knowledge. The listing is a plain read; the bytes route
         // is a wildcard, because an attachment path is a path and carries its

@@ -1298,6 +1298,15 @@ async fn hostile_and_oversized_archives_are_refused() {
         zip_of(&[("back\\slash.md", "x")]),
         zip_of(&[("c:colon.md", "x")]),
         zip_of(&[("/absolute.md", "x")]),
+        // The same shapes under the reserved folder. The containment screen
+        // decides these BEFORE the attachment rules are consulted, so an
+        // `assets/`-prefixed traversal refuses the archive whole rather than
+        // becoming one entry's "path is not a valid assets path" - which is
+        // the safer of the two answers and the one a reorder of the screens
+        // would silently lose.
+        zip_of(&[("assets/../escape.png", "x")]),
+        zip_of(&[("Assets/../escape.png", "x")]),
+        zip_of(&[("/assets/absolute.png", "x")]),
     ] {
         let resp = post_zip(fx.addr, preview_path, &admin, evil).await;
         assert_eq!(
@@ -1308,6 +1317,7 @@ async fn hostile_and_oversized_archives_are_refused() {
     }
     // Nothing landed.
     assert!(!fx._tmp.path().join("escape.md").exists());
+    assert!(!fx._tmp.path().join("escape.png").exists());
 
     let garbage = post_zip(fx.addr, preview_path, &admin, b"not a zip".to_vec()).await;
     assert_eq!(garbage.status(), 422);
@@ -1337,13 +1347,13 @@ async fn hostile_and_oversized_archives_are_refused() {
     let resp = post_zip(fx.addr, preview_path, &admin, zip_of(&refs)).await;
     assert_eq!(resp.status(), 422, "the entry-count cap");
 
-    // The whole-archive total, which no single entry can reach: 33 entries of
-    // exactly 1 MiB each pass the per-entry cap one by one and cross the 32
-    // MiB total on the last one. Repeated bytes deflate to about a kilobyte
-    // apiece, so the body is a few tens of KB against a 10 MiB limit - the
-    // guard is reachable from inside this surface's own bounds.
+    // The whole-archive total, which no single entry can reach: entries of
+    // exactly 1 MiB each pass the per-entry cap one by one and cross the
+    // 200 MiB total on the last one. Repeated bytes deflate to about a
+    // kilobyte apiece, so the body is a couple of hundred KB against a 64 MiB
+    // limit - the guard is reachable from inside this surface's own bounds.
     let one_mib = "a".repeat(1024 * 1024);
-    let names: Vec<String> = (0..33).map(|i| format!("big{i}.md")).collect();
+    let names: Vec<String> = (0..201).map(|i| format!("big{i}.md")).collect();
     let big: Vec<(&str, &str)> = names
         .iter()
         .map(|name| (name.as_str(), one_mib.as_str()))
@@ -1575,13 +1585,105 @@ async fn the_archive_carries_attachments_between_domain_kinds() {
     );
 }
 
+/// Incompressible bytes of a given length, deterministic so a failure is
+/// reproducible: an xorshift stream, which deflate cannot shrink, so a zip of
+/// this is as large as the data itself.
+fn incompressible(len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len);
+    let mut state: u64 = 0x2545_f491_4f6c_dd1d;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
+/// The case the archive could not do before the routes got their own body
+/// limit: an attachment at the attachment ceiling exports to a zip just past
+/// 10 MiB, which the general limit refused with 413 - so the largest
+/// attachment Crystalline accepts could never be imported back. The two
+/// archive routes take 64 MiB now, and the round trip closes.
+///
+/// Deliberately at `MAX_ATTACHMENT_BYTES` exactly, and incompressible, so the
+/// body really is the size the failure needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cap_sized_attachment_round_trips_past_the_general_body_limit() {
+    let fx = serve(Options::default()).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let heavy = incompressible(crystalline_core::MAX_ATTACHMENT_BYTES as usize);
+    put_attachment(fx.addr, "eng", "assets/scan.pdf", &admin, &heavy).await;
+
+    let exported = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/archive",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap()
+    .bytes()
+    .await
+    .unwrap()
+    .to_vec();
+    assert!(
+        exported.len() > crystalline_service::rest::MAX_BODY_BYTES,
+        "the export is past the general body limit ({} bytes), which is the \
+         whole point of this case",
+        exported.len()
+    );
+    assert!(
+        exported.len() <= crystalline_service::rest::ARCHIVE_BODY_BYTES,
+        "and inside the archive routes' own limit"
+    );
+
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
+        .json(&serde_json::json!({"mode": "virtual", "name": "heavy"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201);
+
+    let done = post_zip(
+        fx.addr,
+        "/api/v1/domains/heavy/archive/import",
+        &admin,
+        exported,
+    )
+    .await;
+    assert_eq!(
+        done.status(),
+        200,
+        "an archive-sized body reaches the handler rather than being refused 413"
+    );
+    let done: serde_json::Value = done.json().await.unwrap();
+    let scan = done["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| e["path"] == "assets/scan.pdf")
+        .unwrap_or_else(|| panic!("the attachment was imported: {done}"));
+    assert_eq!(scan["status"], "created");
+    assert_eq!(scan["bytes"], heavy.len());
+    assert_eq!(
+        get_attachment(fx.addr, "heavy", "assets/scan.pdf", &admin).await,
+        heavy,
+        "byte for byte, through a body no other route would accept"
+    );
+}
+
 /// The upload gates decide an `assets/` entry, one reason per entry, and the
 /// markdown rule is untouched for everything outside the folder.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn asset_entries_are_screened_entry_by_entry() {
     let fx = serve(Options::default()).await;
     let admin = login(fx.addr, "root", "rootpw").await;
-    let big = vec![b'a'; 10 * 1024 * 1024 + 1];
+    // Derived from the ceiling rather than written out, so this keeps testing
+    // the boundary if the ceiling ever moves.
+    let big = vec![b'a'; crystalline_core::MAX_ATTACHMENT_BYTES as usize + 1];
     let bytes = zip_of_bytes(&[
         ("assets/ok.png", PNG),
         ("assets/tool.exe", b"MZ"),

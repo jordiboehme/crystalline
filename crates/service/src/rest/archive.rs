@@ -119,7 +119,18 @@ const ASSET_SIZE_REASON: &str = "attachment exceeds the size limit";
 const ASSET_MARKDOWN_REASON: &str = "assets entries must be attachments, not markdown";
 
 /// The largest a whole archive may be once decompressed, in bytes.
-const MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+///
+/// Roughly three times the compressed body these routes accept
+/// ([`super::ARCHIVE_BODY_BYTES`], 64 MiB), the same ratio this cap carried
+/// when the body limit was the general one: enough headroom that a domain of
+/// ordinary markdown, which deflates far better than three to one, is bounded
+/// by the transport rather than by this, and low enough that the memory a
+/// single import can make this process hold stays a number an operator can
+/// predict. Every accepted entry's decompressed bytes are buffered before the
+/// first write, so this is the real memory ceiling of an import, and the
+/// screening that meters against it runs on the blocking pool rather than on a
+/// runtime worker.
+pub(crate) const MAX_TOTAL_BYTES: u64 = 200 * 1024 * 1024;
 
 /// `GET /domains/{domain}/archive` - the whole domain as a zip.
 ///
@@ -386,12 +397,24 @@ fn asset_name_verdict(path: &str) -> Option<Screened> {
 
 /// Open and screen an uploaded archive.
 ///
-/// Hygiene refusals (not a zip, too many entries, oversized by declaration OR
-/// by actual decompressed bytes, a name that is not UTF-8, traversal) reject
-/// the WHOLE request: a hostile archive gets no partial import. Per-entry
-/// demotions (non-`.md`, MANIFEST, reserved names, non-UTF-8 content) stay in
-/// the report. Size limits are enforced on the bytes actually decompressed,
-/// never on the header's claim alone.
+/// Hygiene refusals reject the WHOLE request, because a hostile archive gets
+/// no partial import: not a zip, too many entries, a markdown entry oversized
+/// by declaration OR by actual decompressed bytes, an archive past the
+/// decompressed total, a name that is not UTF-8, and any traversal shape -
+/// including one under `assets/`, which the containment screen decides before
+/// the attachment rules are ever consulted.
+///
+/// Per-entry demotions stay in the report: a non-`.md` entry outside
+/// `assets/`, a MANIFEST, a reserved name, markdown that is not UTF-8, and -
+/// under `assets/` - a path the attachment rules refuse, an extension that is
+/// not on the allowlist, markdown where an attachment belongs, and an
+/// attachment past the attachment ceiling. That last one is the one asymmetry
+/// worth remembering: an oversized markdown entry refuses the archive, an
+/// oversized attachment refuses only itself.
+///
+/// Size limits are enforced on the bytes actually decompressed, never on the
+/// header's claim alone. Synchronous and metering up to
+/// [`MAX_TOTAL_BYTES`] of inflation, so callers run it on the blocking pool.
 fn read_archive(bytes: &[u8]) -> Result<Vec<Screened>, ApiError> {
     let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
         .map_err(|e| ApiError::unprocessable(format!("not a readable zip archive: {e}")))?;
@@ -627,20 +650,27 @@ fn status_of(action: &str, dry_run: bool) -> String {
 async fn run_archive(
     state: &RestState,
     domain: &str,
-    bytes: &[u8],
+    bytes: Bytes,
     overwrite: bool,
     dry_run: bool,
 ) -> Result<ArchiveReport, ApiError> {
     // Resolve the domain before paying for decompression: `read_archive`
-    // meters up to 32 MiB of decompressed content, and an upload aimed at a
-    // domain that does not exist can never succeed regardless of what is
-    // inside it. Both `preview` and `import` inherit this order from this one
-    // function. It still sits BELOW `identity.require_admin()` and
+    // meters up to MAX_TOTAL_BYTES of decompressed content, and an upload
+    // aimed at a domain that does not exist can never succeed regardless of
+    // what is inside it. Both `preview` and `import` inherit this order from
+    // this one function. It still sits BELOW `identity.require_admin()` and
     // `refuse_read_only` in both handlers - moving it above them would make a
     // read-only instance answer 404 where it answers 403, and let an
     // unauthorized caller learn which domains exist.
     state.engine.require_domain(domain)?;
-    let screened = read_archive(bytes)?;
+    // On the blocking pool, like `build_zip` on the way out: inflating an
+    // archive is synchronous CPU work bounded by MAX_TOTAL_BYTES, and running
+    // it inline would park a runtime worker for the whole of it. `Bytes` is
+    // cheap to move here - it hands the shared buffer over rather than copying
+    // the body.
+    let screened = tokio::task::spawn_blocking(move || read_archive(&bytes))
+        .await
+        .map_err(|e| ApiError::internal(format!("archive screening task failed: {e}")))??;
     // What the domain already holds under `assets/`, so an attachment entry
     // gets the same same-path treatment a markdown entry does: reported as a
     // collision by a preview, left alone by a skip-policy import, replaced
@@ -831,13 +861,14 @@ async fn run_archive(
                    than engrams: they are reported with their byte count and \
                    screened by the attachment path rules, the extension \
                    allowlist and the size ceiling, each refusal naming which \
-                   of the three answered.\n\nNothing is written. A hostile \
-                   archive is \
+                   of the three answered; an attachment past the 10 MiB \
+                   ceiling is refused on its own rather than refusing the \
+                   archive.\n\nNothing is written. A hostile archive is \
                    refused whole with 422 rather than partially imported: \
-                   more than 1000 entries, an entry over 1 MiB or a whole \
-                   archive over 32 MiB once decompressed, an entry name that \
-                   is not UTF-8, or any path that could escape the domain \
-                   root.",
+                   more than 1000 entries, a markdown entry over 1 MiB or a \
+                   whole archive over 200 MiB once decompressed, an entry \
+                   name that is not UTF-8, or any path that could escape the \
+                   domain root.",
     params(("domain" = String, Path, description = "The registered domain the archive is aimed at.")),
     request_body(
         // Raw zip bytes. Declared as a string for the same reason the download
@@ -876,7 +907,9 @@ async fn run_archive(
         ),
         (
             status = 413,
-            description = "The upload is past the surface's request-body limit.",
+            description = "The upload is past the 64 MiB body limit these \
+                           two archive routes accept, which is deliberately \
+                           larger than the 10 MiB the rest of this API takes.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -900,9 +933,7 @@ pub async fn preview(
 ) -> Result<Json<ArchiveReport>, ApiError> {
     identity.require_admin()?;
     refuse_read_only(&state)?;
-    Ok(Json(
-        run_archive(&state, &domain, &body, false, true).await?,
-    ))
+    Ok(Json(run_archive(&state, &domain, body, false, true).await?))
 }
 
 /// `POST /domains/{domain}/archive/import?policy=skip|overwrite` - commit the
@@ -972,7 +1003,9 @@ pub async fn preview(
         ),
         (
             status = 413,
-            description = "The upload is past the surface's request-body limit.",
+            description = "The upload is past the 64 MiB body limit these \
+                           two archive routes accept, which is deliberately \
+                           larger than the 10 MiB the rest of this API takes.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1009,7 +1042,7 @@ pub async fn import(
         }
     };
     Ok(Json(
-        run_archive(&state, &domain, &body, overwrite, false).await?,
+        run_archive(&state, &domain, body, overwrite, false).await?,
     ))
 }
 

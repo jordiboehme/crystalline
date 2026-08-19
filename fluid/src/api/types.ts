@@ -265,9 +265,9 @@ export interface paths {
          * Dry-run an archive upload: what each entry would become.
          * @description Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.
          *
-         *     Entries under `assets/` are attachments rather than engrams: they are reported with their byte count and screened by the attachment path rules, the extension allowlist and the size ceiling, each refusal naming which of the three answered.
+         *     Entries under `assets/` are attachments rather than engrams: they are reported with their byte count and screened by the attachment path rules, the extension allowlist and the size ceiling, each refusal naming which of the three answered; an attachment past the 10 MiB ceiling is refused on its own rather than refusing the archive.
          *
-         *     Nothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.
+         *     Nothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, a markdown entry over 1 MiB or a whole archive over 200 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.
          */
         post: operations["preview_domain_archive_import"];
         delete?: never;
@@ -2324,7 +2324,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The upload is past the surface's request-body limit. */
+            /** @description The upload is past the 64 MiB body limit these two archive routes accept, which is deliberately larger than the 10 MiB the rest of this API takes. */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2397,7 +2397,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The upload is past the surface's request-body limit. */
+            /** @description The upload is past the 64 MiB body limit these two archive routes accept, which is deliberately larger than the 10 MiB the rest of this API takes. */
             413: {
                 headers: {
                     [name: string]: unknown;
