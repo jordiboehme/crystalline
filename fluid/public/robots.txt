@@ -1,0 +1,6 @@
+# A knowledge instance is private by nature: nothing here belongs in a
+# search index, and the login page least of all. Operators who serve a
+# deliberately public, read-only instance can override this at their
+# reverse proxy.
+User-agent: *
+Disallow: /
