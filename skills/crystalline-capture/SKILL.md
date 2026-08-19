@@ -95,6 +95,8 @@ An engram needs at least 3 non-blank content lines to pass verification - a lone
 
 The optional `folder` files the engram where its topic's neighbours already live, so check the domain's layout first and `browse_domain` it when the domain is unfamiliar. Start a subfolder once a topic cluster is forming; a singleton stays fine at the root. `index.md` and `log.md` are reserved names Crystalline maintains itself, so never write an engram that would take one. The folder becomes the permalink prefix `build_context` globs as `crystalline://domain/folder/*`.
 
+When the body shows an attachment image, the target may carry a comma-separated formatting fragment - `left`, `right`, `center`, `full` and `w=NN` or `w=NN%`, as in `![Chart](assets/chart.png#right,w=50%)` - which Fluid honors and plain markdown viewers simply ignore.
+
 Exceptionally valuable knowledge - a hard-won debugging insight, the decision that keeps paying off - can carry a numeric `salience` key (0 to 10) in `metadata`. Hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance still dominates and nothing is ever filtered out by it. Most engrams need none; reserve it for knowledge that clearly outranks its neighbours, and when an engram later proves to be the key to a task, raise its salience with `set_frontmatter`, `key: "salience"` and the new number as `value`.
 
 ## Splitting a large capture

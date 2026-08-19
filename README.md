@@ -70,6 +70,7 @@ The primary author in Crystalline is the agent: it captures and refines engrams 
 
 - **Read what was learned.** An engram is a page: frontmatter as a details rail, observations and relations as labelled chips, backlinks, and the `crystalline://` address one click from the clipboard. Domains down the side, Cmd+K to jump anywhere by name.
 - **Edit in place.** A live-preview markdown editor with table editing, a frontmatter form, mermaid previews and wikilink completion across every domain. The file on disk stays the source of truth.
+- **Attach what you teach with.** Paste, drag or upload a screenshot, a diagram, a slide deck, a PDF or a data file straight onto an engram; agents read those attachments back over MCP and evolve keeps the knowledge extracted from them current. An attachment always belongs to some engram's teaching, and a file nothing references is flagged for cleanup rather than left to accumulate. Image references take an optional formatting fragment - `#left`, `#right`, `#center`, `#full` and `#w=50%` or `#w=320` - that Fluid honors and every other markdown renderer simply ignores.
 - **Collaborate in real time.** Everyone in the same engram sees everyone else's cursors and edits live; changes merge conflict-free and land as one save.
 - **Search it all.** Faceted search across the whole instance, backed by the same hybrid text-plus-semantic ranking the agents use.
 - **See what the knowledge needs next.** A maintenance page with the ranked queue of everything due - stale dates, half-finished retirements, unreviewed human captures - the same queue the agent works.
@@ -279,6 +280,8 @@ The MCP server exposes 17 tools, 21 once team domains are turned on (see [Share 
 - **`build_context`** - given a `crystalline://domain/permalink` anchor, follow its relations and links (across domains too) to assemble the neighbourhood around a task before diving in - the neighbourhood comes back ranked by how strongly each engram connects to the anchor, salience-aware, so `max_related` keeps the most relevant.
 - **`vocabulary`** - list the tags, observation categories and relation types already in use, with counts, and reuse an existing term before coining a near-duplicate.
 - **`evolve_engrams`** - ask what the archive needs instead of waiting to trip over it: a read-only sweep of one domain or all of them that returns a ranked maintenance queue, every finding carrying the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, a replacement that landed while the retirement was never finished), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs) and redundancy (near-duplicate clusters, drifted tags). A finding marked `mechanical` completes intent the archive already records; one marked `judgment` changes what the archive claims and wants a yes first. It is the tool behind `crystalline evolve` below.
+
+Attachments run the same loop in the other direction: files enter through Fluid (or a domain archive), never through an agent write, and reach an agent as resource links on `read_engram` that `resources/read` fetches by URI - so the slide deck a person drops onto an engram is something the next session reads and learns from rather than an opaque blob, and `evolve_engrams` raises a finding whenever a fresh or changed file still needs capturing.
 
 Observations are the atomic unit of an engram's body: top-level bullets like `- [decision] we chose Postgres for the write path #database`. Categories are free text; useful ones include `decision`, `fact`, `pattern`, `gotcha`, `convention`, `lesson`, `risk` and `idea`. Relations connect engrams: `- depends_on [[Other Engram]]`, or `- "relates to" [[Other Engram]]` for a multi-word relation type.
 
@@ -526,6 +529,12 @@ No. Team domains talk to GitHub directly over its API - no git, no gh, no local 
 - [The Crystalline Playbook](docs/playbook.md) - the whole workflow by example: one running dataset from first capture through querying, reconciling, retiring and team sharing.
 - [Deployment](docs/deployment.md) - every scenario from a laptop to an air-gapped server, one diagram each.
 - Found a rough edge or a missing piece? [Open an issue](https://github.com/jordiboehme/crystalline/issues) - and if Crystalline made your agent a better peer, a star helps others find it.
+
+## Support
+
+Crystalline is free and open source. If it earned its place in your workflow, you can support the work here:
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/V7V31T6CL9)
 
 ## Privacy Policy
 
