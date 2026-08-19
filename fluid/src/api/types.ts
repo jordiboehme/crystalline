@@ -362,6 +362,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/evolve/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge one evolve finding on one engram.
+         * @description Records `evolve_ack` on the engram: the rule, the evidence the server computed it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`.
+         */
+        post: operations["acknowledge_finding"];
+        /**
+         * Withdraw an acknowledgment.
+         * @description Removes the engram's `evolve_ack` entry for that rule, leaving its other entries alone. 404 when the engram carries none for the rule, rather than reporting a removal that did not happen.
+         */
+        delete: operations["unacknowledge_finding"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/files/{path}": {
         parameters: {
             query?: never;
@@ -562,6 +586,12 @@ export interface paths {
          *     `families` counts the whole filtered result rather than the page, which is
          *     what section headings are drawn from, and `truncations` names any per-domain
          *     cap that fired so a short queue is never mistaken for a finished one.
+         *
+         *     `acknowledged` counts what acknowledgments kept out of the queue, whole and
+         *     per family, so a short queue is never mistaken for a healthy one; a row whose
+         *     acknowledgment was given for evidence that has since changed comes back
+         *     carrying `ack_stale` and the old `ack_note`. Pass `include_acknowledged` to
+         *     see the suppressed rows themselves, each marked `acknowledged`.
          *
          *     `today` is not exposed. The temporal rules are evaluated as of now, which is
          *     the only question a page asks; the tool takes a pinned date for a run that
@@ -872,6 +902,24 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired and an optional note saying why it is intentional. The scope an acknowledgment holds for is never sent - the server computes it by running detection. */
+        AckBody: {
+            /**
+             * @description Why the finding is intentional. Ignored on `DELETE`.
+             * @example lineage citation, keep
+             */
+            note?: string | null;
+            /**
+             * @description The engram the finding fired on.
+             * @example notes/beta
+             */
+            permalink: string;
+            /**
+             * @description The rule id to acknowledge, for example `V101`.
+             * @example V101
+             */
+            rule: string;
+        };
         /** @description One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`. */
         ArchiveEntryReport: {
             /**
@@ -2995,6 +3043,157 @@ export interface operations {
             };
         };
     };
+    acknowledge_finding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The engram's domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckBody"];
+            };
+        };
+        responses: {
+            /** @description The stored entry. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "at": "2026-08-20T09:00:00+00:00",
+                     *       "by": "human:jordi",
+                     *       "note": "lineage citation, keep",
+                     *       "rule": "V101",
+                     *       "scope": "eng/old-runbook"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The rule id is not one the sweep catalog holds. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    unacknowledge_finding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The engram's domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckBody"];
+            };
+        };
+        responses: {
+            /** @description The acknowledgment is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Not an editor, no CSRF token echoed, read-only instance, or a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram, or no acknowledgment for that rule on it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The rule id is not one the sweep catalog holds. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     read_attachment: {
         parameters: {
             query?: never;
@@ -4010,6 +4209,13 @@ export interface operations {
                  * @example 1
                  */
                 page?: number;
+                /**
+                 * @description Include the findings acknowledgments suppressed, each marked
+                 *     `acknowledged` with the note that silenced it. Off by default: the queue
+                 *     is what still needs deciding.
+                 * @example true
+                 */
+                include_acknowledged?: boolean;
             };
             header?: never;
             path?: never;
@@ -4025,6 +4231,14 @@ export interface operations {
                 content: {
                     /**
                      * @example {
+                     *       "acknowledged": {
+                     *         "by_family": {
+                     *           "redundancy": 0,
+                     *           "structure": 1,
+                     *           "temporal": 0
+                     *         },
+                     *         "total": 1
+                     *       },
                      *       "actions": [
                      *         {
                      *           "instruction": "A person captured this directly and nobody has reviewed it since. ...",

@@ -1175,3 +1175,100 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
         "the reference follows the shortened name: {text}"
     );
 }
+
+/// `delete_engram` with an `assets/` identifier deletes the attachment, on both
+/// domain kinds, and records the sweep the change owes. This is the one write
+/// the MCP attachment surface offers, so an agent can complete an orphaned
+/// attachment finding after the user's yes without a second verb existing.
+#[tokio::test]
+async fn delete_engram_deletes_an_attachment_on_either_domain_kind() {
+    let (_tmp, engine, root, scratch) = named_fixture("folded-eng", "folded-scratch").await;
+
+    for (domain, path) in [
+        ("folded-eng", "assets/deck.png"),
+        ("folded-scratch", "assets/notes.txt"),
+    ] {
+        engine
+            .attachment_write(domain, path, PNG.to_vec())
+            .await
+            .unwrap();
+        crystalline_service::maintenance::record_run(&[domain.to_string()]);
+
+        let v = engine
+            .delete_engram(&crystalline_service::params::DeleteParams {
+                identifier: path.to_string(),
+                domain: domain.to_string(),
+                expected_checksum: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(v["attachment"], true, "{v}");
+        assert_eq!(v["deleted"], true, "{v}");
+        assert_eq!(v["path"], path, "{v}");
+        assert!(v.get("permalink").is_none(), "no engram was involved: {v}");
+
+        assert!(
+            engine.attachment_read(domain, path).await.is_err(),
+            "the bytes are gone from {domain}"
+        );
+        assert!(
+            crystalline_service::maintenance::load()
+                .pending_domains
+                .contains(&domain.to_string()),
+            "deleting through the folded verb owes the human a sweep too"
+        );
+    }
+
+    // The file itself, not only its row.
+    assert!(!root.join("assets/deck.png").exists());
+    assert!(scratch.maintenance_path().exists());
+
+    // A path nothing holds is a 404's worth of not-found, not a silent success.
+    let err = engine
+        .delete_engram(&crystalline_service::params::DeleteParams {
+            identifier: "assets/never-there.png".to_string(),
+            domain: "folded-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NotFound(_)), "{err}");
+}
+
+/// An attachment delete refuses `expected_checksum` rather than ignoring it: it
+/// is a promise about markdown a caller read, and accepting it silently would
+/// let a caller believe a delete was guarded when nothing compared anything.
+#[tokio::test]
+async fn an_attachment_delete_refuses_an_expected_checksum() {
+    let (_tmp, engine, root, _scratch) = named_fixture("guard-eng", "guard-scratch").await;
+    engine
+        .attachment_write("guard-eng", "assets/deck.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    let err = engine
+        .delete_engram(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "guard-eng".to_string(),
+            expected_checksum: Some("0".repeat(64)),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "{err}");
+    assert!(err.to_string().contains("expected_checksum"), "{err}");
+    assert!(
+        root.join("assets/deck.png").exists(),
+        "a refused delete deletes nothing"
+    );
+
+    // The reserved folder decides, whatever its spelling and whatever leads it.
+    engine
+        .delete_engram(&crystalline_service::params::DeleteParams {
+            identifier: "./Assets/deck.png".to_string(),
+            domain: "guard-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert!(!root.join("assets/deck.png").exists());
+}
