@@ -15,6 +15,10 @@
 /// The reserved path prefix every attachment lives under, at the domain root.
 pub const ASSETS_PREFIX: &str = "assets/";
 
+/// The reserved folder's own name, the [`ASSETS_PREFIX`] without its separator.
+/// The two must always agree.
+pub const ASSETS_FOLDER: &str = "assets";
+
 /// The largest attachment Crystalline stores, 10 MiB. Equal to the REST and
 /// MCP body ceiling, so an upload that passes the transport passes here too.
 pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
@@ -70,6 +74,41 @@ pub fn is_text_attachment_mime(mime: &str) -> bool {
 /// is served as a download.
 pub fn is_inline_attachment_mime(mime: &str) -> bool {
     mime.starts_with("image/") || mime == "application/pdf" || is_text_attachment_mime(mime)
+}
+
+/// Whether a forward-slashed, domain-relative path sits under the reserved
+/// attachment folder, matching the folder name case-insensitively.
+///
+/// A stored attachment path has exactly one spelling - [`validate_asset_path`]
+/// accepts only the lowercase `assets/` - but the *reservation* has to be wider
+/// than that spelling: APFS and NTFS resolve `Assets` and `assets` to one
+/// directory, so on the two filesystems most people run a folder that differs
+/// only in case IS the reserved folder. Every classifier asks this one
+/// question (the engine's engram write refusals, the sync walk, the daemon's
+/// watcher), so the reservation gives one answer wherever it is asked.
+///
+/// Only the first segment is examined, so `assets-notes/x.md` and a root
+/// `assets.md` are ordinary knowledge, as they should be.
+pub fn is_under_assets(rel: &str) -> bool {
+    rel.split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(ASSETS_FOLDER))
+}
+
+/// The same path with its reserved folder segment folded to the canonical
+/// `assets` spelling, or `None` when the path is not under the folder at all.
+///
+/// Everything after the first segment is left exactly as it was: only the
+/// folder's own case is normalized, because that is the only part two spellings
+/// of one directory can disagree about.
+pub fn canonical_asset_path(rel: &str) -> Option<String> {
+    if !is_under_assets(rel) {
+        return None;
+    }
+    Some(match rel.split_once('/') {
+        Some((_, rest)) => format!("{ASSETS_PREFIX}{rest}"),
+        None => ASSETS_FOLDER.to_string(),
+    })
 }
 
 /// Why an asset path was refused.
@@ -336,6 +375,33 @@ mod tests {
         assert!(!is_inline_attachment_mime(
             "application/vnd.oasis.opendocument.text"
         ));
+    }
+
+    #[test]
+    fn the_reserved_folder_is_recognized_whatever_its_case() {
+        assert!(is_under_assets("assets/shot.png"));
+        assert!(is_under_assets("Assets/shot.png"));
+        assert!(is_under_assets("ASSETS/deep/deck.pdf"));
+        assert!(is_under_assets("assets"));
+        // Only the first segment, so a neighbour and a file are ordinary.
+        assert!(!is_under_assets("assets-notes/x.md"));
+        assert!(!is_under_assets("assets.md"));
+        assert!(!is_under_assets("notes/assets/x.png"));
+        assert!(!is_under_assets(""));
+    }
+
+    #[test]
+    fn folding_a_path_touches_the_folder_segment_and_nothing_else() {
+        assert_eq!(
+            canonical_asset_path("Assets/Deep/Shot.PNG").as_deref(),
+            Some("assets/Deep/Shot.PNG")
+        );
+        assert_eq!(
+            canonical_asset_path("assets/shot.png").as_deref(),
+            Some("assets/shot.png")
+        );
+        assert_eq!(canonical_asset_path("ASSETS").as_deref(), Some("assets"));
+        assert_eq!(canonical_asset_path("notes/shot.png"), None);
     }
 
     #[test]

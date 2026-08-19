@@ -1478,7 +1478,7 @@ impl Engine {
         // hides the destination from a textual reserved check - `a/../assets`
         // is neither `assets` nor `assets/...` as a string, yet it lands
         // exactly there on disk.
-        if !is_contained_rel(&rel) {
+        if !is_within_domain(&rel) {
             return Err(EngineError::Invalid(escapes_root_error(&rel)));
         }
         if crystalline_core::is_reserved_path(&rel) {
@@ -1762,7 +1762,7 @@ impl Engine {
         // this shape, so nothing a caller sends today changes.
         let normalized = normalize_rel(path);
         let path = normalized.as_str();
-        if !is_contained_rel(path) {
+        if !is_within_domain(path) {
             return Err(EngineError::Invalid(escapes_root_error(path)));
         }
         if crystalline_core::is_reserved_path(path) {
@@ -2006,16 +2006,32 @@ impl Engine {
             ContentSource::Virtual => {
                 let row = attachment_row(path, &bytes, Utc::now().to_rfc3339())?;
                 let store = self.store.lock().await;
+                // What was there before this write, so a failure can put it
+                // back rather than approximate it.
+                let previous = store.get_attachment(domain_id, path).await?;
                 store.upsert_attachment(domain_id, &row).await?;
-                // The row cannot outlive a failed blob write: it is the only
-                // thing a listing reads, so leaving it behind would advertise
-                // an attachment whose bytes were never stored. The rollback is
-                // best effort - if it fails too the next write or the walker
-                // reconciles - and the original error is what the caller sees.
+                // A failed blob write must leave the domain exactly as it found
+                // it, which is two different things depending on what was
+                // there. A replace: the upsert above moved the row's metadata
+                // only - the blob belongs to the row and still holds the older
+                // bytes - so restoring the recorded row restores the whole
+                // attachment, and deleting instead would destroy an attachment
+                // this write never got to replace. A create: nothing was there,
+                // so the row this write inserted goes with it, or a listing
+                // would advertise bytes that were never stored. Best effort
+                // either way (the next write, or a scan of the file domain's
+                // twin, reconciles), and the original error is what the caller
+                // sees. A file domain needs none of this: the temp file is
+                // renamed into place only on success, so a failed write leaves
+                // the old file untouched.
                 if let Err(e) = store.write_attachment_blob(domain_id, path, &bytes).await {
-                    if let Err(rollback) = store.delete_attachment(domain_id, path).await {
+                    let undone = match &previous {
+                        Some(prior) => store.upsert_attachment(domain_id, prior).await.err(),
+                        None => store.delete_attachment(domain_id, path).await.err(),
+                    };
+                    if let Some(failed) = undone {
                         tracing::warn!(
-                            "attachment '{path}' in '{domain}' kept a row after a failed blob write: {rollback}"
+                            "attachment '{path}' in '{domain}' could not be rolled back after a failed blob write: {failed}"
                         );
                     }
                     return Err(e.into());
@@ -2966,7 +2982,7 @@ impl Engine {
         // `..`, so containment is decided here, before either reserved check
         // reads the destination as text and before `join_rel` builds a path
         // from it.
-        if !is_contained_rel(&dest_rel) {
+        if !is_within_domain(&dest_rel) {
             return Err(EngineError::Invalid(escapes_root_error(&dest_rel)));
         }
         if crystalline_core::is_reserved_path(&dest_rel) {
@@ -8773,19 +8789,32 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
     p
 }
 
-/// Whether a domain-relative path may be joined onto a domain root at all:
-/// every segment has to be an ordinary name. [`join_rel`] pushes what it is
-/// given segment by segment and would happily push a `..`, so untrusted input -
-/// an archive entry above all - is screened here before any path is built. A
-/// backslash or a colon inside a segment is refused too: both are separators or
-/// drive and stream markers on Windows, where a name that looks contained on
-/// one platform escapes on another.
-fn is_contained_rel(rel: &str) -> bool {
+/// Whether a domain-relative path stays inside the domain: no empty, `.` or
+/// `..` segment, and not absolute. [`join_rel`] pushes what it is given segment
+/// by segment and would happily push a `..`, so every destination is screened
+/// here before any path is built.
+///
+/// This is the containment rule alone. It deliberately says nothing about the
+/// characters a segment may hold, because an engram file is whatever a person
+/// named it: the sync walk indexes `notes/plan: v2.md` like any other markdown
+/// file, so a save, a move or a restore addressing that engram has to keep
+/// working. [`is_contained_rel`] adds the character rules on top, for the paths
+/// that arrive from outside.
+fn is_within_domain(rel: &str) -> bool {
     !rel.is_empty()
         && !Path::new(rel).is_absolute()
         && rel
             .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':']))
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// [`is_within_domain`] plus the character rules for untrusted input: an
+/// archive entry and an attachment path, neither of which a person typed as a
+/// filename here. A backslash or a colon inside a segment is refused because
+/// both are separators or drive and stream markers on Windows, where a name
+/// that looks contained on one platform escapes on another.
+fn is_contained_rel(rel: &str) -> bool {
+    is_within_domain(rel) && rel.split('/').all(|seg| !seg.contains(['\\', ':']))
 }
 
 /// A domain-relative folder as the store's path prefix: the trailing slash is
@@ -8966,24 +8995,15 @@ fn over_cap_error(path: &str, size: u64) -> String {
 /// file called `assets.md`: only the folder itself and what sits inside it is
 /// reserved.
 ///
-/// The first segment is matched case-insensitively, for the same reason the
-/// archive import matches the OKF reserved names that way: APFS and NTFS are
-/// case-insensitive, so a folder called `Assets` *is* `assets/` on the two
-/// filesystems most people run. Refusing only the lowercase spelling would let
-/// an engram land inside the attachment folder on those machines - or, with no
-/// folder there yet, create one the walker then indexes as an ordinary folder
-/// while every attachment written afterwards joins into it and is classified
-/// outside the reserved prefix. Callers pass an already normalized path (see
-/// [`normalize_rel`]), so a `..` segment can no longer walk in behind this
+/// The decision itself is [`crystalline_core::is_under_assets`], the one
+/// classifier the sync walk and the daemon's watcher ask too, so the
+/// reservation cannot mean one thing to a write and another to a scan. This
+/// wrapper only strips the leading `./` and the surrounding slashes a caller
+/// may have typed. Callers pass an already normalized path (see
+/// [`normalize_rel`]), so a `..` segment can no longer walk in behind the
 /// check.
 fn is_assets_reserved(rel: &str) -> bool {
-    rel.trim_start_matches("./")
-        .trim_matches('/')
-        .split('/')
-        .next()
-        .is_some_and(|first| {
-            first.eq_ignore_ascii_case(crystalline_core::ASSETS_PREFIX.trim_end_matches('/'))
-        })
+    crystalline_core::is_under_assets(rel.trim_start_matches("./").trim_matches('/'))
 }
 
 /// A caller-supplied domain-relative path as one normalized, forward-slashed
@@ -9006,7 +9026,7 @@ fn normalize_rel(raw: &str) -> String {
 /// The refusal a write earns by aiming outside the domain root.
 fn escapes_root_error(rel: &str) -> String {
     format!(
-        "'{rel}' is not a domain-relative destination: a path may not climb out of the domain root with a `..` segment, name an absolute path or hold a `\\` or `:` in a segment."
+        "'{rel}' is not a domain-relative destination: a path may not climb out of the domain root with a `..` segment or name an absolute path."
     )
 }
 

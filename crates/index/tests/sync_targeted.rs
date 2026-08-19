@@ -391,6 +391,63 @@ parity!(
     targeted_asset_touches_only_it
 );
 
+/// A symlinked attachment is indexed by neither entry point.
+///
+/// The complete walk uses `WalkDir`'s default `follow_links(false)`, so it
+/// never sees a symlink at all. The targeted pass has to take the same posture
+/// or the two disagree: a link indexed by a watcher event would lose its row on
+/// the next full scan and get it back on the next event, a row that exists
+/// depending on which pass ran last.
+#[cfg(unix)]
+mod symlinked_asset {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    async fn a_symlink_is_indexed_by_neither_pass(store: &dyn Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", "a", "body token"));
+        write_bytes(root, "outside.png", PNG);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        symlink(root.join("outside.png"), root.join("assets/link.png")).unwrap();
+
+        // The full scan: nothing, because it does not follow links.
+        sync_domain_with(store, "d", root, &params()).await.unwrap();
+        let domain = upsert_domain(store, "d", root).await;
+        assert!(
+            store.list_attachments(domain).await.unwrap().is_empty(),
+            "the complete walk indexes nothing through a symlink"
+        );
+
+        // The targeted pass, the one a watcher event drives: the same answer,
+        // and no failure reported either.
+        let report = target(store, root, &["assets/link.png"]).await;
+        assert!(report.failed.is_empty(), "no failures: {report:?}");
+        assert!(
+            store.list_attachments(domain).await.unwrap().is_empty(),
+            "a targeted pass must not index what the walk refuses to see"
+        );
+
+        // A real file beside it still indexes, so this is a symlink rule and
+        // not a broken assets branch.
+        write_bytes(root, "assets/shot.png", PNG);
+        target(store, root, &["assets/shot.png"]).await;
+        let rows: Vec<String> = store
+            .list_attachments(domain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(rows, ["assets/shot.png"]);
+    }
+    parity!(
+        a_symlinked_attachment_is_indexed_by_neither_pass,
+        a_symlink_is_indexed_by_neither_pass
+    );
+}
+
 /// An unreadable targeted path is a reported failure, not a delete: a metadata
 /// error other than "not found" keeps the row in the index and surfaces the
 /// path in the report's `failed` list instead of dropping it.

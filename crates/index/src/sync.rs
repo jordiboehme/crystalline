@@ -84,7 +84,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
-use crystalline_core::{ASSETS_PREFIX, MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_path};
+use crystalline_core::{MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_path};
 
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
@@ -295,13 +295,17 @@ pub async fn scan_domain(
             continue;
         }
         let rel = rel_path(root, entry.path());
-        // The `assets/` prefix is reserved for attachments: nothing under it is
+        // The `assets/` folder is reserved for attachments: nothing under it is
         // ever an engram, whatever its extension, so the branch always ends the
-        // iteration. A file that is not attachable is skipped outright.
-        if rel.starts_with(ASSETS_PREFIX) {
+        // iteration. A file that is not attachable is skipped outright. The
+        // folder is matched case-insensitively, the same question the engine's
+        // write refusals and the daemon's watcher ask, so a directory that
+        // differs only in case cannot smuggle an engram in on APFS or NTFS.
+        if crystalline_core::is_under_assets(&rel) {
             let Ok(meta) = entry.metadata() else { continue };
             let mtime = file_mtime(&meta);
-            if let Some(candidate) = asset_candidate(&rel, entry.path(), &fname, mtime, meta.len())
+            if let Some(candidate) =
+                asset_candidate(root, &rel, entry.path(), &fname, mtime, meta.len())
             {
                 assets.push(candidate);
             }
@@ -410,17 +414,36 @@ pub async fn scan_paths(
         // The reserved `assets/` prefix, classified exactly as the walk does it:
         // an attachable file present on disk is an upsert, a recorded path that
         // is gone is a delete, and nothing under the prefix is ever an engram.
-        if rel.starts_with(ASSETS_PREFIX) {
-            match std::fs::metadata(&abs) {
+        if crystalline_core::is_under_assets(&rel) {
+            // `symlink_metadata`, not `metadata`: the complete walk uses
+            // `WalkDir`'s default `follow_links(false)` and indexes nothing
+            // through a symlink, so following one here would give a symlinked
+            // attachment a row that the next full scan takes away again. The
+            // link is neither a file nor a delete candidate, so it falls to the
+            // `Ok(_)` arm and is left alone.
+            match std::fs::symlink_metadata(&abs) {
                 Ok(meta) if meta.is_file() && !hidden && !is_excluded(&abs, &excluded) => {
                     let fname = rel.rsplit('/').next().unwrap_or(rel.as_str());
                     let mtime = file_mtime(&meta);
-                    if let Some(candidate) = asset_candidate(&rel, &abs, fname, mtime, meta.len()) {
+                    if let Some(candidate) =
+                        asset_candidate(root, &rel, &abs, fname, mtime, meta.len())
+                    {
                         assets.push(candidate);
                     }
                 }
                 Ok(_) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => asset_deletes.push(rel),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Rows carry the folder's canonical spelling, so a delete
+                    // has to name that key. If the canonical path still
+                    // resolves, this is a case-sensitive filesystem where the
+                    // two spellings are different files and the recorded one is
+                    // still there, so nothing is deleted.
+                    let canonical =
+                        crystalline_core::canonical_asset_path(&rel).unwrap_or_else(|| rel.clone());
+                    if canonical == rel || !root.join(&canonical).exists() {
+                        asset_deletes.push(canonical);
+                    }
+                }
                 // Unreadable rather than gone: leave the row alone, exactly as
                 // the engram branch does, and let the next pass retry it.
                 Err(e) => unreadable.push((rel, e.to_string())),
@@ -1148,12 +1171,38 @@ fn rfc3339_from_mtime(mtime: i64) -> String {
 /// is not attachable - a path rule, the extension allowlist or the size cap
 /// refused it - and it is skipped without a row and without a failure.
 fn asset_candidate(
+    root: &Path,
     rel: &str,
     abs: &Path,
     fname: &str,
     mtime: i64,
     size: u64,
 ) -> Option<AssetCandidate> {
+    // A folder whose name differs from `assets` only in case is one and the
+    // same directory on APFS and NTFS, so the bytes an upload wrote as
+    // `assets/x.png` are walked back as `Assets/x.png`. Keying the row by the
+    // canonical spelling is what stops the two writers from taking turns: the
+    // scan would otherwise see no `assets/x.png` on disk and delete the row the
+    // upload just wrote, and the next read would mint it again.
+    //
+    // The `exists` probe is what keeps that fold honest on a case-sensitive
+    // filesystem, where `Assets` and `assets` really are different directories:
+    // the canonical path does not resolve there, so the oddly cased folder is
+    // left unindexed - reserved, exactly as the engram side already treats it.
+    let rel = match crystalline_core::canonical_asset_path(rel) {
+        Some(canonical) if canonical != rel => {
+            if !root.join(&canonical).exists() {
+                tracing::debug!(
+                    path = %rel,
+                    "sync: skipping a file under a reserved folder spelled in another case"
+                );
+                return None;
+            }
+            canonical
+        }
+        _ => rel.to_string(),
+    };
+    let rel = rel.as_str();
     if let Err(e) = validate_asset_path(rel) {
         tracing::debug!(path = %rel, reason = %e, "sync: skipping a file under assets/");
         return None;

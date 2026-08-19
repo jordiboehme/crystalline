@@ -1633,7 +1633,11 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
     // scan, since every other non-markdown file is ignored below. Only an
     // attachable name qualifies - the walk skips a disallowed extension, so
     // waking a pass for one would find nothing to do.
-    let is_asset = rel.starts_with(crystalline_core::ASSETS_PREFIX)
+    // The folder is matched case-insensitively, as the walk and the engine's
+    // refusals match it: on APFS and NTFS a directory differing only in case is
+    // the same directory, and the targeted pass folds the path back to the one
+    // spelling rows are keyed by.
+    let is_asset = crystalline_core::is_under_assets(&rel)
         && rel
             .rsplit('/')
             .next()

@@ -470,6 +470,45 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     );
 }
 
+/// The containment screen on the engram paths refuses a climb out of the
+/// domain and nothing else. A colon is a legal filename character on macOS and
+/// Linux and the sync walk indexes such a file like any other engram, so a
+/// restore or a move addressing one has to keep working: the stricter character
+/// rules belong to untrusted input (an archive entry, an attachment path), not
+/// to a name a person gave their own engram.
+#[tokio::test]
+async fn an_engram_path_with_a_colon_still_moves_and_restores() {
+    let (_tmp, engine, root, _scratch) = engine_fixture().await;
+
+    let plan = ALPHA
+        .replace("title: Alpha", "title: Plan v2")
+        .replace("permalink: alpha", "permalink: plan-v2");
+    engine
+        .restore_engram("eng", "notes/plan: v2.md", &plan)
+        .await
+        .unwrap();
+    assert!(root.join("notes").join("plan: v2.md").exists());
+
+    engine
+        .move_engram(&crystalline_service::params::MoveParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            destination: "notes/rule: two.md".to_string(),
+            destination_domain: None,
+            update_links: None,
+        })
+        .await
+        .unwrap();
+    assert!(root.join("notes").join("rule: two.md").exists());
+
+    // An attachment path is untrusted input and keeps the stricter rule.
+    let err = engine
+        .attachment_write("eng", "assets/a:b.png", PNG.to_vec())
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::Invalid(_)), "got {err:?}");
+}
+
 #[tokio::test]
 async fn an_over_cap_file_is_refused_by_the_read_and_never_gains_a_row() {
     let (_tmp, engine, root, _scratch) = engine_fixture().await;

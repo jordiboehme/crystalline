@@ -620,6 +620,57 @@ parity!(
     removing_the_assets_folder_clears_every_row
 );
 
+/// The reserved folder is recognized whatever case it is spelled in, so an
+/// `Assets` directory cannot hold an engram - and, on a case-insensitive
+/// filesystem, cannot make a row appear and disappear either.
+///
+/// Two filesystems, one test. On APFS and NTFS `Assets` and `assets` are one
+/// directory, so the file an upload wrote as `assets/shot.png` is walked back
+/// as `Assets/shot.png` and has to be recorded under the canonical spelling the
+/// upload used, or the scan would delete the row the upload just wrote. On a
+/// case-sensitive filesystem the two are different directories, the canonical
+/// path does not resolve, and the oddly cased folder is left unindexed -
+/// reserved, exactly as the engram side treats it. The probe decides which
+/// machine this is running on rather than assuming one.
+async fn a_reserved_folder_spelled_in_another_case(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "Assets/shot.png", PNG);
+    write(root, "Assets/notes.md", &engram("N", "n", "notes token"));
+    let case_insensitive = root.join("assets/shot.png").exists();
+
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert!(report.failed.is_empty(), "no failures: {report:?}");
+    assert_eq!(report.added, 1, "only the root markdown file is an engram");
+    let notes = store.search(&SearchQuery::text("notes")).await.unwrap();
+    assert_eq!(
+        notes.total, 0,
+        "markdown under a reserved folder is never an engram, whatever its case"
+    );
+
+    let domain = upsert_domain(store, "d", root).await;
+    let expected: Vec<String> = if case_insensitive {
+        vec!["assets/shot.png".to_string()]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        asset_paths(store, domain).await,
+        expected,
+        "case_insensitive filesystem: {case_insensitive}"
+    );
+
+    // And the row is stable: a second scan finds the same file under the same
+    // canonical key rather than deleting what the first one recorded.
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(asset_paths(store, domain).await, expected);
+}
+parity!(
+    a_reserved_folder_in_another_case_holds_no_engram,
+    a_reserved_folder_spelled_in_another_case
+);
+
 /// A denied domain root is a loud per-domain error, not a silent empty scan: a
 /// full scan of an unreadable root returns an io error and the recorded rows
 /// survive, rather than the scan seeing zero files and the apply deleting them.
