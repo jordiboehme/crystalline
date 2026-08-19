@@ -2082,6 +2082,253 @@ impl Engine {
         Ok(())
     }
 
+    // --- attachments a cross-domain move carries ------------------------------
+    //
+    // An `assets/` reference is domain-root relative, so it survives a rename
+    // inside its own domain untouched and means nothing at all in another
+    // domain. A cross-domain move therefore has to bring the files with the
+    // engram, which is three questions asked before a byte moves: which
+    // attachments does the moving engram actually use, does anything else in
+    // the source still need them (copy) or not (move), and is the name they
+    // arrive under free at the destination.
+
+    /// The most `-N` suffixes a colliding attachment name is offered before
+    /// the move leaves it where it is. A destination holding ninety-nine
+    /// different files under one name is a domain with a problem an automatic
+    /// rename would only deepen.
+    const MAX_ASSET_SUFFIX: usize = 99;
+
+    /// What the cross-domain move owes each attachment the moving engram uses:
+    /// where it lands, whether the bytes are already there, and whether the
+    /// source copy stays behind.
+    ///
+    /// Settled before anything is written, because the destination names it
+    /// picks are what the engram's body references and `analyzes` claim are
+    /// rewritten to, and that rewrite has to travel in the same write that
+    /// lands the engram at its destination.
+    ///
+    /// Every miss is silent by design: a reference to a file that is not there
+    /// is already a dangling reference, and a move is not the verb that should
+    /// refuse over one.
+    async fn plan_attachment_carry(
+        &self,
+        src: &EngramDescriptor,
+        dest_domain: &str,
+        content: &str,
+    ) -> Vec<AttachmentCarry> {
+        let parsed = parse_engram(content).ok();
+        let body = parsed
+            .as_ref()
+            .map_or(content, |engram| engram.body.as_str());
+        let mut candidates = crystalline_core::find_asset_refs(body);
+        if let Some(claim) = parsed.as_ref().and_then(|e| asset_claim(&e.frontmatter))
+            && !candidates.contains(&claim)
+        {
+            candidates.push(claim);
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // The bytes are read and dropped here: what the plan needs is the
+        // sha256, and the read is what makes the row's sha describe the file
+        // that is actually on disk. Reading them again in the carry itself
+        // costs one more read of one attachment and keeps the peak at a single
+        // attachment rather than at everything the engram references.
+        let mut present: Vec<(String, String)> = Vec::new();
+        for path in candidates {
+            match self.attachment_read(&src.domain, &path).await {
+                Ok((_, row)) => present.push((path, row.sha256)),
+                Err(e) => {
+                    tracing::debug!(
+                        "attachment '{path}' referenced by '{}' is not in '{}' ({e}); the move carries nothing for it",
+                        src.permalink,
+                        src.domain
+                    );
+                }
+            }
+        }
+        if present.is_empty() {
+            return Vec::new();
+        }
+
+        let paths: Vec<String> = present.iter().map(|(path, _)| path.clone()).collect();
+        let shared = self.shared_asset_paths(src, &paths).await;
+        let mut claimed: HashSet<String> = HashSet::new();
+        let mut plan = Vec::new();
+        for (from, sha) in present {
+            let Some((to, reuse)) = self
+                .free_asset_destination(dest_domain, &from, &sha, &claimed)
+                .await
+            else {
+                continue;
+            };
+            claimed.insert(to.clone());
+            plan.push(AttachmentCarry {
+                shared: shared.contains(&from),
+                from,
+                to,
+                reuse,
+            });
+        }
+        plan
+    }
+
+    /// The attachment paths another engram in the source domain still
+    /// references or claims.
+    ///
+    /// Counted across live and retired engrams alike, the way the
+    /// consolidation sweep counts referents: a deprecated engram showing a
+    /// screenshot needs the file exactly as much as a current one does, so its
+    /// reference is what turns a move into a copy.
+    ///
+    /// Bodies are read one at a time rather than in one batch, because a
+    /// domain can hold multi-megabyte engrams and this runs on an ordinary
+    /// move; the substring screen keeps the parse to the engrams that could
+    /// possibly match, and the scan stops as soon as every candidate is
+    /// accounted for.
+    async fn shared_asset_paths(
+        &self,
+        src: &EngramDescriptor,
+        candidates: &[String],
+    ) -> HashSet<String> {
+        let mut shared: HashSet<String> = HashSet::new();
+        let others = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(&src.domain, None, None)
+                .await
+                .unwrap_or_default()
+        };
+        for other in others {
+            if shared.len() == candidates.len() {
+                break;
+            }
+            if other.path == src.path {
+                continue;
+            }
+            let text = {
+                let store = self.store.lock().await;
+                store
+                    .engram_content(src.domain_id, &other.path)
+                    .await
+                    .ok()
+                    .flatten()
+            };
+            let Some(text) = text else { continue };
+            if !candidates.iter().any(|path| text.contains(path.as_str())) {
+                continue;
+            }
+            let Ok(engram) = parse_engram(&text) else {
+                continue;
+            };
+            let refs = crystalline_core::find_asset_refs(&engram.body);
+            let claim = asset_claim(&engram.frontmatter);
+            for candidate in candidates {
+                if refs.contains(candidate) || claim.as_deref() == Some(candidate.as_str()) {
+                    shared.insert(candidate.clone());
+                }
+            }
+        }
+        shared
+    }
+
+    /// The path an attachment takes at the destination, and whether the
+    /// destination already holds exactly these bytes there.
+    ///
+    /// Its own name when nothing holds it; its own name with nothing to write
+    /// when the file already there has the same sha256 (same name, same bytes,
+    /// same file); `name-2.ext`, `name-3.ext` and so on when something
+    /// different holds it, since a move must never overwrite a file the
+    /// destination domain already had. `None` when no free name could be
+    /// settled or the destination could not be inspected, which leaves the
+    /// attachment where it is rather than guessing.
+    async fn free_asset_destination(
+        &self,
+        dest_domain: &str,
+        path: &str,
+        sha: &str,
+        claimed: &HashSet<String>,
+    ) -> Option<(String, bool)> {
+        for attempt in 1..=Self::MAX_ASSET_SUFFIX {
+            let candidate = if attempt == 1 {
+                path.to_string()
+            } else {
+                suffixed_asset_path(path, attempt)
+            };
+            // A name another attachment in this same move already took is
+            // occupied even though nothing is written there yet.
+            if claimed.contains(&candidate) {
+                continue;
+            }
+            match self.attachment_read(dest_domain, &candidate).await {
+                Ok((_, row)) if row.sha256 == sha => return Some((candidate, true)),
+                Ok(_) => {}
+                Err(EngineError::NotFound(_)) => return Some((candidate, false)),
+                Err(e) => {
+                    tracing::warn!(
+                        "'{candidate}' in '{dest_domain}' could not be inspected ({e}); '{path}' stays where it is"
+                    );
+                    return None;
+                }
+            }
+        }
+        tracing::warn!(
+            "'{path}' collides with {} different files in '{dest_domain}'; it stays where it is",
+            Self::MAX_ASSET_SUFFIX
+        );
+        None
+    }
+
+    /// Carry out the planned attachment moves and copies.
+    ///
+    /// Runs after the engram itself has landed and never turns a failure into
+    /// a failed move: the engram is already where it was asked to be, and
+    /// every failure here leaves the source copy in place, so the worst
+    /// outcome is a reference the destination cannot resolve yet - which the
+    /// consolidation sweep reports as a dangling attachment rather than
+    /// something a move should have refused over. Both domains are marked
+    /// pending by the writes and deletes themselves.
+    async fn carry_attachments(
+        &self,
+        src_domain: &str,
+        dest_domain: &str,
+        plan: &[AttachmentCarry],
+    ) {
+        for carry in plan {
+            if !carry.reuse {
+                let bytes = match self.attachment_read(src_domain, &carry.from).await {
+                    Ok((bytes, _)) => bytes,
+                    Err(e) => {
+                        tracing::warn!(
+                            "attachment '{}' could not be read out of '{src_domain}' for the move: {e}",
+                            carry.from
+                        );
+                        continue;
+                    }
+                };
+                if let Err(e) = self.attachment_write(dest_domain, &carry.to, bytes).await {
+                    tracing::warn!(
+                        "attachment '{}' could not be written into '{dest_domain}' as '{}': {e}",
+                        carry.from,
+                        carry.to
+                    );
+                    continue;
+                }
+            }
+            // Only now, with the bytes proven to be at the destination, does
+            // the source copy go - and only when nothing there still uses it.
+            if !carry.shared
+                && let Err(e) = self.attachment_delete(src_domain, &carry.from).await
+            {
+                tracing::warn!(
+                    "attachment '{}' was carried into '{dest_domain}' but could not be removed from '{src_domain}': {e}",
+                    carry.from
+                );
+            }
+        }
+    }
+
     /// The retirement statuses [`Engine::retire_engram`] accepts. Any other
     /// status is this verb's business to refuse, not a global rule: the
     /// ordinary save and edit paths accept any status string.
@@ -3007,10 +3254,29 @@ impl Engine {
             Vec::new()
         };
 
+        // What the move carries besides the engram: the attachments it
+        // references or claims. Filled in the cross-domain branch and acted on
+        // once every store lock that branch takes has been released.
+        let mut carried: Vec<AttachmentCarry> = Vec::new();
+
         if cross {
             // Read the source content (file when present, else database), index
             // it into the destination source, then remove the source.
-            let content = self.load_content(&src_source, &src).await?;
+            let mut content = self.load_content(&src_source, &src).await?;
+            // Resolved before the write, since an attachment that has to be
+            // renamed at the destination changes the very text being written:
+            // the engram lands already pointing at the name its file took.
+            carried = self
+                .plan_attachment_carry(&src, &dest_domain, &content)
+                .await;
+            let renames: BTreeMap<String, String> = carried
+                .iter()
+                .filter(|carry| carry.to != carry.from)
+                .map(|carry| (carry.from.clone(), carry.to.clone()))
+                .collect();
+            if !renames.is_empty() {
+                content = rewrite_carried_refs(&content, &renames);
+            }
             match &dest_source {
                 ContentSource::File { root } => {
                     let dest_abs = join_rel(root, &dest_rel);
@@ -3067,6 +3333,16 @@ impl Engine {
             store
                 .rename_engram(src.domain_id, &src.path, &dest_rel)
                 .await?;
+        }
+
+        // The attachments follow the engram, now that the engram itself has
+        // landed and the branch above has released its store lock. A
+        // same-domain move carries nothing: an `assets/` reference is
+        // domain-root relative, so a rename inside one domain leaves every one
+        // of them valid as written.
+        if !carried.is_empty() {
+            self.carry_attachments(&src.domain, &dest_domain, &carried)
+                .await;
         }
 
         // Rewrite inbound bare links from other domains to the prefixed form.
@@ -8960,6 +9236,189 @@ fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<Attachme
         size: bytes.len() as u64,
         modified,
     })
+}
+
+/// One attachment a cross-domain move takes along with its engram. Built by
+/// [`Engine::plan_attachment_carry`] and acted on by
+/// [`Engine::carry_attachments`].
+#[derive(Debug)]
+struct AttachmentCarry {
+    /// The path it has in the source domain.
+    from: String,
+    /// The path it takes at the destination: the same one, unless something
+    /// different already sits there.
+    to: String,
+    /// Whether the destination already holds exactly these bytes under `to`,
+    /// so there is nothing to write there.
+    reuse: bool,
+    /// Whether another engram in the source domain still references or claims
+    /// it, so the source copy stays behind.
+    shared: bool,
+}
+
+/// The `assets/` path an engram's `analyzes` claim names, or `None` when it
+/// claims nothing under the folder.
+///
+/// `analyzes` is ordinary custom frontmatter (the agent's act of claiming an
+/// attachment it read), so the value is whatever was written there: a leading
+/// `./` is stripped and the folder segment is folded to its canonical
+/// spelling, and anything that does not address the reserved folder at all is
+/// not a claim.
+fn asset_claim(fm: &Frontmatter) -> Option<String> {
+    let raw = fm.extra.get("analyzes")?.as_str()?.trim();
+    crystalline_core::canonical_asset_path(raw.trim_start_matches("./"))
+}
+
+/// `assets/deck.pptx` as `assets/deck-2.pptx`: the name an attachment takes
+/// when the destination already holds a different file under its own.
+///
+/// The counter goes before the extension rather than after it, so the file
+/// keeps the extension its mime and its allowlist decision rest on.
+fn suffixed_asset_path(path: &str, attempt: usize) -> String {
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), path),
+    };
+    match name.rsplit_once('.') {
+        Some((stem, extension)) => format!("{dir}{stem}-{attempt}.{extension}"),
+        None => format!("{dir}{name}-{attempt}"),
+    }
+}
+
+/// The moving engram's text with every renamed attachment reference - in the
+/// body and in the `analyzes` claim - pointing at the name the file took at
+/// the destination.
+///
+/// String surgery on both halves, never a re-emit: the frontmatter claim is
+/// replaced line-wise by [`set_frontmatter_field`] and the body only where a
+/// link destination actually changes, so a move that renames one attachment
+/// leaves every other byte of the engram exactly as its author wrote it.
+fn rewrite_carried_refs(content: &str, renames: &BTreeMap<String, String>) -> String {
+    if renames.is_empty() {
+        return content.to_string();
+    }
+    let Ok(parsed) = parse_engram_lossless(content) else {
+        // An engram the parser refuses still moves, so its references still
+        // have to follow; without a frontmatter span the whole text is the
+        // body.
+        return rewrite_asset_refs(content, renames);
+    };
+    let body = rewrite_asset_refs(&content[parsed.body_span.clone()], renames);
+    let mut out = format!("{}{}", &content[..parsed.body_span.start], body);
+    if let Some(renamed) = asset_claim(&parsed.engram.frontmatter).and_then(|c| renames.get(&c)) {
+        out = set_frontmatter_field(&out, "analyzes", renamed);
+    }
+    out
+}
+
+/// Every `assets/` link destination in a body pointed at its new name.
+///
+/// A `./` prefix and a `#fragment` are spellings of the reference rather than
+/// parts of the path, so both survive untouched and only the path between them
+/// changes. Fenced code is skipped exactly as
+/// [`crystalline_core::find_asset_refs`] skips it, so an example in a snippet
+/// is never rewritten into a path the snippet did not mean.
+fn rewrite_asset_refs(body: &str, renames: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        match fence {
+            None => {
+                if let Some((marker, count)) = asset_fence_marker(text) {
+                    fence = Some((marker, count));
+                    out.push_str(line);
+                    continue;
+                }
+            }
+            Some((open_marker, open_count)) => {
+                if let Some((marker, count)) = asset_fence_marker(text)
+                    && marker == open_marker
+                    && count >= open_count
+                    && text.trim_start()[count..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                out.push_str(line);
+                continue;
+            }
+        }
+        out.push_str(&rewrite_line_asset_refs(line, renames));
+    }
+    out
+}
+
+/// A fenced code block's opening or closing marker: the character and how many
+/// of it, for a line indented no more than three spaces.
+///
+/// The same rule the core parser reads fences by, restated here because it is
+/// crate-private there and this is the only reader of it outside core.
+fn asset_fence_marker(line: &str) -> Option<(char, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let first = rest.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = rest.chars().take_while(|c| *c == first).count();
+    (count >= 3).then_some((first, count))
+}
+
+/// One line's `](assets/...)` destinations rewritten, every other byte of the
+/// line copied through.
+fn rewrite_line_asset_refs(line: &str, renames: &BTreeMap<String, String>) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    // How much of the line is already in `out`, so the untouched runs between
+    // two rewritten destinations are copied exactly once.
+    let mut copied = 0usize;
+    let mut idx = 0usize;
+    while let Some(hit) = line[idx..].find("](") {
+        let open = idx + hit + 2;
+        // Markdown allows balanced parentheses inside a destination, so the
+        // closing one is the depth-zero `)`, the same scan core's reference
+        // scanner runs.
+        let mut depth = 1usize;
+        let mut end = None;
+        for (offset, byte) in bytes[open..].iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        idx = end + 1;
+        let inside = &line[open..end];
+        // The destination is the first token; a title clause may follow it.
+        let Some(target) = inside.split_whitespace().next() else {
+            continue;
+        };
+        // Where that token starts in the line, so the rewrite lands on the
+        // path itself rather than on the whitespace in front of it.
+        let start = open + (inside.len() - inside.trim_start().len());
+        let dot = if target.starts_with("./") { 2 } else { 0 };
+        let path_end = target[dot..]
+            .find('#')
+            .map_or(target.len(), |offset| dot + offset);
+        let Some(renamed) = renames.get(&target[dot..path_end]) else {
+            continue;
+        };
+        out.push_str(&line[copied..start + dot]);
+        out.push_str(renamed);
+        copied = start + path_end;
+    }
+    out.push_str(&line[copied..]);
+    out
 }
 
 /// A file's modification instant in the spelling the sync walker records, so a

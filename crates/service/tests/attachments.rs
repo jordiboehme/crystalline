@@ -103,6 +103,76 @@ async fn named_fixture(
     (tmp, engine, dir, scratch)
 }
 
+/// The cross-domain move fixture: the file domains `from` and `into` plus the
+/// virtual domain `vault`, on one engine, so a move can cross a domain
+/// boundary and a domain kind. Returns the two file roots.
+async fn move_fixture() -> (
+    tempfile::TempDir,
+    Arc<Engine>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+    support::ScratchStateDir,
+) {
+    let scratch = support::ScratchStateDir::acquire();
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    let from = root.join("from");
+    let into = root.join("into");
+    for (dir, name) in [(&from, "from"), (&into, "into")] {
+        std::fs::create_dir_all(dir).unwrap();
+        write_manifest(dir, name);
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::file(dir.clone()));
+    }
+    cfg.domains
+        .insert("vault".to_string(), DomainEntry::virtual_domain());
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+    (tmp, engine, from, into, scratch)
+}
+
+/// An engram source with `extra` frontmatter lines (each already newline
+/// terminated) and `body` as its only prose.
+fn engram_source(title: &str, permalink: &str, extra: &str, body: &str) -> String {
+    format!(
+        "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n{extra}---\n\n# {title}\n\n{body}\n"
+    )
+}
+
+/// A move request, spelled once for the tests that only vary its ends.
+fn move_params(
+    domain: &str,
+    identifier: &str,
+    destination: &str,
+    destination_domain: Option<&str>,
+) -> crystalline_service::params::MoveParams {
+    crystalline_service::params::MoveParams {
+        domain: domain.to_string(),
+        identifier: identifier.to_string(),
+        destination: destination.to_string(),
+        destination_domain: destination_domain.map(str::to_string),
+        update_links: None,
+    }
+}
+
+/// The engram text a move landed at `path` in a file domain rooted at `root`.
+fn moved_text(root: &std::path::Path, path: &str) -> String {
+    std::fs::read_to_string(root.join(path)).unwrap()
+}
+
 #[tokio::test]
 async fn a_file_domain_attachment_lands_under_assets_and_round_trips() {
     let (_tmp, engine, root, _scratch) = engine_fixture().await;
@@ -611,5 +681,388 @@ async fn assert_refused_everywhere(engine: &Engine, path: &str) {
     assert!(
         matches!(delete, EngineError::Invalid(_)),
         "delete of '{path}' must be refused, got {delete:?}"
+    );
+}
+
+// --- cross-domain moves carry their attachments -----------------------------
+
+/// A second set of PNG-shaped bytes, so a destination collision can be a
+/// genuine one rather than the same file under the same name.
+const OTHER_PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00other\x00bytes\x00entirely";
+
+#[tokio::test]
+async fn a_cross_domain_move_carries_a_sole_referent_attachment() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    let written = engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert!(
+        engine.attachment_list("from").await.unwrap().is_empty(),
+        "the only referent left, so the row went with it"
+    );
+    assert!(
+        !from.join("assets").join("shot.png").exists(),
+        "the source file went with the engram"
+    );
+    let landed = engine.attachment_list("into").await.unwrap();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].path, "assets/shot.png");
+    assert_eq!(landed[0].sha256, written.sha256, "the same bytes arrived");
+    assert_eq!(
+        std::fs::read(into.join("assets").join("shot.png")).unwrap(),
+        PNG
+    );
+    assert!(
+        moved_text(&into, "note.md").contains("![shot](assets/shot.png)"),
+        "an uncontested name needs no rewrite"
+    );
+}
+
+#[tokio::test]
+async fn a_same_domain_move_leaves_the_attachments_where_they_are() {
+    let (_tmp, engine, from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "notes/note.md", None))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine.attachment_list("from").await.unwrap().len(),
+        1,
+        "an assets/ reference is domain-root relative and stays valid"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG
+    );
+    assert!(moved_text(&from, "notes/note.md").contains("![shot](assets/shot.png)"));
+}
+
+#[tokio::test]
+async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .restore_engram(
+            "from",
+            "keeper.md",
+            &engram_source("Keeper", "keeper", "", "See [the shot](assets/shot.png)."),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine.attachment_list("from").await.unwrap().len(),
+        1,
+        "the engram that stayed behind still needs the file"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG
+    );
+    assert_eq!(engine.attachment_list("into").await.unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read(into.join("assets").join("shot.png")).unwrap(),
+        PNG
+    );
+}
+
+#[tokio::test]
+async fn a_retired_referent_in_the_source_forces_a_copy() {
+    let (_tmp, engine, from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .restore_engram(
+            "from",
+            "old.md",
+            &engram_source("Old", "old", "", "![shot](assets/shot.png)")
+                .replace("status: stable", "status: archived"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine.attachment_list("from").await.unwrap().len(),
+        1,
+        "a retired engram is still a referent, so the file stays"
+    );
+    assert!(from.join("assets").join("shot.png").exists());
+    assert_eq!(engine.attachment_list("into").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn a_claimed_attachment_travels_with_no_body_reference_at_all() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "analyzes: assets/deck.pptx\nanalyzed_hash: nope\n",
+                "What the deck said.",
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/deck.pptx", b"deck bytes".to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert!(engine.attachment_list("from").await.unwrap().is_empty());
+    assert!(!from.join("assets").join("deck.pptx").exists());
+    let landed = engine.attachment_list("into").await.unwrap();
+    assert_eq!(landed.len(), 1);
+    assert_eq!(landed[0].path, "assets/deck.pptx");
+    assert_eq!(
+        std::fs::read(into.join("assets").join("deck.pptx")).unwrap(),
+        b"deck bytes"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_holding_the_identical_file_reuses_it() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    engine
+        .attachment_write("into", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        engine.attachment_list("into").await.unwrap().len(),
+        1,
+        "the same bytes under the same name are already the same file"
+    );
+    assert_eq!(
+        std::fs::read(into.join("assets").join("shot.png")).unwrap(),
+        PNG
+    );
+    assert!(
+        engine.attachment_list("from").await.unwrap().is_empty(),
+        "the source copy still leaves with its only referent"
+    );
+    assert!(!from.join("assets").join("shot.png").exists());
+    assert!(
+        moved_text(&into, "note.md").contains("![shot](assets/shot.png)"),
+        "reuse renames nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_destination_collision_with_other_bytes_suffixes_and_rewrites_the_engram() {
+    let (_tmp, engine, _from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "analyzes: assets/shot.png\n",
+                "![shot](assets/shot.png#right) and again [here](./assets/shot.png).",
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    engine
+        .attachment_write("into", "assets/shot.png", OTHER_PNG.to_vec())
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let landed = engine.attachment_list("into").await.unwrap();
+    let paths: Vec<&str> = landed.iter().map(|row| row.path.as_str()).collect();
+    assert_eq!(paths, vec!["assets/shot-2.png", "assets/shot.png"]);
+    assert_eq!(
+        std::fs::read(into.join("assets").join("shot.png")).unwrap(),
+        OTHER_PNG,
+        "the destination's own file is never overwritten"
+    );
+    assert_eq!(
+        std::fs::read(into.join("assets").join("shot-2.png")).unwrap(),
+        PNG
+    );
+    assert!(engine.attachment_list("from").await.unwrap().is_empty());
+
+    let text = moved_text(&into, "note.md");
+    assert!(
+        text.contains("![shot](assets/shot-2.png#right)"),
+        "the fragment survives the rename: {text}"
+    );
+    assert!(
+        text.contains("[here](./assets/shot-2.png)"),
+        "every spelling of the reference follows: {text}"
+    );
+    assert!(
+        text.contains("analyzes: assets/shot-2.png"),
+        "the claim follows too: {text}"
+    );
+}
+
+#[tokio::test]
+async fn a_reference_to_a_missing_file_never_fails_the_move() {
+    let (_tmp, engine, _from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "analyzes: assets/also-gone.pdf\n",
+                "![gone](assets/gone.png)",
+            ),
+        )
+        .await
+        .unwrap();
+
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    assert!(
+        engine.attachment_list("into").await.unwrap().is_empty(),
+        "a dangling reference carries nothing"
+    );
+    let text = moved_text(&into, "note.md");
+    assert!(text.contains("![gone](assets/gone.png)"), "{text}");
+    assert!(text.contains("analyzes: assets/also-gone.pdf"), "{text}");
+}
+
+#[tokio::test]
+async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    // File domain to virtual domain: the bytes land in the blob table.
+    engine
+        .move_engram(&move_params("from", "note", "note.md", Some("vault")))
+        .await
+        .unwrap();
+    assert!(engine.attachment_list("from").await.unwrap().is_empty());
+    assert!(!from.join("assets").join("shot.png").exists());
+    let (bytes, row) = engine
+        .attachment_read("vault", "assets/shot.png")
+        .await
+        .unwrap();
+    assert_eq!(bytes, PNG);
+    assert_eq!(row.mime, "image/png");
+
+    // And back the other way: the file materializes on disk.
+    engine
+        .move_engram(&move_params("vault", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+    assert!(
+        engine.attachment_list("vault").await.unwrap().is_empty(),
+        "the blob left with its only referent"
+    );
+    assert_eq!(
+        std::fs::read(into.join("assets").join("shot.png")).unwrap(),
+        PNG
     );
 }
