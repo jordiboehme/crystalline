@@ -12,6 +12,8 @@
 
 import { Link, useLocation } from "react-router";
 
+import { BUTTON } from "../components/primitives";
+
 const REPO_URL = "https://github.com/jordiboehme/crystalline";
 
 /** The failed address as a C64 filename: bare, uppercase, one line. */
@@ -30,8 +32,10 @@ export default function NotFound() {
       </h1>
       <p className="mt-2 text-sm text-slate-600 dark:text-slate-400">
         The address names nothing this mind still holds. It may have been
-        reorganized, retired, or never captured at all.{" "}
-        <Link to="/" className="underline underline-offset-2">
+        reorganized, retired, or never captured at all.
+      </p>
+      <p className="mt-4">
+        <Link to="/" className={`inline-block ${BUTTON.primary}`}>
           Back to what is remembered
         </Link>
       </p>
