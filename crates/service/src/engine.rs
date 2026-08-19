@@ -3839,9 +3839,34 @@ impl Engine {
 
     /// Delete an engram and its index rows. A file domain also removes the file
     /// on disk; a virtual domain only drops the database rows.
+    ///
+    /// An `assets/` identifier deletes that attachment instead - the row plus
+    /// the file or the blob - which is what completes an orphaned-attachment
+    /// finding without a second write verb existing. The two are one verb
+    /// because they are one act from the caller's side ("remove this thing from
+    /// the domain"), and the identifier says which thing without ambiguity: an
+    /// engram can never live under the reserved `assets/` folder.
     pub async fn delete_engram(&self, p: &DeleteParams) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
+        }
+        if let Some(path) = attachment_identifier(&p.identifier) {
+            // Refused rather than ignored: `expected_checksum` is a promise
+            // about markdown a caller read, and an attachment's bytes are not
+            // that. Accepting it silently would let a caller believe a delete
+            // was guarded when nothing compared anything.
+            if p.expected_checksum.is_some() {
+                return Err(EngineError::Invalid(format!(
+                    "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
+                )));
+            }
+            self.attachment_delete(&p.domain, &path).await?;
+            return Ok(json!({
+                "domain": p.domain,
+                "path": path,
+                "attachment": true,
+                "deleted": true,
+            }));
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         // Held across the comparison and the removal, so a guarded delete
@@ -9771,6 +9796,20 @@ fn unknown_rule_message(rule: &str) -> String {
             .collect::<Vec<_>>()
             .join(", ")
     )
+}
+
+/// The attachment path an identifier names, or `None` when it names an engram.
+///
+/// A leading `./` is folded and the reserved folder segment is canonicalized by
+/// [`crystalline_core::canonical_asset_path`], so `./Assets/deck.png` and
+/// `assets/deck.png` are the same file. Only the prefix decides: an engram
+/// never lives under the reserved folder, which is what makes one verb able to
+/// serve both without guessing.
+fn attachment_identifier(identifier: &str) -> Option<String> {
+    let raw = identifier.trim().trim_start_matches("./");
+    crystalline_core::is_under_assets(raw)
+        .then(|| crystalline_core::canonical_asset_path(raw))
+        .flatten()
 }
 
 /// The acknowledgments an engram's markdown carries.

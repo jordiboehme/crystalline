@@ -117,6 +117,8 @@ use crate::engine::Engine;
         discovery::activity,
         graph::graph,
         evolve::queue,
+        evolve::acknowledge,
+        evolve::unacknowledge,
         users_api::list,
         users_api::create,
         users_api::update,
@@ -495,6 +497,14 @@ pub fn router(state: RestState) -> Router {
         // recorded, so opening the maintenance page never counts as the sweep
         // it is asking about. See [`evolve::queue`].
         .route("/evolve", get(evolve::queue))
+        // The acknowledgment pair, editor-only and CSRF-guarded like every
+        // other mutation here. Domain-scoped in the path, engram in the body:
+        // a permalink is a path of its own, so it cannot ride a segment before
+        // an action name.
+        .route(
+            "/domains/{domain}/evolve/ack",
+            post(evolve::acknowledge).delete(evolve::unacknowledge),
+        )
         // Admin only, enforced inside the handlers: the guard below stops at
         // viewer. See [`users_api`] for the three rules these first mutating
         // routes are held to.

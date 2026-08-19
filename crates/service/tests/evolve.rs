@@ -959,3 +959,262 @@ async fn the_attachment_rules_fire_over_a_real_domain() {
     fired.sort();
     assert_eq!(fired, vec!["V008", "V107"]);
 }
+
+// ---------------------------------------------------------------------------
+// Acknowledgments
+// ---------------------------------------------------------------------------
+
+/// Acknowledge `rule` on `permalink` the way an agent does: `edit_engram` with
+/// `set_frontmatter`, key `evolve_ack`, the rule and note as one value.
+async fn acknowledge(engine: &Engine, permalink: &str, value: &str) -> Value {
+    engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: permalink.to_string(),
+                domain: "eng".to_string(),
+                operation: "set_frontmatter".to_string(),
+                key: Some("evolve_ack".to_string()),
+                value: Some(value.to_string()),
+                ..Default::default()
+            },
+            Some("agent:test"),
+        )
+        .await
+        .unwrap()
+}
+
+/// The queue rows for one engram, whatever the rule.
+fn rows_on<'a>(v: &'a Value, permalink: &str) -> Vec<&'a Value> {
+    v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|row| row["permalink"] == permalink)
+        .collect()
+}
+
+/// The whole acknowledgment lifecycle over a real file domain: the write path
+/// computes the scope from detection, the entry lands in the file with the
+/// caller's identity and an instant, the finding leaves the queue counted, and
+/// the same rule acknowledged twice replaces rather than doubles.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_acknowledged_finding_leaves_the_queue_counted() {
+    let (tmp, engine) = fixture().await;
+
+    let receipt = acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+    let entry = &receipt["evolve_ack"];
+    assert_eq!(entry["rule"], "V101");
+    assert_eq!(
+        entry["scope"], "eng/retired-thing",
+        "the server computed what the finding fired on"
+    );
+    assert_eq!(entry["note"], "lineage citation, keep");
+    assert_eq!(entry["by"], "agent:test");
+    assert!(entry["at"].as_str().unwrap().contains('T'), "{entry}");
+
+    // It lives in the file, which is what makes it travel and survive a resync.
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/live-doc.md")).unwrap();
+    assert!(on_disk.contains("evolve_ack:"), "{on_disk}");
+    assert!(on_disk.contains("rule: V101"), "{on_disk}");
+
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert!(
+        !rows_on(&v, "live-doc").iter().any(|r| r["rule"] == "V101"),
+        "the acknowledged finding is gone from the queue"
+    );
+    assert_eq!(v["acknowledged"]["total"], 1);
+    assert_eq!(v["acknowledged"]["by_family"]["structure"], 1);
+    assert_eq!(v["acknowledged"]["by_family"]["temporal"], 0);
+
+    // Acknowledged again, with a different note: one entry, not two.
+    let second = acknowledge(&engine, "live-doc", "V101 still deliberate").await;
+    assert_eq!(second["evolve_ack"]["note"], "still deliberate");
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/live-doc.md")).unwrap();
+    assert_eq!(on_disk.matches("rule: V101").count(), 1, "{on_disk}");
+
+    // And the audit view returns the row it suppressed, marked, with the note.
+    let audited = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            include_acknowledged: true,
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let row = rows_on(&audited, "live-doc")[0];
+    assert_eq!(row["acknowledged"], true);
+    assert_eq!(row["ack_note"], "still deliberate");
+    assert!(row.get("ack_stale").is_none(), "{row}");
+}
+
+/// A rule that is not firing is acknowledged scope-less, which is the generous
+/// entry that matches whatever it finds later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledging_a_rule_that_is_not_firing_stores_no_scope() {
+    let (_tmp, engine) = fixture().await;
+    let receipt = acknowledge(&engine, "live-doc", "V104").await;
+    assert_eq!(receipt["evolve_ack"]["rule"], "V104");
+    assert_eq!(receipt["evolve_ack"]["scope"], Value::Null);
+    assert_eq!(receipt["evolve_ack"]["note"], Value::Null);
+}
+
+/// A rule id the catalog does not hold is refused rather than stored: an
+/// acknowledgment that can never suppress anything would read as work done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_rule_is_refused() {
+    let (_tmp, engine) = fixture().await;
+    let err = engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "live-doc".to_string(),
+                domain: "eng".to_string(),
+                operation: "set_frontmatter".to_string(),
+                key: Some("evolve_ack".to_string()),
+                value: Some("V999 nope".to_string()),
+                ..Default::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("V999"), "{err}");
+    assert!(err.contains("V101"), "the catalog is named: {err}");
+}
+
+/// The evidence changes, so the acknowledgment stops matching and the finding
+/// comes back marked stale carrying the old note - never silently forgotten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ack_whose_evidence_changed_comes_back_stale() {
+    let (tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    // A second retired target: the same rule, different evidence.
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Retired thing]]",
+            "- relates_to [[Retired thing]]\n- relates_to [[Old deploy pipeline]]",
+        ),
+    )
+    .unwrap();
+    // The old pipeline is what V005 says should have been retired; retire it so
+    // the second link really points at retired knowledge.
+    let old = tmp.path().join("eng/deploy/old-pipeline.md");
+    let source = std::fs::read_to_string(&old).unwrap();
+    std::fs::write(&old, source.replace("status: stable", "status: deprecated")).unwrap();
+    engine.sync(None).await.unwrap();
+
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let row = rows_on(&v, "live-doc")[0];
+    assert_eq!(row["ack_stale"], true);
+    assert_eq!(row["ack_note"], "lineage citation, keep");
+    assert_eq!(v["acknowledged"]["total"], 0, "nothing was suppressed");
+
+    // Re-acknowledged, it takes the new evidence and goes quiet again.
+    let again = acknowledge(&engine, "live-doc", "V101 both are deliberate").await;
+    assert_eq!(
+        again["evolve_ack"]["scope"],
+        "eng/deploy/old-pipeline, eng/retired-thing",
+        "the scope is the sorted set of what it now points at"
+    );
+    let after = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert!(rows_on(&after, "live-doc").is_empty(), "{after}");
+    assert_eq!(after["acknowledged"]["total"], 1);
+}
+
+/// A hand-written entry with no scope suppresses whatever the rule finds, and
+/// withdrawing it brings the finding straight back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
+    let (tmp, engine) = fixture().await;
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "status: stable",
+            "status: stable\nevolve_ack:\n- { rule: V101, note: kept by hand, by: \"human:jordi\" }",
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert!(rows_on(&v, "live-doc").is_empty(), "{v}");
+    assert_eq!(v["acknowledged"]["total"], 1);
+
+    let removed = engine
+        .unacknowledge_finding_as("eng", "live-doc", "v101", Some("human:jordi"))
+        .await
+        .unwrap();
+    assert!(removed);
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!on_disk.contains("evolve_ack"), "{on_disk}");
+
+    let back = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert_eq!(rows_on(&back, "live-doc").len(), 1);
+    assert_eq!(back["acknowledged"]["total"], 0);
+
+    // Withdrawing what is not there reports exactly that, rather than a
+    // rewrite that changed nothing.
+    assert!(
+        !engine
+            .unacknowledge_finding_as("eng", "live-doc", "V101", None)
+            .await
+            .unwrap()
+    );
+}
