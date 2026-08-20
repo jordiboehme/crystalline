@@ -416,20 +416,20 @@ const SCOPE_SEPARATOR: &str = ", ";
 /// One match for the whole catalog, deliberately. The rules that carry a scope
 /// pass their material in and this decides the shape:
 ///
-/// - `V101` (the retired targets), `V103` (the counterparts), `V107` (the
-///   missing attachment paths), `V201` (the cluster members) and `V202` (the
-///   colliding titles) are **sets**, so the parts are sorted and deduplicated
-///   before joining: reordering the links in a body must not re-raise an
-///   acknowledged finding, while a new member must;
+/// - `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
+///   counterparts), `V107` (the missing attachment paths), `V201` (the cluster
+///   members) and `V202` (the colliding titles) are **sets**, so the parts are
+///   sorted and deduplicated before joining: reordering the links in a body must
+///   not re-raise an acknowledged finding, while a new member must;
 /// - `V007` and `V008` name **one attachment path**, so the first part is the
 ///   whole scope;
 /// - every other rule's identity is just (engram, rule) - the plain temporal
-///   rules, the unresolved reference, orphans, stubs, size, tag drift and the
-///   anchorless orphaned attachment - and carries an empty scope, which matches
-///   whatever the engram looks like next time.
+///   rules, orphans, stubs, size, tag drift and the anchorless orphaned
+///   attachment - and carries an empty scope, which matches whatever the engram
+///   looks like next time.
 fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
     match rule {
-        "V101" | "V103" | "V107" | "V201" | "V202" => {
+        "V101" | "V102" | "V103" | "V107" | "V201" | "V202" => {
             parts.sort();
             parts.dedup();
             parts.join(SCOPE_SEPARATOR)
@@ -1500,7 +1500,22 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 }
 
 /// `V102`: references the index could not resolve.
+///
+/// The rule emits one finding per broken reference, but every finding on one
+/// engram carries the **same** scope: that engram's whole set of unresolved
+/// targets. One acknowledgment therefore covers what is broken now - which is
+/// what a person ruling "these links point outside on purpose" means - and stops
+/// matching the moment the set changes, so a newly broken link is raised rather
+/// than swallowed by an older entry.
 fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
+    let mut targets: HashMap<i64, Vec<String>> = HashMap::new();
+    for reference in &input.unresolved {
+        targets
+            .entry(reference.from.0)
+            .or_default()
+            .push(reference.target.clone());
+    }
+
     for reference in &input.unresolved {
         let Some(fact) = graph.facts.get(&reference.from.0) else {
             continue;
@@ -1556,7 +1571,8 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                     evidence,
                     fix,
                 )
-                .at_line(reference.line),
+                .at_line(reference.line)
+                .scoped(targets.get(&reference.from.0).cloned().unwrap_or_default()),
         );
     }
 }

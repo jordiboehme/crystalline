@@ -60,8 +60,8 @@ pub struct EvolveQuery {
     #[param(example = 1)]
     page: Option<usize>,
     /// Include the findings acknowledgments suppressed, each marked
-    /// `acknowledged` with the note that silenced it. Off by default: the queue
-    /// is what still needs deciding.
+    /// `acknowledged` with the scope and note that silenced it. Off by default:
+    /// the queue is what still needs deciding.
     #[serde(default)]
     #[param(example = true)]
     include_acknowledged: Option<bool>,
@@ -90,10 +90,13 @@ pub struct EvolveQuery {
 /// cap that fired so a short queue is never mistaken for a finished one.
 ///
 /// `acknowledged` counts what acknowledgments kept out of the queue, whole and
-/// per family, so a short queue is never mistaken for a healthy one; a row whose
-/// acknowledgment was given for evidence that has since changed comes back
-/// carrying `ack_stale` and the old `ack_note`. Pass `include_acknowledged` to
-/// see the suppressed rows themselves, each marked `acknowledged`.
+/// per family, and those counts are domain-wide rather than page-wide: they are
+/// taken before `families`, `rules` and `min_priority` narrow the result, so a
+/// short queue is never mistaken for a healthy one. A row whose acknowledgment
+/// was given for evidence that has since changed comes back carrying
+/// `ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass
+/// `include_acknowledged` to see the suppressed rows themselves, each marked
+/// `acknowledged` and carrying the same two fields.
 ///
 /// `today` is not exposed. The temporal rules are evaluated as of now, which is
 /// the only question a page asks; the tool takes a pinned date for a run that

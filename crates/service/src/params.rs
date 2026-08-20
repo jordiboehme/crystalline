@@ -393,9 +393,9 @@ pub struct EvolveParams {
     #[serde(default)]
     pub today: Option<String>,
     /// Include the findings acknowledgments suppressed, each marked
-    /// acknowledged with the note that silenced it. Off by default: the queue
-    /// is what still needs deciding, and this is the audit view of what was
-    /// already decided.
+    /// acknowledged with the scope and note that silenced it. Off by default:
+    /// the queue is what still needs deciding, and this is the audit view of
+    /// what was already decided.
     #[serde(default)]
     pub include_acknowledged: bool,
 }

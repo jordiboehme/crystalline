@@ -110,6 +110,14 @@ fn verified_flow(v: &Verified) -> String {
 /// no meaning in flow context (so no whitespace, quote or flow punctuation)
 /// and neither opens nor closes with a character a parser would read as an
 /// indicator.
+///
+/// A quoted value is escaped so it can never leave its own line. That is what
+/// keeps free text safe here: a raw newline inside a double-quoted YAML scalar
+/// is legal YAML, but this frontmatter is delimited by `---` lines that are
+/// found before any YAML parser sees them, so a note carrying `\n---\n` would
+/// end the block early and leave an engram nothing can read. Every C0 control
+/// character is therefore escaped rather than only the two YAML indicators, and
+/// the value still round-trips: a parser reads `\n` back as the newline it was.
 fn flow_scalar(value: &str) -> String {
     let plain = !value.is_empty()
         && value.chars().all(|c| {
@@ -121,7 +129,22 @@ fn flow_scalar(value: &str) -> String {
     if plain {
         return value.to_string();
     }
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for c in value.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            // The rest of C0 plus DEL: rare in prose, illegal or invisible in a
+            // scalar, and written as the hex escape a YAML parser reads back.
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                escaped.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
     format!("\"{escaped}\"")
 }
 

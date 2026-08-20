@@ -1529,7 +1529,7 @@ fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
         "engineering/alpha".to_string(),
         "engineering/beta".to_string(),
     ];
-    for rule in ["V101", "V103", "V107", "V201", "V202"] {
+    for rule in ["V101", "V102", "V103", "V107", "V201", "V202"] {
         assert_eq!(
             scope_for(rule, unsorted.clone()),
             "engineering/alpha, engineering/beta",
@@ -1544,8 +1544,7 @@ fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
         );
     }
     for rule in [
-        "V001", "V002", "V003", "V004", "V005", "V006", "V102", "V104", "V105", "V106", "V108",
-        "V203",
+        "V001", "V002", "V003", "V004", "V005", "V006", "V104", "V105", "V106", "V108", "V203",
     ] {
         assert_eq!(
             scope_for(rule, unsorted.clone()),
@@ -1560,7 +1559,9 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // The match is exhaustive by construction: a new rule id lands in the
     // empty-scope arm, which is the safe default, and this pins that the
     // catalog and the scope function are read together.
-    let scoped = ["V007", "V008", "V101", "V103", "V107", "V201", "V202"];
+    let scoped = [
+        "V007", "V008", "V101", "V102", "V103", "V107", "V201", "V202",
+    ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);
         if scoped.contains(&info.id) {
@@ -1568,5 +1569,122 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
         } else {
             assert!(produced.is_empty(), "{} carries no scope", info.id);
         }
+    }
+}
+
+/// Every rule that carries a scope hands the right material to `scope_for` at
+/// its own call site. `scope_for` itself is unit tested above; these pin what
+/// each detector puts into it, because a wrong or unstable list there is what
+/// would make an acknowledgment flap between sweeps.
+#[test]
+fn v102_scopes_the_sorted_set_of_unresolved_targets() {
+    let mut fact = fact(1, "link-typo");
+    fact.body = short_body(3);
+    let mut sweep = input(vec![fact]);
+    sweep.unresolved = vec![unresolved(1, "Zulu Target"), unresolved(1, "Alpha Target")];
+
+    let report = detect(&sweep);
+    let scopes: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V102")
+        .map(|f| f.scope.as_str())
+        .collect();
+    assert_eq!(
+        scopes,
+        vec!["Alpha Target, Zulu Target", "Alpha Target, Zulu Target"],
+        "every V102 finding on one engram shares the sorted set, so one \
+         acknowledgment covers what is broken now and expires when that changes"
+    );
+
+    // A third broken link changes the set, so an acknowledgment given for the
+    // old one stops matching.
+    sweep.unresolved.push(unresolved(1, "Mike Target"));
+    let report = detect(&sweep);
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule == "V102")
+        .expect("V102 still fires");
+    assert_eq!(
+        finding.scope, "Alpha Target, Mike Target, Zulu Target",
+        "a new broken link moves the scope"
+    );
+}
+
+#[test]
+fn v103_scopes_the_counterpart_and_v201_the_whole_cluster() {
+    // V103: the counterpart that declared the forward half.
+    let target = fact(1, "summary");
+    let source = fact(2, "long-form");
+    let mut sweep = input(vec![target, source]);
+    sweep.graph.edges = vec![rel(2, 1, "summarizes")];
+    let finding = only(&detect(&sweep), "V103");
+    assert_eq!(finding.scope, "engineering/long-form");
+
+    // V201: every member of the cluster, the lead included, so the scope reads
+    // the same whichever member the finding hung on.
+    let mut one = fact(1, "ci-pipeline");
+    one.body = long_body("release");
+    let mut two = fact(2, "ci-pipeline-copy");
+    two.body = long_body("release");
+    let sweep = input(vec![one, two]);
+    let finding = only(&detect(&sweep), "V201");
+    assert_eq!(
+        finding.scope,
+        "engineering/ci-pipeline, engineering/ci-pipeline-copy"
+    );
+}
+
+#[test]
+fn v202_scopes_the_colliding_titles() {
+    let mut one = fact(1, "setup-a");
+    one.title = "Setup guide".to_string();
+    let mut two = fact(2, "setup-b");
+    two.title = "Setup guides".to_string();
+    let sweep = input(vec![one, two]);
+    let finding = only(&detect(&sweep), "V202");
+    assert_eq!(finding.scope, "Setup guide, Setup guides");
+}
+
+#[test]
+fn v107_scopes_the_sorted_missing_paths_and_v008_the_claimed_one() {
+    // V107: every path the engram points at that the domain does not hold.
+    let mut fact = fact(1, "ghost-ref");
+    fact.asset_refs = vec![
+        "assets/zulu.png".to_string(),
+        "assets/alpha.png".to_string(),
+    ];
+    let sweep = input(vec![fact]);
+    let finding = only(&detect(&sweep), "V107");
+    assert_eq!(finding.scope, "assets/alpha.png, assets/zulu.png");
+
+    // V008: the claimed path, not the hash - acknowledging "this engram is
+    // allowed to lag this file" survives the file changing again.
+    let mut reader = fact_with_claim(2, "what-the-shot-shows", "assets/shot.png");
+    reader.analyzed_hash = Some("cd".repeat(32));
+    let mut sweep = input(vec![reader]);
+    sweep.attachments = vec![attachment("assets/shot.png", YESTERDAY)];
+    let finding = only(&detect(&sweep), "V008");
+    assert_eq!(finding.scope, "assets/shot.png");
+}
+
+/// An engram claiming `path`, with a body that references it too.
+fn fact_with_claim(id: i64, permalink: &str, path: &str) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.analyzes = Some(path.to_string());
+    f.asset_refs = vec![path.to_string()];
+    f
+}
+
+/// An unresolved prose wikilink from `from` to `target`.
+fn unresolved(from: i64, target: &str) -> UnresolvedRef {
+    UnresolvedRef {
+        from: EngramId(from),
+        rel_type: "links_to".to_string(),
+        kind: EdgeKind::Link,
+        target_domain: None,
+        target: target.to_string(),
+        line: Some(3),
     }
 }

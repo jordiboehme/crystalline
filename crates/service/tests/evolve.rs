@@ -1217,3 +1217,138 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
             .unwrap()
     );
 }
+
+/// A note pasted out of a chat window carries newlines. They are folded to
+/// single spaces at intake, so the stored entry is one line of prose and the
+/// engram it lands in still parses - the corruption path a raw `\n---\n` in a
+/// note would otherwise open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_with_newlines_is_folded_and_the_engram_still_parses() {
+    let (tmp, engine) = fixture().await;
+    let receipt = acknowledge(
+        &engine,
+        "live-doc",
+        "V101 first line\n---\ntype: injected\nstatus: evil",
+    )
+    .await;
+    assert_eq!(
+        receipt["evolve_ack"]["note"], "first line --- type: injected status: evil",
+        "the newlines are folded to spaces rather than written into the file"
+    );
+
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/live-doc.md")).unwrap();
+    assert_eq!(
+        on_disk.lines().filter(|l| l.trim() == "---").count(),
+        2,
+        "the note never opens a second frontmatter block: {on_disk}"
+    );
+    crystalline_core::parse_engram(&on_disk).expect("the engram still parses");
+
+    // And the sweep still sees it: an engram nothing can parse is invisible.
+    engine.sync(None).await.unwrap();
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert_eq!(v["unparsed"], 0, "{v}");
+    assert_eq!(v["acknowledged"]["total"], 1);
+
+    // The second acknowledgment - the ordinary re-acknowledge flow - rewrites
+    // the block rather than orphaning a continuation line.
+    acknowledge(&engine, "live-doc", "V104 also deliberate").await;
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/live-doc.md")).unwrap();
+    crystalline_core::parse_engram(&on_disk).expect("the rewrite parses too");
+}
+
+/// An acknowledgment onto an engram that no longer parses is refused rather
+/// than appended: stacking a second `evolve_ack` key onto broken frontmatter
+/// compounds the damage instead of reporting it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ack_refuses_an_engram_that_no_longer_parses() {
+    let (tmp, engine) = fixture().await;
+    let path = tmp.path().join("eng/live-doc.md");
+    // Broken on disk but still indexed, which is exactly the state a hand edit
+    // or an older corruption leaves behind.
+    let broken = "---\ntitle: Live doc\npermalink: live-doc\nstatus: \"unclosed\n---\n\nBody.\n";
+    std::fs::write(&path, broken).unwrap();
+
+    let err = engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "live-doc".to_string(),
+                domain: "eng".to_string(),
+                operation: "set_frontmatter".to_string(),
+                key: Some("evolve_ack".to_string()),
+                value: Some("V101 keep".to_string()),
+                ..Default::default()
+            },
+            Some("agent:test"),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("parse"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        broken,
+        "a refused acknowledgment writes nothing at all"
+    );
+}
+
+/// The audit view carries the scope the acknowledgment was given for, which is
+/// what lets a reader see why a stale one stopped matching.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_audit_row_carries_the_acknowledged_scope() {
+    let (_tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+    let audited = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            include_acknowledged: true,
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let row = rows_on(&audited, "live-doc")[0];
+    assert_eq!(row["acknowledged"], true);
+    assert_eq!(row["ack_scope"], "eng/retired-thing");
+    assert_eq!(row["ack_note"], "lineage citation, keep");
+}
+
+/// A hand-written entry spells its rule id however the person typed it, so
+/// withdrawing one folds case exactly as matching it does. Without this the
+/// Unacknowledge action is permanently broken for that entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lowercase_hand_written_rule_id_can_still_be_withdrawn() {
+    let (tmp, engine) = fixture().await;
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "status: stable",
+            "status: stable\nevolve_ack:\n- { rule: v101, note: kept by hand, by: \"human:jordi\" }",
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    assert!(
+        engine
+            .unacknowledge_finding_as("eng", "live-doc", "V101", Some("human:jordi"))
+            .await
+            .unwrap()
+    );
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!on_disk.contains("evolve_ack"), "{on_disk}");
+}

@@ -3307,7 +3307,27 @@ impl Engine {
                         "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
                     ))
                 })?;
-                Ok(set_evolve_ack(source, &merged_acks(source, entry.clone())))
+                // An engram whose frontmatter no longer parses would have its
+                // existing entries read as none, and this would write a second
+                // `evolve_ack` key beside the one already there - compounding a
+                // break instead of reporting it.
+                parse_engram(source).map_err(|e| {
+                    EngineError::Invalid(format!(
+                        "cannot acknowledge a finding on an engram that does not parse ({e}); repair the frontmatter first"
+                    ))
+                })?;
+                let out = set_evolve_ack(source, &merged_acks(source, entry.clone()));
+                // Defense in depth: whatever the note carried, the bytes about
+                // to be persisted have to be readable. Refusing here is the last
+                // stop before a write that would make the engram invisible to
+                // the sweep, to read_engram and to search.
+                parse_engram(&out).map_err(|e| {
+                    EngineError::Invalid(format!(
+                        "the acknowledgment would leave '{}' unparseable ({e}); nothing was written",
+                        p.identifier
+                    ))
+                })?;
+                Ok(out)
             }
             other => Err(EngineError::Invalid(format!(
                 "set_frontmatter cannot set '{other}'; the settable keys are {}",
@@ -5103,6 +5123,13 @@ impl Engine {
                 if f.ack_stale {
                     row["ack_stale"] = Value::Bool(true);
                 }
+                // The scope rides the row whenever an acknowledgment spoke to
+                // it, which is what lets a reader see what a stale one was
+                // given for. Named beside `ack_note` rather than plain `scope`,
+                // which at the top level already names the swept domains.
+                if (f.acknowledged || f.ack_stale) && !f.scope.is_empty() {
+                    row["ack_scope"] = Value::String(f.scope.clone());
+                }
                 if let Some(note) = &f.ack_note {
                     row["ack_note"] = Value::String(note.clone());
                 }
@@ -5279,13 +5306,19 @@ impl Engine {
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block.
         let current = self.load_source(&source, &desc).await?;
-        if !acks_of(&current).iter().any(|a| a.rule == rule) {
+        // Case-folded, like every other rule comparison on this path: a
+        // hand-written `- { rule: v101 }` suppresses findings, so it has to be
+        // withdrawable too.
+        if !acks_of(&current)
+            .iter()
+            .any(|a| a.rule.eq_ignore_ascii_case(&rule))
+        {
             return Ok(false);
         }
         self.apply_source_edit(&desc, &source, None, &actor, |current| {
             let kept: Vec<EvolveAck> = acks_of(current)
                 .into_iter()
-                .filter(|a| a.rule != rule)
+                .filter(|a| !a.rule.eq_ignore_ascii_case(&rule))
                 .collect();
             Ok(set_evolve_ack(current, &kept))
         })
@@ -9768,14 +9801,31 @@ fn parse_ack_value(raw: &str) -> Result<(String, Option<String>)> {
         )));
     }
     let (rule, note) = match raw.split_once(char::is_whitespace) {
-        Some((rule, note)) => (rule, note.trim()),
-        None => (raw, ""),
+        Some((rule, note)) => (rule, fold_note(note)),
+        None => (raw, String::new()),
     };
     let rule = rule.trim().to_ascii_uppercase();
     if rule_info(&rule).is_none() {
         return Err(EngineError::Invalid(unknown_rule_message(&rule)));
     }
-    Ok((rule, (!note.is_empty()).then(|| note.to_string())))
+    Ok((rule, (!note.is_empty()).then_some(note)))
+}
+
+/// A note as one line of prose: every run of whitespace, newlines included,
+/// folded to a single space.
+///
+/// Folded rather than refused, deliberately. A note is free text a person pastes
+/// into a box - a two-line justification out of a chat window is the ordinary
+/// case, not an attack - and refusing it would send them back to reformat prose
+/// that nothing ever parses. It is also never machine-read: it is shown back to
+/// whoever reads the queue, and one line reads the same as two there.
+///
+/// What the folding buys is that the frontmatter this lands in stays valid. The
+/// emitter escapes control characters too (`crystalline_core::emit`), so this is
+/// the readable half of a defense that holds at both ends rather than the only
+/// guard.
+fn fold_note(note: &str) -> String {
+    note.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// What a caller hears when it names a rule the catalog does not have.

@@ -425,3 +425,85 @@ fn malformed_ack_entries_are_skipped_never_an_error() {
     assert_eq!(parsed[0].scope, None);
     assert_eq!(parsed[0].by, "");
 }
+
+/// A note a human pasted out of a chat window carries newlines. The emitted
+/// frontmatter has to stay one line per entry and keep parsing - both on the
+/// first write and on the rewrite that a re-acknowledgment performs.
+#[test]
+fn a_note_with_newlines_stays_one_line_and_the_engram_still_parses() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let hostile = "first line\n---\ntype: injected\nstatus: evil";
+    let out = set_evolve_ack(
+        source,
+        &[EvolveAck {
+            rule: "V101".to_string(),
+            scope: None,
+            note: Some(hostile.to_string()),
+            by: "human:jordi".to_string(),
+            at: None,
+        }],
+    );
+    assert!(
+        !out.lines().any(|l| l.trim() == "---"
+            && !l.is_empty()
+            && out.lines().filter(|x| x.trim() == "---").count() > 2),
+        "the note must not open a second frontmatter block: {out}"
+    );
+    let engram = parse_engram(&out).expect("a note with newlines still parses");
+    assert_eq!(engram.frontmatter.title, "Lineage");
+    let parsed = EvolveAck::parse_list(
+        engram
+            .frontmatter
+            .extra
+            .get("evolve_ack")
+            .expect("the key is there"),
+    );
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(
+        parsed[0].note.as_deref(),
+        Some(hostile),
+        "the text round-trips through the escape"
+    );
+
+    // The rewrite a re-acknowledgment performs: the old entry must be replaced
+    // whole rather than leaving an orphaned continuation line behind.
+    let again = set_evolve_ack(
+        &out,
+        &[
+            EvolveAck {
+                rule: "V101".to_string(),
+                scope: None,
+                note: Some(hostile.to_string()),
+                by: "human:jordi".to_string(),
+                at: None,
+            },
+            ack("V104", None, Some("second")),
+        ],
+    );
+    let engram = parse_engram(&again).expect("the rewrite parses too");
+    assert_eq!(
+        EvolveAck::parse_list(engram.frontmatter.extra.get("evolve_ack").unwrap()).len(),
+        2
+    );
+}
+
+/// Every control character a flow scalar can carry is escaped, so one entry is
+/// always exactly one line whoever supplied the text - the `verified` actor
+/// included.
+#[test]
+fn a_verified_actor_with_a_newline_stays_one_line() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let out = set_verified(
+        &source,
+        &[Verified {
+            by: "human:jordi\nstatus: evil".to_string(),
+            at: None,
+        }],
+    );
+    parse_engram(&out).expect("a hostile actor never breaks the frontmatter");
+    assert_eq!(
+        out.lines().filter(|l| l.trim() == "---").count(),
+        2,
+        "{out}"
+    );
+}

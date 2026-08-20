@@ -680,3 +680,43 @@ async fn the_ack_endpoint_holds_the_write_rules() {
         .unwrap();
     assert_eq!(resp.status(), 404);
 }
+
+/// The note arrives straight off the wire, so the HTTP boundary is where a
+/// pasted multi-line justification - or a crafted `\n---\n` - would reach the
+/// frontmatter. It is folded to one line, and the engram it lands in stays
+/// readable: the queue still counts the engram rather than reporting it
+/// unparsed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_line_note_never_breaks_the_engram_it_lands_in() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    let session = login_session(fixture.addr, "ada", "s3cret").await;
+
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "note": "reviewed offline\n---\ntype: injected\nstatus: evil"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let entry: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        entry["note"], "reviewed offline --- type: injected status: evil",
+        "the note is folded to one line of prose"
+    );
+
+    let body = queue_as(fixture.addr, &session, "").await;
+    assert_eq!(body["unparsed"], 0, "the engram is still readable: {body}");
+    assert_eq!(body["acknowledged"]["total"], 1);
+}
