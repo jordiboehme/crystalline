@@ -545,7 +545,9 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
 /// Linux and the sync walk indexes such a file like any other engram, so a
 /// restore or a move addressing one has to keep working: the stricter character
 /// rules belong to untrusted input (an archive entry, an attachment path), not
-/// to a name a person gave their own engram.
+/// to a name a person gave their own engram. Unix only: a colon is not a legal
+/// filename character on Windows, so the fixture itself cannot exist there.
+#[cfg(unix)]
 #[tokio::test]
 async fn an_engram_path_with_a_colon_still_moves_and_restores() {
     let (_tmp, engine, root, _scratch) = engine_fixture().await;

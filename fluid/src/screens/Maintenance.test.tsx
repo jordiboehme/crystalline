@@ -595,7 +595,8 @@ describe("a finding with no engram behind it", () => {
     // and the delete deliberately has none. A row with no path names no file,
     // so the irreversible action is simply not there rather than aimed at
     // `eng` because that is what the heading says.
-    const { title: _dropped, ...pathless } = orphanFinding();
+    const pathless = { ...orphanFinding() };
+    delete (pathless as { title?: string }).title;
     const base = evolvePayload();
     await open({
       "/evolve": () =>
