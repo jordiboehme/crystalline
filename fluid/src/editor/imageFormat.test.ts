@@ -11,6 +11,12 @@
 
 import { describe, expect, test } from "vitest";
 
+// The shared corpus, as text, out of the very file the core's own test reads:
+// `crates/core/tests/fixtures/asset_ref_corpus.json`. `?raw` rather than
+// `node:fs` because this program is browser scoped and carries no Node types;
+// vite.config.ts allows the one folder it lives in for the test run.
+import corpusJson from "../../../crates/core/tests/fixtures/asset_ref_corpus.json?raw";
+
 import {
   assetPath,
   assetRefsIn,
@@ -331,5 +337,37 @@ describe("assetRefsIn", () => {
     expect(
       assetRefsIn("![x](https://example.com/a.png) [y](/assets/b.pdf)"),
     ).toEqual([]);
+  });
+});
+
+/** One case out of the shared fixture: a body and every ref it holds. */
+interface CorpusCase {
+  name: string;
+  body: string;
+  refs: string[];
+}
+
+const CORPUS = JSON.parse(corpusJson) as CorpusCase[];
+
+/**
+ * The one file both scanners are held to.
+ *
+ * `crates/core/src/attachment.rs` is the authority and this module is its
+ * mirror, so the mirror is checked against the authority's own fixture rather
+ * than against a second set of examples that could drift out from under it.
+ * Since 0.15.1 the core percent-decodes a target the way {@link decodeTarget}
+ * does, so the agreement is case for case with nothing excused.
+ *
+ * A change to either scanner's answer therefore changes this fixture, and the
+ * fixture is shared: the Rust side moves in the same commit or one of the two
+ * suites goes red.
+ */
+describe("the shared asset-ref corpus", () => {
+  test("the fixture carries the whole corpus, not a truncated read of it", () => {
+    expect(CORPUS.length).toBeGreaterThanOrEqual(16);
+  });
+
+  test.each(CORPUS)("$name", ({ body, refs }) => {
+    expect(assetRefsIn(body)).toEqual(refs);
   });
 });

@@ -12,7 +12,7 @@
 import { ApiProblem, api, encodeSegment, engramPath } from "./client";
 import type { EngramDetail } from "./engram";
 import { readEngramDetail } from "./engram";
-import { asObject, asString } from "./json";
+import { asObject, asString, asStrings } from "./json";
 import type {
   CreateEngramBody,
   MoveBody,
@@ -133,6 +133,14 @@ export interface MoveReceipt {
   permalink: string;
   crossDomain: boolean;
   linksRewritten: number;
+  /**
+   * What the move could not carry with it, in the engine's own words: an
+   * attachment the engram still references that stayed in the old domain. The
+   * move happened either way, so these are notices rather than failures, and a
+   * server that sends none - an older one, or one with nothing to say - leaves
+   * this empty.
+   */
+  attachmentWarnings: string[];
 }
 
 /**
@@ -157,6 +165,7 @@ export async function moveEngram(
     crossDomain: record?.cross_domain === true,
     linksRewritten:
       typeof record?.links_rewritten === "number" ? record.links_rewritten : 0,
+    attachmentWarnings: asStrings(record?.attachment_warnings),
   };
 }
 

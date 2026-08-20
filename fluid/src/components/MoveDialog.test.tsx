@@ -108,6 +108,64 @@ describe("the move dialog", () => {
       const trail = screen.getByRole("navigation", { name: "Breadcrumb" });
       expect(within(trail).getByText("guides")).toBeInTheDocument();
     });
+    // A move that left nothing behind says nothing: the dialog is gone and
+    // there is no notice to dismiss.
+    expect(screen.queryByRole("dialog", { name: /move/i })).toBeNull();
+  });
+
+  it("holds the dialog open on an attachment warning and travels only on the button", async () => {
+    const moved = vi.fn(() => ({
+      from: { domain: "eng", permalink: "alpha", path: "alpha.md" },
+      to: { domain: "eng", path: "guides/alpha.md" },
+      cross_domain: false,
+      links_rewritten: 0,
+      attachment_warnings: [
+        "assets/2026/08/shot.png is referenced but stayed in eng",
+      ],
+    }));
+    serve({
+      "/domains/eng/move": (_path, init) =>
+        init?.method === "POST" ? moved() : null,
+      "/domains/eng/engrams/guides/alpha": () =>
+        detailResponse({ permalink: "guides/alpha" }),
+    });
+    renderApp("/d/eng/e/alpha");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "More actions" }),
+    );
+    await userEvent.click(
+      await screen.findByRole("menuitem", { name: "Move" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /move/i });
+    await userEvent.clear(within(dialog).getByLabelText("Destination path"));
+    await userEvent.type(
+      within(dialog).getByLabelText("Destination path"),
+      "guides/alpha",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Move engram" }),
+    );
+
+    // The move landed; what it left behind is on screen, in the one surface
+    // still mounted. Navigating now would take the notice with it.
+    await waitFor(() => {
+      expect(moved).toHaveBeenCalled();
+    });
+    expect(within(dialog).getByRole("alert")).toHaveTextContent(
+      "assets/2026/08/shot.png is referenced but stayed in eng",
+    );
+    // Nobody has travelled: the new address has not been read, which is the
+    // first thing landing on it would do.
+    expect(reads("/domains/eng/engrams/guides/alpha")).toBe(0);
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Continue to the engram" }),
+    );
+    await waitFor(() => {
+      const landed = screen.getByRole("navigation", { name: "Breadcrumb" });
+      expect(within(landed).getByText("guides")).toBeInTheDocument();
+    });
+    expect(screen.queryByRole("dialog", { name: /move/i })).toBeNull();
   });
 
   it("moves the tree on, so the sidebar shows the new address", async () => {
@@ -169,6 +227,11 @@ describe("the move dialog", () => {
     });
   });
 });
+
+/** How many times one route was asked for. */
+function reads(route: string): number {
+  return apiMock.mock.calls.filter(([path]) => path === route).length;
+}
 
 /** Every read of this domain's tree, in order. */
 function trees(): string[] {
