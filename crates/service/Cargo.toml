@@ -42,6 +42,13 @@ rmcp = { workspace = true, features = [
     "server",
     "client",
     "macros",
+    # The elicitation surface a confirmation round is built from (SEP-2322
+    # MRTR): `delete_engram` and the two edit verbs answer `input_required`
+    # with one form question rather than acting straight away, whenever the
+    # peer is on 2026-07-28 and declared it can put a question to its user.
+    # Not `request-state`: these flows are stateless, the client's answer is
+    # the whole state, and nothing is sealed into an echoed handle.
+    "elicitation",
     "transport-async-rw",
     "transport-io",
     "transport-streamable-http-server",

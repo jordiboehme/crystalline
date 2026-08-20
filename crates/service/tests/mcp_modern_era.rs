@@ -220,6 +220,28 @@ fn modern(id: u32, method: &str, mut params: Value) -> Value {
     request(id, method, params)
 }
 
+/// [`modern_meta`] from a client that can put a question to its user: the same
+/// two required keys, with an `elicitation` capability declared beside them.
+///
+/// Capabilities travel per request in this era rather than per session
+/// (`RequestContext::client_capabilities` reads `_meta` first and reads only
+/// `_meta` once the metadata latch is armed, rmcp 3.1.2 `service.rs:1243-1251`),
+/// so one connection can send both shapes and the two halves of the gate are
+/// testable against the same server.
+fn eliciting_meta() -> Value {
+    json!({
+        "io.modelcontextprotocol/protocolVersion": ERA,
+        "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "form": {} } },
+        "io.modelcontextprotocol/clientInfo": { "name": "modern-era-test", "version": "9.9.9" },
+    })
+}
+
+/// A modern request from an eliciting client.
+fn eliciting(id: u32, method: &str, mut params: Value) -> Value {
+    params["_meta"] = eliciting_meta();
+    request(id, method, params)
+}
+
 /// The three fields SEP-2549 and SEP-2322 put on a complete result for a
 /// modern peer. `ttlMs: 0` and `cacheScope: "public"` are what rmcp's own
 /// `#[tool_handler]` emits (`rmcp-macros-3.1.2/src/tool_handler.rs:79-81`), so
@@ -834,4 +856,258 @@ async fn a_handshake_declaring_the_era_is_served_and_gets_no_session() {
         "a bare follow-up has no session to present:\n{}",
         head_of(&bare)
     );
+}
+
+// --- the confirmation round (SEP-2322 MRTR) ---------------------------------
+//
+// `delete_engram` is the first tool that answers a round of its own. The gate
+// is two-sided and both sides are proved here: the peer must be on this era
+// *and* must have declared that it can put a question to its user. A peer
+// failing either half is served exactly what 0.15.0 served it, which is the
+// contrast the last two tests carry.
+
+/// The arguments that delete the engram the helper below writes.
+fn delete_doomed(responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "delete_engram",
+        "arguments": { "domain": "eng", "identifier": "doomed" },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The client's answer to the `confirm` question, as an `ElicitResult`.
+fn answer(action: &str, confirm: bool) -> Value {
+    json!({ "confirm": { "action": action, "content": { "confirm": confirm } } })
+}
+
+/// Open a modern connection by writing the engram the delete tests kill, and
+/// hand back both the connection and the file that must still be there.
+async fn doomed_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
+    let mut wire = h.stdio().await;
+    let written = wire
+        .open(modern(
+            1,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "title": "Doomed",
+                    "content": "Delete me.",
+                },
+            }),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the engram to delete has to exist first: {written}"
+    );
+    let path = h.root.join("eng/doomed.md");
+    assert!(path.exists(), "the write landed on disk");
+    (wire, path)
+}
+
+/// Round one: an eliciting modern peer is asked before anything is deleted.
+///
+/// The whole point is the negative half of the assertion - the file is still
+/// there when the question comes back - because an `input_required` result
+/// that had already deleted the engram would be a confirmation in name only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_eliciting_delete_gets_a_confirmation_question_first() {
+    let h = Harness::new().await;
+    let (mut wire, path) = doomed_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", delete_doomed(None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than a deletion: {asked}"
+    );
+
+    let question = &result["inputRequests"]["confirm"];
+    assert_eq!(
+        question["method"],
+        json!("elicitation/create"),
+        "the round is an elicitation keyed `confirm`: {asked}"
+    );
+    let schema = &question["params"]["requestedSchema"];
+    assert_eq!(
+        schema["properties"]["confirm"]["type"],
+        json!("boolean"),
+        "one boolean property: {asked}"
+    );
+    assert_eq!(
+        schema["required"],
+        json!(["confirm"]),
+        "and it is required: {asked}"
+    );
+
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("eng/doomed"),
+        "the question names what dies: {message}"
+    );
+    assert!(
+        message.contains("cannot be undone"),
+        "and says so plainly: {message}"
+    );
+
+    assert!(
+        path.exists(),
+        "round one deletes nothing: {}",
+        path.display()
+    );
+}
+
+/// Round two with a yes: the same call, now carrying the answer, deletes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_delete_round_two_deletes() {
+    let h = Harness::new().await;
+    let (mut wire, path) = doomed_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", delete_doomed(None)))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            delete_doomed(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the confirmed round deletes: {done}"
+    );
+    assert_eq!(
+        done["result"]["resultType"],
+        json!("complete"),
+        "and it is an ordinary complete result: {done}"
+    );
+    assert!(!path.exists(), "the engram is gone: {}", path.display());
+}
+
+/// Round two with a no: the call refuses and the engram survives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_delete_round_two_deletes_nothing() {
+    let h = Harness::new().await;
+    let (mut wire, path) = doomed_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", delete_doomed(None)))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let refused = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            delete_doomed(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "a decline is a refusal the model can read: {refused}"
+    );
+    let text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("nothing was deleted"),
+        "and it says what did not happen: {text}"
+    );
+    assert!(
+        path.exists(),
+        "the engram survives a decline: {}",
+        path.display()
+    );
+}
+
+/// A modern peer that declared no elicitation capability gets 0.15.0's
+/// behaviour: the delete happens on the first call, with no round at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_peer_without_elicitation_deletes_immediately() {
+    let h = Harness::new().await;
+    let (mut wire, path) = doomed_engram(&h).await;
+
+    let done = wire
+        .call(modern(2, "tools/call", delete_doomed(None)))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the delete runs on the first call: {done}"
+    );
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a peer that cannot answer a question is not asked one: {done}"
+    );
+    assert!(!path.exists(), "the engram is gone: {}", path.display());
+}
+
+/// A legacy peer is served byte for byte what it was before: no `resultType`
+/// at all, and the delete on the first call.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_peer_deletes_immediately_with_no_input_required() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+
+    let written = wire
+        .call(request(
+            2,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "title": "Doomed",
+                    "content": "Delete me.",
+                },
+            }),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the write lands: {written}"
+    );
+    let path = h.root.join("eng/doomed.md");
+    assert!(path.exists());
+
+    let done = wire
+        .call(request(3, "tools/call", delete_doomed(None)))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the delete runs on the first call: {done}"
+    );
+    assert!(
+        !done["result"]
+            .as_object()
+            .unwrap()
+            .contains_key("resultType"),
+        "a legacy result carries no discriminator: {done}"
+    );
+    assert!(!path.exists(), "the engram is gone: {}", path.display());
 }

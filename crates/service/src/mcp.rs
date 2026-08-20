@@ -158,6 +158,24 @@
 //! that stream, and its doc comment carries what a future dynamic list would
 //! have to do to announce itself.
 //!
+//! # Asking before destroying (SEP-2322)
+//!
+//! A tool that cannot be undone answers with a question instead of acting,
+//! whenever the peer can carry one: `delete_engram` returns an
+//! `input_required` result holding a single form elicitation, the client puts
+//! it to its user, and the same call arrives again with the answer beside the
+//! original arguments. [`confirmation_supported`], [`confirm_question`] and
+//! [`confirmed`] are the three halves of that, deliberately tool-agnostic.
+//!
+//! **The gate decides whether the flow exists at all, not how it behaves.** A
+//! peer below 2026-07-28 has no result shape to receive a question in, and a
+//! peer that never declared an elicitation capability has no way to ask its
+//! user; either one is served exactly what 0.15.0 served it, one call and one
+//! deletion, because a confirmation nobody can answer is a hang. Nothing here
+//! is a permission system: a client is free to answer its own question, and
+//! the CLI's own dispatch (`crate::client::dispatch_engine`) never asks at all,
+//! because the human already typed the verb.
+//!
 //! Every tool also advertises MCP tool annotations: a display `title` plus the
 //! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
 //! confirmation UX and batch the read-only calls. The hints are advisory only;
@@ -175,13 +193,15 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::prompt::PromptContext;
+use rmcp::handler::server::tool::InputResponses;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CacheScope, CallToolResult, ContentBlock, DiscoverResult, ErrorData, GetPromptRequestParams,
-    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
+    CacheScope, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult, ElicitRequest,
+    ElicitRequestParams, ElicitationSchema, ErrorData, GetPromptRequestParams, GetPromptResponse,
+    Implementation, InitializeRequestParams, InitializeResult, InputRequest, InputRequests,
+    InputRequiredResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, PromptMessage,
+    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
     ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo, SubscriptionFilter,
     Tool,
 };
@@ -328,6 +348,93 @@ fn peer_gets_cache_hints(context: &RequestContext<RoleServer>) -> bool {
     context
         .protocol_version()
         .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+/// The key the confirmation question and its answer are both filed under.
+///
+/// One name for the request in [`confirm_question`]'s `inputRequests` map, for
+/// the single boolean property inside that question's schema, and for the
+/// entry [`confirmed`] reads back out of the client's `inputResponses`.
+const CONFIRM_KEY: &str = "confirm";
+
+/// Whether this peer can be asked before a destructive tool acts.
+///
+/// Two conditions, both necessary. The revision has to be 2026-07-28 or newer,
+/// because SEP-2322's `input_required` result is what carries a question back
+/// on the same call and rmcp refuses to hand one to an older peer at all
+/// (`model/mrtr.rs:18-20`); that half is [`peer_gets_cache_hints`], reused
+/// rather than rewritten because it is the same era test under a name that
+/// happens to mention the first obligation we needed it for. And the client
+/// has to have said it can elicit, because a server that asks a client with no
+/// way to ask its user has simply hung the call.
+///
+/// **Any declared elicitation counts, including a bare `{}`.** The capability
+/// split into `form` and `url` sub-capabilities after elicitation shipped, so
+/// a client from before the split declares the empty object and means "yes,
+/// forms"; refusing that would silently drop the confirmation for the clients
+/// most likely to need it. The other direction is the price: a url-only client
+/// that cannot render a form question will decline it, and a decline is
+/// already a clean refusal that deletes nothing. Asking and being told no
+/// costs a round trip; not asking costs the confirmation.
+fn confirmation_supported(context: &RequestContext<RoleServer>) -> bool {
+    peer_gets_cache_hints(context)
+        && context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.elicitation.is_some())
+}
+
+/// One yes-or-no question, as the MRTR round a tool returns instead of acting.
+///
+/// A form elicitation with exactly one required boolean property, so a client
+/// has a schema to render and an unambiguous shape to send back. Nothing is
+/// sealed into `requestState` and none is asked for: the flows that use this
+/// are stateless by construction - the client echoes the original arguments on
+/// the retry and its answer is the whole of the state - which is why the
+/// `request-state` feature is not enabled on rmcp.
+fn confirm_question(message: String) -> InputRequiredResult {
+    let requested_schema = ElicitationSchema::builder()
+        .required_bool_property(CONFIRM_KEY, |schema| {
+            schema
+                .title("Confirm")
+                .description("Yes to go ahead. Anything else leaves everything as it is.")
+        })
+        .build()
+        .expect("the confirmation schema names the property it requires");
+    let mut requests = InputRequests::new();
+    requests.insert(
+        CONFIRM_KEY.to_string(),
+        InputRequest::Elicitation(ElicitRequest::new(
+            ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message,
+                requested_schema,
+            },
+        )),
+    );
+    InputRequiredResult::from_input_requests(requests)
+}
+
+/// What the client answered to [`confirm_question`], or `None` when it has not
+/// been asked yet.
+///
+/// `Some(true)` only for an accepted question whose content says `true`.
+/// `Some(false)` for everything else that is an answer: a decline, a cancel,
+/// an accept carrying `false`, or an accept whose content is missing the
+/// property it was asked for. `None` - the first round - when the call carries
+/// no responses at all or none under [`CONFIRM_KEY`].
+///
+/// The value is read as plain JSON rather than deserialized into
+/// `ElicitResult`, and the difference is the failure mode: `ElicitationAction`
+/// is a closed three-variant enum, so a client answering with an action a
+/// later revision adds would fail to deserialize and turn a "no" into an
+/// error. Read this way, anything that is not exactly `accept` is a no, which
+/// is the only reading that cannot delete something.
+fn confirmed(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
+    let answer = responses.as_ref()?.get(CONFIRM_KEY)?;
+    if answer["action"] != json!("accept") {
+        return Some(false);
+    }
+    Some(answer["content"][CONFIRM_KEY] == json!(true))
 }
 
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
@@ -794,7 +901,7 @@ impl McpServer {
     #[tool(
         name = "delete_engram",
         title = "Delete engram",
-        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment.",
+        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment. On a 2026-07-28 peer that declared an elicitation capability the first call deletes nothing and answers input_required instead: a confirmation question naming the engram, its domain and permalink and the attachments only it references, which the client puts to the user and answers by re-sending the same call with the confirmation; anything but a yes deletes nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -805,12 +912,33 @@ impl McpServer {
     async fn delete_engram(
         &self,
         Parameters(p): Parameters<DeleteParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        // The whole confirmation flow lives inside this gate, so a peer that
+        // cannot be asked is served exactly what it was served before the flow
+        // existed: one call, one delete, one `CallToolResult`.
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    let preview = self.engine.delete_preview(&p).await.map_err(to_error)?;
+                    return Ok(confirm_question(delete_question(&preview)).into());
+                }
+                Some(false) => {
+                    return refuse(
+                        "The delete was not confirmed, so nothing was deleted. Call delete_engram again if the user asks for it.",
+                    )
+                    .map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
+        }
         self.engine
             .delete_engram(&p)
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -2087,6 +2215,42 @@ fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+/// The sentence `delete_engram` asks before it acts, rendered from
+/// [`crate::engine::Engine::delete_preview`]'s two shapes.
+///
+/// **The attachment clause says "orphaned" rather than "deleted" because that
+/// is what happens.** Deleting an engram removes its markdown and its index
+/// rows; the files it referenced stay in the domain, and the ones nothing else
+/// referenced become exactly the orphaned attachments the maintenance sweep
+/// reports. Naming them is what lets the user delete those too, in the same
+/// breath, with the `assets/` form of this verb.
+fn delete_question(preview: &Value) -> String {
+    let domain = preview["domain"].as_str().unwrap_or_default();
+    if preview["attachment"] == json!(true) {
+        let path = preview["path"].as_str().unwrap_or_default();
+        let size = preview["size"].as_u64().unwrap_or_default();
+        return format!(
+            "Delete attachment '{path}' ({size} bytes) from '{domain}'? This cannot be undone."
+        );
+    }
+    let title = preview["title"].as_str().unwrap_or_default();
+    let permalink = preview["permalink"].as_str().unwrap_or_default();
+    let listed = preview["attachments"]
+        .as_array()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default();
+    let attachments = if listed.is_empty() { "none" } else { &listed };
+    format!(
+        "Delete '{title}' ({domain}/{permalink})? This leaves its sole-referent attachments orphaned: {attachments}. This cannot be undone."
+    )
 }
 
 /// A call-time refusal: the tool ran and could not do its job because a

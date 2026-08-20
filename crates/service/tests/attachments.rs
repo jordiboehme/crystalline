@@ -1438,3 +1438,128 @@ async fn an_attachment_delete_refuses_an_expected_checksum() {
         .unwrap();
     assert!(!root.join("assets/deck.png").exists());
 }
+
+// --- the delete preview -----------------------------------------------------
+//
+// `Engine::delete_preview` answers "what would this delete take with it"
+// without taking any of it, which is what the MCP confirmation round asks
+// before it acts. Its attachment list is the part with real logic in it: the
+// same referent count the cross-domain move uses, screened against what the
+// domain actually holds.
+
+/// The preview names the attachments this engram is the last referent of, and
+/// nothing else: not one another engram still uses, and not one nothing holds.
+#[tokio::test]
+async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_referent_of() {
+    let (_tmp, engine, root, _scratch) = named_fixture("preview-eng", "preview-scratch").await;
+    engine
+        .restore_engram(
+            "preview-eng",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "",
+                "![solo](assets/solo.png) ![both](assets/both.png) ![gone](assets/gone.png)",
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .restore_engram(
+            "preview-eng",
+            "peer.md",
+            &engram_source("Peer", "peer", "", "![both](assets/both.png)"),
+        )
+        .await
+        .unwrap();
+    for path in ["assets/solo.png", "assets/both.png"] {
+        engine
+            .attachment_write("preview-eng", path, PNG.to_vec())
+            .await
+            .unwrap();
+    }
+
+    let preview = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "note".to_string(),
+            domain: "preview-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(preview["domain"], "preview-eng", "{preview}");
+    assert_eq!(preview["permalink"], "note", "{preview}");
+    assert_eq!(preview["title"], "Note", "{preview}");
+    assert_eq!(preview["path"], "note.md", "{preview}");
+    assert_eq!(
+        preview["attachments"],
+        serde_json::json!(["assets/solo.png"]),
+        "one referent left for solo, two for both, and gone is not stored: {preview}"
+    );
+
+    // A preview previews. Everything it named is still exactly where it was.
+    assert!(root.join("note.md").exists());
+    assert_eq!(
+        engine.attachment_list("preview-eng").await.unwrap().len(),
+        2,
+        "no attachment was touched"
+    );
+}
+
+/// The `assets/` branch previews the attachment itself, refuses the checksum
+/// the delete refuses, and reports a miss as a miss rather than asking the
+/// user to confirm deleting nothing.
+#[tokio::test]
+async fn a_delete_preview_of_an_attachment_reports_its_size() {
+    let (_tmp, engine, _root, _scratch) = named_fixture("size-eng", "size-scratch").await;
+    engine
+        .attachment_write("size-eng", "assets/deck.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    let preview = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview["attachment"], true, "{preview}");
+    assert_eq!(preview["path"], "assets/deck.png", "{preview}");
+    assert_eq!(preview["size"], PNG.len(), "{preview}");
+    assert!(
+        preview.get("permalink").is_none(),
+        "no engram was involved: {preview}"
+    );
+
+    let refused = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: Some("0".repeat(64)),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Invalid(_)), "{refused}");
+
+    let missing = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/never-there.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, EngineError::NotFound(_)), "{missing}");
+
+    assert!(
+        engine
+            .attachment_read("size-eng", "assets/deck.png")
+            .await
+            .is_ok(),
+        "a preview deletes nothing"
+    );
+}

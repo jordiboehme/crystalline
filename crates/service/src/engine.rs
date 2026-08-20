@@ -2120,16 +2120,7 @@ impl Engine {
         dest_domain: &str,
         content: &str,
     ) -> (Vec<AttachmentCarry>, Vec<String>) {
-        let parsed = parse_engram(content).ok();
-        let body = parsed
-            .as_ref()
-            .map_or(content, |engram| engram.body.as_str());
-        let mut candidates = crystalline_core::find_asset_refs(body);
-        if let Some(claim) = parsed.as_ref().and_then(|e| asset_claim(&e.frontmatter))
-            && !candidates.contains(&claim)
-        {
-            candidates.push(claim);
-        }
+        let candidates = referenced_asset_paths(content);
         if candidates.is_empty() {
             return (Vec::new(), Vec::new());
         }
@@ -2301,9 +2292,11 @@ impl Engine {
     /// files, which is where its frontmatter actually is, and a virtual domain
     /// from the database, which is where its whole engram actually is.
     ///
-    /// That is one file read per engram in the source domain on a
-    /// cross-domain move that carries attachments. It is the price of counting
-    /// claims at all, and the verb is rare.
+    /// That is one file read per engram in the domain, on a cross-domain move
+    /// that carries attachments and on the confirmation preview of a delete
+    /// whose engram references one ([`Engine::sole_referent_attachments`]). It
+    /// is the price of counting claims at all, both verbs are rare, and an
+    /// engram that references no attachment pays none of it.
     ///
     /// `None` when the text is genuinely absent (a row the index still lists
     /// for a file that is gone): text that is not there references nothing. A
@@ -3978,6 +3971,112 @@ impl Engine {
             "path": desc.path,
             "deleted": true,
         }))
+    }
+
+    /// What [`Engine::delete_engram`] would remove, without removing any of it.
+    ///
+    /// Written for the confirmation round the MCP layer opens on a peer that
+    /// can put a question to its user: the question has to name what dies, and
+    /// naming it means resolving the identifier first. Every refusal the delete
+    /// itself would raise on the way to the file - an unknown domain, an
+    /// identifier that resolves to nothing or to two things, a read-only
+    /// server, an `expected_checksum` on an attachment - is raised here too, so
+    /// a call that cannot succeed fails before a human is asked to approve it
+    /// rather than after.
+    ///
+    /// Two shapes, one per branch of the delete. An `assets/` identifier
+    /// previews `{domain, path, size, attachment: true}`; anything else
+    /// previews `{domain, permalink, title, path, attachments}`, where
+    /// `attachments` is the stored attachments **only this engram references**.
+    /// Those files are not deleted with it - `delete_engram` removes the
+    /// markdown and its rows and nothing else - so what the list says is which
+    /// attachments the delete leaves with no referent at all.
+    ///
+    /// The `expected_checksum` comparison is deliberately not repeated here:
+    /// the file can change between the two rounds, so the guard is worth
+    /// nothing unless it runs in the round that actually deletes, which is
+    /// where it already runs.
+    pub async fn delete_preview(&self, p: &DeleteParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if let Some(path) = attachment_identifier(&p.identifier) {
+            if p.expected_checksum.is_some() {
+                return Err(EngineError::Invalid(format!(
+                    "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
+                )));
+            }
+            // The bytes are read and dropped for one number. It is the same
+            // read the delete's own surfaces make, it is bounded by
+            // `MAX_ATTACHMENT_BYTES`, and it is what makes an attachment that
+            // is not there answer `NotFound` now instead of after the user has
+            // said yes to deleting it.
+            let (_, row) = self.attachment_read(&p.domain, &path).await?;
+            return Ok(json!({
+                "domain": p.domain,
+                "path": path,
+                "size": row.size,
+                "attachment": true,
+            }));
+        }
+        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let content = self.load_content(&source, &desc).await?;
+        let attachments = self.sole_referent_attachments(&desc, &content).await;
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "title": desc.title,
+            "path": desc.path,
+            "attachments": attachments,
+        }))
+    }
+
+    /// The stored attachments `src` refers to that nothing else in its domain
+    /// refers to.
+    ///
+    /// Counted by the same pair the cross-domain move counts with
+    /// ([`referenced_asset_paths`] and [`Engine::shared_asset_paths`]), so
+    /// "only this engram uses it" means one thing across the crate, including
+    /// the part where a count that fails resolves to shared and therefore
+    /// names nothing.
+    ///
+    /// Screened against the domain's attachment rows at the end, one metadata
+    /// query and no bytes: a reference to a file the domain does not hold is a
+    /// dangling reference the sweep already reports, and a delete does not
+    /// orphan something that was never there.
+    async fn sole_referent_attachments(
+        &self,
+        src: &EngramDescriptor,
+        content: &str,
+    ) -> Vec<String> {
+        let candidates = referenced_asset_paths(content);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let shared = self.shared_asset_paths(src, &candidates).await;
+        let mut sole: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| !shared.contains(path))
+            .collect();
+        if sole.is_empty() {
+            return sole;
+        }
+        let stored: HashSet<String> = match self.attachment_list(&src.domain).await {
+            Ok(rows) => rows.into_iter().map(|row| row.path).collect(),
+            Err(e) => {
+                // The screen is a refinement, not the decision. When it cannot
+                // run, the unscreened list is still every path this engram is
+                // the last referent of, which is the honest answer minus one
+                // filter.
+                tracing::warn!(
+                    "the attachments of '{}' could not be listed ({e}); the delete preview names every path the engram is the last referent of",
+                    src.domain
+                );
+                return sole;
+            }
+        };
+        sole.retain(|path| stored.contains(path));
+        sole
     }
 
     // --- search --------------------------------------------------------------
@@ -9804,6 +9903,29 @@ fn resolve_shared(counted: Result<HashSet<String>>, candidates: &[String]) -> Ha
             candidates.iter().cloned().collect()
         }
     }
+}
+
+/// Every attachment one engram's own text points at: the `assets/` references
+/// in its body plus the one an `analyzes` claim in its frontmatter names,
+/// deduplicated and in reference order.
+///
+/// The one enumeration of "what does this engram use", shared by the
+/// cross-domain move (which has to carry them) and by
+/// [`Engine::delete_preview`] (which has to name the ones the delete leaves
+/// behind). Text that will not parse is read as a body on its own rather than
+/// dropped, because a reference in unparseable text is still a reference.
+fn referenced_asset_paths(content: &str) -> Vec<String> {
+    let parsed = parse_engram(content).ok();
+    let body = parsed
+        .as_ref()
+        .map_or(content, |engram| engram.body.as_str());
+    let mut paths = crystalline_core::find_asset_refs(body);
+    if let Some(claim) = parsed.as_ref().and_then(|e| asset_claim(&e.frontmatter))
+        && !paths.contains(&claim)
+    {
+        paths.push(claim);
+    }
+    paths
 }
 
 /// The part of an attachment path below the reserved folder (`notes/shot.png`
