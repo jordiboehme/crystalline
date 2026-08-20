@@ -75,9 +75,6 @@ import { engramRoute } from "../paths";
 /** Every domain, as the filter writes it. */
 const EVERY_DOMAIN = "";
 
-/** The rule whose subject is an attachment nothing references. */
-const ORPHAN_ATTACHMENT_RULE = "V108";
-
 /**
  * One group of findings under one heading.
  *
@@ -442,7 +439,10 @@ function FindingRow({
   const noteId = useId();
 
   const anchored = finding.permalink !== "";
-  const orphanAttachment = finding.rule === ORPHAN_ATTACHMENT_RULE;
+  // The path the sweep named, not the words the row is drawn with: what gets
+  // deleted and what gets shown are read from different fields on purpose, so
+  // a future prettier title cannot aim the delete somewhere else.
+  const attachmentPath = finding.attachmentPath;
   // Re-acknowledging is the same write: the server recomputes the scope, so
   // the entry it replaces is the one that stopped matching.
   const ackLabel = finding.ackStale ? "Re-acknowledge" : "Acknowledge";
@@ -568,7 +568,7 @@ function FindingRow({
             Unacknowledge
           </button>
         )}
-        {canWrite && orphanAttachment && asking === null && (
+        {canWrite && attachmentPath !== null && asking === null && (
           <button
             type="button"
             className={BUTTON.ghost}
@@ -634,10 +634,10 @@ function FindingRow({
           </button>
         </div>
       )}
-      {asking === "delete" && (
+      {asking === "delete" && attachmentPath !== null && (
         <div className="mt-2 flex flex-col gap-2">
           <span className="text-caption text-slate-600 dark:text-slate-300">
-            {`Delete ${finding.title}? Nothing references it, and the bytes do not come back.`}
+            {`Delete ${attachmentPath}? Nothing references it, and the bytes do not come back.`}
           </span>
           <span className="flex flex-wrap gap-2">
             <button
@@ -645,7 +645,7 @@ function FindingRow({
               className={BUTTON.destructive}
               disabled={busy}
               onClick={() => {
-                run(() => deleteAttachment(finding.domain, finding.title));
+                run(() => deleteAttachment(finding.domain, attachmentPath));
               }}
             >
               Delete

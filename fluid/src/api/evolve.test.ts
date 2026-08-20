@@ -191,6 +191,8 @@ describe("the evolve payload", () => {
       domain: "eng",
       permalink: "notes/old-way",
       title: "The old way",
+      // Nothing to delete: only the orphaned-attachment rule names a file.
+      attachmentPath: null,
       line: null,
       finding: "supersedes target still current",
       evidence: "supersedes eng/new-way; new-way is stable",
@@ -257,9 +259,15 @@ describe("the evolve payload", () => {
     });
 
     expect(queue.queue.map((row) => row.permalink)).toEqual(["", "orphan"]);
-    expect(defined(queue.queue[0], "the anchorless finding").title).toBe(
-      "assets/2026/08/orphan.png",
-    );
+    const anchorless = defined(queue.queue[0], "the anchorless finding");
+    expect(anchorless.title).toBe("assets/2026/08/orphan.png");
+    // The path a delete is addressed to is read straight off the row, with no
+    // fallback of its own: the same string today as the title, and a separate
+    // field so it stays the path if the title ever stops being one.
+    expect(anchorless.attachmentPath).toBe("assets/2026/08/orphan.png");
+    expect(
+      defined(queue.queue[1], "the orphan engram finding").attachmentPath,
+    ).toBeNull();
     expect(queue.families).toEqual([]);
     expect(queue.actions).toEqual([]);
     expect(queue.truncations).toEqual(["eng - capped"]);
@@ -274,6 +282,18 @@ describe("the evolve payload", () => {
     });
 
     expect(defined(queue.queue[0], "the tag drift finding").title).toBe("eng");
+  });
+
+  it("gives an orphan row that names no path nothing to delete", () => {
+    // The title falls back to the domain; the delete path never does. A row
+    // with no path names no file, and `/files/eng` is not a file.
+    const queue = readEvolveQueue({
+      queue: [{ n: 1, priority: 55, rule: "V108", domain: "eng" }],
+    });
+
+    const row = defined(queue.queue[0], "the pathless orphan finding");
+    expect(row.title).toBe("eng");
+    expect(row.attachmentPath).toBeNull();
   });
 
   it("still refuses a row with no rule or no domain", () => {

@@ -579,10 +579,46 @@ describe("a finding with no engram behind it", () => {
       expect(removals).toHaveLength(1);
     });
     expect(removals[0]?.method).toBe("DELETE");
+    // The exact path the sweep named, read off the row's own field rather than
+    // off whatever the row is drawn with.
+    expect(
+      requested().filter((path) => path.startsWith("/domains/eng/files/")),
+    ).toEqual(["/domains/eng/files/assets/2026/08/orphan.png"]);
     // The queue it was drawn from is stale the moment the file is gone.
     await waitFor(() => {
       expect(sweeps().length).toBeGreaterThan(before);
     });
+  });
+
+  it("offers no delete for an orphan row that names no path", async () => {
+    // The display title has a fallback chain - it ends at the domain name -
+    // and the delete deliberately has none. A row with no path names no file,
+    // so the irreversible action is simply not there rather than aimed at
+    // `eng` because that is what the heading says.
+    const { title: _dropped, ...pathless } = orphanFinding();
+    const base = evolvePayload();
+    await open({
+      "/evolve": () =>
+        evolvePayload({
+          total: 4,
+          count: 4,
+          families: [
+            { family: "temporal", findings: 1 },
+            { family: "structure", findings: 2 },
+            { family: "redundancy", findings: 1 },
+          ],
+          queue: [...base.queue, pathless],
+        }),
+    });
+
+    const orphan = defined(
+      rows(await section(/^Structure/))[1],
+      "the orphan row",
+    );
+    expect(orphan).toHaveTextContent("eng");
+    expect(
+      within(orphan).queryByRole("button", { name: "Delete attachment" }),
+    ).toBeNull();
   });
 
   it("asks before it deletes, and takes no for an answer", async () => {

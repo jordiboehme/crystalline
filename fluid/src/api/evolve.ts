@@ -29,6 +29,12 @@ import type { AckBody } from "./model";
 /** The detector families, in the catalog's own order. */
 export const EVOLVE_FAMILIES = ["temporal", "structure", "redundancy"] as const;
 
+/**
+ * The rule whose subject is an attachment nothing references, and the only one
+ * whose row names a file rather than an engram.
+ */
+export const ORPHAN_ATTACHMENT_RULE = "V108";
+
 /** One detector family. */
 export type EvolveFamily = (typeof EVOLVE_FAMILIES)[number];
 
@@ -98,6 +104,18 @@ export interface EvolveFinding {
    * for one that carries neither.
    */
   title: string;
+  /**
+   * The attachment path an orphaned-attachment finding is about, exactly as
+   * the sweep sent it, or null for every other rule.
+   *
+   * Separate from {@link title} on purpose, even though the sweep puts the
+   * same string in both today. `title` is what a reader is shown and may one
+   * day be prettified - shortened to a filename, decorated with a size - while
+   * this is what a DELETE is addressed to. Binding the irreversible call to
+   * the raw field keeps a change to the first from silently deleting the wrong
+   * file, or nothing at all.
+   */
+  attachmentPath: string | null;
   /** The line the rule fired on, or null when the finding is about the whole. */
   line: number | null;
   /** What was found, in a few words. */
@@ -198,6 +216,11 @@ function readFinding(value: unknown): EvolveFinding | null {
     // usually names its own subject. The one that does not - tag drift - is
     // about the domain, which is then the truest subject there is.
     title: asString(record?.title) ?? (permalink === "" ? domain : permalink),
+    // No fallback here, deliberately: a row that carries no path names no file
+    // to delete, and guessing one from the domain or the permalink would aim
+    // an irreversible call at something nobody chose.
+    attachmentPath:
+      rule === ORPHAN_ATTACHMENT_RULE ? asString(record?.title) : null,
     line: asNumber(record?.line),
     finding: asString(record?.finding) ?? "",
     evidence: asString(record?.evidence) ?? "",
