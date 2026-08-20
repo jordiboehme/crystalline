@@ -13,11 +13,15 @@
 
 use axum::Json;
 use axum::extract::State;
+use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
 use utoipa::IntoParams;
 
-use super::{ApiError, ApiQuery, ProblemDetail, RestState, csv};
+use super::auth::Identity;
+use super::{
+    ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, csv, refuse_read_only,
+};
 use crate::params::EvolveParams;
 
 /// The query string `GET /evolve` takes, mirroring [`EvolveParams`] minus its
@@ -55,6 +59,12 @@ pub struct EvolveQuery {
     #[serde(default)]
     #[param(example = 1)]
     page: Option<usize>,
+    /// Include the findings acknowledgments suppressed, each marked
+    /// `acknowledged` with the scope and note that silenced it. Off by default:
+    /// the queue is what still needs deciding.
+    #[serde(default)]
+    #[param(example = true)]
+    include_acknowledged: Option<bool>,
 }
 
 /// `GET /evolve` - the consolidation queue: the ranked list of what the
@@ -78,6 +88,15 @@ pub struct EvolveQuery {
 /// `families` counts the whole filtered result rather than the page, which is
 /// what section headings are drawn from, and `truncations` names any per-domain
 /// cap that fired so a short queue is never mistaken for a finished one.
+///
+/// `acknowledged` counts what acknowledgments kept out of the queue, whole and
+/// per family, and those counts are domain-wide rather than page-wide: they are
+/// taken before `families`, `rules` and `min_priority` narrow the result, so a
+/// short queue is never mistaken for a healthy one. A row whose acknowledgment
+/// was given for evidence that has since changed comes back carrying
+/// `ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass
+/// `include_acknowledged` to see the suppressed rows themselves, each marked
+/// `acknowledged` and carrying the same two fields.
 ///
 /// `today` is not exposed. The temporal rules are evaluated as of now, which is
 /// the only question a page asks; the tool takes a pinned date for a run that
@@ -112,6 +131,10 @@ pub struct EvolveQuery {
                 "limit": 10,
                 "count": 2,
                 "families": [{ "family": "temporal", "findings": 2 }],
+                "acknowledged": {
+                    "total": 1,
+                    "by_family": { "temporal": 0, "structure": 1, "redundancy": 0 }
+                },
                 "queue": [{
                     "n": 1,
                     "priority": 58,
@@ -179,9 +202,211 @@ pub async fn queue(
             min_priority: query.min_priority,
             limit: query.limit,
             page: query.page,
+            include_acknowledged: query.include_acknowledged.unwrap_or(false),
             // Never from the caller: see the type and the operation doc above.
             today: None,
         })
         .await?;
     Ok(Json(value))
+}
+
+/// What the two acknowledgment endpoints take: which engram, which rule and,
+/// on the way in, why.
+///
+/// The permalink rides in the body rather than the path for the same reason
+/// `RetireBody`'s does: a permalink is a path of its own, so an action segment
+/// after a wildcard would be eaten by the wildcard.
+#[derive(Debug, Deserialize, utoipa::ToSchema)]
+#[schema(description = "Acknowledge one finding on one engram: the engram by \
+                        permalink, the rule id that fired and an optional note \
+                        saying why it is intentional. The scope an \
+                        acknowledgment holds for is never sent - the server \
+                        computes it by running detection.")]
+pub struct AckBody {
+    /// The engram the finding fired on.
+    #[schema(example = "notes/beta")]
+    permalink: String,
+    /// The rule id to acknowledge, for example `V101`.
+    #[schema(example = "V101")]
+    rule: String,
+    /// Why the finding is intentional. Ignored on `DELETE`.
+    #[serde(default)]
+    #[schema(example = "lineage citation, keep")]
+    note: Option<String>,
+}
+
+/// `POST /domains/{domain}/evolve/ack` - rule a finding intentional so future
+/// sweeps count it instead of raising it.
+///
+/// The evidence the acknowledgment is given for is the server's to determine:
+/// it runs detection over the engram's domain, takes the firing finding's scope
+/// and stores it with the entry. That is what makes an acknowledgment hold
+/// while its evidence holds and come back marked stale when the evidence
+/// changes, without a human or an agent ever handling a fingerprint.
+///
+/// The entry lands in the engram's own frontmatter through the same edit path
+/// the MCP `set_frontmatter` verb uses, so it travels with team sharing,
+/// survives a resync and can be removed by hand.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/evolve/ack",
+    tag = "maintenance",
+    operation_id = "acknowledge_finding",
+    summary = "Acknowledge one evolve finding on one engram.",
+    description = "Records `evolve_ack` on the engram: the rule, the evidence \
+                   the server computed it fired on, the note, the acknowledging \
+                   user and the instant. A matching acknowledgment keeps the \
+                   finding out of the queue and counted in `acknowledged`; when \
+                   the evidence changes the finding returns marked `ack_stale`.",
+    params(("domain" = String, Path, description = "The engram's domain.")),
+    request_body = AckBody,
+    responses(
+        (
+            status = 200,
+            description = "The stored entry.",
+            body = Object,
+            example = json!({
+                "rule": "V101",
+                "scope": "eng/old-runbook",
+                "note": "lineage citation, keep",
+                "by": "human:jordi",
+                "at": "2026-08-20T09:00:00+00:00"
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one: an identity with \
+                           no account behind it never writes.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an editor, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The rule id is not one the sweep catalog holds.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn acknowledge(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<AckBody>,
+) -> Result<Json<Value>, ApiError> {
+    let caller = identity.require_editor()?;
+    refuse_read_only(&state)?;
+    let entry = state
+        .engine
+        .acknowledge_finding_as(
+            &domain,
+            &body.permalink,
+            &body.rule,
+            body.note.as_deref(),
+            Some(&format!("human:{}", caller.name())),
+        )
+        .await?;
+    Ok(Json(entry))
+}
+
+/// `DELETE /domains/{domain}/evolve/ack` - withdraw an acknowledgment, so the
+/// finding rejoins the queue on the next sweep.
+///
+/// The half deliberately missing from the MCP surface: an agent may silence a
+/// finding a person ruled intentional, and un-silencing it is the person's
+/// call, made here or by editing the file.
+#[utoipa::path(
+    delete,
+    path = "/api/v1/domains/{domain}/evolve/ack",
+    tag = "maintenance",
+    operation_id = "unacknowledge_finding",
+    summary = "Withdraw an acknowledgment.",
+    description = "Removes the engram's `evolve_ack` entry for that rule, \
+                   leaving its other entries alone. 404 when the engram carries \
+                   none for the rule, rather than reporting a removal that did \
+                   not happen.",
+    params(("domain" = String, Path, description = "The engram's domain.")),
+    request_body = AckBody,
+    responses(
+        (status = 204, description = "The acknowledgment is gone."),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "Not an editor, no CSRF token echoed, read-only \
+                           instance, or a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain or engram, or no acknowledgment for \
+                           that rule on it.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "The rule id is not one the sweep catalog holds.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn unacknowledge(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<AckBody>,
+) -> Result<StatusCode, ApiError> {
+    let caller = identity.require_editor()?;
+    refuse_read_only(&state)?;
+    let removed = state
+        .engine
+        .unacknowledge_finding_as(
+            &domain,
+            &body.permalink,
+            &body.rule,
+            Some(&format!("human:{}", caller.name())),
+        )
+        .await?;
+    if !removed {
+        return Err(ApiError::not_found(format!(
+            "no acknowledgment of {} on '{}' in domain '{}'",
+            body.rule.trim().to_ascii_uppercase(),
+            body.permalink,
+            domain
+        )));
+    }
+    Ok(StatusCode::NO_CONTENT)
 }

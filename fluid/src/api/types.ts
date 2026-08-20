@@ -215,7 +215,7 @@ export interface paths {
         };
         /**
          * Download a whole domain as a zip.
-         * @description Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.
+         * @description Admin only. Every file of the domain - MANIFEST and the `assets/` attachments included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.
          */
         get: operations["download_domain_archive"];
         put?: never;
@@ -241,6 +241,8 @@ export interface paths {
          *
          *     `policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.
          *
+         *     Entries under `assets/` are stored as attachments, through the same gates an upload to the file route passes, and follow the same same-path policy; a restored attachment marks the domain as owing a consolidation sweep, since it is a file the agent has not read yet.
+         *
          *     The same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.
          */
         post: operations["import_domain_archive"];
@@ -263,9 +265,31 @@ export interface paths {
          * Dry-run an archive upload: what each entry would become.
          * @description Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.
          *
-         *     Nothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.
+         *     Entries under `assets/` are attachments rather than engrams: they are reported with their byte count and screened by the attachment path rules, the extension allowlist and the size ceiling, each refusal naming which of the three answered; an attachment past the 10 MiB ceiling is refused on its own rather than refusing the archive.
+         *
+         *     Nothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, a markdown entry over 1 MiB or a whole archive over 200 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.
          */
         post: operations["preview_domain_archive_import"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/attachments": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Every attachment a domain carries.
+         * @description Metadata only, ordered by path: no bytes are read, so listing a domain full of slide decks costs one query. Each row carries the path to fetch it by, its mime, its size, when it last changed and its checksum.
+         */
+        get: operations["list_attachments"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -315,7 +339,7 @@ export interface paths {
          * One engram in full.
          * @description Its frontmatter, its markdown as written and the references the engine resolves around it.
          *
-         *     The response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back.
+         *     The response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          */
         get: operations["get_engram"];
         /**
@@ -333,6 +357,62 @@ export interface paths {
          * @description A file domain removes the file from disk; a virtual domain drops the database rows. Guarded the same way `save` is: 428 with no `If-Match`, 412 when the token is stale (carrying the version the server holds now), 204 once it lands. A read-only instance answers 403 ahead of the precondition check, so it is never 428.
          */
         delete: operations["delete_engram"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/evolve/ack": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Acknowledge one evolve finding on one engram.
+         * @description Records `evolve_ack` on the engram: the rule, the evidence the server computed it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`.
+         */
+        post: operations["acknowledge_finding"];
+        /**
+         * Withdraw an acknowledgment.
+         * @description Removes the engram's `evolve_ack` entry for that rule, leaving its other entries alone. 404 when the engram carries none for the rule, rather than reporting a removal that did not happen.
+         */
+        delete: operations["unacknowledge_finding"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/files/{path}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One attachment's bytes.
+         * @description Serves the stored bytes under the mime the extension allowlist assigns - never one guessed from the content and never one the uploader claimed. Every answer carries `X-Content-Type-Options: nosniff` and a `default-src 'none'; sandbox` content security policy, so an attachment can never script against the instance serving it. Images, PDFs and text are dispositioned `inline`; the office formats arrive as a download.
+         *
+         *     The `ETag` is the strong quoted SHA-256 of the bytes, so `If-None-Match` answers 304 without a body, and `Cache-Control: no-cache` keeps a stored copy revalidating instead of going heuristically fresh, so a file replaced at the same path is picked up on its next use. A malformed path is 400 with the rule that refused it; a well-formed path holding nothing is 404.
+         */
+        get: operations["read_attachment"];
+        /**
+         * Upload an attachment, creating or replacing it.
+         * @description Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.
+         *
+         *     The path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon, `#` or `%`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.
+         */
+        put: operations["write_attachment"];
+        post?: never;
+        /**
+         * Delete an attachment.
+         * @description Editor only. Removes the bytes and the metadata row together. An engram that still references the path keeps its reference - the consolidation sweep is what reports the dangling link, rather than this route rewriting somebody's markdown.
+         */
+        delete: operations["delete_attachment"];
         options?: never;
         head?: never;
         patch?: never;
@@ -371,7 +451,7 @@ export interface paths {
          * The domain's MANIFEST markdown as written.
          * @description The source, not a reduction of it, so a client can render or edit it directly.
          *
-         *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.
+         *     The response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.
          */
         get: operations["get_domain_manifest"];
         /**
@@ -506,6 +586,15 @@ export interface paths {
          *     `families` counts the whole filtered result rather than the page, which is
          *     what section headings are drawn from, and `truncations` names any per-domain
          *     cap that fired so a short queue is never mistaken for a finished one.
+         *
+         *     `acknowledged` counts what acknowledgments kept out of the queue, whole and
+         *     per family, and those counts are domain-wide rather than page-wide: they are
+         *     taken before `families`, `rules` and `min_priority` narrow the result, so a
+         *     short queue is never mistaken for a healthy one. A row whose acknowledgment
+         *     was given for evidence that has since changed comes back carrying
+         *     `ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass
+         *     `include_acknowledged` to see the suppressed rows themselves, each marked
+         *     `acknowledged` and carrying the same two fields.
          *
          *     `today` is not exposed. The temporal rules are evaluated as of now, which is
          *     the only question a page asks; the tool takes a pinned date for a run that
@@ -816,8 +905,34 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired and an optional note saying why it is intentional. The scope an acknowledgment holds for is never sent - the server computes it by running detection. */
+        AckBody: {
+            /**
+             * @description Why the finding is intentional. Ignored on `DELETE`.
+             * @example lineage citation, keep
+             */
+            note?: string | null;
+            /**
+             * @description The engram the finding fired on.
+             * @example notes/beta
+             */
+            permalink: string;
+            /**
+             * @description The rule id to acknowledge, for example `V101`.
+             * @example V101
+             */
+            rule: string;
+        };
         /** @description One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`. */
         ArchiveEntryReport: {
+            /**
+             * Format: int64
+             * @description How many bytes the entry holds, for an attachment. `null` for a
+             *     markdown entry, whose size a preview has no use for, and for an entry
+             *     that was refused before it was ever decompressed.
+             * @example 20480
+             */
+            bytes?: number | null;
             /**
              * @description The verify findings over this entry's markdown, the same families
              *     `POST /validate` runs. Empty for an entry that was never read.
@@ -857,12 +972,14 @@ export interface components {
             entries: components["schemas"]["ArchiveEntryReport"][];
             /**
              * @description Entries an archive may carry but a domain never imports: a MANIFEST, a
-             *     generated OKF index or log, anything that is not markdown.
+             *     generated OKF index or log, anything that is neither markdown nor an
+             *     attachment of an allowed type.
              */
             ignored: number;
             /**
-             * @description Entries refused as not importable: unparseable, not UTF-8 text, or
-             *     carrying a hard verify error. Never written under either policy.
+             * @description Entries refused as not importable: unparseable, not UTF-8 text,
+             *     carrying a hard verify error, or an attachment whose path or size the
+             *     rules refuse. Never written under either policy.
              */
             invalid: number;
             /** @description Preview only: entries that would be created. */
@@ -871,6 +988,41 @@ export interface components {
             skipped: number;
             /** @description Import only: entries written, created and overwritten together. */
             written: number;
+        };
+        /** @description One attachment a domain carries: where it lives, what it is, how big it is and when it last changed. */
+        AttachmentView: {
+            /**
+             * @description The mime the bytes are served under, derived from the extension.
+             * @example image/png
+             */
+            mime: string;
+            /**
+             * @description Last modification instant, RFC 3339.
+             * @example 2026-08-18T09:12:00+00:00
+             */
+            modified: string;
+            /**
+             * @description The domain-relative path, always under `assets/`.
+             * @example assets/architecture.png
+             */
+            path: string;
+            /**
+             * @description Lowercase hex SHA-256 of the bytes, the same token the read's `ETag`
+             *     carries.
+             * @example 9f2a1c05e2b7
+             */
+            sha256: string;
+            /**
+             * Format: int64
+             * @description Byte length.
+             * @example 20481
+             */
+            size: number;
+        };
+        /** @description Every attachment one domain carries, ordered by path. Metadata only: the bytes are fetched one file at a time. */
+        AttachmentsResponse: {
+            /** @description The rows, ordered by path. */
+            attachments: components["schemas"]["AttachmentView"][];
         };
         /**
          * @description The wire form of a 412: a problem detail carrying the version the server
@@ -1281,6 +1433,31 @@ export interface components {
              * @example ghp_xxxxxxxxxxxxxxxxxxxx
              */
             token: string;
+        };
+        /** @description The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry. */
+        UploadedAttachment: {
+            /**
+             * @description The mime the bytes will be served under.
+             * @example image/png
+             */
+            mime: string;
+            /**
+             * @description The domain-relative path it was stored at, the target an engram body
+             *     references.
+             * @example assets/architecture.png
+             */
+            path: string;
+            /**
+             * @description Lowercase hex SHA-256 of the stored bytes.
+             * @example 9f2a1c05e2b7
+             */
+            sha256: string;
+            /**
+             * Format: int64
+             * @description Byte length as stored.
+             * @example 20481
+             */
+            size: number;
         };
         /**
          * @description One account. Carries no password material, so it is safe to hand to a
@@ -2198,7 +2375,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The upload is past the surface's request-body limit. */
+            /** @description The upload is past the 64 MiB body limit these two archive routes accept, which is deliberately larger than the 10 MiB the rest of this API takes. */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2271,7 +2448,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The upload is past the surface's request-body limit. */
+            /** @description The upload is past the 64 MiB body limit these two archive routes accept, which is deliberately larger than the 10 MiB the rest of this API takes. */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -2282,6 +2459,56 @@ export interface operations {
             };
             /** @description The bytes are not a readable zip, or the archive fails hygiene - the detail names which rule. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_attachments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The rows, ordered by path. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AttachmentsResponse"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -2523,7 +2750,13 @@ export interface operations {
     get_engram: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description The quoted checksum of a version already held. A match answers 304 with no body.
+                 * @example "3f8a1c05e2"
+                 */
+                "If-None-Match"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;
@@ -2540,6 +2773,8 @@ export interface operations {
             /** @description The engine's own read payload, unchanged. */
             200: {
                 headers: {
+                    /** @description Always `no-cache`: store it, but revalidate before every use. */
+                    "cache-control"?: string;
                     /** @description The quoted checksum of the engram as read, the same token a later write compares an `expected_checksum` against. */
                     etag?: string;
                     [name: string]: unknown;
@@ -2567,6 +2802,13 @@ export interface operations {
                      */
                     "application/json": Record<string, never>;
                 };
+            };
+            /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description No identity. */
             401: {
@@ -2804,6 +3046,384 @@ export interface operations {
             };
         };
     };
+    acknowledge_finding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The engram's domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckBody"];
+            };
+        };
+        responses: {
+            /** @description The stored entry. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "at": "2026-08-20T09:00:00+00:00",
+                     *       "by": "human:jordi",
+                     *       "note": "lineage citation, keep",
+                     *       "rule": "V101",
+                     *       "scope": "eng/old-runbook"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one: an identity with no account behind it never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The rule id is not one the sweep catalog holds. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    unacknowledge_finding: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The engram's domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AckBody"];
+            };
+        };
+        responses: {
+            /** @description The acknowledgment is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Not an editor, no CSRF token echoed, read-only instance, or a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain or engram, or no acknowledgment for that rule on it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The rule id is not one the sweep catalog holds. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    read_attachment: {
+        parameters: {
+            query?: never;
+            header?: {
+                /**
+                 * @description The quoted SHA-256 of bytes already held. A match answers 304 with no body.
+                 * @example "9f2a1c05e2b7"
+                 */
+                "If-None-Match"?: string | null;
+            };
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description The domain-relative attachment path. It always starts with `assets/` and may contain slashes: `assets/diagrams/flow.png`.
+                 * @example assets/diagrams/flow.png
+                 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The bytes, under the mime the allowlist assigns. */
+            200: {
+                headers: {
+                    /** @description Always `no-cache`: store it, but revalidate before every use. */
+                    "cache-control"?: string;
+                    /** @description `inline` for images, PDFs and text; `attachment; filename="..."` otherwise. */
+                    "content-disposition"?: string;
+                    /** @description Always `default-src 'none'; sandbox`. */
+                    "content-security-policy"?: string;
+                    /** @description The strong quoted SHA-256 of the bytes served. */
+                    etag?: string;
+                    /** @description Always `nosniff`. */
+                    "x-content-type-options"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/octet-stream": string;
+                };
+            };
+            /** @description The `If-None-Match` token matches the stored bytes; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`, so the stored response it refreshes keeps having to revalidate. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The path breaks an attachment path rule: not under `assets/`, a `.` or `..` segment, a hidden segment, a refused character, too long, or an extension that is not on the allowlist. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or no attachment at that path. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    write_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description Where to store it, domain-relative and under `assets/`.
+                 * @example assets/diagrams/flow.png
+                 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        /** @description The raw file bytes. */
+        requestBody: {
+            content: {
+                "application/octet-stream": string;
+            };
+        };
+        responses: {
+            /** @description Stored. The path to reference it by, its mime, its size and its checksum. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["UploadedAttachment"];
+                };
+            };
+            /** @description The path breaks an attachment path rule or carries an extension that is not on the allowlist. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one: an anonymous identity never writes. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is over the 10 MiB limit this API accepts, which is also the attachment size ceiling. */
+            413: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    delete_attachment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /**
+                 * @description The attachment path.
+                 * @example assets/diagrams/flow.png
+                 */
+                path: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The path breaks an attachment path rule. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or no attachment at that path. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     get_inbound_references: {
         parameters: {
             query?: {
@@ -2930,7 +3550,13 @@ export interface operations {
     get_domain_manifest: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description The quoted checksum of a version already held. A match answers 304 with no body.
+                 * @example "3f8a1c05e2"
+                 */
+                "If-None-Match"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;
@@ -2942,6 +3568,8 @@ export interface operations {
             /** @description The manifest source beside the domain it belongs to. */
             200: {
                 headers: {
+                    /** @description Always `no-cache`: store it, but revalidate before every use. */
+                    "cache-control"?: string;
                     /** @description The quoted checksum of the manifest as read, the token a later `PUT` carries in `If-Match`. */
                     etag?: string;
                     [name: string]: unknown;
@@ -2956,6 +3584,13 @@ export interface operations {
                      */
                     "application/json": Record<string, never>;
                 };
+            };
+            /** @description `If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`. */
+            304: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description No identity. */
             401: {
@@ -3583,6 +4218,13 @@ export interface operations {
                  * @example 1
                  */
                 page?: number;
+                /**
+                 * @description Include the findings acknowledgments suppressed, each marked
+                 *     `acknowledged` with the scope and note that silenced it. Off by default:
+                 *     the queue is what still needs deciding.
+                 * @example true
+                 */
+                include_acknowledged?: boolean;
             };
             header?: never;
             path?: never;
@@ -3598,6 +4240,14 @@ export interface operations {
                 content: {
                     /**
                      * @example {
+                     *       "acknowledged": {
+                     *         "by_family": {
+                     *           "redundancy": 0,
+                     *           "structure": 1,
+                     *           "temporal": 0
+                     *         },
+                     *         "total": 1
+                     *       },
                      *       "actions": [
                      *         {
                      *           "instruction": "A person captured this directly and nobody has reviewed it since. ...",

@@ -47,6 +47,17 @@
 //! The watcher's full fallback, the startup sync and manual sync all reconcile
 //! any gap, so the targeted front only has to be convergent, never perfect.
 //!
+//! # Attachments ride the same two phases
+//!
+//! Files under the reserved `assets/` prefix are not engrams: they are hashed
+//! and recorded as attachment metadata instead, and nothing under the prefix is
+//! ever parsed as markdown. The scan classifies them (stat plus the allowlist,
+//! no bytes read), the apply reads and hashes only those whose size or mtime
+//! moved against the recorded row and reconciles the rows in the same
+//! transaction. A full walk deletes every row it did not see; a targeted scan
+//! only touches the paths it was given. Virtual domains have no walker, so their
+//! attachments are written through the engine seam alone.
+//!
 //! # Convergence under a concurrent writer
 //!
 //! Between the snapshot and the apply another writer (an MCP edit or a second
@@ -73,9 +84,11 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use walkdir::WalkDir;
 
+use crystalline_core::{MAX_ATTACHMENT_BYTES, attachment_mime, validate_asset_path};
+
 use crate::embed::{ChunkParams, chunk_engram};
 use crate::error::{IndexError, Result};
-use crate::store::{DomainId, EngramRecord, FileStamp, NewChunk, Store};
+use crate::store::{AttachmentRow, DomainId, EngramRecord, FileStamp, NewChunk, Store};
 
 /// Maximum concurrent hashing or parsing tasks.
 const CONCURRENCY: usize = 8;
@@ -131,6 +144,17 @@ struct Scanned {
 struct PendingChange {
     scanned: Scanned,
     previously_indexed: bool,
+}
+
+/// A file under the reserved `assets/` prefix that may be stored as an
+/// attachment: its stat and the mime the allowlist resolved, with no bytes read
+/// yet. The apply reads and hashes only the candidates whose stat moved.
+struct AssetCandidate {
+    rel: String,
+    abs: PathBuf,
+    mtime: i64,
+    size: u64,
+    mime: &'static str,
 }
 
 /// Sync one domain: walk `root`, reconcile the index and resolve forward refs.
@@ -196,6 +220,14 @@ pub struct DomainScan {
     snapshot: HashMap<String, FileStamp>,
     /// The walk root, so the apply can re-stat a delete candidate on disk.
     root: PathBuf,
+    /// Attachable files found under `assets/`, stat'd but not yet hashed.
+    assets: Vec<AssetCandidate>,
+    /// Asset paths the scan looked for and did not find on disk. Only a
+    /// targeted scan fills this; a full walk reconciles domain-wide instead.
+    asset_deletes: Vec<String>,
+    /// Whether `assets` is every attachable file in the domain (a full walk),
+    /// so the apply may delete every row it did not see.
+    assets_complete: bool,
     /// `unchanged` and `failed` from the scan; the apply fills in the rest.
     report: SyncReport,
     /// When the scan began, so the apply can report the total duration.
@@ -225,6 +257,7 @@ pub async fn scan_domain(
 
     // Walk the folder, skipping dot-directories, dot-files and non-markdown.
     let mut current: HashMap<String, Scanned> = HashMap::new();
+    let mut assets: Vec<AssetCandidate> = Vec::new();
     for entry in WalkDir::new(root)
         .into_iter()
         // Prune dot-directories and dot-files, but never the walk root itself
@@ -258,26 +291,37 @@ pub async fn scan_domain(
             continue;
         }
         let fname = entry.file_name().to_string_lossy();
+        if is_hidden(&fname) {
+            continue;
+        }
+        let rel = rel_path(root, entry.path());
+        // The `assets/` folder is reserved for attachments: nothing under it is
+        // ever an engram, whatever its extension, so the branch always ends the
+        // iteration. A file that is not attachable is skipped outright. The
+        // folder is matched case-insensitively, the same question the engine's
+        // write refusals and the daemon's watcher ask, so a directory that
+        // differs only in case cannot smuggle an engram in on APFS or NTFS.
+        if crystalline_core::is_under_assets(&rel) {
+            let Ok(meta) = entry.metadata() else { continue };
+            let mtime = file_mtime(&meta);
+            if let Some(candidate) =
+                asset_candidate(root, &rel, entry.path(), &fname, mtime, meta.len())
+            {
+                assets.push(candidate);
+            }
+            continue;
+        }
         // OKF reserves `index.md` and `log.md` at every level: they are
         // navigation surfaces, never concept documents, so they are skipped
         // here the way dot-files are. Nothing downstream needs a filter: they
         // never reach a store row, an embedding or a search hit, and a row
         // left over from before this exclusion disappears on the next scan
         // (absent on disk means deleted).
-        if is_hidden(&fname)
-            || crystalline_core::is_reserved_file(&fname)
-            || !fname.to_lowercase().ends_with(".md")
-        {
+        if crystalline_core::is_reserved_file(&fname) || !fname.to_lowercase().ends_with(".md") {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0);
-        let rel = rel_path(root, entry.path());
+        let mtime = file_mtime(&meta);
         current.insert(
             rel.clone(),
             Scanned {
@@ -297,7 +341,7 @@ pub async fn scan_domain(
         .cloned()
         .collect();
 
-    Ok(classify_changes(
+    let mut scan = classify_changes(
         name,
         root,
         stamps,
@@ -307,7 +351,12 @@ pub async fn scan_domain(
         chunk_params,
         started,
     )
-    .await)
+    .await;
+    // A full walk saw every file under `assets/`, so the apply may delete any
+    // attachment row it did not see.
+    scan.assets = assets;
+    scan.assets_complete = true;
+    Ok(scan)
 }
 
 /// Scan a specific list of relative paths against a stamp snapshot, the
@@ -352,6 +401,8 @@ pub async fn scan_paths(
     let mut current: HashMap<String, Scanned> = HashMap::new();
     let mut deleted_paths: Vec<String> = Vec::new();
     let mut unreadable: Vec<(String, String)> = Vec::new();
+    let mut assets: Vec<AssetCandidate> = Vec::new();
+    let mut asset_deletes: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     for rel in paths {
         // The same path can arrive twice in one debounce batch; classify it once.
@@ -360,6 +411,45 @@ pub async fn scan_paths(
         }
         let abs = root.join(&rel);
         let hidden = rel.split('/').any(is_hidden);
+        // The reserved `assets/` prefix, classified exactly as the walk does it:
+        // an attachable file present on disk is an upsert, a recorded path that
+        // is gone is a delete, and nothing under the prefix is ever an engram.
+        if crystalline_core::is_under_assets(&rel) {
+            // `symlink_metadata`, not `metadata`: the complete walk uses
+            // `WalkDir`'s default `follow_links(false)` and indexes nothing
+            // through a symlink, so following one here would give a symlinked
+            // attachment a row that the next full scan takes away again. The
+            // link is neither a file nor a delete candidate, so it falls to the
+            // `Ok(_)` arm and is left alone.
+            match std::fs::symlink_metadata(&abs) {
+                Ok(meta) if meta.is_file() && !hidden && !is_excluded(&abs, &excluded) => {
+                    let fname = rel.rsplit('/').next().unwrap_or(rel.as_str());
+                    let mtime = file_mtime(&meta);
+                    if let Some(candidate) =
+                        asset_candidate(root, &rel, &abs, fname, mtime, meta.len())
+                    {
+                        assets.push(candidate);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Rows carry the folder's canonical spelling, so a delete
+                    // has to name that key. If the canonical path still
+                    // resolves, this is a case-sensitive filesystem where the
+                    // two spellings are different files and the recorded one is
+                    // still there, so nothing is deleted.
+                    let canonical =
+                        crystalline_core::canonical_asset_path(&rel).unwrap_or_else(|| rel.clone());
+                    if canonical == rel || !root.join(&canonical).exists() {
+                        asset_deletes.push(canonical);
+                    }
+                }
+                // Unreadable rather than gone: leave the row alone, exactly as
+                // the engram branch does, and let the next pass retry it.
+                Err(e) => unreadable.push((rel, e.to_string())),
+            }
+            continue;
+        }
         // The OKF reserved names the full walk skips (see `scan_domain`), so a
         // targeted pass indexes exactly what a full pass would.
         let reserved = crystalline_core::is_reserved_path(&rel);
@@ -410,7 +500,7 @@ pub async fn scan_paths(
         }
     }
 
-    classify_changes(
+    let mut scan = classify_changes(
         name,
         root,
         stamps,
@@ -420,7 +510,12 @@ pub async fn scan_paths(
         chunk_params,
         started,
     )
-    .await
+    .await;
+    // A targeted pass saw only the given paths, so the apply reconciles exactly
+    // those rows and never deletes an attachment it was not asked about.
+    scan.assets = assets;
+    scan.asset_deletes = asset_deletes;
+    scan
 }
 
 /// The classification core shared by [`scan_domain`] and [`scan_paths`].
@@ -536,6 +631,11 @@ async fn classify_changes(
         chunk_params: chunk_params.clone(),
         snapshot: stamps,
         root: root.to_path_buf(),
+        // The attachment side is classified by the caller, which knows whether
+        // it walked the whole domain or only a list of paths.
+        assets: Vec::new(),
+        asset_deletes: Vec::new(),
+        assets_complete: false,
         report,
         started,
     }
@@ -581,6 +681,9 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
         chunk_params,
         snapshot,
         root,
+        assets,
+        asset_deletes,
+        assets_complete,
         mut report,
         started,
     } = scan;
@@ -600,6 +703,20 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
     )
     .await;
     if let Err(e) = apply {
+        let _ = store.rollback().await;
+        return Err(e);
+    }
+
+    if let Err(e) = apply_attachments(
+        store,
+        domain,
+        assets,
+        asset_deletes,
+        assets_complete,
+        &mut report,
+    )
+    .await
+    {
         let _ = store.rollback().await;
         return Err(e);
     }
@@ -640,6 +757,100 @@ pub async fn apply_scan_with_slab<S: Store + ?Sized>(
 
     report.duration_ms = duration_ms(started.elapsed());
     Ok(report)
+}
+
+/// Reconcile a domain's attachment rows with the assets the scan found.
+///
+/// The rows are metadata only, so this is deliberately not the engram pipeline:
+/// there is no move detection (an asset carries no permalink, so a rename is a
+/// delete plus an add and costs one hash), no chunking and no embedding. What it
+/// does share is the stat prefilter: a candidate whose recorded row still
+/// carries the same size and modification instant cannot have changed content
+/// without one of them moving, so it is skipped without reading a byte.
+///
+/// A full walk (`complete`) reconciles domain-wide, deleting every row it did
+/// not see; a targeted pass deletes only the paths it was asked about and looked
+/// for in vain, so a one-file watcher event never touches another row.
+async fn apply_attachments<S: Store + ?Sized>(
+    store: &S,
+    domain: DomainId,
+    assets: Vec<AssetCandidate>,
+    deletes: Vec<String>,
+    complete: bool,
+    report: &mut SyncReport,
+) -> Result<()> {
+    if !complete && assets.is_empty() && deletes.is_empty() {
+        return Ok(());
+    }
+    let existing: HashMap<String, AttachmentRow> = store
+        .list_attachments(domain)
+        .await?
+        .into_iter()
+        .map(|row| (row.path.clone(), row))
+        .collect();
+
+    let mut seen: HashSet<String> = HashSet::new();
+    for asset in assets {
+        let AssetCandidate {
+            rel,
+            abs,
+            mtime,
+            size: stat_size,
+            mime,
+        } = asset;
+        let modified = rfc3339_from_mtime(mtime);
+        seen.insert(rel.clone());
+        if let Some(row) = existing.get(&rel)
+            && row.size == stat_size
+            && row.modified == modified
+        {
+            continue;
+        }
+        let read = tokio::task::spawn_blocking(move || read_and_measure(&abs))
+            .await
+            .unwrap_or_else(|e| Err(std::io::Error::other(e.to_string())));
+        let (sha256, size) = match read {
+            Ok(measured) => measured,
+            // The file vanished between the scan and here; its removal has its
+            // own pass queued, so leave the row for that one.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(path = %rel, "sync: skipping an attachment that vanished mid-sync");
+                continue;
+            }
+            Err(e) => {
+                report.failed.push((rel, e.to_string()));
+                continue;
+            }
+        };
+        // The size is taken from the bytes that were actually read, so a file
+        // that grew past the cap between the stat and the read is caught here
+        // rather than stored over the ceiling.
+        if size > MAX_ATTACHMENT_BYTES {
+            tracing::debug!(path = %rel, size, "sync: skipping an attachment over the size cap");
+            continue;
+        }
+        let row = AttachmentRow {
+            path: rel,
+            sha256,
+            mime: mime.to_string(),
+            size,
+            modified,
+        };
+        store.upsert_attachment(domain, &row).await?;
+    }
+
+    if complete {
+        for path in existing.keys() {
+            if !seen.contains(path) {
+                store.delete_attachment(domain, path).await?;
+            }
+        }
+    } else {
+        for path in deletes {
+            store.delete_attachment(domain, &path).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Refresh a domain's derived tag-alias rows from its MANIFEST. Reads the stored
@@ -926,6 +1137,90 @@ fn read_and_hash(path: &Path) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(crate::hex_lower(&hasher.finalize()))
+}
+
+/// Hash an attachment and report the length of the very bytes that were hashed,
+/// so the stored row can never describe a size the checksum does not cover.
+fn read_and_measure(path: &Path) -> std::io::Result<(String, u64)> {
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok((crate::hex_lower(&hasher.finalize()), bytes.len() as u64))
+}
+
+/// A file's modification time in whole seconds since the epoch, 0 when the
+/// platform or the filesystem does not report one.
+fn file_mtime(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// An mtime in whole seconds as an RFC 3339 instant, the form an attachment row
+/// records. A timestamp outside the representable range falls back to the epoch,
+/// which keeps the prefilter comparing like with like rather than erroring.
+fn rfc3339_from_mtime(mtime: i64) -> String {
+    chrono::DateTime::from_timestamp(mtime, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .to_rfc3339()
+}
+
+/// Classify one path under the reserved `assets/` prefix. `None` means the file
+/// is not attachable - a path rule, the extension allowlist or the size cap
+/// refused it - and it is skipped without a row and without a failure.
+fn asset_candidate(
+    root: &Path,
+    rel: &str,
+    abs: &Path,
+    fname: &str,
+    mtime: i64,
+    size: u64,
+) -> Option<AssetCandidate> {
+    // A folder whose name differs from `assets` only in case is one and the
+    // same directory on APFS and NTFS, so the bytes an upload wrote as
+    // `assets/x.png` are walked back as `Assets/x.png`. Keying the row by the
+    // canonical spelling is what stops the two writers from taking turns: the
+    // scan would otherwise see no `assets/x.png` on disk and delete the row the
+    // upload just wrote, and the next read would mint it again.
+    //
+    // The `exists` probe is what keeps that fold honest on a case-sensitive
+    // filesystem, where `Assets` and `assets` really are different directories:
+    // the canonical path does not resolve there, so the oddly cased folder is
+    // left unindexed - reserved, exactly as the engram side already treats it.
+    let rel = match crystalline_core::canonical_asset_path(rel) {
+        Some(canonical) if canonical != rel => {
+            if !root.join(&canonical).exists() {
+                tracing::debug!(
+                    path = %rel,
+                    "sync: skipping a file under a reserved folder spelled in another case"
+                );
+                return None;
+            }
+            canonical
+        }
+        _ => rel.to_string(),
+    };
+    let rel = rel.as_str();
+    if let Err(e) = validate_asset_path(rel) {
+        tracing::debug!(path = %rel, reason = %e, "sync: skipping a file under assets/");
+        return None;
+    }
+    // Validation already refused an extension off the allowlist, so this only
+    // resolves the mime the row records.
+    let mime = attachment_mime(fname)?;
+    if size > MAX_ATTACHMENT_BYTES {
+        tracing::debug!(path = %rel, size, "sync: skipping an attachment over the size cap");
+        return None;
+    }
+    Some(AssetCandidate {
+        rel: rel.to_string(),
+        abs: abs.to_path_buf(),
+        mtime,
+        size,
+        mime,
+    })
 }
 
 /// What one slab task produced: a parsed record with its chunks and the

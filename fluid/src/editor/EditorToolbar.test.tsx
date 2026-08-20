@@ -19,6 +19,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, test } from "vitest";
 
+import { ATTACHMENT_ACCEPT } from "../api/files";
 import { Tooltips } from "../components/primitives";
 import { parsedState } from "../test/parse";
 import { EditorToolbar } from "./EditorToolbar";
@@ -445,5 +446,192 @@ describe("the table segment", () => {
       screen.getByRole("button", { name: "Add column after" }),
     ).not.toBeNull();
     expect(document.activeElement).toBe(focused);
+  });
+});
+
+/**
+ * The attach verb is drawn only where files can actually go: a surface that
+ * hands the bar no handler - the MANIFEST editor - gets no button rather than
+ * a button that refuses.
+ */
+describe("the attach verb", () => {
+  /** A live buffer, the way every other test here builds one. */
+  function buffer(): EditorView {
+    view = new EditorView({
+      state: EditorState.create({
+        doc: "prose\n",
+        selection: EditorSelection.single(5),
+        extensions: [...lineSeparatorFor("prose\n"), ...baseExtensions(false)],
+      }),
+      parent: document.body,
+    });
+    return view;
+  }
+
+  /** The bar over that buffer, with an upload handler on it. */
+  function mountWithAttach(onAttach: (files: File[]) => void): RenderResult {
+    return render(<EditorToolbar view={buffer()} onAttach={onAttach} />, {
+      wrapper: Tooltips,
+    });
+  }
+
+  test("is absent on a surface that takes no attachments", () => {
+    render(<EditorToolbar view={buffer()} />, { wrapper: Tooltips });
+    expect(screen.queryByRole("button", { name: "Attach a file" })).toBeNull();
+  });
+
+  test("opens a picker filtered to the allowlist and hands the files over", async () => {
+    const picked: File[][] = [];
+    const { container } = mountWithAttach((files) => {
+      picked.push(files);
+    });
+
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(input).not.toBeNull();
+    expect(input?.accept).toBe(ATTACHMENT_ACCEPT);
+    expect(input?.accept).toContain(".png");
+    expect(input?.accept).not.toContain(".md");
+    expect(input?.multiple).toBe(true);
+
+    const file = new File(["x"], "shot.png", { type: "image/png" });
+    await userEvent.upload(input as HTMLInputElement, file);
+
+    expect(picked).toEqual([[file]]);
+    // Cleared, so picking the same file again still fires a change.
+    expect(input?.value).toBe("");
+  });
+
+  test("the button reaches the picker", async () => {
+    const opened: string[] = [];
+    const { container } = mountWithAttach(() => undefined);
+    const input =
+      container.querySelector<HTMLInputElement>('input[type="file"]');
+    input?.addEventListener("click", (event) => {
+      // Nothing opens a real dialog in jsdom; what is under test is that the
+      // button's press reaches this element at all.
+      event.preventDefault();
+      opened.push("picker");
+    });
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Attach a file" }),
+    );
+
+    expect(opened).toEqual(["picker"]);
+  });
+});
+
+/**
+ * The image-format menu is context too: it is drawn only where the caret is
+ * actually on an attachment image, and every row of it edits the target of
+ * that one reference. What the verbs do is `imageVerbs.test.ts`'s job; what is
+ * under test here is that each label reaches the verb it promises.
+ */
+describe("the image-format menu", () => {
+  const IMAGE_DOC = "Before\n\n![Shot](assets/2026/08/shot.png)\n";
+  const ON_IMAGE = IMAGE_DOC.indexOf("![Shot]") + 2;
+
+  /** A buffer with the caret on that image, and the bar above it. */
+  function mountOnImage(doc = IMAGE_DOC, at = ON_IMAGE): EditorView {
+    view = new EditorView({
+      state: parsedState(
+        EditorState.create({
+          doc,
+          selection: EditorSelection.single(at),
+          extensions: [...lineSeparatorFor(doc), ...baseExtensions(false)],
+        }),
+      ),
+      parent: document.body,
+    });
+    bar = render(<EditorToolbar view={view} imageActive />, {
+      wrapper: Tooltips,
+    });
+    return view;
+  }
+
+  /** Open the menu and pick one of its rows. */
+  async function pickFormat(label: string): Promise<void> {
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Image format" }));
+    await user.click(await screen.findByRole("menuitem", { name: label }));
+  }
+
+  test("is there only while the caret is on an image", () => {
+    const { rerender } = render(<EditorToolbar view={null} />, {
+      wrapper: Tooltips,
+    });
+    expect(screen.queryByRole("button", { name: "Image format" })).toBeNull();
+    rerender(<EditorToolbar view={null} imageActive />);
+    expect(screen.getByRole("button", { name: "Image format" })).not.toBeNull();
+  });
+
+  test("every row wears a glyph of its own, none of them borrowed", async () => {
+    const user = userEvent.setup();
+    mountOnImage();
+    const glyphOf = (element: HTMLElement) =>
+      element.querySelector("svg")?.getAttribute("class");
+    // Read before opening: an open Radix menu hides the rest of the page from
+    // the accessibility tree, trigger included.
+    const trigger = glyphOf(
+      screen.getByRole("button", { name: "Image format" }),
+    );
+    await user.click(screen.getByRole("button", { name: "Image format" }));
+    const rows = [
+      "Centered",
+      "Full width",
+      "Float left",
+      "Float right",
+      "Width 25%",
+      "Width 50%",
+      "Width 75%",
+    ].map((name) => glyphOf(screen.getByRole("menuitem", { name })));
+    const glyphs = [trigger, ...rows];
+    for (const drawn of glyphs) {
+      expect(drawn).toBeTruthy();
+      expect(drawn).not.toContain("lucide");
+      expect(drawn).toContain("crystalline-icon-image");
+    }
+    expect(new Set(glyphs).size).toBe(8);
+  });
+
+  const ROWS: [string, string][] = [
+    ["Full width", "![Shot](assets/2026/08/shot.png#full)"],
+    ["Float left", "![Shot](assets/2026/08/shot.png#left)"],
+    ["Float right", "![Shot](assets/2026/08/shot.png#right)"],
+    ["Width 25%", "![Shot](assets/2026/08/shot.png#w=25%)"],
+    ["Width 50%", "![Shot](assets/2026/08/shot.png#w=50%)"],
+    ["Width 75%", "![Shot](assets/2026/08/shot.png#w=75%)"],
+  ];
+  for (const [label, written] of ROWS) {
+    test(`${label} rewrites the target under the caret`, async () => {
+      const v = mountOnImage();
+      await pickFormat(label);
+      expect(docText(v.state)).toContain(written);
+    });
+  }
+
+  test("Centered puts the reference back to the bare path an upload wrote", async () => {
+    const doc = "![Shot](assets/2026/08/shot.png#left,w=25%)\n";
+    const v = mountOnImage(doc, 2);
+    await pickFormat("Centered");
+    expect(docText(v.state)).toBe("![Shot](assets/2026/08/shot.png)\n");
+  });
+
+  test("a width composes with the placement rather than replacing it", async () => {
+    const v = mountOnImage();
+    await pickFormat("Float right");
+    await pickFormat("Width 50%");
+    expect(docText(v.state)).toContain(
+      "![Shot](assets/2026/08/shot.png#right,w=50%)",
+    );
+  });
+
+  test("the caret goes back to the buffer when the menu closes", async () => {
+    const v = mountOnImage();
+    await pickFormat("Float left");
+    await waitFor(() => {
+      expect(v.hasFocus).toBe(true);
+    });
   });
 });

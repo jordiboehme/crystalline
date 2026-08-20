@@ -461,6 +461,216 @@ parity!(
     reserved_filenames_stay_out_of_the_index
 );
 
+// --- attachments -------------------------------------------------------------
+
+/// A few bytes that are not valid UTF-8, so a test asset is genuinely binary.
+const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00];
+
+fn write_bytes(dir: &Path, rel: &str, bytes: &[u8]) {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+fn sha_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    crystalline_index::hex_lower(&hasher.finalize())
+}
+
+async fn asset_paths(store: &dyn Store, domain: crystalline_index::DomainId) -> Vec<String> {
+    store
+        .list_attachments(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect()
+}
+
+/// A full scan indexes every attachable file under `assets/`: the row carries
+/// the mime the allowlist resolved, the byte length and the checksum of the
+/// file's bytes. A rewrite refreshes the checksum, a deletion removes the row.
+async fn assets_are_indexed_refreshed_and_removed(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "assets/shot.png", PNG);
+    write_bytes(root, "assets/deck.pdf", b"%PDF-1.7 deck");
+
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(report.added, 1, "only the markdown file is an engram");
+    assert!(report.failed.is_empty(), "no failures: {report:?}");
+
+    let domain = upsert_domain(store, "d", root).await;
+    assert_eq!(
+        asset_paths(store, domain).await,
+        ["assets/deck.pdf", "assets/shot.png"],
+        "both assets are indexed, in byte order"
+    );
+    let shot = store
+        .get_attachment(domain, "assets/shot.png")
+        .await
+        .unwrap()
+        .expect("the png row exists");
+    assert_eq!(shot.mime, "image/png");
+    assert_eq!(shot.size, PNG.len() as u64);
+    assert_eq!(shot.sha256, sha_hex(PNG));
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(&shot.modified).is_ok(),
+        "modified is RFC 3339: {}",
+        shot.modified
+    );
+    let deck = store
+        .get_attachment(domain, "assets/deck.pdf")
+        .await
+        .unwrap()
+        .expect("the pdf row exists");
+    assert_eq!(deck.mime, "application/pdf");
+
+    // A rewrite of a different length moves the size half of the stat prefilter,
+    // so the rescan hashes the file again whatever the mtime resolution is.
+    let rewritten: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x01];
+    write_bytes(root, "assets/shot.png", rewritten);
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    let refreshed = store
+        .get_attachment(domain, "assets/shot.png")
+        .await
+        .unwrap()
+        .expect("the png row survives the rewrite");
+    assert_eq!(
+        refreshed.sha256,
+        sha_hex(rewritten),
+        "the checksum refreshed"
+    );
+    assert_eq!(refreshed.size, rewritten.len() as u64);
+
+    std::fs::remove_file(root.join("assets/deck.pdf")).unwrap();
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(
+        asset_paths(store, domain).await,
+        ["assets/shot.png"],
+        "the deleted file's row is gone and the other survives"
+    );
+}
+parity!(
+    a_full_scan_tracks_the_assets_folder,
+    assets_are_indexed_refreshed_and_removed
+);
+
+/// Files that are not attachable produce no row and no failure: an extension off
+/// the allowlist, a file over the size cap, and anything outside `assets/`.
+/// Markdown under `assets/` is not an engram either - the prefix is reserved.
+async fn unattachable_files_are_skipped(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "assets/tool.exe", b"MZ binary");
+    write_bytes(root, "assets/big.pdf", &vec![7u8; 11 * 1024 * 1024]);
+    write(root, "assets/notes.md", &engram("N", "n", "notes token"));
+    write_bytes(root, "elsewhere/img.png", PNG);
+
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert!(report.failed.is_empty(), "no failures: {report:?}");
+    assert_eq!(report.added, 1, "only the root markdown file is an engram");
+
+    let domain = upsert_domain(store, "d", root).await;
+    assert!(
+        asset_paths(store, domain).await.is_empty(),
+        "nothing attachable was found"
+    );
+    let notes = store.search(&SearchQuery::text("notes")).await.unwrap();
+    assert_eq!(notes.total, 0, "markdown under assets/ is never an engram");
+}
+parity!(
+    unattachable_files_produce_no_row,
+    unattachable_files_are_skipped
+);
+
+/// Removing the whole `assets/` folder removes every attachment row: a full scan
+/// reconciles domain-wide, so no row survives a folder that is gone.
+async fn removing_the_assets_folder_clears_every_row(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "assets/shot.png", PNG);
+    write_bytes(root, "assets/sub/deck.pdf", b"%PDF-1.7 deck");
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+
+    let domain = upsert_domain(store, "d", root).await;
+    assert_eq!(
+        asset_paths(store, domain).await.len(),
+        2,
+        "both assets are indexed before the removal"
+    );
+
+    std::fs::remove_dir_all(root.join("assets")).unwrap();
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert!(report.failed.is_empty(), "no failures: {report:?}");
+    assert!(
+        asset_paths(store, domain).await.is_empty(),
+        "every row is gone with the folder"
+    );
+}
+parity!(
+    a_removed_assets_folder_clears_every_row,
+    removing_the_assets_folder_clears_every_row
+);
+
+/// The reserved folder is recognized whatever case it is spelled in, so an
+/// `Assets` directory cannot hold an engram - and, on a case-insensitive
+/// filesystem, cannot make a row appear and disappear either.
+///
+/// Two filesystems, one test. On APFS and NTFS `Assets` and `assets` are one
+/// directory, so the file an upload wrote as `assets/shot.png` is walked back
+/// as `Assets/shot.png` and has to be recorded under the canonical spelling the
+/// upload used, or the scan would delete the row the upload just wrote. On a
+/// case-sensitive filesystem the two are different directories, the canonical
+/// path does not resolve, and the oddly cased folder is left unindexed -
+/// reserved, exactly as the engram side treats it. The probe decides which
+/// machine this is running on rather than assuming one.
+async fn a_reserved_folder_spelled_in_another_case(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "Assets/shot.png", PNG);
+    write(root, "Assets/notes.md", &engram("N", "n", "notes token"));
+    let case_insensitive = root.join("assets/shot.png").exists();
+
+    let report = sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert!(report.failed.is_empty(), "no failures: {report:?}");
+    assert_eq!(report.added, 1, "only the root markdown file is an engram");
+    let notes = store.search(&SearchQuery::text("notes")).await.unwrap();
+    assert_eq!(
+        notes.total, 0,
+        "markdown under a reserved folder is never an engram, whatever its case"
+    );
+
+    let domain = upsert_domain(store, "d", root).await;
+    let expected: Vec<String> = if case_insensitive {
+        vec!["assets/shot.png".to_string()]
+    } else {
+        Vec::new()
+    };
+    assert_eq!(
+        asset_paths(store, domain).await,
+        expected,
+        "case_insensitive filesystem: {case_insensitive}"
+    );
+
+    // And the row is stable: a second scan finds the same file under the same
+    // canonical key rather than deleting what the first one recorded.
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+    assert_eq!(asset_paths(store, domain).await, expected);
+}
+parity!(
+    a_reserved_folder_in_another_case_holds_no_engram,
+    a_reserved_folder_spelled_in_another_case
+);
+
 /// A denied domain root is a loud per-domain error, not a silent empty scan: a
 /// full scan of an unreadable root returns an io error and the recorded rows
 /// survive, rather than the scan seeing zero files and the apply deleting them.

@@ -1,0 +1,14 @@
+/* TEAM */
+	Originator, keeper: Jordi Böhme
+	Source: https://github.com/jordiboehme/crystalline
+	Support: https://ko-fi.com/V7V31T6CL9
+
+/* THANKS */
+	Every agent that came back knowing something.
+
+/* SITE */
+	Last update: 2026/08/19
+	Language: English
+	Doctype: HTML5
+	Components: Crystalline, Fluid, Rust, React, CodeMirror
+	Standards: humanstxt.org

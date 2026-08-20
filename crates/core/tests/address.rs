@@ -64,6 +64,18 @@ fn url_rejects_malformed() {
     assert!(CrystallineUrl::parse("crystalline:///no-domain").is_none());
 }
 
+#[test]
+fn url_names_an_attachment_only_under_assets() {
+    let asset = CrystallineUrl::parse("crystalline://d/assets/a/b.png").unwrap();
+    assert_eq!(asset.asset_path(), Some("assets/a/b.png"));
+
+    let engram = CrystallineUrl::parse("crystalline://d/notes/a-b").unwrap();
+    assert_eq!(engram.asset_path(), None);
+
+    let glob = CrystallineUrl::parse("crystalline://d/assets/*").unwrap();
+    assert_eq!(glob.asset_path(), None);
+}
+
 fn table() -> LookupTable {
     let mut t = LookupTable::new();
     t.insert("astronomy", "astronomy/phobos-orbit", "Phobos Orbit");

@@ -190,6 +190,73 @@ impl Verified {
     }
 }
 
+/// The frontmatter key that carries the acknowledgments an engram was given:
+/// findings somebody read, ruled intentional and silenced.
+pub const EVOLVE_ACK_KEY: &str = "evolve_ack";
+
+/// One acknowledged finding, the `evolve_ack` entry
+/// `{ rule, scope, note, by, at }`.
+///
+/// Ordinary custom frontmatter rather than a typed field, so it travels with
+/// team sharing, survives a resync and stays editable by hand. `scope` is the
+/// evidence the acknowledgment was given for, computed by the server: absent
+/// means "whatever this rule finds here", which is what a hand-written entry
+/// gets.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EvolveAck {
+    /// The rule id it silences, for example `V101`.
+    pub rule: String,
+    /// The evidence it was given for, or `None` for an entry that matches
+    /// whatever the rule finds.
+    pub scope: Option<String>,
+    /// Why the finding is intentional, in the acknowledger's words.
+    pub note: Option<String>,
+    /// The actor that acknowledged it, the OKF actor convention.
+    pub by: String,
+    /// When it was acknowledged, RFC 3339 with offset.
+    pub at: Option<DateTime<FixedOffset>>,
+}
+
+impl EvolveAck {
+    /// Parse an `evolve_ack` frontmatter value into entries, accepting a bare
+    /// mapping as a one-element list exactly as `verified` does.
+    ///
+    /// Lenient on purpose, and the one place that leniency is decided: an entry
+    /// that names no rule is skipped and everything else about it is taken as
+    /// written, because this key is meant to be hand-editable and a typo in one
+    /// entry must never cost the others or fail a sweep. An `at` that does not
+    /// parse simply leaves the instant unknown.
+    pub fn parse_list(value: &YamlValue) -> Vec<EvolveAck> {
+        match value {
+            YamlValue::Mapping(_) => EvolveAck::parse_entry(value).into_iter().collect(),
+            YamlValue::Sequence(items) => items.iter().filter_map(EvolveAck::parse_entry).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn parse_entry(value: &YamlValue) -> Option<EvolveAck> {
+        let map = value.as_mapping()?;
+        let text = |key: &str| {
+            map.get(key)
+                .and_then(YamlValue::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        let rule = text("rule")?;
+        Some(EvolveAck {
+            rule,
+            scope: text("scope"),
+            note: text("note"),
+            by: text("by").unwrap_or_default(),
+            at: map
+                .get("at")
+                .and_then(YamlValue::as_str)
+                .and_then(|raw| DateTime::parse_from_rfc3339(raw.trim()).ok()),
+        })
+    }
+}
+
 /// The most recent verification recorded on an Engram: the actor when one is
 /// known and the instant it happened.
 #[derive(Debug, Clone, PartialEq)]

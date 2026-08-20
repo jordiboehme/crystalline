@@ -1046,6 +1046,27 @@ pub enum HostClaim {
     HeldByOther(DomainHost),
 }
 
+/// One binary attachment's metadata: an asset stored under a domain's `assets/`
+/// folder, addressed by its domain-relative path.
+///
+/// Where the bytes themselves live depends on the domain kind, and the row is
+/// the same either way: a file domain keeps them on disk under the domain root,
+/// a virtual domain has no filesystem and keeps them in the index alongside the
+/// row (see [`Store::write_attachment_blob`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttachmentRow {
+    /// The domain-relative path, always under the `assets/` prefix.
+    pub path: String,
+    /// Lowercase hex SHA-256 of the attachment bytes.
+    pub sha256: String,
+    /// The MIME type resolved from the extension.
+    pub mime: String,
+    /// Byte length.
+    pub size: u64,
+    /// Last modification instant, RFC 3339.
+    pub modified: String,
+}
+
 /// One tag in use, with how many engrams and how many observations carry it.
 /// The two counts are separate scans so a tag applied on the frontmatter and one
 /// applied on an observation are both visible.
@@ -1489,6 +1510,40 @@ pub trait Store: Send + Sync {
     /// caller can probe a domain that holds no engrams yet. The vectors are
     /// sorted by usage in Rust for cross-backend determinism.
     async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary>;
+
+    // --- attachments ---------------------------------------------------------
+    // Binary assets under a domain's `assets/` folder. The metadata row is the
+    // same for both domain kinds; only the bytes differ in where they live, so
+    // the blob pair below is exercised by virtual domains and left untouched by
+    // file domains, whose bytes stay on disk.
+
+    /// Insert or replace one attachment's metadata, keyed by `(domain, path)`.
+    /// The sync walker calls this on every scan, so a rewritten file refreshes
+    /// its row in place rather than adding a second one.
+    async fn upsert_attachment(&self, domain: DomainId, row: &AttachmentRow) -> Result<()>;
+
+    /// Remove one attachment's metadata and any stored blob. Returns `false`
+    /// when no row was there, which lets a scan tell a delete from a no-op.
+    async fn delete_attachment(&self, domain: DomainId, path: &str) -> Result<bool>;
+
+    /// One attachment's metadata by domain-relative path, or `None`.
+    async fn get_attachment(&self, domain: DomainId, path: &str) -> Result<Option<AttachmentRow>>;
+
+    /// Every attachment in a domain, ordered by path in byte order (both
+    /// backends pin the collation, so the listing is identical across them).
+    async fn list_attachments(&self, domain: DomainId) -> Result<Vec<AttachmentRow>>;
+
+    /// Store an attachment's bytes in the index. The metadata row must already
+    /// exist, otherwise this is a [`crate::IndexError::Constraint`]: the row is
+    /// what names the mime type and the size, so a blob without one would be an
+    /// orphan nothing can serve. Only a virtual domain uses this.
+    async fn write_attachment_blob(&self, domain: DomainId, path: &str, bytes: &[u8])
+    -> Result<()>;
+
+    /// An attachment's stored bytes, or `None` when the path has no row or the
+    /// row has no blob (the normal case for a file domain, whose bytes are on
+    /// disk).
+    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>>;
 
     // --- host locks ----------------------------------------------------------
     // The single-writer-per-file-domain rule for shared-database collaboration.

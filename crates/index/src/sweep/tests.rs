@@ -79,6 +79,19 @@ fn wikilink(from: i64, to: i64) -> GraphEdge {
     }
 }
 
+/// An attachment the domain holds, modified on `modified` at nine in the
+/// morning UTC. The sha256 is a repeated pattern so its first eight characters
+/// are recognizable in evidence.
+fn attachment(path: &str, modified: &str) -> AttachmentRow {
+    AttachmentRow {
+        path: path.to_string(),
+        sha256: "ab".repeat(32),
+        mime: "image/png".to_string(),
+        size: 2048,
+        modified: format!("{modified}T09:12:00+00:00"),
+    }
+}
+
 fn tag(name: &str, engrams: i64) -> TagCount {
     TagCount {
         name: name.to_string(),
@@ -905,6 +918,307 @@ fn ranking_is_deterministic_and_clamped() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Attachments - V007, V008, V107, V108
+// ---------------------------------------------------------------------------
+
+/// Yesterday, so the grace period on a fresh upload has passed.
+const YESTERDAY: &str = "2026-08-01";
+
+#[test]
+fn v007_flags_a_referenced_attachment_nobody_analyzed() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+    let mut later = fact(2, "second-mention");
+    later.asset_refs = vec!["assets/deck.png".to_string()];
+
+    let mut sweep = input(vec![shown, later]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let finding = only(&detect(&sweep), "V007");
+    assert_eq!(finding.family, Family::Temporal);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.priority, 50);
+    assert_eq!(
+        finding.permalink, "deck-notes",
+        "the first engram that shows the file anchors the work"
+    );
+    assert_eq!(
+        finding.evidence,
+        "assets/deck.png; image/png, 2048 bytes; modified 2026-08-01; no engram claims it via analyzes"
+    );
+    assert!(finding.fix.starts_with("analyzes: assets/deck.png"));
+}
+
+#[test]
+fn v007_is_quiet_once_an_engram_claims_the_attachment() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+    let mut reader = fact(2, "what-the-deck-says");
+    reader.analyzes = Some("assets/deck.png".to_string());
+    reader.analyzed_hash = Some("ab".repeat(32));
+
+    let mut sweep = input(vec![shown, reader]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).is_empty(), "{:?}", fired(&report));
+}
+
+#[test]
+fn a_claimed_but_unembedded_attachment_is_a_kept_source_not_an_orphan() {
+    let mut reader = fact(1, "what-the-deck-says");
+    reader.analyzes = Some("assets/deck.png".to_string());
+
+    let mut sweep = input(vec![reader]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).is_empty(), "{:?}", fired(&report));
+}
+
+#[test]
+fn v108_flags_an_orphan_with_the_path_as_its_subject() {
+    let mut sweep = input(vec![fact(1, "unrelated-note")]);
+    sweep.attachments = vec![attachment("assets/stray.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V108");
+    assert_eq!(finding.family, Family::Structure);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.priority, 55);
+    assert_eq!(
+        finding.permalink, "",
+        "an orphan has no engram to hang a link on"
+    );
+    assert_eq!(finding.title, "assets/stray.png");
+    assert_eq!(finding.domain, DOMAIN);
+    assert_eq!(
+        finding.evidence,
+        "assets/stray.png; image/png, 2048 bytes; modified 2026-08-01; no engram references or claims it"
+    );
+    assert!(!fired(&report).contains(&"V007"));
+}
+
+#[test]
+fn a_retired_engram_still_counts_as_a_referent() {
+    let mut retired = fact(1, "old-deck-notes");
+    retired.status = "deprecated".to_string();
+    retired.asset_refs = vec!["assets/deck.png".to_string()];
+
+    let mut sweep = input(vec![retired]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(
+        !fired(&report).contains(&"V108"),
+        "retired knowledge is still knowledge"
+    );
+    assert!(
+        !fired(&report).contains(&"V007"),
+        "nothing live to hang the analysis on"
+    );
+}
+
+#[test]
+fn a_fresh_upload_is_quiet_until_the_day_turns() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+
+    let mut sweep = input(vec![shown]);
+    sweep.attachments = vec![
+        attachment("assets/deck.png", "2026-08-02"),
+        attachment("assets/stray.png", "2026-08-02"),
+    ];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).is_empty(), "{:?}", fired(&report));
+}
+
+#[test]
+fn v007_and_v108_are_disjoint_over_one_domain() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+
+    let mut sweep = input(vec![shown]);
+    sweep.attachments = vec![
+        attachment("assets/deck.png", YESTERDAY),
+        attachment("assets/stray.png", YESTERDAY),
+    ];
+
+    let report = detect(&sweep);
+    assert_eq!(fired(&report), vec!["V108", "V007"], "one of each, ranked");
+    assert_eq!(only(&report, "V007").permalink, "deck-notes");
+    assert_eq!(only(&report, "V108").title, "assets/stray.png");
+}
+
+#[test]
+fn v008_names_both_hash_prefixes() {
+    let mut reader = fact(1, "what-the-deck-says");
+    reader.analyzes = Some("assets/deck.png".to_string());
+    reader.analyzed_hash = Some("0123456789abcdef".repeat(4));
+
+    let mut sweep = input(vec![reader]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let finding = only(&detect(&sweep), "V008");
+    assert_eq!(finding.family, Family::Temporal);
+    assert_eq!(finding.priority, 60);
+    assert_eq!(finding.permalink, "what-the-deck-says");
+    assert_eq!(
+        finding.evidence,
+        "analyzes assets/deck.png; analyzed_hash 01234567.. but the attachment is now abababab.."
+    );
+    assert_eq!(finding.fix, format!("analyzed_hash: {}", "ab".repeat(32)));
+}
+
+#[test]
+fn v008_stays_quiet_without_a_recorded_hash_or_with_a_matching_one() {
+    let mut no_hash = fact(1, "no-hash");
+    no_hash.analyzes = Some("assets/deck.png".to_string());
+    let mut matching = fact(2, "matching");
+    matching.analyzes = Some("assets/deck.png".to_string());
+    matching.analyzed_hash = Some("AB".repeat(32));
+
+    let mut sweep = input(vec![no_hash, matching]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).is_empty(), "{:?}", fired(&report));
+}
+
+#[test]
+fn v107_names_the_missing_path_and_how_it_is_referenced() {
+    let mut body_only = fact(1, "shows-a-ghost");
+    body_only.asset_refs = vec!["assets/gone.png".to_string()];
+    let mut claim_only = fact(2, "claims-a-ghost");
+    claim_only.analyzes = Some("assets/also-gone.pdf".to_string());
+    let mut both = fact(3, "shows-and-claims");
+    both.asset_refs = vec!["assets/missing.png".to_string()];
+    both.analyzes = Some("assets/missing.png".to_string());
+
+    let report = detect(&input(vec![body_only, claim_only, both]));
+    let of = |permalink: &str| -> Finding {
+        report
+            .findings
+            .iter()
+            .find(|f| f.rule == "V107" && f.permalink == permalink)
+            .cloned()
+            .unwrap_or_else(|| panic!("no V107 on {permalink}: {:?}", fired(&report)))
+    };
+    assert_eq!(of("shows-a-ghost").priority, 45);
+    assert_eq!(of("shows-a-ghost").family, Family::Structure);
+    assert_eq!(
+        of("shows-a-ghost").finding,
+        "points at an attachment that is not there"
+    );
+    assert_eq!(
+        of("shows-a-ghost").evidence,
+        "assets/gone.png referenced in the body; nothing in engineering holds that path"
+    );
+    assert_eq!(of("shows-a-ghost").fix, "assets/gone.png");
+
+    // A claim on its own is the same finding, and the evidence says the claim
+    // is where the missing path was written.
+    assert_eq!(
+        of("claims-a-ghost").evidence,
+        "assets/also-gone.pdf claimed by analyzes; nothing in engineering holds that path"
+    );
+    assert!(
+        of("shows-and-claims")
+            .evidence
+            .starts_with("assets/missing.png referenced in the body and claimed by analyzes")
+    );
+}
+
+#[test]
+fn v107_reports_one_finding_per_engram_with_its_paths_sorted() {
+    let mut fact = fact(1, "shows-two-ghosts");
+    fact.asset_refs = vec![
+        "assets/z-last.png".to_string(),
+        "assets/a-first.png".to_string(),
+    ];
+
+    let report = detect(&input(vec![fact]));
+    let finding = only(&report, "V107");
+    assert_eq!(
+        finding.finding,
+        "points at 2 attachments that are not there"
+    );
+    assert!(
+        finding
+            .evidence
+            .ends_with("nothing in engineering holds those paths"),
+        "{}",
+        finding.evidence
+    );
+    assert_eq!(finding.fix, "assets/a-first.png; assets/z-last.png");
+}
+
+#[test]
+fn v107_is_quiet_once_the_attachment_is_there() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+    shown.analyzes = Some("assets/deck.png".to_string());
+    shown.analyzed_hash = Some("ab".repeat(32));
+
+    let mut sweep = input(vec![shown]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    assert!(!fired(&detect(&sweep)).contains(&"V107"));
+}
+
+#[test]
+fn a_retired_engram_draws_no_attachment_work() {
+    let mut retired = fact(1, "old-deck-notes");
+    retired.status = "deprecated".to_string();
+    retired.asset_refs = vec!["assets/gone.png".to_string()];
+    retired.analyzes = Some("assets/deck.png".to_string());
+    retired.analyzed_hash = Some("0123456789abcdef".repeat(4));
+
+    let mut sweep = input(vec![retired]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).is_empty(), "{:?}", fired(&report));
+}
+
+#[test]
+fn an_undatable_attachment_is_left_alone() {
+    let mut sweep = input(vec![fact(1, "unrelated-note")]);
+    let mut row = attachment("assets/stray.png", YESTERDAY);
+    row.modified = "whenever".to_string();
+    sweep.attachments = vec![row];
+
+    assert!(fired(&detect(&sweep)).is_empty());
+}
+
+#[test]
+fn the_human_boost_follows_the_anchor_and_an_orphan_has_none() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+    shown.generated_by = Some("human:jordi".to_string());
+    shown.verified_on = Some(day("2026-07-02"));
+
+    let mut sweep = input(vec![shown]);
+    sweep.attachments = vec![
+        attachment("assets/deck.png", YESTERDAY),
+        attachment("assets/stray.png", YESTERDAY),
+    ];
+
+    let report = detect(&sweep);
+    assert_eq!(
+        only(&report, "V007").priority,
+        58,
+        "base 50 plus the human boost of 8"
+    );
+    assert_eq!(
+        only(&report, "V108").priority,
+        55,
+        "an orphan has no engram whose provenance could lift it"
+    );
+}
+
 #[test]
 fn human_authored_boost_applies_to_every_rule_not_only_v006() {
     let mut big = fact(1, "everything-guide");
@@ -917,8 +1231,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_fifteen_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 15);
+fn the_catalog_carries_nineteen_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 19);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -960,8 +1274,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
     assert_eq!(
         ids,
         vec![
-            "V001", "V002", "V003", "V004", "V005", "V006", "V101", "V102", "V103", "V104", "V105",
-            "V106", "V201", "V202", "V203",
+            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V101", "V102", "V103",
+            "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
         ]
     );
     for rule in RULES {
@@ -1018,4 +1332,387 @@ fn engram_facts_defaults_are_quiet() {
     assert_eq!(f.age_days(today()), None);
     assert_eq!(f.address(), "engineering/alpha");
     assert_eq!(f.token_budget, DEFAULT_TOKEN_BUDGET);
+}
+
+// ---------------------------------------------------------------------------
+// Acknowledgments
+// ---------------------------------------------------------------------------
+
+/// An acknowledgment for `rule`, scoped or not, with a note.
+fn ack(rule: &str, scope: Option<&str>, note: &str) -> AckEntry {
+    AckEntry {
+        rule: rule.to_string(),
+        scope: scope.map(str::to_string),
+        note: Some(note.to_string()),
+    }
+}
+
+/// The V101 fixture the acknowledgment tests work: one live engram linking to
+/// one retired one, so the scope is a single address.
+fn v101_fixture() -> SweepInput {
+    let live = fact(1, "onboarding-guide");
+    let mut retired = fact(2, "old-runbook");
+    retired.status = "deprecated".to_string();
+    let mut sweep = input(vec![live, retired]);
+    sweep.graph.edges = vec![wikilink(1, 2)];
+    sweep
+}
+
+#[test]
+fn a_scoped_ack_suppresses_its_finding_and_is_counted() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+    assert_eq!(report.acknowledged.structure, 1);
+    assert_eq!(report.acknowledged.temporal, 0);
+    assert_eq!(report.acknowledged.redundancy, 0);
+}
+
+#[test]
+fn a_second_retired_link_changes_the_scope_and_the_ack_goes_stale() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+    let mut also_retired = fact(3, "older-runbook");
+    also_retired.status = "deprecated".to_string();
+    sweep.graph.nodes.push(node_of(&also_retired));
+    sweep.engrams.push(also_retired);
+    sweep.graph.edges.push(wikilink(1, 3));
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V101");
+    assert!(finding.ack_stale, "the acknowledged evidence changed");
+    assert!(!finding.acknowledged);
+    assert_eq!(finding.ack_note.as_deref(), Some("lineage citation; keep"));
+    assert_eq!(
+        finding.ack_scope.as_deref(),
+        Some("engineering/old-runbook"),
+        "the row says what was acknowledged, not what the rule fires on now"
+    );
+    assert_eq!(
+        finding.scope, "engineering/old-runbook, engineering/older-runbook",
+        "while the finding's own scope has moved on"
+    );
+    assert_eq!(report.acknowledged.total, 0);
+}
+
+#[test]
+fn a_scopeless_ack_matches_whatever_the_evidence_becomes() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack("V101", None, "hand written")];
+    let mut also_retired = fact(3, "older-runbook");
+    also_retired.status = "deprecated".to_string();
+    sweep.graph.nodes.push(node_of(&also_retired));
+    sweep.engrams.push(also_retired);
+    sweep.graph.edges.push(wikilink(1, 3));
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+/// A scope-less entry acknowledged nothing in particular, so an audited row
+/// carries no acknowledged scope rather than borrowing the finding's own.
+#[test]
+fn a_scopeless_ack_leaves_the_audited_row_without_an_acknowledged_scope() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack("V101", None, "hand written")];
+    sweep.include_acknowledged = true;
+
+    let finding = only(&detect(&sweep), "V101");
+    assert!(finding.acknowledged);
+    assert_eq!(finding.ack_scope, None);
+    assert_eq!(finding.scope, "engineering/old-runbook");
+}
+
+#[test]
+fn a_prose_edit_that_leaves_the_links_alone_keeps_the_ack_matching() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+    sweep.engrams[0].body = format!("{}\nA new paragraph nobody linked from.", short_body(3));
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn include_acknowledged_returns_the_suppressed_finding_marked() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack(
+        "V101",
+        Some("engineering/old-runbook"),
+        "lineage citation; keep",
+    )];
+    sweep.include_acknowledged = true;
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V101");
+    assert!(finding.acknowledged);
+    assert!(!finding.ack_stale);
+    assert_eq!(finding.ack_note.as_deref(), Some("lineage citation; keep"));
+    assert_eq!(finding.scope, "engineering/old-runbook");
+    assert_eq!(
+        finding.ack_scope.as_deref(),
+        Some("engineering/old-runbook"),
+        "the two agree while the acknowledgment still matches"
+    );
+    assert_eq!(
+        report.acknowledged.total, 1,
+        "the count is what it suppressed, whether or not the row came back"
+    );
+}
+
+#[test]
+fn an_ack_for_a_rule_that_never_fires_counts_nothing() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack("V104", None, "standalone on purpose")];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged, AckCounts::default());
+    let finding = only(&report, "V101");
+    assert!(!finding.ack_stale);
+    assert_eq!(finding.ack_note, None);
+}
+
+#[test]
+fn an_ack_on_one_engram_never_silences_another() {
+    let mut sweep = v101_fixture();
+    let mut second = fact(3, "second-guide");
+    second.acks = vec![ack("V101", None, "not mine to give")];
+    sweep.graph.nodes.push(node_of(&second));
+    sweep.engrams.push(second);
+    sweep.graph.edges.push(wikilink(3, 2));
+
+    let report = detect(&sweep);
+    assert_eq!(
+        fired_on(&report, "onboarding-guide"),
+        vec!["V101"],
+        "the unacknowledged engram keeps its finding"
+    );
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn the_generous_entry_wins_over_a_stale_one() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![
+        ack("V101", Some("engineering/somewhere-else"), "outdated"),
+        ack("V101", None, "hand written catch-all"),
+    ];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged.total, 1);
+}
+
+#[test]
+fn an_attachment_ack_is_scoped_to_its_path() {
+    let mut shown = fact(1, "deck-notes");
+    shown.asset_refs = vec!["assets/deck.png".to_string()];
+    shown.acks = vec![ack("V007", Some("assets/deck.png"), "decorative")];
+    let mut sweep = input(vec![shown]);
+    sweep.attachments = vec![attachment("assets/deck.png", YESTERDAY)];
+    sweep.include_acknowledged = true;
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V007");
+    assert!(finding.acknowledged);
+    assert_eq!(finding.scope, "assets/deck.png");
+    assert_eq!(report.acknowledged.total, 1);
+    assert_eq!(report.acknowledged.temporal, 1);
+}
+
+#[test]
+fn an_anchorless_finding_takes_no_ack() {
+    let mut holder = fact(1, "unrelated-note");
+    holder.acks = vec![ack("V108", None, "cannot reach it")];
+    let mut sweep = input(vec![holder]);
+    sweep.attachments = vec![attachment("assets/stray.png", YESTERDAY)];
+
+    let report = detect(&sweep);
+    assert!(fired(&report).contains(&"V108"), "{:?}", fired(&report));
+    assert_eq!(report.acknowledged, AckCounts::default());
+}
+
+#[test]
+fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
+    let unsorted = vec![
+        "engineering/beta".to_string(),
+        "engineering/alpha".to_string(),
+        "engineering/beta".to_string(),
+    ];
+    for rule in ["V101", "V102", "V103", "V107", "V201", "V202"] {
+        assert_eq!(
+            scope_for(rule, unsorted.clone()),
+            "engineering/alpha, engineering/beta",
+            "{rule} scopes a set"
+        );
+    }
+    for rule in ["V007", "V008"] {
+        assert_eq!(
+            scope_for(rule, vec!["assets/deck.png".to_string()]),
+            "assets/deck.png",
+            "{rule} scopes one path"
+        );
+    }
+    for rule in [
+        "V001", "V002", "V003", "V004", "V005", "V006", "V104", "V105", "V106", "V108", "V203",
+    ] {
+        assert_eq!(
+            scope_for(rule, unsorted.clone()),
+            "",
+            "{rule}'s identity is the engram and the rule"
+        );
+    }
+}
+
+#[test]
+fn every_rule_in_the_catalog_has_a_decided_scope() {
+    // The match is exhaustive by construction: a new rule id lands in the
+    // empty-scope arm, which is the safe default, and this pins that the
+    // catalog and the scope function are read together.
+    let scoped = [
+        "V007", "V008", "V101", "V102", "V103", "V107", "V201", "V202",
+    ];
+    for info in RULES {
+        let produced = scope_for(info.id, vec!["one".to_string()]);
+        if scoped.contains(&info.id) {
+            assert_eq!(produced, "one", "{} carries a scope", info.id);
+        } else {
+            assert!(produced.is_empty(), "{} carries no scope", info.id);
+        }
+    }
+}
+
+/// Every rule that carries a scope hands the right material to `scope_for` at
+/// its own call site. `scope_for` itself is unit tested above; these pin what
+/// each detector puts into it, because a wrong or unstable list there is what
+/// would make an acknowledgment flap between sweeps.
+#[test]
+fn v102_scopes_the_sorted_set_of_unresolved_targets() {
+    let mut fact = fact(1, "link-typo");
+    fact.body = short_body(3);
+    let mut sweep = input(vec![fact]);
+    sweep.unresolved = vec![unresolved(1, "Zulu Target"), unresolved(1, "Alpha Target")];
+
+    let report = detect(&sweep);
+    let scopes: Vec<&str> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V102")
+        .map(|f| f.scope.as_str())
+        .collect();
+    assert_eq!(
+        scopes,
+        vec!["Alpha Target, Zulu Target", "Alpha Target, Zulu Target"],
+        "every V102 finding on one engram shares the sorted set, so one \
+         acknowledgment covers what is broken now and expires when that changes"
+    );
+
+    // A third broken link changes the set, so an acknowledgment given for the
+    // old one stops matching.
+    sweep.unresolved.push(unresolved(1, "Mike Target"));
+    let report = detect(&sweep);
+    let finding = report
+        .findings
+        .iter()
+        .find(|f| f.rule == "V102")
+        .expect("V102 still fires");
+    assert_eq!(
+        finding.scope, "Alpha Target, Mike Target, Zulu Target",
+        "a new broken link moves the scope"
+    );
+}
+
+#[test]
+fn v103_scopes_the_counterpart_and_v201_the_whole_cluster() {
+    // V103: the counterpart that declared the forward half.
+    let target = fact(1, "summary");
+    let source = fact(2, "long-form");
+    let mut sweep = input(vec![target, source]);
+    sweep.graph.edges = vec![rel(2, 1, "summarizes")];
+    let finding = only(&detect(&sweep), "V103");
+    assert_eq!(finding.scope, "engineering/long-form");
+
+    // V201: every member of the cluster, the lead included, so the scope reads
+    // the same whichever member the finding hung on.
+    let mut one = fact(1, "ci-pipeline");
+    one.body = long_body("release");
+    let mut two = fact(2, "ci-pipeline-copy");
+    two.body = long_body("release");
+    let sweep = input(vec![one, two]);
+    let finding = only(&detect(&sweep), "V201");
+    assert_eq!(
+        finding.scope,
+        "engineering/ci-pipeline, engineering/ci-pipeline-copy"
+    );
+}
+
+#[test]
+fn v202_scopes_the_colliding_titles() {
+    let mut one = fact(1, "setup-a");
+    one.title = "Setup guide".to_string();
+    let mut two = fact(2, "setup-b");
+    two.title = "Setup guides".to_string();
+    let sweep = input(vec![one, two]);
+    let finding = only(&detect(&sweep), "V202");
+    assert_eq!(finding.scope, "Setup guide, Setup guides");
+}
+
+#[test]
+fn v107_scopes_the_sorted_missing_paths_and_v008_the_claimed_one() {
+    // V107: every path the engram points at that the domain does not hold.
+    let mut fact = fact(1, "ghost-ref");
+    fact.asset_refs = vec![
+        "assets/zulu.png".to_string(),
+        "assets/alpha.png".to_string(),
+    ];
+    let sweep = input(vec![fact]);
+    let finding = only(&detect(&sweep), "V107");
+    assert_eq!(finding.scope, "assets/alpha.png, assets/zulu.png");
+
+    // V008: the claimed path, not the hash - acknowledging "this engram is
+    // allowed to lag this file" survives the file changing again.
+    let mut reader = fact_with_claim(2, "what-the-shot-shows", "assets/shot.png");
+    reader.analyzed_hash = Some("cd".repeat(32));
+    let mut sweep = input(vec![reader]);
+    sweep.attachments = vec![attachment("assets/shot.png", YESTERDAY)];
+    let finding = only(&detect(&sweep), "V008");
+    assert_eq!(finding.scope, "assets/shot.png");
+}
+
+/// An engram claiming `path`, with a body that references it too.
+fn fact_with_claim(id: i64, permalink: &str, path: &str) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.analyzes = Some(path.to_string());
+    f.asset_refs = vec![path.to_string()];
+    f
+}
+
+/// An unresolved prose wikilink from `from` to `target`.
+fn unresolved(from: i64, target: &str) -> UnresolvedRef {
+    UnresolvedRef {
+        from: EngramId(from),
+        rel_type: "links_to".to_string(),
+        kind: EdgeKind::Link,
+        target_domain: None,
+        target: target.to_string(),
+        line: Some(3),
+    }
 }

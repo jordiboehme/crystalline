@@ -861,7 +861,7 @@
           "domains"
         ],
         "summary": "Download a whole domain as a zip.",
-        "description": "Admin only. Every file of the domain - MANIFEST included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.",
+        "description": "Admin only. Every file of the domain - MANIFEST and the `assets/` attachments included - as one zip, read from whichever source of truth the domain has: markdown on disk for a file domain, the database for a virtual one. A pure read, so it is served even on a read-only instance, which is exactly where an operator wants a backup to take.",
         "operationId": "download_domain_archive",
         "parameters": [
           {
@@ -924,7 +924,7 @@
           "domains"
         ],
         "summary": "Import an uploaded archive into a domain.",
-        "description": "Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.\n\n`policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.\n\nThe same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.",
+        "description": "Admin only. Runs the engine verb the preview dry-ran, so the outcome matches the report that was approved: entries land as `created` or `overwritten`, and `skipped`, `invalid` and `ignored` name everything that did not.\n\n`policy=skip` (the default) leaves an existing path alone; `policy=overwrite` replaces it. Overwrite is a same-path decision only - an entry whose permalink is held at another path is refused under either policy, since writing it would leave two files claiming one permalink.\n\nEntries under `assets/` are stored as attachments, through the same gates an upload to the file route passes, and follow the same same-path policy; a restored attachment marks the domain as owing a consolidation sweep, since it is a file the agent has not read yet.\n\nThe same hygiene the preview enforces applies here: a hostile archive is refused whole rather than partially imported.",
         "operationId": "import_domain_archive",
         "parameters": [
           {
@@ -1000,7 +1000,7 @@
             }
           },
           "413": {
-            "description": "The upload is past the surface's request-body limit.",
+            "description": "The upload is past the 64 MiB body limit these two archive routes accept, which is deliberately larger than the 10 MiB the rest of this API takes.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1028,7 +1028,7 @@
           "domains"
         ],
         "summary": "Dry-run an archive upload: what each entry would become.",
-        "description": "Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.\n\nNothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, an entry over 1 MiB or a whole archive over 32 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.",
+        "description": "Admin only. Takes the raw bytes of a zip and reports, per entry, what an import would do with it - `new`, `collides`, `invalid` or `ignored` - with the verify findings `POST /validate` would raise over that entry's markdown.\n\nEntries under `assets/` are attachments rather than engrams: they are reported with their byte count and screened by the attachment path rules, the extension allowlist and the size ceiling, each refusal naming which of the three answered; an attachment past the 10 MiB ceiling is refused on its own rather than refusing the archive.\n\nNothing is written. A hostile archive is refused whole with 422 rather than partially imported: more than 1000 entries, a markdown entry over 1 MiB or a whole archive over 200 MiB once decompressed, an entry name that is not UTF-8, or any path that could escape the domain root.",
         "operationId": "preview_domain_archive_import",
         "parameters": [
           {
@@ -1094,7 +1094,7 @@
             }
           },
           "413": {
-            "description": "The upload is past the surface's request-body limit.",
+            "description": "The upload is past the 64 MiB body limit these two archive routes accept, which is deliberately larger than the 10 MiB the rest of this API takes.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1105,6 +1105,69 @@
           },
           "422": {
             "description": "The bytes are not a readable zip, or the archive fails hygiene - the detail names which rule.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/attachments": {
+      "get": {
+        "tags": [
+          "attachments"
+        ],
+        "summary": "Every attachment a domain carries.",
+        "description": "Metadata only, ordered by path: no bytes are read, so listing a domain full of slide decks costs one query. Each row carries the path to fetch it by, its mime, its size, when it last changed and its checksum.",
+        "operationId": "list_attachments",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The rows, ordered by path.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AttachmentsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1418,7 +1481,7 @@
           "engrams"
         ],
         "summary": "One engram in full.",
-        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back.",
+        "description": "Its frontmatter, its markdown as written and the references the engine resolves around it.\n\nThe response carries an `ETag` over the markdown, so a client knows which version it is holding and can say so when it later writes back. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.",
         "operationId": "get_engram",
         "parameters": [
           {
@@ -1439,12 +1502,31 @@
               "type": "string"
             },
             "example": "notes/deep/gamma"
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "The quoted checksum of a version already held. A match answers 304 with no body.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "\"3f8a1c05e2\""
           }
         ],
         "responses": {
           "200": {
             "description": "The engine's own read payload, unchanged.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `no-cache`: store it, but revalidate before every use."
+              },
               "etag": {
                 "schema": {
                   "type": "string"
@@ -1477,6 +1559,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "`If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
           },
           "401": {
             "description": "No identity.",
@@ -1774,6 +1859,497 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/evolve/ack": {
+      "post": {
+        "tags": [
+          "maintenance"
+        ],
+        "summary": "Acknowledge one evolve finding on one engram.",
+        "description": "Records `evolve_ack` on the engram: the rule, the evidence the server computed it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`.",
+        "operationId": "acknowledge_finding",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The engram's domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AckBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The stored entry.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                },
+                "example": {
+                  "at": "2026-08-20T09:00:00+00:00",
+                  "by": "human:jordi",
+                  "note": "lineage citation, keep",
+                  "rule": "V101",
+                  "scope": "eng/old-runbook"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an identity with no account behind it never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The rule id is not one the sweep catalog holds.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "maintenance"
+        ],
+        "summary": "Withdraw an acknowledgment.",
+        "description": "Removes the engram's `evolve_ack` entry for that rule, leaving its other entries alone. 404 when the engram carries none for the rule, rather than reporting a removal that did not happen.",
+        "operationId": "unacknowledge_finding",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The engram's domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AckBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The acknowledgment is gone."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Not an editor, no CSRF token echoed, read-only instance, or a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain or engram, or no acknowledgment for that rule on it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The rule id is not one the sweep catalog holds.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/files/{path}": {
+      "get": {
+        "tags": [
+          "attachments"
+        ],
+        "summary": "One attachment's bytes.",
+        "description": "Serves the stored bytes under the mime the extension allowlist assigns - never one guessed from the content and never one the uploader claimed. Every answer carries `X-Content-Type-Options: nosniff` and a `default-src 'none'; sandbox` content security policy, so an attachment can never script against the instance serving it. Images, PDFs and text are dispositioned `inline`; the office formats arrive as a download.\n\nThe `ETag` is the strong quoted SHA-256 of the bytes, so `If-None-Match` answers 304 without a body, and `Cache-Control: no-cache` keeps a stored copy revalidating instead of going heuristically fresh, so a file replaced at the same path is picked up on its next use. A malformed path is 400 with the rule that refused it; a well-formed path holding nothing is 404.",
+        "operationId": "read_attachment",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The domain-relative attachment path. It always starts with `assets/` and may contain slashes: `assets/diagrams/flow.png`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "assets/diagrams/flow.png"
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "The quoted SHA-256 of bytes already held. A match answers 304 with no body.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "\"9f2a1c05e2b7\""
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The bytes, under the mime the allowlist assigns.",
+            "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `no-cache`: store it, but revalidate before every use."
+              },
+              "content-disposition": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`inline` for images, PDFs and text; `attachment; filename=\"...\"` otherwise."
+              },
+              "content-security-policy": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `default-src 'none'; sandbox`."
+              },
+              "etag": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The strong quoted SHA-256 of the bytes served."
+              },
+              "x-content-type-options": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `nosniff`."
+              }
+            },
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "304": {
+            "description": "The `If-None-Match` token matches the stored bytes; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`, so the stored response it refreshes keeps having to revalidate."
+          },
+          "400": {
+            "description": "The path breaks an attachment path rule: not under `assets/`, a `.` or `..` segment, a hidden segment, a refused character, too long, or an extension that is not on the allowlist.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or no attachment at that path.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "put": {
+        "tags": [
+          "attachments"
+        ],
+        "summary": "Upload an attachment, creating or replacing it.",
+        "description": "Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.\n\nThe path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon, `#` or `%`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.",
+        "operationId": "write_attachment",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "Where to store it, domain-relative and under `assets/`.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "assets/diagrams/flow.png"
+          }
+        ],
+        "requestBody": {
+          "description": "The raw file bytes.",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored. The path to reference it by, its mime, its size and its checksum.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadedAttachment"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The path breaks an attachment path rule or carries an extension that is not on the allowlist.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: an anonymous identity never writes.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is over the 10 MiB limit this API accepts, which is also the attachment size ceiling.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "attachments"
+        ],
+        "summary": "Delete an attachment.",
+        "description": "Editor only. Removes the bytes and the metadata row together. An engram that still references the path keeps its reference - the consolidation sweep is what reports the dangling link, rather than this route rewriting somebody's markdown.",
+        "operationId": "delete_attachment",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "path",
+            "in": "path",
+            "description": "The attachment path.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            },
+            "example": "assets/diagrams/flow.png"
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Deleted."
+          },
+          "400": {
+            "description": "The path breaks an attachment path rule.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an editor, the CSRF token is missing or wrong, or the instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or no attachment at that path.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/inbound/{permalink}": {
       "get": {
         "tags": [
@@ -1939,7 +2515,7 @@
           "domains"
         ],
         "summary": "The domain's MANIFEST markdown as written.",
-        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against.",
+        "description": "The source, not a reduction of it, so a client can render or edit it directly.\n\nThe response carries an `ETag` over the markdown, the same strong validator a later `PUT` compares an `If-Match` against. `If-None-Match` naming the current checksum answers 304 with no body, and `Cache-Control: no-cache` on both the 200 and the 304 keeps a stored copy revalidating instead of going heuristically fresh, so a save elsewhere is picked up on its next use.",
         "operationId": "get_domain_manifest",
         "parameters": [
           {
@@ -1950,12 +2526,31 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "The quoted checksum of a version already held. A match answers 304 with no body.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "\"3f8a1c05e2\""
           }
         ],
         "responses": {
           "200": {
             "description": "The manifest source beside the domain it belongs to.",
             "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Always `no-cache`: store it, but revalidate before every use."
+              },
               "etag": {
                 "schema": {
                   "type": "string"
@@ -1975,6 +2570,9 @@
                 }
               }
             }
+          },
+          "304": {
+            "description": "`If-None-Match` names the current checksum; no body is sent. Carries the `ETag` it matched and the same `Cache-Control`."
           },
           "401": {
             "description": "No identity.",
@@ -2696,7 +3294,7 @@
           "maintenance"
         ],
         "summary": "`GET /evolve` - the consolidation queue: the ranked list of what the\nregistered domains need next, with the evidence behind each finding and the\ninstruction that says how to work it.",
-        "description": "A read and only a read. Detection runs over the scope and nothing at all is\nwritten, the maintenance state included: viewing the queue never counts as a\nconsolidation run, so opening this page does not stop a Stop hook from asking\nfor the sweep that is actually owed. The `evolve` MCP tool is the surface that\nrecords a run, because an agent calling it is about to do the work.\n\nEach row carries its rank across the whole result (`n`), its priority, the\nrule that fired, the engram it fired on, and a `class`: `mechanical` for work\nthat completes intent the knowledge already records, `judgment` for work that\nchanges what it claims. A client renders the two differently - a judgment\nfinding is a question for a person, never a change to apply.\n\nThe per-rule instruction rides `actions` rather than a column, so a page of\nfindings from one rule carries it once; only the rules on this page appear.\n`families` counts the whole filtered result rather than the page, which is\nwhat section headings are drawn from, and `truncations` names any per-domain\ncap that fired so a short queue is never mistaken for a finished one.\n\n`today` is not exposed. The temporal rules are evaluated as of now, which is\nthe only question a page asks; the tool takes a pinned date for a run that\nhas to be reproducible.",
+        "description": "A read and only a read. Detection runs over the scope and nothing at all is\nwritten, the maintenance state included: viewing the queue never counts as a\nconsolidation run, so opening this page does not stop a Stop hook from asking\nfor the sweep that is actually owed. The `evolve` MCP tool is the surface that\nrecords a run, because an agent calling it is about to do the work.\n\nEach row carries its rank across the whole result (`n`), its priority, the\nrule that fired, the engram it fired on, and a `class`: `mechanical` for work\nthat completes intent the knowledge already records, `judgment` for work that\nchanges what it claims. A client renders the two differently - a judgment\nfinding is a question for a person, never a change to apply.\n\nThe per-rule instruction rides `actions` rather than a column, so a page of\nfindings from one rule carries it once; only the rules on this page appear.\n`families` counts the whole filtered result rather than the page, which is\nwhat section headings are drawn from, and `truncations` names any per-domain\ncap that fired so a short queue is never mistaken for a finished one.\n\n`acknowledged` counts what acknowledgments kept out of the queue, whole and\nper family, and those counts are domain-wide rather than page-wide: they are\ntaken before `families`, `rules` and `min_priority` narrow the result, so a\nshort queue is never mistaken for a healthy one. A row whose acknowledgment\nwas given for evidence that has since changed comes back carrying\n`ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass\n`include_acknowledged` to see the suppressed rows themselves, each marked\n`acknowledged` and carrying the same two fields.\n\n`today` is not exposed. The temporal rules are evaluated as of now, which is\nthe only question a page asks; the tool takes a pinned date for a run that\nhas to be reproducible.",
         "operationId": "get_evolve_queue",
         "parameters": [
           {
@@ -2762,6 +3360,16 @@
               "minimum": 0
             },
             "example": 1
+          },
+          {
+            "name": "include_acknowledged",
+            "in": "query",
+            "description": "Include the findings acknowledgments suppressed, each marked\n`acknowledged` with the scope and note that silenced it. Off by default:\nthe queue is what still needs deciding.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "example": true
           }
         ],
         "responses": {
@@ -2773,6 +3381,14 @@
                   "type": "object"
                 },
                 "example": {
+                  "acknowledged": {
+                    "by_family": {
+                      "redundancy": 0,
+                      "structure": 1,
+                      "temporal": 0
+                    },
+                    "total": 1
+                  },
                   "actions": [
                     {
                       "instruction": "A person captured this directly and nobody has reviewed it since. ...",
@@ -4049,6 +4665,34 @@
   },
   "components": {
     "schemas": {
+      "AckBody": {
+        "type": "object",
+        "description": "Acknowledge one finding on one engram: the engram by permalink, the rule id that fired and an optional note saying why it is intentional. The scope an acknowledgment holds for is never sent - the server computes it by running detection.",
+        "required": [
+          "permalink",
+          "rule"
+        ],
+        "properties": {
+          "note": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Why the finding is intentional. Ignored on `DELETE`.",
+            "example": "lineage citation, keep"
+          },
+          "permalink": {
+            "type": "string",
+            "description": "The engram the finding fired on.",
+            "example": "notes/beta"
+          },
+          "rule": {
+            "type": "string",
+            "description": "The rule id to acknowledge, for example `V101`.",
+            "example": "V101"
+          }
+        }
+      },
       "ArchiveEntryReport": {
         "type": "object",
         "description": "One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`.",
@@ -4058,6 +4702,16 @@
           "findings"
         ],
         "properties": {
+          "bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "How many bytes the entry holds, for an attachment. `null` for a\nmarkdown entry, whose size a preview has no use for, and for an entry\nthat was refused before it was ever decompressed.",
+            "example": 20480,
+            "minimum": 0
+          },
           "findings": {
             "type": "array",
             "items": {
@@ -4130,12 +4784,12 @@
           },
           "ignored": {
             "type": "integer",
-            "description": "Entries an archive may carry but a domain never imports: a MANIFEST, a\ngenerated OKF index or log, anything that is not markdown.",
+            "description": "Entries an archive may carry but a domain never imports: a MANIFEST, a\ngenerated OKF index or log, anything that is neither markdown nor an\nattachment of an allowed type.",
             "minimum": 0
           },
           "invalid": {
             "type": "integer",
-            "description": "Entries refused as not importable: unparseable, not UTF-8 text, or\ncarrying a hard verify error. Never written under either policy.",
+            "description": "Entries refused as not importable: unparseable, not UTF-8 text,\ncarrying a hard verify error, or an attachment whose path or size the\nrules refuse. Never written under either policy.",
             "minimum": 0
           },
           "new": {
@@ -4152,6 +4806,62 @@
             "type": "integer",
             "description": "Import only: entries written, created and overwritten together.",
             "minimum": 0
+          }
+        }
+      },
+      "AttachmentView": {
+        "type": "object",
+        "description": "One attachment a domain carries: where it lives, what it is, how big it is and when it last changed.",
+        "required": [
+          "path",
+          "mime",
+          "size",
+          "modified",
+          "sha256"
+        ],
+        "properties": {
+          "mime": {
+            "type": "string",
+            "description": "The mime the bytes are served under, derived from the extension.",
+            "example": "image/png"
+          },
+          "modified": {
+            "type": "string",
+            "description": "Last modification instant, RFC 3339.",
+            "example": "2026-08-18T09:12:00+00:00"
+          },
+          "path": {
+            "type": "string",
+            "description": "The domain-relative path, always under `assets/`.",
+            "example": "assets/architecture.png"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of the bytes, the same token the read's `ETag`\ncarries.",
+            "example": "9f2a1c05e2b7"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Byte length.",
+            "example": 20481,
+            "minimum": 0
+          }
+        }
+      },
+      "AttachmentsResponse": {
+        "type": "object",
+        "description": "Every attachment one domain carries, ordered by path. Metadata only: the bytes are fetched one file at a time.",
+        "required": [
+          "attachments"
+        ],
+        "properties": {
+          "attachments": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/AttachmentView"
+            },
+            "description": "The rows, ordered by path."
           }
         }
       },
@@ -4741,6 +5451,40 @@
           }
         }
       },
+      "UploadedAttachment": {
+        "type": "object",
+        "description": "The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry.",
+        "required": [
+          "path",
+          "mime",
+          "size",
+          "sha256"
+        ],
+        "properties": {
+          "mime": {
+            "type": "string",
+            "description": "The mime the bytes will be served under.",
+            "example": "image/png"
+          },
+          "path": {
+            "type": "string",
+            "description": "The domain-relative path it was stored at, the target an engram body\nreferences.",
+            "example": "assets/architecture.png"
+          },
+          "sha256": {
+            "type": "string",
+            "description": "Lowercase hex SHA-256 of the stored bytes.",
+            "example": "9f2a1c05e2b7"
+          },
+          "size": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Byte length as stored.",
+            "example": 20481,
+            "minimum": 0
+          }
+        }
+      },
       "User": {
         "type": "object",
         "description": "One account. Carries no password material, so it is safe to hand to a\nhandler and serialize into a response.",
@@ -4934,6 +5678,10 @@
     {
       "name": "graph",
       "description": "The neighborhood graph around an anchor."
+    },
+    {
+      "name": "attachments",
+      "description": "The files an engram carries: bytes in, bytes out, and what a domain holds."
     },
     {
       "name": "maintenance",

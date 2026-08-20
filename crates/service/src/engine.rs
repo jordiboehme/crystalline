@@ -26,22 +26,22 @@ use crystalline_core::config::{
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, set_frontmatter_number,
-    set_stale_after, set_verified, touch_generated,
+    remove_frontmatter_field, replace_section, set_evolve_ack, set_frontmatter_field,
+    set_frontmatter_number, set_stale_after, set_verified, touch_generated,
 };
 use crystalline_core::schema::{self, Schema};
 use crystalline_core::{
-    CrystallineUrl, Engram, Frontmatter, HarnessKind, LinkTarget, Manifest, YamlValue,
-    is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
+    CrystallineUrl, EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, HarnessKind, LinkTarget,
+    Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
-    ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind,
-    EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId,
-    EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery,
-    RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput, SweepOptions, SyncReport,
-    apply_scan, chunk_engram, configured_model_id, detect, order_jobs_for_batching,
-    parse_metadata_filters, provider_from_config, rank, retired_factor, rule_info, salience_prior,
-    scan_domain, scan_paths,
+    AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
+    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, Family, FileStamp,
+    Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES, RecentFilter, SearchMode,
+    SearchQuery, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
+    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
+    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -160,6 +160,7 @@ pub const SETTABLE_FRONTMATTER_KEYS: &[&str] = &[
     "source_date",
     "salience",
     "verified",
+    "evolve_ack",
 ];
 
 /// [`SETTABLE_FRONTMATTER_KEYS`] rendered for an error message.
@@ -1466,13 +1467,29 @@ impl Engine {
                     .into(),
             ));
         }
-        let rel = if folder.trim_matches('/').is_empty() {
+        let folder = normalize_rel(&folder);
+        let rel = if folder.is_empty() {
             format!("{title_slug}.md")
         } else {
-            format!("{}/{title_slug}.md", folder.trim_matches('/'))
+            format!("{folder}/{title_slug}.md")
         };
+        // Screened before either reserved check, and before `join_rel` ever
+        // sees it: `join_rel` pushes segment by segment, `..` included, so an
+        // unscreened folder both places the file outside the domain root and
+        // hides the destination from a textual reserved check - `a/../assets`
+        // is neither `assets` nor `assets/...` as a string, yet it lands
+        // exactly there on disk.
+        if !is_within_domain(&rel) {
+            return Err(EngineError::Invalid(escapes_root_error(&rel)));
+        }
         if crystalline_core::is_reserved_path(&rel) {
             return Err(EngineError::Invalid(reserved_name_error(&rel)));
+        }
+        // The other reserved shape: the folder attachments live in. Checked on
+        // the joined path, so a `folder` of `assets`, `/assets/`, `Assets` or
+        // `assets/deep` is refused whichever spelling arrived.
+        if is_assets_reserved(&rel) {
+            return Err(EngineError::Invalid(assets_reserved_error(&rel)));
         }
         let permalink = slugify(&rel);
 
@@ -1617,6 +1634,13 @@ impl Engine {
         if crystalline_core::is_reserved_path(&desc.path) {
             return Err(EngineError::Invalid(reserved_name_error(&desc.path)));
         }
+        // Defence in depth for the same reason: the walk never indexes
+        // anything under `assets/`, so a resolved engram cannot sit there
+        // today, and a row left over from before the prefix was reserved must
+        // not become a way to write into the attachment folder.
+        if is_assets_reserved(&desc.path) {
+            return Err(EngineError::Invalid(assets_reserved_error(&desc.path)));
+        }
 
         match &source {
             ContentSource::File { root } => {
@@ -1734,8 +1758,19 @@ impl Engine {
                     .into(),
             ));
         }
+        // Normalized and screened before the two reserved checks read it, the
+        // same order the create and move paths use. A stored path is already in
+        // this shape, so nothing a caller sends today changes.
+        let normalized = normalize_rel(path);
+        let path = normalized.as_str();
+        if !is_within_domain(path) {
+            return Err(EngineError::Invalid(escapes_root_error(path)));
+        }
         if crystalline_core::is_reserved_path(path) {
             return Err(EngineError::Invalid(reserved_name_error(path)));
+        }
+        if is_assets_reserved(path) {
+            return Err(EngineError::Invalid(assets_reserved_error(path)));
         }
         let (domain_id, source) = self.domain_source(domain).await?;
         match &source {
@@ -1802,6 +1837,596 @@ impl Engine {
             }
         };
         Ok((domain_id, source))
+    }
+
+    // --- attachments ---------------------------------------------------------
+    //
+    // The byte seam every attachment surface goes through: the REST file
+    // routes, the archive and the MCP resource reads. Above it nothing knows
+    // which kind of domain it is addressing; below it a file domain keeps plain
+    // files under its root (so a git team domain carries them like any other
+    // tracked file) and a virtual domain keeps the bytes in the index beside
+    // the row. The metadata row is identical either way, and it is written
+    // here rather than left to the next walker pass, so a surface that just
+    // uploaded a file can list it immediately.
+
+    /// Every attachment a domain carries, metadata only, ordered by path.
+    ///
+    /// Bytes are never loaded: a listing of a domain full of slide decks costs
+    /// one query.
+    pub async fn attachment_list(&self, domain: &str) -> Result<Vec<AttachmentRow>> {
+        let (domain_id, _) = self.domain_source(domain).await?;
+        let store = self.store.lock().await;
+        Ok(store.list_attachments(domain_id).await?)
+    }
+
+    /// One attachment's bytes and its metadata row.
+    ///
+    /// A file domain reads the file under its root; a virtual domain reads the
+    /// stored blob. Either way an absent attachment is
+    /// [`EngineError::NotFound`], the same miss an absent engram reports.
+    ///
+    /// The file arm heals the row it serves. A file can arrive behind the index
+    /// (a `git pull`, an editor, a domain whose first sync has not run) and can
+    /// change behind it the same way, so when the recorded row does not match
+    /// the file's own size and modification instant the bytes just read are
+    /// hashed and the row is refreshed through the same upsert the walker uses.
+    /// That keeps the sha a caller caches on describing exactly what it
+    /// received. The match itself is the walker's stat prefilter, so the common
+    /// case costs no hashing at all.
+    pub async fn attachment_read(
+        &self,
+        domain: &str,
+        path: &str,
+    ) -> Result<(Vec<u8>, AttachmentRow)> {
+        validate_attachment_path(path)?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        match &source {
+            ContentSource::File { root } => {
+                let abs = contained_asset_path(root, path)?;
+                // The stat comes first so an over-cap file is refused without
+                // ever being read: the ceiling is enforced by the walker (which
+                // skips such a file, so it has no row) and by the write, and a
+                // read that hashed one anyway would both spend the memory and
+                // mint a row the next full scan deletes again.
+                let meta = match std::fs::metadata(&abs) {
+                    Ok(meta) => meta,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(missing_attachment(domain, path)));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                if meta.len() > crystalline_core::MAX_ATTACHMENT_BYTES {
+                    return Err(EngineError::Invalid(over_cap_error(path, meta.len())));
+                }
+                let bytes = match std::fs::read(&abs) {
+                    Ok(bytes) => bytes,
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(EngineError::NotFound(missing_attachment(domain, path)));
+                    }
+                    Err(source) => {
+                        return Err(EngineError::Io {
+                            path: abs.display().to_string(),
+                            source,
+                        });
+                    }
+                };
+                // The bytes that were actually read decide, like the walker's
+                // post-read check: a file that grew past the ceiling between
+                // the stat and the read is caught here rather than served.
+                if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
+                    return Err(EngineError::Invalid(over_cap_error(
+                        path,
+                        bytes.len() as u64,
+                    )));
+                }
+                let modified = asset_modified(&abs);
+                let store = self.store.lock().await;
+                if let Some(row) = store.get_attachment(domain_id, path).await?
+                    && row.size == bytes.len() as u64
+                    && row.modified == modified
+                {
+                    return Ok((bytes, row));
+                }
+                let row = attachment_row(path, &bytes, modified)?;
+                store.upsert_attachment(domain_id, &row).await?;
+                Ok((bytes, row))
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                let row = store
+                    .get_attachment(domain_id, path)
+                    .await?
+                    .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))?;
+                let bytes = store
+                    .read_attachment_blob(domain_id, path)
+                    .await?
+                    .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))?;
+                Ok((bytes, row))
+            }
+        }
+    }
+
+    /// Create or replace one attachment, returning the row that now describes
+    /// it.
+    ///
+    /// Every gate runs before a byte is stored: the path rules and the
+    /// extension allowlist ([`crystalline_core::validate_asset_path`]) and the
+    /// size ceiling. A file domain then writes the bytes atomically under its
+    /// root, with the joined path proven to stay inside it, and takes the same
+    /// per-file lock every other file write takes so a concurrent replace
+    /// cannot leave the row describing the loser's bytes. A virtual domain
+    /// writes the row and then the blob, in that order, since the store keeps a
+    /// blob without a row an error rather than an orphan; a blob write that
+    /// fails takes the row back out with it, so a failure leaves the domain
+    /// exactly as it found it rather than listing a path with no bytes.
+    ///
+    /// Both kinds mark the domain pending in the maintenance state afterwards:
+    /// a human just added something the agent has not read yet, which is
+    /// exactly what a consolidation sweep is for.
+    pub async fn attachment_write(
+        &self,
+        domain: &str,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<AttachmentRow> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        if bytes.len() as u64 > crystalline_core::MAX_ATTACHMENT_BYTES {
+            return Err(EngineError::Invalid(over_cap_error(
+                path,
+                bytes.len() as u64,
+            )));
+        }
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let row = match &source {
+            ContentSource::File { root } => {
+                let abs = contained_asset_path(root, path)?;
+                // Held across the write and the row upsert, the file lock
+                // before the store lock like every other writer here. See
+                // `Engine::write_lock`.
+                let lock = self.write_lock(&abs);
+                let _guard = lock.lock().await;
+                write_bytes(&abs, &bytes)?;
+                // The modification instant is read back off the file rather
+                // than taken from the clock, so it is the same value the sync
+                // walker's stat prefilter compares against and an upload costs
+                // no re-hash on the next scan.
+                let row = attachment_row(path, &bytes, asset_modified(&abs))?;
+                let store = self.store.lock().await;
+                store.upsert_attachment(domain_id, &row).await?;
+                row
+            }
+            ContentSource::Virtual => {
+                let row = attachment_row(path, &bytes, Utc::now().to_rfc3339())?;
+                let store = self.store.lock().await;
+                // What was there before this write, so a failure can put it
+                // back rather than approximate it.
+                let previous = store.get_attachment(domain_id, path).await?;
+                store.upsert_attachment(domain_id, &row).await?;
+                // A failed blob write must leave the domain exactly as it found
+                // it, which is two different things depending on what was
+                // there. A replace: the upsert above moved the row's metadata
+                // only - the blob belongs to the row and still holds the older
+                // bytes - so restoring the recorded row restores the whole
+                // attachment, and deleting instead would destroy an attachment
+                // this write never got to replace. A create: nothing was there,
+                // so the row this write inserted goes with it, or a listing
+                // would advertise bytes that were never stored. Best effort
+                // either way (the next write, or a scan of the file domain's
+                // twin, reconciles), and the original error is what the caller
+                // sees. A file domain needs none of this: the temp file is
+                // renamed into place only on success, so a failed write leaves
+                // the old file untouched.
+                if let Err(e) = store.write_attachment_blob(domain_id, path, &bytes).await {
+                    let undone = match &previous {
+                        Some(prior) => store.upsert_attachment(domain_id, prior).await.err(),
+                        None => store.delete_attachment(domain_id, path).await.err(),
+                    };
+                    if let Some(failed) = undone {
+                        tracing::warn!(
+                            "attachment '{path}' in '{domain}' could not be rolled back after a failed blob write: {failed}"
+                        );
+                    }
+                    return Err(e.into());
+                }
+                row
+            }
+        };
+        crate::maintenance::record_pending(domain);
+        Ok(row)
+    }
+
+    /// Remove one attachment: the file or the blob, and the row.
+    ///
+    /// [`EngineError::NotFound`] when neither was there, so a caller can answer
+    /// a miss. A file that is gone while its row stands (or the reverse, after
+    /// a hand-edited domain) still counts as a delete: whichever half existed
+    /// is removed and the pair ends up consistent.
+    pub async fn attachment_delete(&self, domain: &str, path: &str) -> Result<()> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        validate_attachment_path(path)?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let mut file_removed = false;
+        if let ContentSource::File { root } = &source {
+            let abs = contained_asset_path(root, path)?;
+            let lock = self.write_lock(&abs);
+            let _guard = lock.lock().await;
+            match std::fs::remove_file(&abs) {
+                Ok(()) => file_removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        let row_removed = {
+            let store = self.store.lock().await;
+            store.delete_attachment(domain_id, path).await?
+        };
+        if !file_removed && !row_removed {
+            return Err(EngineError::NotFound(missing_attachment(domain, path)));
+        }
+        crate::maintenance::record_pending(domain);
+        Ok(())
+    }
+
+    // --- attachments a cross-domain move carries ------------------------------
+    //
+    // An `assets/` reference is domain-root relative, so it survives a rename
+    // inside its own domain untouched and means nothing at all in another
+    // domain. A cross-domain move therefore has to bring the files with the
+    // engram, which is three questions asked before a byte moves: which
+    // attachments does the moving engram actually use, does anything else in
+    // the source still need them (copy) or not (move), and is the name they
+    // arrive under free at the destination.
+
+    /// The most `-N` suffixes a colliding attachment name is offered before
+    /// the move leaves it where it is. A destination holding ninety-nine
+    /// different files under one name is a domain with a problem an automatic
+    /// rename would only deepen.
+    const MAX_ASSET_SUFFIX: usize = 99;
+
+    /// What the cross-domain move owes each attachment the moving engram uses:
+    /// where it lands, whether the bytes are already there, and whether the
+    /// source copy stays behind.
+    ///
+    /// Settled before anything is written, because the destination names it
+    /// picks are what the engram's body references and `analyzes` claim are
+    /// rewritten to, and that rewrite has to travel in the same write that
+    /// lands the engram at its destination.
+    ///
+    /// Every miss is silent by design: a reference to a file that is not there
+    /// is already a dangling reference, and a move is not the verb that should
+    /// refuse over one.
+    async fn plan_attachment_carry(
+        &self,
+        src: &EngramDescriptor,
+        dest_domain: &str,
+        content: &str,
+    ) -> Vec<AttachmentCarry> {
+        let parsed = parse_engram(content).ok();
+        let body = parsed
+            .as_ref()
+            .map_or(content, |engram| engram.body.as_str());
+        let mut candidates = crystalline_core::find_asset_refs(body);
+        if let Some(claim) = parsed.as_ref().and_then(|e| asset_claim(&e.frontmatter))
+            && !candidates.contains(&claim)
+        {
+            candidates.push(claim);
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // The bytes are read and dropped here: what the plan needs is the
+        // sha256, and the read is what makes the row's sha describe the file
+        // that is actually on disk. Reading them again in the carry itself
+        // costs one more read of one attachment and keeps the peak at a single
+        // attachment rather than at everything the engram references.
+        let mut present: Vec<(String, String)> = Vec::new();
+        for path in candidates {
+            match self.attachment_read(&src.domain, &path).await {
+                Ok((_, row)) => present.push((path, row.sha256)),
+                Err(e) => {
+                    // Loud enough to answer "why did my screenshot not
+                    // travel": the move went through, but something the engram
+                    // points at did not come with it.
+                    tracing::warn!(
+                        "attachment '{path}' referenced by '{}' is not in '{}' ({e}); the move carries nothing for it",
+                        src.permalink,
+                        src.domain
+                    );
+                }
+            }
+        }
+        if present.is_empty() {
+            return Vec::new();
+        }
+
+        let paths: Vec<String> = present.iter().map(|(path, _)| path.clone()).collect();
+        let shared = self.shared_asset_paths(src, &paths).await;
+        let mut claimed: HashSet<String> = HashSet::new();
+        let mut plan = Vec::new();
+        for (from, sha) in present {
+            let Some((to, reuse)) = self
+                .free_asset_destination(dest_domain, &from, &sha, &claimed)
+                .await
+            else {
+                continue;
+            };
+            claimed.insert(to.clone());
+            plan.push(AttachmentCarry {
+                shared: shared.contains(&from),
+                from,
+                to,
+                reuse,
+            });
+        }
+        plan
+    }
+
+    /// The attachment paths another engram in the source domain still
+    /// references or claims, with every failure resolved the safe way by
+    /// [`resolve_shared`].
+    ///
+    /// Counted across live and retired engrams alike, the way the
+    /// consolidation sweep counts referents: a deprecated engram showing a
+    /// screenshot needs the file exactly as much as a current one does, so its
+    /// reference is what turns a move into a copy.
+    async fn shared_asset_paths(
+        &self,
+        src: &EngramDescriptor,
+        candidates: &[String],
+    ) -> HashSet<String> {
+        resolve_shared(
+            self.count_shared_asset_paths(src, candidates).await,
+            candidates,
+        )
+    }
+
+    /// The counting itself: which candidates another engram in `src`'s domain
+    /// still references or claims, or the first failure that stopped the count
+    /// from answering.
+    ///
+    /// Engrams are read one at a time rather than in one batch, because a
+    /// domain can hold multi-megabyte engrams and this runs on an ordinary
+    /// move; the screen keeps the parse to the engrams that could possibly
+    /// match, and the scan stops as soon as every candidate is accounted for.
+    ///
+    /// The screen tests the path *below* the reserved folder (`shot.png` for
+    /// `assets/shot.png`) rather than the whole path, which makes it strictly
+    /// wider than the decision it protects: a body reference must spell the
+    /// folder as `assets/` to be a reference at all, and a claim is folded to
+    /// that spelling when it is read, so an engram claiming `Assets/shot.png`
+    /// (the same folder on APFS and NTFS) is screened in and then decided
+    /// exactly. A narrower screen would let a live claim lose its file.
+    ///
+    /// Nothing here answers "not referenced" on a failure. A store error is
+    /// returned, and text that will not parse marks every candidate the screen
+    /// matched in it as referenced: the engram plainly mentions the path and
+    /// the only reading that cannot delete something in use is that it uses
+    /// it.
+    async fn count_shared_asset_paths(
+        &self,
+        src: &EngramDescriptor,
+        candidates: &[String],
+    ) -> Result<HashSet<String>> {
+        let mut shared: HashSet<String> = HashSet::new();
+        let source = self.content_source(&src.domain)?;
+        let others = {
+            let store = self.store.lock().await;
+            store.list_engrams(&src.domain, None, None).await?
+        };
+        for other in others {
+            if shared.len() == candidates.len() {
+                break;
+            }
+            if other.path == src.path {
+                continue;
+            }
+            let Some(text) = self
+                .peer_engram_text(&source, src.domain_id, &other.path)
+                .await?
+            else {
+                // Whatever the listing knew about, its text is not there any
+                // more, and text that is gone references nothing. Only a real
+                // read failure counts as not knowing, and that is an `Err`.
+                continue;
+            };
+            let screened: Vec<&String> = candidates
+                .iter()
+                .filter(|path| text.contains(asset_tail(path)))
+                .collect();
+            if screened.is_empty() {
+                continue;
+            }
+            let Ok(engram) = parse_engram(&text) else {
+                for candidate in screened {
+                    shared.insert(candidate.clone());
+                }
+                continue;
+            };
+            let refs = crystalline_core::find_asset_refs(&engram.body);
+            let claim = asset_claim(&engram.frontmatter);
+            for candidate in screened {
+                if refs.contains(candidate) || claim.as_deref() == Some(candidate.as_str()) {
+                    shared.insert(candidate.clone());
+                }
+            }
+        }
+        Ok(shared)
+    }
+
+    /// One peer engram's whole text, frontmatter included, for the referent
+    /// count.
+    ///
+    /// Deliberately not [`Store::engram_content`] alone. The index keeps only
+    /// the *body* for a file domain (`EngramRecord::from_engram` sets
+    /// `content` to `engram.body`; the virtual write path is the one that
+    /// stores the whole source), and an `analyzes` claim lives in the
+    /// frontmatter - so counting off the index alone would never see a claim
+    /// in a file domain and would delete a claimed attachment out from under
+    /// the engram that claimed it. A file domain is therefore read from its
+    /// files, which is where its frontmatter actually is, and a virtual domain
+    /// from the database, which is where its whole engram actually is.
+    ///
+    /// That is one file read per engram in the source domain on a
+    /// cross-domain move that carries attachments. It is the price of counting
+    /// claims at all, and the verb is rare.
+    ///
+    /// `None` when the text is genuinely absent (a row the index still lists
+    /// for a file that is gone): text that is not there references nothing. A
+    /// read that fails for any other reason is an `Err`, which
+    /// [`resolve_shared`] turns into "still referenced".
+    async fn peer_engram_text(
+        &self,
+        source: &ContentSource,
+        domain_id: DomainId,
+        path: &str,
+    ) -> Result<Option<String>> {
+        match source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, path);
+                match std::fs::read_to_string(&abs) {
+                    Ok(text) => Ok(Some(text)),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                    Err(source) => Err(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    }),
+                }
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                Ok(store.engram_content(domain_id, path).await?)
+            }
+        }
+    }
+
+    /// The path an attachment takes at the destination, and whether the
+    /// destination already holds exactly these bytes there.
+    ///
+    /// Its own name when nothing holds it; its own name with nothing to write
+    /// when the file already there has the same sha256 (same name, same bytes,
+    /// same file); `name-2.ext`, `name-3.ext` and so on when something
+    /// different holds it, since a move must never overwrite a file the
+    /// destination domain already had. Every suffixed name is put back through
+    /// [`crystalline_core::validate_asset_path`], so the name the engram's
+    /// references are rewritten to is always a name a write will accept.
+    ///
+    /// `None` when no free, valid name could be settled or the destination
+    /// could not be inspected. That is the fallback that keeps everything
+    /// referenced: the attachment is simply not carried, so nothing is written
+    /// at the destination, nothing is deleted at the source and the moving
+    /// engram's references keep the spelling they had. The whole file stays in
+    /// the source domain under the name that still addresses it there, and the
+    /// destination is left with a plain dangling reference for the sweep to
+    /// report - the same outcome an already-missing attachment produces, and
+    /// the one thing that cannot happen is a reference rewritten to a name
+    /// nothing will ever accept.
+    async fn free_asset_destination(
+        &self,
+        dest_domain: &str,
+        path: &str,
+        sha: &str,
+        claimed: &HashSet<String>,
+    ) -> Option<(String, bool)> {
+        for attempt in 1..=Self::MAX_ASSET_SUFFIX {
+            let candidate = if attempt == 1 {
+                path.to_string()
+            } else {
+                // A stem that cannot be shortened into a valid name at all
+                // cannot be shortened into a valid longer-suffixed one either,
+                // so this ends the search rather than skipping an attempt.
+                suffixed_asset_path(path, attempt)?
+            };
+            // A name another attachment in this same move already took is
+            // occupied even though nothing is written there yet.
+            if claimed.contains(&candidate) {
+                continue;
+            }
+            match self.attachment_read(dest_domain, &candidate).await {
+                Ok((_, row)) if row.sha256 == sha => return Some((candidate, true)),
+                Ok(_) => {}
+                Err(EngineError::NotFound(_)) => return Some((candidate, false)),
+                Err(e) => {
+                    // The attachment stays whole where it is, so this is a
+                    // note for whoever is reading the trace rather than
+                    // something the user lost.
+                    tracing::debug!(
+                        "'{candidate}' in '{dest_domain}' could not be inspected ({e}); '{path}' stays where it is"
+                    );
+                    return None;
+                }
+            }
+        }
+        tracing::warn!(
+            "'{path}' collides with {} different files in '{dest_domain}'; it stays where it is",
+            Self::MAX_ASSET_SUFFIX
+        );
+        None
+    }
+
+    /// Carry out the planned attachment moves and copies.
+    ///
+    /// Runs after the engram itself has landed and never turns a failure into
+    /// a failed move: the engram is already where it was asked to be, and
+    /// every failure here leaves the source copy in place, so the worst
+    /// outcome is a reference the destination cannot resolve yet - which the
+    /// consolidation sweep reports as a dangling attachment rather than
+    /// something a move should have refused over. Both domains are marked
+    /// pending by the writes and deletes themselves.
+    async fn carry_attachments(
+        &self,
+        src_domain: &str,
+        dest_domain: &str,
+        plan: &[AttachmentCarry],
+    ) {
+        for carry in plan {
+            if !carry.reuse {
+                let bytes = match self.attachment_read(src_domain, &carry.from).await {
+                    Ok((bytes, _)) => bytes,
+                    Err(e) => {
+                        tracing::warn!(
+                            "attachment '{}' could not be read out of '{src_domain}' for the move: {e}",
+                            carry.from
+                        );
+                        continue;
+                    }
+                };
+                if let Err(e) = self.attachment_write(dest_domain, &carry.to, bytes).await {
+                    tracing::warn!(
+                        "attachment '{}' could not be written into '{dest_domain}' as '{}': {e}",
+                        carry.from,
+                        carry.to
+                    );
+                    continue;
+                }
+            }
+            // Only now, with the bytes proven to be at the destination, does
+            // the source copy go - and only when nothing there still uses it.
+            if !carry.shared
+                && let Err(e) = self.attachment_delete(src_domain, &carry.from).await
+            {
+                tracing::warn!(
+                    "attachment '{}' was carried into '{dest_domain}' but could not be removed from '{src_domain}': {e}",
+                    carry.from
+                );
+            }
+        }
     }
 
     /// The retirement statuses [`Engine::retire_engram`] accepts. Any other
@@ -2373,15 +2998,59 @@ impl Engine {
         }
         let actor = self.actor(client);
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // An `evolve_ack` assignment is the one set_frontmatter key whose value
+        // the server completes rather than takes: the scope comes from running
+        // detection over this engram's domain, which needs the store and so
+        // cannot happen inside the pure text edit below. Computed before the
+        // write lock is taken, so a sweep never runs while a file is held.
+        let ack = self.ack_draft(p, &desc, &actor).await?;
 
-        match &source {
+        self.apply_source_edit(
+            &desc,
+            &source,
+            p.expected_checksum.as_deref(),
+            &actor,
+            |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
+        )
+        .await?;
+
+        let mut response = json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "path": desc.path,
+            "operation": p.operation,
+        });
+        if let Some(entry) = &ack {
+            response["evolve_ack"] = ack_json(entry);
+        }
+        Ok(response)
+    }
+
+    /// Read an engram's source, hand it to `apply`, and write the result back:
+    /// the shared body of every edit that rewrites content in place.
+    ///
+    /// Kind-agnostic and lock-correct, which is why it is one function rather
+    /// than repeated per caller. For a file domain the write lock is held
+    /// across the read, the compare, the edit and the write; without an
+    /// `expected_checksum` that serialization is the whole guarantee, since two
+    /// unguarded edits must each apply to what the other wrote rather than
+    /// silently dropping it. For a virtual domain the store's own compare and
+    /// swap plays that part, with the checksum of what was just read standing
+    /// in when the caller presents none.
+    async fn apply_source_edit<F>(
+        &self,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+        expected_checksum: Option<&str>,
+        actor: &str,
+        apply: F,
+    ) -> Result<()>
+    where
+        F: FnOnce(&str) -> Result<String>,
+    {
+        match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
-                // Held across the read, the compare, the edit and the write.
-                // With an expected_checksum the compare below refuses a stale
-                // edit; without one, serializing is the whole guarantee: two
-                // unguarded edits each apply to what the other wrote rather
-                // than silently dropping it. See `Engine::write_lock`.
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
                 let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
@@ -2390,16 +3059,15 @@ impl Engine {
                 })?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
-                // compares. Absent stays last-write-wins - the serialized
-                // read-modify-write below is then the whole guarantee.
-                if let Some(expected) = &p.expected_checksum {
+                // compares.
+                if let Some(expected) = expected_checksum {
                     let found = sha256_hex(current.as_bytes());
-                    if found != *expected {
+                    if found != expected {
                         return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
                     }
                 }
-                let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
-                let edited = touch_generated(&edited, &actor, now_offset());
+                let edited = apply(&current)?;
+                let edited = touch_generated(&edited, actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 write_file(&abs, &edited)?;
                 let store = self.store.lock().await;
@@ -2419,16 +3087,11 @@ impl Engine {
                             ))
                         })?
                 };
-                // The CAS token: the caller's expected_checksum when supplied
-                // (guarding against a change since their read), else the sha of
-                // what we just read (last-write-wins, matching the settled
-                // semantics).
-                let expected = p
-                    .expected_checksum
-                    .clone()
+                let expected = expected_checksum
+                    .map(str::to_string)
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = self.apply_edit(&current, p, &desc.permalink, &actor)?;
-                let edited = touch_generated(&edited, &actor, now_offset());
+                let edited = apply(&current)?;
+                let edited = touch_generated(&edited, actor, now_offset());
                 let edited = Self::enforce_temporal(edited)?;
                 let stamp = virtual_stamp(&edited);
                 let store = self.store.lock().await;
@@ -2453,13 +3116,7 @@ impl Engine {
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;
-
-        Ok(json!({
-            "domain": desc.domain,
-            "permalink": desc.permalink,
-            "path": desc.path,
-            "operation": p.operation,
-        }))
+        Ok(())
     }
 
     /// Apply one edit operation to an engram's markdown, returning the edited
@@ -2472,6 +3129,7 @@ impl Engine {
         p: &EditParams,
         permalink: &str,
         actor: &str,
+        ack: Option<&EvolveAck>,
     ) -> Result<String> {
         Ok(match p.operation.as_str() {
             "append" => append_body(source, self.require_content(p)?),
@@ -2515,7 +3173,7 @@ impl Engine {
                 let section = self.require_section(p)?;
                 insert_after_section(source, section, content).map_err(section_err)?
             }
-            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor)?,
+            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor, ack)?,
             other => {
                 return Err(EngineError::Invalid(format!(
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
@@ -2532,7 +3190,12 @@ impl Engine {
     ///
     /// An absent or empty value clears the field, except on `status`, which is
     /// required, and on `verified`, which stamps a verification instead.
-    fn apply_set_frontmatter(source: &str, p: &EditParams, actor: &str) -> Result<String> {
+    fn apply_set_frontmatter(
+        source: &str,
+        p: &EditParams,
+        actor: &str,
+        ack: Option<&EvolveAck>,
+    ) -> Result<String> {
         let key = p
             .key
             .as_deref()
@@ -2635,6 +3298,37 @@ impl Engine {
                 entries.push(entry);
                 Ok(set_verified(source, &entries))
             }
+            EVOLVE_ACK_KEY => {
+                // The entry was completed before the lock (see
+                // `Engine::ack_draft`), because its scope is the sweep's
+                // verdict about this engram and no text edit can know it.
+                let entry = ack.ok_or_else(|| {
+                    EngineError::Invalid(format!(
+                        "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
+                    ))
+                })?;
+                // An engram whose frontmatter no longer parses would have its
+                // existing entries read as none, and this would write a second
+                // `evolve_ack` key beside the one already there - compounding a
+                // break instead of reporting it.
+                parse_engram(source).map_err(|e| {
+                    EngineError::Invalid(format!(
+                        "cannot acknowledge a finding on an engram that does not parse ({e}); repair the frontmatter first"
+                    ))
+                })?;
+                let out = set_evolve_ack(source, &merged_acks(source, entry.clone()));
+                // Defense in depth: whatever the note carried, the bytes about
+                // to be persisted have to be readable. Refusing here is the last
+                // stop before a write that would make the engram invisible to
+                // the sweep, to read_engram and to search.
+                parse_engram(&out).map_err(|e| {
+                    EngineError::Invalid(format!(
+                        "the acknowledgment would leave '{}' unparseable ({e}); nothing was written",
+                        p.identifier
+                    ))
+                })?;
+                Ok(out)
+            }
             other => Err(EngineError::Invalid(format!(
                 "set_frontmatter cannot set '{other}'; the settable keys are {}",
                 settable_keys()
@@ -2700,8 +3394,18 @@ impl Engine {
         if dest_rel.is_empty() {
             return Err(EngineError::Invalid("destination path is empty".into()));
         }
+        // As on the create path: `normalize_md` drops empty segments but keeps
+        // `..`, so containment is decided here, before either reserved check
+        // reads the destination as text and before `join_rel` builds a path
+        // from it.
+        if !is_within_domain(&dest_rel) {
+            return Err(EngineError::Invalid(escapes_root_error(&dest_rel)));
+        }
         if crystalline_core::is_reserved_path(&dest_rel) {
             return Err(EngineError::Invalid(reserved_name_error(&dest_rel)));
+        }
+        if is_assets_reserved(&dest_rel) {
+            return Err(EngineError::Invalid(assets_reserved_error(&dest_rel)));
         }
         let cross = dest_domain != p.domain;
 
@@ -2719,10 +3423,29 @@ impl Engine {
             Vec::new()
         };
 
+        // What the move carries besides the engram: the attachments it
+        // references or claims. Filled in the cross-domain branch and acted on
+        // once every store lock that branch takes has been released.
+        let mut carried: Vec<AttachmentCarry> = Vec::new();
+
         if cross {
             // Read the source content (file when present, else database), index
             // it into the destination source, then remove the source.
-            let content = self.load_content(&src_source, &src).await?;
+            let mut content = self.load_content(&src_source, &src).await?;
+            // Resolved before the write, since an attachment that has to be
+            // renamed at the destination changes the very text being written:
+            // the engram lands already pointing at the name its file took.
+            carried = self
+                .plan_attachment_carry(&src, &dest_domain, &content)
+                .await;
+            let renames: BTreeMap<String, String> = carried
+                .iter()
+                .filter(|carry| carry.to != carry.from)
+                .map(|carry| (carry.from.clone(), carry.to.clone()))
+                .collect();
+            if !renames.is_empty() {
+                content = rewrite_carried_refs(&content, &renames);
+            }
             match &dest_source {
                 ContentSource::File { root } => {
                     let dest_abs = join_rel(root, &dest_rel);
@@ -2779,6 +3502,16 @@ impl Engine {
             store
                 .rename_engram(src.domain_id, &src.path, &dest_rel)
                 .await?;
+        }
+
+        // The attachments follow the engram, now that the engram itself has
+        // landed and the branch above has released its store lock. A
+        // same-domain move carries nothing: an `assets/` reference is
+        // domain-root relative, so a rename inside one domain leaves every one
+        // of them valid as written.
+        if !carried.is_empty() {
+            self.carry_attachments(&src.domain, &dest_domain, &carried)
+                .await;
         }
 
         // Rewrite inbound bare links from other domains to the prefixed form.
@@ -3126,9 +3859,34 @@ impl Engine {
 
     /// Delete an engram and its index rows. A file domain also removes the file
     /// on disk; a virtual domain only drops the database rows.
+    ///
+    /// An `assets/` identifier deletes that attachment instead - the row plus
+    /// the file or the blob - which is what completes an orphaned-attachment
+    /// finding without a second write verb existing. The two are one verb
+    /// because they are one act from the caller's side ("remove this thing from
+    /// the domain"), and the identifier says which thing without ambiguity: an
+    /// engram can never live under the reserved `assets/` folder.
     pub async fn delete_engram(&self, p: &DeleteParams) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
+        }
+        if let Some(path) = attachment_identifier(&p.identifier) {
+            // Refused rather than ignored: `expected_checksum` is a promise
+            // about markdown a caller read, and an attachment's bytes are not
+            // that. Accepting it silently would let a caller believe a delete
+            // was guarded when nothing compared anything.
+            if p.expected_checksum.is_some() {
+                return Err(EngineError::Invalid(format!(
+                    "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
+                )));
+            }
+            self.attachment_delete(&p.domain, &path).await?;
+            return Ok(json!({
+                "domain": p.domain,
+                "path": path,
+                "attachment": true,
+                "deleted": true,
+            }));
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         // Held across the comparison and the removal, so a guarded delete
@@ -4206,7 +4964,7 @@ impl Engine {
     /// shapes the merged result. Nothing is written and nothing is remembered,
     /// so "what is left" is re-derived by calling again with the same scope.
     ///
-    /// Five details of the assembly are load-bearing, each guarding a class of
+    /// Six details of the assembly are load-bearing, each guarding a class of
     /// silently wrong finding:
     ///
     /// - the resolved degrees are counted over the **merged** graph slices, so
@@ -4225,7 +4983,17 @@ impl Engine {
     /// - `known_domains` is every registered domain, so `V102` can tell an
     ///   unregistered target domain apart from a target that does not exist,
     ///   and the graph is taken at depth 1 so cross-domain targets carry a
-    ///   status for `V101` to read.
+    ///   status for `V101` to read;
+    /// - the attachment facts (`analyzes`, `analyzed_hash`, `asset_refs`) are
+    ///   read off the **parsed engram** [`Engine::load_engram`] returns - the
+    ///   file for a file domain, the stored source for a virtual one - and
+    ///   never off the index's `content` column, which for a file domain holds
+    ///   the body alone. A claim lives in the frontmatter, so counting it off
+    ///   the index would make every file domain look as if it claimed nothing
+    ///   and would report claimed attachments as orphans. This is the same
+    ///   split [`Engine::peer_engram_text`] makes for the move's referent
+    ///   count, and the two agree on what a reference is: an `assets/` link in
+    ///   the body or the `analyzes` key, compared as exact paths.
     pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
@@ -4261,102 +5029,37 @@ impl Engine {
         let mut truncations: Vec<String> = Vec::new();
         let mut engrams_scanned = 0usize;
         let mut unparsed = 0usize;
+        let mut acknowledged = AckCounts::default();
 
         // One domain at a time: `SweepInput` is domain-scoped (two rules are
         // domain-relative) and processing them in turn bounds the memory an
         // unscoped sweep needs to whatever the largest domain costs.
         for name in &scope {
-            let source = self.content_source(name)?;
-            let store = self.store.lock().await;
-            let descs = store.list_engrams(name, None, None).await?;
-            drop(store);
-            // No engrams means no domain row to query against and nothing to
-            // detect. An empty domain is quiet, not an error.
-            let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
+            let Some(swept) = self
+                .sweep_domain(name, today, &known_domains, p.include_acknowledged)
+                .await?
+            else {
                 continue;
             };
-
-            let graph = self.sweep_graph(&descs).await?;
-            let mut inbound: HashMap<i64, usize> = HashMap::new();
-            let mut outbound: HashMap<i64, usize> = HashMap::new();
-            for edge in &graph.edges {
-                *outbound.entry(edge.from.0).or_default() += 1;
-                *inbound.entry(edge.to.0).or_default() += 1;
-            }
-
-            let store = self.store.lock().await;
-            let unresolved = store.unresolved_refs(domain_id).await?;
-            let vocab = store.vocabulary(Some(name)).await?;
-            drop(store);
-
-            let verify_config = domain_verify_config(&source);
-            let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
-            for d in &descs {
-                // Files-are-truth for a file domain, the stored content for a
-                // virtual one. An engram that no longer parses is counted and
-                // skipped rather than failing the whole sweep, since one broken
-                // file must not hide every finding behind it.
-                let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
-                    unparsed += 1;
-                    continue;
-                };
-                let fm = &engram.frontmatter;
-                let status = match fm
-                    .status
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                {
-                    Some(s) => s.to_ascii_lowercase(),
-                    None => d.status.trim().to_ascii_lowercase(),
-                };
-                let title = if fm.title.trim().is_empty() {
-                    d.title.clone()
-                } else {
-                    fm.title.clone()
-                };
-                let tokens = engram.body.chars().count() / 4;
-                facts.push(EngramFacts {
-                    id: d.id,
-                    domain: d.domain.clone(),
-                    permalink: d.permalink.clone(),
-                    title,
-                    path: d.path.clone(),
-                    status,
-                    engram_type: fm.engram_type.trim().to_ascii_lowercase(),
-                    tags: fm.tags.clone(),
-                    salience: yaml_number(fm.extra.get("salience")),
-                    recorded_at: fm.recorded_at,
-                    valid_from: fm.valid_from,
-                    valid_to: fm.valid_to,
-                    stale_on: fm.stale_on(),
-                    verified_on: fm.latest_verified().map(|v| v.at.date_naive()),
-                    tokens,
-                    token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
-                    inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
-                    outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
-                    generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
-                    body: engram.body,
-                });
-            }
-
-            let input = SweepInput {
-                domain: name.clone(),
-                today,
-                engrams: facts,
-                graph,
-                unresolved,
-                tags: vocab.tags,
-                tag_aliases: vocab.aliases,
-                known_domains: known_domains.clone(),
-                options: SweepOptions::default(),
-            };
-            let report = detect(&input);
-            engrams_scanned += report.engrams_scanned;
+            engrams_scanned += swept.report.engrams_scanned;
+            unparsed += swept.unparsed;
             // A cap that fired is domain-local, so the merged list names the
             // domain it fired in.
-            truncations.extend(report.truncations.iter().map(|t| format!("{name} - {t}")));
-            findings.extend(report.findings);
+            truncations.extend(
+                swept
+                    .report
+                    .truncations
+                    .iter()
+                    .map(|t| format!("{name} - {t}")),
+            );
+            // Counted before the family and rule filters below, because what an
+            // acknowledgment suppressed is a fact about the domain rather than
+            // about the slice of it this call asked for.
+            acknowledged.total += swept.report.acknowledged.total;
+            acknowledged.temporal += swept.report.acknowledged.temporal;
+            acknowledged.structure += swept.report.acknowledged.structure;
+            acknowledged.redundancy += swept.report.acknowledged.redundancy;
+            findings.extend(swept.report.findings);
         }
 
         findings.retain(|f| {
@@ -4398,7 +5101,7 @@ impl Engine {
             .iter()
             .enumerate()
             .map(|(i, f)| {
-                json!({
+                let mut row = json!({
                     "n": offset + i + 1,
                     "priority": f.priority,
                     "rule": f.rule,
@@ -4410,7 +5113,29 @@ impl Engine {
                     "finding": f.finding,
                     "evidence": f.evidence,
                     "fix": f.fix,
-                })
+                });
+                // The acknowledgment columns ride along only when they say
+                // something, so an ordinary queue row stays the flat shape every
+                // renderer already knows.
+                if f.acknowledged {
+                    row["acknowledged"] = Value::Bool(true);
+                }
+                if f.ack_stale {
+                    row["ack_stale"] = Value::Bool(true);
+                }
+                // The scope the acknowledgment was **given for**, which on a
+                // stale row is deliberately not what the finding fires on now:
+                // the row's own evidence and fix columns say that, and the pair
+                // is what shows a reader why the acknowledgment stopped
+                // matching. Named beside `ack_note` rather than plain `scope`,
+                // which at the top level already names the swept domains.
+                if let Some(scope) = f.ack_scope.as_deref().filter(|s| !s.is_empty()) {
+                    row["ack_scope"] = Value::String(scope.to_string());
+                }
+                if let Some(note) = &f.ack_note {
+                    row["ack_note"] = Value::String(note.clone());
+                }
+                row
             })
             .collect();
 
@@ -4438,11 +5163,313 @@ impl Engine {
             "limit": limit,
             "count": queue.len(),
             "families": family_counts,
+            "acknowledged": {
+                "total": acknowledged.total,
+                "by_family": {
+                    "temporal": acknowledged.temporal,
+                    "structure": acknowledged.structure,
+                    "redundancy": acknowledged.redundancy,
+                },
+            },
             "queue": queue,
             "actions": actions,
             "guidance": EVOLVE_GUIDANCE,
             "truncations": truncations,
         }))
+    }
+
+    // --- acknowledgments -----------------------------------------------------
+
+    /// The acknowledgment an `evolve_ack` assignment is asking for, completed
+    /// with the scope only the sweep can supply, or `None` when this edit is
+    /// not one.
+    ///
+    /// The value is the rule id optionally followed by a note, split at the
+    /// first whitespace: `V101` or `V101 lineage citation, keep`. The rule has
+    /// to be one the catalog knows, because an acknowledgment of a rule that
+    /// does not exist can never suppress anything and silently storing it would
+    /// read as work done.
+    ///
+    /// The scope is the firing finding's, and its absence is meaningful: a rule
+    /// that is not currently firing for this engram is acknowledged scope-less,
+    /// which matches whatever it finds later. That is the honest reading of
+    /// "acknowledge this before it appears".
+    async fn ack_draft(
+        &self,
+        p: &EditParams,
+        desc: &EngramDescriptor,
+        actor: &str,
+    ) -> Result<Option<EvolveAck>> {
+        if p.operation != "set_frontmatter"
+            || p.key.as_deref().map(str::trim) != Some(EVOLVE_ACK_KEY)
+        {
+            return Ok(None);
+        }
+        let raw = p.value.as_deref().map(str::trim).unwrap_or_default();
+        let (rule, note) = parse_ack_value(raw)?;
+        Ok(Some(EvolveAck {
+            scope: self
+                .firing_scope(&desc.domain, &desc.permalink, &rule)
+                .await?,
+            rule,
+            note,
+            by: actor.to_string(),
+            at: Some(now_offset()),
+        }))
+    }
+
+    /// What `rule` is currently firing on `permalink` for, as the scope an
+    /// acknowledgment is matched against later. `None` when the rule is not
+    /// firing, or when it fires with an empty scope because its identity is
+    /// just the engram and the rule.
+    ///
+    /// Detection runs with the suppressed findings included, so
+    /// re-acknowledging a finding an older entry already silences still sees
+    /// the evidence it fires on and records the current scope rather than
+    /// dropping to a scope-less entry.
+    async fn firing_scope(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+    ) -> Result<Option<String>> {
+        let mut known_domains = self.known_domain_names();
+        known_domains.sort();
+        known_domains.dedup();
+        let today = Utc::now().date_naive();
+        let Some(swept) = self
+            .sweep_domain(domain, today, &known_domains, true)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(swept
+            .report
+            .findings
+            .into_iter()
+            .find(|f| f.rule == rule && f.permalink == permalink)
+            .map(|f| f.scope)
+            .filter(|scope| !scope.is_empty()))
+    }
+
+    /// Acknowledge a finding: record on the engram that this rule's finding was
+    /// read and ruled intentional, so future sweeps count it rather than
+    /// raising it. The Fluid half of the same act
+    /// [`Engine::edit_engram_as`]'s `set_frontmatter` performs for an agent,
+    /// through the one edit path, with the scope computed the one way.
+    pub async fn acknowledge_finding_as(
+        &self,
+        domain: &str,
+        identifier: &str,
+        rule: &str,
+        note: Option<&str>,
+        client: Option<&str>,
+    ) -> Result<Value> {
+        let value = match note.map(str::trim).filter(|n| !n.is_empty()) {
+            Some(note) => format!("{} {note}", rule.trim()),
+            None => rule.trim().to_string(),
+        };
+        let params = EditParams {
+            identifier: identifier.to_string(),
+            domain: domain.to_string(),
+            operation: "set_frontmatter".to_string(),
+            key: Some(EVOLVE_ACK_KEY.to_string()),
+            value: Some(value),
+            ..EditParams::default()
+        };
+        let result = self.edit_engram_as(&params, client).await?;
+        Ok(result.get("evolve_ack").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Withdraw an acknowledgment, leaving the engram's other entries alone.
+    /// `false` when the engram carries none for that rule, which the surface
+    /// answers as a 404 rather than pretending a removal happened.
+    ///
+    /// Deliberately not offered over MCP: an agent silences a finding a person
+    /// ruled intentional, and un-silencing it is the person's call, in Fluid or
+    /// in the file.
+    pub async fn unacknowledge_finding_as(
+        &self,
+        domain: &str,
+        identifier: &str,
+        rule: &str,
+        client: Option<&str>,
+    ) -> Result<bool> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let rule = rule.trim().to_ascii_uppercase();
+        if rule_info(&rule).is_none() {
+            return Err(EngineError::Invalid(unknown_rule_message(&rule)));
+        }
+        let actor = self.actor(client);
+        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        // Checked before the write so an engram carrying no such entry answers
+        // "nothing to withdraw" without a rewrite, a reindex or a touched
+        // generated block.
+        let current = self.load_source(&source, &desc).await?;
+        // Case-folded, like every other rule comparison on this path: a
+        // hand-written `- { rule: v101 }` suppresses findings, so it has to be
+        // withdrawable too.
+        if !acks_of(&current)
+            .iter()
+            .any(|a| a.rule.eq_ignore_ascii_case(&rule))
+        {
+            return Ok(false);
+        }
+        self.apply_source_edit(&desc, &source, None, &actor, |current| {
+            let kept: Vec<EvolveAck> = acks_of(current)
+                .into_iter()
+                .filter(|a| !a.rule.eq_ignore_ascii_case(&rule))
+                .collect();
+            Ok(set_evolve_ack(current, &kept))
+        })
+        .await?;
+        Ok(true)
+    }
+
+    /// An engram's markdown as its domain holds it, whichever kind that is.
+    async fn load_source(&self, source: &ContentSource, desc: &EngramDescriptor) -> Result<String> {
+        match source {
+            ContentSource::File { root } => {
+                let abs = join_rel(root, &desc.path);
+                std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
+                    path: abs.display().to_string(),
+                    source,
+                })
+            }
+            ContentSource::Virtual => {
+                let store = self.store.lock().await;
+                store
+                    .engram_content(desc.domain_id, &desc.path)
+                    .await?
+                    .ok_or_else(|| {
+                        EngineError::NotFound(format!(
+                            "no content stored for '{}' in domain '{}'",
+                            desc.permalink, desc.domain
+                        ))
+                    })
+            }
+        }
+    }
+
+    /// One domain's assembled facts, detected: the sweep's whole per-domain
+    /// half, shared by [`Engine::evolve_detect`] and the acknowledgment write
+    /// path, which needs the same verdict about one engram before it can record
+    /// what a finding was acknowledged for.
+    ///
+    /// `Ok(None)` for a domain with no engrams: no domain row to query against
+    /// and nothing to detect. An empty domain is quiet, not an error.
+    async fn sweep_domain(
+        &self,
+        name: &str,
+        today: NaiveDate,
+        known_domains: &[String],
+        include_acknowledged: bool,
+    ) -> Result<Option<DomainSweep>> {
+        let mut unparsed = 0usize;
+        let source = self.content_source(name)?;
+        let store = self.store.lock().await;
+        let descs = store.list_engrams(name, None, None).await?;
+        drop(store);
+        // No engrams means no domain row to query against and nothing to
+        // detect. An empty domain is quiet, not an error.
+        let Some(domain_id) = descs.first().map(|d| d.domain_id) else {
+            return Ok(None);
+        };
+
+        let graph = self.sweep_graph(&descs).await?;
+        let mut inbound: HashMap<i64, usize> = HashMap::new();
+        let mut outbound: HashMap<i64, usize> = HashMap::new();
+        for edge in &graph.edges {
+            *outbound.entry(edge.from.0).or_default() += 1;
+            *inbound.entry(edge.to.0).or_default() += 1;
+        }
+
+        let store = self.store.lock().await;
+        let unresolved = store.unresolved_refs(domain_id).await?;
+        let vocab = store.vocabulary(Some(name)).await?;
+        // Metadata only, one query: the attachment rules compare paths,
+        // sizes and hashes and never read a byte of any file.
+        let attachments = store.list_attachments(domain_id).await?;
+        drop(store);
+
+        let verify_config = domain_verify_config(&source);
+        let mut facts: Vec<EngramFacts> = Vec::with_capacity(descs.len());
+        for d in &descs {
+            // Files-are-truth for a file domain, the stored content for a
+            // virtual one. An engram that no longer parses is counted and
+            // skipped rather than failing the whole sweep, since one broken
+            // file must not hide every finding behind it.
+            let Some(engram) = self.load_engram(&source, d.domain_id, &d.path).await else {
+                unparsed += 1;
+                continue;
+            };
+            let fm = &engram.frontmatter;
+            let status = match fm
+                .status
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(s) => s.to_ascii_lowercase(),
+                None => d.status.trim().to_ascii_lowercase(),
+            };
+            let title = if fm.title.trim().is_empty() {
+                d.title.clone()
+            } else {
+                fm.title.clone()
+            };
+            let tokens = engram.body.chars().count() / 4;
+            facts.push(EngramFacts {
+                id: d.id,
+                domain: d.domain.clone(),
+                permalink: d.permalink.clone(),
+                title,
+                path: d.path.clone(),
+                status,
+                engram_type: fm.engram_type.trim().to_ascii_lowercase(),
+                tags: fm.tags.clone(),
+                salience: yaml_number(fm.extra.get("salience")),
+                recorded_at: fm.recorded_at,
+                valid_from: fm.valid_from,
+                valid_to: fm.valid_to,
+                stale_on: fm.stale_on(),
+                verified_on: fm.latest_verified().map(|v| v.at.date_naive()),
+                tokens,
+                token_budget: resolve_token_budget(verify_config.as_ref(), &d.path),
+                inbound: inbound.get(&d.id.0).copied().unwrap_or(0),
+                outbound: outbound.get(&d.id.0).copied().unwrap_or(0),
+                generated_by: fm.generated.as_ref().map(|g| g.by.clone()),
+                analyzes: asset_claim(fm),
+                analyzed_hash: fm
+                    .extra
+                    .get("analyzed_hash")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string),
+                asset_refs: crystalline_core::find_asset_refs(&engram.body),
+                acks: ack_entries(fm),
+                body: engram.body,
+            });
+        }
+
+        let input = SweepInput {
+            domain: name.to_string(),
+            today,
+            engrams: facts,
+            graph,
+            unresolved,
+            tags: vocab.tags,
+            tag_aliases: vocab.aliases,
+            known_domains: known_domains.to_vec(),
+            attachments,
+            include_acknowledged,
+            options: SweepOptions::default(),
+        };
+        let report = detect(&input);
+        Ok(Some(DomainSweep { report, unparsed }))
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every
@@ -4995,9 +6022,15 @@ impl Engine {
         }))
     }
 
-    /// Every file of a domain as `(domain-relative path, content)`, MANIFEST
-    /// included: the portable view an archive download is built from, byte for
-    /// byte as the domain holds it.
+    /// Every file of a domain as `(domain-relative path, bytes)`, MANIFEST and
+    /// attachments included: the portable view an archive download is built
+    /// from, byte for byte as the domain holds it.
+    ///
+    /// Bytes rather than text, and that is the whole reason for the type: an
+    /// attachment is a PNG or a slide deck, and a collection of `String` could
+    /// only carry a domain's markdown. Markdown entries are the same bytes they
+    /// always were - UTF-8 is validated where a body is parsed, not here, since
+    /// nothing on this path parses anything.
     ///
     /// Each storage kind is read from its own source of truth, which is why
     /// this is not simply `export_domain`'s read half. A file domain's truth is
@@ -5006,9 +6039,18 @@ impl Engine {
     /// so reading the store would hand back headerless engrams and a MANIFEST
     /// that never indexed would go missing entirely. A virtual domain has no
     /// disk at all - the row IS the file, and it carries the full text.
-    pub async fn domain_files(&self, domain: &str) -> Result<Vec<(String, String)>> {
+    ///
+    /// Attachments come last, and through the seam rather than off either
+    /// source directly ([`Engine::attachment_list`] then
+    /// [`Engine::attachment_read`]), so both kinds hand over the same bytes
+    /// under the same `assets/` paths - which is what lets an export of one
+    /// kind be imported as the other. An attachment whose row stands but whose
+    /// bytes cannot be read (a file deleted behind the index) is logged and
+    /// skipped, like an unreadable markdown file: a backup missing one file
+    /// beats no backup.
+    pub async fn domain_files(&self, domain: &str) -> Result<Vec<(String, Vec<u8>)>> {
         let entry = self.domain_entry(domain)?;
-        match self.source_of(&entry) {
+        let mut files = match self.source_of(&entry) {
             ContentSource::File { root } => {
                 let mut files = Vec::new();
                 for (rel, abs) in walk_markdown(&root) {
@@ -5019,17 +6061,17 @@ impl Engine {
                     if crystalline_core::is_reserved_path(&rel) {
                         continue;
                     }
-                    match std::fs::read_to_string(&abs) {
-                        Ok(text) => files.push((rel, text)),
-                        // One unreadable or non-UTF-8 file must not deny the
-                        // operator the rest of the backup: it is skipped and
-                        // logged rather than failing the whole archive.
+                    match std::fs::read(&abs) {
+                        Ok(bytes) => files.push((rel, bytes)),
+                        // One unreadable file must not deny the operator the
+                        // rest of the backup: it is skipped and logged rather
+                        // than failing the whole archive.
                         Err(e) => {
                             tracing::warn!("archive of '{domain}' skipped '{rel}': {e}");
                         }
                     }
                 }
-                Ok(files)
+                files
             }
             ContentSource::Virtual => {
                 let store = self.store.lock().await;
@@ -5038,9 +6080,20 @@ impl Engine {
                     .await?;
                 let all = store.all_engram_contents(domain_id).await?;
                 drop(store);
-                Ok(all.into_iter().map(|e| (e.path, e.content)).collect())
+                all.into_iter()
+                    .map(|e| (e.path, e.content.into_bytes()))
+                    .collect()
+            }
+        };
+        for row in self.attachment_list(domain).await? {
+            match self.attachment_read(domain, &row.path).await {
+                Ok((bytes, _)) => files.push((row.path, bytes)),
+                Err(e) => {
+                    tracing::warn!("archive of '{domain}' skipped '{}': {e}", row.path);
+                }
             }
         }
+        Ok(files)
     }
 
     /// Export every file of a domain (file or virtual) to `dest` as a normal
@@ -5051,13 +6104,14 @@ impl Engine {
     /// download uses, so an export is a copy of the domain rather than a
     /// re-serialization of the index: a file domain hands over its exact disk
     /// bytes (frontmatter included, MANIFEST included), a virtual domain the
-    /// full text of every row, and the OKF reserved names are excluded from
-    /// both. Reading the store directly instead - the shape this verb had -
-    /// wrote frontmatter-less markdown for file domains, since their index
-    /// rows keep only the body, and silently dropped MANIFEST.md.
+    /// full text of every row, both hand over their attachments under
+    /// `assets/`, and the OKF reserved names are excluded from both. Reading
+    /// the store directly instead - the shape this verb had - wrote
+    /// frontmatter-less markdown for file domains, since their index rows keep
+    /// only the body, and silently dropped MANIFEST.md.
     ///
     /// Report shape follows from that source: `domain_files` carries
-    /// `(path, content)` and no permalink column, so each row reports its
+    /// `(path, bytes)` and no permalink column, so each row reports its
     /// path and byte count instead of the former path/permalink pair. Parsing
     /// every body back just to re-derive a permalink would re-introduce the
     /// re-serialization this verb exists to avoid, and no caller reads the
@@ -5087,7 +6141,7 @@ impl Engine {
                 continue;
             }
             let abs = join_rel(dest, path);
-            write_file(&abs, content)?;
+            write_bytes(&abs, content)?;
             written += 1;
         }
 
@@ -8501,19 +9555,32 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
     p
 }
 
-/// Whether a domain-relative path may be joined onto a domain root at all:
-/// every segment has to be an ordinary name. [`join_rel`] pushes what it is
-/// given segment by segment and would happily push a `..`, so untrusted input -
-/// an archive entry above all - is screened here before any path is built. A
-/// backslash or a colon inside a segment is refused too: both are separators or
-/// drive and stream markers on Windows, where a name that looks contained on
-/// one platform escapes on another.
-fn is_contained_rel(rel: &str) -> bool {
+/// Whether a domain-relative path stays inside the domain: no empty, `.` or
+/// `..` segment, and not absolute. [`join_rel`] pushes what it is given segment
+/// by segment and would happily push a `..`, so every destination is screened
+/// here before any path is built.
+///
+/// This is the containment rule alone. It deliberately says nothing about the
+/// characters a segment may hold, because an engram file is whatever a person
+/// named it: the sync walk indexes `notes/plan: v2.md` like any other markdown
+/// file, so a save, a move or a restore addressing that engram has to keep
+/// working. [`is_contained_rel`] adds the character rules on top, for the paths
+/// that arrive from outside.
+fn is_within_domain(rel: &str) -> bool {
     !rel.is_empty()
         && !Path::new(rel).is_absolute()
         && rel
             .split('/')
-            .all(|seg| !seg.is_empty() && seg != "." && seg != ".." && !seg.contains(['\\', ':']))
+            .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+/// [`is_within_domain`] plus the character rules for untrusted input: an
+/// archive entry and an attachment path, neither of which a person typed as a
+/// filename here. A backslash or a colon inside a segment is refused because
+/// both are separators or drive and stream markers on Windows, where a name
+/// that looks contained on one platform escapes on another.
+fn is_contained_rel(rel: &str) -> bool {
+    is_within_domain(rel) && rel.split('/').all(|seg| !seg.contains(['\\', ':']))
 }
 
 /// A domain-relative folder as the store's path prefix: the trailing slash is
@@ -8528,12 +9595,15 @@ fn folder_prefix(raw: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| format!("{trimmed}/"))
 }
 
-/// Normalize a destination into a forward-slashed `.md` path.
+/// Normalize a destination into a forward-slashed `.md` path. A `.` segment is
+/// dropped with the empty ones (it resolves to nothing); a `..` segment
+/// survives, so the containment screen at the call site refuses it rather than
+/// this quietly resolving a destination nobody asked for.
 fn normalize_md(dest: &str) -> String {
     let trimmed = dest.trim_start_matches("./").trim_matches('/');
     let joined = trimmed
         .split('/')
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty() && *s != ".")
         .collect::<Vec<_>>()
         .join("/");
     if joined.is_empty() {
@@ -8568,7 +9638,15 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
     // guarded verbs off each other, but the counter is what makes the temp
     // file private to a single write whichever path produced it.
     let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let tmp = abs.with_extension(format!("md.tmp.{}.{seq}", std::process::id()));
+    // The suffix is appended to the whole filename rather than replacing its
+    // extension, so an attachment's temp file keeps naming the file it belongs
+    // to (`shot.png.tmp.<pid>.<seq>`) instead of claiming an extension it never
+    // had. For a `.md` engram the two spellings produce the same name.
+    let name = abs
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let tmp = abs.with_file_name(format!("{name}.tmp.{}.{seq}", std::process::id()));
     std::fs::write(&tmp, contents).map_err(|source| EngineError::Io {
         path: tmp.display().to_string(),
         source,
@@ -8578,6 +9656,531 @@ fn write_bytes(abs: &Path, contents: &[u8]) -> Result<()> {
         source,
     })?;
     Ok(())
+}
+
+/// Screen an attachment path before it reaches a filesystem or the store:
+/// [`crystalline_core::validate_asset_path`]'s rules - the reserved prefix, the
+/// segment rules, the character rules, the length ceiling and the extension
+/// allowlist - reported as a malformed request.
+fn validate_attachment_path(path: &str) -> Result<()> {
+    crystalline_core::validate_asset_path(path)
+        .map_err(|e| EngineError::Invalid(format!("attachment path '{path}': {e}")))
+}
+
+/// The absolute path an attachment occupies under a file domain's root, proven
+/// to stay inside it.
+///
+/// Two proofs, because they catch different things.
+/// [`is_contained_rel`] refuses a relative path that could climb out
+/// (`..`, an absolute path, a Windows separator or drive marker) before any
+/// path is built, which is the one that matters for untrusted input.
+/// Canonicalization then catches what a string check cannot see: an `assets`
+/// folder, or a folder inside it, that is a symlink pointing somewhere else
+/// entirely. It is taken on the deepest ancestor that actually exists, since
+/// the file itself usually does not yet.
+fn contained_asset_path(root: &Path, rel: &str) -> Result<PathBuf> {
+    if !is_contained_rel(rel) {
+        return Err(EngineError::Invalid(format!(
+            "attachment path '{rel}' escapes the domain root"
+        )));
+    }
+    let abs = join_rel(root, rel);
+    // A root that cannot be resolved does not exist yet, so there is no
+    // symlink in place to escape through and the segment-by-segment join
+    // stands on its own.
+    let Ok(canonical_root) = std::fs::canonicalize(root) else {
+        return Ok(abs);
+    };
+    let mut probe = abs.clone();
+    while probe != *root {
+        if let Ok(resolved) = std::fs::canonicalize(&probe) {
+            if !resolved.starts_with(&canonical_root) {
+                return Err(EngineError::Invalid(format!(
+                    "attachment path '{rel}' resolves outside the domain root"
+                )));
+            }
+            break;
+        }
+        match probe.parent() {
+            Some(parent) => probe = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    Ok(abs)
+}
+
+/// The metadata row describing these bytes at this path. The mime comes from
+/// the extension and never from a caller, which is why this cannot be built
+/// before [`validate_attachment_path`] has accepted the path.
+fn attachment_row(path: &str, bytes: &[u8], modified: String) -> Result<AttachmentRow> {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let mime = crystalline_core::attachment_mime(name).ok_or_else(|| {
+        EngineError::Invalid(format!(
+            "attachment path '{path}': an attachment must carry an allowlisted file extension"
+        ))
+    })?;
+    Ok(AttachmentRow {
+        path: path.to_string(),
+        sha256: sha256_hex(bytes),
+        mime: mime.to_string(),
+        size: bytes.len() as u64,
+        modified,
+    })
+}
+
+/// One attachment a cross-domain move takes along with its engram. Built by
+/// [`Engine::plan_attachment_carry`] and acted on by
+/// [`Engine::carry_attachments`].
+#[derive(Debug)]
+struct AttachmentCarry {
+    /// The path it has in the source domain.
+    from: String,
+    /// The path it takes at the destination: the same one, unless something
+    /// different already sits there.
+    to: String,
+    /// Whether the destination already holds exactly these bytes under `to`,
+    /// so there is nothing to write there.
+    reuse: bool,
+    /// Whether another engram in the source domain still references or claims
+    /// it, so the source copy stays behind.
+    shared: bool,
+}
+
+/// The counting's verdict, resolved so that not knowing can only point the
+/// safe way.
+///
+/// A failure to count means "we do not know whether anything else in the
+/// domain still uses these files", and the only reading of not knowing that
+/// cannot destroy something is that something does: an unknown resolves to
+/// shared, which copies the attachment and leaves the source copy where it is.
+/// The opposite default would let a store hiccup authorize a delete, and a
+/// delete is the one step of a move that cannot be taken back.
+fn resolve_shared(counted: Result<HashSet<String>>, candidates: &[String]) -> HashSet<String> {
+    match counted {
+        Ok(shared) => shared,
+        Err(e) => {
+            tracing::warn!(
+                "the referents of the attachments being moved could not be counted ({e}); each one is copied rather than moved, so nothing is removed from the source"
+            );
+            candidates.iter().cloned().collect()
+        }
+    }
+}
+
+/// The part of an attachment path below the reserved folder (`notes/shot.png`
+/// for `assets/notes/shot.png`), which is the part every spelling of a
+/// reference to it shares.
+fn asset_tail(path: &str) -> &str {
+    path.strip_prefix(crystalline_core::ASSETS_PREFIX)
+        .unwrap_or(path)
+}
+
+/// The `assets/` path an engram's `analyzes` claim names, or `None` when it
+/// claims nothing under the folder.
+///
+/// `analyzes` is ordinary custom frontmatter (the agent's act of claiming an
+/// attachment it read), so the value is whatever was written there: a leading
+/// `./` is stripped and the folder segment is folded to its canonical
+/// spelling, and anything that does not address the reserved folder at all is
+/// not a claim.
+/// One domain's sweep: its report and how many of its engrams no longer parse.
+struct DomainSweep {
+    /// The ranked findings for that domain, acknowledgments already applied.
+    report: SweepReport,
+    /// Engrams that failed to parse and were skipped rather than failing the
+    /// run.
+    unparsed: usize,
+}
+
+/// Split an `evolve_ack` value into the rule id and the note: the rule up to
+/// the first whitespace, everything after it the note. The id is uppercased, so
+/// `v101 keep` records the same acknowledgment `V101 keep` does.
+fn parse_ack_value(raw: &str) -> Result<(String, Option<String>)> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(EngineError::Invalid(format!(
+            "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
+        )));
+    }
+    let (rule, note) = match raw.split_once(char::is_whitespace) {
+        Some((rule, note)) => (rule, fold_note(note)),
+        None => (raw, String::new()),
+    };
+    let rule = rule.trim().to_ascii_uppercase();
+    if rule_info(&rule).is_none() {
+        return Err(EngineError::Invalid(unknown_rule_message(&rule)));
+    }
+    Ok((rule, (!note.is_empty()).then_some(note)))
+}
+
+/// A note as one line of prose: every run of whitespace, newlines included,
+/// folded to a single space.
+///
+/// Folded rather than refused, deliberately. A note is free text a person pastes
+/// into a box - a two-line justification out of a chat window is the ordinary
+/// case, not an attack - and refusing it would send them back to reformat prose
+/// that nothing ever parses. It is also never machine-read: it is shown back to
+/// whoever reads the queue, and one line reads the same as two there.
+///
+/// What the folding buys is that the frontmatter this lands in stays valid. The
+/// emitter escapes control characters too (`crystalline_core::emit`), so this is
+/// the readable half of a defense that holds at both ends rather than the only
+/// guard.
+fn fold_note(note: &str) -> String {
+    note.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// What a caller hears when it names a rule the catalog does not have.
+fn unknown_rule_message(rule: &str) -> String {
+    format!(
+        "'{rule}' is not a rule the sweep knows; the catalog holds {}",
+        RULES.iter().map(|r| r.id).collect::<Vec<_>>().join(", ")
+    )
+}
+
+/// The attachment path an identifier names, or `None` when it names an engram.
+///
+/// A leading `./` is folded and the reserved folder segment is canonicalized by
+/// [`crystalline_core::canonical_asset_path`], so `./Assets/deck.png` and
+/// `assets/deck.png` are the same file. Only the prefix decides: an engram
+/// never lives under the reserved folder, which is what makes one verb able to
+/// serve both without guessing.
+fn attachment_identifier(identifier: &str) -> Option<String> {
+    let raw = identifier.trim().trim_start_matches("./");
+    crystalline_core::is_under_assets(raw)
+        .then(|| crystalline_core::canonical_asset_path(raw))
+        .flatten()
+}
+
+/// The acknowledgments an engram's markdown carries.
+fn acks_of(source: &str) -> Vec<EvolveAck> {
+    parse_engram(source)
+        .ok()
+        .and_then(|e| {
+            e.frontmatter
+                .extra
+                .get(EVOLVE_ACK_KEY)
+                .map(EvolveAck::parse_list)
+        })
+        .unwrap_or_default()
+}
+
+/// The engram's acknowledgments with `entry` folded in: one entry per rule, so
+/// re-acknowledging a finding replaces what it said rather than stacking a
+/// second line nobody reads. The replacement keeps the original position, which
+/// keeps a hand-ordered list hand-ordered.
+fn merged_acks(source: &str, entry: EvolveAck) -> Vec<EvolveAck> {
+    let mut entries = acks_of(source);
+    let mut replaced = false;
+    entries.retain_mut(|existing| {
+        if !existing.rule.eq_ignore_ascii_case(&entry.rule) {
+            return true;
+        }
+        // A hand-edited file may name one rule twice; the entry just written is
+        // the survivor and the rest go, so the list stays one entry per rule.
+        if replaced {
+            return false;
+        }
+        *existing = entry.clone();
+        replaced = true;
+        true
+    });
+    if !replaced {
+        entries.push(entry);
+    }
+    entries
+}
+
+/// One acknowledgment as a surface renders it.
+fn ack_json(entry: &EvolveAck) -> Value {
+    json!({
+        "rule": entry.rule,
+        "scope": entry.scope,
+        "note": entry.note,
+        "by": entry.by,
+        "at": entry.at.map(|at| at.to_rfc3339()),
+    })
+}
+
+fn asset_claim(fm: &Frontmatter) -> Option<String> {
+    let raw = fm.extra.get("analyzes")?.as_str()?.trim();
+    crystalline_core::canonical_asset_path(raw.trim_start_matches("./"))
+}
+
+/// The acknowledgments an engram carries, as the sweep reads them.
+///
+/// The provenance the file records (`by`, `at`) is left behind here on purpose:
+/// the detectors decide whether an acknowledgment still matches its evidence,
+/// never who gave it. Malformed entries are skipped by
+/// [`EvolveAck::parse_list`], so a hand-edited line costs its own entry and
+/// nothing else.
+fn ack_entries(fm: &Frontmatter) -> Vec<AckEntry> {
+    let Some(value) = fm.extra.get(EVOLVE_ACK_KEY) else {
+        return Vec::new();
+    };
+    EvolveAck::parse_list(value)
+        .into_iter()
+        .map(|a| AckEntry {
+            rule: a.rule,
+            scope: a.scope,
+            note: a.note,
+        })
+        .collect()
+}
+
+/// `assets/deck.pptx` as `assets/deck-2.pptx`: the name an attachment takes
+/// when the destination already holds a different file under its own.
+///
+/// The counter goes before the extension rather than after it, so the file
+/// keeps the extension its mime and its allowlist decision rest on, and the
+/// stem is shortened as far as it has to be for the result to pass
+/// [`crystalline_core::validate_asset_path`]. A path already at the length
+/// ceiling would otherwise grow past it, and since this name is what the
+/// moving engram's references are rewritten to, an invalid one would be a
+/// reference rewritten to a path no write can ever accept. `None` when no
+/// valid name can be built even with the stem gone, which leaves the
+/// attachment uncarried rather than renamed into nowhere.
+fn suffixed_asset_path(path: &str, attempt: usize) -> Option<String> {
+    let (dir, name) = match path.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), path),
+    };
+    let (stem, extension) = match name.rsplit_once('.') {
+        Some((stem, extension)) => (stem, Some(extension)),
+        None => (name, None),
+    };
+    let mut keep = stem.len();
+    loop {
+        let candidate = match extension {
+            Some(extension) => format!("{dir}{}-{attempt}.{extension}", &stem[..keep]),
+            None => format!("{dir}{}-{attempt}", &stem[..keep]),
+        };
+        if crystalline_core::validate_asset_path(&candidate).is_ok() {
+            return Some(candidate);
+        }
+        if keep == 0 {
+            return None;
+        }
+        // One character at a time, never one byte: a stem cut through a
+        // multi-byte character would not be a string at all.
+        keep -= 1;
+        while keep > 0 && !stem.is_char_boundary(keep) {
+            keep -= 1;
+        }
+    }
+}
+
+/// The moving engram's text with every renamed attachment reference - in the
+/// body and in the `analyzes` claim - pointing at the name the file took at
+/// the destination.
+///
+/// String surgery on both halves, never a re-emit: the frontmatter claim is
+/// replaced line-wise by [`set_frontmatter_field`] and the body only where a
+/// link destination actually changes, so a move that renames one attachment
+/// leaves every other byte of the engram exactly as its author wrote it.
+fn rewrite_carried_refs(content: &str, renames: &BTreeMap<String, String>) -> String {
+    if renames.is_empty() {
+        return content.to_string();
+    }
+    let Ok(parsed) = parse_engram_lossless(content) else {
+        // An engram the parser refuses still moves, so its references still
+        // have to follow; without a frontmatter span the whole text is the
+        // body.
+        return rewrite_asset_refs(content, renames);
+    };
+    let body = rewrite_asset_refs(&content[parsed.body_span.clone()], renames);
+    let mut out = format!("{}{}", &content[..parsed.body_span.start], body);
+    if let Some(renamed) = asset_claim(&parsed.engram.frontmatter).and_then(|c| renames.get(&c)) {
+        out = set_frontmatter_field(&out, "analyzes", renamed);
+    }
+    out
+}
+
+/// Every `assets/` link destination in a body pointed at its new name.
+///
+/// A `./` prefix and a `#fragment` are spellings of the reference rather than
+/// parts of the path, so both survive untouched and only the path between them
+/// changes. Fenced code is skipped exactly as
+/// [`crystalline_core::find_asset_refs`] skips it, so an example in a snippet
+/// is never rewritten into a path the snippet did not mean.
+fn rewrite_asset_refs(body: &str, renames: &BTreeMap<String, String>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut fence: Option<(char, usize)> = None;
+    for line in body.split_inclusive('\n') {
+        let text = line.trim_end_matches(['\n', '\r']);
+        match fence {
+            None => {
+                if let Some((marker, count)) = asset_fence_marker(text) {
+                    fence = Some((marker, count));
+                    out.push_str(line);
+                    continue;
+                }
+            }
+            Some((open_marker, open_count)) => {
+                if let Some((marker, count)) = asset_fence_marker(text)
+                    && marker == open_marker
+                    && count >= open_count
+                    && text.trim_start()[count..].trim().is_empty()
+                {
+                    fence = None;
+                }
+                out.push_str(line);
+                continue;
+            }
+        }
+        out.push_str(&rewrite_line_asset_refs(line, renames));
+    }
+    out
+}
+
+/// A fenced code block's opening or closing marker: the character and how many
+/// of it, for a line indented no more than three spaces.
+///
+/// The same rule the core parser reads fences by, restated here because it is
+/// crate-private there and this is the only reader of it outside core.
+fn asset_fence_marker(line: &str) -> Option<(char, usize)> {
+    let indent = line.len() - line.trim_start_matches(' ').len();
+    if indent > 3 {
+        return None;
+    }
+    let rest = &line[indent..];
+    let first = rest.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = rest.chars().take_while(|c| *c == first).count();
+    (count >= 3).then_some((first, count))
+}
+
+/// One line's `](assets/...)` destinations rewritten, every other byte of the
+/// line copied through.
+fn rewrite_line_asset_refs(line: &str, renames: &BTreeMap<String, String>) -> String {
+    let bytes = line.as_bytes();
+    let mut out = String::with_capacity(line.len());
+    // How much of the line is already in `out`, so the untouched runs between
+    // two rewritten destinations are copied exactly once.
+    let mut copied = 0usize;
+    let mut idx = 0usize;
+    while let Some(hit) = line[idx..].find("](") {
+        let open = idx + hit + 2;
+        // Markdown allows balanced parentheses inside a destination, so the
+        // closing one is the depth-zero `)`, the same scan core's reference
+        // scanner runs.
+        let mut depth = 1usize;
+        let mut end = None;
+        for (offset, byte) in bytes[open..].iter().enumerate() {
+            match byte {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + offset);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let Some(end) = end else { break };
+        idx = end + 1;
+        let inside = &line[open..end];
+        // The destination is the first token; a title clause may follow it.
+        let Some(target) = inside.split_whitespace().next() else {
+            continue;
+        };
+        // Where that token starts in the line, so the rewrite lands on the
+        // path itself rather than on the whitespace in front of it.
+        let start = open + (inside.len() - inside.trim_start().len());
+        let dot = if target.starts_with("./") { 2 } else { 0 };
+        let path_end = target[dot..]
+            .find('#')
+            .map_or(target.len(), |offset| dot + offset);
+        let Some(renamed) = renames.get(&target[dot..path_end]) else {
+            continue;
+        };
+        out.push_str(&line[copied..start + dot]);
+        out.push_str(renamed);
+        copied = start + path_end;
+    }
+    out.push_str(&line[copied..]);
+    out
+}
+
+/// A file's modification instant in the spelling the sync walker records, so a
+/// row written here and a row written by a scan compare equal.
+fn asset_modified(abs: &Path) -> String {
+    let mtime = std::fs::metadata(abs)
+        .map(|meta| mtime_secs(&meta))
+        .unwrap_or_else(|_| Utc::now().timestamp());
+    chrono::DateTime::from_timestamp(mtime, 0)
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+        .to_rfc3339()
+}
+
+/// The miss message every attachment verb reports, one spelling.
+fn missing_attachment(domain: &str, path: &str) -> String {
+    format!("no attachment '{path}' in domain '{domain}'")
+}
+
+/// The refusal an over-cap attachment earns, one spelling for the write path
+/// and the read path so a file and an upload of the same size are refused in
+/// the same words.
+fn over_cap_error(path: &str, size: u64) -> String {
+    format!(
+        "attachment '{path}' is {size} bytes, over the {} byte ceiling",
+        crystalline_core::MAX_ATTACHMENT_BYTES
+    )
+}
+
+/// Whether a forward-slashed domain-relative path lands under the reserved
+/// `assets/` prefix, where attachments live and no engram is ever written.
+///
+/// A folder called `assets-notes` is an ordinary folder, and so is an engram
+/// file called `assets.md`: only the folder itself and what sits inside it is
+/// reserved.
+///
+/// The decision itself is [`crystalline_core::is_under_assets`], the one
+/// classifier the sync walk and the daemon's watcher ask too, so the
+/// reservation cannot mean one thing to a write and another to a scan. This
+/// wrapper only strips the leading `./` and the surrounding slashes a caller
+/// may have typed. Callers pass an already normalized path (see
+/// [`normalize_rel`]), so a `..` segment can no longer walk in behind the
+/// check.
+fn is_assets_reserved(rel: &str) -> bool {
+    crystalline_core::is_under_assets(rel.trim_start_matches("./").trim_matches('/'))
+}
+
+/// A caller-supplied domain-relative path as one normalized, forward-slashed
+/// string: a leading `./` stripped, surrounding slashes trimmed, empty and `.`
+/// segments dropped.
+///
+/// `..` segments deliberately survive, because normalizing them away would
+/// resolve a path the caller never asked for. They are refused instead, by the
+/// [`is_contained_rel`] screen every call site runs straight afterwards, which
+/// is what makes the reserved-name and reserved-prefix checks that follow
+/// decidable on the text alone.
+fn normalize_rel(raw: &str) -> String {
+    raw.trim_start_matches("./")
+        .split('/')
+        .filter(|segment| !segment.is_empty() && *segment != ".")
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The refusal a write earns by aiming outside the domain root.
+fn escapes_root_error(rel: &str) -> String {
+    format!(
+        "'{rel}' is not a domain-relative destination: a path may not climb out of the domain root with a `..` segment or name an absolute path."
+    )
+}
+
+/// The refusal an engram write earns by aiming at the reserved `assets/`
+/// prefix.
+fn assets_reserved_error(rel: &str) -> String {
+    format!(
+        "'{rel}' sits under the reserved {} folder: assets is reserved for attachments, so nothing under it is an engram. Choose another folder or destination.",
+        crystalline_core::ASSETS_PREFIX
+    )
 }
 
 /// A synthesized file stamp for a virtual write: the current epoch seconds, the
@@ -9260,5 +10863,95 @@ mod lock_tests {
             theirs,
             "and the other writer's version is still the one on disk"
         );
+    }
+}
+
+#[cfg(test)]
+mod attachment_carry_tests {
+    use super::*;
+
+    fn candidates() -> Vec<String> {
+        vec![
+            "assets/shot.png".to_string(),
+            "assets/notes/deck.pptx".to_string(),
+        ]
+    }
+
+    /// The safe default is structural: whatever went wrong while counting
+    /// referents, every candidate comes back shared, which copies it and
+    /// leaves the source copy in place. An error must never point in the
+    /// deleting direction.
+    #[test]
+    fn a_counting_failure_resolves_to_shared() {
+        let candidates = candidates();
+        for failure in [
+            EngineError::Invalid("broken".into()),
+            EngineError::NotFound("gone".into()),
+            EngineError::Conflict("busy".into()),
+        ] {
+            let resolved = resolve_shared(Err(failure), &candidates);
+            assert_eq!(
+                resolved,
+                candidates.iter().cloned().collect::<HashSet<String>>(),
+                "a failure to count has to read as 'still in use'"
+            );
+        }
+    }
+
+    /// And a successful count is passed through exactly, so the safe default
+    /// costs nothing when the counting worked.
+    #[test]
+    fn a_successful_count_passes_through() {
+        let candidates = candidates();
+        let counted: HashSet<String> = std::iter::once(candidates[0].clone()).collect();
+        assert_eq!(resolve_shared(Ok(counted.clone()), &candidates), counted);
+        assert!(resolve_shared(Ok(HashSet::new()), &candidates).is_empty());
+    }
+
+    #[test]
+    fn the_screen_matches_every_spelling_of_a_reference() {
+        assert_eq!(asset_tail("assets/shot.png"), "shot.png");
+        assert_eq!(asset_tail("assets/notes/deck.pptx"), "notes/deck.pptx");
+        // A claim may name the folder in another case; the part below it is
+        // what both spellings share, which is why the screen tests that.
+        assert!("analyzes: Assets/shot.png".contains(asset_tail("assets/shot.png")));
+        assert!("![x](./assets/shot.png#right)".contains(asset_tail("assets/shot.png")));
+    }
+
+    #[test]
+    fn a_suffixed_name_stays_a_valid_attachment_path() {
+        assert_eq!(
+            suffixed_asset_path("assets/shot.png", 2).unwrap(),
+            "assets/shot-2.png"
+        );
+        assert_eq!(
+            suffixed_asset_path("assets/notes/deck.pptx", 3).unwrap(),
+            "assets/notes/deck-3.pptx"
+        );
+
+        // At the 256 byte ceiling the stem gives way, never the extension:
+        // the name has to stay one a write will accept, because the engram's
+        // references are rewritten to it.
+        let at_cap = format!("assets/{}.png", "a".repeat(245));
+        assert_eq!(at_cap.len(), 256);
+        let suffixed = suffixed_asset_path(&at_cap, 2).unwrap();
+        assert_eq!(suffixed, format!("assets/{}-2.png", "a".repeat(243)));
+        assert!(crystalline_core::validate_asset_path(&suffixed).is_ok());
+        let long_suffix = suffixed_asset_path(&at_cap, 100).unwrap();
+        assert!(crystalline_core::validate_asset_path(&long_suffix).is_ok());
+
+        // A multi-byte stem is cut on character boundaries, not byte ones:
+        // 255 bytes of path with a two-byte stem character, where `-2` no
+        // longer fits and exactly one character has to go.
+        let wide = format!("assets/{}.png", "é".repeat(122));
+        assert_eq!(wide.len(), 255);
+        let cut = suffixed_asset_path(&wide, 2).unwrap();
+        assert!(crystalline_core::validate_asset_path(&cut).is_ok());
+        assert_eq!(cut, format!("assets/{}-2.png", "é".repeat(121)));
+
+        // And a path with no room left at all is refused rather than
+        // rewritten into something no write would take.
+        let hopeless = format!("assets/{}/x.png", "d".repeat(246));
+        assert!(suffixed_asset_path(&hopeless, 2).is_none());
     }
 }

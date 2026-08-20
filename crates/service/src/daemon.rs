@@ -1627,17 +1627,34 @@ fn classify_in_root(path: &Path, root: &Path) -> DirtyKind {
         return DirtyKind::Ignore;
     }
     let is_md = rel.to_lowercase().ends_with(".md");
+    // Attachments are indexed too, so a file under the reserved `assets/`
+    // folder is a targeted candidate exactly like an engram: without this a
+    // `git pull` or a hand-dropped screenshot would wait for the next full
+    // scan, since every other non-markdown file is ignored below. Only an
+    // attachable name qualifies - the walk skips a disallowed extension, so
+    // waking a pass for one would find nothing to do.
+    // The folder is matched case-insensitively, as the walk and the engine's
+    // refusals match it: on APFS and NTFS a directory differing only in case is
+    // the same directory, and the targeted pass folds the path back to the one
+    // spelling rows are keyed by.
+    let is_asset = crystalline_core::is_under_assets(&rel)
+        && rel
+            .rsplit('/')
+            .next()
+            .is_some_and(|name| crystalline_core::attachment_mime(name).is_some());
     if path.exists() {
         // An existing non-markdown regular file is never indexed (directories
-        // were escalated above), so ignore it; a markdown file is a targeted
-        // candidate, resolved against the stamps by scan_paths.
-        if is_md {
+        // were escalated above), so ignore it; a markdown file or an
+        // allowlisted attachment is a targeted candidate, resolved against the
+        // stamps and the attachment rows by scan_paths.
+        if is_md || is_asset {
             DirtyKind::Path(rel)
         } else {
             DirtyKind::Ignore
         }
-    } else if is_md {
-        // A vanished markdown file is a targeted delete candidate.
+    } else if is_md || is_asset {
+        // A vanished markdown file or attachment is a targeted delete
+        // candidate.
         DirtyKind::Path(rel)
     } else {
         // A vanished non-markdown path is ambiguous - it may have been a
@@ -2150,6 +2167,42 @@ mod tests {
         let hidden = classify_event(&root.join(".hidden.md"), &domains);
         assert_eq!(hidden.len(), 1);
         assert!(matches!(hidden[0].1, DirtyKind::Ignore));
+    }
+
+    #[test]
+    fn classify_tracks_attachments_under_the_assets_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        std::fs::create_dir_all(root.join("assets/deep")).unwrap();
+        std::fs::write(root.join("assets/shot.png"), "x").unwrap();
+        std::fs::write(root.join("assets/deep/deck.pdf"), "x").unwrap();
+        std::fs::write(root.join("assets/tool.exe"), "x").unwrap();
+        std::fs::write(root.join("scratch.txt"), "x").unwrap();
+
+        // An attachment that arrived behind the index (a pull, an editor) is a
+        // targeted candidate, nested or not.
+        assert!(
+            matches!(classify_in_root(&root.join("assets/shot.png"), &root), DirtyKind::Path(p) if p == "assets/shot.png")
+        );
+        assert!(
+            matches!(classify_in_root(&root.join("assets/deep/deck.pdf"), &root), DirtyKind::Path(p) if p == "assets/deep/deck.pdf")
+        );
+        // A vanished one is a targeted delete candidate rather than a full
+        // rescan.
+        assert!(
+            matches!(classify_in_root(&root.join("assets/gone.png"), &root), DirtyKind::Path(p) if p == "assets/gone.png")
+        );
+        // A file the allowlist refuses is invisible to the walk either way, so
+        // it never wakes a pass; neither does a non-markdown file outside the
+        // reserved folder.
+        assert!(matches!(
+            classify_in_root(&root.join("assets/tool.exe"), &root),
+            DirtyKind::Ignore
+        ));
+        assert!(matches!(
+            classify_in_root(&root.join("scratch.txt"), &root),
+            DirtyKind::Ignore
+        ));
     }
 
     #[test]

@@ -172,6 +172,8 @@
 
 use std::sync::Arc;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::prompt::PromptContext;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
@@ -180,13 +182,14 @@ use rmcp::model::{
     ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
     PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, Role, ServerCapabilities, ServerInfo, SubscriptionFilter, Tool,
+    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo, SubscriptionFilter,
+    Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
 use serde_json::{Value, json};
 
-use crystalline_core::SKILL_ASSETS;
+use crystalline_core::{CrystallineUrl, SKILL_ASSETS};
 use crystalline_remote::RemoteError;
 
 /// The tools hidden in read-only mode: the four content-mutating engram tools
@@ -482,6 +485,18 @@ fn skill_uris() -> String {
         .join(", ")
 }
 
+/// The RFC 6570 template every attachment is addressed by. `{+path}` is the
+/// reserved expansion, so a nested path keeps its separators: an attachment two
+/// folders deep is one uri, not one segment.
+const ATTACHMENT_URI_TEMPLATE: &str = "crystalline://{domain}/assets/{+path}";
+
+/// The template's programmatic name, and what a client shows beside it.
+const ATTACHMENT_TEMPLATE_NAME: &str = "attachment";
+
+/// What the template is for, in the words a model reads before deciding to
+/// fetch one.
+const ATTACHMENT_TEMPLATE_DESCRIPTION: &str = "A file attachment a human added to a domain: read it here when an engram's resource links or an evolve finding point at it.";
+
 /// Whether the whole skill-serving surface (the `skills` tool, the `skill://`
 /// resources and the two prompts) is hidden.
 ///
@@ -717,24 +732,24 @@ impl McpServer {
     #[tool(
         name = "read_engram",
         title = "Read engram",
-        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge.",
+        description = "Read an engram's full markdown and resolved frontmatter to learn what is already known before acting or writing. Identify it by bare permalink, title or a crystalline:// URL; pass domain to disambiguate. An identifier without crystalline:// is domain-relative: 'onboarding/setup', never 'mydomain/onboarding/setup'. The response flags whether each relation and prose link resolves, summarizes what links back and names a build_context anchor for exploring nearby knowledge. Attachments the engram references come back as resource links; fetch one with resources/read when the file itself matters.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn read_engram(
         &self,
         Parameters(p): Parameters<ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .read_engram(&p)
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+        let value = self.engine.read_engram(&p).await.map_err(to_error)?;
+        let links = self.attachment_links(&value).await;
+        let mut result = ok(value)?;
+        result.content.extend(links);
+        Ok(result)
     }
 
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience and verified, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack never removes either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry, and acknowledgments are removed in Fluid or by editing the file, never here. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -779,7 +794,7 @@ impl McpServer {
     #[tool(
         name = "delete_engram",
         title = "Delete engram",
-        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters.",
+        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -937,7 +952,7 @@ impl McpServer {
     #[tool(
         name = "evolve_engrams",
         title = "Evolve engrams",
-        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep.",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn evolve_engrams(
@@ -1359,6 +1374,45 @@ impl McpServer {
             info.instructions = Some(instructions);
         }
         info
+    }
+
+    /// The resource links a `read_engram` result carries: one per distinct
+    /// `assets/` reference in the body that resolves to a stored attachment.
+    ///
+    /// Links rather than bytes, deliberately. A screenshot inlined as base64
+    /// would spend a model's whole context on a file it may not need; a link
+    /// names it - uri, filename, mime and size - and `resources/read` fetches
+    /// the bytes when the model decides the file itself matters.
+    ///
+    /// A reference that resolves to nothing produces no link and no complaint:
+    /// a dangling attachment reference is knowledge debt, and `evolve_engrams`
+    /// is where debt is reported. A listing that cannot be read (a domain
+    /// dropped between the read and this call) costs the links, never the read.
+    async fn attachment_links(&self, value: &Value) -> Vec<ContentBlock> {
+        let (Some(domain), Some(content)) = (
+            value.get("domain").and_then(Value::as_str),
+            value.get("content").and_then(Value::as_str),
+        ) else {
+            return Vec::new();
+        };
+        let refs = crystalline_core::find_asset_refs(content);
+        if refs.is_empty() {
+            return Vec::new();
+        }
+        let Ok(rows) = self.engine.attachment_list(domain).await else {
+            return Vec::new();
+        };
+        refs.iter()
+            .filter_map(|target| rows.iter().find(|row| row.path == *target))
+            .map(|row| {
+                let name = row.path.rsplit('/').next().unwrap_or(row.path.as_str());
+                ContentBlock::resource_link(
+                    Resource::new(format!("crystalline://{domain}/{}", row.path), name)
+                        .with_mime_type(row.mime.clone())
+                        .with_size(row.size),
+                )
+            })
+            .collect()
     }
 
     /// Wrap a list-shaped engine value as a successful tool result: TOON
@@ -1856,46 +1910,84 @@ impl ServerHandler for McpServer {
         Ok(ListResourcesResult::with_all_items(resources).with_cache_hints(&context))
     }
 
-    /// This server serves no resource templates, and answering the method is
-    /// still work: rmcp's default returns `ListResourceTemplatesResult::default()`
-    /// (rmcp 3.1.2 `handler/server.rs:387-395`), which is a **complete** result
-    /// with no caching hints on one of the six operations SEP-2549 names. So
-    /// the override exists for the hints alone, and the empty list is rmcp's
-    /// answer unchanged. See [`CacheHinted`] for why an un-advertised or empty
-    /// surface is not a defence against that MUST.
+    /// The one template this server serves: every attachment a domain carries,
+    /// addressed as `crystalline://<domain>/assets/<path>`.
+    ///
+    /// A template rather than a listing because the set is open and per domain:
+    /// enumerating every screenshot of every registered domain would spend a
+    /// client's context on files it will never open, while the template plus the
+    /// resource links `read_engram` returns name exactly the ones an engram
+    /// actually references.
+    ///
+    /// The override also carries the caching hints on its own account: rmcp's
+    /// default returns `ListResourceTemplatesResult::default()` (rmcp 3.1.2
+    /// `handler/server.rs:387-395`), a **complete** result with no hints on one
+    /// of the six operations SEP-2549 names. See [`CacheHinted`].
     async fn list_resource_templates(
         &self,
         _request: Option<PaginatedRequestParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<ListResourceTemplatesResult, ErrorData> {
-        Ok(ListResourceTemplatesResult::with_all_items(Vec::new()).with_cache_hints(&context))
+        let template = ResourceTemplate::new(ATTACHMENT_URI_TEMPLATE, ATTACHMENT_TEMPLATE_NAME)
+            .with_description(ATTACHMENT_TEMPLATE_DESCRIPTION);
+        Ok(ListResourceTemplatesResult::with_all_items(vec![template]).with_cache_hints(&context))
     }
 
-    /// Read one shipped skill by its resource uri. Like every hidden tool,
-    /// this answers even while `skills.serve` is off: the gate hides the
-    /// surface from a listing rather than disabling it, and a skill is static
-    /// public copy this binary already carries, so a client holding a uri from
-    /// an earlier listing gets the bytes rather than a puzzle.
+    /// Read one shipped skill, or one attachment, by its resource uri.
+    ///
+    /// A skill answers even while `skills.serve` is off, like every hidden
+    /// tool: the gate hides the surface from a listing rather than disabling
+    /// it, and a skill is static public copy this binary already carries, so a
+    /// client holding a uri from an earlier listing gets the bytes rather than
+    /// a puzzle.
+    ///
+    /// An attachment uri is anything [`CrystallineUrl::asset_path`] recognizes
+    /// once its path has been percent-decoded (see [`decoded_uri_path`]), and
+    /// the bytes come back the way the file is read rather than the way it was
+    /// asked for: a text mime as `TextResourceContents`, everything else base64
+    /// in `BlobResourceContents`. This is the one place base64 is ever emitted
+    /// - a tool result carries links, never bytes - so a model spends the
+    /// context on an image or a deck only when it decided to open it.
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        match skill_for_uri(&request.uri) {
-            Some(asset) => Ok(ReadResourceResult::new(vec![
+        if let Some(asset) = skill_for_uri(&request.uri) {
+            return Ok(ReadResourceResult::new(vec![
                 ResourceContents::text(asset.content, &request.uri).with_mime_type(SKILL_MIME_TYPE),
             ])
             .with_cache_hints(&context)
-            .into()),
-            None => Err(ErrorData::invalid_params(
-                format!(
-                    "unknown resource '{}'; this server serves {}",
-                    request.uri,
-                    skill_uris()
-                ),
-                None,
-            )),
+            .into());
         }
+        if let Some(url) = CrystallineUrl::parse(&request.uri) {
+            let url = CrystallineUrl {
+                permalink: decoded_uri_path(&url.permalink)?,
+                ..url
+            };
+            if let Some(path) = url.asset_path() {
+                let (bytes, row) = self
+                    .engine
+                    .attachment_read(&url.domain, path)
+                    .await
+                    .map_err(to_error)?;
+                return Ok(ReadResourceResult::new(vec![attachment_contents(
+                    &request.uri,
+                    bytes,
+                    &row.mime,
+                )])
+                .with_cache_hints(&context)
+                .into());
+            }
+        }
+        Err(ErrorData::invalid_params(
+            format!(
+                "unknown resource '{}'; this server serves {} and every attachment addressed as {ATTACHMENT_URI_TEMPLATE}",
+                request.uri,
+                skill_uris()
+            ),
+            None,
+        ))
     }
 
     /// List the two onboarding prompts, empty while `skills.serve` is off.
@@ -1931,6 +2023,62 @@ impl ServerHandler for McpServer {
             ))
             .await
     }
+}
+
+/// The percent-decoded path of a `crystalline://` resource uri.
+///
+/// RFC 3986 lets a path carry only a restricted set of characters, so a
+/// conforming client percent-encodes the rest before sending a uri back - every
+/// non-ASCII letter in a filename a human chose, for a start. The REST file
+/// route gets this step for free from axum's `Path` extractor, which decodes
+/// before the handler runs (`crate::rest::files`); the MCP surface has no
+/// extractor in front of it, so it decodes here. Without it a browser and an
+/// agent following the same link reach different answers on the same file.
+///
+/// Decoding is not lenient. A sequence that is not valid UTF-8 once decoded is
+/// refused, and so is a decoded control character:
+/// [`crystalline_core::validate_asset_path`] refuses control characters too,
+/// but a NUL reaching a filesystem call truncates the name it is part of, so
+/// the guarantee is made here rather than borrowed. A path with nothing to
+/// decode comes back unchanged.
+fn decoded_uri_path(path: &str) -> Result<String, ErrorData> {
+    let decoded = percent_encoding::percent_decode_str(path)
+        .decode_utf8()
+        .map_err(|e| {
+            ErrorData::invalid_params(
+                format!("resource uri path '{path}' is not valid UTF-8 once percent-decoded: {e}"),
+                None,
+            )
+        })?;
+    if decoded.chars().any(char::is_control) {
+        return Err(ErrorData::invalid_params(
+            format!("resource uri path '{path}' percent-decodes to a control character"),
+            None,
+        ));
+    }
+    Ok(decoded.into_owned())
+}
+
+/// One attachment's bytes as resource contents, in the shape its mime asks
+/// for: text for the readable formats
+/// [`crystalline_core::is_text_attachment_mime`] names, base64 for everything
+/// else.
+///
+/// A text mime whose bytes are not valid UTF-8 falls back to the blob shape
+/// rather than losing them to a lossy conversion: a `.txt` in some other
+/// encoding is still the file the caller asked for, and a client that decodes
+/// the base64 gets it byte for byte.
+fn attachment_contents(uri: &str, bytes: Vec<u8>, mime: &str) -> ResourceContents {
+    if crystalline_core::is_text_attachment_mime(mime) {
+        match String::from_utf8(bytes) {
+            Ok(text) => return ResourceContents::text(text, uri).with_mime_type(mime),
+            Err(e) => {
+                return ResourceContents::blob(BASE64.encode(e.into_bytes()), uri)
+                    .with_mime_type(mime);
+            }
+        }
+    }
+    ResourceContents::blob(BASE64.encode(bytes), uri).with_mime_type(mime)
 }
 
 /// Wrap an engine value as a successful tool result. The compact JSON is the

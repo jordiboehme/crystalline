@@ -16,6 +16,7 @@
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod address;
+pub mod attachment;
 pub mod config;
 pub mod emit;
 pub mod engram;
@@ -35,10 +36,15 @@ pub mod verify;
 pub mod yaml;
 
 pub use address::{CrystallineUrl, LinkResolver, LookupTable, Resolution, ResolvedRef, slugify};
+pub use attachment::{
+    ASSETS_FOLDER, ASSETS_PREFIX, AssetPathError, MAX_ATTACHMENT_BYTES, attachment_mime,
+    canonical_asset_path, find_asset_refs, is_inline_attachment_mime, is_text_attachment_mime,
+    is_under_assets, validate_asset_path,
+};
 pub use emit::emit_engram;
 pub use engram::{
-    Engram, Frontmatter, Generated, Heading, LinkTarget, Observation, RECOMMENDED_STATUSES,
-    RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
+    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, Heading, LinkTarget, Observation,
+    RECOMMENDED_STATUSES, RECOMMENDED_TYPES, Relation, SchemaDef, Verification, Verified, WikiLink,
 };
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use index::{

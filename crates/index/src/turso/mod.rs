@@ -31,11 +31,11 @@ use turso::{Builder, Connection, Database, Row, Value};
 use crate::alias::{AliasMap, query_uses_tags};
 use crate::error::{IndexError, Result};
 use crate::store::{
-    BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind, DomainStats,
-    EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord,
-    EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit, InboundPage,
-    InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page, RecentFilter,
-    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
+    AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
+    DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
+    EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
+    InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
+    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
     build_vocabulary, folder_slash, page_window,
 };
 use crate::sweep::UnresolvedRef;
@@ -302,6 +302,32 @@ fn descriptor_from_row(r: &Row) -> EngramDescriptor {
         engram_type: cell_text(r, 6).unwrap_or_default(),
         status: cell_text(r, 7).unwrap_or_default(),
     }
+}
+
+/// Decode one attachment row: path, sha256, mime, size, modified. The column
+/// layout is identical across both backends.
+fn attachment_from_row(r: &Row) -> AttachmentRow {
+    AttachmentRow {
+        path: cell_text(r, 0).unwrap_or_default(),
+        sha256: cell_text(r, 1).unwrap_or_default(),
+        mime: cell_text(r, 2).unwrap_or_default(),
+        size: cell_i64(r, 3).unwrap_or(0).max(0) as u64,
+        modified: cell_text(r, 4).unwrap_or_default(),
+    }
+}
+
+/// The primary key of one attachment, or a [`IndexError::Constraint`] when the
+/// path has no row. Writing a blob without a metadata row would leave bytes
+/// nothing can serve, so the missing row is refused rather than created blank.
+async fn attachment_id(conn: &Connection, domain: DomainId, path: &str) -> Result<i64> {
+    query_first(
+        conn,
+        "SELECT id FROM attachment WHERE domain_id=?1 AND path=?2",
+        vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+    )
+    .await?
+    .and_then(|r| cell_i64(&r, 0))
+    .ok_or_else(|| IndexError::Constraint(format!("no attachment row at `{path}`")))
 }
 
 /// Decode one `outbound_refs` row: line, kind discriminator (0 relation, 1
@@ -788,8 +814,11 @@ impl Store for TursoStore {
     async fn clear_domain(&self, domain: DomainId) -> Result<()> {
         // Deletes this domain's chunks, so the coverage snapshot is now stale.
         self.invalidate_coverage();
-        // Delete a single domain's engram and child rows, keeping the domain
-        // row. Child rows first, then chunks, then the engram rows themselves.
+        // Delete a single domain's engram, attachment and child rows, keeping
+        // the domain row. Child rows first, then chunks, then the engram rows
+        // themselves; attachment blobs before the attachment rows that own
+        // them. `upsert_domain` reuses the id for a name it has seen, so
+        // anything left here would resurface as the next registration's own.
         let did = vec![Value::Integer(domain.0)];
         for sql in [
             "DELETE FROM observation_tag WHERE observation_id IN \
@@ -801,6 +830,9 @@ impl Store for TursoStore {
             "DELETE FROM link WHERE domain_id=?1",
             "DELETE FROM engram WHERE domain_id=?1",
             "DELETE FROM tag_alias WHERE domain_id=?1",
+            "DELETE FROM attachment_blob WHERE attachment_id IN \
+             (SELECT id FROM attachment WHERE domain_id=?1)",
+            "DELETE FROM attachment WHERE domain_id=?1",
         ] {
             self.conn.execute(sql, did.clone()).await?;
         }
@@ -1958,6 +1990,101 @@ impl Store for TursoStore {
             instance_id: cell_text(&r, 0).unwrap_or_default(),
             label: cell_text(&r, 1).unwrap_or_default(),
             heartbeat_at: cell_text(&r, 2).unwrap_or_default(),
+        }))
+    }
+
+    async fn upsert_attachment(&self, domain: DomainId, row: &AttachmentRow) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO attachment(domain_id, path, sha256, mime, size, modified) \
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6) \
+                 ON CONFLICT(domain_id, path) DO UPDATE SET \
+                     sha256=excluded.sha256, mime=excluded.mime, \
+                     size=excluded.size, modified=excluded.modified",
+                vec![
+                    Value::Integer(domain.0),
+                    Value::Text(row.path.clone()),
+                    Value::Text(row.sha256.clone()),
+                    Value::Text(row.mime.clone()),
+                    Value::Integer(row.size as i64),
+                    Value::Text(row.modified.clone()),
+                ],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn delete_attachment(&self, domain: DomainId, path: &str) -> Result<bool> {
+        // The blob goes first and by hand: this connection does not enable
+        // `PRAGMA foreign_keys`, so the declared cascade would not fire and the
+        // blob would outlive its row.
+        let key = vec![Value::Integer(domain.0), Value::Text(path.to_string())];
+        self.conn
+            .execute(
+                "DELETE FROM attachment_blob WHERE attachment_id IN \
+                 (SELECT id FROM attachment WHERE domain_id=?1 AND path=?2)",
+                key.clone(),
+            )
+            .await?;
+        let n = self
+            .conn
+            .execute("DELETE FROM attachment WHERE domain_id=?1 AND path=?2", key)
+            .await?;
+        Ok(n > 0)
+    }
+
+    async fn get_attachment(&self, domain: DomainId, path: &str) -> Result<Option<AttachmentRow>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT path, sha256, mime, size, modified FROM attachment \
+             WHERE domain_id=?1 AND path=?2",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.as_ref().map(attachment_from_row))
+    }
+
+    async fn list_attachments(&self, domain: DomainId) -> Result<Vec<AttachmentRow>> {
+        // TEXT sorts byte-wise here, the order the Postgres twin pins itself to
+        // with an explicit `COLLATE "C"`.
+        let rows = query_all(
+            &self.conn,
+            "SELECT path, sha256, mime, size, modified FROM attachment \
+             WHERE domain_id=?1 ORDER BY path",
+            vec![Value::Integer(domain.0)],
+        )
+        .await?;
+        Ok(rows.iter().map(attachment_from_row).collect())
+    }
+
+    async fn write_attachment_blob(
+        &self,
+        domain: DomainId,
+        path: &str,
+        bytes: &[u8],
+    ) -> Result<()> {
+        let id = attachment_id(&self.conn, domain, path).await?;
+        self.conn
+            .execute(
+                "INSERT INTO attachment_blob(attachment_id, content) VALUES(?1, ?2) \
+                 ON CONFLICT(attachment_id) DO UPDATE SET content=excluded.content",
+                vec![Value::Integer(id), Value::Blob(bytes.to_vec())],
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn read_attachment_blob(&self, domain: DomainId, path: &str) -> Result<Option<Vec<u8>>> {
+        let row = query_first(
+            &self.conn,
+            "SELECT b.content FROM attachment_blob b JOIN attachment a ON a.id=b.attachment_id \
+             WHERE a.domain_id=?1 AND a.path=?2",
+            vec![Value::Integer(domain.0), Value::Text(path.to_string())],
+        )
+        .await?;
+        Ok(row.and_then(|r| match r.get_value(0) {
+            Ok(Value::Blob(b)) => Some(b),
+            _ => None,
         }))
     }
 

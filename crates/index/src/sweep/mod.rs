@@ -52,8 +52,8 @@ use crystalline_core::similarity::{dice_coefficient, normalize};
 use serde::Serialize;
 
 use crate::store::{
-    EdgeKind, EngramId, GraphEdge, GraphNode, GraphSlice, TagAlias, TagCount, is_current_status,
-    is_retired_status,
+    AttachmentRow, EdgeKind, EngramId, GraphEdge, GraphNode, GraphSlice, TagAlias, TagCount,
+    is_current_status, is_retired_status,
 };
 use crate::vocab::{tag_clusters, tag_clusters_with_aliases};
 
@@ -262,7 +262,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 15] = [
+pub const RULES: [RuleInfo; 19] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -304,6 +304,20 @@ pub const RULES: [RuleInfo; 15] = [
         base: 50,
         summary: "human capture never reviewed",
         instruction: "A person captured this directly and nobody has reviewed it since. Read it and verify the claim, align its tags with the vocabulary and its aliases, wire relations both ways into the neighbourhood it belongs to, then record a verified entry. Propose any wording change and wait for a yes - the words are the human's.",
+    },
+    RuleInfo {
+        id: "V007",
+        family: Family::Temporal,
+        base: 50,
+        summary: "attachment never analyzed",
+        instruction: "Read the attachment through the crystalline attachment resource (resources/read on crystalline://<domain>/<path>). Capture what it teaches as an engram, or confirm an engram embedding it already covers it. On that engram set analyzes: <path> and analyzed_hash to the attachment's current sha256, and wire relations into its neighbourhood. Creating or changing knowledge: ask before acting.",
+    },
+    RuleInfo {
+        id: "V008",
+        family: Family::Temporal,
+        base: 60,
+        summary: "attachment changed since analysis",
+        instruction: "The attachment changed after this engram captured it. Re-read it, update the engram to match what it now shows, set analyzed_hash to the current hash and record a verified entry. Propose wording changes and wait for a yes.",
     },
     RuleInfo {
         id: "V101",
@@ -348,6 +362,20 @@ pub const RULES: [RuleInfo; 15] = [
         instruction: "Almost no content beyond the frontmatter. Enrich it, fold it into the engram that owns the topic or retire it. Verify's Q001 flags the same shape.",
     },
     RuleInfo {
+        id: "V107",
+        family: Family::Structure,
+        base: 45,
+        summary: "dangling attachment reference",
+        instruction: "The file is gone. Restore it (Fluid upload or archive import) or remove or correct the reference; either changes what the engram shows a reader, so ask first.",
+    },
+    RuleInfo {
+        id: "V108",
+        family: Family::Structure,
+        base: 55,
+        summary: "orphaned attachment",
+        instruction: "An attachment without a reference from an engram should not exist. Delete it - or, if it should have been knowledge, analyze it into an engram that references and claims it first. Deleting is irreversible, so ask before acting. Delete with delete_engram using the assets/ path as the identifier, or in Fluid. One limit worth knowing: nothing records reference history, so a file nobody ever referenced and a file an edit stopped referencing look the same here, and the resolution is the same either way.",
+    },
+    RuleInfo {
         id: "V201",
         family: Family::Redundancy,
         base: 80,
@@ -375,9 +403,89 @@ pub fn rule_info(id: &str) -> Option<&'static RuleInfo> {
     RULES.iter().find(|r| r.id == id)
 }
 
+/// The separator a scope joins its parts with. A scope is stored in an engram's
+/// frontmatter and compared as one string, never rendered as a table cell, so
+/// it uses the ordinary comma rather than the semicolon the evidence columns
+/// avoid commas for.
+const SCOPE_SEPARATOR: &str = ", ";
+
+/// The stable discriminator for a finding: the evidence an acknowledgment was
+/// given for, in a form that survives an unrelated edit and changes the moment
+/// the evidence does.
+///
+/// One match for the whole catalog, deliberately. The rules that carry a scope
+/// pass their material in and this decides the shape:
+///
+/// - `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
+///   counterparts), `V107` (the missing attachment paths), `V201` (the cluster
+///   members) and `V202` (the colliding titles) are **sets**, so the parts are
+///   sorted and deduplicated before joining: reordering the links in a body must
+///   not re-raise an acknowledged finding, while a new member must;
+/// - `V007` and `V008` name **one attachment path**, so the first part is the
+///   whole scope;
+/// - every other rule's identity is just (engram, rule) - the plain temporal
+///   rules, orphans, stubs, size, tag drift and the anchorless orphaned
+///   attachment - and carries an empty scope, which matches whatever the engram
+///   looks like next time.
+fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
+    match rule {
+        "V101" | "V102" | "V103" | "V107" | "V201" | "V202" => {
+            parts.sort();
+            parts.dedup();
+            parts.join(SCOPE_SEPARATOR)
+        }
+        "V007" | "V008" => parts.into_iter().next().unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Input
 // ---------------------------------------------------------------------------
+
+/// One acknowledgment read off an engram's `evolve_ack` frontmatter: somebody
+/// looked at a finding, ruled it intentional and said so in the engram itself.
+///
+/// The stamp the file also carries (`by` and `at`) is deliberately absent: the
+/// detectors decide whether an acknowledgment still matches, never who wrote it
+/// or when, and leaving provenance out of the fact keeps that honest.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AckEntry {
+    /// The rule id the acknowledgment silences, for example `V101`.
+    pub rule: String,
+    /// The evidence it was given for, as [`scope_for`] renders it. `None` is
+    /// the generous fallback a hand-written entry gets: it matches whatever the
+    /// finding's scope turns out to be.
+    pub scope: Option<String>,
+    /// Why it is intentional, in the acknowledger's own words.
+    pub note: Option<String>,
+}
+
+/// How many findings acknowledgments suppressed on one run, whole and per
+/// family, so a sweep never silently shrinks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AckCounts {
+    /// Every suppressed finding.
+    pub total: usize,
+    /// Suppressed `V0xx` findings.
+    pub temporal: usize,
+    /// Suppressed `V1xx` findings.
+    pub structure: usize,
+    /// Suppressed `V2xx` findings.
+    pub redundancy: usize,
+}
+
+impl AckCounts {
+    /// Count one suppressed finding of `family`.
+    fn add(&mut self, family: Family) {
+        self.total += 1;
+        match family {
+            Family::Temporal => self.temporal += 1,
+            Family::Structure => self.structure += 1,
+            Family::Redundancy => self.redundancy += 1,
+        }
+    }
+}
 
 /// Everything the rules read about one engram, resolved once by the engine so
 /// no detector ever touches a store or a file.
@@ -444,6 +552,23 @@ pub struct EngramFacts {
     /// somewhere that never wrote it. Absence fails quiet everywhere: no rule
     /// treats an unknown author as a finding.
     pub generated_by: Option<String>,
+    /// The `assets/` path the engram's `analyzes` frontmatter key claims, with
+    /// the reserved folder segment already folded to its canonical spelling.
+    /// Setting it is the agent's act of saying "I read this file and this
+    /// engram is what it teaches".
+    pub analyzes: Option<String>,
+    /// The `analyzed_hash` frontmatter key: the attachment's sha256 as it was
+    /// when the engram captured it. Absent means the claim never recorded a
+    /// hash, which `V008` reads as nothing to compare rather than as a change.
+    pub analyzed_hash: Option<String>,
+    /// The distinct `assets/` paths the body links to, from
+    /// `crystalline_core::find_asset_refs`: fenced code skipped, fragments
+    /// stripped, in order of first appearance.
+    pub asset_refs: Vec<String>,
+    /// The `evolve_ack` entries the engram carries: the findings somebody ruled
+    /// intentional. Malformed entries never reach here - the engine skips them
+    /// rather than failing a sweep over a hand-edited line.
+    pub acks: Vec<AckEntry>,
 }
 
 impl EngramFacts {
@@ -477,6 +602,10 @@ impl EngramFacts {
             inbound: 0,
             outbound: 0,
             generated_by: None,
+            analyzes: None,
+            analyzed_hash: None,
+            asset_refs: Vec::new(),
+            acks: Vec::new(),
         }
     }
 
@@ -617,6 +746,14 @@ pub struct SweepInput {
     /// Every registered domain name. `V102` uses it to tell an unregistered
     /// target domain apart from a target that simply does not exist.
     pub known_domains: Vec<String>,
+    /// Every attachment the domain holds, metadata only. The attachment rules
+    /// compare this list against what the engrams reference and claim, in both
+    /// directions.
+    pub attachments: Vec<AttachmentRow>,
+    /// Return the findings acknowledgments suppressed anyway, each marked
+    /// [`Finding::acknowledged`] with the scope and note that silenced it. An
+    /// audit view: the queue a run hands out drops them.
+    pub include_acknowledged: bool,
     /// The thresholds for this run.
     pub options: SweepOptions,
 }
@@ -634,6 +771,8 @@ impl SweepInput {
             tags: Vec::new(),
             tag_aliases: Vec::new(),
             known_domains: Vec::new(),
+            attachments: Vec::new(),
+            include_acknowledged: false,
             options: SweepOptions::default(),
         }
     }
@@ -676,6 +815,28 @@ pub struct Finding {
     /// link text or the exact command. The prose instruction lives once per
     /// rule in [`RuleInfo::instruction`] rather than being repeated here.
     pub fix: String,
+    /// The evidence discriminator an acknowledgment is matched against, per
+    /// [`scope_for`]. Internal: it exists so an acknowledgment can hold while
+    /// the evidence holds, and no surface renders it as a column.
+    #[serde(skip)]
+    pub scope: String,
+    /// An acknowledgment matched and this finding is only here because the
+    /// caller asked for the suppressed ones.
+    pub acknowledged: bool,
+    /// An acknowledgment for this rule exists on the engram but was given for
+    /// different evidence, so it no longer matches. The finding is returned as
+    /// usual: an acknowledgment that stopped applying is worth saying out loud
+    /// rather than pretending it never happened.
+    pub ack_stale: bool,
+    /// The note the matching or stale acknowledgment carries, when it has one.
+    pub ack_note: Option<String>,
+    /// The evidence the matching or stale acknowledgment was **given for**,
+    /// which is a different thing from [`Finding::scope`]: on a stale row the
+    /// two disagree, and that disagreement is the whole story ("acknowledged
+    /// for this, firing on that"). `None` when no acknowledgment spoke to this
+    /// finding, or when the one that did carries no scope and so acknowledged
+    /// nothing in particular.
+    pub ack_scope: Option<String>,
 }
 
 impl Finding {
@@ -700,6 +861,11 @@ impl Finding {
             finding: String::new(),
             evidence: String::new(),
             fix: String::new(),
+            scope: String::new(),
+            acknowledged: false,
+            ack_stale: false,
+            ack_note: None,
+            ack_scope: None,
         }
     }
 
@@ -719,6 +885,22 @@ impl Finding {
             finding: String::new(),
             evidence: String::new(),
             fix: String::new(),
+            scope: String::new(),
+            acknowledged: false,
+            ack_stale: false,
+            ack_note: None,
+            ack_scope: None,
+        }
+    }
+
+    /// A finding about an attachment rather than an engram: the path is the
+    /// subject and the permalink stays empty, because no engram is the thing
+    /// the reader has to open. Fabricating one would be a link to knowledge
+    /// that does not exist, which is exactly what the finding is about.
+    fn about_attachment(rule: &'static str, domain: &str, path: &str) -> Finding {
+        Finding {
+            title: path.to_string(),
+            ..Finding::about_domain(rule, domain)
         }
     }
 
@@ -736,6 +918,14 @@ impl Finding {
         self.line = line;
         self
     }
+
+    /// Record the evidence this finding fired on, which [`scope_for`] shapes
+    /// into the scope an acknowledgment is matched against. A rule that says
+    /// nothing here keeps the empty scope, which any acknowledgment matches.
+    fn scoped(mut self, parts: impl IntoIterator<Item = String>) -> Finding {
+        self.scope = scope_for(self.rule, parts.into_iter().collect());
+        self
+    }
 }
 
 /// The outcome of one domain's sweep: the ranked queue plus whatever a cap cut
@@ -749,6 +939,10 @@ pub struct SweepReport {
     /// One line per cap that fired, phrased for a reader: what was cut and how
     /// much of it there was. Empty on a complete run.
     pub truncations: Vec<String>,
+    /// How many findings acknowledgments suppressed, whole and per family. A
+    /// suppressed finding leaves this trace whether or not
+    /// [`SweepInput::include_acknowledged`] put it back in the queue.
+    pub acknowledged: AckCounts,
 }
 
 // ---------------------------------------------------------------------------
@@ -815,9 +1009,75 @@ pub fn detect(input: &SweepInput) -> SweepReport {
     detect_lifecycle(input, &graph, &mut report);
     detect_structure(input, &graph, &mut report);
     detect_redundancy(input, &mut report);
+    detect_attachments(input, &mut report);
 
+    apply_acknowledgments(input, &mut report);
     rank(&mut report.findings);
     report
+}
+
+/// Drop the findings an acknowledgment silences, count them, and mark the ones
+/// whose acknowledgment no longer matches.
+///
+/// The three outcomes for a finding whose anchor engram carries an `evolve_ack`
+/// for its rule:
+///
+/// - the entry's scope is absent, or equals the finding's scope: **suppressed**,
+///   counted, and returned only when the caller asked for the suppressed ones;
+/// - the entry's scope differs: **returned**, flagged [`Finding::ack_stale`]
+///   and carrying the old note, because "somebody ruled this intentional and
+///   the evidence has since changed" is a different thing to read than a fresh
+///   finding;
+/// - no entry for the rule: untouched.
+///
+/// A finding with no anchor engram - `V203`'s vocabulary, `V108`'s attachment -
+/// has nowhere to hang an acknowledgment and passes through.
+fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
+    let acks: HashMap<&str, &[AckEntry]> = input
+        .engrams
+        .iter()
+        .filter(|f| !f.acks.is_empty())
+        .map(|f| (f.permalink.as_str(), f.acks.as_slice()))
+        .collect();
+    if acks.is_empty() {
+        return;
+    }
+
+    let mut counts = AckCounts::default();
+    let include = input.include_acknowledged;
+    report.findings.retain_mut(|finding| {
+        let Some(entries) = acks.get(finding.permalink.as_str()) else {
+            return true;
+        };
+        let mut for_rule = entries
+            .iter()
+            .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule));
+        // The generous match wins over a stale one: an engram carrying both a
+        // scope-less entry and an outdated scoped one is acknowledged.
+        let matching = for_rule
+            .clone()
+            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
+        match matching.or_else(|| for_rule.next()) {
+            Some(ack) if matching.is_some() => {
+                counts.add(finding.family);
+                finding.acknowledged = true;
+                finding.ack_note = ack.note.clone();
+                finding.ack_scope = ack.scope.clone();
+                include
+            }
+            Some(stale) => {
+                finding.ack_stale = true;
+                finding.ack_note = stale.note.clone();
+                // The entry's own scope, not the finding's: a stale row exists
+                // precisely because those two have drifted apart, and the row
+                // is where a reader compares them.
+                finding.ack_scope = stale.scope.clone();
+                true
+            }
+            None => true,
+        }
+    });
+    report.acknowledged = counts;
 }
 
 /// The edge and node lookups every rule shares, built once per run.
@@ -1144,6 +1404,11 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
         if fact.is_current() {
             let mut seen: BTreeSet<i64> = BTreeSet::new();
             let mut targets: Vec<String> = Vec::new();
+            // The retired engrams themselves, which is what an acknowledgment
+            // of this finding was given for: a link repointed or a new retired
+            // target added changes it, rewording the paragraph around it does
+            // not.
+            let mut retired: Vec<String> = Vec::new();
             let mut repoint: Option<String> = None;
             for edge in graph.outbound_of(fact.id) {
                 if edge.rel_type == "supersedes" || edge.to == fact.id {
@@ -1156,6 +1421,7 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
                     continue;
                 }
                 let successor = graph.successor(edge.to);
+                retired.push(graph.address(edge.to));
                 targets.push(format!(
                     "{} is {status} via {}{}",
                     graph.address(edge.to),
@@ -1174,16 +1440,20 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
             if !targets.is_empty() {
                 let count = targets.len();
                 report.findings.push(
-                    Finding::about("V101", fact).with(
-                        Class::Judgment,
-                        format!("references {count} retired engram(s) while still current"),
-                        join_semis(targets.into_iter()),
-                        match repoint {
-                            Some(link) => format!("repoint at {link}"),
-                            None => "repoint at the successor or keep it as a historical citation"
-                                .to_string(),
-                        },
-                    ),
+                    Finding::about("V101", fact)
+                        .with(
+                            Class::Judgment,
+                            format!("references {count} retired engram(s) while still current"),
+                            join_semis(targets.into_iter()),
+                            match repoint {
+                                Some(link) => format!("repoint at {link}"),
+                                None => {
+                                    "repoint at the successor or keep it as a historical citation"
+                                        .to_string()
+                                }
+                            },
+                        )
+                        .scoped(retired),
                 );
             }
         }
@@ -1234,7 +1504,22 @@ fn detect_structure(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 }
 
 /// `V102`: references the index could not resolve.
+///
+/// The rule emits one finding per broken reference, but every finding on one
+/// engram carries the **same** scope: that engram's whole set of unresolved
+/// targets. One acknowledgment therefore covers what is broken now - which is
+/// what a person ruling "these links point outside on purpose" means - and stops
+/// matching the moment the set changes, so a newly broken link is raised rather
+/// than swallowed by an older entry.
 fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
+    let mut targets: HashMap<i64, Vec<String>> = HashMap::new();
+    for reference in &input.unresolved {
+        targets
+            .entry(reference.from.0)
+            .or_default()
+            .push(reference.target.clone());
+    }
+
     for reference in &input.unresolved {
         let Some(fact) = graph.facts.get(&reference.from.0) else {
             continue;
@@ -1290,7 +1575,8 @@ fn detect_unresolved(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                     evidence,
                     fix,
                 )
-                .at_line(reference.line),
+                .at_line(reference.line)
+                .scoped(targets.get(&reference.from.0).cloned().unwrap_or_default()),
         );
     }
 }
@@ -1360,19 +1646,28 @@ fn detect_reciprocal(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
             let Some(first) = sources.first() else {
                 continue;
             };
-            let addrs = join_semis(sources.iter().map(|s| graph.address(*s)));
-            report.findings.push(Finding::about("V103", fact).with(
-                Class::Mechanical,
-                format!("{addrs} declares {forward} but the {inverse} back-link is missing"),
-                format!(
-                    "{addrs} -{forward}-> {}; no {inverse} pointing back",
-                    fact.address()
-                ),
-                format!(
-                    "append `- {inverse} {}`",
-                    graph.link_text(*first, &fact.domain)
-                ),
-            ));
+            let counterparts: Vec<String> = sources.iter().map(|s| graph.address(*s)).collect();
+            let addrs = join_semis(counterparts.iter());
+            report.findings.push(
+                Finding::about("V103", fact)
+                    .with(
+                        Class::Mechanical,
+                        format!(
+                            "{addrs} declares {forward} but the {inverse} back-link is missing"
+                        ),
+                        format!(
+                            "{addrs} -{forward}-> {}; no {inverse} pointing back",
+                            fact.address()
+                        ),
+                        format!(
+                            "append `- {inverse} {}`",
+                            graph.link_text(*first, &fact.domain)
+                        ),
+                    )
+                    // The counterpart is the pair, so acknowledging a one-sided
+                    // relation says nothing about the next one.
+                    .scoped(counterparts),
+            );
         }
     }
 }
@@ -1416,18 +1711,23 @@ fn detect_redundancy(input: &SweepInput, report: &mut SweepReport) {
             .filter(|m| live[**m].id != live[lead].id)
             .map(|m| live[*m].address())
             .collect();
-        report
-            .findings
-            .push(Finding::about("V201", live[lead]).with(
-                Class::Judgment,
-                format!("near-duplicate of {} other engram(s)", others.len()),
-                format!(
-                    "dice at or above {:.2}; also in the cluster: {}",
-                    input.options.dup_threshold,
-                    join_semis(others.into_iter())
-                ),
-                "merge the others into this one then supersede them".to_string(),
-            ));
+        // The whole cluster, the lead included, so the scope reads the same
+        // whichever member the finding happened to hang on.
+        let cluster: Vec<String> = members.iter().map(|m| live[*m].address()).collect();
+        report.findings.push(
+            Finding::about("V201", live[lead])
+                .with(
+                    Class::Judgment,
+                    format!("near-duplicate of {} other engram(s)", others.len()),
+                    format!(
+                        "dice at or above {:.2}; also in the cluster: {}",
+                        input.options.dup_threshold,
+                        join_semis(others.into_iter())
+                    ),
+                    "merge the others into this one then supersede them".to_string(),
+                )
+                .scoped(cluster),
+        );
     }
 
     detect_title_collisions(&live, &cluster_of, report);
@@ -1503,14 +1803,19 @@ fn detect_title_collisions(
                 .iter()
                 .map(|m| format!("{} ({})", live[*m].title, live[*m].address())),
         );
-        report
-            .findings
-            .push(Finding::about("V202", live[lead]).with(
-                Class::Judgment,
-                format!("title collides with {} other engram(s)", members.len() - 1),
-                listed,
-                "merge them or retitle for disambiguation".to_string(),
-            ));
+        report.findings.push(
+            Finding::about("V202", live[lead])
+                .with(
+                    Class::Judgment,
+                    format!("title collides with {} other engram(s)", members.len() - 1),
+                    listed,
+                    "merge them or retitle for disambiguation".to_string(),
+                )
+                // The colliding titles: retitling one ends the collision this
+                // acknowledgment was about, a third engram joining starts a new
+                // one.
+                .scoped(members.iter().map(|m| live[*m].title.clone())),
+        );
     }
 }
 
@@ -1572,9 +1877,212 @@ fn detect_tag_drift(input: &SweepInput, report: &mut SweepReport) {
     }
 }
 
+/// The four attachment rules: `V007` and `V008` in the temporal family,
+/// `V107` and `V108` in the structural one.
+///
+/// One pass rather than two halves filed under their families, because all
+/// four read the same pair of indexes - which engram references or claims
+/// which path, and which paths the domain actually holds - and building that
+/// twice would be bookkeeping no reader benefits from.
+///
+/// Who counts as a referent is the load-bearing part, and it matches what the
+/// engine's move already decides when it works out whether an attachment may
+/// leave a domain:
+///
+/// - a body reference is what [`crystalline_core::find_asset_refs`] found in
+///   the body and a claim is the `analyzes` frontmatter key, compared as exact
+///   paths;
+/// - **`V108` counts live and retired engrams alike.** Retired knowledge is
+///   still knowledge, and a file its text shows a reader is part of somebody's
+///   teaching whatever the status says;
+/// - every rule that asks an agent to act on an engram - `V007`'s anchor,
+///   `V008` and `V107` - speaks only about a live one, since prescribing work
+///   on retired knowledge is what retirement already answered.
+///
+/// `V007` and `V108` are disjoint by construction: `V007` needs a live body
+/// reference, `V108` needs no reference of any kind. Both wait until the
+/// attachment's modified date is behind `today`, so an upload is never nagged
+/// about in the minutes between the file arriving and the engram that embeds
+/// it being saved.
+fn detect_attachments(input: &SweepInput, report: &mut SweepReport) {
+    let rows: BTreeMap<&str, &AttachmentRow> = input
+        .attachments
+        .iter()
+        .map(|row| (row.path.as_str(), row))
+        .collect();
+
+    // Every path anything references or claims, whatever its status, plus the
+    // two live-only views the acting rules need.
+    let mut referenced: BTreeSet<&str> = BTreeSet::new();
+    let mut claimed_live: BTreeSet<&str> = BTreeSet::new();
+    let mut first_referent: BTreeMap<&str, &EngramFacts> = BTreeMap::new();
+
+    for fact in &input.engrams {
+        let claim = fact.analyzes.as_deref();
+        for path in fact.asset_refs.iter().map(String::as_str).chain(claim) {
+            referenced.insert(path);
+        }
+        if fact.is_retired() {
+            continue;
+        }
+        if let Some(claim) = claim {
+            claimed_live.insert(claim);
+        }
+        for path in &fact.asset_refs {
+            // Input order decides the anchor, so the same domain always hangs
+            // the finding on the same engram.
+            first_referent.entry(path.as_str()).or_insert(fact);
+        }
+
+        // V107: a reference or a claim naming a file the domain does not hold.
+        // One finding per engram rather than per path, because the work is one
+        // pass over that engram's references.
+        let mut missing: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
+        for path in &fact.asset_refs {
+            if !rows.contains_key(path.as_str()) {
+                missing.entry(path.as_str()).or_default().0 = true;
+            }
+        }
+        // A claim on its own counts, not only a claim beside a body reference:
+        // an `analyzes` pointing at nothing is a promise the engram cannot
+        // keep, and the evidence below names the claim as where the missing
+        // path was written, which is what tells the two cases apart.
+        if let Some(claim) = claim
+            && !rows.contains_key(claim)
+        {
+            missing.entry(claim).or_default().1 = true;
+        }
+        if !missing.is_empty() {
+            let listed = join_semis(missing.iter().map(|(path, (body, claimed))| {
+                let how = match (body, claimed) {
+                    (true, true) => "referenced in the body and claimed by analyzes",
+                    (true, false) => "referenced in the body",
+                    _ => "claimed by analyzes",
+                };
+                format!("{path} {how}")
+            }));
+            let (found, held) = if missing.len() == 1 {
+                (
+                    "points at an attachment that is not there".to_string(),
+                    format!("nothing in {} holds that path", fact.domain),
+                )
+            } else {
+                (
+                    format!("points at {} attachments that are not there", missing.len()),
+                    format!("nothing in {} holds those paths", fact.domain),
+                )
+            };
+            report.findings.push(
+                Finding::about("V107", fact)
+                    .with(
+                        Class::Judgment,
+                        found,
+                        format!("{listed}; {held}"),
+                        join_semis(missing.keys()),
+                    )
+                    .scoped(missing.keys().map(|p| (*p).to_string())),
+            );
+        }
+
+        // V008: the engram captured one version of the file and the file has
+        // moved on. A claim with no recorded hash is nothing to compare, never
+        // a change.
+        if let Some(claim) = claim
+            && let Some(row) = rows.get(claim)
+            && let Some(recorded) = fact
+                .analyzed_hash
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+            && !recorded.eq_ignore_ascii_case(&row.sha256)
+        {
+            report.findings.push(
+                Finding::about("V008", fact)
+                    .with(
+                        Class::Judgment,
+                        "the attachment changed after this engram captured it".to_string(),
+                        format!(
+                            "analyzes {claim}; analyzed_hash {}.. but the attachment is now {}..",
+                            short_hash(recorded),
+                            short_hash(&row.sha256)
+                        ),
+                        format!("analyzed_hash: {}", row.sha256),
+                    )
+                    // The path, not the hash: acknowledging "this engram is
+                    // allowed to lag this file" should survive the file
+                    // changing again, and stop when the claim moves.
+                    .scoped([claim.to_string()]),
+            );
+        }
+    }
+
+    for (path, row) in &rows {
+        // A stamp nobody can read is a stamp no grace period can measure, so
+        // the file is left alone rather than called stale on a guess.
+        let Some(modified) = attachment_date(&row.modified) else {
+            continue;
+        };
+        if modified >= input.today {
+            continue;
+        }
+        let described = format!(
+            "{path}; {}, {} bytes; modified {modified}",
+            row.mime, row.size
+        );
+
+        // V108: nothing in the domain says this file is part of its teaching.
+        if !referenced.contains(path) {
+            report
+                .findings
+                .push(Finding::about_attachment("V108", &input.domain, path).with(
+                    Class::Judgment,
+                    "no engram references or claims this attachment".to_string(),
+                    format!("{described}; no engram references or claims it"),
+                    format!("delete {path} or analyze it into an engram that references it"),
+                ));
+            continue;
+        }
+
+        // V007: an engram shows the file to a reader but nothing says anybody
+        // read it into knowledge.
+        if claimed_live.contains(path) {
+            continue;
+        }
+        let Some(anchor) = first_referent.get(path) else {
+            continue;
+        };
+        report.findings.push(
+            Finding::about("V007", anchor)
+                .with(
+                    Class::Judgment,
+                    "shown to a reader but never captured as knowledge".to_string(),
+                    format!("{described}; no engram claims it via analyzes"),
+                    format!("analyzes: {path} and analyzed_hash: {}", row.sha256),
+                )
+                .scoped([(*path).to_string()]),
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The date an attachment's RFC 3339 `modified` stamp falls on, or `None` when
+/// the stamp does not parse. Absence fails quiet: a row nobody can date is
+/// never called orphaned or unanalyzed.
+fn attachment_date(modified: &str) -> Option<NaiveDate> {
+    chrono::DateTime::parse_from_rfc3339(modified.trim())
+        .ok()
+        .map(|dt| dt.date_naive())
+}
+
+/// The first eight characters of a hash, which is as much as evidence needs to
+/// show that two hashes differ. Shorter input is quoted whole rather than
+/// padded, so a hand-written `analyzed_hash` reads back as what was written.
+fn short_hash(hex: &str) -> String {
+    hex.chars().take(8).collect()
+}
 
 /// The member a cluster finding attaches to: the highest salience, ties broken
 /// by the lowest address so the pick is deterministic. Returns an index into

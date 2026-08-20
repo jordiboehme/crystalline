@@ -1,12 +1,25 @@
-//! The single error type every REST handler returns, rendered as an RFC 9457
-//! problem detail so a browser client can branch on `status` alone.
+//! How a REST request fails, and how a conditional one succeeds without a
+//! body: the shared vocabulary of failure and preconditions this surface
+//! answers with.
 //!
-//! axum's own extractors reject in plain text, which would put a second error
-//! shape on the wire for exactly the requests a client is most likely to get
-//! wrong. [`ApiQuery`], [`ApiPath`] and [`ApiJson`] wrap them so every
-//! rejection arrives as a problem detail too; the router pairs them with a
-//! method-not-allowed fallback (see [`ApiError::method_not_allowed`]) so the
-//! last plain-text answer axum can produce is covered as well.
+//! The failure half is [`ApiError`], the single error type every handler
+//! returns, rendered as an RFC 9457 problem detail so a browser client can
+//! branch on `status` alone. axum's own extractors reject in plain text, which
+//! would put a second error shape on the wire for exactly the requests a
+//! client is most likely to get wrong. [`ApiQuery`], [`ApiPath`] and
+//! [`ApiJson`] wrap them so every rejection arrives as a problem detail too;
+//! the router pairs them with a method-not-allowed fallback (see
+//! [`ApiError::method_not_allowed`]) so the last plain-text answer axum can
+//! produce is covered as well.
+//!
+//! The precondition half is the ETag machinery every conditional single
+//! resource read and write shares, here rather than in one of the three route
+//! modules that use it so all three agree by construction: [`if_match`] reads
+//! the strong validator a write must carry, [`precondition_failed`] renders
+//! the 412 it fails with (a [`ConflictDetail`], which carries the current
+//! version so a client can merge), [`if_none_match_matches`] decides whether a
+//! read may answer 304 and documents the shape of that 304, and [`REVALIDATE`]
+//! is the `Cache-Control` both the 200 and the 304 carry.
 
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::StatusCode;
@@ -347,6 +360,57 @@ pub fn if_match(headers: &axum::http::HeaderMap) -> Result<String, ApiError> {
     Ok(token.to_string())
 }
 
+/// `Cache-Control` for every conditional single-resource read, sent on both
+/// the 200 and the 304: store it, but revalidate before every use.
+///
+/// With no `Cache-Control`, no `Expires` and no `Last-Modified`, RFC 9111
+/// section 4.2.2 lets a cache invent a heuristic freshness lifetime and reuse a
+/// stored response with no request to this server at all - which skips
+/// `If-None-Match` entirely rather than skipping only the body, so a save
+/// elsewhere would go unnoticed by an already-cached reader. `no-cache`
+/// despite its name means "store it, revalidate it every time", not "do not
+/// store it": with the strong `ETag` these reads already carry, the
+/// revalidation costs one cheap 304 and no body. The 304 repeats the header
+/// too, since a 304 updates the stored response's own headers and dropping it
+/// there would let the very response it refreshes go heuristically fresh.
+pub const REVALIDATE: &str = "no-cache";
+
+/// Whether the request's `If-None-Match` covers the given strong validator.
+///
+/// Deliberately more forgiving than [`if_match`], which guards a write: this
+/// one only decides whether to resend bytes the client may already have, so a
+/// list of candidates, a `*` wildcard and a weak validator are all honoured
+/// rather than refused. Nothing is lost by being wrong in the permissive
+/// direction either, since the worst outcome is a full response the client
+/// discards.
+///
+/// # The 304 this gates
+///
+/// The canonical statement of that response's shape, kept here because three
+/// routes build the same one (the manifest, an engram and an attachment) and
+/// each of them points at this paragraph rather than repeating it. RFC 9110: a
+/// 304 carries the validator it matched and no body, so the client goes on
+/// caching under the same token; and it repeats [`REVALIDATE`] as well, since
+/// a 304 updates the stored response's own headers and dropping the directive
+/// there would let the very response it refreshes turn heuristically fresh.
+pub fn if_none_match_matches(headers: &axum::http::HeaderMap, checksum: &str) -> bool {
+    let Some(raw) = headers
+        .get(axum::http::header::IF_NONE_MATCH)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    raw.split(',').any(|candidate| {
+        let candidate = candidate.trim();
+        candidate == "*"
+            || candidate
+                .strip_prefix("W/")
+                .unwrap_or(candidate)
+                .trim_matches('"')
+                == checksum
+    })
+}
+
 /// The wire form of a 412: a problem detail carrying the version the server
 /// holds now, so a client can show a merge view instead of just failing.
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
@@ -551,6 +615,30 @@ mod tests {
             err.detail.contains("one") && err.detail.to_lowercase().contains("if-match"),
             "the detail says one ETag is expected: {}",
             err.detail
+        );
+    }
+
+    /// `if_none_match_matches` honours every form a real cache sends, unlike
+    /// `if_match`'s strict contract - a list, a wildcard and a weak validator
+    /// all count, since the worst outcome of being wrong here is a full
+    /// response the client discards rather than a clobbered write.
+    #[test]
+    fn if_none_match_honours_the_forms_a_cache_sends() {
+        use axum::http::{HeaderMap, header};
+        let with = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, value.parse().unwrap());
+            if_none_match_matches(&headers, "abc123")
+        };
+        assert!(with("\"abc123\""));
+        assert!(with("*"), "a wildcard asks about any version at all");
+        assert!(with("W/\"abc123\""), "a weak validator still identifies it");
+        assert!(with("\"other\", \"abc123\""), "one of a list is enough");
+        assert!(!with("\"other\""));
+        assert!(!with(""));
+        assert!(
+            !if_none_match_matches(&HeaderMap::new(), "abc123"),
+            "no header asks for the bytes"
         );
     }
 

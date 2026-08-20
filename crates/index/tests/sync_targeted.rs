@@ -315,6 +315,139 @@ parity!(
     outside_batch_untouched
 );
 
+// --- attachments -------------------------------------------------------------
+
+/// A few bytes that are not valid UTF-8, so a test asset is genuinely binary.
+const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0xff, 0x00];
+
+fn write_bytes(dir: &Path, rel: &str, bytes: &[u8]) {
+    let path = dir.join(rel);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).unwrap();
+    }
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// A targeted pass over one asset path touches exactly that attachment: the
+/// rewritten file's row refreshes, every other row stays as the full scan left
+/// it, and targeting a path whose file is gone removes just its row.
+async fn targeted_asset_touches_only_it(store: &dyn Store) {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    write(root, "a.md", &engram("A", "a", "body token"));
+    write_bytes(root, "assets/shot.png", PNG);
+    write_bytes(root, "assets/deck.pdf", b"%PDF-1.7 deck");
+    sync_domain_with(store, "d", root, &params()).await.unwrap();
+
+    let domain = upsert_domain(store, "d", root).await;
+    let before = store
+        .get_attachment(domain, "assets/deck.pdf")
+        .await
+        .unwrap()
+        .expect("the pdf row exists");
+
+    // A rewrite of a different length moves the size half of the stat prefilter,
+    // so the targeted pass hashes the file again whatever the mtime resolution is.
+    let rewritten: &[u8] = &[
+        0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x02, 0x03, 0x04,
+    ];
+    write_bytes(root, "assets/shot.png", rewritten);
+    target(store, root, &["assets/shot.png"]).await;
+
+    let shot = store
+        .get_attachment(domain, "assets/shot.png")
+        .await
+        .unwrap()
+        .expect("the png row exists");
+    assert_eq!(
+        shot.size,
+        rewritten.len() as u64,
+        "the targeted row refreshed"
+    );
+    assert_eq!(
+        store
+            .get_attachment(domain, "assets/deck.pdf")
+            .await
+            .unwrap()
+            .expect("the pdf row survives"),
+        before,
+        "a row outside the targeted batch is untouched"
+    );
+
+    // A targeted path whose file is gone deletes just that row.
+    std::fs::remove_file(root.join("assets/deck.pdf")).unwrap();
+    target(store, root, &["assets/deck.pdf"]).await;
+    let rows: Vec<String> = store
+        .list_attachments(domain)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.path)
+        .collect();
+    assert_eq!(rows, ["assets/shot.png"], "only the targeted row is gone");
+}
+parity!(
+    a_targeted_asset_path_touches_only_it,
+    targeted_asset_touches_only_it
+);
+
+/// A symlinked attachment is indexed by neither entry point.
+///
+/// The complete walk uses `WalkDir`'s default `follow_links(false)`, so it
+/// never sees a symlink at all. The targeted pass has to take the same posture
+/// or the two disagree: a link indexed by a watcher event would lose its row on
+/// the next full scan and get it back on the next event, a row that exists
+/// depending on which pass ran last.
+#[cfg(unix)]
+mod symlinked_asset {
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    async fn a_symlink_is_indexed_by_neither_pass(store: &dyn Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(root, "a.md", &engram("A", "a", "body token"));
+        write_bytes(root, "outside.png", PNG);
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        symlink(root.join("outside.png"), root.join("assets/link.png")).unwrap();
+
+        // The full scan: nothing, because it does not follow links.
+        sync_domain_with(store, "d", root, &params()).await.unwrap();
+        let domain = upsert_domain(store, "d", root).await;
+        assert!(
+            store.list_attachments(domain).await.unwrap().is_empty(),
+            "the complete walk indexes nothing through a symlink"
+        );
+
+        // The targeted pass, the one a watcher event drives: the same answer,
+        // and no failure reported either.
+        let report = target(store, root, &["assets/link.png"]).await;
+        assert!(report.failed.is_empty(), "no failures: {report:?}");
+        assert!(
+            store.list_attachments(domain).await.unwrap().is_empty(),
+            "a targeted pass must not index what the walk refuses to see"
+        );
+
+        // A real file beside it still indexes, so this is a symlink rule and
+        // not a broken assets branch.
+        write_bytes(root, "assets/shot.png", PNG);
+        target(store, root, &["assets/shot.png"]).await;
+        let rows: Vec<String> = store
+            .list_attachments(domain)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.path)
+            .collect();
+        assert_eq!(rows, ["assets/shot.png"]);
+    }
+    parity!(
+        a_symlinked_attachment_is_indexed_by_neither_pass,
+        a_symlink_is_indexed_by_neither_pass
+    );
+}
+
 /// An unreadable targeted path is a reported failure, not a delete: a metadata
 /// error other than "not found" keeps the row in the index and surfaces the
 /// path in the report's `failed` list instead of dropping it.

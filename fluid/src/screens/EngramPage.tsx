@@ -346,6 +346,9 @@ export default function EngramPage() {
               source={engram.content}
               wikilinks={wikilinks}
               foldTitle={engram.title}
+              // What a relative `assets/` target is relative to: without it an
+              // attachment reference is a path with nowhere to point.
+              domain={engram.domain}
             />
           </article>
           <div className="print:hidden">
@@ -360,7 +363,15 @@ export default function EngramPage() {
           </div>
         </div>
         <aside className="flex flex-col gap-6 print:hidden">
-          <DetailsPanel frontmatter={engram.frontmatter} address={engram.url} />
+          <DetailsPanel
+            frontmatter={engram.frontmatter}
+            address={engram.url}
+            domain={engram.domain}
+            // The body decides which of the domain's files this engram
+            // carries: the panel lists what the prose actually references.
+            body={engram.content}
+            canDelete={capabilities.canWrite}
+          />
           <BacklinksPanel
             domain={engram.domain}
             permalink={engram.permalink}

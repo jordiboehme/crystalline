@@ -220,6 +220,9 @@ async fn read_alpha(addr: std::net::SocketAddr, session: &(String, String)) -> (
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_editor_creates_an_engram_and_gets_the_detail_back() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -267,6 +270,9 @@ async fn an_editor_creates_an_engram_and_gets_the_detail_back() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn save_walks_the_if_match_contract() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -347,6 +353,9 @@ async fn save_walks_the_if_match_contract() {
 /// order is what a client actually gets.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_concurrent_saves_settle_as_one_winner_and_one_conflict() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -392,6 +401,9 @@ async fn two_concurrent_saves_settle_as_one_winner_and_one_conflict() {
 /// than 404 over a write that landed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -445,13 +457,25 @@ async fn a_save_writes_verbatim_and_answers_at_the_new_address() {
 /// conflict an author never resolved cannot put a domain on the queue.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
+    // The scratch state directory is one per process, so an earlier test's
+    // write outlives that test: start from no state at all, which makes
+    // "nothing is pending yet" a claim about this test rather than about the
+    // order the binary happened to run in. Done after the fixture, never
+    // before: the redirection has to be in place, or the removal would reach
+    // the developer's own state directory.
+    std::fs::remove_file(fx.state.maintenance_path()).ok();
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
     let before = crystalline_service::maintenance::load();
     assert!(
         !before.pending_domains.contains(&"eng".to_string()),
-        "nothing is pending before the first write"
+        "nothing is pending before the first write: {:?} at {}",
+        before.pending_domains,
+        fx.state.maintenance_path().display()
     );
 
     // A stale token: refused, and nothing recorded.
@@ -512,6 +536,9 @@ async fn a_human_save_marks_its_domain_pending_for_the_sweep() {
 /// would fail on the order they happened to run in.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_human_create_marks_its_domain_pending_for_the_sweep() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -550,6 +577,9 @@ async fn a_human_create_marks_its_domain_pending_for_the_sweep() {
 /// authoring, and the sweep wants to see what the retirement left dangling.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_human_retire_marks_its_domain_pending_for_the_sweep() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -598,6 +628,9 @@ async fn a_human_retire_marks_its_domain_pending_for_the_sweep() {
 /// flood of human edits is exactly the one that is not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_archive_import_does_not_mark_its_domain_pending() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let admin = login(fx.addr, "root", "rootpw").await;
     let before = crystalline_service::maintenance::load();
@@ -645,6 +678,10 @@ async fn an_archive_import_does_not_mark_its_domain_pending() {
 /// is a trap an author only finds after making their edit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_body_past_the_limit_is_refused_with_413() {
+    // The second leg of this test saves successfully, which marks `eng`
+    // pending, so it belongs to the serialized set even though it is not a
+    // maintenance test. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     let (etag, content) = read_alpha(fx.addr, &editor).await;
@@ -987,6 +1024,9 @@ async fn a_read_only_instance_refuses_before_the_precondition_check() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retire_move_and_delete_run_through_their_endpoints() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
 
@@ -1093,6 +1133,9 @@ async fn retire_move_and_delete_run_through_their_endpoints() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options::default()).await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     // Manifest saves are admin, not editor (spec section 5: MANIFEST editing
@@ -1293,6 +1336,9 @@ async fn serve_with_a_virtual_domain() -> Fixture {
 /// one on disk.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_round_trip_holds_for_a_virtual_domain() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve_with_a_virtual_domain().await;
     let editor = login(fx.addr, "eddy", "eddypw").await;
     // Reads stay open to any account; the save below is admin-only.
@@ -1390,6 +1436,9 @@ async fn validate_reports_findings_without_writing() {
 /// the route.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_proxy_identity_writes_once_it_is_an_editor_carrying_its_token() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     let fx = serve(Options {
         trusted_header: Some("remote-user"),
         ..Options::default()
@@ -1754,6 +1803,40 @@ fn write_ops() -> Vec<WriteOp> {
             body: None,
             admin_only: true,
         },
+        // The attachment bytes, in this order so the delete row has something
+        // to remove. Editor writes rather than admin ones: attaching a file to
+        // an engram is content editing, and the same role that writes the
+        // markdown referencing it writes the file.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/files/assets/matrix.png",
+            body: Some(serde_json::json!("bytes")),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/files/assets/matrix.png",
+            body: None,
+            admin_only: false,
+        },
+        // The acknowledgment pair: editor writes, because ruling a finding
+        // intentional is a judgment about content rather than about the
+        // deployment. Their allowed legs answer 404 by the time this matrix
+        // runs (an earlier row moved `alpha` out from under them), which is
+        // exactly the "anything but 401/403" this asserts while changing
+        // nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/evolve/ack",
+            body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/evolve/ack",
+            body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
+            admin_only: false,
+        },
         // Last among the domain rows, and no later row targets `scrap`: this
         // one unregisters it.
         WriteOp {
@@ -1842,6 +1925,9 @@ fn request_for(
 /// preconditions).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_write_matrix_holds_on_every_route() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
     // Plain instance: role and CSRF rows.
     let fx = serve(Options::default()).await;
     let admin = login(fx.addr, "root", "rootpw").await;
@@ -1955,6 +2041,12 @@ async fn the_write_matrix_holds_on_every_route() {
 /// two user-admin targets - so a fixed per-segment substitution is enough;
 /// nothing here needs to be a general router.
 fn canonicalize(path: &str) -> String {
+    // The attachment routes take a wildcard rather than a segment: everything
+    // after `files/` is the one `{path}` parameter, however many slashes it
+    // holds, so it collapses before the per-segment pass runs over the head.
+    if let Some((head, _)) = path.split_once("/files/") {
+        return format!("{}/files/{{path}}", canonicalize(head));
+    }
     path.split('/')
         .map(|segment| match segment {
             "eng" | "scrap" => "{domain}",

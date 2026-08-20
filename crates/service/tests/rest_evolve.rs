@@ -54,8 +54,11 @@ fn yesterday() -> chrono::NaiveDate {
 /// claimed looks like.
 fn engram(title: &str, permalink: &str, generated_by: Option<&str>, body: &str) -> String {
     let day = yesterday();
+    // The flow form Crystalline's own emitter writes, so an edit that refreshes
+    // the provenance line (every write does) rewrites one line rather than
+    // orphaning an indented block.
     let generated = generated_by
-        .map(|by| format!("generated:\n  by: \"{by}\"\n  at: {day}T09:12:00+00:00\n"))
+        .map(|by| format!("generated: {{ by: \"{by}\", at: {day}T09:12:00+00:00 }}\n"))
         .unwrap_or_default();
     format!(
         "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - reference\nstatus: stable\nrecorded_at: {day}\n{generated}---\n\n{body}"
@@ -432,4 +435,288 @@ async fn viewing_the_queue_never_counts_as_a_run() {
         state.last_run_at.is_none(),
         "nothing here counts as a sweep having run"
     );
+}
+
+/// Log in, returning (session cookie value, CSRF token): the pair a browser
+/// carries on every write.
+async fn login_session(addr: std::net::SocketAddr, name: &str, password: &str) -> (String, String) {
+    let resp = client()
+        .post(format!("http://{addr}/api/v1/auth/login"))
+        .json(&serde_json::json!({ "name": name, "password": password }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "login as {name} must succeed");
+    let cookie = resp
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|v| v.starts_with("fluid_session="))
+        .and_then(|v| v.split(';').next())
+        .and_then(|v| v.strip_prefix("fluid_session="))
+        .unwrap()
+        .to_string();
+    let body: serde_json::Value = resp.json().await.unwrap();
+    (cookie, body["csrf"].as_str().unwrap().to_string())
+}
+
+/// A request to the ack endpoint carrying a session and its token.
+fn ack_request(
+    addr: std::net::SocketAddr,
+    method: reqwest::Method,
+    session: &(String, String),
+    body: serde_json::Value,
+) -> reqwest::RequestBuilder {
+    client()
+        .request(
+            method,
+            format!("http://{addr}/api/v1/domains/eng/evolve/ack"),
+        )
+        .header("cookie", format!("fluid_session={}", session.0))
+        .header("x-csrf-token", &session.1)
+        .json(&body)
+}
+
+/// The queue read with a session, for a closed instance.
+async fn queue_as(
+    addr: std::net::SocketAddr,
+    session: &(String, String),
+    query: &str,
+) -> serde_json::Value {
+    let resp = client()
+        .get(format!("http://{addr}/api/v1/evolve{query}"))
+        .header("cookie", format!("fluid_session={}", session.0))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "GET /api/v1/evolve{query}");
+    resp.json().await.unwrap()
+}
+
+/// The round trip a person makes on the maintenance page: acknowledge a
+/// finding, watch it leave the queue counted, see it again under the audit
+/// toggle, then un-acknowledge it and watch it come back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn acknowledging_removes_a_finding_and_withdrawing_brings_it_back() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    let session = login_session(fixture.addr, "ada", "s3cret").await;
+
+    let before = queue_as(fixture.addr, &session, "").await;
+    assert!(
+        rows(&before)
+            .iter()
+            .any(|r| r["permalink"] == "human-capture" && r["rule"] == "V006"),
+        "{before}"
+    );
+    assert_eq!(before["acknowledged"]["total"], 0);
+
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "note": "the responder's own words, reviewed offline"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let entry: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{entry}");
+    assert_eq!(entry["rule"], "V006");
+    assert_eq!(entry["by"], "human:ada", "the session user acknowledged it");
+    assert_eq!(entry["note"], "the responder's own words, reviewed offline");
+    assert!(entry["at"].as_str().unwrap().contains('T'), "{entry}");
+
+    let after = queue_as(fixture.addr, &session, "").await;
+    assert!(
+        !rows(&after)
+            .iter()
+            .any(|r| r["permalink"] == "human-capture" && r["rule"] == "V006"),
+        "{after}"
+    );
+    assert_eq!(after["acknowledged"]["total"], 1);
+    assert_eq!(after["acknowledged"]["by_family"]["temporal"], 1);
+
+    let audited = queue_as(fixture.addr, &session, "?include_acknowledged=true").await;
+    let row = rows(&audited)
+        .iter()
+        .find(|r| r["permalink"] == "human-capture" && r["rule"] == "V006")
+        .expect("the audit view returns what it suppressed");
+    assert_eq!(row["acknowledged"], true);
+    assert_eq!(
+        row["ack_note"],
+        "the responder's own words, reviewed offline"
+    );
+
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::DELETE,
+        &session,
+        serde_json::json!({ "permalink": "human-capture", "rule": "V006" }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 204);
+
+    let back = queue_as(fixture.addr, &session, "").await;
+    assert!(
+        rows(&back)
+            .iter()
+            .any(|r| r["permalink"] == "human-capture" && r["rule"] == "V006"),
+        "{back}"
+    );
+    assert_eq!(back["acknowledged"]["total"], 0);
+
+    // Withdrawing again says so rather than reporting a removal that did not
+    // happen.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::DELETE,
+        &session,
+        serde_json::json!({ "permalink": "human-capture", "rule": "V006" }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// The write matrix the endpoint is held to: identity, role, CSRF, and the two
+/// ways a body can be wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_ack_endpoint_holds_the_write_rules() {
+    let fixture = serve(Options::default()).await;
+    for (name, role) in [("ada", Role::Editor), ("view", Role::Viewer)] {
+        fixture
+            .auth
+            .add_user(name, name, None, role, "s3cret")
+            .await
+            .unwrap();
+    }
+    let body = serde_json::json!({ "permalink": "human-capture", "rule": "V006" });
+
+    // No identity at all.
+    let resp = client()
+        .post(format!(
+            "http://{}/api/v1/domains/eng/evolve/ack",
+            fixture.addr
+        ))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401);
+
+    // A viewer never writes.
+    let viewer = login_session(fixture.addr, "view", "s3cret").await;
+    let resp = ack_request(fixture.addr, reqwest::Method::POST, &viewer, body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    let editor = login_session(fixture.addr, "ada", "s3cret").await;
+
+    // A session without its CSRF token is a cross-site request.
+    let resp = client()
+        .post(format!(
+            "http://{}/api/v1/domains/eng/evolve/ack",
+            fixture.addr
+        ))
+        .header("cookie", format!("fluid_session={}", editor.0))
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+
+    // A rule the catalog does not hold.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &editor,
+        serde_json::json!({ "permalink": "human-capture", "rule": "V999" }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+
+    // An engram nobody has.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &editor,
+        serde_json::json!({ "permalink": "not-a-thing", "rule": "V006" }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 404);
+
+    // A domain nobody registered.
+    let resp = client()
+        .post(format!(
+            "http://{}/api/v1/domains/nope/evolve/ack",
+            fixture.addr
+        ))
+        .header("cookie", format!("fluid_session={}", editor.0))
+        .header("x-csrf-token", &editor.1)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 404);
+}
+
+/// The note arrives straight off the wire, so the HTTP boundary is where a
+/// pasted multi-line justification - or a crafted `\n---\n` - would reach the
+/// frontmatter. It is folded to one line, and the engram it lands in stays
+/// readable: the queue still counts the engram rather than reporting it
+/// unparsed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_multi_line_note_never_breaks_the_engram_it_lands_in() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    let session = login_session(fixture.addr, "ada", "s3cret").await;
+
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "note": "reviewed offline\n---\ntype: injected\nstatus: evil"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 200);
+    let entry: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        entry["note"], "reviewed offline --- type: injected status: evil",
+        "the note is folded to one line of prose"
+    );
+
+    let body = queue_as(fixture.addr, &session, "").await;
+    assert_eq!(body["unparsed"], 0, "the engram is still readable: {body}");
+    assert_eq!(body["acknowledged"]["total"], 1);
 }

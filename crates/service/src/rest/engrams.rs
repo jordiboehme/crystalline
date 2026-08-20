@@ -27,7 +27,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::header::ETAG;
+use axum::http::header::{CACHE_CONTROL, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -36,8 +36,8 @@ use utoipa::IntoParams;
 
 use super::auth::Identity;
 use super::{
-    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, RestState, csv, if_match,
-    precondition_failed,
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
+    csv, if_match, if_none_match_matches, precondition_failed,
 };
 use crate::engine::EngineError;
 use crate::params::{
@@ -236,7 +236,12 @@ pub async fn list(
     description = "Its frontmatter, its markdown as written and the references \
                    the engine resolves around it.\n\nThe response carries an \
                    `ETag` over the markdown, so a client knows which version it \
-                   is holding and can say so when it later writes back.",
+                   is holding and can say so when it later writes back. \
+                   `If-None-Match` naming the current checksum answers 304 with \
+                   no body, and `Cache-Control: no-cache` on both the 200 and \
+                   the 304 keeps a stored copy revalidating instead of going \
+                   heuristically fresh, so a save elsewhere is picked up on its \
+                   next use.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (
@@ -246,15 +251,26 @@ pub async fn list(
                            segment may contain slashes: `notes/deep/gamma`.",
             example = "notes/deep/gamma",
         ),
+        (
+            "If-None-Match" = Option<String>,
+            Header,
+            description = "The quoted checksum of a version already held. A \
+                           match answers 304 with no body.",
+            example = "\"3f8a1c05e2\"",
+        ),
     ),
     responses(
         (
             status = 200,
             description = "The engine's own read payload, unchanged.",
             body = Object,
-            headers(("etag" = String, description = "The quoted checksum of the \
-                     engram as read, the same token a later write compares an \
-                     `expected_checksum` against.")),
+            headers(
+                ("etag" = String, description = "The quoted checksum of the \
+                 engram as read, the same token a later write compares an \
+                 `expected_checksum` against."),
+                ("cache-control" = String, description = "Always `no-cache`: \
+                 store it, but revalidate before every use."),
+            ),
             example = json!({
                 "domain": "eng",
                 "permalink": "alpha",
@@ -270,6 +286,12 @@ pub async fn list(
                 "relations": [],
                 "links": []
             }),
+        ),
+        (
+            status = 304,
+            description = "`If-None-Match` names the current checksum; no body \
+                           is sent. Carries the `ETag` it matched and the same \
+                           `Cache-Control`.",
         ),
         (
             status = 401,
@@ -293,6 +315,7 @@ pub async fn list(
 )]
 pub async fn detail(
     State(state): State<RestState>,
+    headers: HeaderMap,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
     let value = state
@@ -302,9 +325,24 @@ pub async fn detail(
             domain: Some(domain),
         })
         .await?;
+    let checksum = checksum_of(&value)?.to_string();
+    if if_none_match_matches(&headers, &checksum) {
+        // The validator and `Cache-Control`, no body: the shape is stated
+        // once, on `if_none_match_matches`.
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (ETAG, etag(&value)?),
+                (CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+            ],
+        )
+            .into_response());
+    }
     let etag = etag(&value)?;
     let mut resp = Json(value).into_response();
     resp.headers_mut().insert(ETAG, etag);
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
     Ok(resp)
 }
 
@@ -1524,11 +1562,19 @@ async fn detail_response(
 /// `checksum` from a read; it guards against a future contract break, loudly,
 /// rather than letting an engram be served without a version.
 fn etag(value: &Value) -> Result<HeaderValue, ApiError> {
-    let checksum = value["checksum"].as_str().ok_or_else(|| {
-        ApiError::internal("the engram read carried no checksum to version it by")
-    })?;
+    let checksum = checksum_of(value)?;
     HeaderValue::from_str(&format!("\"{checksum}\""))
         .map_err(|_| ApiError::internal("the engram's checksum is not a usable ETag"))
+}
+
+/// The raw checksum an engram read carries, unquoted: what [`etag`] wraps into
+/// a header, and what a conditional read's `If-None-Match` compares against.
+/// Split out from `etag` because the detail route needs the bare token for the
+/// comparison as well as the quoted header.
+fn checksum_of(value: &Value) -> Result<&str, ApiError> {
+    value["checksum"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal("the engram read carried no checksum to version it by"))
 }
 
 #[cfg(test)]

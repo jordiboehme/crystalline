@@ -7,10 +7,10 @@ use chrono::{DateTime, FixedOffset};
 use common::{fixtures_dir, read};
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
-    remove_frontmatter_field, replace_section, set_frontmatter_field, set_frontmatter_number,
-    set_stale_after, set_verified, touch_generated,
+    remove_frontmatter_field, replace_section, set_evolve_ack, set_frontmatter_field,
+    set_frontmatter_number, set_stale_after, set_verified, touch_generated,
 };
-use crystalline_core::{Verified, parse_engram};
+use crystalline_core::{EvolveAck, Verified, parse_engram};
 
 fn nested_headings() -> String {
     read(&fixtures_dir().join("canonical/nested-headings.md"))
@@ -176,6 +176,85 @@ body
 }
 
 #[test]
+fn touch_generated_replaces_a_block_form_generated_mapping() {
+    // A person (or another tool) spelled the provenance as a block mapping,
+    // which is what YAML invites and what the parser reads back happily. The
+    // refresh has to take the indented continuation lines with the key line:
+    // a flow scalar left sitting above an orphaned block is not YAML, and the
+    // engram would stop parsing on the way to disk.
+    let source = "---
+type: engram
+title: Hand written
+permalink: hand-written
+generated:
+  by: human:jordi
+  at: 2026-01-01T00:00:00+00:00
+status: stable
+---
+
+Body.
+";
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(source, "claude-code/1.0.5", now);
+    let e = parse_engram(&out).expect("the refreshed engram still parses");
+    let g = e.frontmatter.generated.unwrap();
+    assert_eq!(g.by, "claude-code/1.0.5");
+    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-02T10:00:00+00:00");
+    // The old block is gone rather than orphaned, and its neighbours stayed put.
+    assert!(!out.contains("human:jordi"), "{out}");
+    assert!(!out.contains("2026-01-01T00:00:00+00:00"), "{out}");
+    assert_eq!(out.matches("generated:").count(), 1, "{out}");
+    assert!(out.contains("title: Hand written"), "{out}");
+    assert!(out.contains("status: stable"), "{out}");
+    assert!(out.ends_with("---\n\nBody.\n"), "{out}");
+}
+
+#[test]
+fn touch_generated_replaces_a_block_form_generated_at_the_end_of_the_frontmatter() {
+    // The same shape with nothing after it: the continuation lines are the last
+    // lines of the block, so the closing delimiter is what ends the value.
+    let source = "---
+type: engram
+title: Last key
+generated:
+  by: human:jordi
+---
+
+Body.
+";
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(source, "new/2", now);
+    let e = parse_engram(&out).expect("the refreshed engram still parses");
+    assert_eq!(e.frontmatter.generated.unwrap().by, "new/2");
+    assert!(!out.contains("human:jordi"), "{out}");
+}
+
+#[test]
+fn set_stale_after_replaces_a_hand_written_multiline_bound() {
+    // `review_after:` with the date on its own indented line is valid YAML and
+    // reads back as the same scalar. Migrating it must not leave the date
+    // stranded under the new key.
+    let source = "---
+type: engram
+title: Hand written bound
+review_after:
+  2026-08-01
+status: stable
+---
+
+Body.
+";
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let out = set_stale_after(source, date);
+    let e = parse_engram(&out).expect("the edited engram still parses");
+    assert_eq!(e.frontmatter.stale_on().unwrap().to_string(), "2026-12-01");
+    assert!(!out.contains("2026-08-01"), "{out}");
+    assert!(out.contains("status: stable"), "{out}");
+}
+
+#[test]
 fn set_stale_after_migrates_a_legacy_review_after_line_in_place() {
     // A file written before the `stale_after` migration carries `review_after`.
     // Setting the bound swaps that one line and leaves every other byte,
@@ -329,4 +408,181 @@ fn set_frontmatter_field_quotes_ambiguous_values() {
     // The value is an ambiguous scalar and must be quoted so it stays a string.
     let e = parse_engram(&out).unwrap();
     assert_eq!(e.frontmatter.status.as_deref(), Some("true"));
+}
+
+// --- evolve_ack --------------------------------------------------------------
+
+fn ack(rule: &str, scope: Option<&str>, note: Option<&str>) -> EvolveAck {
+    EvolveAck {
+        rule: rule.to_string(),
+        scope: scope.map(str::to_string),
+        note: note.map(str::to_string),
+        by: "human:jordi".to_string(),
+        at: DateTime::parse_from_rfc3339("2026-08-20T09:00:00+00:00").ok(),
+    }
+}
+
+/// An engram carrying acknowledgments parses, emits and parses again with the
+/// list intact - the round trip the frontmatter convention rests on.
+#[test]
+fn evolve_ack_round_trips_through_the_frontmatter() {
+    let source = "---\ntitle: Lineage\ntype: engram\nstatus: stable\n---\n\nBody.\n";
+    let entries = vec![
+        ack(
+            "V101",
+            Some("eng/old-runbook"),
+            Some("lineage citation, keep"),
+        ),
+        ack("V007", None, None),
+    ];
+    let out = set_evolve_ack(source, &entries);
+    assert!(out.contains("evolve_ack:\n- { rule: V101"), "{out}");
+    assert!(out.contains("scope: eng/old-runbook"), "{out}");
+    assert!(out.contains("note: \"lineage citation, keep\""), "{out}");
+    assert!(out.contains("by: human:jordi"), "{out}");
+    assert!(out.contains("Body."), "{out}");
+
+    let engram = parse_engram(&out).expect("an engram with acknowledgments parses");
+    let value = engram
+        .frontmatter
+        .extra
+        .get("evolve_ack")
+        .expect("the key survives into extra");
+    assert_eq!(EvolveAck::parse_list(value), entries);
+}
+
+/// One entry stays on the key's own line, and replacing the list replaces the
+/// whole block rather than orphaning the old sequence.
+#[test]
+fn a_single_ack_is_one_line_and_a_rewrite_replaces_the_block() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let one = set_evolve_ack(source, &[ack("V101", Some("eng/old"), None)]);
+    assert!(
+        one.contains("evolve_ack: { rule: V101, scope: eng/old, by: human:jordi"),
+        "{one}"
+    );
+
+    let two = set_evolve_ack(
+        &one,
+        &[ack("V101", Some("eng/old"), None), ack("V104", None, None)],
+    );
+    assert_eq!(two.matches("rule: V101").count(), 1, "{two}");
+    assert!(two.contains("rule: V104"), "{two}");
+    assert!(two.contains("status: stable"), "{two}");
+
+    let back = set_evolve_ack(&two, &[ack("V104", None, None)]);
+    assert!(!back.contains("V101"), "{back}");
+    assert_eq!(back.matches("evolve_ack").count(), 1, "{back}");
+}
+
+/// Withdrawing the last acknowledgment removes the key and its continuation
+/// lines, leaving every other byte alone.
+#[test]
+fn an_empty_ack_list_removes_the_key_whole() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let two = set_evolve_ack(source, &[ack("V101", None, None), ack("V104", None, None)]);
+    let cleared = set_evolve_ack(&two, &[]);
+    assert_eq!(cleared, source, "the source is byte-identical again");
+}
+
+/// A hand-written entry survives its neighbours being malformed, and an entry
+/// with no rule is skipped rather than failing the read.
+#[test]
+fn malformed_ack_entries_are_skipped_never_an_error() {
+    let source = "---\ntitle: Lineage\nstatus: stable\nevolve_ack:\n- { note: no rule here }\n- { rule: V101, note: keep }\n- just a string\n---\n\nBody.\n";
+    let engram = parse_engram(source).expect("a malformed entry never breaks the parse");
+    let parsed = EvolveAck::parse_list(
+        engram
+            .frontmatter
+            .extra
+            .get("evolve_ack")
+            .expect("the key is there"),
+    );
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].rule, "V101");
+    assert_eq!(parsed[0].note.as_deref(), Some("keep"));
+    assert_eq!(parsed[0].scope, None);
+    assert_eq!(parsed[0].by, "");
+}
+
+/// A note a human pasted out of a chat window carries newlines. The emitted
+/// frontmatter has to stay one line per entry and keep parsing - both on the
+/// first write and on the rewrite that a re-acknowledgment performs.
+#[test]
+fn a_note_with_newlines_stays_one_line_and_the_engram_still_parses() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let hostile = "first line\n---\ntype: injected\nstatus: evil";
+    let out = set_evolve_ack(
+        source,
+        &[EvolveAck {
+            rule: "V101".to_string(),
+            scope: None,
+            note: Some(hostile.to_string()),
+            by: "human:jordi".to_string(),
+            at: None,
+        }],
+    );
+    assert!(
+        !out.lines().any(|l| l.trim() == "---"
+            && !l.is_empty()
+            && out.lines().filter(|x| x.trim() == "---").count() > 2),
+        "the note must not open a second frontmatter block: {out}"
+    );
+    let engram = parse_engram(&out).expect("a note with newlines still parses");
+    assert_eq!(engram.frontmatter.title, "Lineage");
+    let parsed = EvolveAck::parse_list(
+        engram
+            .frontmatter
+            .extra
+            .get("evolve_ack")
+            .expect("the key is there"),
+    );
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(
+        parsed[0].note.as_deref(),
+        Some(hostile),
+        "the text round-trips through the escape"
+    );
+
+    // The rewrite a re-acknowledgment performs: the old entry must be replaced
+    // whole rather than leaving an orphaned continuation line behind.
+    let again = set_evolve_ack(
+        &out,
+        &[
+            EvolveAck {
+                rule: "V101".to_string(),
+                scope: None,
+                note: Some(hostile.to_string()),
+                by: "human:jordi".to_string(),
+                at: None,
+            },
+            ack("V104", None, Some("second")),
+        ],
+    );
+    let engram = parse_engram(&again).expect("the rewrite parses too");
+    assert_eq!(
+        EvolveAck::parse_list(engram.frontmatter.extra.get("evolve_ack").unwrap()).len(),
+        2
+    );
+}
+
+/// Every control character a flow scalar can carry is escaped, so one entry is
+/// always exactly one line whoever supplied the text - the `verified` actor
+/// included.
+#[test]
+fn a_verified_actor_with_a_newline_stays_one_line() {
+    let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
+    let out = set_verified(
+        source,
+        &[Verified {
+            by: "human:jordi\nstatus: evil".to_string(),
+            at: None,
+        }],
+    );
+    parse_engram(&out).expect("a hostile actor never breaks the frontmatter");
+    assert_eq!(
+        out.lines().filter(|l| l.trim() == "---").count(),
+        2,
+        "{out}"
+    );
 }

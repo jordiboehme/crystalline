@@ -60,6 +60,10 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/domains/{domain}/archive",
     "POST /api/v1/domains/{domain}/archive/preview",
     "POST /api/v1/domains/{domain}/archive/import",
+    "GET /api/v1/domains/{domain}/attachments",
+    "GET /api/v1/domains/{domain}/files/{path}",
+    "PUT /api/v1/domains/{domain}/files/{path}",
+    "DELETE /api/v1/domains/{domain}/files/{path}",
     "GET /api/v1/domains/{domain}/tree",
     "GET /api/v1/domains/{domain}/manifest",
     "PUT /api/v1/domains/{domain}/manifest",
@@ -79,6 +83,8 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/activity",
     "GET /api/v1/graph",
     "GET /api/v1/evolve",
+    "POST /api/v1/domains/{domain}/evolve/ack",
+    "DELETE /api/v1/domains/{domain}/evolve/ack",
     "GET /api/v1/users",
     "POST /api/v1/users",
     "PATCH /api/v1/users/{name}",
@@ -847,6 +853,24 @@ impl ScratchStateDir {
     pub fn maintenance_path(&self) -> std::path::PathBuf {
         crystalline_service::maintenance::path().unwrap()
     }
+}
+
+/// Serializes the tests that assert over the *whole* maintenance state file.
+///
+/// [`ScratchStateDir`] redirects one home per process, so every test in a
+/// binary shares one `maintenance.json`. Under `cargo nextest` each test owns
+/// its process and that is invisible; under plain `cargo test` - this repo's
+/// canonical fallback - the tests of one binary are threads, and an assertion
+/// like "the file did not change" or "the backlog is empty" is only true while
+/// nothing else is writing. A test that can phrase its claim as "the list
+/// gained my domain" needs no lock and should not take one; a test that needs
+/// exclusivity takes this and holds the guard for its duration.
+///
+/// A tokio mutex rather than a `std` one because the guard is held across
+/// `await` points by design.
+pub async fn maintenance_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    LOCK.lock().await
 }
 
 impl Drop for ScratchStateDir {

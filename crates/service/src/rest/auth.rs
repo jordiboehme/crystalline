@@ -1351,49 +1351,58 @@ mod tests {
     /// version that runs the dummy on top of a real check, which costs an
     /// existing account two and an unknown one - the same oracle, inverted.
     /// Counting every verification is what pins the balance.
+    ///
+    /// The counting runs inside a task-local scope, so the verifications a
+    /// sibling test is running in the same process at the same moment (plain
+    /// `cargo test` runs them as threads) never land in this test's total.
     #[tokio::test]
     async fn one_argon2_verification_per_login_attempt() {
-        let (_dir, store) = store().await;
-        store
-            .add_user("ada", "Ada", None, Role::Editor, "s3cret")
-            .await
-            .unwrap();
-        // Provisioned by a trusted header, so it has no password at all.
-        store
-            .ensure_user("bob", Role::Viewer, usize::MAX)
-            .await
-            .unwrap();
-        store
-            .add_user("cyd", "Cyd", None, Role::Editor, "pw")
-            .await
-            .unwrap();
-        store.set_disabled("cyd", true).await.unwrap();
-        let slots = Semaphore::new(LOGIN_SLOTS);
+        auth_store::VERIFICATIONS
+            .scope(std::cell::Cell::new(0), async {
+                let (_dir, store) = store().await;
+                store
+                    .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+                    .await
+                    .unwrap();
+                // Provisioned by a trusted header, so it has no password at all.
+                store
+                    .ensure_user("bob", Role::Viewer, usize::MAX)
+                    .await
+                    .unwrap();
+                store
+                    .add_user("cyd", "Cyd", None, Role::Editor, "pw")
+                    .await
+                    .unwrap();
+                store.set_disabled("cyd", true).await.unwrap();
+                let slots = Semaphore::new(LOGIN_SLOTS);
 
-        // An unknown name, a passwordless account, a disabled account, a name
-        // that will not normalize, a wrong password, and the right one.
-        for (name, password, expected) in [
-            ("ghost", "s3cret", None),
-            ("bob", "", None),
-            ("cyd", "pw", None),
-            ("   ", "s3cret", None),
-            ("ada", "wrong", None),
-            ("AdA", "s3cret", Some("ada")),
-        ] {
-            let before = auth_store::VERIFICATIONS.load(Ordering::Relaxed);
-            let got = authenticate(&store, &slots, name, password).await.unwrap();
-            assert_eq!(
-                got.map(|u| u.name).as_deref(),
-                expected,
-                "wrong outcome for {name:?}"
-            );
-            assert_eq!(
-                auth_store::VERIFICATIONS.load(Ordering::Relaxed) - before,
-                1,
-                "logging in as {name:?} must cost exactly one verification, \
-                 or how long it takes says which kind of miss it was"
-            );
-        }
+                // An unknown name, a passwordless account, a disabled account, a
+                // name that will not normalize, a wrong password, and the right
+                // one.
+                for (name, password, expected) in [
+                    ("ghost", "s3cret", None),
+                    ("bob", "", None),
+                    ("cyd", "pw", None),
+                    ("   ", "s3cret", None),
+                    ("ada", "wrong", None),
+                    ("AdA", "s3cret", Some("ada")),
+                ] {
+                    let before = auth_store::VERIFICATIONS.with(|count| count.get());
+                    let got = authenticate(&store, &slots, name, password).await.unwrap();
+                    assert_eq!(
+                        got.map(|u| u.name).as_deref(),
+                        expected,
+                        "wrong outcome for {name:?}"
+                    );
+                    assert_eq!(
+                        auth_store::VERIFICATIONS.with(|count| count.get()) - before,
+                        1,
+                        "logging in as {name:?} must cost exactly one verification, \
+                         or how long it takes says which kind of miss it was"
+                    );
+                }
+            })
+            .await;
     }
 
     /// The memory cap: however many logins arrive at once, only [`LOGIN_SLOTS`]

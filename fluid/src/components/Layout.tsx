@@ -20,7 +20,6 @@
 
 import { useQuery } from "@tanstack/react-query";
 import {
-  Gem,
   House,
   Moon,
   PanelLeft,
@@ -68,6 +67,7 @@ import { CreateDomainDialog } from "./CreateDomainDialog";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
+import { ShatterGem } from "./ShatterGem";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 import { BUTTON, Chip, FOCUS_RING, IconButton, Tooltip } from "./primitives";
 
@@ -346,12 +346,7 @@ function TopBar({
           to="/"
           className={`flex items-center gap-1.5 rounded text-lg font-semibold tracking-tight hover:opacity-80 ${FOCUS_RING}`}
         >
-          <Gem
-            aria-hidden="true"
-            size={18}
-            strokeWidth={1.75}
-            className="text-accent-600 dark:text-accent-400"
-          />
+          <ShatterGem />
           Fluid
         </Link>
 

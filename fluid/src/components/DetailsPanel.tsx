@@ -26,6 +26,7 @@ import { Link } from "react-router";
 import type { EngramFrontmatter, VerifiedEntry } from "../api/engram";
 import { formatActor, formatDay } from "../format";
 import { tagRoute } from "../paths";
+import { AttachmentsSection } from "./AttachmentsSection";
 import { Chip, FOCUS_RING, IconButton, statusVariant } from "./primitives";
 
 /** How long the copy outcome stays announced. */
@@ -35,74 +36,101 @@ export interface DetailsPanelProps {
   frontmatter: EngramFrontmatter;
   /** The engram's `crystalline://` address, which is what it is called. */
   address: string;
+  /**
+   * The domain and the body, for the attachments the engram carries with it.
+   * Both or neither: an attachment path is domain-relative and the body is
+   * what says which ones this engram references, so a caller without both has
+   * no list to draw. A screen with nothing to say about files - a preview, a
+   * test - simply leaves them out.
+   */
+  domain?: string;
+  body?: string;
+  /** Whether this session may remove a file. A reader is offered no control. */
+  canDelete?: boolean;
 }
 
-export function DetailsPanel({ frontmatter, address }: DetailsPanelProps) {
+export function DetailsPanel({
+  frontmatter,
+  address,
+  domain,
+  body,
+  canDelete = false,
+}: DetailsPanelProps) {
   const { type, status, tags, salience, verified, generatedBy } = frontmatter;
   const validity = validityOf(frontmatter);
   const stamp = latestVerification(verified);
 
   return (
-    <section aria-label="Details" className="text-sm">
-      <h2 className="mb-3 text-caption font-semibold text-slate-500 dark:text-slate-400">
-        Details
-      </h2>
-      <dl className="flex flex-col divide-y divide-slate-100 dark:divide-slate-800">
-        {status !== null && (
-          <Row label="Status">
-            <Chip variant={statusVariant(status)}>{status}</Chip>
-          </Row>
-        )}
-        {type !== null && (
-          <Row label="Type">
-            <Chip>{type}</Chip>
-          </Row>
-        )}
-        {tags.length > 0 && (
-          <Row label="Tags">
-            <span className="flex flex-wrap gap-1">
-              {tags.map((tag) => (
-                <Link
-                  key={tag}
-                  to={tagRoute(tag)}
-                  className={`rounded ${FOCUS_RING}`}
-                >
-                  <Chip variant="accent">#{tag}</Chip>
-                </Link>
-              ))}
+    <>
+      <section aria-label="Details" className="text-sm">
+        <h2 className="mb-3 text-caption font-semibold text-slate-500 dark:text-slate-400">
+          Details
+        </h2>
+        <dl className="flex flex-col divide-y divide-slate-100 dark:divide-slate-800">
+          {status !== null && (
+            <Row label="Status">
+              <Chip variant={statusVariant(status)}>{status}</Chip>
+            </Row>
+          )}
+          {type !== null && (
+            <Row label="Type">
+              <Chip>{type}</Chip>
+            </Row>
+          )}
+          {tags.length > 0 && (
+            <Row label="Tags">
+              <span className="flex flex-wrap gap-1">
+                {tags.map((tag) => (
+                  <Link
+                    key={tag}
+                    to={tagRoute(tag)}
+                    className={`rounded ${FOCUS_RING}`}
+                  >
+                    <Chip variant="accent">#{tag}</Chip>
+                  </Link>
+                ))}
+              </span>
+            </Row>
+          )}
+          {salience !== null && (
+            <Row label="Salience">
+              <span className="tabular-nums">{salience}</span>
+            </Row>
+          )}
+          {validity !== null && (
+            <Row label="Valid">
+              <span className="tabular-nums">{validity}</span>
+            </Row>
+          )}
+          {generatedBy !== null && (
+            <Row label="Captured by">
+              <span>{formatActor(generatedBy)}</span>
+            </Row>
+          )}
+          {stamp !== null && (
+            <Row label="Verified">
+              <span>{stamp}</span>
+            </Row>
+          )}
+          <Row label="Address">
+            <span className="flex min-w-0 items-center gap-1">
+              <code className="truncate font-mono text-caption" title={address}>
+                {address}
+              </code>
+              <CopyAddress address={address} />
             </span>
           </Row>
-        )}
-        {salience !== null && (
-          <Row label="Salience">
-            <span className="tabular-nums">{salience}</span>
-          </Row>
-        )}
-        {validity !== null && (
-          <Row label="Valid">
-            <span className="tabular-nums">{validity}</span>
-          </Row>
-        )}
-        {generatedBy !== null && (
-          <Row label="Captured by">
-            <span>{formatActor(generatedBy)}</span>
-          </Row>
-        )}
-        {stamp !== null && (
-          <Row label="Verified">
-            <span>{stamp}</span>
-          </Row>
-        )}
-        <Row label="Address">
-          <span className="flex min-w-0 items-center gap-1">
-            <code className="truncate font-mono text-caption" title={address}>
-              {address}
-            </code>
-            <CopyAddress address={address} />
-          </span>
-        </Row>
-      </dl>
-    </section>
+        </dl>
+      </section>
+      {/*
+        Its own region under the fields rather than a row among them: what an
+        engram carries with it is a list of things a reader opens, not another
+        value the frontmatter states.
+      */}
+      {domain !== undefined && body !== undefined && (
+        <AttachmentsSection domain={domain} body={body} canDelete={canDelete} />
+      )}
+    </>
   );
 }
 

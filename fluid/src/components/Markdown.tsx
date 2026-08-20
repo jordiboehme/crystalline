@@ -35,23 +35,56 @@ export interface MarkdownProps {
    * the screen says it once; absent, every heading in the document is drawn.
    */
   foldTitle?: string;
+  /**
+   * The domain this document lives in. It is what a relative `assets/` target
+   * resolves against - an attachment path is domain-relative and means nothing
+   * without one - so a caller that knows says so, and one that does not leaves
+   * such targets as the text they were written as.
+   */
+  domain?: string;
 }
 
-export function Markdown({ source, wikilinks, foldTitle }: MarkdownProps) {
+export function Markdown({
+  source,
+  wikilinks,
+  foldTitle,
+  domain,
+}: MarkdownProps) {
   return (
     <Suspense
       fallback={
         // Deliberately quiet rather than the raw source: the chunk is one
-        // request and showing unrendered markdown first would flash.
-        <p className="py-3 text-sm text-slate-500 dark:text-slate-400">
-          Rendering
-        </p>
+        // request and showing unrendered markdown first would flash. The
+        // gem facet-fills, and a sketch of the incoming prose hardens from
+        // amorphous shade blocks to solid ones: crystallization, literally.
+        <div className="py-3 font-mono text-sm text-slate-500 dark:text-slate-400">
+          <p className="flex items-center gap-2">
+            <span aria-hidden className="gem-cycle inline-grid">
+              <span>{"◇"}</span>
+              <span>{"◈"}</span>
+              <span>{"◆"}</span>
+            </span>
+            crystallizing
+            <span aria-hidden className="crystal-cursor">
+              {"▌"}
+            </span>
+          </p>
+          <div aria-hidden className="mt-2 select-none text-xs opacity-60">
+            {[46, 42, 27].map((n) => (
+              <span key={n} className="crystal-line">
+                {"░".repeat(n)}
+                <span className="solid">{"▓".repeat(n)}</span>
+              </span>
+            ))}
+          </div>
+        </div>
       }
     >
       <MarkdownBody
         source={source}
         {...(wikilinks ? { wikilinks } : {})}
         {...(foldTitle === undefined ? {} : { foldTitle })}
+        {...(domain === undefined ? {} : { domain })}
       />
     </Suspense>
   );

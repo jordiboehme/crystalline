@@ -1,15 +1,21 @@
 /**
- * Maintenance: what the knowledge needs next, read-only.
+ * Maintenance: what the knowledge needs next.
  *
  * The screen is a report rather than a workbench, and everything pinned here
  * follows from that. The queue arrives ranked and is drawn under the catalog's
  * own three families, so a reader sees the shape of the backlog rather than a
- * flat hundred rows. Every finding names the engram it fired on and links
- * there, because the only thing to do about a finding is to go and read the
- * engram. A judgment finding says so on its face: it is a question for a
- * person, never a change to apply. And an empty queue is good news, so it is
- * never dressed as a failure - the one thing on this screen that must never
- * wear an alert.
+ * flat hundred rows. A finding names the engram it fired on and links there,
+ * because the usual thing to do about one is to go and read the engram - and a
+ * finding with no engram behind it says its subject in plain text instead,
+ * rather than being dropped and counted. A judgment finding says what it is on
+ * its face: a question for a person, never a change to apply. And an empty
+ * queue is good news, so it is never dressed as a failure - the one thing on
+ * this screen that must never wear an alert.
+ *
+ * The writes it does offer are pinned to the same rule. Looking records
+ * nothing: acknowledging, un-acknowledging and deleting an orphaned attachment
+ * each go out on a press and on nothing else, and what an acknowledgment
+ * silences is counted under the queue whether or not anybody asks to see it.
  */
 
 import { screen, waitFor, within } from "@testing-library/react";
@@ -17,6 +23,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ApiProblem, api } from "../api/client";
+import { defined } from "../test/assert";
 import type { Answer } from "../test/harness";
 import {
   answersFor,
@@ -100,10 +107,108 @@ function evolvePayload(overrides: Record<string, unknown> = {}) {
       { rule: "V101", instruction: "Repoint it at the successor." },
       { rule: "V201", instruction: "Merge into the richest one." },
     ],
+    acknowledged: {
+      total: 0,
+      by_family: { temporal: 0, structure: 0, redundancy: 0 },
+    },
     guidance: "This queue changes nothing by itself.",
     truncations: [],
     ...overrides,
   };
+}
+
+/** An orphaned attachment: the subject is the file, so there is no engram. */
+function orphanFinding() {
+  return {
+    n: 4,
+    priority: 55,
+    rule: "V108",
+    class: "judgment",
+    domain: "eng",
+    permalink: "",
+    title: "assets/2026/08/orphan.png",
+    line: null,
+    finding: "no engram references or claims this attachment",
+    evidence: "12 KiB, image/png; no engram references or claims it",
+    fix: "delete assets/2026/08/orphan.png or analyze it into an engram",
+  };
+}
+
+/** A sweep whose structure family holds an anchorless finding as well. */
+function orphanPayload() {
+  const base = evolvePayload();
+  return evolvePayload({
+    total: 4,
+    count: 4,
+    families: [
+      { family: "temporal", findings: 1 },
+      { family: "structure", findings: 2 },
+      { family: "redundancy", findings: 1 },
+    ],
+    queue: [...base.queue, orphanFinding()],
+    actions: [
+      ...base.actions,
+      { rule: "V108", instruction: "Delete it, or analyze it into an engram." },
+    ],
+  });
+}
+
+/** One acknowledgment holding a finding out of the queue. */
+function suppressedPayload() {
+  return evolvePayload({
+    acknowledged: {
+      total: 1,
+      by_family: { temporal: 0, structure: 1, redundancy: 0 },
+    },
+  });
+}
+
+/** The same sweep, asked for the silenced finding as well. */
+function includingSuppressedPayload() {
+  const base = evolvePayload();
+  return evolvePayload({
+    total: 4,
+    count: 4,
+    families: [
+      { family: "temporal", findings: 1 },
+      { family: "structure", findings: 2 },
+      { family: "redundancy", findings: 1 },
+    ],
+    queue: [
+      ...base.queue,
+      {
+        n: 4,
+        priority: 45,
+        rule: "V104",
+        class: "mechanical",
+        domain: "eng",
+        permalink: "beta",
+        title: "Beta",
+        line: null,
+        finding: "orphan",
+        evidence: "no inbound or outbound reference",
+        fix: "link it into the neighbourhood its tags suggest",
+        acknowledged: true,
+        ack_note: "a deliberate island",
+      },
+    ],
+    acknowledged: {
+      total: 1,
+      by_family: { temporal: 0, structure: 1, redundancy: 0 },
+    },
+  });
+}
+
+/** A sweep whose acknowledgment was given for evidence that has since moved. */
+function stalePayload() {
+  const base = evolvePayload();
+  return evolvePayload({
+    queue: base.queue.map((finding) =>
+      finding.rule === "V101"
+        ? { ...finding, ack_stale: true, ack_note: "lineage citation, keep" }
+        : finding,
+    ),
+  });
 }
 
 /**
@@ -176,6 +281,24 @@ function section(name: RegExp): Promise<HTMLElement> {
 /** The findings of a section. */
 function rows(region: HTMLElement): HTMLElement[] {
   return within(region).getAllByRole("listitem");
+}
+
+/** The JSON body a write went out with. */
+function sentBody(init: RequestInit | undefined): unknown {
+  const body = init?.body;
+  if (typeof body !== "string") {
+    throw new Error("expected the write to carry a JSON body");
+  }
+  return JSON.parse(body) as unknown;
+}
+
+/** The finding row a piece of its text sits in. */
+function rowOf(text: HTMLElement): HTMLElement {
+  const row = text.closest("li");
+  if (row === null) {
+    throw new Error("expected that text to sit inside a finding row");
+  }
+  return row;
 }
 
 /** The domain filter. */
@@ -378,6 +501,393 @@ describe("the maintenance screen", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "this account may not sweep",
     );
+  });
+});
+
+/**
+ * A finding that names no engram.
+ *
+ * Several rules are about a domain rather than about any one engram - an
+ * orphaned attachment, a drifted tag vocabulary - and they arrive with an
+ * empty permalink. They used to be counted and never drawn, which is a queue
+ * that says four and shows three. The subject is still shown, as the plain
+ * text it is: a link to an engram that does not exist would be the very thing
+ * the finding is about.
+ */
+describe("a finding with no engram behind it", () => {
+  it("names its subject in plain text rather than as a link", async () => {
+    await open({ "/evolve": orphanPayload });
+
+    const structure = await section(/^Structure/);
+    const [, orphan] = rows(structure);
+
+    expect(orphan).toHaveTextContent("assets/2026/08/orphan.png");
+    expect(
+      within(structure).queryByRole("link", {
+        name: "assets/2026/08/orphan.png",
+      }),
+    ).toBeNull();
+    // Counted and drawn: the tally and the rows agree.
+    expect(
+      await screen.findByText(
+        "42 engrams swept, 4 findings. Temporal 1, Structure 2, Redundancy 1.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("offers no acknowledgment, because there is nowhere to record one", async () => {
+    await open({ "/evolve": orphanPayload });
+
+    const [, orphan] = rows(await section(/^Structure/));
+
+    // An acknowledgment lives in an engram's frontmatter. This finding has no
+    // engram, so the action would be a button with nowhere to write.
+    expect(
+      within(defined(orphan, "the orphan row")).queryByRole("button", {
+        name: /acknowledge/i,
+      }),
+    ).toBeNull();
+  });
+
+  it("deletes an orphaned attachment once the file has been named", async () => {
+    const removals: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": orphanPayload,
+      "/domains/eng/files/assets/2026/08/orphan.png": (_path, init) => {
+        removals.push(init);
+        return undefined;
+      },
+    });
+    const before = sweeps().length;
+    const orphan = defined(
+      rows(await section(/^Structure/))[1],
+      "the orphan row",
+    );
+
+    await userEvent.click(
+      within(orphan).getByRole("button", { name: "Delete attachment" }),
+    );
+
+    // The confirm names the file, because deleting bytes is irreversible.
+    expect(orphan).toHaveTextContent(/Delete assets\/2026\/08\/orphan\.png\?/);
+
+    await userEvent.click(
+      within(orphan).getByRole("button", { name: "Delete" }),
+    );
+
+    await waitFor(() => {
+      expect(removals).toHaveLength(1);
+    });
+    expect(removals[0]?.method).toBe("DELETE");
+    // The exact path the sweep named, read off the row's own field rather than
+    // off whatever the row is drawn with.
+    expect(
+      requested().filter((path) => path.startsWith("/domains/eng/files/")),
+    ).toEqual(["/domains/eng/files/assets/2026/08/orphan.png"]);
+    // The queue it was drawn from is stale the moment the file is gone.
+    await waitFor(() => {
+      expect(sweeps().length).toBeGreaterThan(before);
+    });
+  });
+
+  it("offers no delete for an orphan row that names no path", async () => {
+    // The display title has a fallback chain - it ends at the domain name -
+    // and the delete deliberately has none. A row with no path names no file,
+    // so the irreversible action is simply not there rather than aimed at
+    // `eng` because that is what the heading says.
+    const pathless = { ...orphanFinding() };
+    delete (pathless as { title?: string }).title;
+    const base = evolvePayload();
+    await open({
+      "/evolve": () =>
+        evolvePayload({
+          total: 4,
+          count: 4,
+          families: [
+            { family: "temporal", findings: 1 },
+            { family: "structure", findings: 2 },
+            { family: "redundancy", findings: 1 },
+          ],
+          queue: [...base.queue, pathless],
+        }),
+    });
+
+    const orphan = defined(
+      rows(await section(/^Structure/))[1],
+      "the orphan row",
+    );
+    expect(orphan).toHaveTextContent("eng");
+    expect(
+      within(orphan).queryByRole("button", { name: "Delete attachment" }),
+    ).toBeNull();
+  });
+
+  it("asks before it deletes, and takes no for an answer", async () => {
+    const removals: unknown[] = [];
+    await open({
+      "/evolve": orphanPayload,
+      "/domains/eng/files/assets/2026/08/orphan.png": () => {
+        removals.push(true);
+        return undefined;
+      },
+    });
+    const orphan = defined(
+      rows(await section(/^Structure/))[1],
+      "the orphan row",
+    );
+
+    await userEvent.click(
+      within(orphan).getByRole("button", { name: "Delete attachment" }),
+    );
+    await userEvent.click(
+      within(orphan).getByRole("button", { name: "Cancel" }),
+    );
+
+    expect(removals).toEqual([]);
+    expect(
+      within(orphan).getByRole("button", { name: "Delete attachment" }),
+    ).toBeVisible();
+  });
+});
+
+/**
+ * Acknowledging: ruling a finding intentional so future sweeps stop raising
+ * it, without the queue ever shrinking quietly.
+ *
+ * Viewing still records nothing. Every write on this screen is a button
+ * somebody pressed, and what those writes silence is said out loud underneath
+ * the queue with a way to look at it.
+ */
+describe("acknowledging a finding", () => {
+  it("posts the engram, the rule and the note somebody typed, then sweeps again", async () => {
+    const acks: (RequestInit | undefined)[] = [];
+    await open({
+      "/domains/eng/evolve/ack": (_path, init) => {
+        acks.push(init);
+        return undefined;
+      },
+    });
+    const before = sweeps().length;
+    const row = defined(rows(await section(/^Temporal/))[0], "the first row");
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await userEvent.type(
+      within(row).getByLabelText(/why is this intentional/i),
+      "the lineage citation is deliberate",
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(acks).toHaveLength(1);
+    });
+    expect(sentBody(acks[0])).toEqual({
+      permalink: "notes/old-way",
+      rule: "V005",
+      note: "the lineage citation is deliberate",
+    });
+    expect(acks[0]?.method).toBe("POST");
+    await waitFor(() => {
+      expect(sweeps().length).toBeGreaterThan(before);
+    });
+  });
+
+  it("takes an acknowledgment with no note at all", async () => {
+    const acks: (RequestInit | undefined)[] = [];
+    await open({
+      "/domains/eng/evolve/ack": (_path, init) => {
+        acks.push(init);
+        return undefined;
+      },
+    });
+    const row = defined(rows(await section(/^Temporal/))[0], "the first row");
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(acks).toHaveLength(1);
+    });
+    expect(sentBody(acks[0])).toEqual({
+      permalink: "notes/old-way",
+      rule: "V005",
+    });
+  });
+
+  it("says the server's own words when an acknowledgment is refused", async () => {
+    await open({
+      "/domains/eng/evolve/ack": () => {
+        throw new ApiProblem(403, "forbidden", "this instance is read only");
+      },
+    });
+    const row = defined(rows(await section(/^Temporal/))[0], "the first row");
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+
+    expect(await within(row).findByRole("alert")).toHaveTextContent(
+      "this instance is read only",
+    );
+  });
+
+  it("offers a reader nothing to press", async () => {
+    await open({
+      "/auth/me": () => meResponse({ user: userFixture({ role: "viewer" }) }),
+    });
+    await section(/^Temporal/);
+
+    // The server would refuse it, and a button that only ever fails is worse
+    // than no button.
+    expect(screen.queryByRole("button", { name: /acknowledge/i })).toBeNull();
+  });
+});
+
+/**
+ * What the acknowledgments silenced: a number under the queue, and a way to
+ * look at what it stands for.
+ */
+describe("the acknowledged findings", () => {
+  it("says nothing at all when nothing is silenced", async () => {
+    await open();
+    await section(/^Temporal/);
+
+    expect(screen.queryByText(/staying quiet/i)).toBeNull();
+  });
+
+  it("counts what is staying quiet, and shows it on request", async () => {
+    await open({
+      "/evolve": (path) =>
+        path.includes("include_acknowledged=true")
+          ? includingSuppressedPayload()
+          : suppressedPayload(),
+    });
+
+    expect(
+      await screen.findByText("1 acknowledged finding is staying quiet."),
+    ).toBeVisible();
+    // Nothing is fetched to say it: the count rides the ordinary sweep.
+    expect(sweeps().some((path) => path.includes("include_acknowledged"))).toBe(
+      false,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Show them" }));
+
+    await waitFor(() => {
+      expect(
+        sweeps().some((path) => path.includes("include_acknowledged=true")),
+      ).toBe(true);
+    });
+    const structure = await section(/^Structure/);
+    const row = rowOf(await within(structure).findByText("Beta"));
+    expect(row).toHaveTextContent("a deliberate island");
+    expect(
+      within(row).getByRole("button", { name: "Unacknowledge" }),
+    ).toBeVisible();
+    // The tally counts what is drawn, and everything is drawn: no prefix.
+    expect(
+      await screen.findByText(
+        "42 engrams swept, 4 findings. Temporal 1, Structure 2, Redundancy 1.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("takes an acknowledgment back and sweeps again", async () => {
+    const removals: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": (path) =>
+        path.includes("include_acknowledged=true")
+          ? includingSuppressedPayload()
+          : suppressedPayload(),
+      "/domains/eng/evolve/ack": (_path, init) => {
+        removals.push(init);
+        return undefined;
+      },
+    });
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Show them" }),
+    );
+    const row = rowOf(await screen.findByText("Beta"));
+    const before = sweeps().length;
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Unacknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(removals).toHaveLength(1);
+    });
+    expect(removals[0]?.method).toBe("DELETE");
+    expect(sentBody(removals[0])).toEqual({
+      permalink: "beta",
+      rule: "V104",
+    });
+    await waitFor(() => {
+      expect(sweeps().length).toBeGreaterThan(before);
+    });
+  });
+});
+
+/**
+ * An acknowledgment given for evidence that has since changed.
+ *
+ * It is neither silenced nor forgotten: the finding comes back saying that
+ * somebody ruled it intentional and that the thing they ruled on has moved.
+ */
+describe("an acknowledgment that no longer matches", () => {
+  it("says so on the finding, with the note it was given with", async () => {
+    await open({ "/evolve": stalePayload });
+
+    const row = defined(rows(await section(/^Structure/))[0], "the stale row");
+
+    expect(row).toHaveTextContent(
+      /acknowledged earlier, but the evidence changed/i,
+    );
+    expect(row).toHaveTextContent("lineage citation, keep");
+  });
+
+  it("offers re-acknowledging as the action, which is the same write", async () => {
+    const acks: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": stalePayload,
+      "/domains/eng/evolve/ack": (_path, init) => {
+        acks.push(init);
+        return undefined;
+      },
+    });
+    const row = defined(rows(await section(/^Structure/))[0], "the stale row");
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Re-acknowledge" }),
+    );
+    // The note it was given with is the note to keep or to correct, so it is
+    // offered rather than asked for again.
+    expect(within(row).getByLabelText(/why is this intentional/i)).toHaveValue(
+      "lineage citation, keep",
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Re-acknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(acks).toHaveLength(1);
+    });
+    expect(acks[0]?.method).toBe("POST");
+    expect(sentBody(acks[0])).toEqual({
+      permalink: "alpha",
+      rule: "V101",
+      note: "lineage citation, keep",
+    });
   });
 });
 

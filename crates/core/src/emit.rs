@@ -12,7 +12,9 @@
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::engram::{Engram, Frontmatter, Generated, SchemaDef, Verified};
+use crate::engram::{
+    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, SchemaDef, Verified,
+};
 use crate::parse::{locate, parse_heading};
 
 /// The stand-in scalar the `generated` key carries through YAML serialization,
@@ -108,6 +110,14 @@ fn verified_flow(v: &Verified) -> String {
 /// no meaning in flow context (so no whitespace, quote or flow punctuation)
 /// and neither opens nor closes with a character a parser would read as an
 /// indicator.
+///
+/// A quoted value is escaped so it can never leave its own line. That is what
+/// keeps free text safe here: a raw newline inside a double-quoted YAML scalar
+/// is legal YAML, but this frontmatter is delimited by `---` lines that are
+/// found before any YAML parser sees them, so a note carrying `\n---\n` would
+/// end the block early and leave an engram nothing can read. Every C0 control
+/// character is therefore escaped rather than only the two YAML indicators, and
+/// the value still round-trips: a parser reads `\n` back as the newline it was.
 fn flow_scalar(value: &str) -> String {
     let plain = !value.is_empty()
         && value.chars().all(|c| {
@@ -119,7 +129,22 @@ fn flow_scalar(value: &str) -> String {
     if plain {
         return value.to_string();
     }
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    let mut escaped = String::with_capacity(value.len() + 2);
+    for c in value.chars() {
+        match c {
+            '\\' => escaped.push_str("\\\\"),
+            '"' => escaped.push_str("\\\""),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            // The rest of C0 plus DEL: rare in prose, illegal or invisible in a
+            // scalar, and written as the hex escape a YAML parser reads back.
+            c if (c as u32) < 0x20 || c == '\u{7f}' => {
+                escaped.push_str(&format!("\\x{:02x}", c as u32));
+            }
+            c => escaped.push(c),
+        }
+    }
     format!("\"{escaped}\"")
 }
 
@@ -342,18 +367,80 @@ pub fn set_verified(source: &str, entries: &[Verified]) -> String {
     set_frontmatter_block(source, "verified", verified_block(entries))
 }
 
+/// Record the acknowledged findings in the original source: replace the
+/// `evolve_ack` value with `entries`, leaving every other byte untouched. An
+/// empty `entries` removes the key, which is how the last acknowledgment is
+/// withdrawn.
+///
+/// Shaped like [`set_verified`]: one entry on the key's own line as a flow
+/// mapping, several as a block sequence, so the frontmatter stays as readable
+/// by hand as it is meant to be edited by hand.
+pub fn set_evolve_ack(source: &str, entries: &[EvolveAck]) -> String {
+    if entries.is_empty() {
+        return remove_frontmatter_block(source, EVOLVE_ACK_KEY);
+    }
+    set_frontmatter_block(source, EVOLVE_ACK_KEY, evolve_ack_block(entries))
+}
+
+fn evolve_ack_block(entries: &[EvolveAck]) -> String {
+    if let [only] = entries {
+        return format!("{EVOLVE_ACK_KEY}: {}", evolve_ack_flow(only));
+    }
+    let mut out = format!("{EVOLVE_ACK_KEY}:");
+    for entry in entries {
+        out.push_str(&format!("\n- {}", evolve_ack_flow(entry)));
+    }
+    out
+}
+
+/// Render one `evolve_ack` entry as a flow mapping, without the key. The
+/// optional halves are written only when they carry something, so a scope-less
+/// hand-written entry reads back the way it was written.
+fn evolve_ack_flow(ack: &EvolveAck) -> String {
+    let mut out = format!("{{ rule: {}", flow_scalar(&ack.rule));
+    if let Some(scope) = ack.scope.as_deref().filter(|s| !s.is_empty()) {
+        out.push_str(&format!(", scope: {}", flow_scalar(scope)));
+    }
+    if let Some(note) = ack.note.as_deref().filter(|n| !n.is_empty()) {
+        out.push_str(&format!(", note: {}", flow_scalar(note)));
+    }
+    out.push_str(&format!(", by: {}", flow_scalar(&ack.by)));
+    if let Some(at) = ack.at {
+        out.push_str(&format!(", at: {}", flow_scalar(&at.to_rfc3339())));
+    }
+    out.push_str(" }");
+    out
+}
+
 /// Replace the frontmatter value of `key` with `new_block`, which may span
 /// several lines and carries the key itself. Continuation lines belonging to
 /// the old value - a block sequence item or an indented nested mapping - are
 /// removed with the key line. Appends when the key is absent and creates a
 /// frontmatter block when the source has none.
 fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
+    set_frontmatter_block_line(source, &[key], new_block)
+}
+
+/// Replace the first frontmatter key among `keys` with `new_block`, taking the
+/// old value's continuation lines with it. The block-shaped counterpart of
+/// [`set_frontmatter_line`]: the keys are tried in order, so a caller can name
+/// a canonical key first and a legacy spelling second and have the legacy line
+/// rewritten in place, while a value that was written as a block mapping or a
+/// block sequence is replaced whole rather than beheaded.
+fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) -> String {
     let (has_fm, fm_span, _body_start) = locate(source);
     if !has_fm {
         return format!("---\n{new_block}\n---\n{source}");
     }
 
     let raw = &source[fm_span.clone()];
+    // Which key actually appears decides which value is rewritten, so a file
+    // carrying both the canonical and the legacy spelling has the canonical one
+    // updated whatever order they sit in.
+    let target = keys.iter().copied().find(|k| {
+        raw.split_inclusive('\n')
+            .any(|l| line_sets_key(l.strip_suffix('\n').unwrap_or(l), k))
+    });
     let mut new_raw = String::with_capacity(raw.len() + new_block.len());
     // 0: the key has not been seen; 1: it was just replaced and continuation
     // lines are being dropped; 2: the old value is fully behind us.
@@ -361,7 +448,7 @@ fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
     for line in raw.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
         match phase {
-            0 if line_sets_key(content, key) => {
+            0 if target.is_some_and(|k| line_sets_key(content, k)) => {
                 new_raw.push_str(&new_block);
                 new_raw.push('\n');
                 phase = 1;
@@ -380,6 +467,44 @@ fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
         }
         new_raw.push_str(&new_block);
         new_raw.push('\n');
+    }
+    format!(
+        "{}{}{}",
+        &source[..fm_span.start],
+        new_raw,
+        &source[fm_span.end..]
+    )
+}
+
+/// Remove a frontmatter key whose value may span several lines, the
+/// counterpart of [`set_frontmatter_block`]. The key line and every
+/// continuation line under it go together, so nothing is orphaned. A no-op when
+/// the key or the frontmatter block is absent.
+fn remove_frontmatter_block(source: &str, key: &str) -> String {
+    let (has_fm, fm_span, _body_start) = locate(source);
+    if !has_fm {
+        return source.to_string();
+    }
+
+    let raw = &source[fm_span.clone()];
+    let mut new_raw = String::with_capacity(raw.len());
+    // 0: the key has not been seen; 1: it was dropped and continuation lines
+    // are going with it; 2: the old value is fully behind us.
+    let mut phase = 0u8;
+    for line in raw.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        match phase {
+            0 if line_sets_key(content, key) => phase = 1,
+            1 if is_value_continuation(content) => {}
+            1 => {
+                phase = 2;
+                new_raw.push_str(line);
+            }
+            _ => new_raw.push_str(line),
+        }
+    }
+    if phase == 0 {
+        return source.to_string();
     }
     format!(
         "{}{}{}",
@@ -442,12 +567,20 @@ pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
 /// block migrates here, lazily: the `timestamp` line is replaced in place by
 /// the `generated` line, so a file only ever changes shape when it is actually
 /// edited and the frontmatter keeps its original order.
+///
+/// The replacement is block-aware, which matters because this runs on every
+/// edit of every engram, hand-written ones included: a person may well have
+/// spelled the provenance as a block mapping (`generated:` on its own line with
+/// `by:` and `at:` indented under it). Replacing only the key line would leave
+/// the flow mapping above two orphaned indented lines - not YAML, so the engram
+/// would stop parsing and go invisible to the sweep, to reads and to search.
+/// The old value goes whole, whatever shape it was written in.
 pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) -> String {
     let line = generated_flow(&Generated {
         by: actor.to_string(),
         at: Some(now),
     });
-    set_frontmatter_line(source, &["generated", "timestamp"], line)
+    set_frontmatter_block_line(source, &["generated", "timestamp"], line)
 }
 
 /// Set the staleness bound in the original source, leaving every other byte
@@ -457,9 +590,13 @@ pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) ->
 /// lazily: that one line is replaced by the `stale_after` line, so a file only
 /// ever changes shape when it is actually edited and the frontmatter keeps its
 /// original order.
+///
+/// Block-aware for the same reason [`touch_generated`] is: a hand-written bound
+/// may sit on its own indented line under the key, and stranding it there would
+/// cost the engram its parse.
 pub fn set_stale_after(source: &str, date: NaiveDate) -> String {
     let line = format!("stale_after: {}", date.format("%Y-%m-%d"));
-    set_frontmatter_line(source, &["stale_after", "review_after"], line)
+    set_frontmatter_block_line(source, &["stale_after", "review_after"], line)
 }
 
 fn format_scalar_line(key: &str, value: &str) -> String {

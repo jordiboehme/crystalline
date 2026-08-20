@@ -109,7 +109,11 @@ async fn domain_files_serves_manifest_and_engrams_verbatim() {
     assert!(paths.contains(&"MANIFEST.md"), "{paths:?}");
     assert!(paths.contains(&"alpha.md"));
     let alpha = files.iter().find(|(p, _)| p == "alpha.md").unwrap();
-    assert_eq!(alpha.1, ALPHA, "exact bytes, not a re-serialization");
+    assert_eq!(
+        alpha.1,
+        ALPHA.as_bytes(),
+        "exact bytes, not a re-serialization"
+    );
     assert!(engine.domain_files("ghost").await.is_err());
 }
 
@@ -128,7 +132,55 @@ async fn domain_files_reads_a_virtual_domain_from_the_database() {
 
     let files = engine.domain_files("scratch").await.unwrap();
     let alpha = files.iter().find(|(p, _)| p == "alpha.md").unwrap();
-    assert_eq!(alpha.1, ALPHA, "exact bytes for the database-backed kind");
+    assert_eq!(
+        alpha.1,
+        ALPHA.as_bytes(),
+        "exact bytes for the database-backed kind"
+    );
+}
+
+/// A PNG stand-in: it never has to decode, only to travel unchanged, so it is
+/// a short blob carrying the NUL a text-shaped collection would lose.
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00binary\x00bytes";
+
+/// The archive source carries attachments too, for both storage kinds, and an
+/// export materializes them as real files: the collection is bytes rather than
+/// text precisely so a binary can travel in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn domain_files_carries_attachments_of_both_kinds() {
+    // An attachment write marks its domain pending in the maintenance state
+    // file, which lives under the state directory: redirect it.
+    let _state = support::ScratchStateDir::acquire();
+    let (_tmp, engine) = engine().await;
+    engine.domain_add_virtual("scratch").await.unwrap();
+    engine
+        .attachment_write("eng", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    engine
+        .attachment_write("scratch", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    for domain in ["eng", "scratch"] {
+        let files = engine.domain_files(domain).await.unwrap();
+        let shot = files
+            .iter()
+            .find(|(p, _)| p == "assets/shot.png")
+            .unwrap_or_else(|| panic!("no attachment in the {domain} collection"));
+        assert_eq!(shot.1, PNG, "the attachment travels byte for byte");
+    }
+
+    // And an export writes it out as the file it is.
+    let dest = tempfile::tempdir().unwrap();
+    engine
+        .export_domain("eng", dest.path(), true, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::read(dest.path().join("assets/shot.png")).unwrap(),
+        PNG
+    );
 }
 
 /// `domain export` of a FILE domain copies the domain, it does not

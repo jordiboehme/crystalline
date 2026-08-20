@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 
+use crate::attachment::ASSETS_PREFIX;
 use crate::engram::LinkTarget;
 
 /// The address scheme prefix.
@@ -101,6 +102,20 @@ impl CrystallineUrl {
         } else {
             format!("{SCHEME}{}/{}", self.domain, self.permalink)
         }
+    }
+
+    /// The attachment path this address names, when it names one: a non-glob
+    /// address whose permalink sits under the reserved `assets/` prefix.
+    ///
+    /// Consumer sites branch on this instead of testing the prefix by hand, so
+    /// the reserved prefix has one spelling.
+    pub fn asset_path(&self) -> Option<&str> {
+        if self.glob {
+            return None;
+        }
+        self.permalink
+            .starts_with(ASSETS_PREFIX)
+            .then_some(self.permalink.as_str())
     }
 
     /// Whether a candidate `(domain, permalink)` is matched by this address.

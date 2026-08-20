@@ -9,7 +9,7 @@
 
 use axum::Json;
 use axum::extract::State;
-use axum::http::header::ETAG;
+use axum::http::header::{CACHE_CONTROL, ETAG};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
@@ -18,8 +18,8 @@ use utoipa::IntoParams;
 
 use super::auth::Identity;
 use super::{
-    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, RestState, if_match,
-    precondition_failed,
+    ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
+    if_match, if_none_match_matches, precondition_failed,
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
@@ -219,21 +219,44 @@ pub async fn tree(
     description = "The source, not a reduction of it, so a client can render \
                    or edit it directly.\n\nThe response carries an `ETag` \
                    over the markdown, the same strong validator a later \
-                   `PUT` compares an `If-Match` against.",
-    params(("domain" = String, Path, description = "The registered domain.")),
+                   `PUT` compares an `If-Match` against. `If-None-Match` \
+                   naming the current checksum answers 304 with no body, and \
+                   `Cache-Control: no-cache` on both the 200 and the 304 keeps \
+                   a stored copy revalidating instead of going heuristically \
+                   fresh, so a save elsewhere is picked up on its next use.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        (
+            "If-None-Match" = Option<String>,
+            Header,
+            description = "The quoted checksum of a version already held. A \
+                           match answers 304 with no body.",
+            example = "\"3f8a1c05e2\"",
+        ),
+    ),
     responses(
         (
             status = 200,
             description = "The manifest source beside the domain it belongs to.",
             body = Object,
-            headers(("etag" = String, description = "The quoted checksum of \
-                     the manifest as read, the token a later `PUT` carries \
-                     in `If-Match`.")),
+            headers(
+                ("etag" = String, description = "The quoted checksum of \
+                 the manifest as read, the token a later `PUT` carries \
+                 in `If-Match`."),
+                ("cache-control" = String, description = "Always `no-cache`: \
+                 store it, but revalidate before every use."),
+            ),
             example = json!({
                 "domain": "eng",
                 "markdown": "---\ntitle: eng\n---\n\n## When to Use\n\n- Route here for eng questions.\n",
                 "checksum": "3f8a1c05e2"
             }),
+        ),
+        (
+            status = 304,
+            description = "`If-None-Match` names the current checksum; no body \
+                           is sent. Carries the `ETag` it matched and the same \
+                           `Cache-Control`.",
         ),
         (
             status = 401,
@@ -257,10 +280,29 @@ pub async fn tree(
 )]
 pub async fn manifest(
     State(state): State<RestState>,
+    headers: HeaderMap,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Response, ApiError> {
     let markdown = state.engine.manifest_markdown(&domain).await?;
-    manifest_response(&domain, markdown, StatusCode::OK)
+    let checksum = manifest_checksum(&markdown);
+    if if_none_match_matches(&headers, &checksum) {
+        let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
+            .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
+        // The validator and `Cache-Control`, no body: the shape is stated
+        // once, on `if_none_match_matches`.
+        return Ok((
+            StatusCode::NOT_MODIFIED,
+            [
+                (ETAG, etag),
+                (CACHE_CONTROL, HeaderValue::from_static(REVALIDATE)),
+            ],
+        )
+            .into_response());
+    }
+    let mut resp = manifest_response(&domain, markdown, StatusCode::OK)?;
+    resp.headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(REVALIDATE));
+    Ok(resp)
 }
 
 /// What `PUT /domains/{domain}/manifest` takes: the complete MANIFEST source.
