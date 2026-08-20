@@ -3031,8 +3031,10 @@ impl Engine {
             "path": desc.path,
             "operation": p.operation,
         });
-        if let Some(entry) = &ack {
-            response["evolve_ack"] = ack_json(entry);
+        match &ack {
+            Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
+            Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
+            None => {}
         }
         Ok(response)
     }
@@ -3140,7 +3142,7 @@ impl Engine {
         p: &EditParams,
         permalink: &str,
         actor: &str,
-        ack: Option<&EvolveAck>,
+        ack: Option<&AckDraft>,
     ) -> Result<String> {
         Ok(match p.operation.as_str() {
             "append" => append_body(source, self.require_content(p)?),
@@ -3184,7 +3186,7 @@ impl Engine {
                 let section = self.require_section(p)?;
                 insert_after_section(source, section, content).map_err(section_err)?
             }
-            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor, ack)?,
+            "set_frontmatter" => Self::apply_set_frontmatter(source, p, permalink, actor, ack)?,
             other => {
                 return Err(EngineError::Invalid(format!(
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
@@ -3204,8 +3206,9 @@ impl Engine {
     fn apply_set_frontmatter(
         source: &str,
         p: &EditParams,
+        permalink: &str,
         actor: &str,
-        ack: Option<&EvolveAck>,
+        ack: Option<&AckDraft>,
     ) -> Result<String> {
         let key = p
             .key
@@ -3310,14 +3313,28 @@ impl Engine {
                 Ok(set_verified(source, &entries))
             }
             EVOLVE_ACK_KEY => {
-                // The entry was completed before the lock (see
-                // `Engine::ack_draft`), because its scope is the sweep's
+                // The draft was completed before the lock (see
+                // `Engine::ack_draft`), because a record's scope is the sweep's
                 // verdict about this engram and no text edit can know it.
-                let entry = ack.ok_or_else(|| {
+                let draft = ack.ok_or_else(|| {
                     EngineError::Invalid(format!(
                         "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
                     ))
                 })?;
+                let entry = match draft {
+                    AckDraft::Record(entry) => entry,
+                    // A removal reads the entries the file holds right now,
+                    // under the lock, so a concurrent acknowledgment is either
+                    // fully there or not there at all when it filters.
+                    AckDraft::Remove(rule) => {
+                        if !has_ack(source, rule) {
+                            return Err(EngineError::Invalid(format!(
+                                "no acknowledgment for {rule} on '{permalink}'; nothing to remove"
+                            )));
+                        }
+                        return Ok(without_ack(source, rule));
+                    }
+                };
                 // An engram whose frontmatter no longer parses would have its
                 // existing entries read as none, and this would write a second
                 // `evolve_ack` key beside the one already there - compounding a
@@ -5368,42 +5385,57 @@ impl Engine {
 
     // --- acknowledgments -----------------------------------------------------
 
-    /// The acknowledgment an `evolve_ack` assignment is asking for, completed
-    /// with the scope only the sweep can supply, or `None` when this edit is
-    /// not one.
+    /// What an `evolve_ack` assignment asks for, or `None` when this edit is
+    /// not one. Pure and public, so a surface can put the act to a user before
+    /// it happens without the engine having to guess at the wording.
     ///
     /// The value is the rule id optionally followed by a note, split at the
     /// first whitespace: `V101` or `V101 lineage citation, keep`. The rule has
     /// to be one the catalog knows, because an acknowledgment of a rule that
     /// does not exist can never suppress anything and silently storing it would
-    /// read as work done.
-    ///
-    /// The scope is the firing finding's, and its absence is meaningful: a rule
-    /// that is not currently firing for this engram is acknowledged scope-less,
-    /// which matches whatever it finds later. That is the honest reading of
-    /// "acknowledge this before it appears".
-    async fn ack_draft(
-        &self,
-        p: &EditParams,
-        desc: &EngramDescriptor,
-        actor: &str,
-    ) -> Result<Option<EvolveAck>> {
+    /// read as work done. `remove V101` takes an entry back instead of
+    /// recording one (see [`parse_ack_value`]).
+    pub fn ack_intent(p: &EditParams) -> Result<Option<AckIntent>> {
         if p.operation != "set_frontmatter"
             || p.key.as_deref().map(str::trim) != Some(EVOLVE_ACK_KEY)
         {
             return Ok(None);
         }
         let raw = p.value.as_deref().map(str::trim).unwrap_or_default();
-        let (rule, note) = parse_ack_value(raw)?;
-        Ok(Some(EvolveAck {
-            scope: self
-                .firing_scope(&desc.domain, &desc.permalink, &rule)
-                .await?,
-            rule,
-            note,
-            by: actor.to_string(),
-            at: Some(now_offset()),
-        }))
+        parse_ack_value(raw).map(Some)
+    }
+
+    /// The acknowledgment an `evolve_ack` assignment is asking for, completed
+    /// with the scope only the sweep can supply, or `None` when this edit is
+    /// not one.
+    ///
+    /// The scope is the firing finding's, and its absence is meaningful: a rule
+    /// that is not currently firing for this engram is acknowledged scope-less,
+    /// which matches whatever it finds later. That is the honest reading of
+    /// "acknowledge this before it appears".
+    ///
+    /// A removal needs none of that: it names an entry that is already on the
+    /// engram, so it travels to the text edit as the rule id alone and the
+    /// filtering happens there, under the lock, against what the file holds.
+    async fn ack_draft(
+        &self,
+        p: &EditParams,
+        desc: &EngramDescriptor,
+        actor: &str,
+    ) -> Result<Option<AckDraft>> {
+        Ok(match Self::ack_intent(p)? {
+            None => None,
+            Some(AckIntent::Remove { rule }) => Some(AckDraft::Remove(rule)),
+            Some(AckIntent::Record { rule, note }) => Some(AckDraft::Record(EvolveAck {
+                scope: self
+                    .firing_scope(&desc.domain, &desc.permalink, &rule)
+                    .await?,
+                rule,
+                note,
+                by: actor.to_string(),
+                at: Some(now_offset()),
+            })),
+        })
     }
 
     /// What `rule` is currently firing on `permalink` for, as the scope an
@@ -5445,6 +5477,12 @@ impl Engine {
     /// raising it. The Fluid half of the same act
     /// [`Engine::edit_engram_as`]'s `set_frontmatter` performs for an agent,
     /// through the one edit path, with the scope computed the one way.
+    ///
+    /// The rule is screened here as well as inside the edit, because this
+    /// surface carries the rule and the note as separate fields and joins them
+    /// into one value: the screen is what keeps a rule field that happens to
+    /// read `remove` an unknown-rule refusal rather than a value the parser
+    /// would take for a removal.
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
@@ -5453,6 +5491,10 @@ impl Engine {
         note: Option<&str>,
         client: Option<&str>,
     ) -> Result<Value> {
+        let screened = rule.trim().to_ascii_uppercase();
+        if rule_info(&screened).is_none() {
+            return Err(EngineError::Invalid(unknown_rule_message(&screened)));
+        }
         let value = match note.map(str::trim).filter(|n| !n.is_empty()) {
             Some(note) => format!("{} {note}", rule.trim()),
             None => rule.trim().to_string(),
@@ -5473,9 +5515,9 @@ impl Engine {
     /// `false` when the engram carries none for that rule, which the surface
     /// answers as a 404 rather than pretending a removal happened.
     ///
-    /// Deliberately not offered over MCP: an agent silences a finding a person
-    /// ruled intentional, and un-silencing it is the person's call, in Fluid or
-    /// in the file.
+    /// Fluid's half of the take-back an agent asks for with the `remove
+    /// <rule-id>` value form; both filter through [`without_ack`], and they
+    /// differ only in how an entry that is not there is reported.
     pub async fn unacknowledge_finding_as(
         &self,
         domain: &str,
@@ -5496,21 +5538,11 @@ impl Engine {
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block.
         let current = self.load_source(&source, &desc).await?;
-        // Case-folded, like every other rule comparison on this path: a
-        // hand-written `- { rule: v101 }` suppresses findings, so it has to be
-        // withdrawable too.
-        if !acks_of(&current)
-            .iter()
-            .any(|a| a.rule.eq_ignore_ascii_case(&rule))
-        {
+        if !has_ack(&current, &rule) {
             return Ok(false);
         }
         self.apply_source_edit(&desc, &source, None, &actor, |current| {
-            let kept: Vec<EvolveAck> = acks_of(current)
-                .into_iter()
-                .filter(|a| !a.rule.eq_ignore_ascii_case(&rule))
-                .collect();
-            Ok(set_evolve_ack(current, &kept))
+            Ok(without_ack(current, &rule))
         })
         .await?;
         Ok(true)
@@ -10003,25 +10035,91 @@ struct DomainSweep {
     unparsed: usize,
 }
 
-/// Split an `evolve_ack` value into the rule id and the note: the rule up to
-/// the first whitespace, everything after it the note. The id is uppercased, so
-/// `v101 keep` records the same acknowledgment `V101 keep` does.
-fn parse_ack_value(raw: &str) -> Result<(String, Option<String>)> {
+/// What an `evolve_ack` assignment asks for, read out of its value and nothing
+/// else. [`Engine::ack_intent`] is how a surface gets one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckIntent {
+    /// Record `rule`'s finding as intentional, with the caller's note.
+    Record {
+        /// The rule id, uppercased.
+        rule: String,
+        /// Why the finding is intentional, folded to one line.
+        note: Option<String>,
+    },
+    /// Take `rule`'s acknowledgment back, so the finding resurfaces.
+    Remove {
+        /// The rule id, uppercased.
+        rule: String,
+    },
+}
+
+/// An [`AckIntent`] the server has completed, on its way to the text edit: the
+/// record carries the scope only a sweep could supply, the removal carries the
+/// rule alone because the entry it names is already in the file.
+enum AckDraft {
+    Record(EvolveAck),
+    Remove(String),
+}
+
+/// Split an `evolve_ack` value into what it asks for: a record, or a removal.
+///
+/// The record form is the rule id up to the first whitespace and everything
+/// after it as the note. The id is uppercased, so `v101 keep` records the same
+/// acknowledgment `V101 keep` does.
+///
+/// The removal form is the whole first token being exactly `remove`, followed
+/// by one rule id and nothing else. Case-sensitive and whole-token on purpose:
+/// the record form puts the rule first, so `V101 remove this later` is a note
+/// that happens to start with the word and stays a record. Trailing text is
+/// refused rather than dropped, because the most likely thing after the rule is
+/// a note the caller believed was being stored.
+fn parse_ack_value(raw: &str) -> Result<AckIntent> {
     let raw = raw.trim();
     if raw.is_empty() {
         return Err(EngineError::Invalid(format!(
             "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
         )));
     }
-    let (rule, note) = match raw.split_once(char::is_whitespace) {
-        Some((rule, note)) => (rule, fold_note(note)),
-        None => (raw, String::new()),
+    let (head, rest) = match raw.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (raw, ""),
     };
-    let rule = rule.trim().to_ascii_uppercase();
+    if head == REMOVE_VERB {
+        let mut tokens = rest.split_whitespace();
+        let Some(rule) = tokens.next() else {
+            return Err(EngineError::Invalid(removal_form_message(
+                "name the rule to take back",
+            )));
+        };
+        if tokens.next().is_some() {
+            return Err(EngineError::Invalid(removal_form_message(
+                "drop the extra text",
+            )));
+        }
+        let rule = rule.to_ascii_uppercase();
+        if rule_info(&rule).is_none() {
+            return Err(EngineError::Invalid(unknown_rule_message(&rule)));
+        }
+        return Ok(AckIntent::Remove { rule });
+    }
+    let rule = head.trim().to_ascii_uppercase();
     if rule_info(&rule).is_none() {
         return Err(EngineError::Invalid(unknown_rule_message(&rule)));
     }
-    Ok((rule, (!note.is_empty()).then_some(note)))
+    let note = fold_note(rest);
+    Ok(AckIntent::Record {
+        rule,
+        note: (!note.is_empty()).then_some(note),
+    })
+}
+
+/// The first token that makes an `evolve_ack` value a removal.
+const REMOVE_VERB: &str = "remove";
+
+/// What a caller hears when the removal form is malformed: the form itself,
+/// then the fix.
+fn removal_form_message(fix: &str) -> String {
+    format!("a removal takes exactly 'remove <rule-id>'; {fix}")
 }
 
 /// A note as one line of prose: every run of whitespace, newlines included,
@@ -10074,6 +10172,34 @@ fn acks_of(source: &str) -> Vec<EvolveAck> {
                 .map(EvolveAck::parse_list)
         })
         .unwrap_or_default()
+}
+
+/// Whether the engram acknowledges `rule` at all.
+///
+/// Case-folded, like every other rule comparison on this path: a hand-written
+/// `- { rule: v101 }` suppresses findings, so it has to be findable - and
+/// withdrawable - too.
+fn has_ack(source: &str, rule: &str) -> bool {
+    acks_of(source)
+        .iter()
+        .any(|a| a.rule.eq_ignore_ascii_case(rule))
+}
+
+/// The engram's markdown with `rule`'s acknowledgment dropped and every other
+/// entry left exactly as it was. Removing the last one removes the key rather
+/// than leaving an empty one ([`set_evolve_ack`] on an empty slice).
+///
+/// The one removal both surfaces run: Fluid's withdraw
+/// ([`Engine::unacknowledge_finding_as`]) and an agent's `remove <rule-id>`
+/// value. They differ only in how they report an entry that is not there - a
+/// `false` the REST layer answers as a 404, an error the agent reads - which is
+/// why the presence test is [`has_ack`] beside this rather than folded into it.
+fn without_ack(source: &str, rule: &str) -> String {
+    let kept: Vec<EvolveAck> = acks_of(source)
+        .into_iter()
+        .filter(|a| !a.rule.eq_ignore_ascii_case(rule))
+        .collect();
+    set_evolve_ack(source, &kept)
 }
 
 /// The engram's acknowledgments with `entry` folded in: one entry per rule, so

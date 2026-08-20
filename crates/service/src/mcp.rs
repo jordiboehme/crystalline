@@ -696,7 +696,7 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
-use crate::engine::{ConfigureAction, Engine, EngineError, ProvisionAction};
+use crate::engine::{AckIntent, ConfigureAction, Engine, EngineError, ProvisionAction};
 use crate::params::*;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
@@ -857,7 +857,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack never removes either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry, and acknowledgments are removed in Fluid or by editing the file, never here. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it errors when the engram carries no entry for that rule and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -868,13 +868,29 @@ impl McpServer {
     async fn edit_engram(
         &self,
         Parameters(p): Parameters<EditParams>,
+        responses: InputResponses,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
+        // One key arms the round and every other edit runs untouched. The
+        // parse failure is swallowed rather than reported here on purpose: the
+        // engine is the one place that words it, and asking a user about an
+        // edit that cannot run is worse than letting it fail where it always
+        // failed.
+        if confirmation_supported(&ctx)
+            && let Ok(Some(intent)) = Engine::ack_intent(&p)
+        {
+            match confirmed(&responses.0) {
+                None => return Ok(confirm_question(ack_question(&p, &intent)).into()),
+                Some(false) => return refuse(ack_refusal(&intent)).map(CallToolResponse::from),
+                Some(true) => {}
+            }
+        }
         self.engine
             .edit_engram_as(&p, client_actor(&ctx).as_deref())
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -2251,6 +2267,44 @@ fn delete_question(preview: &Value) -> String {
     let attachments = if listed.is_empty() { "none" } else { &listed };
     format!(
         "Delete '{title}' ({domain}/{permalink})? This leaves its sole-referent attachments orphaned: {attachments}. This cannot be undone."
+    )
+}
+
+/// The sentence an `evolve_ack` assignment asks before it acts.
+///
+/// Both halves name the consequence rather than the write, because that is
+/// what the user is deciding: a record keeps a finding out of every future
+/// sweep, a removal puts it back into the next one. The engram is named by the
+/// identifier the call carried, which is what the user would recognize, and
+/// resolving it to a permalink would cost a lookup to say the same thing.
+fn ack_question(p: &EditParams, intent: &AckIntent) -> String {
+    let identifier = p.identifier.trim();
+    let domain = p.domain.trim();
+    match intent {
+        AckIntent::Record { rule, note } => {
+            let note = note
+                .as_deref()
+                .map(|note| format!(" The note reads: '{note}'."))
+                .unwrap_or_default();
+            format!(
+                "Acknowledge {rule} on '{identifier}' in '{domain}'? This records the finding as intentional until its evidence changes.{note}"
+            )
+        }
+        AckIntent::Remove { rule } => format!(
+            "Remove the {rule} acknowledgment on '{identifier}' in '{domain}'? The finding resurfaces on the next sweep."
+        ),
+    }
+}
+
+/// What an unconfirmed `evolve_ack` assignment tells the model, naming what did
+/// not happen so it does not retry blind.
+fn ack_refusal(intent: &AckIntent) -> String {
+    let (act, state) = match intent {
+        AckIntent::Record { .. } => ("acknowledgment", "nothing was recorded"),
+        AckIntent::Remove { .. } => ("removal", "the acknowledgment is still there"),
+    };
+    format!(
+        "The {act} was not confirmed, so {state}. Call edit_engram again if the user asks for it."
     )
 }
 

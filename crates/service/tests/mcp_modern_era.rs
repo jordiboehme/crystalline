@@ -1165,3 +1165,322 @@ async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
         stray.display()
     );
 }
+
+// --- acknowledgments, recorded and taken back -------------------------------
+//
+// `set_frontmatter` on `evolve_ack` is the second act that asks first: it
+// silences a finding, or resurfaces one, on the user's behalf. The gate is the
+// same two-sided one the delete tests prove, and it arms for this one key
+// only - every other `edit_engram` operation runs on the first call, whatever
+// the peer.
+
+/// One `edit_engram` call assigning `value` to `evolve_ack` on `acked`.
+fn ack_call(value: &str, responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "edit_engram",
+        "arguments": {
+            "domain": "eng",
+            "identifier": "acked",
+            "operation": "set_frontmatter",
+            "key": "evolve_ack",
+            "value": value,
+        },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The engine payload a tool result carries, as JSON.
+fn payload_of(answer: &Value) -> Value {
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    serde_json::from_str(text).unwrap_or(Value::Null)
+}
+
+/// Open a connection by writing the engram the acknowledgment tests annotate.
+async fn acked_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
+    let mut wire = h.stdio().await;
+    let written = wire
+        .open(modern(
+            1,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "title": "Acked",
+                    "content": "A finding will be ruled intentional here.",
+                },
+            }),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the engram to acknowledge has to exist first: {written}"
+    );
+    let path = h.root.join("eng/acked.md");
+    assert!(path.exists(), "the write landed on disk");
+    (wire, path)
+}
+
+/// Round one of a record: the peer is asked, and nothing is written yet.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_ack_gets_a_confirmation_question() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            ack_call("V101 lineage citation, keep", None),
+        ))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than an acknowledgment: {asked}"
+    );
+    let question = &result["inputRequests"]["confirm"];
+    assert_eq!(question["method"], json!("elicitation/create"), "{asked}");
+
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("Acknowledge V101"),
+        "the question names the rule: {message}"
+    );
+    assert!(
+        message.contains("acked") && message.contains("eng"),
+        "and the engram it lands on: {message}"
+    );
+    assert!(
+        message.contains("lineage citation, keep"),
+        "and the note it would record: {message}"
+    );
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        !on_disk.contains("evolve_ack"),
+        "round one records nothing: {on_disk}"
+    );
+}
+
+/// The whole take-back: acknowledge, then confirm a removal, and the receipt
+/// names the rule it resurfaced.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_unack_removes_and_reports_evolve_ack_removed() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+
+    // Recorded by a peer that cannot be asked, so the removal is the only
+    // round in play.
+    let recorded = wire
+        .call(modern(2, "tools/call", ack_call("V101 keep it", None)))
+        .await;
+    assert!(
+        recorded["error"].is_null() && recorded["result"]["isError"] != json!(true),
+        "the acknowledgment lands: {recorded}"
+    );
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("V101"),
+        "it is in the file"
+    );
+
+    let asked = wire
+        .call(eliciting(3, "tools/call", ack_call("remove V101", None)))
+        .await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "a take-back is asked about too: {asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("Remove the V101 acknowledgment"),
+        "the question names what goes: {message}"
+    );
+    assert!(
+        message.contains("resurfaces"),
+        "and what comes back: {message}"
+    );
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("V101"),
+        "round one removes nothing"
+    );
+
+    let done = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            ack_call("remove V101", Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the confirmed round removes it: {done}"
+    );
+    assert_eq!(
+        payload_of(&done)["evolve_ack_removed"],
+        json!("V101"),
+        "and the receipt names the rule: {done}"
+    );
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("evolve_ack"),
+        "the entry is gone from the file"
+    );
+}
+
+/// A declined take-back leaves the acknowledgment exactly where it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_unack_keeps_the_acknowledgment() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+
+    wire.call(modern(2, "tools/call", ack_call("V101 keep it", None)))
+        .await;
+    let refused = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            ack_call("remove V101", Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "a decline is a refusal the model can read: {refused}"
+    );
+    let text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("still there"),
+        "and it says what did not happen: {text}"
+    );
+    assert!(
+        std::fs::read_to_string(&path).unwrap().contains("V101"),
+        "the acknowledgment survives"
+    );
+}
+
+/// Every other `edit_engram` operation is untouched: an eliciting peer editing
+/// a different frontmatter key is served on the first call, with no round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_peer_edits_every_other_key_immediately() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            json!({
+                "name": "edit_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "identifier": "acked",
+                    "operation": "set_frontmatter",
+                    "key": "status",
+                    "value": "deprecated",
+                },
+            }),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "only the acknowledgment key asks: {done}"
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("status: deprecated"),
+        "the edit landed"
+    );
+}
+
+/// A legacy peer acknowledges on the first call and gets 0.15.0's receipt: the
+/// `evolve_ack` entry, no discriminator, no round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_peer_acks_immediately() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+
+    let written = wire
+        .call(request(
+            2,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "title": "Acked",
+                    "content": "A finding will be ruled intentional here.",
+                },
+            }),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the write lands: {written}"
+    );
+
+    let done = wire
+        .call(request(
+            3,
+            "tools/call",
+            ack_call("V101 lineage citation, keep", None),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the acknowledgment runs on the first call: {done}"
+    );
+    assert!(
+        !done["result"]
+            .as_object()
+            .unwrap()
+            .contains_key("resultType"),
+        "a legacy result carries no discriminator: {done}"
+    );
+    let entry = &payload_of(&done)["evolve_ack"];
+    assert_eq!(entry["rule"], json!("V101"), "{done}");
+    assert_eq!(entry["note"], json!("lineage citation, keep"), "{done}");
+
+    // And the take-back is open to it too, prose-guided rather than asked.
+    let removed = wire
+        .call(request(4, "tools/call", ack_call("remove V101", None)))
+        .await;
+    assert_eq!(
+        payload_of(&removed)["evolve_ack_removed"],
+        json!("V101"),
+        "{removed}"
+    );
+    assert!(
+        !std::fs::read_to_string(h.root.join("eng/acked.md"))
+            .unwrap()
+            .contains("evolve_ack"),
+        "the entry is gone"
+    );
+}
