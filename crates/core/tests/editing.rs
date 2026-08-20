@@ -494,7 +494,7 @@ fn a_note_with_newlines_stays_one_line_and_the_engram_still_parses() {
 fn a_verified_actor_with_a_newline_stays_one_line() {
     let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
     let out = set_verified(
-        &source,
+        source,
         &[Verified {
             by: "human:jordi\nstatus: evil".to_string(),
             at: None,
