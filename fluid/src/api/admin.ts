@@ -217,6 +217,10 @@ export interface SyncStatus {
   localChanges: number;
   /** Proposals still open on the origin, as a count. */
   openProposals: number;
+  /** Proposals the team turned down, as a count. */
+  declinedProposals: number;
+  /** Files a pull could not merge and somebody has to settle, as a count. */
+  conflicts: number;
   /** Whether the origin is ahead, or null when the probe could not say. */
   behind: boolean | null;
   /**
@@ -240,9 +244,9 @@ export function syncStatusKey(domain: string): readonly unknown[] {
 /**
  * A count that may arrive as a number or as the list it counts.
  *
- * The engine's status report embeds the open proposals themselves while its
- * poll overview counts them, and both spellings reach this surface. A card
- * wants the number either way.
+ * The engine's status report embeds the proposals and the conflicts themselves
+ * while its poll overview counts them, and both spellings reach this surface. A
+ * card wants the number either way.
  */
 function asCount(value: unknown): number {
   return asNumber(value) ?? asArray(value).length;
@@ -257,6 +261,8 @@ function readSyncStatus(payload: unknown): SyncStatus {
     lastChecked: asString(record?.last_checked),
     localChanges: asCount(record?.local_changes),
     openProposals: asCount(record?.open_proposals),
+    declinedProposals: asCount(record?.declined_proposals),
+    conflicts: asCount(record?.conflicts),
     behind: typeof record?.behind === "boolean" ? record.behind : null,
     probeError: asString(record?.probe_error),
   };

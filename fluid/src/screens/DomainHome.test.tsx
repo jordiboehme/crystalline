@@ -686,8 +686,35 @@ describe("the team sync card", () => {
     expect(within(card).getByText("2026-08-10")).toBeVisible();
     expect(within(card).getByText("2 pending local changes")).toBeVisible();
     expect(within(card).getByText("1 open proposal")).toBeVisible();
+    // Nothing was declined and nothing conflicts, so neither is mentioned: a
+    // zero of an exceptional thing is noise on a card that is otherwise fine.
+    expect(within(card).queryByText(/declined proposal/)).toBeNull();
+    expect(within(card).queryByText(/to settle/)).toBeNull();
     // Nothing failed, so nothing is announced as failed.
     expect(within(card).queryByRole("alert")).toBeNull();
+  });
+
+  it("names the declined proposals and the conflicts when there are any", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            declined_proposals: [{ number: 3 }, { number: 4 }],
+            conflicts: ["notes/a.md"],
+          }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    // Declined work is informational; a conflict is something somebody has to
+    // go and do, so the wording says so.
+    expect(within(card).getByText("2 declined proposals")).toBeVisible();
+    expect(within(card).getByText("1 conflict to settle")).toBeVisible();
   });
 
   it("counts the proposals the real endpoint actually sends", async () => {

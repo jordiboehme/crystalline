@@ -227,10 +227,34 @@ describe("the admin client layer", () => {
       lastChecked: "2026-08-10T08:00:00Z",
       localChanges: 2,
       openProposals: 2,
+      // Nothing declined and nothing conflicting is nothing to count: a report
+      // that leaves the keys out says zero rather than "unknown".
+      declinedProposals: 0,
+      conflicts: 0,
       behind: false,
       probeError: null,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("counts the declined proposals and the conflicts as well", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      branch: "main",
+      last_checked: "2026-08-10T08:00:00Z",
+      local_changes: 0,
+      open_proposals: [],
+      // The two exceptional lists, in the spelling `status_report_json` sends:
+      // the records themselves, which the card wants as counts.
+      declined_proposals: [{ number: 3 }, { number: 4 }],
+      conflicts: ["notes/a.md"],
+      behind: false,
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.declinedProposals).toBe(2);
+    expect(status.conflicts).toBe(1);
   });
 
   it("carries a failed probe's own words through", async () => {

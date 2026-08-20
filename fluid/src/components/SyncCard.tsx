@@ -161,6 +161,30 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
             <span>
               {plural(sync.openProposals, "open proposal", "open proposals")}
             </span>
+            {/* The two exceptional counts, each shown only when it is not
+                zero: "0 declined proposals" and "0 conflicts to settle" are
+                the normal state of every team domain, and a card that recites
+                them teaches a reader to skim past the line that one day says
+                something. Declined work is informational, a conflict is
+                somebody's next task, and the wording is what says which. */}
+            {sync.declinedProposals > 0 && (
+              <span>
+                {plural(
+                  sync.declinedProposals,
+                  "declined proposal",
+                  "declined proposals",
+                )}
+              </span>
+            )}
+            {sync.conflicts > 0 && (
+              <span>
+                {plural(
+                  sync.conflicts,
+                  "conflict to settle",
+                  "conflicts to settle",
+                )}
+              </span>
+            )}
           </p>
           {/* Only when the origin is actually ahead: `behind` is null when
                 nothing probed it, and "not behind" is not a fact then. */}
