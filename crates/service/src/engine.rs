@@ -35,13 +35,13 @@ use crystalline_core::{
     Manifest, YamlValue, is_lower_hyphen, parse_engram, parse_engram_lossless, slugify,
 };
 use crystalline_index::{
-    AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT, DomainHost,
-    DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind, EmbeddingProvider, EngramDescriptor,
-    EngramFacts, EngramId, EngramRecord, Family, FileStamp, Finding, GraphNode, GraphSlice,
-    HostClaim, InboundQuery, RULES, RecentFilter, SearchMode, SearchQuery, Store, SweepInput,
-    SweepOptions, SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
-    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, retired_factor,
-    rule_info, salience_prior, scan_domain, scan_paths,
+    AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
+    DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
+    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, Family, FileStamp,
+    Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES, RecentFilter, SearchMode,
+    SearchQuery, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
+    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
+    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -5179,7 +5179,9 @@ impl Engine {
         let raw = p.value.as_deref().map(str::trim).unwrap_or_default();
         let (rule, note) = parse_ack_value(raw)?;
         Ok(Some(EvolveAck {
-            scope: self.firing_scope(&desc.domain, &desc.permalink, &rule).await?,
+            scope: self
+                .firing_scope(&desc.domain, &desc.permalink, &rule)
+                .await?,
             rule,
             note,
             by: actor.to_string(),
@@ -5247,10 +5249,7 @@ impl Engine {
             ..EditParams::default()
         };
         let result = self.edit_engram_as(&params, client).await?;
-        Ok(result
-            .get("evolve_ack")
-            .cloned()
-            .unwrap_or(Value::Null))
+        Ok(result.get("evolve_ack").cloned().unwrap_or(Value::Null))
     }
 
     /// Withdraw an acknowledgment, leaving the engram's other entries alone.
@@ -5295,11 +5294,7 @@ impl Engine {
     }
 
     /// An engram's markdown as its domain holds it, whichever kind that is.
-    async fn load_source(
-        &self,
-        source: &ContentSource,
-        desc: &EngramDescriptor,
-    ) -> Result<String> {
+    async fn load_source(&self, source: &ContentSource, desc: &EngramDescriptor) -> Result<String> {
         match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
@@ -9780,21 +9775,14 @@ fn parse_ack_value(raw: &str) -> Result<(String, Option<String>)> {
     if rule_info(&rule).is_none() {
         return Err(EngineError::Invalid(unknown_rule_message(&rule)));
     }
-    Ok((
-        rule,
-        (!note.is_empty()).then(|| note.to_string()),
-    ))
+    Ok((rule, (!note.is_empty()).then(|| note.to_string())))
 }
 
 /// What a caller hears when it names a rule the catalog does not have.
 fn unknown_rule_message(rule: &str) -> String {
     format!(
         "'{rule}' is not a rule the sweep knows; the catalog holds {}",
-        RULES
-            .iter()
-            .map(|r| r.id)
-            .collect::<Vec<_>>()
-            .join(", ")
+        RULES.iter().map(|r| r.id).collect::<Vec<_>>().join(", ")
     )
 }
 
@@ -9816,7 +9804,12 @@ fn attachment_identifier(identifier: &str) -> Option<String> {
 fn acks_of(source: &str) -> Vec<EvolveAck> {
     parse_engram(source)
         .ok()
-        .and_then(|e| e.frontmatter.extra.get(EVOLVE_ACK_KEY).map(EvolveAck::parse_list))
+        .and_then(|e| {
+            e.frontmatter
+                .extra
+                .get(EVOLVE_ACK_KEY)
+                .map(EvolveAck::parse_list)
+        })
         .unwrap_or_default()
 }
 

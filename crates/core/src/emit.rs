@@ -12,7 +12,9 @@
 use chrono::{DateTime, FixedOffset, NaiveDate};
 use serde_yaml_ng::{Mapping, Value};
 
-use crate::engram::{EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, SchemaDef, Verified};
+use crate::engram::{
+    EVOLVE_ACK_KEY, Engram, EvolveAck, Frontmatter, Generated, SchemaDef, Verified,
+};
 use crate::parse::{locate, parse_heading};
 
 /// The stand-in scalar the `generated` key carries through YAML serialization,

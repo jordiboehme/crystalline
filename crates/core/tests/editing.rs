@@ -349,7 +349,11 @@ fn ack(rule: &str, scope: Option<&str>, note: Option<&str>) -> EvolveAck {
 fn evolve_ack_round_trips_through_the_frontmatter() {
     let source = "---\ntitle: Lineage\ntype: engram\nstatus: stable\n---\n\nBody.\n";
     let entries = vec![
-        ack("V101", Some("eng/old-runbook"), Some("lineage citation, keep")),
+        ack(
+            "V101",
+            Some("eng/old-runbook"),
+            Some("lineage citation, keep"),
+        ),
         ack("V007", None, None),
     ];
     let out = set_evolve_ack(source, &entries);
@@ -374,9 +378,15 @@ fn evolve_ack_round_trips_through_the_frontmatter() {
 fn a_single_ack_is_one_line_and_a_rewrite_replaces_the_block() {
     let source = "---\ntitle: Lineage\nstatus: stable\n---\n\nBody.\n";
     let one = set_evolve_ack(source, &[ack("V101", Some("eng/old"), None)]);
-    assert!(one.contains("evolve_ack: { rule: V101, scope: eng/old, by: human:jordi"), "{one}");
+    assert!(
+        one.contains("evolve_ack: { rule: V101, scope: eng/old, by: human:jordi"),
+        "{one}"
+    );
 
-    let two = set_evolve_ack(&one, &[ack("V101", Some("eng/old"), None), ack("V104", None, None)]);
+    let two = set_evolve_ack(
+        &one,
+        &[ack("V101", Some("eng/old"), None), ack("V104", None, None)],
+    );
     assert_eq!(two.matches("rule: V101").count(), 1, "{two}");
     assert!(two.contains("rule: V104"), "{two}");
     assert!(two.contains("status: stable"), "{two}");

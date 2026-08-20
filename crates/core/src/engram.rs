@@ -229,9 +229,7 @@ impl EvolveAck {
     pub fn parse_list(value: &YamlValue) -> Vec<EvolveAck> {
         match value {
             YamlValue::Mapping(_) => EvolveAck::parse_entry(value).into_iter().collect(),
-            YamlValue::Sequence(items) => {
-                items.iter().filter_map(EvolveAck::parse_entry).collect()
-            }
+            YamlValue::Sequence(items) => items.iter().filter_map(EvolveAck::parse_entry).collect(),
             _ => Vec::new(),
         }
     }

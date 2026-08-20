@@ -439,11 +439,7 @@ async fn viewing_the_queue_never_counts_as_a_run() {
 
 /// Log in, returning (session cookie value, CSRF token): the pair a browser
 /// carries on every write.
-async fn login_session(
-    addr: std::net::SocketAddr,
-    name: &str,
-    password: &str,
-) -> (String, String) {
+async fn login_session(addr: std::net::SocketAddr, name: &str, password: &str) -> (String, String) {
     let resp = client()
         .post(format!("http://{addr}/api/v1/auth/login"))
         .json(&serde_json::json!({ "name": name, "password": password }))
@@ -557,7 +553,10 @@ async fn acknowledging_removes_a_finding_and_withdrawing_brings_it_back() {
         .find(|r| r["permalink"] == "human-capture" && r["rule"] == "V006")
         .expect("the audit view returns what it suppressed");
     assert_eq!(row["acknowledged"], true);
-    assert_eq!(row["ack_note"], "the responder's own words, reviewed offline");
+    assert_eq!(
+        row["ack_note"],
+        "the responder's own words, reviewed offline"
+    );
 
     let resp = ack_request(
         fixture.addr,

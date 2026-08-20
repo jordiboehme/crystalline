@@ -1139,8 +1139,7 @@ async fn an_ack_whose_evidence_changed_comes_back_stale() {
     // Re-acknowledged, it takes the new evidence and goes quiet again.
     let again = acknowledge(&engine, "live-doc", "V101 both are deliberate").await;
     assert_eq!(
-        again["evolve_ack"]["scope"],
-        "eng/deploy/old-pipeline, eng/retired-thing",
+        again["evolve_ack"]["scope"], "eng/deploy/old-pipeline, eng/retired-thing",
         "the scope is the sorted set of what it now points at"
     );
     let after = sweep(

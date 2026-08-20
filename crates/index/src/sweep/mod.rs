@@ -1632,7 +1632,9 @@ fn detect_reciprocal(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRe
                 Finding::about("V103", fact)
                     .with(
                         Class::Mechanical,
-                        format!("{addrs} declares {forward} but the {inverse} back-link is missing"),
+                        format!(
+                            "{addrs} declares {forward} but the {inverse} back-link is missing"
+                        ),
                         format!(
                             "{addrs} -{forward}-> {}; no {inverse} pointing back",
                             fact.address()

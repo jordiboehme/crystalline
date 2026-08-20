@@ -1819,6 +1819,24 @@ fn write_ops() -> Vec<WriteOp> {
             body: None,
             admin_only: false,
         },
+        // The acknowledgment pair: editor writes, because ruling a finding
+        // intentional is a judgment about content rather than about the
+        // deployment. Their allowed legs answer 404 by the time this matrix
+        // runs (an earlier row moved `alpha` out from under them), which is
+        // exactly the "anything but 401/403" this asserts while changing
+        // nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/evolve/ack",
+            body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/evolve/ack",
+            body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
+            admin_only: false,
+        },
         // Last among the domain rows, and no later row targets `scrap`: this
         // one unregisters it.
         WriteOp {

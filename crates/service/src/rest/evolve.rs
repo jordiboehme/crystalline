@@ -19,7 +19,9 @@ use serde_json::Value;
 use utoipa::IntoParams;
 
 use super::auth::Identity;
-use super::{ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, csv, refuse_read_only};
+use super::{
+    ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, csv, refuse_read_only,
+};
 use crate::params::EvolveParams;
 
 /// The query string `GET /evolve` takes, mirroring [`EvolveParams`] minus its

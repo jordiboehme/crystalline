@@ -1368,11 +1368,7 @@ fn a_scoped_ack_suppresses_its_finding_and_is_counted() {
     )];
 
     let report = detect(&sweep);
-    assert!(
-        !fired(&report).contains(&"V101"),
-        "{:?}",
-        fired(&report)
-    );
+    assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
     assert_eq!(report.acknowledged.total, 1);
     assert_eq!(report.acknowledged.structure, 1);
     assert_eq!(report.acknowledged.temporal, 0);
@@ -1547,9 +1543,10 @@ fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
             "{rule} scopes one path"
         );
     }
-    for rule in ["V001", "V002", "V003", "V004", "V005", "V006", "V102", "V104", "V105", "V106",
-        "V108", "V203"]
-    {
+    for rule in [
+        "V001", "V002", "V003", "V004", "V005", "V006", "V102", "V104", "V105", "V106", "V108",
+        "V203",
+    ] {
         assert_eq!(
             scope_for(rule, unsorted.clone()),
             "",
