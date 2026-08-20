@@ -164,7 +164,10 @@ pub enum AssetPathError {
 /// stored `assets/100%.png` and the encoded `assets/100%25.png` - and the
 /// scanner, the rail and the sweep would not have to agree about which one is
 /// the reference. Keeping `%` out of stored paths is what keeps that question
-/// from existing.
+/// from existing. The body scanner does decode a reference it finds
+/// (`find_asset_refs`), which is what lets an encoded link resolve to the file
+/// it renders; a stored path still never carries a literal `%`, so decoding a
+/// reference can only ever land on one spelling.
 ///
 /// A space and a parenthesis are refused because a markdown link target cannot
 /// carry them reliably - a space ends the target and an unbalanced `)` closes
@@ -218,6 +221,12 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
 /// carrying a scheme or a leading `/` addresses something outside the domain
 /// and is ignored, which the `assets/` prefix test already decides.
 ///
+/// A target is percent-decoded before any of that is read off it, so
+/// `assets/caf%C3%A9.png` claims `assets/café.png` and an encoded `%23` opens
+/// a fragment; a malformed escape or a sequence that is not valid UTF-8 leaves
+/// the target raw. That is the rule Fluid's scanner follows, and the two agree
+/// so a reference the page renders is never reported as unreferenced.
+///
 /// A trailing `#fragment` is stripped: an image formatting directive
 /// (`assets/pic.png#right,w=50%`) is a rendering instruction, not part of the
 /// path, so it resolves and dedupes as `assets/pic.png`. Since a stored asset
@@ -261,6 +270,48 @@ pub fn find_asset_refs(body: &str) -> Vec<String> {
     refs
 }
 
+/// One hex digit of a percent escape, or `None` for anything else.
+fn hex_nibble(byte: Option<&u8>) -> Option<u8> {
+    let byte = *byte?;
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Percent-decode a link target the way a browser's `decodeURIComponent`
+/// does: `%XX` hex pairs become bytes, the result must be valid UTF-8, and
+/// any malformed escape or invalid sequence leaves the target untouched -
+/// the same catch-and-keep fallback Fluid's `decodeTarget` uses, so the two
+/// scanners read one spelling.
+fn percent_decode_target(target: &str) -> String {
+    let bytes = target.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            // Both digits must be plain ASCII hex. A parse would also accept a
+            // sign (`%+A`), which `decodeURIComponent` throws on, so the pair
+            // is read nibble by nibble instead.
+            let (Some(hi), Some(lo)) = (hex_nibble(bytes.get(i + 1)), hex_nibble(bytes.get(i + 2)))
+            else {
+                return target.to_string();
+            };
+            out.push(hi * 16 + lo);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    match String::from_utf8(out) {
+        Ok(decoded) => decoded,
+        Err(_) => target.to_string(),
+    }
+}
+
 /// The `assets/` link targets on one line, in order, duplicates included.
 fn line_targets(line: &str) -> Vec<String> {
     let bytes = line.as_bytes();
@@ -289,7 +340,11 @@ fn line_targets(line: &str) -> Vec<String> {
         idx = end + 1;
         let inside = line[open..end].trim();
         let target = inside.split_whitespace().next().unwrap_or("");
-        let target = target.strip_prefix("./").unwrap_or(target);
+        // The whole target decodes before anything is read off it, the order
+        // Fluid's scanner uses: an encoded `%23` becomes a real `#` and then
+        // opens the formatting fragment, an encoded prefix becomes `assets/`.
+        let target = percent_decode_target(target);
+        let target = target.strip_prefix("./").unwrap_or(&target);
         // An image formatting fragment is a rendering directive, not part of
         // the path, so it never reaches a reference. `#` cannot occur inside a
         // stored asset path, so the first one always opens the fragment.
@@ -516,6 +571,22 @@ Again: ![d](assets/flow.png)\n\
     fn a_target_that_is_only_a_fragment_is_not_a_reference() {
         assert_eq!(find_asset_refs("![x](assets/#left)"), Vec::<String>::new());
         assert_eq!(find_asset_refs("![x](assets/#)"), Vec::<String>::new());
+    }
+
+    /// `decodeURIComponent` throws on an escape whose digits are not both plain
+    /// hex, and on a `%` with fewer than two characters behind it, so both
+    /// leave the target raw here too. A signed pair (`%+A`) is the one an
+    /// integer parse would have accepted and the browser does not.
+    #[test]
+    fn an_escape_that_is_not_two_hex_digits_leaves_the_target_raw() {
+        assert_eq!(
+            find_asset_refs("![x](assets/bad%+Aname.png)"),
+            vec!["assets/bad%+Aname.png".to_string()]
+        );
+        assert_eq!(
+            find_asset_refs("![x](assets/trailing.png%4)"),
+            vec!["assets/trailing.png%4".to_string()]
+        );
     }
 
     #[test]
