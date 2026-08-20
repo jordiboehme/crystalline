@@ -276,11 +276,11 @@ pub async fn read(
                    multipart - and the declared content type is ignored: the \
                    extension allowlist decides the mime, at upload and at every \
                    later read.\n\nThe path must start with `assets/`, hold no \
-                   `.`, `..` or hidden segment, no backslash, colon or `#`, be \
-                   at most 256 bytes and end in an allowlisted extension; \
-                   anything else is 400 naming the rule. The domain is marked \
-                   as owing a consolidation sweep, because a person just added \
-                   something the agent has not read yet.",
+                   `.`, `..` or hidden segment, no backslash, colon, `#` or \
+                   `%`, be at most 256 bytes and end in an allowlisted \
+                   extension; anything else is 400 naming the rule. The \
+                   domain is marked as owing a consolidation sweep, because a \
+                   person just added something the agent has not read yet.",
     params(
         ("domain" = String, Path, description = "The registered domain."),
         (

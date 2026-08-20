@@ -12,9 +12,9 @@
  *
  * The sanitizer carries the weight of that mirror. Asset paths are never
  * slugified server-side, so a name that keeps a space, a parenthesis, a `#`, a
- * colon, a backslash or a leading dot is REFUSED rather than cleaned up, and
- * an author would see their own screenshot bounce. Everything outside the safe
- * set therefore becomes a dash here.
+ * `%`, a colon, a backslash or a leading dot is REFUSED rather than cleaned up,
+ * and an author would see their own screenshot bounce. Everything outside the
+ * safe set therefore becomes a dash here.
  */
 
 import { API_BASE, api, encodePermalink, encodeSegment } from "./client";
@@ -145,8 +145,8 @@ function truncateToBytes(value: string, maxBytes: number): string {
  * recognizes is the point" and an author writing in Japanese or Greek should
  * get their own words back rather than a row of dashes. What is dropped is
  * what the server refuses or what a path cannot carry: whitespace,
- * parentheses, `#`, `:`, slashes, backslashes, control and format characters,
- * and symbols including emoji. A name made only of those sanitizes to nothing
+ * parentheses, `#`, `%`, `:`, slashes, backslashes, control and format
+ * characters, and symbols including emoji. A name made only of those sanitizes to nothing
  * and takes {@link FALLBACK_STEM}.
  */
 function slug(part: string): string {

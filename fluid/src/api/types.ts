@@ -404,7 +404,7 @@ export interface paths {
          * Upload an attachment, creating or replacing it.
          * @description Editor only. The request body is the raw file - not multipart - and the declared content type is ignored: the extension allowlist decides the mime, at upload and at every later read.
          *
-         *     The path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon or `#`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.
+         *     The path must start with `assets/`, hold no `.`, `..` or hidden segment, no backslash, colon, `#` or `%`, be at most 256 bytes and end in an allowlisted extension; anything else is 400 naming the rule. The domain is marked as owing a consolidation sweep, because a person just added something the agent has not read yet.
          */
         put: operations["write_attachment"];
         post?: never;

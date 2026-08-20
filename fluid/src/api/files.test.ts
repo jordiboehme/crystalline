@@ -4,8 +4,8 @@
  *
  * The naming rules are pinned hard, because the server refuses a path that
  * breaks them (`crates/core/src/attachment.rs`): a space, a parenthesis, a
- * `#`, a colon, a backslash, a leading dot or an extension that is not on the
- * allowlist. Every one of those refusals would reach an author as a failed
+ * `#`, a `%`, a colon, a backslash, a leading dot or an extension that is not
+ * on the allowlist. Every one of those refusals would reach an author as a failed
  * upload of a file they picked by hand, so the sanitizer is held to producing
  * names that pass rather than to looking tidy.
  */
@@ -155,6 +155,8 @@ describe("sanitizeAttachmentName", () => {
       "Q3 Deck (final).PDF",
       "C:report.xlsx",
       "notes#2.txt",
+      "100%.png",
+      "already%20encoded.png",
       "back\\slash.png",
       " padded .json",
       "Übersicht Plan.png",
@@ -169,7 +171,7 @@ describe("sanitizeAttachmentName", () => {
       const path = freeAttachmentPath(name, [], AUGUST);
       // Transcribed from `validate_asset_path`: the refused characters, the
       // hidden and dot segments, and the 256-byte ceiling.
-      expect(path).not.toMatch(/[ ():#\\]/);
+      expect(path).not.toMatch(/[ ():#%\\]/);
       for (const character of path) {
         // No control character survives, checked by code point rather
         // than by a regex holding literal control bytes.

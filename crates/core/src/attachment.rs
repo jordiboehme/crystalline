@@ -126,10 +126,10 @@ pub enum AssetPathError {
     /// A segment starts with `.`, which would hide the file from sync.
     #[error("an attachment path must not hold a segment starting with `.`")]
     HiddenSegment,
-    /// The path holds a backslash, a colon, a `#`, a space, a parenthesis or a
-    /// control character.
+    /// The path holds a backslash, a colon, a `#`, a `%`, a space, a
+    /// parenthesis or a control character.
     #[error(
-        "an attachment path must not hold a backslash, a colon, a `#`, a space, a parenthesis or a control character"
+        "an attachment path must not hold a backslash, a colon, a `#`, a `%`, a space, a parenthesis or a control character"
     )]
     BadCharacter,
     /// The path is longer than 256 bytes.
@@ -145,8 +145,8 @@ pub enum AssetPathError {
 /// Asset paths are never slugified - a filename a human recognizes is the
 /// point - so validation carries the whole burden: the path starts with
 /// `assets/`, uses forward slashes only, holds no empty, `.`, `..` or
-/// dot-leading segment, holds no backslash, colon, `#`, space, parenthesis or
-/// control character, is at most 256 bytes, and its final segment carries an
+/// dot-leading segment, holds no backslash, colon, `#`, `%`, space, parenthesis
+/// or control character, is at most 256 bytes, and its final segment carries an
 /// allowlisted extension.
 ///
 /// A colon is refused because it is a path separator on some platforms and a
@@ -155,6 +155,16 @@ pub enum AssetPathError {
 /// `#` is refused because it opens the image formatting fragment a body target
 /// may carry; keeping it out of stored paths is what makes that fragment
 /// unambiguous.
+///
+/// A `%` is refused because it opens a percent escape, and a stored path is
+/// read back through two layers that decode one: the MCP surface
+/// percent-decodes an attachment identifier before it reaches this validator,
+/// and the markdown renderer percent-encodes a link target on its way into
+/// HTML. A literal `%` therefore makes one file answer to two spellings - the
+/// stored `assets/100%.png` and the encoded `assets/100%25.png` - and the
+/// scanner, the rail and the sweep would not have to agree about which one is
+/// the reference. Keeping `%` out of stored paths is what keeps that question
+/// from existing.
 ///
 /// A space and a parenthesis are refused because a markdown link target cannot
 /// carry them reliably - a space ends the target and an unbalanced `)` closes
@@ -170,6 +180,7 @@ pub fn validate_asset_path(path: &str) -> Result<(), AssetPathError> {
     if path.contains('\\')
         || path.contains(':')
         || path.contains('#')
+        || path.contains('%')
         || path.contains(' ')
         || path.contains('(')
         || path.contains(')')
@@ -523,6 +534,27 @@ Again: ![d](assets/flow.png)\n\
     fn a_hash_in_a_path_is_refused() {
         assert_eq!(
             validate_asset_path("assets/a#b.png"),
+            Err(AssetPathError::BadCharacter)
+        );
+    }
+
+    /// A `%` is refused because two layers decode one on the way back: the MCP
+    /// surface percent-decodes an identifier before it reaches this validator,
+    /// and the markdown renderer percent-encodes a link target on its way into
+    /// HTML. Both spellings below would otherwise name the same file, and no
+    /// surface would be wrong to pick either.
+    #[test]
+    fn a_percent_in_a_path_is_refused() {
+        assert_eq!(
+            validate_asset_path("assets/100%.png"),
+            Err(AssetPathError::BadCharacter)
+        );
+        assert_eq!(
+            validate_asset_path("assets/100%25.png"),
+            Err(AssetPathError::BadCharacter)
+        );
+        assert_eq!(
+            validate_asset_path("assets/%2e%2e/x.png"),
             Err(AssetPathError::BadCharacter)
         );
     }
