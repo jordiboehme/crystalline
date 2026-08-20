@@ -1563,3 +1563,64 @@ async fn a_delete_preview_of_an_attachment_reports_its_size() {
         "a preview deletes nothing"
     );
 }
+
+/// **A preview must never be stricter than the act it previews.**
+///
+/// `attachment_delete` reads no bytes and succeeds when either half of the
+/// pair is there, so the preview has to succeed everywhere the delete would.
+/// The half-present case is the reachable one on a file domain: a
+/// hand-edited domain (or a `git pull` that dropped a file) leaves the row
+/// standing over nothing, and the delete still removes the row. Built on the
+/// byte read instead, round one would refuse and an eliciting peer would lose
+/// a delete a legacy peer still gets.
+#[tokio::test]
+async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
+    let (_tmp, engine, root, _scratch) = named_fixture("strict-eng", "strict-scratch").await;
+    engine
+        .attachment_write("strict-eng", "assets/deck.png", PNG.to_vec())
+        .await
+        .unwrap();
+    // The file goes, the row stays: exactly what the delete's own doc comment
+    // describes as still counting as a delete.
+    std::fs::remove_file(root.join("assets/deck.png")).unwrap();
+    assert!(
+        engine
+            .attachment_read("strict-eng", "assets/deck.png")
+            .await
+            .is_err(),
+        "the read this preview used to be built on refuses here"
+    );
+
+    let preview = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "strict-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview["attachment"], true, "{preview}");
+    assert_eq!(
+        preview["size"],
+        PNG.len(),
+        "the standing row is where the number comes from: {preview}"
+    );
+
+    // And the delete the preview promised still goes through.
+    engine
+        .delete_engram(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "strict-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .attachment_list("strict-eng")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the row went with it"
+    );
+}

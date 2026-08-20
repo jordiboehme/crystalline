@@ -3996,6 +3996,15 @@ impl Engine {
     /// the file can change between the two rounds, so the guard is worth
     /// nothing unless it runs in the round that actually deletes, which is
     /// where it already runs.
+    ///
+    /// One narrow divergence the other way, stated so it is not discovered:
+    /// the engram branch loads the engram's content unconditionally, to see
+    /// what it references, where the delete loads it only when a checksum is
+    /// being compared. A row whose content cannot be loaded therefore fails
+    /// the preview while the plain delete of it would succeed - reachable on a
+    /// virtual domain holding a row with no stored content. It is a miss the
+    /// caller can act on rather than a silent one, and the alternative is
+    /// answering "attachments: none" for an engram nobody could read.
     pub async fn delete_preview(&self, p: &DeleteParams) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -4006,16 +4015,11 @@ impl Engine {
                     "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
                 )));
             }
-            // The bytes are read and dropped for one number. It is the same
-            // read the delete's own surfaces make, it is bounded by
-            // `MAX_ATTACHMENT_BYTES`, and it is what makes an attachment that
-            // is not there answer `NotFound` now instead of after the user has
-            // said yes to deleting it.
-            let (_, row) = self.attachment_read(&p.domain, &path).await?;
+            let size = self.attachment_delete_size(&p.domain, &path).await?;
             return Ok(json!({
                 "domain": p.domain,
                 "path": path,
-                "size": row.size,
+                "size": size,
                 "attachment": true,
             }));
         }
@@ -4029,6 +4033,52 @@ impl Engine {
             "path": desc.path,
             "attachments": attachments,
         }))
+    }
+
+    /// How many bytes [`Engine::attachment_delete`] would remove, or
+    /// [`EngineError::NotFound`] when it would remove nothing.
+    ///
+    /// **Deliberately not [`Engine::attachment_read`], and the difference is a
+    /// bug rather than a preference.** That read refuses a file over
+    /// [`crystalline_core::MAX_ATTACHMENT_BYTES`] and, on a virtual domain,
+    /// insists on both a row and a blob. The delete does neither: it reads no
+    /// bytes and succeeds when either half is there. A preview built on the
+    /// read would therefore fail round one - and so refuse the delete outright
+    /// for a peer that gets asked - on exactly the files this verb is the
+    /// escape hatch for: the stray oversized file the walker skipped and so
+    /// never gave a row, and the half-present pair a hand-edited domain leaves
+    /// behind. **A preview must never be stricter than the act it previews.**
+    ///
+    /// So the size is looked up rather than measured: the file's own metadata
+    /// where there is a file, the recorded row where the file is already gone
+    /// and only the row stands. No bytes are read and nothing is written -
+    /// unlike the read, which heals the row it serves, so round one no longer
+    /// mutates the derived layer at all.
+    async fn attachment_delete_size(&self, domain: &str, path: &str) -> Result<u64> {
+        validate_attachment_path(path)?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let row = {
+            let store = self.store.lock().await;
+            store.get_attachment(domain_id, path).await?
+        };
+        // Whichever half the delete would find, in the order that gives the
+        // truest number: a row can be stale about a file that is right there,
+        // and a file cannot be stale about itself.
+        if let ContentSource::File { root } = &source {
+            let abs = contained_asset_path(root, path)?;
+            match std::fs::metadata(&abs) {
+                Ok(meta) => return Ok(meta.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        row.map(|row| row.size)
+            .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))
     }
 
     /// The stored attachments `src` refers to that nothing else in its domain

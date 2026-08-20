@@ -1111,3 +1111,57 @@ async fn a_legacy_peer_deletes_immediately_with_no_input_required() {
     );
     assert!(!path.exists(), "the engram is gone: {}", path.display());
 }
+
+/// **An eliciting peer keeps every delete a legacy peer has**, including the
+/// one this verb exists as an escape hatch for: a stray file above the
+/// attachment ceiling, which the walker skips and so never gives a row.
+///
+/// Round one has to succeed before a user can be asked anything, so a preview
+/// that refused an over-cap file would not merely lose the byte count - it
+/// would refuse the delete outright, and only for the clients that ask before
+/// destroying. The whole round trip is driven here rather than the question
+/// alone, because "asks, then cannot act" would be the same regression one
+/// step later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
+    let h = Harness::new().await;
+    let assets = h.root.join("eng/assets");
+    std::fs::create_dir_all(&assets).unwrap();
+    let over_cap = crystalline_core::MAX_ATTACHMENT_BYTES + 1;
+    let stray = assets.join("big.png");
+    std::fs::write(&stray, vec![0u8; over_cap as usize]).unwrap();
+
+    let mut wire = h.stdio().await;
+    let call = json!({
+        "name": "delete_engram",
+        "arguments": { "domain": "eng", "identifier": "assets/big.png" },
+    });
+
+    let asked = wire.open(eliciting(1, "tools/call", call.clone())).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "the oversized file is previewable, so it is asked about: {asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("assets/big.png") && message.contains(&format!("{over_cap} bytes")),
+        "the question names the file and its real size: {message}"
+    );
+    assert!(stray.exists(), "round one deletes nothing");
+
+    let mut confirmed = call;
+    confirmed["inputResponses"] = answer("accept", true);
+    let done = wire.call(eliciting(2, "tools/call", confirmed)).await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "and the confirmed round removes it: {done}"
+    );
+    assert!(
+        !stray.exists(),
+        "the stray file is gone: {}",
+        stray.display()
+    );
+}

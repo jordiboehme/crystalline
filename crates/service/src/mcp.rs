@@ -164,8 +164,9 @@
 //! whenever the peer can carry one: `delete_engram` returns an
 //! `input_required` result holding a single form elicitation, the client puts
 //! it to its user, and the same call arrives again with the answer beside the
-//! original arguments. [`confirmation_supported`], [`confirm_question`] and
-//! [`confirmed`] are the three halves of that, deliberately tool-agnostic.
+//! original arguments. [`confirmation_supported`] decides whether to ask,
+//! [`confirm_question`] builds the question and [`confirmed`] reads the
+//! answer; all three are deliberately tool-agnostic.
 //!
 //! **The gate decides whether the flow exists at all, not how it behaves.** A
 //! peer below 2026-07-28 has no result shape to receive a question in, and a
@@ -2329,6 +2330,85 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// One `inputResponses` map holding `value` under the `confirm` key.
+    fn responses(value: Value) -> Option<rmcp::model::InputResponses> {
+        let mut map = rmcp::model::InputResponses::new();
+        map.insert(CONFIRM_KEY.to_string(), value);
+        Some(map)
+    }
+
+    /// **The parser two more confirmation flows will be built on, so every
+    /// shape it can be handed is pinned rather than the two that are obvious.**
+    ///
+    /// The invariant, and the only one that matters: nothing malformed
+    /// confirms. `Some(true)` is reachable from exactly one shape - an
+    /// accepted question whose content carries the boolean `true` under the
+    /// key it was asked for. Everything else that is an answer is a no, and
+    /// only the genuine absence of an answer is [`None`], because that is what
+    /// opens round one.
+    #[test]
+    fn confirmed_says_yes_to_one_shape_and_no_to_every_other() {
+        let yes = [json!({ "action": "accept", "content": { "confirm": true } })];
+        for value in yes {
+            assert_eq!(
+                confirmed(&responses(value.clone())),
+                Some(true),
+                "an accepted yes confirms: {value}"
+            );
+        }
+
+        let no = [
+            // Accepted, but not a yes.
+            json!({ "action": "accept", "content": { "confirm": false } }),
+            // Accepted with nothing in it, or with the wrong thing in it.
+            json!({ "action": "accept" }),
+            json!({ "action": "accept", "content": {} }),
+            json!({ "action": "accept", "content": null }),
+            json!({ "action": "accept", "content": { "confirm": "true" } }),
+            json!({ "action": "accept", "content": { "confirm": 1 } }),
+            json!({ "action": "accept", "content": { "confirmed": true } }),
+            // The two refusals the specification names.
+            json!({ "action": "decline" }),
+            json!({ "action": "cancel", "content": { "confirm": true } }),
+            // An action a later revision might add, which we have never heard
+            // of and therefore must not read as consent.
+            json!({ "action": "deferred", "content": { "confirm": true } }),
+            // Shapes that are not an `ElicitResult` at all.
+            json!({ "content": { "confirm": true } }),
+            json!({ "action": null, "content": { "confirm": true } }),
+            json!({ "action": ["accept"], "content": { "confirm": true } }),
+            json!("accept"),
+            json!(true),
+            json!(null),
+            json!([{ "action": "accept", "content": { "confirm": true } }]),
+        ];
+        for value in no {
+            assert_eq!(
+                confirmed(&responses(value.clone())),
+                Some(false),
+                "nothing but an accepted yes confirms: {value}"
+            );
+        }
+
+        // Round one: no answer at all, or an answer to some other question.
+        assert_eq!(confirmed(&None), None, "no responses is round one");
+        assert_eq!(
+            confirmed(&Some(rmcp::model::InputResponses::new())),
+            None,
+            "an empty map is round one"
+        );
+        let mut elsewhere = rmcp::model::InputResponses::new();
+        elsewhere.insert(
+            "something_else".to_string(),
+            json!({ "action": "accept", "content": { "confirm": true } }),
+        );
+        assert_eq!(
+            confirmed(&Some(elsewhere)),
+            None,
+            "a yes filed under another key answers another question"
+        );
+    }
 
     #[test]
     fn transient_remote_errors_map_to_the_internal_error_class() {
