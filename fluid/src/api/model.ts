@@ -53,6 +53,9 @@ export type RetireBody = components["schemas"]["RetireBody"];
 /** What `POST /domains/{domain}/move` takes. */
 export type MoveBody = components["schemas"]["MoveBody"];
 
+/** What both verbs on `/domains/{domain}/evolve/ack` take. */
+export type AckBody = components["schemas"]["AckBody"];
+
 /** What `PUT /domains/{domain}/manifest` takes. */
 export type SaveManifestBody = components["schemas"]["SaveManifestBody"];
 
