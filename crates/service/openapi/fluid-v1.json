@@ -2792,13 +2792,14 @@
         },
         "responses": {
           "200": {
-            "description": "The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.",
+            "description": "The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.\n\n`attachment_warnings` lists the attachments the move could not carry, one sentence each and empty when everything travelled; those files stay whole in the source domain.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object"
                 },
                 "example": {
+                  "attachment_warnings": [],
                   "cross_domain": false,
                   "from": {
                     "domain": "eng",

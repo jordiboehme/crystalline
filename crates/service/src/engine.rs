@@ -2108,15 +2108,18 @@ impl Engine {
     /// rewritten to, and that rewrite has to travel in the same write that
     /// lands the engram at its destination.
     ///
-    /// Every miss is silent by design: a reference to a file that is not there
-    /// is already a dangling reference, and a move is not the verb that should
-    /// refuse over one.
+    /// Every miss is quiet rather than fatal: a reference to a file that is not
+    /// there is already a dangling reference, and a move is not the verb that
+    /// should refuse over one. Quiet is not silent, though - each miss is
+    /// returned beside the plan as a sentence the move receipt carries, so the
+    /// caller learns which attachment stayed behind without having to read the
+    /// daemon's trace.
     async fn plan_attachment_carry(
         &self,
         src: &EngramDescriptor,
         dest_domain: &str,
         content: &str,
-    ) -> Vec<AttachmentCarry> {
+    ) -> (Vec<AttachmentCarry>, Vec<String>) {
         let parsed = parse_engram(content).ok();
         let body = parsed
             .as_ref()
@@ -2128,8 +2131,9 @@ impl Engine {
             candidates.push(claim);
         }
         if candidates.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
+        let mut warnings: Vec<String> = Vec::new();
 
         // The bytes are read and dropped here: what the plan needs is the
         // sha256, and the read is what makes the row's sha describe the file
@@ -2143,17 +2147,23 @@ impl Engine {
                 Err(e) => {
                     // Loud enough to answer "why did my screenshot not
                     // travel": the move went through, but something the engram
-                    // points at did not come with it.
+                    // points at did not come with it. The trace keeps the store
+                    // error, which is an operator's detail; the receipt gets
+                    // the same sentence without it.
                     tracing::warn!(
                         "attachment '{path}' referenced by '{}' is not in '{}' ({e}); the move carries nothing for it",
                         src.permalink,
                         src.domain
                     );
+                    warnings.push(format!(
+                        "attachment '{path}' referenced by '{}' is not in '{}'; the move carries nothing for it",
+                        src.permalink, src.domain
+                    ));
                 }
             }
         }
         if present.is_empty() {
-            return Vec::new();
+            return (Vec::new(), warnings);
         }
 
         let paths: Vec<String> = present.iter().map(|(path, _)| path.clone()).collect();
@@ -2165,6 +2175,14 @@ impl Engine {
                 .free_asset_destination(dest_domain, &from, &sha, &claimed)
                 .await
             else {
+                // The file is whole and still in the source domain, which is
+                // the part that matters; what the caller cannot see without
+                // being told is that the reference travelling with the engram
+                // now points at whatever the destination happens to hold under
+                // that name.
+                warnings.push(format!(
+                    "attachment '{from}' could not be carried to '{dest_domain}'; its reference at the destination may resolve to a different same-name file"
+                ));
                 continue;
             };
             claimed.insert(to.clone());
@@ -2175,7 +2193,7 @@ impl Engine {
                 reuse,
             });
         }
-        plan
+        (plan, warnings)
     }
 
     /// The attachment paths another engram in the source domain still
@@ -3425,8 +3443,12 @@ impl Engine {
 
         // What the move carries besides the engram: the attachments it
         // references or claims. Filled in the cross-domain branch and acted on
-        // once every store lock that branch takes has been released.
+        // once every store lock that branch takes has been released. Beside it,
+        // the attachments the plan could not carry, which ride out in the
+        // receipt so a caller who never sees the daemon's trace still learns
+        // what stayed behind.
         let mut carried: Vec<AttachmentCarry> = Vec::new();
+        let mut attachment_warnings: Vec<String> = Vec::new();
 
         if cross {
             // Read the source content, index it into the destination source,
@@ -3451,7 +3473,7 @@ impl Engine {
             // Resolved before the write, since an attachment that has to be
             // renamed at the destination changes the very text being written:
             // the engram lands already pointing at the name its file took.
-            carried = self
+            (carried, attachment_warnings) = self
                 .plan_attachment_carry(&src, &dest_domain, &content)
                 .await;
             let renames: BTreeMap<String, String> = carried
@@ -3607,6 +3629,7 @@ impl Engine {
             "to": { "domain": dest_domain, "path": dest_rel },
             "cross_domain": cross,
             "links_rewritten": rewritten,
+            "attachment_warnings": attachment_warnings,
         }))
     }
 

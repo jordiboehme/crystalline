@@ -1025,6 +1025,64 @@ async fn a_reference_to_a_missing_file_never_fails_the_move() {
 }
 
 #[tokio::test]
+async fn a_carry_that_cannot_land_surfaces_a_warning_in_the_move_result() {
+    let (_tmp, engine, _from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![ghost](assets/ghost.png)"),
+        )
+        .await
+        .unwrap();
+
+    let result = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let warnings = result["attachment_warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{result}");
+    let warning = warnings[0].as_str().unwrap();
+    assert!(warning.contains("assets/ghost.png"), "{warning}");
+    assert!(warning.contains("note"), "{warning}");
+    assert!(warning.contains("from"), "{warning}");
+}
+
+#[tokio::test]
+async fn a_clean_move_reports_an_empty_warnings_array() {
+    let (_tmp, engine, _from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    let crossed = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+    assert_eq!(crossed["attachment_warnings"], serde_json::json!([]));
+
+    let renamed = engine
+        .move_engram(&move_params("into", "note", "notes/note.md", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed["attachment_warnings"],
+        serde_json::json!([]),
+        "a same-domain move carries nothing and so warns about nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
     let (_tmp, engine, from, into, _scratch) = move_fixture().await;
     engine
