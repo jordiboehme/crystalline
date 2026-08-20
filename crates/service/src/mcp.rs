@@ -168,6 +168,13 @@
 //! [`confirm_question`] builds the question and [`confirmed`] reads the
 //! answer; all three are deliberately tool-agnostic.
 //!
+//! **Two more rounds are built on those three.** `edit_engram` asks before it
+//! records an `evolve_ack` or takes one back, and `write_engram` asks on a
+//! permalink collision - the one round whose question is not a yes-or-no, so
+//! it brings a single-select of its own ([`collision_question`],
+//! [`resolved_overwrite`]) and a third condition beside the gate: a call that
+//! already passed `overwrite` answered the question before it was put.
+//!
 //! **The gate decides whether the flow exists at all, not how it behaves.** A
 //! peer below 2026-07-28 has no result shape to receive a question in, and a
 //! peer that never declared an elicitation capability has no way to ask its
@@ -198,13 +205,13 @@ use rmcp::handler::server::tool::InputResponses;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CacheScope, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult, ElicitRequest,
-    ElicitRequestParams, ElicitationSchema, ErrorData, GetPromptRequestParams, GetPromptResponse,
-    Implementation, InitializeRequestParams, InitializeResult, InputRequest, InputRequests,
-    InputRequiredResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
-    ListToolsResult, PaginatedRequestParams, ProgressNotificationParam, PromptMessage,
-    ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo, SubscriptionFilter,
-    Tool,
+    ElicitRequestParams, ElicitationSchema, EnumSchema, ErrorData, GetPromptRequestParams,
+    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult, InputRequest,
+    InputRequests, InputRequiredResult, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+    ServerInfo, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
@@ -358,6 +365,22 @@ fn peer_gets_cache_hints(context: &RequestContext<RoleServer>) -> bool {
 /// entry [`confirmed`] reads back out of the client's `inputResponses`.
 const CONFIRM_KEY: &str = "confirm";
 
+/// The key the collision question and its answer are both filed under, and the
+/// two choices it offers. `overwrite` is spelled exactly as `write_engram`'s
+/// own parameter, so the answer and the retry say the same word.
+const RESOLUTION_KEY: &str = "resolution";
+const RESOLUTION_OVERWRITE: &str = "overwrite";
+const RESOLUTION_CANCEL: &str = "cancel";
+
+/// The substring of the engine's permalink-collision error that identifies it.
+///
+/// The engine words one message for this failure
+/// (`crate::engine::Engine::write_engram_as`) and this is the phrase it is
+/// recognized by; `a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts`
+/// in `tests/engine_writes.rs` pins it there, so a rewording breaks a test
+/// beside the sentence rather than silently disarming the round here.
+const COLLISION_MARKER: &str = "already exists in domain";
+
 /// Whether this peer can be asked before a destructive tool acts.
 ///
 /// Two conditions, both necessary. The revision has to be 2026-07-28 or newer,
@@ -401,9 +424,23 @@ fn confirm_question(message: String) -> InputRequiredResult {
         })
         .build()
         .expect("the confirmation schema names the property it requires");
+    form_question(CONFIRM_KEY, message, requested_schema)
+}
+
+/// One form elicitation, filed under the key its single property carries.
+///
+/// The shape every round in this file returns: one request in the map, keyed
+/// the same as the property inside it, so the client's answer comes back under
+/// a name the reader already knows. Split out of [`confirm_question`] when the
+/// second question stopped being a boolean.
+fn form_question(
+    key: &str,
+    message: String,
+    requested_schema: ElicitationSchema,
+) -> InputRequiredResult {
     let mut requests = InputRequests::new();
     requests.insert(
-        CONFIRM_KEY.to_string(),
+        key.to_string(),
         InputRequest::Elicitation(ElicitRequest::new(
             ElicitRequestParams::FormElicitationParams {
                 meta: None,
@@ -436,6 +473,52 @@ fn confirmed(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
         return Some(false);
     }
     Some(answer["content"][CONFIRM_KEY] == json!(true))
+}
+
+/// The choice a permalink collision offers, as the MRTR round `write_engram`
+/// returns instead of the bare error.
+///
+/// A single-select enum rather than [`confirm_question`]'s boolean, because
+/// the collision is not a yes-or-no: "no" here means "leave what is there",
+/// which is a decision worth a word of its own rather than the absence of a
+/// yes. The options are titled, so a client renders two sentences instead of
+/// two identifiers, and `cancel` is deliberately not the schema default -
+/// nothing is preselected, because either answer is a real choice.
+fn collision_question(message: String) -> InputRequiredResult {
+    let choices = EnumSchema::builder(vec![
+        RESOLUTION_OVERWRITE.to_string(),
+        RESOLUTION_CANCEL.to_string(),
+    ])
+    .title("Resolution")
+    .description("What to do about the engram already at that permalink.")
+    .enum_titles(vec![
+        "Overwrite the existing engram".to_string(),
+        "Cancel and write nothing".to_string(),
+    ])
+    .expect("two titles for two choices")
+    .build();
+    let requested_schema = ElicitationSchema::builder()
+        .required_enum_schema(RESOLUTION_KEY, choices)
+        .build()
+        .expect("the resolution schema names the property it requires");
+    form_question(RESOLUTION_KEY, message, requested_schema)
+}
+
+/// Whether the client chose to overwrite, or `None` when it has not been asked
+/// yet.
+///
+/// The same tri-state discipline as [`confirmed`], read as plain JSON for the
+/// same reason: `Some(true)` for exactly one shape - an accepted question whose
+/// content carries the string `overwrite` under the key it was asked for - and
+/// `Some(false)` for every other answer, an explicit `cancel` and a decline
+/// alike. Only the genuine absence of an answer is [`None`], because that is
+/// what opens round one; anything malformed leaves the existing engram alone.
+fn resolved_overwrite(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
+    let answer = responses.as_ref()?.get(RESOLUTION_KEY)?;
+    if answer["action"] != json!("accept") {
+        return Some(false);
+    }
+    Some(answer["content"][RESOLUTION_KEY] == json!(RESOLUTION_OVERWRITE))
 }
 
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
@@ -817,7 +900,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -828,13 +911,53 @@ impl McpServer {
     async fn write_engram(
         &self,
         Parameters(p): Parameters<WriteParams>,
+        responses: InputResponses,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .write_engram_as(&p, client_actor(&ctx).as_deref())
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+    ) -> Result<CallToolResponse, ErrorData> {
+        let actor = client_actor(&ctx);
+        let written = self.engine.write_engram_as(&p, actor.as_deref()).await;
+
+        // A permalink collision is the one failure here with a real choice
+        // behind it, so a peer that can put that choice to its user is offered
+        // it instead of the error. `overwrite` already being set is belt and
+        // braces - the engine cannot raise this error when it is - but it
+        // keeps the condition readable without a trip through engine
+        // internals, and it is what the flow promises: a caller that asked for
+        // the overwrite is never asked about it.
+        let collision = match &written {
+            Err(e) if !p.overwrite && confirmation_supported(&ctx) => {
+                let message = e.to_string();
+                message
+                    .contains(COLLISION_MARKER)
+                    .then(|| collision_permalink(&message).map(str::to_string))
+                    .flatten()
+            }
+            _ => None,
+        };
+        let Some(permalink) = collision else {
+            return written
+                .map_err(to_error)
+                .and_then(ok)
+                .map(CallToolResponse::from);
+        };
+
+        match resolved_overwrite(&responses.0) {
+            None => Ok(collision_question(collision_question_text(&p, &permalink)).into()),
+            Some(false) => refuse(COLLISION_REFUSAL).map(CallToolResponse::from),
+            // The retry is the original call with the answer applied, so
+            // everything else about the write - folder, tags, metadata, the
+            // actor - is the caller's, not a reconstruction.
+            Some(true) => {
+                let mut retry = p.clone();
+                retry.overwrite = true;
+                self.engine
+                    .write_engram_as(&retry, actor.as_deref())
+                    .await
+                    .map_err(to_error)
+                    .and_then(ok)
+                    .map(CallToolResponse::from)
+            }
+        }
     }
 
     #[tool(
@@ -2270,6 +2393,38 @@ fn delete_question(preview: &Value) -> String {
     )
 }
 
+/// The permalink the engine's collision message names, when it names one.
+///
+/// The engine words that failure `permalink '<permalink>' already exists in
+/// domain '<domain>' (at <path>); ...`, and reading the value back out of it is
+/// both cheaper and truer than re-deriving it here: slugification is the
+/// engine's (the folder prefix, the reserved names, the lot), and a second
+/// implementation on this side could name a permalink the write would never
+/// have used. `None` when the phrase is not there, which sends the caller back
+/// to the bare error rather than to a question naming the wrong thing.
+fn collision_permalink(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("permalink '")?;
+    let (permalink, _) = rest.split_once('\'')?;
+    (!permalink.is_empty()).then_some(permalink)
+}
+
+/// The sentence a permalink collision asks instead of reporting.
+///
+/// It names all three things the user needs to decide with - what would be
+/// written, where it would land and what is already there - because the choice
+/// is between two engrams, and only one of them is in front of the caller.
+fn collision_question_text(p: &WriteParams, permalink: &str) -> String {
+    format!(
+        "'{}' would land at permalink '{permalink}' which already exists in '{}'. Overwrite it, or cancel?",
+        p.title.trim(),
+        p.domain.trim()
+    )
+}
+
+/// What an unresolved collision tells the model: what is still there, and the
+/// one argument that would have replaced it.
+const COLLISION_REFUSAL: &str = "The overwrite was not confirmed, so the existing engram was left in place; nothing was written. Call write_engram again with overwrite=true if the user asks for it.";
+
 /// The sentence an `evolve_ack` assignment asks before it acts.
 ///
 /// Both halves name the consequence rather than the write, because that is
@@ -2462,6 +2617,112 @@ mod tests {
             None,
             "a yes filed under another key answers another question"
         );
+    }
+
+    /// The same invariant as [`confirmed`], on the parser that decides whether
+    /// an existing engram is replaced: nothing malformed overwrites.
+    ///
+    /// The failure mode this rules out is specific to a string answer. A
+    /// boolean has two values and a typo cannot land on the wrong one; a
+    /// single-select can be answered with the wrong case, the title instead of
+    /// the value, an array of one, or nothing at all, and every one of those
+    /// has to read as "leave what is there" rather than as consent to clobber
+    /// it.
+    #[test]
+    fn only_an_accepted_overwrite_replaces_an_existing_engram() {
+        let responses = |value: Value| {
+            let mut map = rmcp::model::InputResponses::new();
+            map.insert(RESOLUTION_KEY.to_string(), value);
+            Some(map)
+        };
+
+        assert_eq!(
+            resolved_overwrite(&responses(
+                json!({ "action": "accept", "content": { "resolution": "overwrite" } })
+            )),
+            Some(true),
+            "an accepted overwrite replaces"
+        );
+
+        let no = [
+            // The other choice, accepted.
+            json!({ "action": "accept", "content": { "resolution": "cancel" } }),
+            // Accepted with nothing in it, or with the wrong thing in it.
+            json!({ "action": "accept" }),
+            json!({ "action": "accept", "content": {} }),
+            json!({ "action": "accept", "content": null }),
+            json!({ "action": "accept", "content": { "resolution": "Overwrite" } }),
+            json!({ "action": "accept", "content": { "resolution": "overwrite " } }),
+            json!({ "action": "accept", "content": { "resolution": true } }),
+            json!({ "action": "accept", "content": { "resolution": ["overwrite"] } }),
+            // The title rather than the value behind it.
+            json!({ "action": "accept", "content": { "resolution": "Overwrite the existing engram" } }),
+            // The right value under the wrong key.
+            json!({ "action": "accept", "content": { "confirm": "overwrite" } }),
+            // The two refusals the specification names, and one it does not.
+            json!({ "action": "decline" }),
+            json!({ "action": "cancel", "content": { "resolution": "overwrite" } }),
+            json!({ "action": "deferred", "content": { "resolution": "overwrite" } }),
+            // Shapes that are not an `ElicitResult` at all.
+            json!({ "content": { "resolution": "overwrite" } }),
+            json!("overwrite"),
+            json!(null),
+        ];
+        for value in no {
+            assert_eq!(
+                resolved_overwrite(&responses(value.clone())),
+                Some(false),
+                "nothing but an accepted overwrite replaces: {value}"
+            );
+        }
+
+        // Round one: no answer at all, or an answer to some other question.
+        assert_eq!(resolved_overwrite(&None), None, "no responses is round one");
+        assert_eq!(
+            resolved_overwrite(&Some(rmcp::model::InputResponses::new())),
+            None,
+            "an empty map is round one"
+        );
+        let mut elsewhere = rmcp::model::InputResponses::new();
+        elsewhere.insert(
+            CONFIRM_KEY.to_string(),
+            json!({ "action": "accept", "content": { "resolution": "overwrite" } }),
+        );
+        assert_eq!(
+            resolved_overwrite(&Some(elsewhere)),
+            None,
+            "an answer filed under the confirmation key answers another question"
+        );
+    }
+
+    /// The engine message is parsed for the permalink, and a message that does
+    /// not carry one never becomes a question naming the wrong thing.
+    ///
+    /// The positive case is worded exactly as `engine.rs` words it - the same
+    /// sentence `a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts`
+    /// pins from the engine side - so the two halves of the seam are asserted
+    /// against the same string.
+    #[test]
+    fn the_colliding_permalink_is_read_out_of_the_engine_message() {
+        assert_eq!(
+            collision_permalink(
+                "permalink 'topic/taken' already exists in domain 'eng' (at topic/taken.md); pass overwrite=true to replace"
+            ),
+            Some("topic/taken"),
+            "the folder prefix survives, because the engine put it there"
+        );
+
+        for message in [
+            "the domain 'eng' is read only",
+            "permalink 'unterminated, so there is nothing to read out",
+            "permalink '' already exists in domain 'eng' (at .md)",
+        ] {
+            assert_eq!(
+                collision_permalink(message),
+                None,
+                "a message naming no permalink yields none: {message}"
+            );
+        }
     }
 
     #[test]

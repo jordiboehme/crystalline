@@ -1484,3 +1484,364 @@ async fn a_legacy_peer_acks_immediately() {
         "the entry is gone"
     );
 }
+
+// --- a permalink collision, resolved rather than reported -------------------
+//
+// `write_engram` is the third tool that answers a round, and the first whose
+// question is not a yes-or-no: the engine's collision error names a real
+// choice, so an eliciting peer is offered it as a single-select rather than
+// handed the error and left to reconstruct `overwrite=true` from prose. The
+// gate is the same two-sided one the delete round proves, plus a third
+// condition of its own - the call did not already ask for an overwrite.
+
+/// The body the first write lands, and the body every collision tries to land
+/// over it. Different bytes, so "did the overwrite happen" is readable off
+/// disk rather than inferred from a receipt.
+const FIRST_BODY: &str = "The first body.";
+const SECOND_BODY: &str = "The second body.";
+
+/// One `write_engram` call landing `content` under the title `Taken`, with an
+/// optional explicit overwrite and an optional answer to the round.
+fn write_taken(content: &str, overwrite: bool, responses: Option<Value>) -> Value {
+    let mut arguments = json!({
+        "domain": "eng",
+        "title": "Taken",
+        "content": content,
+    });
+    if overwrite {
+        arguments["overwrite"] = json!(true);
+    }
+    let mut params = json!({ "name": "write_engram", "arguments": arguments });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The client's answer to the `resolution` question, as an `ElicitResult`.
+fn resolution(action: &str, choice: &str) -> Value {
+    json!({ "resolution": { "action": action, "content": { "resolution": choice } } })
+}
+
+/// Open a modern connection by writing the engram every collision below lands
+/// on, and hand back the connection and the file that must survive a cancel.
+///
+/// The opener is a plain modern write rather than an eliciting one so the
+/// first write is never itself a round: nothing exists to collide with yet.
+async fn taken_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
+    let mut wire = h.stdio().await;
+    let written = wire
+        .open(modern(
+            1,
+            "tools/call",
+            write_taken(FIRST_BODY, false, None),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the engram to collide with has to exist first: {written}"
+    );
+    let path = h.root.join("eng/taken.md");
+    assert!(path.exists(), "the write landed on disk");
+    (wire, path)
+}
+
+/// Round one: the collision comes back as a choice, and nothing is written.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_collision_on_an_eliciting_peer_offers_overwrite_or_cancel() {
+    let h = Harness::new().await;
+    let (mut wire, path) = taken_engram(&h).await;
+    let before = std::fs::read(&path).unwrap();
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than the bare error: {asked}"
+    );
+
+    let question = &result["inputRequests"]["resolution"];
+    assert_eq!(
+        question["method"],
+        json!("elicitation/create"),
+        "the round is an elicitation keyed `resolution`: {asked}"
+    );
+    let schema = &question["params"]["requestedSchema"];
+    assert_eq!(
+        schema["required"],
+        json!(["resolution"]),
+        "and the one property is required: {asked}"
+    );
+    let property = &schema["properties"]["resolution"];
+    assert_eq!(property["type"], json!("string"), "a string enum: {asked}");
+    let options: Vec<&str> = property["oneOf"]
+        .as_array()
+        .expect("a titled single-select carries oneOf")
+        .iter()
+        .map(|option| option["const"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        options,
+        vec!["overwrite", "cancel"],
+        "exactly the two choices, in that order: {asked}"
+    );
+    for option in property["oneOf"].as_array().unwrap() {
+        let title = option["title"].as_str().unwrap_or_default();
+        assert!(
+            !title.is_empty(),
+            "each option is titled for a human to read: {asked}"
+        );
+    }
+
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("'Taken'"),
+        "the question names the title that would land: {message}"
+    );
+    assert!(
+        message.contains("'taken'"),
+        "and the permalink it would land at: {message}"
+    );
+    assert!(
+        message.contains("'eng'"),
+        "and the domain it collides in: {message}"
+    );
+    assert!(
+        message.contains("Overwrite it, or cancel?"),
+        "and puts the choice plainly: {message}"
+    );
+
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "round one writes nothing: {}",
+        path.display()
+    );
+}
+
+/// Round two with `overwrite`: the same call replaces the existing engram.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn choosing_overwrite_replaces_the_engram() {
+    let h = Harness::new().await;
+    let (mut wire, path) = taken_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            write_taken(SECOND_BODY, false, Some(resolution("accept", "overwrite"))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the resolved round writes: {done}"
+    );
+    assert_eq!(
+        done["result"]["resultType"],
+        json!("complete"),
+        "and it is an ordinary complete result: {done}"
+    );
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains(SECOND_BODY) && !on_disk.contains(FIRST_BODY),
+        "the new body replaced the old one: {on_disk}"
+    );
+}
+
+/// Round two with `cancel`: the call refuses and the engram is untouched, byte
+/// for byte. A decline - the other way a client says no - is the same answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn choosing_cancel_leaves_the_engram() {
+    let h = Harness::new().await;
+    let (mut wire, path) = taken_engram(&h).await;
+    let before = std::fs::read(&path).unwrap();
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let refused = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            write_taken(SECOND_BODY, false, Some(resolution("accept", "cancel"))),
+        ))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "a cancel is a refusal the model can read: {refused}"
+    );
+    let text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("the existing engram was left in place; nothing was written"),
+        "and it says what did not happen: {text}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the engram survives a cancel byte for byte: {}",
+        path.display()
+    );
+
+    // A declined question never carries a choice at all, and must read as a no
+    // rather than as a missing answer that reopens round one.
+    let declined = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            write_taken(SECOND_BODY, false, Some(resolution("decline", ""))),
+        ))
+        .await;
+    assert_eq!(
+        declined["result"]["isError"],
+        json!(true),
+        "a decline refuses too: {declined}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "and writes nothing either"
+    );
+}
+
+/// An eliciting peer that already asked for an overwrite is not asked again:
+/// the caller answered the question before it was put.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_overwrite_never_elicits() {
+    let h = Harness::new().await;
+    let (mut wire, path) = taken_engram(&h).await;
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            write_taken(SECOND_BODY, true, None),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the write runs on the first call: {done}"
+    );
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a caller that asked for the overwrite is not asked about it: {done}"
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains(SECOND_BODY),
+        "and the overwrite happened"
+    );
+}
+
+/// A modern peer that declared no elicitation capability gets 0.15.0's
+/// behaviour: the bare collision error, on the first call, with the hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_peer_without_elicitation_gets_the_bare_collision_error() {
+    let h = Harness::new().await;
+    let (mut wire, path) = taken_engram(&h).await;
+    let before = std::fs::read(&path).unwrap();
+
+    let refused = wire
+        .call(modern(
+            2,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already exists in domain")
+            && message.contains("pass overwrite=true to replace"),
+        "a peer that cannot answer a question is handed the error: {refused}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "and nothing was written"
+    );
+}
+
+/// A legacy peer is served byte for byte what it was before, elicitation
+/// capability or not: no round, and the collision error with its hint.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_collision_still_errors_with_the_overwrite_hint() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+
+    let written = wire
+        .call(request(
+            2,
+            "tools/call",
+            write_taken(FIRST_BODY, false, None),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the first write lands: {written}"
+    );
+    let path = h.root.join("eng/taken.md");
+    let before = std::fs::read(&path).unwrap();
+
+    let refused = wire
+        .call(request(
+            3,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("already exists in domain")
+            && message.contains("pass overwrite=true to replace"),
+        "the collision is reported, not negotiated: {refused}"
+    );
+    assert!(
+        refused["result"].is_null(),
+        "and there is no round to carry: {refused}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the existing engram is untouched"
+    );
+}

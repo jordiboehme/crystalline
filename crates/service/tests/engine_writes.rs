@@ -110,6 +110,51 @@ async fn a_zero_edit_save_is_byte_identical() {
     );
 }
 
+/// **The permalink-collision message is an interface, not just prose.**
+///
+/// `write_engram`'s MCP handler (`crates/service/src/mcp.rs`, the
+/// `COLLISION_MARKER` interception) recognizes this one failure by the marker
+/// `already exists in domain` in the error's display, and reads the colliding
+/// permalink back out of `permalink '<permalink>'` to word the
+/// overwrite-or-cancel question an eliciting 2026-07-28 peer is offered.
+/// Rewording the message would disarm that round silently - the write would
+/// simply go back to erroring - so both halves are pinned here, where a
+/// rewording breaks loudly beside the sentence being reworded.
+#[tokio::test]
+async fn a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts() {
+    let (_tmp, engine) = engine_fixture().await;
+
+    // `alpha.md` is in the fixture, so a second Alpha collides with it.
+    let err = engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "eng".to_string(),
+            title: "Alpha".to_string(),
+            content: "A second rule about alpha.".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec![],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap_err();
+
+    let message = err.to_string();
+    assert!(
+        message.contains("already exists in domain"),
+        "the marker mcp.rs intercepts on: {message}"
+    );
+    assert!(
+        message.contains("permalink 'alpha'"),
+        "the permalink, quoted where mcp.rs reads it out: {message}"
+    );
+    assert!(
+        message.contains("pass overwrite=true to replace"),
+        "and the hint every non-eliciting peer still gets: {message}"
+    );
+}
+
 /// A stale token is refused on a FILE domain too - this is what the spec's
 /// "the engine's expected_checksum path enforces it" adds over slice 1, where
 /// file-domain edits ignored the token. The wording is pinned because the REST
