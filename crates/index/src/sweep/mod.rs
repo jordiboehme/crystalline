@@ -840,6 +840,13 @@ pub struct Finding {
     pub ack_stale: bool,
     /// The note the matching or stale acknowledgment carries, when it has one.
     pub ack_note: Option<String>,
+    /// The evidence the matching or stale acknowledgment was **given for**,
+    /// which is a different thing from [`Finding::scope`]: on a stale row the
+    /// two disagree, and that disagreement is the whole story ("acknowledged
+    /// for this, firing on that"). `None` when no acknowledgment spoke to this
+    /// finding, or when the one that did carries no scope and so acknowledged
+    /// nothing in particular.
+    pub ack_scope: Option<String>,
 }
 
 impl Finding {
@@ -868,6 +875,7 @@ impl Finding {
             acknowledged: false,
             ack_stale: false,
             ack_note: None,
+            ack_scope: None,
         }
     }
 
@@ -891,6 +899,7 @@ impl Finding {
             acknowledged: false,
             ack_stale: false,
             ack_note: None,
+            ack_scope: None,
         }
     }
 
@@ -1063,11 +1072,16 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
                 counts.add(finding.family);
                 finding.acknowledged = true;
                 finding.ack_note = ack.note.clone();
+                finding.ack_scope = ack.scope.clone();
                 include
             }
             Some(stale) => {
                 finding.ack_stale = true;
                 finding.ack_note = stale.note.clone();
+                // The entry's own scope, not the finding's: a stale row exists
+                // precisely because those two have drifted apart, and the row
+                // is where a reader compares them.
+                finding.ack_scope = stale.scope.clone();
                 true
             }
             None => true,

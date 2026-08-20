@@ -1134,6 +1134,26 @@ async fn an_ack_whose_evidence_changed_comes_back_stale() {
     let row = rows_on(&v, "live-doc")[0];
     assert_eq!(row["ack_stale"], true);
     assert_eq!(row["ack_note"], "lineage citation, keep");
+    assert_eq!(
+        row["ack_scope"], "eng/retired-thing",
+        "the row says what was acknowledged"
+    );
+    // And the finding's own columns say what it fires on now, so a reader sees
+    // both sides of the drift rather than one of them twice.
+    assert!(
+        row["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("eng/deploy/old-pipeline"),
+        "{row}"
+    );
+    assert!(
+        row["evidence"]
+            .as_str()
+            .unwrap()
+            .contains("eng/retired-thing"),
+        "{row}"
+    );
     assert_eq!(v["acknowledged"]["total"], 0, "nothing was suppressed");
 
     // Re-acknowledged, it takes the new evidence and goes quiet again.

@@ -5123,12 +5123,14 @@ impl Engine {
                 if f.ack_stale {
                     row["ack_stale"] = Value::Bool(true);
                 }
-                // The scope rides the row whenever an acknowledgment spoke to
-                // it, which is what lets a reader see what a stale one was
-                // given for. Named beside `ack_note` rather than plain `scope`,
+                // The scope the acknowledgment was **given for**, which on a
+                // stale row is deliberately not what the finding fires on now:
+                // the row's own evidence and fix columns say that, and the pair
+                // is what shows a reader why the acknowledgment stopped
+                // matching. Named beside `ack_note` rather than plain `scope`,
                 // which at the top level already names the swept domains.
-                if (f.acknowledged || f.ack_stale) && !f.scope.is_empty() {
-                    row["ack_scope"] = Value::String(f.scope.clone());
+                if let Some(scope) = f.ack_scope.as_deref().filter(|s| !s.is_empty()) {
+                    row["ack_scope"] = Value::String(scope.to_string());
                 }
                 if let Some(note) = &f.ack_note {
                     row["ack_note"] = Value::String(note.clone());

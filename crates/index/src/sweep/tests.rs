@@ -1394,6 +1394,15 @@ fn a_second_retired_link_changes_the_scope_and_the_ack_goes_stale() {
     assert!(finding.ack_stale, "the acknowledged evidence changed");
     assert!(!finding.acknowledged);
     assert_eq!(finding.ack_note.as_deref(), Some("lineage citation; keep"));
+    assert_eq!(
+        finding.ack_scope.as_deref(),
+        Some("engineering/old-runbook"),
+        "the row says what was acknowledged, not what the rule fires on now"
+    );
+    assert_eq!(
+        finding.scope, "engineering/old-runbook, engineering/older-runbook",
+        "while the finding's own scope has moved on"
+    );
     assert_eq!(report.acknowledged.total, 0);
 }
 
@@ -1410,6 +1419,20 @@ fn a_scopeless_ack_matches_whatever_the_evidence_becomes() {
     let report = detect(&sweep);
     assert!(!fired(&report).contains(&"V101"), "{:?}", fired(&report));
     assert_eq!(report.acknowledged.total, 1);
+}
+
+/// A scope-less entry acknowledged nothing in particular, so an audited row
+/// carries no acknowledged scope rather than borrowing the finding's own.
+#[test]
+fn a_scopeless_ack_leaves_the_audited_row_without_an_acknowledged_scope() {
+    let mut sweep = v101_fixture();
+    sweep.engrams[0].acks = vec![ack("V101", None, "hand written")];
+    sweep.include_acknowledged = true;
+
+    let finding = only(&detect(&sweep), "V101");
+    assert!(finding.acknowledged);
+    assert_eq!(finding.ack_scope, None);
+    assert_eq!(finding.scope, "engineering/old-runbook");
 }
 
 #[test]
@@ -1443,6 +1466,11 @@ fn include_acknowledged_returns_the_suppressed_finding_marked() {
     assert!(!finding.ack_stale);
     assert_eq!(finding.ack_note.as_deref(), Some("lineage citation; keep"));
     assert_eq!(finding.scope, "engineering/old-runbook");
+    assert_eq!(
+        finding.ack_scope.as_deref(),
+        Some("engineering/old-runbook"),
+        "the two agree while the acknowledgment still matches"
+    );
     assert_eq!(
         report.acknowledged.total, 1,
         "the count is what it suppressed, whether or not the row came back"
