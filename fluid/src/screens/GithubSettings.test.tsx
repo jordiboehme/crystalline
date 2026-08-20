@@ -127,7 +127,9 @@ describe("the GitHub settings screen", () => {
     serveAs("editor");
     renderApp("/settings/github");
 
-    expect(await screen.findByText(/this memory could not be recalled/i)).toBeInTheDocument();
+    expect(
+      await screen.findByText(/this memory could not be recalled/i),
+    ).toBeInTheDocument();
     expect(
       screen.queryByRole("heading", { name: "GitHub" }),
     ).not.toBeInTheDocument();
