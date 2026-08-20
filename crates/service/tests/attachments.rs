@@ -1043,10 +1043,72 @@ async fn a_carry_that_cannot_land_surfaces_a_warning_in_the_move_result() {
 
     let warnings = result["attachment_warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1, "{result}");
-    let warning = warnings[0].as_str().unwrap();
-    assert!(warning.contains("assets/ghost.png"), "{warning}");
-    assert!(warning.contains("note"), "{warning}");
-    assert!(warning.contains("from"), "{warning}");
+    assert_eq!(
+        warnings[0].as_str().unwrap(),
+        "attachment 'assets/ghost.png' referenced by 'note' is not in 'from'; \
+         the move carries nothing for it"
+    );
+}
+
+/// The other way a carry can fail: the name is taken at the destination by a
+/// different file, and every suffix the rename is allowed to offer is taken
+/// too. Nothing is lost - the file stays whole in the source domain - but the
+/// reference travelling with the engram now reads as a file that is not the one
+/// it was written about, which is exactly the thing a receipt has to say out
+/// loud.
+#[tokio::test]
+async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    // `assets/shot.png` plus every `-2` through `-99` the suffixing is allowed
+    // to reach, each holding bytes of its own so none of them can be reused.
+    for attempt in 1..=99u32 {
+        let path = if attempt == 1 {
+            "assets/shot.png".to_string()
+        } else {
+            format!("assets/shot-{attempt}.png")
+        };
+        let bytes = [OTHER_PNG, attempt.to_string().as_bytes()].concat();
+        engine.attachment_write("into", &path, bytes).await.unwrap();
+    }
+
+    let result = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let warnings = result["attachment_warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{result}");
+    assert_eq!(
+        warnings[0].as_str().unwrap(),
+        "attachment 'assets/shot.png' could not be carried to 'into'; its \
+         reference at the destination may resolve to a different same-name file"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG,
+        "the file stays whole where it already was"
+    );
+    assert_eq!(
+        engine.attachment_list("into").await.unwrap().len(),
+        99,
+        "nothing was written at the destination"
+    );
+    assert!(
+        moved_text(&into, "note.md").contains("![shot](assets/shot.png)"),
+        "a reference that was not carried keeps the spelling it had"
+    );
 }
 
 #[tokio::test]
