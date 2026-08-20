@@ -485,16 +485,6 @@ impl AckCounts {
             Family::Redundancy => self.redundancy += 1,
         }
     }
-
-    /// The per-family counts in catalog order, for a caller shaping them into a
-    /// map.
-    pub fn by_family(&self) -> [(Family, usize); 3] {
-        [
-            (Family::Temporal, self.temporal),
-            (Family::Structure, self.structure),
-            (Family::Redundancy, self.redundancy),
-        ]
-    }
 }
 
 /// Everything the rules read about one engram, resolved once by the engine so

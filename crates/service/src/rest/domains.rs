@@ -288,10 +288,8 @@ pub async fn manifest(
     if if_none_match_matches(&headers, &checksum) {
         let etag = HeaderValue::from_str(&format!("\"{checksum}\""))
             .map_err(|_| ApiError::internal("the manifest's checksum is not a usable ETag"))?;
-        // RFC 9110: a 304 carries the validator it matched and no body, and
-        // repeats `Cache-Control` too, since a 304 updates the stored
-        // response's headers and dropping the directive here would let the
-        // very response it refreshes turn heuristically fresh.
+        // The validator and `Cache-Control`, no body: the shape is stated
+        // once, on `if_none_match_matches`.
         return Ok((
             StatusCode::NOT_MODIFIED,
             [

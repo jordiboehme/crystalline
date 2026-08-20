@@ -926,9 +926,11 @@ pub async fn preview(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
-    // Last, and it has to be: `Bytes` consumes the body. It rides the
-    // surface's outermost `DefaultBodyLimit`, so an oversized upload is
-    // refused with 413 before this handler runs.
+    // Last, and it has to be: `Bytes` consumes the body. The limit it is read
+    // under is this route's own `DefaultBodyLimit`
+    // ([`super::ARCHIVE_BODY_BYTES`], 64 MiB, layered inside the surface's
+    // general 10 MiB one, and axum takes the innermost), so an upload past 64
+    // MiB is refused with 413 before this handler runs.
     body: Bytes,
 ) -> Result<Json<ArchiveReport>, ApiError> {
     identity.require_admin()?;

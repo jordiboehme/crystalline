@@ -3200,7 +3200,13 @@ export interface operations {
     read_attachment: {
         parameters: {
             query?: never;
-            header?: never;
+            header?: {
+                /**
+                 * @description The quoted SHA-256 of bytes already held. A match answers 304 with no body.
+                 * @example "9f2a1c05e2b7"
+                 */
+                "If-None-Match"?: string | null;
+            };
             path: {
                 /** @description The registered domain. */
                 domain: string;

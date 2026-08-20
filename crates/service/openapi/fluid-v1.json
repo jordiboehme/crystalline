@@ -2070,6 +2070,19 @@
               "type": "string"
             },
             "example": "assets/diagrams/flow.png"
+          },
+          {
+            "name": "If-None-Match",
+            "in": "header",
+            "description": "The quoted SHA-256 of bytes already held. A match answers 304 with no body.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "example": "\"9f2a1c05e2b7\""
           }
         ],
         "responses": {

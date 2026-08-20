@@ -1,12 +1,25 @@
-//! The single error type every REST handler returns, rendered as an RFC 9457
-//! problem detail so a browser client can branch on `status` alone.
+//! How a REST request fails, and how a conditional one succeeds without a
+//! body: the shared vocabulary of failure and preconditions this surface
+//! answers with.
 //!
-//! axum's own extractors reject in plain text, which would put a second error
-//! shape on the wire for exactly the requests a client is most likely to get
-//! wrong. [`ApiQuery`], [`ApiPath`] and [`ApiJson`] wrap them so every
-//! rejection arrives as a problem detail too; the router pairs them with a
-//! method-not-allowed fallback (see [`ApiError::method_not_allowed`]) so the
-//! last plain-text answer axum can produce is covered as well.
+//! The failure half is [`ApiError`], the single error type every handler
+//! returns, rendered as an RFC 9457 problem detail so a browser client can
+//! branch on `status` alone. axum's own extractors reject in plain text, which
+//! would put a second error shape on the wire for exactly the requests a
+//! client is most likely to get wrong. [`ApiQuery`], [`ApiPath`] and
+//! [`ApiJson`] wrap them so every rejection arrives as a problem detail too;
+//! the router pairs them with a method-not-allowed fallback (see
+//! [`ApiError::method_not_allowed`]) so the last plain-text answer axum can
+//! produce is covered as well.
+//!
+//! The precondition half is the ETag machinery every conditional single
+//! resource read and write shares, here rather than in one of the three route
+//! modules that use it so all three agree by construction: [`if_match`] reads
+//! the strong validator a write must carry, [`precondition_failed`] renders
+//! the 412 it fails with (a [`ConflictDetail`], which carries the current
+//! version so a client can merge), [`if_none_match_matches`] decides whether a
+//! read may answer 304 and documents the shape of that 304, and [`REVALIDATE`]
+//! is the `Cache-Control` both the 200 and the 304 carry.
 
 use axum::extract::{FromRequest, FromRequestParts, Request};
 use axum::http::StatusCode;
@@ -370,6 +383,16 @@ pub const REVALIDATE: &str = "no-cache";
 /// rather than refused. Nothing is lost by being wrong in the permissive
 /// direction either, since the worst outcome is a full response the client
 /// discards.
+///
+/// # The 304 this gates
+///
+/// The canonical statement of that response's shape, kept here because three
+/// routes build the same one (the manifest, an engram and an attachment) and
+/// each of them points at this paragraph rather than repeating it. RFC 9110: a
+/// 304 carries the validator it matched and no body, so the client goes on
+/// caching under the same token; and it repeats [`REVALIDATE`] as well, since
+/// a 304 updates the stored response's own headers and dropping the directive
+/// there would let the very response it refreshes turn heuristically fresh.
 pub fn if_none_match_matches(headers: &axum::http::HeaderMap, checksum: &str) -> bool {
     let Some(raw) = headers
         .get(axum::http::header::IF_NONE_MATCH)

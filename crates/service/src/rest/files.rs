@@ -158,6 +158,13 @@ pub struct UploadedAttachment {
                            `assets/diagrams/flow.png`.",
             example = "assets/diagrams/flow.png",
         ),
+        (
+            "If-None-Match" = Option<String>,
+            Header,
+            description = "The quoted SHA-256 of bytes already held. A match \
+                           answers 304 with no body.",
+            example = "\"9f2a1c05e2b7\"",
+        ),
     ),
     responses(
         (
@@ -224,11 +231,8 @@ pub async fn read(
         .map_err(malformed_path_is_a_bad_request)?;
     let etag = format!("\"{}\"", row.sha256);
     if if_none_match_matches(&headers, &row.sha256) {
-        // RFC 9110: a 304 carries the validator it matched and no body, so the
-        // client can go on caching under the same token. It repeats
-        // `Cache-Control` too, since a 304 updates the stored response's
-        // headers and dropping the directive here would let the very response
-        // it refreshes turn heuristically fresh.
+        // The validator and `Cache-Control`, no body: the shape is stated
+        // once, on `if_none_match_matches`.
         return Ok((
             StatusCode::NOT_MODIFIED,
             [
