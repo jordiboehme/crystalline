@@ -209,6 +209,20 @@ describe("the evolve payload", () => {
     expect(queue.truncations).toEqual(["eng - findings capped at 200"]);
   });
 
+  it("reads the guidance the whole queue is worked under", () => {
+    // The engine's own mechanical-versus-judgment sentence, which the chips on
+    // every row are shorthand for. It rides the sweep rather than the rows,
+    // so it is read once and said once.
+    expect(readEvolveQueue(evolvePayload()).guidance).toBe(
+      "This queue changes nothing by itself.",
+    );
+  });
+
+  it("reads no guidance at all as none rather than as an empty line", () => {
+    expect(readEvolveQueue({ total: 1 }).guidance).toBeNull();
+    expect(readEvolveQueue({ guidance: 7 }).guidance).toBeNull();
+  });
+
   it("reads a class it has never heard of as judgment", () => {
     const queue = readEvolveQueue(evolvePayload());
 
@@ -318,6 +332,7 @@ describe("the evolve payload", () => {
       actions: [],
       truncations: [],
       acknowledged: { total: 0, byFamily: {} },
+      guidance: null,
     });
   });
 });

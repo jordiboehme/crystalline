@@ -18,7 +18,7 @@
  * silences is counted under the queue whether or not anybody asks to see it.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -335,9 +335,11 @@ describe("the maintenance screen", () => {
 
     const [row] = rows(await section(/^Temporal/));
 
+    // Each chip says what it is a value of, for a reader who hears the row
+    // rather than seeing three coloured blocks in a line.
     expect(row).toHaveTextContent("Priority 90");
-    expect(row).toHaveTextContent("V005");
-    expect(row).toHaveTextContent("mechanical");
+    expect(row).toHaveTextContent("Rule V005");
+    expect(row).toHaveTextContent("Finding class mechanical");
     expect(row).toHaveTextContent("supersedes target still current");
     // The judgment finding says what it is, on its face: it is a question for
     // a person rather than a change to apply.
@@ -376,6 +378,18 @@ describe("the maintenance screen", () => {
       ),
     ).toBeVisible();
     expect(disclose).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("says the engine's guidance once, above the queue", async () => {
+    await open();
+    await section(/^Temporal/);
+
+    // The legend the class chips are shorthand for. It belongs to the sweep
+    // rather than to a row, so it is said once rather than on every finding -
+    // `getByText` is the assertion that it is exactly once.
+    expect(
+      screen.getByText("This queue changes nothing by itself."),
+    ).toBeVisible();
   });
 
   it("narrows the queue to one domain without asking the server again", async () => {
@@ -453,8 +467,11 @@ describe("the maintenance screen", () => {
     window.dispatchEvent(new Event("visibilitychange"));
     document.dispatchEvent(new Event("visibilitychange"));
     window.dispatchEvent(new Event("focus"));
-    await waitFor(() => {
-      expect(screen.getByRole("button", { name: "Refresh" })).toBeEnabled();
+    // Flushed rather than merely awaited: a refetch that should not have
+    // started has to be given every chance to reach the stub, or the count
+    // below passes by being taken too early.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(sweeps()).toHaveLength(before);
@@ -501,6 +518,96 @@ describe("the maintenance screen", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "this account may not sweep",
     );
+  });
+});
+
+/**
+ * The queue for somebody who is not looking at it.
+ *
+ * A page of a hundred rows drawn from one component is where identical
+ * accessible names come from, and "How to work this" said thirty times is a
+ * list of buttons nobody can choose between. Each disclosure is named by the
+ * finding it belongs to, it says which panel it opens, and pressing the one
+ * control that reloads the page leaves the keyboard where it was.
+ */
+describe("working the queue from the keyboard", () => {
+  it("names each disclosure by the finding it belongs to", async () => {
+    await open();
+    await section(/^Temporal/);
+
+    const body = await screen.findByRole("main");
+    const names = within(body)
+      .getAllByRole("button", { name: /how to work this/i })
+      .map((button) => button.getAttribute("aria-label"));
+
+    // The rule and its subject, in the families' own order: three names, all
+    // different, each one enough to choose by.
+    expect(names).toEqual([
+      "How to work this: V005 on The old way",
+      "How to work this: V101 on Alpha",
+      "How to work this: V201 on Restarting the daemon",
+    ]);
+  });
+
+  it("points the disclosure at the panel it opens", async () => {
+    await open();
+
+    const temporal = await section(/^Temporal/);
+    const disclose = within(temporal).getByRole("button", {
+      name: /how to work this/i,
+    });
+    const panelId = disclose.getAttribute("aria-controls");
+    expect(panelId).not.toBeNull();
+
+    await userEvent.click(disclose);
+
+    expect(
+      await within(temporal).findByText(
+        "Complete the retirement in both halves.",
+      ),
+    ).toHaveAttribute("id", panelId);
+  });
+
+  it("keeps Refresh under the keyboard while the sweep it asked for runs", async () => {
+    // The second sweep is held open, so the state under test is a state the
+    // test is standing in rather than one it hopes to catch.
+    let land = () => {};
+    const landed = new Promise<void>((resolve) => {
+      land = resolve;
+    });
+    let holding = false;
+    await open({
+      "/evolve": async () => {
+        if (holding) {
+          await landed;
+        }
+        return evolvePayload();
+      },
+    });
+    await section(/^Temporal/);
+    const refresh = screen.getByRole("button", { name: "Refresh" });
+    const before = sweeps().length;
+    holding = true;
+
+    await userEvent.click(refresh);
+
+    // It used to disable itself for the length of the sweep, which in a
+    // browser takes the focus off it and leaves the keyboard on the document -
+    // and this is the only control in the header, so there is nothing next to
+    // land on. It says it is busy instead and stays where it was.
+    await waitFor(() => {
+      expect(sweeps().length).toBeGreaterThan(before);
+    });
+    expect(refresh).toBeEnabled();
+    expect(refresh).toHaveAttribute("aria-busy", "true");
+    expect(refresh).toHaveFocus();
+
+    land();
+
+    await waitFor(() => {
+      expect(refresh).toHaveAttribute("aria-busy", "false");
+    });
+    expect(refresh).toHaveFocus();
   });
 });
 

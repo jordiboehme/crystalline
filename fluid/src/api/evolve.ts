@@ -168,6 +168,17 @@ export interface EvolveQueue {
    * still said out loud, as a number with a way to look at it.
    */
   acknowledged: EvolveAcknowledged;
+  /**
+   * The fixed sentence the whole queue is worked under: what a mechanical
+   * finding licenses, what a judgment one asks for, and that detecting
+   * something is not permission to change it.
+   *
+   * It belongs to the sweep rather than to a row, so it is said once above the
+   * queue rather than repeated on every finding - the class chip on a row is
+   * the shorthand, and this is what the shorthand stands for. Null when the
+   * sweep sent none, which draws no line at all rather than an empty one.
+   */
+  guidance: string | null;
 }
 
 /**
@@ -293,6 +304,7 @@ export function readEvolveQueue(payload: unknown): EvolveQueue {
       (entry): entry is string => typeof entry === "string",
     ),
     acknowledged: readAcknowledged(record?.acknowledged),
+    guidance: asString(record?.guidance),
   };
 }
 
