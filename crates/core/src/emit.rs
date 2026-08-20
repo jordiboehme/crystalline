@@ -418,12 +418,29 @@ fn evolve_ack_flow(ack: &EvolveAck) -> String {
 /// removed with the key line. Appends when the key is absent and creates a
 /// frontmatter block when the source has none.
 fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
+    set_frontmatter_block_line(source, &[key], new_block)
+}
+
+/// Replace the first frontmatter key among `keys` with `new_block`, taking the
+/// old value's continuation lines with it. The block-shaped counterpart of
+/// [`set_frontmatter_line`]: the keys are tried in order, so a caller can name
+/// a canonical key first and a legacy spelling second and have the legacy line
+/// rewritten in place, while a value that was written as a block mapping or a
+/// block sequence is replaced whole rather than beheaded.
+fn set_frontmatter_block_line(source: &str, keys: &[&str], new_block: String) -> String {
     let (has_fm, fm_span, _body_start) = locate(source);
     if !has_fm {
         return format!("---\n{new_block}\n---\n{source}");
     }
 
     let raw = &source[fm_span.clone()];
+    // Which key actually appears decides which value is rewritten, so a file
+    // carrying both the canonical and the legacy spelling has the canonical one
+    // updated whatever order they sit in.
+    let target = keys.iter().copied().find(|k| {
+        raw.split_inclusive('\n')
+            .any(|l| line_sets_key(l.strip_suffix('\n').unwrap_or(l), k))
+    });
     let mut new_raw = String::with_capacity(raw.len() + new_block.len());
     // 0: the key has not been seen; 1: it was just replaced and continuation
     // lines are being dropped; 2: the old value is fully behind us.
@@ -431,7 +448,7 @@ fn set_frontmatter_block(source: &str, key: &str, new_block: String) -> String {
     for line in raw.split_inclusive('\n') {
         let content = line.strip_suffix('\n').unwrap_or(line);
         match phase {
-            0 if line_sets_key(content, key) => {
+            0 if target.is_some_and(|k| line_sets_key(content, k)) => {
                 new_raw.push_str(&new_block);
                 new_raw.push('\n');
                 phase = 1;
@@ -550,12 +567,20 @@ pub fn remove_frontmatter_field(source: &str, key: &str) -> String {
 /// block migrates here, lazily: the `timestamp` line is replaced in place by
 /// the `generated` line, so a file only ever changes shape when it is actually
 /// edited and the frontmatter keeps its original order.
+///
+/// The replacement is block-aware, which matters because this runs on every
+/// edit of every engram, hand-written ones included: a person may well have
+/// spelled the provenance as a block mapping (`generated:` on its own line with
+/// `by:` and `at:` indented under it). Replacing only the key line would leave
+/// the flow mapping above two orphaned indented lines - not YAML, so the engram
+/// would stop parsing and go invisible to the sweep, to reads and to search.
+/// The old value goes whole, whatever shape it was written in.
 pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) -> String {
     let line = generated_flow(&Generated {
         by: actor.to_string(),
         at: Some(now),
     });
-    set_frontmatter_line(source, &["generated", "timestamp"], line)
+    set_frontmatter_block_line(source, &["generated", "timestamp"], line)
 }
 
 /// Set the staleness bound in the original source, leaving every other byte
@@ -565,9 +590,13 @@ pub fn touch_generated(source: &str, actor: &str, now: DateTime<FixedOffset>) ->
 /// lazily: that one line is replaced by the `stale_after` line, so a file only
 /// ever changes shape when it is actually edited and the frontmatter keeps its
 /// original order.
+///
+/// Block-aware for the same reason [`touch_generated`] is: a hand-written bound
+/// may sit on its own indented line under the key, and stranding it there would
+/// cost the engram its parse.
 pub fn set_stale_after(source: &str, date: NaiveDate) -> String {
     let line = format!("stale_after: {}", date.format("%Y-%m-%d"));
-    set_frontmatter_line(source, &["stale_after", "review_after"], line)
+    set_frontmatter_block_line(source, &["stale_after", "review_after"], line)
 }
 
 fn format_scalar_line(key: &str, value: &str) -> String {

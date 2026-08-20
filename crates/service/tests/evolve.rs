@@ -1321,6 +1321,76 @@ async fn an_ack_refuses_an_engram_that_no_longer_parses() {
     );
 }
 
+/// A hand-written engram spells its provenance as a block mapping, which is
+/// what YAML invites and what the parser reads back happily. Both an ordinary
+/// edit and an acknowledgment refresh that provenance on the way to disk, and
+/// neither may cost the engram its parse.
+///
+/// This pins the reachability the ack path cannot defend on its own: the merge
+/// is parse-validated inside `apply`, and `touch_generated` then rewrites the
+/// blessed bytes before they are written, so the only place the block form can
+/// be handled correctly is the emitter. An engram that stops parsing here goes
+/// invisible to the sweep, to reads and to search - the exact failure the ack
+/// validation was built to prevent, arriving one step later.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_edit_and_an_ack_both_survive_a_block_form_generated_mapping() {
+    let (tmp, engine) = fixture().await;
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let hand_written = source.replace(
+        "status: stable",
+        "generated:\n  by: human:jordi\n  at: 2026-01-01T00:00:00+00:00\nstatus: stable",
+    );
+    assert!(hand_written.contains("by: human:jordi"), "{hand_written}");
+    std::fs::write(&path, &hand_written).unwrap();
+    engine.sync(None).await.unwrap();
+
+    // (a) an ordinary edit.
+    engine
+        .edit_engram_as(
+            &crystalline_service::params::EditParams {
+                identifier: "live-doc".to_string(),
+                domain: "eng".to_string(),
+                operation: "append".to_string(),
+                content: Some("One more line.".to_string()),
+                ..Default::default()
+            },
+            Some("agent:test"),
+        )
+        .await
+        .unwrap();
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let e = crystalline_core::parse_engram(&on_disk).expect("the edited engram still parses");
+    assert_eq!(e.frontmatter.generated.as_ref().unwrap().by, "agent:test");
+    assert!(!on_disk.contains("human:jordi"), "{on_disk}");
+    assert_eq!(on_disk.matches("generated:").count(), 1, "{on_disk}");
+
+    // (b) the acknowledgment path, on the same hand-written shape again.
+    std::fs::write(&path, &hand_written).unwrap();
+    engine.sync(None).await.unwrap();
+
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let e = crystalline_core::parse_engram(&on_disk).expect("the acknowledged engram still parses");
+    assert_eq!(e.frontmatter.generated.as_ref().unwrap().by, "agent:test");
+    assert!(!on_disk.contains("human:jordi"), "{on_disk}");
+    assert!(on_disk.contains("evolve_ack:"), "{on_disk}");
+
+    // And the sweep still sees it: an engram nothing can parse is invisible.
+    engine.sync(None).await.unwrap();
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert_eq!(v["unparsed"], 0, "{v}");
+}
+
 /// The audit view carries the scope the acknowledgment was given for, which is
 /// what lets a reader see why a stale one stopped matching.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

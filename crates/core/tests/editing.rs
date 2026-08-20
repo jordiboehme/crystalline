@@ -176,6 +176,85 @@ body
 }
 
 #[test]
+fn touch_generated_replaces_a_block_form_generated_mapping() {
+    // A person (or another tool) spelled the provenance as a block mapping,
+    // which is what YAML invites and what the parser reads back happily. The
+    // refresh has to take the indented continuation lines with the key line:
+    // a flow scalar left sitting above an orphaned block is not YAML, and the
+    // engram would stop parsing on the way to disk.
+    let source = "---
+type: engram
+title: Hand written
+permalink: hand-written
+generated:
+  by: human:jordi
+  at: 2026-01-01T00:00:00+00:00
+status: stable
+---
+
+Body.
+";
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(source, "claude-code/1.0.5", now);
+    let e = parse_engram(&out).expect("the refreshed engram still parses");
+    let g = e.frontmatter.generated.unwrap();
+    assert_eq!(g.by, "claude-code/1.0.5");
+    assert_eq!(g.at.unwrap().to_rfc3339(), "2026-07-02T10:00:00+00:00");
+    // The old block is gone rather than orphaned, and its neighbours stayed put.
+    assert!(!out.contains("human:jordi"), "{out}");
+    assert!(!out.contains("2026-01-01T00:00:00+00:00"), "{out}");
+    assert_eq!(out.matches("generated:").count(), 1, "{out}");
+    assert!(out.contains("title: Hand written"), "{out}");
+    assert!(out.contains("status: stable"), "{out}");
+    assert!(out.ends_with("---\n\nBody.\n"), "{out}");
+}
+
+#[test]
+fn touch_generated_replaces_a_block_form_generated_at_the_end_of_the_frontmatter() {
+    // The same shape with nothing after it: the continuation lines are the last
+    // lines of the block, so the closing delimiter is what ends the value.
+    let source = "---
+type: engram
+title: Last key
+generated:
+  by: human:jordi
+---
+
+Body.
+";
+    let now: DateTime<FixedOffset> =
+        DateTime::parse_from_rfc3339("2026-07-02T10:00:00+00:00").unwrap();
+    let out = touch_generated(source, "new/2", now);
+    let e = parse_engram(&out).expect("the refreshed engram still parses");
+    assert_eq!(e.frontmatter.generated.unwrap().by, "new/2");
+    assert!(!out.contains("human:jordi"), "{out}");
+}
+
+#[test]
+fn set_stale_after_replaces_a_hand_written_multiline_bound() {
+    // `review_after:` with the date on its own indented line is valid YAML and
+    // reads back as the same scalar. Migrating it must not leave the date
+    // stranded under the new key.
+    let source = "---
+type: engram
+title: Hand written bound
+review_after:
+  2026-08-01
+status: stable
+---
+
+Body.
+";
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 12, 1).unwrap();
+    let out = set_stale_after(source, date);
+    let e = parse_engram(&out).expect("the edited engram still parses");
+    assert_eq!(e.frontmatter.stale_on().unwrap().to_string(), "2026-12-01");
+    assert!(!out.contains("2026-08-01"), "{out}");
+    assert!(out.contains("status: stable"), "{out}");
+}
+
+#[test]
 fn set_stale_after_migrates_a_legacy_review_after_line_in_place() {
     // A file written before the `stale_after` migration carries `review_after`.
     // Setting the bound swaps that one line and leaves every other byte,
