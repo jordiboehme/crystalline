@@ -3429,9 +3429,25 @@ impl Engine {
         let mut carried: Vec<AttachmentCarry> = Vec::new();
 
         if cross {
-            // Read the source content (file when present, else database), index
-            // it into the destination source, then remove the source.
-            let mut content = self.load_content(&src_source, &src).await?;
+            // Read the source content, index it into the destination source,
+            // then remove the source. Stricter than the read path on purpose: a
+            // move re-emits the file at the destination, and a file domain's
+            // stored `content` column holds the body only, so falling back to
+            // it would strip the frontmatter off the engram that lands. Failing
+            // loudly is the only honest option; the store is the source of
+            // truth for a virtual domain, so only that kind reads from it.
+            let mut content = match &src_source {
+                ContentSource::File { root } => {
+                    let abs = join_rel(root, &src.path);
+                    std::fs::read_to_string(&abs).map_err(|e| {
+                        EngineError::NotFound(format!(
+                            "the source file for '{}' is unreadable ({e}); resync '{}' and retry the move",
+                            src.permalink, p.domain
+                        ))
+                    })?
+                }
+                ContentSource::Virtual => self.load_content(&src_source, &src).await?,
+            };
             // Resolved before the write, since an attachment that has to be
             // renamed at the destination changes the very text being written:
             // the engram lands already pointing at the name its file took.

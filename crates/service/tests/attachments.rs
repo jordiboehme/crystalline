@@ -1178,6 +1178,50 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
     );
 }
 
+/// A cross-domain move re-emits the engram at the destination, so the store's
+/// content column must never stand in for an unreadable source file: a file
+/// domain indexes the body only, and the fallback would land a
+/// frontmatter-stripped engram in the destination domain.
+#[tokio::test]
+async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "A rule about note."),
+        )
+        .await
+        .unwrap();
+
+    // Remove the markdown behind the index's back: the row still points at it,
+    // and the store still holds the body-only text the file domain indexed.
+    std::fs::remove_file(from.join("note.md")).unwrap();
+
+    let err = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unreadable"), "got: {msg}");
+    assert!(msg.contains("resync"), "got: {msg}");
+
+    assert!(
+        !into.join("note.md").exists(),
+        "no file landed in the destination domain"
+    );
+    assert!(
+        engine
+            .read_engram(&crystalline_service::params::ReadParams {
+                identifier: "note".to_string(),
+                domain: Some("into".to_string()),
+            })
+            .await
+            .is_err(),
+        "and nothing was indexed there either"
+    );
+}
+
 /// `delete_engram` with an `assets/` identifier deletes the attachment, on both
 /// domain kinds, and records the sweep the change owes. This is the one write
 /// the MCP attachment surface offers, so an agent can complete an orphaned
