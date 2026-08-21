@@ -1,0 +1,6 @@
+# Keeps a hung test from wedging the whole run: the sandboxed environments
+# this repo is developed in can stall the loopback-binding suites
+# (crates/remote/tests/github_client.rs and github_auth.rs bind
+# 127.0.0.1:0), and without a terminate-after nextest waits forever.
+[profile.default]
+slow-timeout = { period = "120s", terminate-after = 2 }
