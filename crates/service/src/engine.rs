@@ -5346,11 +5346,19 @@ impl Engine {
 
         // The prose instruction rides a per-rule legend rather than a column, so
         // a page of ten findings from one rule carries it once. Only the rules
-        // on this page appear.
+        // on this page appear. The catalog's short `summary` rides beside it:
+        // a renderer wants a few words for a heading and the instruction for
+        // the body, and deriving one from the other is not a client's job.
         let actions: Vec<Value> = RULES
             .iter()
             .filter(|info| shown.iter().any(|f| f.rule == info.id))
-            .map(|info| json!({ "rule": info.id, "instruction": info.instruction }))
+            .map(|info| {
+                json!({
+                    "rule": info.id,
+                    "summary": info.summary,
+                    "instruction": info.instruction,
+                })
+            })
             .collect();
 
         Ok(json!({
