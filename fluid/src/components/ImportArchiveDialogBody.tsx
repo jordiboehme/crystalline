@@ -251,7 +251,9 @@ export default function ImportArchiveDialogBody({
             */}
             {result === null && preview !== null && (
               <p className="text-sm tabular-nums">
-                {`${preview.newEntries} new, ${preview.collides} collide.`}
+                {`${preview.newEntries} new, ${preview.collides} ${
+                  preview.collides === 1 ? "collides" : "collide"
+                }.`}
               </p>
             )}
 

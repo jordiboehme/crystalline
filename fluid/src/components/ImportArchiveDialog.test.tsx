@@ -263,8 +263,9 @@ describe("importing an archive", () => {
 
     // And what the rows add up to, so the size of the decision is readable
     // without counting rows: this is a dry run, so it counts what would be
-    // created and what is already taken.
-    expect(within(dialog).getByText("1 new, 1 collide.")).toBeVisible();
+    // created and what is already taken. One collision reads as one, verb and
+    // all, rather than as the plural with a 1 in front of it.
+    expect(within(dialog).getByText("1 new, 1 collides.")).toBeVisible();
 
     // The dry run went out as the bytes that were picked, announced as a zip.
     const sent = callTo("/domains/eng/archive/preview");
@@ -278,6 +279,26 @@ describe("importing an archive", () => {
     expect(
       within(dialog).getByRole("button", { name: "Import" }),
     ).toBeEnabled();
+  });
+
+  it("counts more than one collision in the plural", async () => {
+    serve({
+      "/domains/eng/archive/preview": () => ({
+        ...previewReport(),
+        new: 0,
+        collides: 3,
+      }),
+    });
+
+    const dialog = await openWithFile();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Preview" }),
+    );
+    await within(dialog).findByRole("table", {
+      name: /what an import would do/i,
+    });
+
+    expect(within(dialog).getByText("0 new, 3 collide.")).toBeVisible();
   });
 
   it("imports with the chosen policy and refreshes what it changed", async () => {
@@ -314,7 +335,7 @@ describe("importing an archive", () => {
     ).toBeVisible();
     // The preview's counters go with the preview: what would have happened is
     // not left standing beside what did.
-    expect(within(dialog).queryByText(/collide\./)).toBeNull();
+    expect(within(dialog).queryByText(/collides?\./)).toBeNull();
     expect(
       requested().includes("/domains/eng/archive/import?policy=overwrite"),
     ).toBe(true);
