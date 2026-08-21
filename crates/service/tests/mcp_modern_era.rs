@@ -1729,6 +1729,78 @@ async fn choosing_cancel_leaves_the_engram() {
     );
 }
 
+/// **A cancel is a cancel even when the thing it was about is gone.**
+///
+/// The collision is discovered by attempting the write, so the shape that
+/// suggests itself reads the answer off the engine's failure - and that shape
+/// has a hole exactly here. Between the two rounds something else removes the
+/// engram in the way; the round-two call no longer collides, so there is no
+/// error to read the "cancel" off, and the write the user refused lands as an
+/// ordinary success. Nothing about the wire says this went wrong, which is why
+/// it is pinned rather than reasoned about: the handler reads the refusal
+/// before it calls the engine, and this is the test that fails if it stops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancel_still_refuses_when_the_collision_vanished_between_rounds() {
+    let h = Harness::new().await;
+    let (mut wire, path) = taken_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            write_taken(SECOND_BODY, false, None),
+        ))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    // Out of band, while the user is being asked: something else takes the
+    // engram away. A modern non-eliciting delete is the shortest stand-in for
+    // the other agent, Fluid tab or CLI invocation that would do it, and it
+    // clears the index row as well as the file - a bare unlink would leave the
+    // row behind and the collision would simply persist, which would make this
+    // test pass without ever reaching the case it is about.
+    let deleted = wire
+        .call(modern(
+            3,
+            "tools/call",
+            json!({
+                "name": "delete_engram",
+                "arguments": { "domain": "eng", "identifier": "taken" },
+            }),
+        ))
+        .await;
+    assert!(
+        deleted["error"].is_null() && deleted["result"]["isError"] != json!(true),
+        "the engram in the way is removed: {deleted}"
+    );
+    assert!(!path.exists(), "the collision is genuinely gone");
+
+    let refused = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            write_taken(SECOND_BODY, false, Some(resolution("accept", "cancel"))),
+        ))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "the cancel still refuses, collision or no collision: {refused}"
+    );
+    let text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("the existing engram was left in place; nothing was written"),
+        "with the same refusal: {text}"
+    );
+    assert!(
+        !path.exists(),
+        "and the write the user cancelled did not happen after all: {}",
+        path.display()
+    );
+}
+
 /// An eliciting peer that already asked for an overwrite is not asked again:
 /// the caller answered the question before it was put.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

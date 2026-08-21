@@ -175,6 +175,14 @@
 //! [`resolved_overwrite`]) and a third condition beside the gate: a call that
 //! already passed `overwrite` answered the question before it was put.
 //!
+//! **An answer is not bound to the arguments it was asked about.** The client
+//! re-sends the original arguments beside the answer and nothing on this side
+//! remembers what was asked, so a buggy client that changes an argument on the
+//! retry is honoured rather than caught - the price of the stateless design
+//! (see [`confirm_question`] on why nothing is sealed into `requestState`),
+//! and the reason each round's refusal is read before the act it guards rather
+//! than after it.
+//!
 //! **The gate decides whether the flow exists at all, not how it behaves.** A
 //! peer below 2026-07-28 has no result shape to receive a question in, and a
 //! peer that never declared an elicitation capability has no way to ask its
@@ -915,6 +923,27 @@ impl McpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let actor = client_actor(&ctx);
+
+        // **A refusal is read before the engine runs, never after it.** A
+        // collision is discovered by attempting the write, so the shape that
+        // suggests itself - call, then read the answer off the failure - is
+        // wrong in exactly one case, and it is the case that matters: if the
+        // engram in the way is deleted or renamed between the two rounds
+        // (another agent, Fluid, the CLI), the round-two call no longer
+        // collides, there is no error left to intercept, and the engram the
+        // user answered "cancel and write nothing" about is written. Reading
+        // the no first makes that impossible. It costs one case in the other
+        // direction - a stale cancel carried on a call that no longer collides
+        // refuses a write that would have succeeded, which the caller fixes by
+        // re-sending without the answer - and that is the only direction a
+        // confirmation is allowed to fail in.
+        if confirmation_supported(&ctx)
+            && !p.overwrite
+            && resolved_overwrite(&responses.0) == Some(false)
+        {
+            return refuse(COLLISION_REFUSAL).map(CallToolResponse::from);
+        }
+
         let written = self.engine.write_engram_as(&p, actor.as_deref()).await;
 
         // A permalink collision is the one failure here with a real choice
@@ -943,10 +972,17 @@ impl McpServer {
 
         match resolved_overwrite(&responses.0) {
             None => Ok(collision_question(collision_question_text(&p, &permalink)).into()),
+            // Unreachable while the guard above stands, and written out anyway:
+            // the arm that must never fall through to a write is not one to
+            // leave implicit under a `_`.
             Some(false) => refuse(COLLISION_REFUSAL).map(CallToolResponse::from),
             // The retry is the original call with the answer applied, so
             // everything else about the write - folder, tags, metadata, the
-            // actor - is the caller's, not a reconstruction.
+            // actor - is the caller's, not a reconstruction. What it is not is
+            // consent to particular bytes: the existing engram's content can
+            // change between the collision error and this retry, and the user
+            // agreed to replace whatever is at that permalink rather than the
+            // version that was there when they were asked.
             Some(true) => {
                 let mut retry = p.clone();
                 retry.overwrite = true;
