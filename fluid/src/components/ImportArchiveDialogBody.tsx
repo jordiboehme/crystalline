@@ -242,6 +242,21 @@ export default function ImportArchiveDialogBody({
               <EntryTable entries={report.entries} imported={result !== null} />
             )}
 
+            {/*
+              The size of the decision, under the rows that spell it out: how
+              many engrams would be created and how many addresses are already
+              taken, which is what the policy above is actually a choice about.
+              A dry run's counters only, so once the import has landed the line
+              below replaces this one rather than standing beside it.
+            */}
+            {result === null && preview !== null && (
+              <p className="text-sm tabular-nums">
+                {`${preview.newEntries} new, ${preview.collides} ${
+                  preview.collides === 1 ? "collides" : "collide"
+                }.`}
+              </p>
+            )}
+
             {result !== null && (
               <p className="text-sm tabular-nums">
                 {`${result.written} written, ${result.skipped} skipped, ${result.invalid} invalid, ${result.ignored} ignored.`}

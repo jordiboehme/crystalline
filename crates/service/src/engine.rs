@@ -135,6 +135,28 @@ const EVOLVE_MAX_LIMIT: usize = 100;
 /// screenful of rows.
 const MAX_INBOUND_LIMIT: usize = 100;
 
+/// The largest domain [`Engine::delete_preview`] enumerates sole-referent
+/// attachments on.
+///
+/// The enumeration is a full-domain read, and the cost is worth naming exactly:
+/// [`Engine::sole_referent_attachments`] lists every engram in the domain and
+/// loads the text of each one that could hold a reference, so asking "what does
+/// this delete orphan" on a domain of fifty thousand engrams reads fifty
+/// thousand engrams - to build a question, before anything is deleted. The
+/// scan stops early only when every candidate is already accounted for, which a
+/// domain that shares none of them never reaches.
+///
+/// So the bound caps **when** the enumeration runs, never what the delete does.
+/// Past it the question says the attachments were not enumerated instead of
+/// naming them, and [`Engine::delete_engram`] behaves exactly as it always has:
+/// it removes the markdown and the rows and leaves every file alone, on a
+/// domain of five hundred engrams and on a domain of fifty thousand alike.
+///
+/// Five hundred is the same shape of number as [`TREE_LEVEL_CAP`] and picked
+/// the same way: past any archive a person curates by hand, and small enough
+/// that the read behind the question stays a fraction of a second.
+pub const MAX_PREVIEW_SCAN_ENGRAMS: usize = 500;
+
 /// The fixed instruction every `evolve_engrams` response carries. It states the
 /// authority the queue does and does not have, so an agent working it never
 /// treats detection as permission to rewrite the archive.
@@ -1705,18 +1727,22 @@ impl Engine {
         // engram's permalink from its frontmatter, so an author who edited that
         // line has just moved the address, and a receipt naming the old one
         // would send its caller to a permalink nothing resolves. The saved
-        // content is the truth here, so the truth is what is asked.
+        // content is the truth here, so the truth is what is asked. Asked
+        // tolerantly, though: the save is committed by this line, so neither a
+        // missing row nor a failing lookup may turn it into a reported error -
+        // see [`receipt_permalink`], which answers both with the resolved name.
         let permalink = {
             let store = self.store.lock().await;
-            store
+            let found = store
                 .list_engrams(&desc.domain, Some(&desc.path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == desc.path)
-                .map(|found| found.permalink)
-                // Unreachable while the write above succeeded; the resolved
-                // name is the honest fallback rather than a panic.
-                .unwrap_or_else(|| desc.permalink.clone())
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == desc.path)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, desc.permalink.clone())
         };
 
         // A save can rewrite the MANIFEST engram of a virtual domain or the
@@ -1798,16 +1824,22 @@ impl Engine {
 
         // Read back after the reindex, exactly as a save does: the index takes
         // the permalink from the restored frontmatter, which need not match
-        // the path slug.
+        // the path slug. Tolerantly, for the same reason a save asks
+        // tolerantly: the restore is committed by this line, so a missing row
+        // and a failing lookup alike fall back to the path-derived name rather
+        // than reporting a done write as failed - see [`receipt_permalink`].
         let permalink = {
             let store = self.store.lock().await;
-            store
+            let found = store
                 .list_engrams(domain, Some(path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == path)
-                .map(|found| found.permalink)
-                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == path)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
         Ok(json!({
             "domain": domain,
@@ -2108,28 +2140,23 @@ impl Engine {
     /// rewritten to, and that rewrite has to travel in the same write that
     /// lands the engram at its destination.
     ///
-    /// Every miss is silent by design: a reference to a file that is not there
-    /// is already a dangling reference, and a move is not the verb that should
-    /// refuse over one.
+    /// Every miss is quiet rather than fatal: a reference to a file that is not
+    /// there is already a dangling reference, and a move is not the verb that
+    /// should refuse over one. Quiet is not silent, though - each miss is
+    /// returned beside the plan as a sentence the move receipt carries, so the
+    /// caller learns which attachment stayed behind without having to read the
+    /// daemon's trace.
     async fn plan_attachment_carry(
         &self,
         src: &EngramDescriptor,
         dest_domain: &str,
         content: &str,
-    ) -> Vec<AttachmentCarry> {
-        let parsed = parse_engram(content).ok();
-        let body = parsed
-            .as_ref()
-            .map_or(content, |engram| engram.body.as_str());
-        let mut candidates = crystalline_core::find_asset_refs(body);
-        if let Some(claim) = parsed.as_ref().and_then(|e| asset_claim(&e.frontmatter))
-            && !candidates.contains(&claim)
-        {
-            candidates.push(claim);
-        }
+    ) -> (Vec<AttachmentCarry>, Vec<String>) {
+        let candidates = referenced_asset_paths(content);
         if candidates.is_empty() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
+        let mut warnings: Vec<String> = Vec::new();
 
         // The bytes are read and dropped here: what the plan needs is the
         // sha256, and the read is what makes the row's sha describe the file
@@ -2143,17 +2170,17 @@ impl Engine {
                 Err(e) => {
                     // Loud enough to answer "why did my screenshot not
                     // travel": the move went through, but something the engram
-                    // points at did not come with it.
-                    tracing::warn!(
-                        "attachment '{path}' referenced by '{}' is not in '{}' ({e}); the move carries nothing for it",
-                        src.permalink,
-                        src.domain
-                    );
+                    // points at did not come with it. The trace keeps the store
+                    // error, which is an operator's detail; the receipt gets
+                    // the same sentence without it.
+                    let warning = attachment_missing_warning(&path, &src.permalink, &src.domain);
+                    tracing::warn!("{warning} ({e})");
+                    warnings.push(warning);
                 }
             }
         }
         if present.is_empty() {
-            return Vec::new();
+            return (Vec::new(), warnings);
         }
 
         let paths: Vec<String> = present.iter().map(|(path, _)| path.clone()).collect();
@@ -2165,6 +2192,12 @@ impl Engine {
                 .free_asset_destination(dest_domain, &from, &sha, &claimed)
                 .await
             else {
+                // The file is whole and still in the source domain, which is
+                // the part that matters; what the caller cannot see without
+                // being told is that the reference travelling with the engram
+                // now points at whatever the destination happens to hold under
+                // that name.
+                warnings.push(attachment_not_carried_warning(&from, dest_domain));
                 continue;
             };
             claimed.insert(to.clone());
@@ -2175,7 +2208,7 @@ impl Engine {
                 reuse,
             });
         }
-        plan
+        (plan, warnings)
     }
 
     /// The attachment paths another engram in the source domain still
@@ -2283,9 +2316,11 @@ impl Engine {
     /// files, which is where its frontmatter actually is, and a virtual domain
     /// from the database, which is where its whole engram actually is.
     ///
-    /// That is one file read per engram in the source domain on a
-    /// cross-domain move that carries attachments. It is the price of counting
-    /// claims at all, and the verb is rare.
+    /// That is one file read per engram in the domain, on a cross-domain move
+    /// that carries attachments and on the confirmation preview of a delete
+    /// whose engram references one ([`Engine::sole_referent_attachments`]). It
+    /// is the price of counting claims at all, both verbs are rare, and an
+    /// engram that references no attachment pays none of it.
     ///
     /// `None` when the text is genuinely absent (a row the index still lists
     /// for a file that is gone): text that is not there references nothing. A
@@ -3020,8 +3055,10 @@ impl Engine {
             "path": desc.path,
             "operation": p.operation,
         });
-        if let Some(entry) = &ack {
-            response["evolve_ack"] = ack_json(entry);
+        match &ack {
+            Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
+            Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
+            None => {}
         }
         Ok(response)
     }
@@ -3129,7 +3166,7 @@ impl Engine {
         p: &EditParams,
         permalink: &str,
         actor: &str,
-        ack: Option<&EvolveAck>,
+        ack: Option<&AckDraft>,
     ) -> Result<String> {
         Ok(match p.operation.as_str() {
             "append" => append_body(source, self.require_content(p)?),
@@ -3173,7 +3210,7 @@ impl Engine {
                 let section = self.require_section(p)?;
                 insert_after_section(source, section, content).map_err(section_err)?
             }
-            "set_frontmatter" => Self::apply_set_frontmatter(source, p, actor, ack)?,
+            "set_frontmatter" => Self::apply_set_frontmatter(source, p, permalink, actor, ack)?,
             other => {
                 return Err(EngineError::Invalid(format!(
                     "unknown edit operation '{other}'; expected append, prepend, find_replace, replace_section, insert_before_section, insert_after_section or set_frontmatter"
@@ -3193,8 +3230,9 @@ impl Engine {
     fn apply_set_frontmatter(
         source: &str,
         p: &EditParams,
+        permalink: &str,
         actor: &str,
-        ack: Option<&EvolveAck>,
+        ack: Option<&AckDraft>,
     ) -> Result<String> {
         let key = p
             .key
@@ -3299,14 +3337,28 @@ impl Engine {
                 Ok(set_verified(source, &entries))
             }
             EVOLVE_ACK_KEY => {
-                // The entry was completed before the lock (see
-                // `Engine::ack_draft`), because its scope is the sweep's
+                // The draft was completed before the lock (see
+                // `Engine::ack_draft`), because a record's scope is the sweep's
                 // verdict about this engram and no text edit can know it.
-                let entry = ack.ok_or_else(|| {
-                    EngineError::Invalid(format!(
-                        "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
-                    ))
-                })?;
+                let draft = ack.ok_or_else(|| EngineError::Invalid(ack_value_message()))?;
+                let entry = match draft {
+                    AckDraft::Record(entry) => entry,
+                    // A removal reads the entries the file holds right now,
+                    // under the lock, so a concurrent acknowledgment is either
+                    // fully there or not there at all when it filters.
+                    AckDraft::Remove(rule) => {
+                        if !has_ack(source, rule) {
+                            return Err(EngineError::Invalid(format!(
+                                "no acknowledgment for {rule} on '{permalink}'; nothing to remove"
+                            )));
+                        }
+                        return guarded_ack_write(
+                            without_ack(source, rule),
+                            "removal",
+                            &p.identifier,
+                        );
+                    }
+                };
                 // An engram whose frontmatter no longer parses would have its
                 // existing entries read as none, and this would write a second
                 // `evolve_ack` key beside the one already there - compounding a
@@ -3316,18 +3368,13 @@ impl Engine {
                         "cannot acknowledge a finding on an engram that does not parse ({e}); repair the frontmatter first"
                     ))
                 })?;
-                let out = set_evolve_ack(source, &merged_acks(source, entry.clone()));
                 // Defense in depth: whatever the note carried, the bytes about
-                // to be persisted have to be readable. Refusing here is the last
-                // stop before a write that would make the engram invisible to
-                // the sweep, to read_engram and to search.
-                parse_engram(&out).map_err(|e| {
-                    EngineError::Invalid(format!(
-                        "the acknowledgment would leave '{}' unparseable ({e}); nothing was written",
-                        p.identifier
-                    ))
-                })?;
-                Ok(out)
+                // to be persisted have to be readable.
+                guarded_ack_write(
+                    set_evolve_ack(source, &merged_acks(source, entry.clone())),
+                    "acknowledgment",
+                    &p.identifier,
+                )
             }
             other => Err(EngineError::Invalid(format!(
                 "set_frontmatter cannot set '{other}'; the settable keys are {}",
@@ -3425,17 +3472,39 @@ impl Engine {
 
         // What the move carries besides the engram: the attachments it
         // references or claims. Filled in the cross-domain branch and acted on
-        // once every store lock that branch takes has been released.
+        // once every store lock that branch takes has been released. Beside it,
+        // the attachments the plan could not carry, which ride out in the
+        // receipt so a caller who never sees the daemon's trace still learns
+        // what stayed behind.
         let mut carried: Vec<AttachmentCarry> = Vec::new();
+        let mut attachment_warnings: Vec<String> = Vec::new();
 
         if cross {
-            // Read the source content (file when present, else database), index
-            // it into the destination source, then remove the source.
-            let mut content = self.load_content(&src_source, &src).await?;
+            // Read the source content, index it into the destination source,
+            // then remove the source. Stricter than the read path on purpose: a
+            // move re-emits the file at the destination, and a file domain's
+            // stored `content` column holds the body only, so falling back to
+            // it would strip the frontmatter off the engram that lands. Failing
+            // loudly is the only honest option; the store is the source of
+            // truth for a virtual domain, so only that kind reads from it.
+            let mut content = match &src_source {
+                ContentSource::File { root } => {
+                    let abs = join_rel(root, &src.path);
+                    std::fs::read_to_string(&abs).map_err(|e| {
+                        EngineError::NotFound(format!(
+                            "the source file for '{}' at {} is unreadable ({e}); resync '{}' and retry the move",
+                            src.permalink,
+                            abs.display(),
+                            p.domain
+                        ))
+                    })?
+                }
+                ContentSource::Virtual => self.load_content(&src_source, &src).await?,
+            };
             // Resolved before the write, since an attachment that has to be
             // renamed at the destination changes the very text being written:
             // the engram lands already pointing at the name its file took.
-            carried = self
+            (carried, attachment_warnings) = self
                 .plan_attachment_carry(&src, &dest_domain, &content)
                 .await;
             let renames: BTreeMap<String, String> = carried
@@ -3586,11 +3655,35 @@ impl Engine {
             self.refresh_index_files(&dest_domain).await;
         }
 
+        // The address the engram answers to at its destination, asked rather
+        // than assumed, exactly as `save_engram` asks: a permalink that was
+        // derived from the path follows the move (the store's rename says so
+        // in as many words), so a receipt repeating the one it went in with
+        // would name a permalink that no longer resolves on the very calls
+        // that changed it. The move is committed by this line, so the asking is
+        // tolerant: a missing row and a failing lookup alike fall back to the
+        // name it went in with rather than failing a done move - see
+        // [`receipt_permalink`].
+        let dest_permalink = {
+            let store = self.store.lock().await;
+            let found = store
+                .list_engrams(&dest_domain, Some(&dest_rel), None)
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == dest_rel)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, src.permalink.clone())
+        };
+
         Ok(json!({
             "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
-            "to": { "domain": dest_domain, "path": dest_rel },
+            "to": { "domain": dest_domain, "permalink": dest_permalink, "path": dest_rel },
             "cross_domain": cross,
             "links_rewritten": rewritten,
+            "attachment_warnings": attachment_warnings,
         }))
     }
 
@@ -3939,6 +4032,213 @@ impl Engine {
             "path": desc.path,
             "deleted": true,
         }))
+    }
+
+    /// What [`Engine::delete_engram`] would remove, without removing any of it.
+    ///
+    /// Written for the confirmation round the MCP layer opens on a peer that
+    /// can put a question to its user: the question has to name what dies, and
+    /// naming it means resolving the identifier first. Every refusal the delete
+    /// itself would raise on the way to the file - an unknown domain, an
+    /// identifier that resolves to nothing or to two things, a read-only
+    /// server, an `expected_checksum` on an attachment - is raised here too, so
+    /// a call that cannot succeed fails before a human is asked to approve it
+    /// rather than after.
+    ///
+    /// Two shapes, one per branch of the delete. An `assets/` identifier
+    /// previews `{domain, path, size, attachment: true}`; anything else
+    /// previews `{domain, permalink, title, path, attachments}`, where
+    /// `attachments` is the stored attachments **only this engram references**.
+    /// Those files are not deleted with it - `delete_engram` removes the
+    /// markdown and its rows and nothing else - so what the list says is which
+    /// attachments the delete leaves with no referent at all.
+    ///
+    /// `attachments` is `null` rather than a list on a domain past
+    /// [`MAX_PREVIEW_SCAN_ENGRAMS`], where enumerating them would read the
+    /// whole domain to build one sentence. The delete is the same delete
+    /// either way; only the question is worded differently, and `null` says
+    /// nobody looked where `[]` says somebody looked and found none.
+    ///
+    /// The `expected_checksum` comparison is deliberately not repeated here:
+    /// the file can change between the two rounds, so the guard is worth
+    /// nothing unless it runs in the round that actually deletes, which is
+    /// where it already runs.
+    ///
+    /// One narrow divergence the other way, stated so it is not discovered:
+    /// the engram branch loads the engram's content unconditionally, to see
+    /// what it references, where the delete loads it only when a checksum is
+    /// being compared. A row whose content cannot be loaded therefore fails
+    /// the preview while the plain delete of it would succeed - reachable on a
+    /// virtual domain holding a row with no stored content. It is a miss the
+    /// caller can act on rather than a silent one, and the alternative is
+    /// answering "attachments: none" for an engram nobody could read.
+    pub async fn delete_preview(&self, p: &DeleteParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        if let Some(path) = attachment_identifier(&p.identifier) {
+            if p.expected_checksum.is_some() {
+                return Err(EngineError::Invalid(format!(
+                    "expected_checksum guards an engram edit and has no meaning for the attachment '{path}'; delete it without one"
+                )));
+            }
+            let size = self.attachment_delete_size(&p.domain, &path).await?;
+            return Ok(json!({
+                "domain": p.domain,
+                "path": path,
+                "size": size,
+                "attachment": true,
+            }));
+        }
+        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let content = self.load_content(&source, &desc).await?;
+        let attachments = self.previewable_attachments(&desc, &content).await;
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+            "title": desc.title,
+            "path": desc.path,
+            "attachments": attachments,
+        }))
+    }
+
+    /// [`Engine::sole_referent_attachments`] under
+    /// [`MAX_PREVIEW_SCAN_ENGRAMS`], and [`None`] above it.
+    ///
+    /// The two answers are different facts and the shape says which is which:
+    /// an array is "these are the attachments the delete orphans", empty
+    /// included, and `null` is "nobody looked". The caller that renders the
+    /// question reads the difference and words the clause accordingly; nothing
+    /// here changes what the delete removes.
+    async fn previewable_attachments(
+        &self,
+        desc: &EngramDescriptor,
+        content: &str,
+    ) -> Option<Vec<String>> {
+        if !self.within_preview_scan_bound(&desc.domain).await {
+            return None;
+        }
+        Some(self.sole_referent_attachments(desc, content).await)
+    }
+
+    /// Whether `domain` is small enough for the preview to enumerate, one
+    /// metadata query and no bodies.
+    ///
+    /// **A count that cannot be taken answers `true`.** The bound exists to
+    /// keep a question cheap, not to give round one a new way to fail, and a
+    /// preview that is stricter than the delete it previews is the one thing
+    /// this whole surface must never be. It costs nothing in practice either:
+    /// the listing this failed on is the same listing the enumeration opens
+    /// with, so it fails there immediately and resolves the safe way, which
+    /// names no attachments at all.
+    async fn within_preview_scan_bound(&self, domain: &str) -> bool {
+        let counted = {
+            let store = self.store.lock().await;
+            store.list_engrams(domain, None, None).await
+        };
+        match counted {
+            Ok(rows) => count_within_preview_bound(rows.len()),
+            Err(e) => {
+                tracing::warn!(
+                    "the engrams of '{domain}' could not be counted ({e}); the delete preview enumerates attachments as it would on a small domain"
+                );
+                true
+            }
+        }
+    }
+
+    /// How many bytes [`Engine::attachment_delete`] would remove, or
+    /// [`EngineError::NotFound`] when it would remove nothing.
+    ///
+    /// **Deliberately not [`Engine::attachment_read`], and the difference is a
+    /// bug rather than a preference.** That read refuses a file over
+    /// [`crystalline_core::MAX_ATTACHMENT_BYTES`] and, on a virtual domain,
+    /// insists on both a row and a blob. The delete does neither: it reads no
+    /// bytes and succeeds when either half is there. A preview built on the
+    /// read would therefore fail round one - and so refuse the delete outright
+    /// for a peer that gets asked - on exactly the files this verb is the
+    /// escape hatch for: the stray oversized file the walker skipped and so
+    /// never gave a row, and the half-present pair a hand-edited domain leaves
+    /// behind. **A preview must never be stricter than the act it previews.**
+    ///
+    /// So the size is looked up rather than measured: the file's own metadata
+    /// where there is a file, the recorded row where the file is already gone
+    /// and only the row stands. No bytes are read and nothing is written -
+    /// unlike the read, which heals the row it serves, so round one no longer
+    /// mutates the derived layer at all.
+    async fn attachment_delete_size(&self, domain: &str, path: &str) -> Result<u64> {
+        validate_attachment_path(path)?;
+        let (domain_id, source) = self.domain_source(domain).await?;
+        let row = {
+            let store = self.store.lock().await;
+            store.get_attachment(domain_id, path).await?
+        };
+        // Whichever half the delete would find, in the order that gives the
+        // truest number: a row can be stale about a file that is right there,
+        // and a file cannot be stale about itself.
+        if let ContentSource::File { root } = &source {
+            let abs = contained_asset_path(root, path)?;
+            match std::fs::metadata(&abs) {
+                Ok(meta) => return Ok(meta.len()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(source) => {
+                    return Err(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
+        row.map(|row| row.size)
+            .ok_or_else(|| EngineError::NotFound(missing_attachment(domain, path)))
+    }
+
+    /// The stored attachments `src` refers to that nothing else in its domain
+    /// refers to.
+    ///
+    /// Counted by the same pair the cross-domain move counts with
+    /// ([`referenced_asset_paths`] and [`Engine::shared_asset_paths`]), so
+    /// "only this engram uses it" means one thing across the crate, including
+    /// the part where a count that fails resolves to shared and therefore
+    /// names nothing.
+    ///
+    /// Screened against the domain's attachment rows at the end, one metadata
+    /// query and no bytes: a reference to a file the domain does not hold is a
+    /// dangling reference the sweep already reports, and a delete does not
+    /// orphan something that was never there.
+    async fn sole_referent_attachments(
+        &self,
+        src: &EngramDescriptor,
+        content: &str,
+    ) -> Vec<String> {
+        let candidates = referenced_asset_paths(content);
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let shared = self.shared_asset_paths(src, &candidates).await;
+        let mut sole: Vec<String> = candidates
+            .into_iter()
+            .filter(|path| !shared.contains(path))
+            .collect();
+        if sole.is_empty() {
+            return sole;
+        }
+        let stored: HashSet<String> = match self.attachment_list(&src.domain).await {
+            Ok(rows) => rows.into_iter().map(|row| row.path).collect(),
+            Err(e) => {
+                // The screen is a refinement, not the decision. When it cannot
+                // run, the unscreened list is still every path this engram is
+                // the last referent of, which is the honest answer minus one
+                // filter.
+                tracing::warn!(
+                    "the attachments of '{}' could not be listed ({e}); the delete preview names every path the engram is the last referent of",
+                    src.domain
+                );
+                return sole;
+            }
+        };
+        sole.retain(|path| stored.contains(path));
+        sole
     }
 
     // --- search --------------------------------------------------------------
@@ -5141,11 +5441,19 @@ impl Engine {
 
         // The prose instruction rides a per-rule legend rather than a column, so
         // a page of ten findings from one rule carries it once. Only the rules
-        // on this page appear.
+        // on this page appear. The catalog's short `summary` rides beside it:
+        // a renderer wants a few words for a heading and the instruction for
+        // the body, and deriving one from the other is not a client's job.
         let actions: Vec<Value> = RULES
             .iter()
             .filter(|info| shown.iter().any(|f| f.rule == info.id))
-            .map(|info| json!({ "rule": info.id, "instruction": info.instruction }))
+            .map(|info| {
+                json!({
+                    "rule": info.id,
+                    "summary": info.summary,
+                    "instruction": info.instruction,
+                })
+            })
             .collect();
 
         Ok(json!({
@@ -5180,42 +5488,84 @@ impl Engine {
 
     // --- acknowledgments -----------------------------------------------------
 
-    /// The acknowledgment an `evolve_ack` assignment is asking for, completed
-    /// with the scope only the sweep can supply, or `None` when this edit is
-    /// not one.
+    /// What an `evolve_ack` assignment asks for, or `None` when this edit is
+    /// not one. Pure and public, so a surface can put the act to a user before
+    /// it happens without the engine having to guess at the wording.
     ///
     /// The value is the rule id optionally followed by a note, split at the
     /// first whitespace: `V101` or `V101 lineage citation, keep`. The rule has
     /// to be one the catalog knows, because an acknowledgment of a rule that
     /// does not exist can never suppress anything and silently storing it would
-    /// read as work done.
-    ///
-    /// The scope is the firing finding's, and its absence is meaningful: a rule
-    /// that is not currently firing for this engram is acknowledged scope-less,
-    /// which matches whatever it finds later. That is the honest reading of
-    /// "acknowledge this before it appears".
-    async fn ack_draft(
-        &self,
-        p: &EditParams,
-        desc: &EngramDescriptor,
-        actor: &str,
-    ) -> Result<Option<EvolveAck>> {
+    /// read as work done. `remove V101` takes an entry back instead of
+    /// recording one (see [`parse_ack_value`]).
+    pub fn ack_intent(p: &EditParams) -> Result<Option<AckIntent>> {
         if p.operation != "set_frontmatter"
             || p.key.as_deref().map(str::trim) != Some(EVOLVE_ACK_KEY)
         {
             return Ok(None);
         }
         let raw = p.value.as_deref().map(str::trim).unwrap_or_default();
-        let (rule, note) = parse_ack_value(raw)?;
-        Ok(Some(EvolveAck {
-            scope: self
-                .firing_scope(&desc.domain, &desc.permalink, &rule)
-                .await?,
-            rule,
-            note,
-            by: actor.to_string(),
-            at: Some(now_offset()),
+        parse_ack_value(raw).map(Some)
+    }
+
+    /// What an `evolve_ack` confirmation round names: `{domain, permalink}` for
+    /// the engram the assignment would land on.
+    ///
+    /// Shaped after [`Engine::delete_preview`] and there for the same reason: a
+    /// question is only worth putting to a user about a call that can run.
+    /// Read-only is checked first and the identifier is resolved next, so a
+    /// server that never writes, a domain nobody registered and an identifier
+    /// nobody has each fail in round one - rather than collecting a yes and
+    /// reporting the miss in round two, against a name the user already
+    /// approved.
+    ///
+    /// It resolves and nothing else. The `expected_checksum` comparison and the
+    /// "is that acknowledgment even there" test both read what the file holds,
+    /// the file can change between the rounds, and both already run in the
+    /// round that writes; repeating them here would buy a guarantee that does
+    /// not survive the gap.
+    pub async fn ack_preview(&self, p: &EditParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let (desc, _) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
         }))
+    }
+
+    /// The acknowledgment an `evolve_ack` assignment is asking for, completed
+    /// with the scope only the sweep can supply, or `None` when this edit is
+    /// not one.
+    ///
+    /// The scope is the firing finding's, and its absence is meaningful: a rule
+    /// that is not currently firing for this engram is acknowledged scope-less,
+    /// which matches whatever it finds later. That is the honest reading of
+    /// "acknowledge this before it appears".
+    ///
+    /// A removal needs none of that: it names an entry that is already on the
+    /// engram, so it travels to the text edit as the rule id alone and the
+    /// filtering happens there, under the lock, against what the file holds.
+    async fn ack_draft(
+        &self,
+        p: &EditParams,
+        desc: &EngramDescriptor,
+        actor: &str,
+    ) -> Result<Option<AckDraft>> {
+        Ok(match Self::ack_intent(p)? {
+            None => None,
+            Some(AckIntent::Remove { rule }) => Some(AckDraft::Remove(rule)),
+            Some(AckIntent::Record { rule, note }) => Some(AckDraft::Record(EvolveAck {
+                scope: self
+                    .firing_scope(&desc.domain, &desc.permalink, &rule)
+                    .await?,
+                rule,
+                note,
+                by: actor.to_string(),
+                at: Some(now_offset()),
+            })),
+        })
     }
 
     /// What `rule` is currently firing on `permalink` for, as the scope an
@@ -5257,6 +5607,20 @@ impl Engine {
     /// raising it. The Fluid half of the same act
     /// [`Engine::edit_engram_as`]'s `set_frontmatter` performs for an agent,
     /// through the one edit path, with the scope computed the one way.
+    ///
+    /// The rule is screened here as well as inside the edit, because this
+    /// surface carries the rule and the note as separate fields and joins them
+    /// into one value: the screen is what keeps a rule field that happens to
+    /// read `remove` an unknown-rule refusal rather than a value the parser
+    /// would take for a removal.
+    ///
+    /// **The screen runs before resolution by design, so an unknown rule
+    /// answers before a missing engram does**: a request that gets both halves
+    /// wrong is refused for the rule (a 422 on the REST surface) rather than
+    /// for the permalink (a 404). The rule is the half the caller can fix
+    /// without another lookup - the catalog is right there in the message - and
+    /// an acknowledgment of a rule nobody has could not be recorded even on an
+    /// engram that does exist.
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
@@ -5265,6 +5629,10 @@ impl Engine {
         note: Option<&str>,
         client: Option<&str>,
     ) -> Result<Value> {
+        let screened = rule.trim().to_ascii_uppercase();
+        if rule_info(&screened).is_none() {
+            return Err(EngineError::Invalid(unknown_rule_message(&screened)));
+        }
         let value = match note.map(str::trim).filter(|n| !n.is_empty()) {
             Some(note) => format!("{} {note}", rule.trim()),
             None => rule.trim().to_string(),
@@ -5285,9 +5653,9 @@ impl Engine {
     /// `false` when the engram carries none for that rule, which the surface
     /// answers as a 404 rather than pretending a removal happened.
     ///
-    /// Deliberately not offered over MCP: an agent silences a finding a person
-    /// ruled intentional, and un-silencing it is the person's call, in Fluid or
-    /// in the file.
+    /// Fluid's half of the take-back an agent asks for with the `remove
+    /// <rule-id>` value form; both filter through [`without_ack`], and they
+    /// differ only in how an entry that is not there is reported.
     pub async fn unacknowledge_finding_as(
         &self,
         domain: &str,
@@ -5308,21 +5676,11 @@ impl Engine {
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block.
         let current = self.load_source(&source, &desc).await?;
-        // Case-folded, like every other rule comparison on this path: a
-        // hand-written `- { rule: v101 }` suppresses findings, so it has to be
-        // withdrawable too.
-        if !acks_of(&current)
-            .iter()
-            .any(|a| a.rule.eq_ignore_ascii_case(&rule))
-        {
+        if !has_ack(&current, &rule) {
             return Ok(false);
         }
         self.apply_source_edit(&desc, &source, None, &actor, |current| {
-            let kept: Vec<EvolveAck> = acks_of(current)
-                .into_iter()
-                .filter(|a| !a.rule.eq_ignore_ascii_case(&rule))
-                .collect();
-            Ok(set_evolve_ack(current, &kept))
+            Ok(without_ack(current, &rule))
         })
         .await?;
         Ok(true)
@@ -5555,20 +5913,27 @@ impl Engine {
 
     // --- vocabulary ----------------------------------------------------------
 
-    /// List the tags, observation categories and relation types already in use,
-    /// each with a usage count, for one domain or across every domain. An unknown
-    /// domain reports empty lists rather than erroring, matching the store
-    /// contract, so an agent can probe a fresh domain safely. `domain` echoes the
-    /// request, `null` for an all-domain sweep.
+    /// List the tags, observation categories, relation types and engram `type`
+    /// and `status` values already in use, each with a usage count, for one
+    /// domain or across every domain. An unknown domain reports empty lists
+    /// rather than erroring, matching the store contract, so an agent can probe a
+    /// fresh domain safely. `domain` echoes the request, `null` for an all-domain
+    /// sweep.
     pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
         let store = self.store.lock().await;
         let vocab = store.vocabulary(p.domain.as_deref()).await?;
         drop(store);
+        // Every count list is present unconditionally, empty when nothing is in
+        // use, so a client reads a list rather than testing for a missing key.
+        // Only the two advisory keys below (clusters, aliases) are omitted when
+        // they have nothing to say.
         let mut out = json!({
             "domain": p.domain,
             "tags": vocab.tags,
             "categories": vocab.categories,
             "relation_types": vocab.relation_types,
+            "types": vocab.types,
+            "statuses": vocab.statuses,
         });
         // Near-duplicate tag clusters, omitted entirely when there are none so a
         // clean vocabulary stays quiet. They point at tags to consolidate with
@@ -9746,6 +10111,26 @@ struct AttachmentCarry {
     shared: bool,
 }
 
+/// The receipt sentence for an attachment the source domain does not hold, so
+/// the move takes nothing along for the reference that names it.
+///
+/// The wire text lives here alone: the trace line the planner also writes
+/// formats this same sentence and adds the store error beside it, which is an
+/// operator's detail rather than something a caller's receipt should carry.
+fn attachment_missing_warning(path: &str, permalink: &str, domain: &str) -> String {
+    format!(
+        "attachment '{path}' referenced by '{permalink}' is not in '{domain}'; the move carries nothing for it"
+    )
+}
+
+/// The receipt sentence for an attachment that stays in the source domain
+/// because no free name for it could be settled at the destination.
+fn attachment_not_carried_warning(path: &str, dest_domain: &str) -> String {
+    format!(
+        "attachment '{path}' could not be carried to '{dest_domain}'; its reference at the destination may resolve to a different same-name file"
+    )
+}
+
 /// The counting's verdict, resolved so that not knowing can only point the
 /// safe way.
 ///
@@ -9765,6 +10150,63 @@ fn resolve_shared(counted: Result<HashSet<String>>, candidates: &[String]) -> Ha
             candidates.iter().cloned().collect()
         }
     }
+}
+
+/// The address a write's receipt names, resolved so that decorating a receipt
+/// can never fail the write it describes.
+///
+/// Every caller asks the index for the permalink of something it has just
+/// written, after the write and its reindex are committed. That read-back is
+/// worth doing (the index takes an engram's permalink from its frontmatter, so
+/// an author or a rename may have moved the address), but it is the last step
+/// of an operation that is already done: a store error here would report a
+/// committed write as failed and invite a caller to retry something that
+/// already happened. So a failure is logged at debug and answered the same way
+/// a missing row is, with the name the caller went in with.
+fn receipt_permalink(found: Result<Option<String>>, fallback: String) -> String {
+    match found {
+        Ok(Some(permalink)) => permalink,
+        Ok(None) => fallback,
+        Err(e) => {
+            tracing::debug!(
+                "the address of the engram just written could not be read back ({e}); the receipt names '{fallback}', the address it went in with"
+            );
+            fallback
+        }
+    }
+}
+
+/// Whether a domain holding `engrams` engrams is inside
+/// [`MAX_PREVIEW_SCAN_ENGRAMS`].
+///
+/// A line of arithmetic with its own name so the boundary is pinned by a test
+/// rather than by a reading: exactly the bound still enumerates, one past it
+/// does not.
+fn count_within_preview_bound(engrams: usize) -> bool {
+    engrams <= MAX_PREVIEW_SCAN_ENGRAMS
+}
+
+/// Every attachment one engram's own text points at: the `assets/` references
+/// in its body plus the one an `analyzes` claim in its frontmatter names,
+/// deduplicated and in reference order.
+///
+/// The one enumeration of "what does this engram use", shared by the
+/// cross-domain move (which has to carry them) and by
+/// [`Engine::delete_preview`] (which has to name the ones the delete leaves
+/// behind). Text that will not parse is read as a body on its own rather than
+/// dropped, because a reference in unparseable text is still a reference.
+fn referenced_asset_paths(content: &str) -> Vec<String> {
+    let parsed = parse_engram(content).ok();
+    let body = parsed
+        .as_ref()
+        .map_or(content, |engram| engram.body.as_str());
+    let mut paths = crystalline_core::find_asset_refs(body);
+    if let Some(claim) = parsed.as_ref().and_then(|e| asset_claim(&e.frontmatter))
+        && !paths.contains(&claim)
+    {
+        paths.push(claim);
+    }
+    paths
 }
 
 /// The part of an attachment path below the reserved folder (`notes/shot.png`
@@ -9792,25 +10234,122 @@ struct DomainSweep {
     unparsed: usize,
 }
 
-/// Split an `evolve_ack` value into the rule id and the note: the rule up to
-/// the first whitespace, everything after it the note. The id is uppercased, so
-/// `v101 keep` records the same acknowledgment `V101 keep` does.
-fn parse_ack_value(raw: &str) -> Result<(String, Option<String>)> {
+/// What an `evolve_ack` assignment asks for, read out of its value and nothing
+/// else. [`Engine::ack_intent`] is how a surface gets one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AckIntent {
+    /// Record `rule`'s finding as intentional, with the caller's note.
+    Record {
+        /// The rule id, uppercased.
+        rule: String,
+        /// Why the finding is intentional, folded to one line.
+        note: Option<String>,
+    },
+    /// Take `rule`'s acknowledgment back, so the finding resurfaces.
+    Remove {
+        /// The rule id, uppercased.
+        rule: String,
+    },
+}
+
+/// An [`AckIntent`] the server has completed, on its way to the text edit: the
+/// record carries the scope only a sweep could supply, the removal carries the
+/// rule alone because the entry it names is already in the file.
+enum AckDraft {
+    Record(EvolveAck),
+    Remove(String),
+}
+
+/// Split an `evolve_ack` value into what it asks for: a record, or a removal.
+///
+/// The record form is the rule id up to the first whitespace and everything
+/// after it as the note. The id is uppercased, so `v101 keep` records the same
+/// acknowledgment `V101 keep` does.
+///
+/// The removal form is the whole first token being exactly `remove`, followed
+/// by one rule id and nothing else. Case-sensitive and whole-token on purpose:
+/// the record form puts the rule first, so `V101 remove this later` is a note
+/// that happens to start with the word and stays a record. Trailing text is
+/// refused rather than dropped, because the most likely thing after the rule is
+/// a note the caller believed was being stored.
+fn parse_ack_value(raw: &str) -> Result<AckIntent> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return Err(EngineError::Invalid(format!(
-            "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
-        )));
+        return Err(EngineError::Invalid(ack_value_message()));
     }
-    let (rule, note) = match raw.split_once(char::is_whitespace) {
-        Some((rule, note)) => (rule, fold_note(note)),
-        None => (raw, String::new()),
+    let (head, rest) = match raw.split_once(char::is_whitespace) {
+        Some((head, rest)) => (head, rest.trim()),
+        None => (raw, ""),
     };
-    let rule = rule.trim().to_ascii_uppercase();
+    if head == REMOVE_VERB {
+        let mut tokens = rest.split_whitespace();
+        let Some(rule) = tokens.next() else {
+            return Err(EngineError::Invalid(removal_form_message(
+                "name the rule to take back",
+            )));
+        };
+        if tokens.next().is_some() {
+            return Err(EngineError::Invalid(removal_form_message(
+                "drop the extra text",
+            )));
+        }
+        let rule = rule.to_ascii_uppercase();
+        if rule_info(&rule).is_none() {
+            return Err(EngineError::Invalid(unknown_rule_message(&rule)));
+        }
+        return Ok(AckIntent::Remove { rule });
+    }
+    let rule = head.trim().to_ascii_uppercase();
     if rule_info(&rule).is_none() {
         return Err(EngineError::Invalid(unknown_rule_message(&rule)));
     }
-    Ok((rule, (!note.is_empty()).then_some(note)))
+    let note = fold_note(rest);
+    Ok(AckIntent::Record {
+        rule,
+        note: (!note.is_empty()).then_some(note),
+    })
+}
+
+/// The first token that makes an `evolve_ack` value a removal.
+const REMOVE_VERB: &str = "remove";
+
+/// The last stop before an `evolve_ack` rewrite is persisted: the bytes have to
+/// parse, or nothing is written and the caller hears why.
+///
+/// Both halves of the key run through it, because neither edits lines in place:
+/// a record and a removal each re-render the whole value from the entries that
+/// survive ([`set_evolve_ack`]), so what lands is emitter output rather than the
+/// file minus a line. A write that persisted unparseable bytes would make the
+/// engram invisible to the sweep, to `read_engram` and to search - the one
+/// failure this path must never cause while claiming to tidy knowledge up.
+/// `act` names which half refused, so a caller reads what did not happen rather
+/// than a generic parse complaint.
+fn guarded_ack_write(out: String, act: &str, identifier: &str) -> Result<String> {
+    parse_engram(&out).map_err(|e| {
+        EngineError::Invalid(format!(
+            "the {act} would leave '{identifier}' unparseable ({e}); nothing was written"
+        ))
+    })?;
+    Ok(out)
+}
+
+/// What a caller hears when an `evolve_ack` assignment carries no value at all.
+///
+/// It names **both** forms rather than only the record, because this is the
+/// message an agent that guessed at the key reads, and the take-back has no
+/// other discovery path: nothing in a value it typed wrong hints that `remove
+/// <rule-id>` exists. An error text is a teaching surface here, so the cost of
+/// the second clause is a line and the benefit is the other half of the verb.
+fn ack_value_message() -> String {
+    format!(
+        "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note ('V101 lineage citation, keep'), or 'remove <rule-id>' to take an acknowledgment back"
+    )
+}
+
+/// What a caller hears when the removal form is malformed: the form itself,
+/// then the fix.
+fn removal_form_message(fix: &str) -> String {
+    format!("a removal takes exactly 'remove <rule-id>'; {fix}")
 }
 
 /// A note as one line of prose: every run of whitespace, newlines included,
@@ -9863,6 +10402,34 @@ fn acks_of(source: &str) -> Vec<EvolveAck> {
                 .map(EvolveAck::parse_list)
         })
         .unwrap_or_default()
+}
+
+/// Whether the engram acknowledges `rule` at all.
+///
+/// Case-folded, like every other rule comparison on this path: a hand-written
+/// `- { rule: v101 }` suppresses findings, so it has to be findable - and
+/// withdrawable - too.
+fn has_ack(source: &str, rule: &str) -> bool {
+    acks_of(source)
+        .iter()
+        .any(|a| a.rule.eq_ignore_ascii_case(rule))
+}
+
+/// The engram's markdown with `rule`'s acknowledgment dropped and every other
+/// entry left exactly as it was. Removing the last one removes the key rather
+/// than leaving an empty one ([`set_evolve_ack`] on an empty slice).
+///
+/// The one removal both surfaces run: Fluid's withdraw
+/// ([`Engine::unacknowledge_finding_as`]) and an agent's `remove <rule-id>`
+/// value. They differ only in how they report an entry that is not there - a
+/// `false` the REST layer answers as a 404, an error the agent reads - which is
+/// why the presence test is [`has_ack`] beside this rather than folded into it.
+fn without_ack(source: &str, rule: &str) -> String {
+    let kept: Vec<EvolveAck> = acks_of(source)
+        .into_iter()
+        .filter(|a| !a.rule.eq_ignore_ascii_case(rule))
+        .collect();
+    set_evolve_ack(source, &kept)
 }
 
 /// The engram's acknowledgments with `entry` folded in: one entry per rule, so
@@ -10908,6 +11475,19 @@ mod attachment_carry_tests {
         assert!(resolve_shared(Ok(HashSet::new()), &candidates).is_empty());
     }
 
+    /// The bound the delete preview enumerates under, pinned at the edge:
+    /// exactly [`MAX_PREVIEW_SCAN_ENGRAMS`] engrams still gets the full
+    /// enumeration, one more does not. The number itself may move; which side
+    /// of it each count falls on must not drift by an off-by-one.
+    #[test]
+    fn the_preview_scan_bound_includes_its_own_number() {
+        assert!(count_within_preview_bound(0));
+        assert!(count_within_preview_bound(1));
+        assert!(count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS));
+        assert!(!count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS + 1));
+        assert!(!count_within_preview_bound(50_000));
+    }
+
     #[test]
     fn the_screen_matches_every_spelling_of_a_reference() {
         assert_eq!(asset_tail("assets/shot.png"), "shot.png");
@@ -10953,5 +11533,49 @@ mod attachment_carry_tests {
         // rewritten into something no write would take.
         let hopeless = format!("assets/{}/x.png", "d".repeat(246));
         assert!(suffixed_asset_path(&hopeless, 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod receipt_permalink_tests {
+    use super::*;
+
+    /// The address the index answers with is the one the receipt names: that
+    /// read-back is the whole point of asking, so a hit must pass through.
+    #[test]
+    fn the_address_the_index_answers_with_is_the_one_reported() {
+        assert_eq!(
+            receipt_permalink(Ok(Some("notes/moved".to_string())), "notes/old".to_string()),
+            "notes/moved"
+        );
+    }
+
+    /// No row for the path (the write is committed, the index has not caught
+    /// up) falls back to the name the caller already knows.
+    #[test]
+    fn a_missing_row_falls_back_to_the_known_name() {
+        assert_eq!(
+            receipt_permalink(Ok(None), "notes/old".to_string()),
+            "notes/old"
+        );
+    }
+
+    /// And the case this function exists for: the lookup itself failed. The
+    /// write it decorates is already committed on disk and in the index, so
+    /// the failure can only cost the receipt its freshest address, never turn
+    /// a done write into a reported error.
+    #[test]
+    fn a_lookup_failure_falls_back_rather_than_failing_a_committed_write() {
+        for failure in [
+            EngineError::Internal("the database went away".into()),
+            EngineError::Invalid("broken".into()),
+            EngineError::Conflict("busy".into()),
+        ] {
+            assert_eq!(
+                receipt_permalink(Err(failure), "notes/old".to_string()),
+                "notes/old",
+                "a receipt lookup must never fail the write it describes"
+            );
+        }
     }
 }

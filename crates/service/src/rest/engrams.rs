@@ -1111,13 +1111,22 @@ pub async fn retire(
             status = 200,
             description = "The move receipt: where the engram came from, \
                            where it landed, whether the move crossed domains \
-                           and how many inbound links were rewritten.",
+                           and how many inbound links were rewritten.\n\n\
+                           `to.permalink` is the address the engram answers \
+                           to after the move, which is not always the one it \
+                           went in with: a permalink that was derived from \
+                           the path follows the file.\n\n\
+                           `attachment_warnings` lists the attachments the \
+                           move could not carry, one sentence each and empty \
+                           when everything travelled; those files stay whole \
+                           in the source domain.",
             body = Object,
             example = json!({
                 "from": { "domain": "eng", "permalink": "beta", "path": "beta.md" },
-                "to": { "domain": "eng", "path": "guides/beta.md" },
+                "to": { "domain": "eng", "permalink": "guides/beta", "path": "guides/beta.md" },
                 "cross_domain": false,
-                "links_rewritten": 0
+                "links_rewritten": 0,
+                "attachment_warnings": []
             }),
         ),
         (

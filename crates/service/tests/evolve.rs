@@ -964,9 +964,10 @@ async fn the_attachment_rules_fire_over_a_real_domain() {
 // Acknowledgments
 // ---------------------------------------------------------------------------
 
-/// Acknowledge `rule` on `permalink` the way an agent does: `edit_engram` with
-/// `set_frontmatter`, key `evolve_ack`, the rule and note as one value.
-async fn acknowledge(engine: &Engine, permalink: &str, value: &str) -> Value {
+/// One `evolve_ack` assignment as an agent makes it: `edit_engram` with
+/// `set_frontmatter`, key `evolve_ack`, the whole value as one string. Left
+/// unwrapped so the tests that assert on a refusal can read the message.
+async fn ack_edit(engine: &Engine, permalink: &str, value: &str) -> Result<Value, String> {
     engine
         .edit_engram_as(
             &crystalline_service::params::EditParams {
@@ -980,7 +981,13 @@ async fn acknowledge(engine: &Engine, permalink: &str, value: &str) -> Value {
             Some("agent:test"),
         )
         .await
-        .unwrap()
+        .map_err(|e| e.to_string())
+}
+
+/// Acknowledge `rule` on `permalink` the way an agent does: `edit_engram` with
+/// `set_frontmatter`, key `evolve_ack`, the rule and note as one value.
+async fn acknowledge(engine: &Engine, permalink: &str, value: &str) -> Value {
+    ack_edit(engine, permalink, value).await.unwrap()
 }
 
 /// The queue rows for one engram, whatever the rule.
@@ -1441,4 +1448,153 @@ async fn a_lowercase_hand_written_rule_id_can_still_be_withdrawn() {
     );
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert!(!on_disk.contains("evolve_ack"), "{on_disk}");
+}
+
+/// The removal value form takes one acknowledgment back and leaves the other
+/// entries exactly as they were, which is what makes it usable on an engram
+/// that carries a considered list rather than a single entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_value_takes_one_acknowledgment_back() {
+    let (tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+    acknowledge(&engine, "live-doc", "V104 deliberate orphan").await;
+
+    let receipt = ack_edit(&engine, "live-doc", "remove V101").await.unwrap();
+    assert_eq!(
+        receipt["evolve_ack_removed"], "V101",
+        "the receipt names what it took back: {receipt}"
+    );
+    assert!(
+        receipt["evolve_ack"].is_null(),
+        "and records nothing: {receipt}"
+    );
+
+    let on_disk = std::fs::read_to_string(tmp.path().join("eng/live-doc.md")).unwrap();
+    assert!(!on_disk.contains("rule: V101"), "{on_disk}");
+    assert!(
+        on_disk.contains("rule: V104"),
+        "the other one stays: {on_disk}"
+    );
+
+    // The finding it silenced is back in the queue, which is the whole point.
+    let back = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert_eq!(rows_on(&back, "live-doc").len(), 1, "{back}");
+}
+
+/// Taking the last acknowledgment back removes the frontmatter key rather than
+/// leaving an empty one behind: asserted by re-parsing the file, because an
+/// `evolve_ack:` with nothing under it is what an emitter bug would leave.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_the_last_acknowledgment_removes_the_frontmatter_block() {
+    let (tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    ack_edit(&engine, "live-doc", "remove v101").await.unwrap();
+
+    let path = tmp.path().join("eng/live-doc.md");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    let parsed = crystalline_core::parse_engram(&on_disk).expect("the engram still parses");
+    assert!(
+        parsed.frontmatter.extra.get("evolve_ack").is_none(),
+        "the key is gone, not emptied: {on_disk}"
+    );
+}
+
+/// A removal naming a rule the engram never acknowledged is refused rather
+/// than answered as a no-op: an agent that mistyped the rule has to hear it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_an_acknowledgment_that_is_not_there_is_refused() {
+    let (_tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    let err = ack_edit(&engine, "live-doc", "remove V104")
+        .await
+        .unwrap_err();
+    assert!(err.contains("V104"), "{err}");
+    assert!(err.contains("live-doc"), "the engram is named: {err}");
+    assert!(err.contains("nothing to remove"), "{err}");
+}
+
+/// The removal form is exactly `remove <rule-id>`: no rule, an unknown rule or
+/// trailing text are each refused with the form named, so a note meant for a
+/// record never lands as a half-read removal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_removal_value_takes_exactly_one_rule_id() {
+    let (_tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    let bare = ack_edit(&engine, "live-doc", "remove").await.unwrap_err();
+    assert!(bare.contains("remove <rule-id>"), "{bare}");
+
+    let extra = ack_edit(&engine, "live-doc", "remove V101 because I changed my mind")
+        .await
+        .unwrap_err();
+    assert!(extra.contains("remove <rule-id>"), "{extra}");
+    assert!(extra.contains("drop the extra text"), "{extra}");
+
+    let unknown = ack_edit(&engine, "live-doc", "remove V999")
+        .await
+        .unwrap_err();
+    assert!(unknown.contains("V999"), "{unknown}");
+
+    // None of it touched the acknowledgment they were aimed at.
+    let audited = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    assert!(rows_on(&audited, "live-doc").is_empty(), "{audited}");
+}
+
+/// An `evolve_ack` assignment with no value is where an agent learns the key's
+/// two forms, so the refusal names both: the record form it probably meant, and
+/// the take-back form it has no other way to discover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_ack_value_names_both_forms() {
+    let (_tmp, engine) = fixture().await;
+
+    let empty = ack_edit(&engine, "live-doc", "   ").await.unwrap_err();
+    assert!(
+        empty.contains("V101 lineage citation, keep"),
+        "the record form is shown: {empty}"
+    );
+    assert!(
+        empty.contains("remove <rule-id>"),
+        "and so is the take-back: {empty}"
+    );
+    assert!(
+        empty.contains("take an acknowledgment back"),
+        "in words that say what it does: {empty}"
+    );
+}
+
+/// `remove` is only the removal verb as the whole first token: a note that
+/// happens to start with the word still records, because the rule id comes
+/// first in the record form.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_note_starting_with_remove_still_records() {
+    let (_tmp, engine) = fixture().await;
+    let receipt = acknowledge(&engine, "live-doc", "V101 remove this later, not now").await;
+    assert_eq!(receipt["evolve_ack"]["rule"], "V101", "{receipt}");
+    assert_eq!(
+        receipt["evolve_ack"]["note"], "remove this later, not now",
+        "{receipt}"
+    );
+    assert!(receipt["evolve_ack_removed"].is_null(), "{receipt}");
 }

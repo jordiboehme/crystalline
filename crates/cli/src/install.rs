@@ -830,11 +830,7 @@ fn install_mcp(harness: HarnessKind, project: bool) -> McpReport {
     // would not do: these CLIs refuse a same-name add outright (`claude mcp
     // add crystalline` on an existing name exits 1 with "already exists"), so
     // a printed command has to remove first or it cannot succeed as printed.
-    let manual_replace = format!(
-        "{} {} && {manual}",
-        harness.cli(),
-        mcp_remove_args(harness, project).join(" ")
-    );
+    let manual_replace = format!("{} && {manual}", mcp_remove_command(harness, project));
 
     match run_harness_cli(harness, &["mcp", "get", "crystalline"]) {
         CliRun::NotFound => return McpReport::new("cli-missing", Some(manual)),
@@ -904,11 +900,29 @@ fn mcp_remove_args(harness: HarnessKind, project: bool) -> Vec<String> {
     args.into_iter().map(String::from).collect()
 }
 
+/// The removal spelled as a person would type it, for the hint printed when
+/// the harness CLI is missing: the command we would have run, scope included.
+fn mcp_remove_command(harness: HarnessKind, project: bool) -> String {
+    format!(
+        "{} {}",
+        harness.cli(),
+        mcp_remove_args(harness, project).join(" ")
+    )
+}
+
 /// Deregister the MCP server, tolerantly: a missing CLI records the manual
 /// command, a non-zero exit is read as already gone.
-fn uninstall_mcp(harness: HarnessKind) -> McpReport {
-    let manual = format!("{} mcp remove crystalline", harness.cli());
-    match run_harness_cli(harness, &["mcp", "remove", "crystalline"]) {
+///
+/// Scoped like every other half of this pair. The bare form this used to run
+/// removes from whichever scope happens to hold the name, so an uninstall of a
+/// project install standing beside a user install could take the user's
+/// registration and leave the project's - the removal doing the opposite of
+/// what was asked, in both directions.
+fn uninstall_mcp(harness: HarnessKind, project: bool) -> McpReport {
+    let manual = mcp_remove_command(harness, project);
+    let args = mcp_remove_args(harness, project);
+    let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
+    match run_harness_cli(harness, &args_ref) {
         CliRun::NotFound => McpReport::new("cli-missing", Some(manual)),
         CliRun::Ok => McpReport::new("removed", None),
         CliRun::Failed => McpReport::new("not-present", None),
@@ -1764,7 +1778,10 @@ pub fn run_uninstall(
         .find(harness.id(), scope, project_path.as_deref())
         .cloned();
 
-    let mcp = uninstall_mcp(harness);
+    // The scope this run was asked for is the scope the receipt lookup above
+    // matched on, so `prior.scope` and this flag are the same statement; the
+    // flag is the one that survives a machine with no receipt at all.
+    let mcp = uninstall_mcp(harness, project);
     let hooks = uninstall_hooks(harness, &paths.settings)?;
     let prior_skills = prior.as_ref().map(|p| p.skills.as_slice()).unwrap_or(&[]);
     let skills = uninstall_skills(&paths.skills_dir, prior_skills, force)?;
@@ -2013,6 +2030,26 @@ mod tests {
         assert_eq!(
             mcp_remove_args(HarnessKind::Codex, false),
             vec!["mcp", "remove", "crystalline"]
+        );
+    }
+
+    /// The command a user is handed when the CLI is missing is the command we
+    /// would have run, scope included: a printed removal that names no scope
+    /// takes whichever one happens to hold the name.
+    #[test]
+    fn the_printed_removal_names_the_same_scope_the_run_one_does() {
+        assert_eq!(
+            mcp_remove_command(HarnessKind::ClaudeCode, false),
+            "claude mcp remove crystalline --scope user"
+        );
+        assert_eq!(
+            mcp_remove_command(HarnessKind::ClaudeCode, true),
+            "claude mcp remove crystalline --scope project"
+        );
+        assert_eq!(
+            mcp_remove_command(HarnessKind::Copilot, true),
+            format!("{} mcp remove crystalline", HarnessKind::Copilot.cli()),
+            "a harness with one scope is printed without one"
         );
     }
 

@@ -686,8 +686,76 @@ describe("the team sync card", () => {
     expect(within(card).getByText("2026-08-10")).toBeVisible();
     expect(within(card).getByText("2 pending local changes")).toBeVisible();
     expect(within(card).getByText("1 open proposal")).toBeVisible();
+    // Nothing was declined and nothing conflicts, so neither is mentioned: a
+    // zero of an exceptional thing is noise on a card that is otherwise fine.
+    expect(within(card).queryByText(/declined proposal/)).toBeNull();
+    expect(within(card).queryByText(/to settle/)).toBeNull();
     // Nothing failed, so nothing is announced as failed.
     expect(within(card).queryByRole("alert")).toBeNull();
+  });
+
+  it("names the declined proposals and the conflicts when there are any", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            declined_proposals: [{ number: 3 }, { number: 4 }],
+            conflicts: ["notes/a.md"],
+          }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    // Declined work is informational; a conflict is something somebody has to
+    // go and do, so the wording says so.
+    expect(within(card).getByText("2 declined proposals")).toBeVisible();
+    expect(within(card).getByText("1 conflict to settle")).toBeVisible();
+  });
+
+  it("names the declined proposals without inventing a conflict row", async () => {
+    // The two exceptional counts are two independent rows, and the test above
+    // shows them together, which cannot tell a pair of rows apart from one row
+    // that recites both counts. Each half on its own is what pins that: no
+    // connection block in the fixture, so the not-connected hint is not on the
+    // card either and the row assertions are about the counts alone.
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({ declined_proposals: 2, conflicts: 0 }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("2 declined proposals")).toBeVisible();
+    expect(within(card).queryByText(/to settle/)).toBeNull();
+  });
+
+  it("names the conflicts without inventing a declined row", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({ declined_proposals: 0, conflicts: 2 }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("2 conflicts to settle")).toBeVisible();
+    expect(within(card).queryByText(/declined proposal/)).toBeNull();
   });
 
   it("counts the proposals the real endpoint actually sends", async () => {
@@ -747,6 +815,67 @@ describe("the team sync card", () => {
       "offline: could not reach api.github.com",
     );
     expect(within(card).getByText(/2026-08-09 \(stale\)/)).toBeVisible();
+  });
+
+  it("says the instance is not connected, and where that is fixed", async () => {
+    // The status route reports a missing connection rather than refusing over
+    // it, so the card is the only place that answer is ever seen. Without this
+    // row a disconnected instance shows a stale report and a probe error that
+    // never names the actual cause.
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            connection: { connected: false },
+            probe_error: "no GitHub connection on this instance",
+          }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(
+      await within(card).findByText(
+        /not connected - connect GitHub under Settings to sync/i,
+      ),
+    ).toBeVisible();
+  });
+
+  it("says nothing about the connection when there is one, or no answer", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({ connection: { connected: true, user: "octo" } }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+    expect(within(card).queryByText(/not connected/i)).toBeNull();
+  });
+
+  it("says nothing about the connection when the report carries none", async () => {
+    // A report with no connection block at all is not a report of a missing
+    // connection: an older server, or one that dropped the key, must not make
+    // this card tell somebody to go and connect what is already connected.
+    serve({ "/domains/eng/sync": () => syncResponse() }, "admin");
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+    expect(within(card).queryByText(/not connected/i)).toBeNull();
   });
 
   it("pulls the origin and refreshes what the pull changed", async () => {

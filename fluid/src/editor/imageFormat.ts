@@ -43,11 +43,19 @@
  *   tildes at up to three spaces of indent and closes only on the same
  *   character, at that length or longer, with nothing else on the line.
  *
- * Two divergences are deliberate and are stated where they are made:
- * {@link decodeTarget} decodes a percent-encoded target where the core does
- * not, so the rail and the reading page cannot disagree about one file, and
- * {@link assetPath} refuses a `.` or `..` segment, which the core's SCANNER
- * counts but its VALIDATOR would never let be stored.
+ * The two sides now decode alike: since 0.15.1 the core percent-decodes a
+ * target the way {@link decodeTarget} does, strict hex nibbles and the raw
+ * token back when the escape will not decode, so the rail, the reading page
+ * and the maintenance sweep answer one path for one file. The agreement is
+ * pinned rather than asserted, by the corpus both suites read -
+ * `crates/core/tests/fixtures/asset_ref_corpus.json`, checked here in
+ * imageFormat.test.ts and there in attachment.rs - so changing what either
+ * scanner answers means changing the corpus, and changing the corpus means
+ * moving the other side in the same commit.
+ *
+ * One divergence is left and is stated where it is made: {@link assetPath}
+ * refuses a `.` or `..` segment, which the core's SCANNER counts but its
+ * VALIDATOR would never let be stored.
  */
 
 import { ASSETS_PREFIX, isImageAttachment } from "../api/files";
@@ -91,9 +99,10 @@ const WIDTH = /^w=(\d+%?)$/;
  *
  * The cost is stated rather than hidden: a stored name holding a literal `%25`
  * is indistinguishable from one holding `%`, which is the parked finding about
- * banning `%` in asset paths. The core's own scanner does not decode at all, so
- * this is the one deliberate divergence from it - taken because the alternative
- * is the rail and the page disagreeing about the same reference.
+ * banning `%` in asset paths. The core's scanner decodes the same way as of
+ * 0.15.1 and pays the same cost, so this is no longer a divergence: it is one
+ * rule kept in two languages, and the shared corpus in
+ * `crates/core/tests/fixtures` is what keeps the two spellings honest.
  */
 export function decodeTarget(target: string): string {
   try {
@@ -442,12 +451,17 @@ function eachLiveLine(
  * The reading side's mirror of `find_asset_refs`, sharing its scanner
  * ({@link lineRefs}) and its fence rule ({@link eachLiveLine}): both markdown
  * forms count, code is skipped, a leading `./` is stripped, a title clause is
- * dropped and a fragment never reaches the path. The core remains the
- * authority - it is what the maintenance sweep and the resource links are
- * built on - and the two known divergences are stated where they are made:
- * {@link decodeTarget} decodes a percent-encoded target where the core does
- * not, and {@link assetPath} refuses a `.` or `..` segment the core's scanner
- * would count and its validator would refuse.
+ * dropped, a percent escape is decoded ({@link decodeTarget}, which the core
+ * has done since 0.15.1) and a fragment never reaches the path. The core
+ * remains the authority - it is what the maintenance sweep and the resource
+ * links are built on - and the agreement is pinned by the corpus both suites
+ * read, `crates/core/tests/fixtures/asset_ref_corpus.json`: a change to what
+ * this function answers is a change to that fixture and to the Rust scanner in
+ * the same commit.
+ *
+ * One divergence is left, stated where it is made: {@link assetPath} refuses a
+ * `.` or `..` segment the core's scanner would count and its validator would
+ * refuse.
  */
 export function assetRefsIn(text: string): string[] {
   const paths = new Set<string>();

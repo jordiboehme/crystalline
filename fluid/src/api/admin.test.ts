@@ -227,10 +227,101 @@ describe("the admin client layer", () => {
       lastChecked: "2026-08-10T08:00:00Z",
       localChanges: 2,
       openProposals: 2,
+      // Nothing declined and nothing conflicting is nothing to count: a report
+      // that leaves the keys out says zero rather than "unknown".
+      declinedProposals: 0,
+      conflicts: 0,
       behind: false,
       probeError: null,
+      // Neither key was sent, and neither is invented: a report with no mode
+      // and no connection block says nothing about either rather than
+      // guessing "github" and "connected".
+      mode: null,
+      connected: null,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("reads the mode and the connection the sync report carries", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      mode: "github",
+      repo: "acme/kb",
+      branch: "main",
+      local_changes: 0,
+      open_proposals: [],
+      behind: false,
+      connection: { connected: true, user: "octo", token_store: "keychain" },
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.mode).toBe("github");
+    expect(status.connected).toBe(true);
+  });
+
+  it("reads an instance with no credential on file as not connected", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      mode: "github",
+      repo: "acme/kb",
+      local_changes: 0,
+      open_proposals: [],
+      // The route reports a missing connection rather than refusing over it,
+      // so `false` is an answer the card has to be able to say out loud.
+      connection: { connected: false },
+      probe_error: "no GitHub connection on this instance",
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.connected).toBe(false);
+  });
+
+  it("reads a connection block of nonsense as no answer rather than as false", async () => {
+    // Absent, or present and unreadable, both mean "this report does not say".
+    // Only a literal boolean is an answer, because the card acts on `false`.
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      connection: "nonsense",
+    });
+    expect((await fetchSyncStatus("eng")).connected).toBeNull();
+
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      connection: { connected: "yes" },
+    });
+    expect((await fetchSyncStatus("eng")).connected).toBeNull();
+  });
+
+  it("counts the declined proposals and the conflicts as well", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      branch: "main",
+      last_checked: "2026-08-10T08:00:00Z",
+      local_changes: 0,
+      open_proposals: [],
+      // The two exceptional lists, in the spelling `status_report_json` sends:
+      // the records themselves, which the card wants as counts. A conflict is
+      // the wire record and not the path string it is easy to mistake it for -
+      // counting by length works either way, so the fixture carries the real
+      // shape to keep the reader honest about what it is reading past.
+      declined_proposals: [{ number: 3 }, { number: 4 }],
+      conflicts: [
+        {
+          id: "9f3c1ab0",
+          path: "notes/a.md",
+          kind: "EditEdit",
+          base_commit: "1111111111111111111111111111111111111111",
+          upstream_commit: "2222222222222222222222222222222222222222",
+          detected_at: "2026-08-10T07:59:00Z",
+        },
+      ],
+      behind: false,
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.declinedProposals).toBe(2);
+    expect(status.conflicts).toBe(1);
   });
 
   it("carries a failed probe's own words through", async () => {
@@ -295,11 +386,37 @@ describe("the admin client layer", () => {
           ],
         },
       ],
+      newEntries: 0,
+      collides: 0,
       written: 0,
       skipped: 0,
       invalid: 1,
       ignored: 0,
     });
+  });
+
+  it("carries the preview's own counters, and reads an absent one as none", async () => {
+    const data = new ArrayBuffer(4);
+    apiMock.mockResolvedValueOnce({
+      ...PREVIEW_REPORT,
+      new: 3,
+      collides: 2,
+    });
+    const counted = await previewArchive("eng", data);
+    // The wire key and the field a screen reads are spelled differently on
+    // purpose, so the rename is part of what this pins.
+    expect(counted.newEntries).toBe(3);
+    expect(counted.collides).toBe(2);
+
+    // An import's report tallies nothing under either key. Reading that as
+    // none rather than as undefined is what keeps a counter line a number.
+    const withoutCounters: Record<string, unknown> = { ...PREVIEW_REPORT };
+    delete withoutCounters.new;
+    delete withoutCounters.collides;
+    apiMock.mockResolvedValueOnce(withoutCounters);
+    const bare = await previewArchive("eng", data);
+    expect(bare.newEntries).toBe(0);
+    expect(bare.collides).toBe(0);
   });
 
   it("names the policy on the import only when it is not the default", async () => {

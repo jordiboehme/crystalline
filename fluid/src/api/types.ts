@@ -519,13 +519,13 @@ export interface paths {
         };
         /**
          * Where a team domain stands relative to its GitHub origin.
-         * @description Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`.
+         * @description Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`. An instance with no GitHub connection is reported, not refused: the report comes back from local state with `connection.connected` false.
          */
         get: operations["get_domain_sync_status"];
         put?: never;
         /**
          * Pull a team domain's origin now.
-         * @description Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from.
+         * @description Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from or on an instance with no GitHub connection to pull through.
          */
         post: operations["sync_domain"];
         delete?: never;
@@ -582,7 +582,9 @@ export interface paths {
          *     finding is a question for a person, never a change to apply.
          *
          *     The per-rule instruction rides `actions` rather than a column, so a page of
-         *     findings from one rule carries it once; only the rules on this page appear.
+         *     findings from one rule carries it once; only the rules on this page appear,
+         *     each with the catalog's short `summary` beside its `instruction` so a
+         *     renderer has both a heading and a body without deriving one from the other.
          *     `families` counts the whole filtered result rather than the page, which is
          *     what section headings are drawn from, and `truncations` names any per-domain
          *     cap that fired so a short queue is never mistaken for a finished one.
@@ -885,9 +887,9 @@ export interface paths {
         };
         /**
          * `GET /vocabulary` - the words the domains are written in: the tags in use
-         *     with their counts, the observation categories and the relation types, plus
-         *     the near-duplicate clusters and tag aliases the engine reports when there are
-         *     any.
+         *     with their counts, the observation categories, the relation types and the
+         *     engram types and statuses, plus the near-duplicate clusters and tag aliases
+         *     the engine reports when there are any.
          * @description The domain is a filter here rather than a path segment, so an unknown name
          *     answers an empty vocabulary rather than a 404: this route asks what is in
          *     use, and the answer to that can legitimately be nothing.
@@ -3760,7 +3762,13 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten. */
+            /**
+             * @description The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.
+             *
+             *     `to.permalink` is the address the engram answers to after the move, which is not always the one it went in with: a permalink that was derived from the path follows the file.
+             *
+             *     `attachment_warnings` lists the attachments the move could not carry, one sentence each and empty when everything travelled; those files stay whole in the source domain.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3768,6 +3776,7 @@ export interface operations {
                 content: {
                     /**
                      * @example {
+                     *       "attachment_warnings": [],
                      *       "cross_domain": false,
                      *       "from": {
                      *         "domain": "eng",
@@ -3777,7 +3786,8 @@ export interface operations {
                      *       "links_rewritten": 0,
                      *       "to": {
                      *         "domain": "eng",
-                     *         "path": "guides/beta.md"
+                     *         "path": "guides/beta.md",
+                     *         "permalink": "guides/beta"
                      *       }
                      *     }
                      */
@@ -3941,7 +3951,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own status report for this one domain, plus the mode it is synced in. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone. */
+            /** @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -3953,6 +3963,11 @@ export interface operations {
                      *       "behind": false,
                      *       "branch": "main",
                      *       "conflicts": [],
+                     *       "connection": {
+                     *         "connected": true,
+                     *         "token_store": "keychain",
+                     *         "user": "octo"
+                     *       },
                      *       "declined_proposals": [],
                      *       "domain": "eng",
                      *       "last_checked": "2026-08-10T08:00:00Z",
@@ -3993,7 +4008,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on. */
+            /** @description GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on. A missing connection is NOT refused here: the report comes back with `connection.connected` false instead. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4066,7 +4081,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The domain has no team origin to pull from, or GitHub is switched off on this instance - the detail says which, and where to fix it. */
+            /** @description The domain has no team origin to pull from, GitHub is switched off on this instance, or it is on but no account is connected - the detail says which, and where to fix it. A repository that is simply missing is a different answer, carrying the remote's own not-found error. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4251,7 +4266,8 @@ export interface operations {
                      *       "actions": [
                      *         {
                      *           "instruction": "A person captured this directly and nobody has reviewed it since. ...",
-                     *           "rule": "V006"
+                     *           "rule": "V006",
+                     *           "summary": "human capture never reviewed"
                      *         }
                      *       ],
                      *       "count": 2,
@@ -5252,7 +5268,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own vocabulary payload, unchanged. `clusters` and `aliases` are omitted when there are none. */
+            /** @description The engine's own vocabulary payload, unchanged. `tags`, `categories`, `relation_types`, `types` and `statuses` are always present, empty when nothing is in use; `clusters` and `aliases` are omitted when there are none. `types` and `statuses` count the engram `type` and `status` values as stored, with no folding and no retirement filter. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5279,11 +5295,23 @@ export interface operations {
                      *           "name": "relates_to"
                      *         }
                      *       ],
+                     *       "statuses": [
+                     *         {
+                     *           "count": 3,
+                     *           "name": "stable"
+                     *         }
+                     *       ],
                      *       "tags": [
                      *         {
                      *           "engrams": 3,
                      *           "name": "eng",
                      *           "observations": 5
+                     *         }
+                     *       ],
+                     *       "types": [
+                     *         {
+                     *           "count": 3,
+                     *           "name": "engram"
                      *         }
                      *       ]
                      *     }

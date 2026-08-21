@@ -294,7 +294,12 @@ pub fn decide(
 ///   there is something to consolidate, which the calendar alone is not.
 ///
 /// [`EVOLVE_NUDGE_COOLDOWN_HOURS`] gates both arms, so a machine with a
-/// standing backlog asks once a day at most.
+/// standing backlog asks once a day at most. A `last_nudge_at` in the future -
+/// a clock that ran ahead and was corrected, or a hand-edited file - suppresses
+/// the ask until the clock passes it and is deliberately not clamped: this
+/// function stays a plain comparison, and a throttle record that reads as
+/// nonsense costs delayed asks rather than a decision made on a stamp nobody
+/// wrote.
 pub fn evolve_ask(m: &MaintenanceState, now: DateTime<Utc>) -> Option<Vec<String>> {
     if let Some(nudged) = m.last_nudge_at
         && now.signed_duration_since(nudged) < TimeDelta::hours(EVOLVE_NUDGE_COOLDOWN_HOURS)
@@ -428,20 +433,28 @@ pub fn run_stop() {
     // quiet week, and a call that stays silent is still evidence the machine
     // exists. Seeding it with `now` cannot arm the weekly arm below - an age
     // of zero is inside every interval.
+    //
+    // Both fields this handler owns are stamped through the recorders in
+    // [`crystalline_service::maintenance`] rather than by saving the state read
+    // here: this process decides between the read and the write, and a
+    // `record_pending` from the daemon landing inside that gap has to survive.
+    // Nothing else here writes the file, so the whole-file save is gone and
+    // with it the window it opened.
     let now = chrono::Utc::now();
     let mut maintenance_state = maintenance::load();
-    let mut maintenance_dirty = false;
     if maintenance_state.first_seen.is_none() {
+        maintenance::record_first_seen(now);
+        // Mirrored into the copy this call decides from, so the seeding and the
+        // decision agree without re-reading the file.
         maintenance_state.first_seen = Some(now);
-        maintenance_dirty = true;
     }
     // The ride-along: only a call that already earned the capture nudge ever
     // asks, so the maintenance throttle can never be the reason this handler
     // breaks its silence. The state it asks about is narrowed to the domains
     // this install registers first, so a ghost neither arms the pending arm nor
     // gets named as a focus domain - see [`registered_pending`]. Narrowed for
-    // the question only: the file itself is round-tripped untouched, because
-    // the hook never edits a backlog it is not the recorder for.
+    // the question only: nothing here writes the backlog back, because the hook
+    // never edits a list it is not the recorder for.
     let evolve = if decision == StopDecision::Nudge {
         let visible = MaintenanceState {
             pending_domains: registered_pending(
@@ -454,16 +467,12 @@ pub fn run_stop() {
     } else {
         None
     };
+    // Stamped before the print, the same crash-safety order the session state
+    // follows: a crash in between can only cost a missed ask, never a repeated
+    // one. The write goes through the same serialized, atomic writer the daemon
+    // uses, and a failure is silent like every other bail.
     if evolve.is_some() {
-        maintenance_state.last_nudge_at = Some(now);
-        maintenance_dirty = true;
-    }
-    // Persisted before the print, the same crash-safety order the session
-    // state follows: a crash in between can only cost a missed ask, never a
-    // repeated one. The write goes through the same serialized, atomic
-    // writer the daemon uses, and a failure is silent like every other bail.
-    if maintenance_dirty {
-        let _ = maintenance::save(&maintenance_state);
+        maintenance::record_nudge(now);
     }
 
     sweep_stale_state();
@@ -839,6 +848,96 @@ mod tests {
             evolve_ask(&state, now()),
             None,
             "a nudge two hours ago silences the weekly and the pending arm alike"
+        );
+    }
+
+    /// The weekly arm's edge, measured from the last recorded sweep: exactly
+    /// the interval is due, one minute short of it is not. The comparison is
+    /// `>=`, and this is what pins it.
+    #[test]
+    fn the_weekly_arm_fires_at_exactly_the_interval() {
+        let due = MaintenanceState {
+            last_run_at: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&due, now()),
+            Some(Vec::new()),
+            "a sweep exactly a week old is due"
+        );
+
+        let short = MaintenanceState {
+            // One minute later than the sweep above, so one minute short of the
+            // interval.
+            last_run_at: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + TimeDelta::minutes(1)),
+            ..due.clone()
+        };
+        assert_eq!(
+            evolve_ask(&short, now()),
+            None,
+            "a minute short of the week is not due yet"
+        );
+    }
+
+    /// The same edge on the fallback clock: a machine that never swept measures
+    /// the week from `first_seen`, and the boundary sits in the same place.
+    #[test]
+    fn the_first_seen_fallback_shares_the_weekly_edge() {
+        let due = MaintenanceState {
+            first_seen: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&due, now()),
+            Some(Vec::new()),
+            "an install exactly a week old and never swept is due"
+        );
+
+        let short = MaintenanceState {
+            first_seen: Some(days_ago(EVOLVE_RUN_INTERVAL_DAYS) + TimeDelta::minutes(1)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&short, now()),
+            None,
+            "a minute short of the first week stays quiet"
+        );
+    }
+
+    /// The cooldown's edge, on a state whose pending arm is armed so the only
+    /// thing under test is the floor: a minute short of it silences the ask.
+    #[test]
+    fn the_cooldown_suppresses_a_minute_short_of_the_floor() {
+        let state = MaintenanceState {
+            pending_domains: vec!["a".to_string()],
+            pending_since: Some(days_ago(2)),
+            last_nudge_at: Some(hours_ago(EVOLVE_NUDGE_COOLDOWN_HOURS) + TimeDelta::minutes(1)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&state, now()),
+            None,
+            "23h59m after the last ask the floor still holds"
+        );
+    }
+
+    /// The other side of the same edge: exactly the floor releases the ask,
+    /// because the cooldown check is `<` rather than `<=`.
+    #[test]
+    fn the_cooldown_releases_at_exactly_the_floor() {
+        let state = MaintenanceState {
+            pending_domains: vec!["a".to_string()],
+            pending_since: Some(days_ago(2)),
+            last_nudge_at: Some(hours_ago(EVOLVE_NUDGE_COOLDOWN_HOURS)),
+            first_seen: Some(days_ago(30)),
+            ..MaintenanceState::default()
+        };
+        assert_eq!(
+            evolve_ask(&state, now()),
+            Some(vec!["a".to_string()]),
+            "exactly a day after the last ask the backlog may ask again"
         );
     }
 

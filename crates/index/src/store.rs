@@ -1103,9 +1103,10 @@ pub struct NamedCount {
 }
 
 /// The vocabulary in use across a domain or the whole index: tags with their
-/// engram and observation usage counts, observation categories with counts and
-/// relation types with counts. Backs the `vocabulary` tool so an agent reuses an
-/// existing term instead of coining a near-duplicate.
+/// engram and observation usage counts, observation categories with counts,
+/// relation types with counts and the engram `type` and `status` values in use.
+/// Backs the `vocabulary` tool so an agent reuses an existing term instead of
+/// coining a near-duplicate.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct Vocabulary {
     /// Tags, most-used first (engrams + observations), then by name.
@@ -1114,22 +1115,33 @@ pub struct Vocabulary {
     pub categories: Vec<NamedCount>,
     /// Relation types, most-used first, then by name.
     pub relation_types: Vec<NamedCount>,
+    /// Engram `type` values in use, most-used first, then by name. Raw as
+    /// stored: the vocabulary reports what the engrams are literally written in,
+    /// never a recommended set.
+    pub types: Vec<NamedCount>,
+    /// Engram `status` values in use, most-used first, then by name. Raw as
+    /// stored too, so `stable` and `current` stay two entries and a retired
+    /// status is listed like any other.
+    pub statuses: Vec<NamedCount>,
     /// Tag aliases in effect, sorted by alias then canonical. Derived from the
     /// scanned domains' MANIFEST declarations, so an agent sees which spellings
     /// fold onto which and reuses the canonical.
     pub aliases: Vec<TagAlias>,
 }
 
-/// Merge the four decoded vocabulary aggregates into a sorted [`Vocabulary`].
+/// Merge the decoded vocabulary aggregates into a sorted [`Vocabulary`].
 /// Shared by both backends so the ordering is identical regardless of SQL's
 /// grouping order: engram-tag and observation-tag counts merge by tag name, tags
 /// sort by total usage (engrams + observations) descending then name, and
-/// categories and relation types sort by count descending then name.
+/// categories, relation types, engram types and engram statuses sort by count
+/// descending then name.
 pub(crate) fn build_vocabulary(
     engram_tags: Vec<(String, i64)>,
     observation_tags: Vec<(String, i64)>,
     categories: Vec<(String, i64)>,
     relation_types: Vec<(String, i64)>,
+    types: Vec<(String, i64)>,
+    statuses: Vec<(String, i64)>,
     aliases: Vec<(String, String)>,
 ) -> Vocabulary {
     let mut merged: HashMap<String, (i64, i64)> = HashMap::new();
@@ -1180,6 +1192,8 @@ pub(crate) fn build_vocabulary(
         tags,
         categories: to_named(categories),
         relation_types: to_named(relation_types),
+        types: to_named(types),
+        statuses: to_named(statuses),
         aliases,
     }
 }
@@ -1504,8 +1518,9 @@ pub trait Store: Send + Sync {
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
 
-    /// The vocabulary in use: tag, observation-category and relation-type usage
-    /// counts, for one domain or (when `domain` is `None`) across every domain.
+    /// The vocabulary in use: tag, observation-category, relation-type, engram
+    /// `type` and engram `status` usage counts, for one domain or (when
+    /// `domain` is `None`) across every domain.
     /// An unknown domain name yields empty vectors rather than an error, so a
     /// caller can probe a domain that holds no engrams yet. The vectors are
     /// sorted by usage in Rust for cross-backend determinism.

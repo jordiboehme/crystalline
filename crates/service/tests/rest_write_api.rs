@@ -1131,6 +1131,79 @@ async fn retire_move_and_delete_run_through_their_endpoints() {
     assert!(!fx._tmp.path().join("eng/alpha.md").exists());
 }
 
+/// **The move receipt names the address the engram answers to afterwards.**
+///
+/// A path-derived permalink follows the file, so a receipt that echoed the
+/// permalink the caller sent would hand a browser client an address that stops
+/// resolving on exactly the calls that changed it - and Fluid navigates to the
+/// moved engram off this body. The GET at the end is the point rather than
+/// belt-and-braces: it proves the receipt names something reachable, not merely
+/// something plausible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_move_receipt_names_the_permalink_the_engram_landed_at() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let editor = login(fx.addr, "eddy", "eddypw").await;
+
+    let moved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/move",
+        &editor,
+    )
+    .json(&serde_json::json!({"permalink": "alpha", "destination": "guides/alpha"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(moved.status(), 200);
+    let receipt: serde_json::Value = moved.json().await.unwrap();
+
+    assert_eq!(
+        receipt["from"],
+        serde_json::json!({ "domain": "eng", "permalink": "alpha", "path": "alpha.md" }),
+        "the receipt says where it came from: {receipt}"
+    );
+    assert_eq!(
+        receipt["to"],
+        serde_json::json!({
+            "domain": "eng",
+            "permalink": "guides/alpha",
+            "path": "guides/alpha.md",
+        }),
+        "and where it landed, permalink included: {receipt}"
+    );
+    assert_eq!(receipt["cross_domain"], false, "{receipt}");
+    assert_eq!(
+        receipt["attachment_warnings"],
+        serde_json::json!([]),
+        "a same-domain move carries nothing and so warns about nothing: {receipt}"
+    );
+
+    // The address the receipt names is one that resolves, and resolves to the
+    // engram that moved rather than to whatever else the string might match.
+    let read = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/eng/engrams/guides/alpha",
+        &editor,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        read.status(),
+        200,
+        "the permalink in the receipt is reachable"
+    );
+    let detail: serde_json::Value = read.json().await.unwrap();
+    assert_eq!(detail["permalink"], "guides/alpha", "{detail}");
+    assert_eq!(detail["path"], "guides/alpha.md", "{detail}");
+    assert!(fx._tmp.path().join("eng/guides/alpha.md").exists());
+    assert!(!fx._tmp.path().join("eng/alpha.md").exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_manifest_reads_with_an_etag_and_saves_under_if_match() {
     // Serialized against every other test here that writes the shared

@@ -2183,6 +2183,23 @@ async fn vocabulary_lists_the_tags_and_relation_types_in_use() {
         names(&all["relation_types"]).contains(&"relates_to".to_string()),
         "the one relation the fixture declares: {all}"
     );
+    // The engram types and statuses in use, counted the same way and always
+    // present. The fixture is two `engram`s, one `guide` and the `manifest`,
+    // all of them `current`.
+    assert_eq!(
+        all["types"],
+        serde_json::json!([
+            { "name": "engram", "count": 2 },
+            { "name": "guide", "count": 1 },
+            { "name": "manifest", "count": 1 },
+        ]),
+        "types count the fixture's engrams, most-used first then name: {all}"
+    );
+    assert_eq!(
+        all["statuses"],
+        serde_json::json!([{ "name": "current", "count": 4 }]),
+        "every fixture engram is written in the one status: {all}"
+    );
 
     let scoped: serde_json::Value = get(fixture.addr, "/api/v1/vocabulary?domain=void")
         .await
@@ -2193,6 +2210,56 @@ async fn vocabulary_lists_the_tags_and_relation_types_in_use() {
     assert!(
         scoped["tags"].as_array().unwrap().is_empty(),
         "the empty domain is written in nothing yet: {scoped}"
+    );
+    // Both new lists are present rather than omitted on an empty domain, so a
+    // client can read them without a null check.
+    assert_eq!(
+        scoped["types"],
+        serde_json::json!([]),
+        "the empty domain reports an empty type list, not a missing one: {scoped}"
+    );
+    assert_eq!(
+        scoped["statuses"],
+        serde_json::json!([]),
+        "and an empty status list: {scoped}"
+    );
+
+    // The other half of the scope, which the empty domain cannot show: a scope
+    // onto a domain that holds something reports what that domain is written
+    // in. The fixture puts everything in `eng`, so the scoped counts and the
+    // unscoped ones agree here - the assertion that matters is that the filter
+    // returns the domain's real vocabulary rather than an empty list, which is
+    // the failure an unwired scope produces.
+    let seeded: serde_json::Value = get(fixture.addr, "/api/v1/vocabulary?domain=eng")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(seeded["domain"], "eng", "the scope is echoed: {seeded}");
+    assert_eq!(
+        seeded["types"],
+        serde_json::json!([
+            { "name": "engram", "count": 2 },
+            { "name": "guide", "count": 1 },
+            { "name": "manifest", "count": 1 },
+        ]),
+        "the seeded domain's own types, counted: {seeded}"
+    );
+    assert_eq!(
+        seeded["statuses"],
+        serde_json::json!([{ "name": "current", "count": 4 }]),
+        "and its own statuses: {seeded}"
+    );
+    let seeded_tags = names(&seeded["tags"]);
+    for tag in ["eng", "root", "nested", "manifest"] {
+        assert!(
+            seeded_tags.contains(&tag.to_string()),
+            "{tag} missing from the scoped tags: {seeded}"
+        );
+    }
+    assert!(
+        names(&seeded["relation_types"]).contains(&"relates_to".to_string()),
+        "and the relation the fixture declares: {seeded}"
     );
 }
 

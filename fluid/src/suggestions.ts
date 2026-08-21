@@ -18,6 +18,7 @@
  * words.
  */
 
+import type { NamedCount } from "./api/vocabulary";
 import type { Suggestion } from "./components/SuggestInput";
 import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "./filters";
 
@@ -68,3 +69,32 @@ export const STATUS_SUGGESTIONS: Suggestion[] = glossed(
   SUGGESTED_STATUSES,
   STATUS_GLOSSES,
 );
+
+/**
+ * Recommended suggestions enriched with what the domain actually uses:
+ * matching names gain their live count, house-only values are appended
+ * (count desc, then name) so a domain's own vocabulary is one keystroke
+ * away without losing the glossed recommendations.
+ *
+ * The recommendations keep their order and their place at the top, because
+ * they are the advice; the house words come after because they are already
+ * known to whoever writes them and need no explaining. Neither list is a
+ * closed set - an appended word has no gloss because this app has nothing to
+ * say about it, not because it is somehow lesser.
+ */
+export function withHouseCounts(
+  base: readonly Suggestion[],
+  house: readonly NamedCount[],
+): Suggestion[] {
+  const counts = new Map(house.map((each) => [each.name, each.count]));
+  const merged = base.map((suggestion) => {
+    const count = counts.get(suggestion.name);
+    return count === undefined ? suggestion : { ...suggestion, count };
+  });
+  const recommended = new Set(base.map((suggestion) => suggestion.name));
+  const extra = house
+    .filter((each) => !recommended.has(each.name))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .map(({ name, count }) => ({ name, count }));
+  return [...merged, ...extra];
+}

@@ -217,6 +217,10 @@ export interface SyncStatus {
   localChanges: number;
   /** Proposals still open on the origin, as a count. */
   openProposals: number;
+  /** Proposals the team turned down, as a count. */
+  declinedProposals: number;
+  /** Files a pull could not merge and somebody has to settle, as a count. */
+  conflicts: number;
   /** Whether the origin is ahead, or null when the probe could not say. */
   behind: boolean | null;
   /**
@@ -230,6 +234,24 @@ export interface SyncStatus {
    * that shows those numbers without showing this shows stale facts as fresh.
    */
   probeError: string | null;
+  /**
+   * Which kind of origin this is, in the server's own word, or null when the
+   * report did not say. Only `github` exists today, and the route sets it
+   * because a client looking at a sync card has to know what it is looking at
+   * without inferring it from the fields that happen to be filled in.
+   */
+  mode: string | null;
+  /**
+   * Whether this instance has a GitHub credential on file, or null when the
+   * report carried no connection block at all.
+   *
+   * The three states are three different sentences, which is why this is not a
+   * boolean: `false` is "connect GitHub and this starts working", and it is an
+   * answer the status route goes out of its way to give rather than refusing
+   * over. `null` is "this report does not say", and a card that read it as
+   * `false` would tell somebody to connect what is already connected.
+   */
+  connected: boolean | null;
 }
 
 /** The cache key of one domain's sync status. */
@@ -240,9 +262,9 @@ export function syncStatusKey(domain: string): readonly unknown[] {
 /**
  * A count that may arrive as a number or as the list it counts.
  *
- * The engine's status report embeds the open proposals themselves while its
- * poll overview counts them, and both spellings reach this surface. A card
- * wants the number either way.
+ * The engine's status report embeds the proposals and the conflicts themselves
+ * while its poll overview counts them, and both spellings reach this surface. A
+ * card wants the number either way.
  */
 function asCount(value: unknown): number {
   return asNumber(value) ?? asArray(value).length;
@@ -251,14 +273,23 @@ function asCount(value: unknown): number {
 /** Read a sync status out of the engine's own per-domain report. */
 function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
+  const connected = asObject(record?.connection)?.connected;
   return {
     repo: asString(record?.repo) ?? "",
     branch: asString(record?.branch),
     lastChecked: asString(record?.last_checked),
     localChanges: asCount(record?.local_changes),
     openProposals: asCount(record?.open_proposals),
+    declinedProposals: asCount(record?.declined_proposals),
+    conflicts: asCount(record?.conflicts),
     behind: typeof record?.behind === "boolean" ? record.behind : null,
     probeError: asString(record?.probe_error),
+    mode: asString(record?.mode),
+    // Read tolerantly and off the aggregate's own block, which the route lifts
+    // onto the per-domain report unchanged. Anything that is not a boolean -
+    // an absent block, a block of nonsense, a string "true" - is "no answer"
+    // rather than "not connected", because only `false` makes the card speak.
+    connected: typeof connected === "boolean" ? connected : null,
   };
 }
 
@@ -299,6 +330,13 @@ export interface ArchiveEntry {
 /** The per-entry report of a preview or an import, with its counters. */
 export interface ArchiveReport {
   entries: ArchiveEntry[];
+  /**
+   * Preview only: entries that would be created. Renamed off the wire's `new`,
+   * which reads as the operator rather than as a count at every use site.
+   */
+  newEntries: number;
+  /** Preview only: entries whose path or permalink is already taken. */
+  collides: number;
   written: number;
   skipped: number;
   invalid: number;
@@ -331,6 +369,12 @@ function readArchiveReport(report: ArchiveReportWire): ArchiveReport {
         line: finding.line ?? null,
       })),
     })),
+    // A preview tallies these two and an import tallies the four below, so
+    // each pair arrives at zero in the other's report. Read tolerantly all the
+    // same: a counter a report does not carry is none of them, not a hole a
+    // counter line would print as `undefined`.
+    newEntries: asCount(report.new),
+    collides: asCount(report.collides),
     written: report.written,
     skipped: report.skipped,
     invalid: report.invalid,

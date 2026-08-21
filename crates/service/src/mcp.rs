@@ -158,6 +158,49 @@
 //! that stream, and its doc comment carries what a future dynamic list would
 //! have to do to announce itself.
 //!
+//! # Asking before destroying (SEP-2322)
+//!
+//! A tool that cannot be undone answers with a question instead of acting,
+//! whenever the peer can carry one: `delete_engram` returns an
+//! `input_required` result holding a single form elicitation, the client puts
+//! it to its user, and the same call arrives again with the answer beside the
+//! original arguments. [`confirmation_supported`] decides whether to ask,
+//! [`confirm_question`] builds the question and [`confirmed`] reads the
+//! answer; all three are deliberately tool-agnostic.
+//!
+//! **Two more rounds are built on those three.** `edit_engram` asks before it
+//! records an `evolve_ack` or takes one back, and `write_engram` asks on a
+//! permalink collision - the one round whose question is not a yes-or-no, so
+//! it brings a single-select of its own ([`collision_question`],
+//! [`resolved_overwrite`]) and a third condition beside the gate: a call that
+//! already passed `overwrite` answered the question before it was put.
+//!
+//! **A question is only put about a call that can run.** Both rounds that take
+//! an identifier resolve it before they ask - `delete_engram` through
+//! [`crate::engine::Engine::delete_preview`], the `evolve_ack` round through
+//! [`crate::engine::Engine::ack_preview`] - so a read-only server, a domain
+//! nobody registered and an identifier nobody has each fail in round one, and
+//! the question names what resolution found rather than what was typed. The
+//! collision round needs no such step: the write itself is what discovers the
+//! collision, and the question is built from the failure.
+//!
+//! **An answer is not bound to the arguments it was asked about.** The client
+//! re-sends the original arguments beside the answer and nothing on this side
+//! remembers what was asked, so a buggy client that changes an argument on the
+//! retry is honoured rather than caught - the price of the stateless design
+//! (see [`confirm_question`] on why nothing is sealed into `requestState`),
+//! and the reason each round's refusal is read before the act it guards rather
+//! than after it.
+//!
+//! **The gate decides whether the flow exists at all, not how it behaves.** A
+//! peer below 2026-07-28 has no result shape to receive a question in, and a
+//! peer that never declared an elicitation capability has no way to ask its
+//! user; either one is served exactly what 0.15.0 served it, one call and one
+//! deletion, because a confirmation nobody can answer is a hang. Nothing here
+//! is a permission system: a client is free to answer its own question, and
+//! the CLI's own dispatch (`crate::client::dispatch_engine`) never asks at all,
+//! because the human already typed the verb.
+//!
 //! Every tool also advertises MCP tool annotations: a display `title` plus the
 //! readOnly/destructive/idempotent/openWorld hints, so a client can tune its
 //! confirmation UX and batch the read-only calls. The hints are advisory only;
@@ -175,15 +218,17 @@ use std::sync::Arc;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rmcp::handler::server::prompt::PromptContext;
+use rmcp::handler::server::tool::InputResponses;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CacheScope, CallToolResult, ContentBlock, DiscoverResult, ErrorData, GetPromptRequestParams,
-    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult,
-    ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
-    PaginatedRequestParams, ProgressNotificationParam, PromptMessage, ProtocolVersion,
-    ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, Resource,
-    ResourceContents, ResourceTemplate, Role, ServerCapabilities, ServerInfo, SubscriptionFilter,
-    Tool,
+    CacheScope, CallToolResponse, CallToolResult, ContentBlock, DiscoverResult, ElicitRequest,
+    ElicitRequestParams, ElicitationSchema, EnumSchema, ErrorData, GetPromptRequestParams,
+    GetPromptResponse, Implementation, InitializeRequestParams, InitializeResult, InputRequest,
+    InputRequests, InputRequiredResult, ListPromptsResult, ListResourceTemplatesResult,
+    ListResourcesResult, ListToolsResult, PaginatedRequestParams, ProgressNotificationParam,
+    PromptMessage, ProtocolVersion, ReadResourceRequestParams, ReadResourceResponse,
+    ReadResourceResult, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+    ServerInfo, SubscriptionFilter, Tool,
 };
 use rmcp::service::{RequestContext, SubscriptionContext};
 use rmcp::{RoleServer, ServerHandler, prompt, prompt_router, tool, tool_handler, tool_router};
@@ -328,6 +373,169 @@ fn peer_gets_cache_hints(context: &RequestContext<RoleServer>) -> bool {
     context
         .protocol_version()
         .is_some_and(|version| version >= ProtocolVersion::V_2026_07_28)
+}
+
+/// The key the confirmation question and its answer are both filed under.
+///
+/// One name for the request in [`confirm_question`]'s `inputRequests` map, for
+/// the single boolean property inside that question's schema, and for the
+/// entry [`confirmed`] reads back out of the client's `inputResponses`.
+const CONFIRM_KEY: &str = "confirm";
+
+/// The key the collision question and its answer are both filed under, and the
+/// two choices it offers. `overwrite` is spelled exactly as `write_engram`'s
+/// own parameter, so the answer and the retry say the same word.
+const RESOLUTION_KEY: &str = "resolution";
+const RESOLUTION_OVERWRITE: &str = "overwrite";
+const RESOLUTION_CANCEL: &str = "cancel";
+
+/// The substring of the engine's permalink-collision error that identifies it.
+///
+/// The engine words one message for this failure
+/// (`crate::engine::Engine::write_engram_as`) and this is the phrase it is
+/// recognized by; `a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts`
+/// in `tests/engine_writes.rs` pins it there, so a rewording breaks a test
+/// beside the sentence rather than silently disarming the round here.
+const COLLISION_MARKER: &str = "already exists in domain";
+
+/// Whether this peer can be asked before a destructive tool acts.
+///
+/// Two conditions, both necessary. The revision has to be 2026-07-28 or newer,
+/// because SEP-2322's `input_required` result is what carries a question back
+/// on the same call and rmcp refuses to hand one to an older peer at all
+/// (`model/mrtr.rs:18-20`); that half is [`peer_gets_cache_hints`], reused
+/// rather than rewritten because it is the same era test under a name that
+/// happens to mention the first obligation we needed it for. And the client
+/// has to have said it can elicit, because a server that asks a client with no
+/// way to ask its user has simply hung the call.
+///
+/// **Any declared elicitation counts, including a bare `{}`.** The capability
+/// split into `form` and `url` sub-capabilities after elicitation shipped, so
+/// a client from before the split declares the empty object and means "yes,
+/// forms"; refusing that would silently drop the confirmation for the clients
+/// most likely to need it. The other direction is the price: a url-only client
+/// that cannot render a form question will decline it, and a decline is
+/// already a clean refusal that deletes nothing. Asking and being told no
+/// costs a round trip; not asking costs the confirmation.
+fn confirmation_supported(context: &RequestContext<RoleServer>) -> bool {
+    peer_gets_cache_hints(context)
+        && context
+            .client_capabilities()
+            .is_some_and(|capabilities| capabilities.elicitation.is_some())
+}
+
+/// One yes-or-no question, as the MRTR round a tool returns instead of acting.
+///
+/// A form elicitation with exactly one required boolean property, so a client
+/// has a schema to render and an unambiguous shape to send back. Nothing is
+/// sealed into `requestState` and none is asked for: the flows that use this
+/// are stateless by construction - the client echoes the original arguments on
+/// the retry and its answer is the whole of the state - which is why the
+/// `request-state` feature is not enabled on rmcp.
+fn confirm_question(message: String) -> InputRequiredResult {
+    let requested_schema = ElicitationSchema::builder()
+        .required_bool_property(CONFIRM_KEY, |schema| {
+            schema
+                .title("Confirm")
+                .description("Yes to go ahead. Anything else leaves everything as it is.")
+        })
+        .build()
+        .expect("the confirmation schema names the property it requires");
+    form_question(CONFIRM_KEY, message, requested_schema)
+}
+
+/// One form elicitation, filed under the key its single property carries.
+///
+/// The shape every round in this file returns: one request in the map, keyed
+/// the same as the property inside it, so the client's answer comes back under
+/// a name the reader already knows. Split out of [`confirm_question`] when the
+/// second question stopped being a boolean.
+fn form_question(
+    key: &str,
+    message: String,
+    requested_schema: ElicitationSchema,
+) -> InputRequiredResult {
+    let mut requests = InputRequests::new();
+    requests.insert(
+        key.to_string(),
+        InputRequest::Elicitation(ElicitRequest::new(
+            ElicitRequestParams::FormElicitationParams {
+                meta: None,
+                message,
+                requested_schema,
+            },
+        )),
+    );
+    InputRequiredResult::from_input_requests(requests)
+}
+
+/// What the client answered to [`confirm_question`], or `None` when it has not
+/// been asked yet.
+///
+/// `Some(true)` only for an accepted question whose content says `true`.
+/// `Some(false)` for everything else that is an answer: a decline, a cancel,
+/// an accept carrying `false`, or an accept whose content is missing the
+/// property it was asked for. `None` - the first round - when the call carries
+/// no responses at all or none under [`CONFIRM_KEY`].
+///
+/// The value is read as plain JSON rather than deserialized into
+/// `ElicitResult`, and the difference is the failure mode: `ElicitationAction`
+/// is a closed three-variant enum, so a client answering with an action a
+/// later revision adds would fail to deserialize and turn a "no" into an
+/// error. Read this way, anything that is not exactly `accept` is a no, which
+/// is the only reading that cannot delete something.
+fn confirmed(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
+    let answer = responses.as_ref()?.get(CONFIRM_KEY)?;
+    if answer["action"] != json!("accept") {
+        return Some(false);
+    }
+    Some(answer["content"][CONFIRM_KEY] == json!(true))
+}
+
+/// The choice a permalink collision offers, as the MRTR round `write_engram`
+/// returns instead of the bare error.
+///
+/// A single-select enum rather than [`confirm_question`]'s boolean, because
+/// the collision is not a yes-or-no: "no" here means "leave what is there",
+/// which is a decision worth a word of its own rather than the absence of a
+/// yes. The options are titled, so a client renders two sentences instead of
+/// two identifiers, and `cancel` is deliberately not the schema default -
+/// nothing is preselected, because either answer is a real choice.
+fn collision_question(message: String) -> InputRequiredResult {
+    let choices = EnumSchema::builder(vec![
+        RESOLUTION_OVERWRITE.to_string(),
+        RESOLUTION_CANCEL.to_string(),
+    ])
+    .title("Resolution")
+    .description("What to do about the engram already at that permalink.")
+    .enum_titles(vec![
+        "Overwrite the existing engram".to_string(),
+        "Cancel and write nothing".to_string(),
+    ])
+    .expect("two titles for two choices")
+    .build();
+    let requested_schema = ElicitationSchema::builder()
+        .required_enum_schema(RESOLUTION_KEY, choices)
+        .build()
+        .expect("the resolution schema names the property it requires");
+    form_question(RESOLUTION_KEY, message, requested_schema)
+}
+
+/// Whether the client chose to overwrite, or `None` when it has not been asked
+/// yet.
+///
+/// The same tri-state discipline as [`confirmed`], read as plain JSON for the
+/// same reason: `Some(true)` for exactly one shape - an accepted question whose
+/// content carries the string `overwrite` under the key it was asked for - and
+/// `Some(false)` for every other answer, an explicit `cancel` and a decline
+/// alike. Only the genuine absence of an answer is [`None`], because that is
+/// what opens round one; anything malformed leaves the existing engram alone.
+fn resolved_overwrite(responses: &Option<rmcp::model::InputResponses>) -> Option<bool> {
+    let answer = responses.as_ref()?.get(RESOLUTION_KEY)?;
+    if answer["action"] != json!("accept") {
+        return Some(false);
+    }
+    Some(answer["content"][RESOLUTION_KEY] == json!(RESOLUTION_OVERWRITE))
 }
 
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
@@ -588,7 +796,7 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
-use crate::engine::{ConfigureAction, Engine, EngineError, ProvisionAction};
+use crate::engine::{AckIntent, ConfigureAction, Engine, EngineError, ProvisionAction};
 use crate::params::*;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
@@ -709,7 +917,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -720,13 +928,81 @@ impl McpServer {
     async fn write_engram(
         &self,
         Parameters(p): Parameters<WriteParams>,
+        responses: InputResponses,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
-        self.engine
-            .write_engram_as(&p, client_actor(&ctx).as_deref())
-            .await
-            .map_err(to_error)
-            .and_then(ok)
+    ) -> Result<CallToolResponse, ErrorData> {
+        let actor = client_actor(&ctx);
+
+        // **A refusal is read before the engine runs, never after it.** A
+        // collision is discovered by attempting the write, so the shape that
+        // suggests itself - call, then read the answer off the failure - is
+        // wrong in exactly one case, and it is the case that matters: if the
+        // engram in the way is deleted or renamed between the two rounds
+        // (another agent, Fluid, the CLI), the round-two call no longer
+        // collides, there is no error left to intercept, and the engram the
+        // user answered "cancel and write nothing" about is written. Reading
+        // the no first makes that impossible. It costs one case in the other
+        // direction - a stale cancel carried on a call that no longer collides
+        // refuses a write that would have succeeded, which the caller fixes by
+        // re-sending without the answer - and that is the only direction a
+        // confirmation is allowed to fail in.
+        if confirmation_supported(&ctx)
+            && !p.overwrite
+            && resolved_overwrite(&responses.0) == Some(false)
+        {
+            return refuse(COLLISION_REFUSAL).map(CallToolResponse::from);
+        }
+
+        let written = self.engine.write_engram_as(&p, actor.as_deref()).await;
+
+        // A permalink collision is the one failure here with a real choice
+        // behind it, so a peer that can put that choice to its user is offered
+        // it instead of the error. `overwrite` already being set is belt and
+        // braces - the engine cannot raise this error when it is - but it
+        // keeps the condition readable without a trip through engine
+        // internals, and it is what the flow promises: a caller that asked for
+        // the overwrite is never asked about it.
+        let collision = match &written {
+            Err(e) if !p.overwrite && confirmation_supported(&ctx) => {
+                let message = e.to_string();
+                message
+                    .contains(COLLISION_MARKER)
+                    .then(|| collision_permalink(&message).map(str::to_string))
+                    .flatten()
+            }
+            _ => None,
+        };
+        let Some(permalink) = collision else {
+            return written
+                .map_err(to_error)
+                .and_then(ok_written)
+                .map(CallToolResponse::from);
+        };
+
+        match resolved_overwrite(&responses.0) {
+            None => Ok(collision_question(collision_question_text(&p, &permalink)).into()),
+            // Unreachable while the guard above stands, and written out anyway:
+            // the arm that must never fall through to a write is not one to
+            // leave implicit under a `_`.
+            Some(false) => refuse(COLLISION_REFUSAL).map(CallToolResponse::from),
+            // The retry is the original call with the answer applied, so
+            // everything else about the write - folder, tags, metadata, the
+            // actor - is the caller's, not a reconstruction. What it is not is
+            // consent to particular bytes: the existing engram's content can
+            // change between the collision error and this retry, and the user
+            // agreed to replace whatever is at that permalink rather than the
+            // version that was there when they were asked.
+            Some(true) => {
+                let mut retry = p.clone();
+                retry.overwrite = true;
+                self.engine
+                    .write_engram_as(&retry, actor.as_deref())
+                    .await
+                    .map_err(to_error)
+                    .and_then(ok_written)
+                    .map(CallToolResponse::from)
+            }
+        }
     }
 
     #[tool(
@@ -749,7 +1025,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack never removes either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry, and acknowledgments are removed in Fluid or by editing the file, never here. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it errors when the engram carries no entry for that rule and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -760,13 +1036,34 @@ impl McpServer {
     async fn edit_engram(
         &self,
         Parameters(p): Parameters<EditParams>,
+        responses: InputResponses,
         ctx: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, ErrorData> {
+    ) -> Result<CallToolResponse, ErrorData> {
+        // One key arms the round and every other edit runs untouched. The
+        // parse failure is swallowed rather than reported here on purpose: the
+        // engine is the one place that words it, and asking a user about an
+        // edit that cannot run is worse than letting it fail where it always
+        // failed. Round one resolves before it asks, exactly as the delete's
+        // preview does, so the same rule holds for the identifier as for the
+        // value: what cannot run is never put to a user.
+        if confirmation_supported(&ctx)
+            && let Ok(Some(intent)) = Engine::ack_intent(&p)
+        {
+            match confirmed(&responses.0) {
+                None => {
+                    let preview = self.engine.ack_preview(&p).await.map_err(to_error)?;
+                    return Ok(confirm_question(ack_question(&preview, &intent)).into());
+                }
+                Some(false) => return refuse(ack_refusal(&intent)).map(CallToolResponse::from),
+                Some(true) => {}
+            }
+        }
         self.engine
             .edit_engram_as(&p, client_actor(&ctx).as_deref())
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(ok_written)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -788,13 +1085,13 @@ impl McpServer {
             .move_engram(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(ok_moved)
     }
 
     #[tool(
         name = "delete_engram",
         title = "Delete engram",
-        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment.",
+        description = "Remove an engram when its knowledge is retired. Deletes the file and its index rows. Prefer setting status to deprecated or superseded when the history still matters. An identifier under assets/ deletes that attachment instead - the stored file and its row - which is how an orphaned-attachment finding is completed after the user says yes; expected_checksum guards engram markdown and is refused for an attachment. On a 2026-07-28 peer that declared an elicitation capability the first call deletes nothing and answers input_required instead: a confirmation question naming the engram, its domain and permalink and the attachments only it references, which the client puts to the user and answers by re-sending the same call with the confirmation; anything but a yes deletes nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -805,18 +1102,39 @@ impl McpServer {
     async fn delete_engram(
         &self,
         Parameters(p): Parameters<DeleteParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        // The whole confirmation flow lives inside this gate, so a peer that
+        // cannot be asked is served exactly what it was served before the flow
+        // existed: one call, one delete, one `CallToolResult`.
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    let preview = self.engine.delete_preview(&p).await.map_err(to_error)?;
+                    return Ok(confirm_question(delete_question(&preview)).into());
+                }
+                Some(false) => {
+                    return refuse(
+                        "The delete was not confirmed, so nothing was deleted. Call delete_engram again if the user asks for it.",
+                    )
+                    .map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
+        }
         self.engine
             .delete_engram(&p)
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
         name = "search_engrams",
         title = "Search engrams",
-        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded.",
+        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded. Every hit on the returned page also comes back as a resource_link block beside the text, in hit order: follow the crystalline:// handle with resources/read instead of assembling the address out of the row's domain and permalink.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_engrams(
@@ -827,7 +1145,7 @@ impl McpServer {
             .search_engrams(&p)
             .await
             .map_err(to_error)
-            .and_then(|v| self.ok_list(v))
+            .and_then(|v| self.ok_found(v))
     }
 
     #[tool(
@@ -935,7 +1253,7 @@ impl McpServer {
     #[tool(
         name = "vocabulary",
         title = "Vocabulary in use",
-        description = "List the vocabulary in use: tags with engram and observation usage counts, observation categories with counts and relation types with counts, for one domain or across all domains. Check it before inventing a new tag or category so existing terms are reused instead of multiplied. Near-duplicate tag clusters are reported so they can be merged. Tag aliases recorded in a MANIFEST are listed too and clusters an alias already explains are not reported.",
+        description = "List the vocabulary in use: tags with engram and observation usage counts, observation categories with counts, relation types with counts and the engram types and statuses in use with counts, for one domain or across all domains. Check it before inventing a new tag, category, type or status so existing terms are reused instead of multiplied. The types and statuses lists report what the engrams are literally written in, counted as stored: nothing is folded (stable and current stay two entries) and a retired status is listed like any other, so they answer 'what does this domain actually use' rather than 'what is recommended'. Near-duplicate tag clusters are reported so they can be merged. Tag aliases recorded in a MANIFEST are listed too and clusters an alias already explains are not reported.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn vocabulary(
@@ -1426,6 +1744,43 @@ impl McpServer {
                 crate::toon::render(&value),
             )])),
         }
+    }
+
+    /// [`Self::ok_list`] for a search result, with one `resource_link` per hit
+    /// on the returned page appended behind the text block, in hit order.
+    ///
+    /// The rows already carry `domain` and `permalink`, so this makes the same
+    /// trade the write receipts make: an address a client assembles out of two
+    /// fields is an address every client has to be taught, and a link is one
+    /// the era already knows how to follow. The links are blocks beside the
+    /// text rather than anything inside it, so a TOON table and a JSON body
+    /// hand back the same handles.
+    ///
+    /// One link per row, so the nth link pairs with the nth hit - two
+    /// observation hits inside one engram therefore link that engram twice,
+    /// which is the pairing holding rather than a duplicate. Only the returned
+    /// page is linked, and a hit missing a field is skipped rather than
+    /// guessed at, the same tolerance as [`ok_written`].
+    fn ok_found(&self, value: Value) -> Result<CallToolResult, ErrorData> {
+        let links: Vec<ContentBlock> = value
+            .get("hits")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|hit| {
+                let domain = hit.get("domain").and_then(Value::as_str)?;
+                let permalink = hit.get("permalink").and_then(Value::as_str)?;
+                let title = hit
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(permalink);
+                Some(engram_link(domain, permalink, title))
+            })
+            .collect();
+        let mut result = self.ok_list(value)?;
+        result.content.extend(links);
+        Ok(result)
     }
 
     /// Applies `configure`'s `set` map then `unset` list, one key at a time
@@ -2089,6 +2444,187 @@ fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
 }
 
+/// A `resource_link` content block addressing the engram a write touched, so
+/// an era-aware client can follow the handle instead of rebuilding the address
+/// out of two payload fields. Same unconditional policy as `read_engram`'s
+/// attachment links: a link, never bytes.
+fn engram_link(domain: &str, permalink: &str, title: &str) -> ContentBlock {
+    ContentBlock::resource_link(
+        Resource::new(
+            format!("crystalline://{domain}/{permalink}"),
+            title.to_string(),
+        )
+        .with_mime_type("text/markdown"),
+    )
+}
+
+/// [`ok`] for a `write_engram` or `edit_engram` result, with the link to the
+/// engram appended: `domain` and `permalink` read off the result itself, named
+/// by its `title` when it carries one (a write does, an edit does not).
+///
+/// A shape this does not recognize simply gets no link. A result that grew a
+/// different spelling costs a client one lookup it was doing anyway; a link
+/// built from half a shape would send it somewhere else entirely, and no
+/// engine result is worth a panic in the layer that only reports it.
+fn ok_written(value: Value) -> Result<CallToolResult, ErrorData> {
+    let link = (|| {
+        let domain = value.get("domain").and_then(Value::as_str)?;
+        let permalink = value.get("permalink").and_then(Value::as_str)?;
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(permalink);
+        Some(engram_link(domain, permalink, title))
+    })();
+    let mut result = ok(value)?;
+    result.content.extend(link);
+    Ok(result)
+}
+
+/// [`ok`] for a `move_engram` result, with the link to where the engram
+/// landed: the destination is the point of the call, so the handle names the
+/// address the engram answers to now, off the result's own `to` block. Same
+/// tolerance as [`ok_written`] for a shape that is not there.
+fn ok_moved(value: Value) -> Result<CallToolResult, ErrorData> {
+    let link = (|| {
+        let to = value.get("to")?;
+        let domain = to.get("domain").and_then(Value::as_str)?;
+        let permalink = to.get("permalink").and_then(Value::as_str)?;
+        Some(engram_link(domain, permalink, permalink))
+    })();
+    let mut result = ok(value)?;
+    result.content.extend(link);
+    Ok(result)
+}
+
+/// The sentence `delete_engram` asks before it acts, rendered from
+/// [`crate::engine::Engine::delete_preview`]'s two shapes.
+///
+/// **The attachment clause says "orphaned" rather than "deleted" because that
+/// is what happens.** Deleting an engram removes its markdown and its index
+/// rows; the files it referenced stay in the domain, and the ones nothing else
+/// referenced become exactly the orphaned attachments the maintenance sweep
+/// reports. Naming them is what lets the user delete those too, in the same
+/// breath, with the `assets/` form of this verb.
+fn delete_question(preview: &Value) -> String {
+    let domain = preview["domain"].as_str().unwrap_or_default();
+    if preview["attachment"] == json!(true) {
+        let path = preview["path"].as_str().unwrap_or_default();
+        let size = preview["size"].as_u64().unwrap_or_default();
+        return format!(
+            "Delete attachment '{path}' ({size} bytes) from '{domain}'? This cannot be undone."
+        );
+    }
+    let title = preview["title"].as_str().unwrap_or_default();
+    let permalink = preview["permalink"].as_str().unwrap_or_default();
+    let enumerated: Option<Vec<String>> = preview["attachments"].as_array().map(|paths| {
+        paths
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    });
+    let clause = preview_attachment_clause(enumerated.as_deref());
+    format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
+}
+
+/// The middle sentence of [`delete_question`]: what the delete does to the
+/// engram's attachments.
+///
+/// `Some` is an answer and `None` is the absence of one. A list - empty
+/// included - was enumerated by
+/// [`crate::engine::Engine::delete_preview`] and names exactly what the delete
+/// orphans. `None` is a domain past
+/// [`crate::engine::MAX_PREVIEW_SCAN_ENGRAMS`], where naming them would mean
+/// reading every engram in the domain to write one sentence.
+///
+/// **The unenumerated wording promises less, never more.** It says the
+/// attachments were not looked at and that any sole-referent ones are left
+/// orphaned, which is true of every delete this verb performs; what changes
+/// past the bound is what the question can tell the user, not what saying yes
+/// to it does.
+fn preview_attachment_clause(enumerated: Option<&[String]>) -> String {
+    let Some(paths) = enumerated else {
+        return "Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned.".to_string();
+    };
+    let listed = paths.join(", ");
+    let attachments = if listed.is_empty() { "none" } else { &listed };
+    format!("This leaves its sole-referent attachments orphaned: {attachments}.")
+}
+
+/// The permalink the engine's collision message names, when it names one.
+///
+/// The engine words that failure `permalink '<permalink>' already exists in
+/// domain '<domain>' (at <path>); ...`, and reading the value back out of it is
+/// both cheaper and truer than re-deriving it here: slugification is the
+/// engine's (the folder prefix, the reserved names, the lot), and a second
+/// implementation on this side could name a permalink the write would never
+/// have used. `None` when the phrase is not there, which sends the caller back
+/// to the bare error rather than to a question naming the wrong thing.
+fn collision_permalink(message: &str) -> Option<&str> {
+    let (_, rest) = message.split_once("permalink '")?;
+    let (permalink, _) = rest.split_once('\'')?;
+    (!permalink.is_empty()).then_some(permalink)
+}
+
+/// The sentence a permalink collision asks instead of reporting.
+///
+/// It names all three things the user needs to decide with - what would be
+/// written, where it would land and what is already there - because the choice
+/// is between two engrams, and only one of them is in front of the caller.
+fn collision_question_text(p: &WriteParams, permalink: &str) -> String {
+    format!(
+        "'{}' would land at permalink '{permalink}' which already exists in '{}'. Overwrite it, or cancel?",
+        p.title.trim(),
+        p.domain.trim()
+    )
+}
+
+/// What an unresolved collision tells the model: what is still there, and the
+/// one argument that would have replaced it.
+const COLLISION_REFUSAL: &str = "The overwrite was not confirmed, so the existing engram was left in place; nothing was written. Call write_engram again with overwrite=true if the user asks for it.";
+
+/// The sentence an `evolve_ack` assignment asks before it acts, rendered from
+/// [`crate::engine::Engine::ack_preview`].
+///
+/// Both halves name the consequence rather than the write, because that is
+/// what the user is deciding: a record keeps a finding out of every future
+/// sweep, a removal puts it back into the next one. The engram is named by the
+/// permalink the identifier resolved to rather than by the identifier itself,
+/// so a yes is given to the engram the write lands on - a title, a bare
+/// permalink and a `crystalline://` URL all reach the same question, and an
+/// identifier that reaches nothing never becomes one.
+fn ack_question(preview: &Value, intent: &AckIntent) -> String {
+    let permalink = preview["permalink"].as_str().unwrap_or_default();
+    let domain = preview["domain"].as_str().unwrap_or_default();
+    match intent {
+        AckIntent::Record { rule, note } => {
+            let note = note
+                .as_deref()
+                .map(|note| format!(" The note reads: '{note}'."))
+                .unwrap_or_default();
+            format!(
+                "Acknowledge {rule} on '{permalink}' in '{domain}'? This records the finding as intentional until its evidence changes.{note}"
+            )
+        }
+        AckIntent::Remove { rule } => format!(
+            "Remove the {rule} acknowledgment on '{permalink}' in '{domain}'? The finding resurfaces on the next sweep."
+        ),
+    }
+}
+
+/// What an unconfirmed `evolve_ack` assignment tells the model, naming what did
+/// not happen so it does not retry blind.
+fn ack_refusal(intent: &AckIntent) -> String {
+    let (act, state) = match intent {
+        AckIntent::Record { .. } => ("acknowledgment", "nothing was recorded"),
+        AckIntent::Remove { .. } => ("removal", "the acknowledgment is still there"),
+    };
+    format!(
+        "The {act} was not confirmed, so {state}. Call edit_engram again if the user asks for it."
+    )
+}
+
 /// A call-time refusal: the tool ran and could not do its job because a
 /// server-side condition is off.
 ///
@@ -2165,6 +2701,250 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// One `inputResponses` map holding `value` under the `confirm` key.
+    fn responses(value: Value) -> Option<rmcp::model::InputResponses> {
+        let mut map = rmcp::model::InputResponses::new();
+        map.insert(CONFIRM_KEY.to_string(), value);
+        Some(map)
+    }
+
+    /// **The parser two more confirmation flows will be built on, so every
+    /// shape it can be handed is pinned rather than the two that are obvious.**
+    ///
+    /// The invariant, and the only one that matters: nothing malformed
+    /// confirms. `Some(true)` is reachable from exactly one shape - an
+    /// accepted question whose content carries the boolean `true` under the
+    /// key it was asked for. Everything else that is an answer is a no, and
+    /// only the genuine absence of an answer is [`None`], because that is what
+    /// opens round one.
+    #[test]
+    fn confirmed_says_yes_to_one_shape_and_no_to_every_other() {
+        let yes = [json!({ "action": "accept", "content": { "confirm": true } })];
+        for value in yes {
+            assert_eq!(
+                confirmed(&responses(value.clone())),
+                Some(true),
+                "an accepted yes confirms: {value}"
+            );
+        }
+
+        let no = [
+            // Accepted, but not a yes.
+            json!({ "action": "accept", "content": { "confirm": false } }),
+            // Accepted with nothing in it, or with the wrong thing in it.
+            json!({ "action": "accept" }),
+            json!({ "action": "accept", "content": {} }),
+            json!({ "action": "accept", "content": null }),
+            json!({ "action": "accept", "content": { "confirm": "true" } }),
+            json!({ "action": "accept", "content": { "confirm": 1 } }),
+            json!({ "action": "accept", "content": { "confirmed": true } }),
+            // The two refusals the specification names.
+            json!({ "action": "decline" }),
+            json!({ "action": "cancel", "content": { "confirm": true } }),
+            // An action a later revision might add, which we have never heard
+            // of and therefore must not read as consent.
+            json!({ "action": "deferred", "content": { "confirm": true } }),
+            // Shapes that are not an `ElicitResult` at all.
+            json!({ "content": { "confirm": true } }),
+            json!({ "action": null, "content": { "confirm": true } }),
+            json!({ "action": ["accept"], "content": { "confirm": true } }),
+            json!("accept"),
+            json!(true),
+            json!(null),
+            json!([{ "action": "accept", "content": { "confirm": true } }]),
+        ];
+        for value in no {
+            assert_eq!(
+                confirmed(&responses(value.clone())),
+                Some(false),
+                "nothing but an accepted yes confirms: {value}"
+            );
+        }
+
+        // Round one: no answer at all, or an answer to some other question.
+        assert_eq!(confirmed(&None), None, "no responses is round one");
+        assert_eq!(
+            confirmed(&Some(rmcp::model::InputResponses::new())),
+            None,
+            "an empty map is round one"
+        );
+        let mut elsewhere = rmcp::model::InputResponses::new();
+        elsewhere.insert(
+            "something_else".to_string(),
+            json!({ "action": "accept", "content": { "confirm": true } }),
+        );
+        assert_eq!(
+            confirmed(&Some(elsewhere)),
+            None,
+            "a yes filed under another key answers another question"
+        );
+    }
+
+    /// The same invariant as [`confirmed`], on the parser that decides whether
+    /// an existing engram is replaced: nothing malformed overwrites.
+    ///
+    /// The failure mode this rules out is specific to a string answer. A
+    /// boolean has two values and a typo cannot land on the wrong one; a
+    /// single-select can be answered with the wrong case, the title instead of
+    /// the value, an array of one, or nothing at all, and every one of those
+    /// has to read as "leave what is there" rather than as consent to clobber
+    /// it.
+    #[test]
+    fn only_an_accepted_overwrite_replaces_an_existing_engram() {
+        let responses = |value: Value| {
+            let mut map = rmcp::model::InputResponses::new();
+            map.insert(RESOLUTION_KEY.to_string(), value);
+            Some(map)
+        };
+
+        assert_eq!(
+            resolved_overwrite(&responses(
+                json!({ "action": "accept", "content": { "resolution": "overwrite" } })
+            )),
+            Some(true),
+            "an accepted overwrite replaces"
+        );
+
+        let no = [
+            // The other choice, accepted.
+            json!({ "action": "accept", "content": { "resolution": "cancel" } }),
+            // Accepted with nothing in it, or with the wrong thing in it.
+            json!({ "action": "accept" }),
+            json!({ "action": "accept", "content": {} }),
+            json!({ "action": "accept", "content": null }),
+            json!({ "action": "accept", "content": { "resolution": "Overwrite" } }),
+            json!({ "action": "accept", "content": { "resolution": "overwrite " } }),
+            json!({ "action": "accept", "content": { "resolution": true } }),
+            json!({ "action": "accept", "content": { "resolution": ["overwrite"] } }),
+            // The title rather than the value behind it.
+            json!({ "action": "accept", "content": { "resolution": "Overwrite the existing engram" } }),
+            // The right value under the wrong key.
+            json!({ "action": "accept", "content": { "confirm": "overwrite" } }),
+            // The two refusals the specification names, and one it does not.
+            json!({ "action": "decline" }),
+            json!({ "action": "cancel", "content": { "resolution": "overwrite" } }),
+            json!({ "action": "deferred", "content": { "resolution": "overwrite" } }),
+            // Shapes that are not an `ElicitResult` at all.
+            json!({ "content": { "resolution": "overwrite" } }),
+            json!("overwrite"),
+            json!(null),
+        ];
+        for value in no {
+            assert_eq!(
+                resolved_overwrite(&responses(value.clone())),
+                Some(false),
+                "nothing but an accepted overwrite replaces: {value}"
+            );
+        }
+
+        // Round one: no answer at all, or an answer to some other question.
+        assert_eq!(resolved_overwrite(&None), None, "no responses is round one");
+        assert_eq!(
+            resolved_overwrite(&Some(rmcp::model::InputResponses::new())),
+            None,
+            "an empty map is round one"
+        );
+        let mut elsewhere = rmcp::model::InputResponses::new();
+        elsewhere.insert(
+            CONFIRM_KEY.to_string(),
+            json!({ "action": "accept", "content": { "resolution": "overwrite" } }),
+        );
+        assert_eq!(
+            resolved_overwrite(&Some(elsewhere)),
+            None,
+            "an answer filed under the confirmation key answers another question"
+        );
+    }
+
+    /// The engine message is parsed for the permalink, and a message that does
+    /// not carry one never becomes a question naming the wrong thing.
+    ///
+    /// The positive case is worded exactly as `engine.rs` words it - the same
+    /// sentence `a_permalink_collision_carries_the_marker_the_mcp_layer_intercepts`
+    /// pins from the engine side - so the two halves of the seam are asserted
+    /// against the same string.
+    #[test]
+    fn the_colliding_permalink_is_read_out_of_the_engine_message() {
+        assert_eq!(
+            collision_permalink(
+                "permalink 'topic/taken' already exists in domain 'eng' (at topic/taken.md); pass overwrite=true to replace"
+            ),
+            Some("topic/taken"),
+            "the folder prefix survives, because the engine put it there"
+        );
+
+        for message in [
+            "the domain 'eng' is read only",
+            "permalink 'unterminated, so there is nothing to read out",
+            "permalink '' already exists in domain 'eng' (at .md)",
+        ] {
+            assert_eq!(
+                collision_permalink(message),
+                None,
+                "a message naming no permalink yields none: {message}"
+            );
+        }
+    }
+
+    /// The three things the attachment clause can say, and the one it must
+    /// never say: that a domain too large to enumerate has no sole-referent
+    /// attachments.
+    ///
+    /// A list is an answer, an empty list is the answer "none", and `None` is
+    /// the absence of one. The unenumerated wording is asserted verbatim
+    /// because it is the sentence a user decides a delete on.
+    #[test]
+    fn the_attachment_clause_says_nothing_it_did_not_look_for() {
+        assert_eq!(
+            preview_attachment_clause(Some(&[
+                "assets/solo.png".to_string(),
+                "assets/deck.pptx".to_string(),
+            ])),
+            "This leaves its sole-referent attachments orphaned: assets/solo.png, assets/deck.pptx.",
+            "an enumerated list names every path the delete orphans"
+        );
+        assert_eq!(
+            preview_attachment_clause(Some(&[])),
+            "This leaves its sole-referent attachments orphaned: none.",
+            "an empty enumeration is the answer 'none', not a missing one"
+        );
+        assert_eq!(
+            preview_attachment_clause(None),
+            "Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned.",
+            "past the scan bound the question says nobody looked"
+        );
+    }
+
+    /// And the whole sentence, both ways round, because the clause is only
+    /// ever read inside it: the engram is named, the consequence is stated and
+    /// the delete is still called what it is.
+    #[test]
+    fn the_delete_question_wraps_whichever_clause_the_preview_earned() {
+        let asked = delete_question(&json!({
+            "domain": "eng",
+            "permalink": "eng/doomed",
+            "title": "Doomed",
+            "path": "eng/doomed.md",
+            "attachments": ["assets/solo.png"],
+        }));
+        assert_eq!(
+            asked,
+            "Delete 'Doomed' (eng/eng/doomed)? This leaves its sole-referent attachments orphaned: assets/solo.png. This cannot be undone."
+        );
+
+        let unenumerated = delete_question(&json!({
+            "domain": "eng",
+            "permalink": "eng/doomed",
+            "title": "Doomed",
+            "path": "eng/doomed.md",
+            "attachments": Value::Null,
+        }));
+        assert_eq!(
+            unenumerated,
+            "Delete 'Doomed' (eng/eng/doomed)? Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned. This cannot be undone."
+        );
+    }
 
     #[test]
     fn transient_remote_errors_map_to_the_internal_error_class() {

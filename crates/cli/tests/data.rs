@@ -310,8 +310,9 @@ fn vocabulary_json_shape_and_human_sections() {
     let work = tempfile::tempdir().unwrap();
     let (config, db) = seed_two_engrams(work.path());
 
-    // --json returns the { domain, tags, categories, relation_types } shape with
-    // a null domain for the all-domain sweep.
+    // --json returns the { domain, tags, categories, relation_types, types,
+    // statuses } shape with a null domain for the all-domain sweep. Every count
+    // list is present unconditionally; only `clusters` and `aliases` come and go.
     let out = bin()
         .args(["--json", "vocabulary", "--config"])
         .arg(&config)
@@ -323,7 +324,14 @@ fn vocabulary_json_shape_and_human_sections() {
     let vocab: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
         object_keys(&vocab),
-        ["categories", "domain", "relation_types", "tags"],
+        [
+            "categories",
+            "domain",
+            "relation_types",
+            "statuses",
+            "tags",
+            "types"
+        ],
         "vocabulary JSON shape: {vocab}"
     );
     assert!(
@@ -351,7 +359,8 @@ fn vocabulary_json_shape_and_human_sections() {
         "the seeded relation type surfaces: {vocab}"
     );
 
-    // Human output shows the three labelled sections, scoped to one domain.
+    // Human output shows every labelled section the envelope carries, scoped to
+    // one domain, so the human view never lags the JSON.
     let human = bin()
         .args(["vocabulary", "--domain", "eng", "--config"])
         .arg(&config)
@@ -361,7 +370,14 @@ fn vocabulary_json_shape_and_human_sections() {
         .unwrap();
     assert!(human.status.success());
     let stdout = String::from_utf8_lossy(&human.stdout);
-    for needle in ["Tags:", "Categories:", "Relation types:", "depends_on"] {
+    for needle in [
+        "Tags:",
+        "Categories:",
+        "Relation types:",
+        "Types:",
+        "Statuses:",
+        "depends_on",
+    ] {
         assert!(
             stdout.contains(needle),
             "vocabulary human output missing {needle:?}: {stdout}"

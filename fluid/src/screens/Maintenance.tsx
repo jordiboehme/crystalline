@@ -40,6 +40,11 @@
  * apply. And an empty queue is good news: it is said in the words of good news
  * and never in the shape of a failure.
  *
+ * What that class means is the engine's own sentence, and it rides the sweep
+ * rather than the rows: it is the legend above the queue, said once, because
+ * the chip on a finding is shorthand for it and a shorthand needs its key on
+ * the page exactly once.
+ *
  * The domain filter is a lens over what already arrived rather than a second
  * sweep. Its choices come from the findings themselves, so it offers the
  * domains that actually have something waiting, and it keeps offering all of
@@ -51,7 +56,7 @@ import { useId, useState } from "react";
 import { Link } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { EvolveFinding, EvolveQueue } from "../api/evolve";
+import type { EvolveAction, EvolveFinding, EvolveQueue } from "../api/evolve";
 import {
   EVOLVE_FAMILIES,
   EVOLVE_FAMILY_BLURBS,
@@ -133,9 +138,13 @@ export default function Maintenance() {
   const domains = [...new Set(findings.map((finding) => finding.domain))].sort(
     (left, right) => left.localeCompare(right),
   );
-  const instructions = new Map(
-    (queue?.actions ?? []).map((action) => [action.rule, action.instruction]),
+  // Keyed by rule and carried whole: a row wants the paragraph and the words
+  // that head it, and splitting them into two lookups here would only put them
+  // back together one component down.
+  const actions = new Map(
+    (queue?.actions ?? []).map((action) => [action.rule, action]),
   );
+  const guidance = queue?.guidance ?? null;
 
   return (
     <div className="flex flex-col gap-6">
@@ -150,10 +159,19 @@ export default function Maintenance() {
             happens there.
           </p>
         </div>
+        {/*
+          Enabled while the sweep it started is running, deliberately. A
+          control that disables under the keyboard drops the focus on the
+          document, and this is the only button in the header: somebody who
+          pressed it would have to find their way back into the page to press
+          it again. So the busy state is said rather than drawn as an absence.
+          A second press abandons the sweep in flight and asks again, which is
+          what pressing Refresh means and is no worse than the first press was.
+        */}
         <button
           type="button"
           className={BUTTON.secondary}
-          disabled={sweep.isFetching}
+          aria-busy={sweep.isFetching}
           onClick={() => {
             void sweep.refetch();
           }}
@@ -191,6 +209,18 @@ export default function Maintenance() {
         </div>
       )}
 
+      {guidance !== null && (
+        <p className="text-caption text-slate-500 dark:text-slate-400">
+          {/*
+            The engine's own sentence, said once above the queue rather than
+            per row: the class chip on a finding is shorthand for it, and a
+            legend printed on every row would be the loudest thing on a page
+            of a hundred.
+          */}
+          {guidance}
+        </p>
+      )}
+
       {sweep.isPending && <Skeleton label="Sweeping the domains" rows={6} />}
 
       {sweep.error && (
@@ -210,7 +240,7 @@ export default function Maintenance() {
         <FamilySection
           key={group.key}
           group={group}
-          instructions={instructions}
+          actions={actions}
           canWrite={capabilities.canWrite}
           onChanged={resweep}
         />
@@ -358,12 +388,12 @@ function Acknowledged({
 /** One family, its findings under it. */
 function FamilySection({
   group,
-  instructions,
+  actions,
   canWrite,
   onChanged,
 }: {
   group: FindingGroup;
-  instructions: Map<string, string>;
+  actions: Map<string, EvolveAction>;
   canWrite: boolean;
   onChanged: () => Promise<void>;
 }) {
@@ -382,15 +412,19 @@ function FamilySection({
         </p>
       </div>
       <ul className="flex flex-col gap-2">
-        {group.findings.map((finding) => (
-          <FindingRow
-            key={`${finding.domain}/${finding.permalink}/${finding.rule}/${String(finding.n)}`}
-            finding={finding}
-            instruction={instructions.get(finding.rule) ?? null}
-            canWrite={canWrite}
-            onChanged={onChanged}
-          />
-        ))}
+        {group.findings.map((finding) => {
+          const action = actions.get(finding.rule) ?? null;
+          return (
+            <FindingRow
+              key={`${finding.domain}/${finding.permalink}/${finding.rule}/${String(finding.n)}`}
+              finding={finding}
+              instruction={action?.instruction ?? null}
+              summary={action?.summary ?? null}
+              canWrite={canWrite}
+              onChanged={onChanged}
+            />
+          );
+        })}
       </ul>
     </section>
   );
@@ -423,11 +457,14 @@ type Asking = "ack" | "delete";
 function FindingRow({
   finding,
   instruction,
+  summary,
   canWrite,
   onChanged,
 }: {
   finding: EvolveFinding;
   instruction: string | null;
+  /** The catalog's four-word name for the rule, heading the instruction. */
+  summary: string | null;
   canWrite: boolean;
   onChanged: () => Promise<void>;
 }) {
@@ -437,6 +474,7 @@ function FindingRow({
   const [busy, setBusy] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const noteId = useId();
+  const panelId = useId();
 
   const anchored = finding.permalink !== "";
   // The path the sweep named, not the words the row is drawn with: what gets
@@ -479,12 +517,22 @@ function FindingRow({
           <span className="sr-only">{"Priority "}</span>
           <span className="tabular-nums">{finding.priority}</span>
         </Chip>
-        <Chip mono>{finding.rule}</Chip>
+        {/*
+          Every chip says what it is a value of. Color and position are what
+          tell a reader looking at the row that `V005` is a rule and
+          `judgment` a class; heard one after another they are three words in
+          a line, and `judgment` on its own is not even a noun phrase.
+        */}
+        <Chip mono>
+          <span className="sr-only">{"Rule "}</span>
+          {finding.rule}
+        </Chip>
         {/*
           Judgment is drawn in the accent so it stands out of a scan: it is the
           class that needs a person, and mechanical work is the quiet default.
         */}
         <Chip variant={finding.class === "judgment" ? "accent" : "neutral"}>
+          <span className="sr-only">{"Finding class "}</span>
           {finding.class}
         </Chip>
         {finding.acknowledged && <Chip>acknowledged</Chip>}
@@ -527,6 +575,13 @@ function FindingRow({
           <button
             type="button"
             aria-expanded={open}
+            aria-controls={panelId}
+            // Named by the finding it belongs to rather than by its own words.
+            // A queue is a hundred rows drawn from this one component, and a
+            // list of controls all called "How to work this" is a list nobody
+            // can choose from - the rule and its subject are what tell them
+            // apart, and they are already on the row.
+            aria-label={`How to work this: ${finding.rule} on ${finding.title}`}
             className={`${BUTTON.ghost} -ml-2`}
             onClick={() => {
               setOpen((was) => !was);
@@ -581,10 +636,29 @@ function FindingRow({
           </button>
         )}
       </div>
-      {open && instruction !== null && (
-        <p className="mt-1 rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300">
-          {instruction}
-        </p>
+      {instruction !== null && (
+        /*
+          Drawn whenever the button above names it, folded away with `hidden`
+          rather than taken out of the document. A control's `aria-controls`
+          has to point at something that is there: an id that only exists once
+          the panel is open is a dangling reference for exactly as long as the
+          panel is closed, which is the state a reader meets it in.
+        */
+        <div
+          id={panelId}
+          hidden={!open}
+          className="mt-1 rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300"
+        >
+          {/* The catalog's own name for the rule, above its paragraph: the
+              row says what fired here, and this says what the rule is, so
+              whoever opened a panel three screens down still knows which
+              instruction they are reading. A sweep that sent no summary gets
+              no heading rather than a blank one. */}
+          {summary !== null && (
+            <strong className="mb-0.5 block font-medium">{summary}</strong>
+          )}
+          <p>{instruction}</p>
+        </div>
       )}
       {asking === "ack" && (
         <div className="mt-2 flex flex-wrap items-end gap-2">

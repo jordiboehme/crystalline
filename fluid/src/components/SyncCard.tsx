@@ -133,6 +133,19 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
       )}
       {sync !== null && (
         <>
+          {/*
+            Only at a literal false. The status route answers with the
+            connection rather than refusing over it, so this is the one place
+            a disconnected instance is ever told why its report is thin - and
+            the probe error above it says the check failed without ever
+            naming the cause. A report that carries no connection block says
+            nothing, which is not the same as saying no.
+          */}
+          {sync.connected === false && (
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Not connected - connect GitHub under Settings to sync.
+            </p>
+          )}
           {sync.probeError !== null && (
             <p role="alert" className={STALE_CLASSES}>
               {`The last origin check failed, so these numbers are this copy's own: ${sync.probeError}`}
@@ -161,6 +174,30 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
             <span>
               {plural(sync.openProposals, "open proposal", "open proposals")}
             </span>
+            {/* The two exceptional counts, each shown only when it is not
+                zero: "0 declined proposals" and "0 conflicts to settle" are
+                the normal state of every team domain, and a card that recites
+                them teaches a reader to skim past the line that one day says
+                something. Declined work is informational, a conflict is
+                somebody's next task, and the wording is what says which. */}
+            {sync.declinedProposals > 0 && (
+              <span>
+                {plural(
+                  sync.declinedProposals,
+                  "declined proposal",
+                  "declined proposals",
+                )}
+              </span>
+            )}
+            {sync.conflicts > 0 && (
+              <span>
+                {plural(
+                  sync.conflicts,
+                  "conflict to settle",
+                  "conflicts to settle",
+                )}
+              </span>
+            )}
           </p>
           {/* Only when the origin is actually ahead: `behind` is null when
                 nothing probed it, and "not behind" is not a fact then. */}

@@ -19,6 +19,7 @@ use crystalline_core::config::{
     ServiceConfig,
 };
 use crystalline_index::TursoStore;
+use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
 use crystalline_service::engine::ConnectAuth;
@@ -47,10 +48,11 @@ struct Options {
     /// github-mode tests so nothing here dials github.com; unset means no
     /// override, which is fine for every test that never reaches a provider.
     origin_provider: Option<Arc<support::MockProvider>>,
-    /// Register a domain `kb` that carries a GitHub origin in the config
-    /// without ever downloading one. The only way to address a team domain on
-    /// an instance where `github.enabled` is off, which is the state the sync
-    /// endpoints' 409 exists for.
+    /// Register a domain `kb` that carries a GitHub origin in the config,
+    /// with the origin state a first pull would have left behind, without ever
+    /// downloading one. The only way to address a team domain on an instance
+    /// where GitHub is switched off or nobody is connected - the two states
+    /// the sync endpoints answer differently.
     origin_domain: bool,
 }
 
@@ -116,6 +118,14 @@ async fn serve(opts: Options) -> Fixture {
                 ..DomainEntry::file(team)
             },
         );
+        // The state a first pull would have left behind, written where
+        // `with_origins_dir` below points. Without it the domain is registered
+        // but has never synced, and a status read fails on the missing state
+        // file instead of reporting what it knows - which is not the state
+        // being tested here.
+        OriginState::new("acme/kb", "main")
+            .save(&root.join("origins").join("kb"))
+            .unwrap();
     }
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
@@ -588,6 +598,107 @@ async fn a_disabled_github_names_the_fix_on_both_sync_endpoints() {
             "the refusal points at the fix: {problem}"
         );
     }
+}
+
+/// GitHub switched ON but no credential on file: the PULL is refused with a
+/// 409 naming the connection, rather than travelling to the remote where a
+/// missing token comes back as a missing repository. The two failures have
+/// different fixes, so they get different sentences.
+///
+/// The status read beside it is NOT gated the same way - see
+/// `a_disconnected_github_still_reports_status_rather_than_refusing`, which
+/// pins the other half of this ruling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disconnected_github_refuses_the_pull_and_names_the_connection() {
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 409, "the pull on a disconnected instance");
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    let detail = problem["detail"].as_str().unwrap().to_lowercase();
+    assert!(
+        detail.contains("not connected"),
+        "the refusal names the connection, not a missing repo: {problem}"
+    );
+    assert!(
+        detail.contains("settings"),
+        "and it points at the screen that fixes it: {problem}"
+    );
+
+    // The no-origin refusal still comes first, so a local domain reads the
+    // same on a disconnected instance as on a connected one: 404 on the GET,
+    // 409 on the POST, both naming the missing origin rather than the missing
+    // credential.
+    for (method, expected) in [(reqwest::Method::GET, 404), (reqwest::Method::POST, 409)] {
+        let resp = as_session(fx.addr, method.clone(), "/api/v1/domains/eng/sync", &admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{method} on a local domain");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("team") && !detail.contains("not connected"),
+            "the no-origin sentence still wins the ordering: {problem}"
+        );
+    }
+}
+
+/// The other half of that ruling: the status read degrades instead of
+/// refusing. A team domain whose instance has no credential on file still
+/// answers 200 from local state, with the connection block saying why the
+/// live parts are empty - the engine documents `origin_status` as never
+/// hard-failing on a missing connection, and a read-only mirror's card is
+/// built on exactly that guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disconnected_github_still_reports_status_rather_than_refusing() {
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        200,
+        "a status read reports the state instead of refusing over it"
+    );
+    let status: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status["domain"], "kb");
+    assert_eq!(status["repo"], "acme/kb");
+    assert_eq!(
+        status["connection"]["connected"], false,
+        "the card is told WHY the live parts are empty: {status}"
+    );
+    assert!(
+        status["behind"].is_null(),
+        "nothing was probed, so `behind` is unknown rather than false: {status}"
+    );
 }
 
 /// The read-only ruling on this pair: the status is a pure read and stays

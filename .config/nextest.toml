@@ -1,0 +1,25 @@
+# Keeps a hung test from wedging the whole run: the sandboxed environments
+# this repo is developed in can stall the loopback-binding suites
+# (crates/remote/tests/github_client.rs and github_auth.rs bind
+# 127.0.0.1:0), and without a terminate-after nextest waits forever.
+[profile.default]
+slow-timeout = { period = "120s", terminate-after = 2 }
+
+# The same two loopback suites, given a far longer ceiling rather than a mute:
+# they finish in under a second standalone, but a machine under environmental
+# load (a post-update Gatekeeper scan, a sandbox) has been seen stalling them
+# past the 240s the default override allows, killing tests that were only slow.
+# They still terminate, so a genuine hang cannot wedge the run.
+[[profile.default.overrides]]
+filter = 'binary(github_auth) or binary(github_client)'
+slow-timeout = { period = "120s", terminate-after = 10 }
+
+# The same environmental stall, observed on two more loopback users during
+# full-workspace runs on 2026-08-21 (post macOS update) while every one of them
+# passes per-crate: the CLI's `service` suite, whose `http_smoke_*` cases spawn
+# a daemon and talk to it over 127.0.0.1, and `embed::remote`'s retry tests,
+# which drive a local mock HTTP endpoint. Same ceiling, same guarantee: slow is
+# survivable, hung still dies.
+[[profile.default.overrides]]
+filter = 'package(crystalline) & binary(service) | package(crystalline-index) & test(embed::remote)'
+slow-timeout = { period = "120s", terminate-after = 10 }

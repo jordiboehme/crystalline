@@ -1025,6 +1025,226 @@ async fn a_reference_to_a_missing_file_never_fails_the_move() {
 }
 
 #[tokio::test]
+async fn a_carry_that_cannot_land_surfaces_a_warning_in_the_move_result() {
+    let (_tmp, engine, _from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![ghost](assets/ghost.png)"),
+        )
+        .await
+        .unwrap();
+
+    let result = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let warnings = result["attachment_warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{result}");
+    assert_eq!(
+        warnings[0].as_str().unwrap(),
+        "attachment 'assets/ghost.png' referenced by 'note' is not in 'from'; \
+         the move carries nothing for it"
+    );
+}
+
+/// The other way a carry can fail: the name is taken at the destination by a
+/// different file, and every suffix the rename is allowed to offer is taken
+/// too. Nothing is lost - the file stays whole in the source domain - but the
+/// reference travelling with the engram now reads as a file that is not the one
+/// it was written about, which is exactly the thing a receipt has to say out
+/// loud.
+#[tokio::test]
+async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    // `assets/shot.png` plus every `-2` through `-99` the suffixing is allowed
+    // to reach, each holding bytes of its own so none of them can be reused.
+    for attempt in 1..=99u32 {
+        let path = if attempt == 1 {
+            "assets/shot.png".to_string()
+        } else {
+            format!("assets/shot-{attempt}.png")
+        };
+        let bytes = [OTHER_PNG, attempt.to_string().as_bytes()].concat();
+        engine.attachment_write("into", &path, bytes).await.unwrap();
+    }
+
+    let result = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let warnings = result["attachment_warnings"].as_array().unwrap();
+    assert_eq!(warnings.len(), 1, "{result}");
+    assert_eq!(
+        warnings[0].as_str().unwrap(),
+        "attachment 'assets/shot.png' could not be carried to 'into'; its \
+         reference at the destination may resolve to a different same-name file"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG,
+        "the file stays whole where it already was"
+    );
+    assert_eq!(
+        engine.attachment_list("into").await.unwrap().len(),
+        99,
+        "nothing was written at the destination"
+    );
+    assert!(
+        moved_text(&into, "note.md").contains("![shot](assets/shot.png)"),
+        "a reference that was not carried keeps the spelling it had"
+    );
+}
+
+/// **One move, both failure modes, and the healthy attachment still travels.**
+///
+/// The two warnings are pushed at different points of the same plan - a
+/// reference the source domain does not hold is reported while the present
+/// files are being read, a name that cannot be freed at the destination while
+/// the destinations are being settled - so a move that hits both is what proves
+/// they accumulate rather than replace one another. The clean attachment beside
+/// them carries the other half of the contract: one reference failing must not
+/// stop the next one from arriving.
+#[tokio::test]
+async fn a_move_accumulates_every_carry_warning() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "",
+                "![clean](assets/clean.png) ![ghost](assets/ghost.png) ![shot](assets/shot.png)",
+            ),
+        )
+        .await
+        .unwrap();
+    // Two of the three references have bytes behind them; `assets/ghost.png`
+    // deliberately has none, so the source domain holds nothing to carry for it.
+    engine
+        .attachment_write("from", "assets/clean.png", PNG.to_vec())
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    // And every name the rename is allowed to offer `assets/shot.png` at the
+    // destination is taken by bytes of its own, so no free name can be settled.
+    for attempt in 1..=99u32 {
+        let path = if attempt == 1 {
+            "assets/shot.png".to_string()
+        } else {
+            format!("assets/shot-{attempt}.png")
+        };
+        let bytes = [OTHER_PNG, attempt.to_string().as_bytes()].concat();
+        engine.attachment_write("into", &path, bytes).await.unwrap();
+    }
+
+    let result = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let warnings: Vec<&str> = result["attachment_warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one warning per failure, and none for the reference that travelled: {result}"
+    );
+    assert!(
+        warnings.contains(
+            &"attachment 'assets/ghost.png' referenced by 'note' is not in 'from'; \
+              the move carries nothing for it"
+        ),
+        "the missing reference is named: {warnings:?}"
+    );
+    assert!(
+        warnings.contains(
+            &"attachment 'assets/shot.png' could not be carried to 'into'; its \
+              reference at the destination may resolve to a different same-name file"
+        ),
+        "and so is the one that found no free name: {warnings:?}"
+    );
+
+    // The clean attachment is the sole referent's, so it moved outright.
+    assert_eq!(
+        std::fs::read(into.join("assets").join("clean.png")).unwrap(),
+        PNG,
+        "a failure elsewhere in the plan does not strand the healthy carry"
+    );
+    assert!(
+        !from.join("assets").join("clean.png").exists(),
+        "and it left the source, the way a sole referent's attachment does"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG,
+        "the one that could not land stays whole where it already was"
+    );
+    assert_eq!(
+        engine.attachment_list("into").await.unwrap().len(),
+        100,
+        "the ninety-nine squatters plus the one attachment that arrived"
+    );
+}
+
+#[tokio::test]
+async fn a_clean_move_reports_an_empty_warnings_array() {
+    let (_tmp, engine, _from, _into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "![shot](assets/shot.png)"),
+        )
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    let crossed = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+    assert_eq!(crossed["attachment_warnings"], serde_json::json!([]));
+
+    let renamed = engine
+        .move_engram(&move_params("into", "note", "notes/note.md", None))
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed["attachment_warnings"],
+        serde_json::json!([]),
+        "a same-domain move carries nothing and so warns about nothing"
+    );
+}
+
+#[tokio::test]
 async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
     let (_tmp, engine, from, into, _scratch) = move_fixture().await;
     engine
@@ -1178,6 +1398,56 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
     );
 }
 
+/// A cross-domain move re-emits the engram at the destination, so the store's
+/// content column must never stand in for an unreadable source file: a file
+/// domain indexes the body only, and the fallback would land a
+/// frontmatter-stripped engram in the destination domain.
+#[tokio::test]
+async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source("Note", "note", "", "A rule about note."),
+        )
+        .await
+        .unwrap();
+
+    // Remove the markdown behind the index's back: the row still points at it,
+    // and the store still holds the body-only text the file domain indexed.
+    std::fs::remove_file(from.join("note.md")).unwrap();
+
+    let err = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.contains("unreadable"), "got: {msg}");
+    assert!(msg.contains("resync"), "got: {msg}");
+    // The file that could not be read, named outright: an operator reading the
+    // refusal should not have to reconstruct the path from the domain root.
+    assert!(
+        msg.contains(&from.join("note.md").display().to_string()),
+        "got: {msg}"
+    );
+
+    assert!(
+        !into.join("note.md").exists(),
+        "no file landed in the destination domain"
+    );
+    assert!(
+        engine
+            .read_engram(&crystalline_service::params::ReadParams {
+                identifier: "note".to_string(),
+                domain: Some("into".to_string()),
+            })
+            .await
+            .is_err(),
+        "and nothing was indexed there either"
+    );
+}
+
 /// `delete_engram` with an `assets/` identifier deletes the attachment, on both
 /// domain kinds, and records the sweep the change owes. This is the one write
 /// the MCP attachment surface offers, so an agent can complete an orphaned
@@ -1273,4 +1543,195 @@ async fn an_attachment_delete_refuses_an_expected_checksum() {
         .await
         .unwrap();
     assert!(!root.join("assets/deck.png").exists());
+}
+
+// --- the delete preview -----------------------------------------------------
+//
+// `Engine::delete_preview` answers "what would this delete take with it"
+// without taking any of it, which is what the MCP confirmation round asks
+// before it acts. Its attachment list is the part with real logic in it: the
+// same referent count the cross-domain move uses, screened against what the
+// domain actually holds.
+
+/// The preview names the attachments this engram is the last referent of, and
+/// nothing else: not one another engram still uses, and not one nothing holds.
+#[tokio::test]
+async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_referent_of() {
+    let (_tmp, engine, root, _scratch) = named_fixture("preview-eng", "preview-scratch").await;
+    engine
+        .restore_engram(
+            "preview-eng",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "",
+                "![solo](assets/solo.png) ![both](assets/both.png) ![gone](assets/gone.png)",
+            ),
+        )
+        .await
+        .unwrap();
+    engine
+        .restore_engram(
+            "preview-eng",
+            "peer.md",
+            &engram_source("Peer", "peer", "", "![both](assets/both.png)"),
+        )
+        .await
+        .unwrap();
+    for path in ["assets/solo.png", "assets/both.png"] {
+        engine
+            .attachment_write("preview-eng", path, PNG.to_vec())
+            .await
+            .unwrap();
+    }
+
+    let preview = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "note".to_string(),
+            domain: "preview-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(preview["domain"], "preview-eng", "{preview}");
+    assert_eq!(preview["permalink"], "note", "{preview}");
+    assert_eq!(preview["title"], "Note", "{preview}");
+    assert_eq!(preview["path"], "note.md", "{preview}");
+    assert!(
+        preview["attachments"].is_array(),
+        "a domain this far inside MAX_PREVIEW_SCAN_ENGRAMS is enumerated, so the \
+         field is a list rather than the null that says nobody looked: {preview}"
+    );
+    assert_eq!(
+        preview["attachments"],
+        serde_json::json!(["assets/solo.png"]),
+        "one referent left for solo, two for both, and gone is not stored: {preview}"
+    );
+
+    // A preview previews. Everything it named is still exactly where it was.
+    assert!(root.join("note.md").exists());
+    assert_eq!(
+        engine.attachment_list("preview-eng").await.unwrap().len(),
+        2,
+        "no attachment was touched"
+    );
+}
+
+/// The `assets/` branch previews the attachment itself, refuses the checksum
+/// the delete refuses, and reports a miss as a miss rather than asking the
+/// user to confirm deleting nothing.
+#[tokio::test]
+async fn a_delete_preview_of_an_attachment_reports_its_size() {
+    let (_tmp, engine, _root, _scratch) = named_fixture("size-eng", "size-scratch").await;
+    engine
+        .attachment_write("size-eng", "assets/deck.png", PNG.to_vec())
+        .await
+        .unwrap();
+
+    let preview = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview["attachment"], true, "{preview}");
+    assert_eq!(preview["path"], "assets/deck.png", "{preview}");
+    assert_eq!(preview["size"], PNG.len(), "{preview}");
+    assert!(
+        preview.get("permalink").is_none(),
+        "no engram was involved: {preview}"
+    );
+
+    let refused = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: Some("0".repeat(64)),
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(refused, EngineError::Invalid(_)), "{refused}");
+
+    let missing = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/never-there.png".to_string(),
+            domain: "size-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, EngineError::NotFound(_)), "{missing}");
+
+    assert!(
+        engine
+            .attachment_read("size-eng", "assets/deck.png")
+            .await
+            .is_ok(),
+        "a preview deletes nothing"
+    );
+}
+
+/// **A preview must never be stricter than the act it previews.**
+///
+/// `attachment_delete` reads no bytes and succeeds when either half of the
+/// pair is there, so the preview has to succeed everywhere the delete would.
+/// The half-present case is the reachable one on a file domain: a
+/// hand-edited domain (or a `git pull` that dropped a file) leaves the row
+/// standing over nothing, and the delete still removes the row. Built on the
+/// byte read instead, round one would refuse and an eliciting peer would lose
+/// a delete a legacy peer still gets.
+#[tokio::test]
+async fn a_delete_preview_is_never_stricter_than_the_delete_it_previews() {
+    let (_tmp, engine, root, _scratch) = named_fixture("strict-eng", "strict-scratch").await;
+    engine
+        .attachment_write("strict-eng", "assets/deck.png", PNG.to_vec())
+        .await
+        .unwrap();
+    // The file goes, the row stays: exactly what the delete's own doc comment
+    // describes as still counting as a delete.
+    std::fs::remove_file(root.join("assets/deck.png")).unwrap();
+    assert!(
+        engine
+            .attachment_read("strict-eng", "assets/deck.png")
+            .await
+            .is_err(),
+        "the read this preview used to be built on refuses here"
+    );
+
+    let preview = engine
+        .delete_preview(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "strict-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(preview["attachment"], true, "{preview}");
+    assert_eq!(
+        preview["size"],
+        PNG.len(),
+        "the standing row is where the number comes from: {preview}"
+    );
+
+    // And the delete the preview promised still goes through.
+    engine
+        .delete_engram(&crystalline_service::params::DeleteParams {
+            identifier: "assets/deck.png".to_string(),
+            domain: "strict-eng".to_string(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        engine
+            .attachment_list("strict-eng")
+            .await
+            .unwrap()
+            .is_empty(),
+        "the row went with it"
+    );
 }

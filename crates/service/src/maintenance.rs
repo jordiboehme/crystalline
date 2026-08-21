@@ -15,8 +15,15 @@
 //!   `last_run_at` and drops the swept domains from the pending list - or,
 //!   when the sweep named no scope at all and so covered every registered
 //!   domain, empties that list outright;
-//! - the Stop hook, which reads the file to decide whether to nudge and
-//!   stamps `last_nudge_at` when it does.
+//! - the Stop hook, which reads the file to decide whether to nudge, starts
+//!   the machine's clock with [`record_first_seen`] on its very first call and
+//!   stamps `last_nudge_at` with [`record_nudge`] when it asks.
+//!
+//! Every one of them writes through a recorder here rather than saving a state
+//! it loaded earlier, and that is a correctness rule rather than a convention:
+//! a caller that decides between its read and its write - the Stop hook is the
+//! one that does - would otherwise install the file as it was before the
+//! decision and erase whatever landed meanwhile.
 //!
 //! Concurrency has two halves, and only one of them is last-write-wins.
 //!
@@ -38,7 +45,8 @@
 //! block the write path it exists to annotate.
 //!
 //! For the same reason every writer treats failure as log-and-continue.
-//! [`record_pending`] and [`record_run`] swallow their errors at
+//! [`record_pending`], [`record_run`], [`record_nudge`] and
+//! [`record_first_seen`] swallow their errors at
 //! `tracing::debug` and nothing louder: a knowledge write that succeeded must
 //! never be reported as failed because a throttle record could not be
 //! updated.
@@ -86,12 +94,13 @@ pub struct MaintenanceState {
     #[serde(default)]
     pub last_run_at: Option<DateTime<Utc>>,
     /// When the human was last nudged about the backlog. Written by the Stop
-    /// hook, which is the only thing that nudges.
+    /// hook through [`record_nudge`], which is the only thing that nudges.
     #[serde(default)]
     pub last_nudge_at: Option<DateTime<Utc>>,
     /// When this file was first written on this machine. Written by the Stop
-    /// hook, which owns it: the recorders below round-trip it untouched, so a
-    /// human write is never the thing that starts the clock.
+    /// hook through [`record_first_seen`], which owns it: the other recorders
+    /// round-trip it untouched, so a human write is never the thing that starts
+    /// the clock.
     #[serde(default)]
     pub first_seen: Option<DateTime<Utc>>,
 }
@@ -172,9 +181,38 @@ pub fn record_run_unscoped() {
     }
 }
 
+/// Record that the human was nudged about the backlog at `now`.
+///
+/// The Stop hook's half of the file, and the reason it is a recorder rather
+/// than a save: the hook reads the state, decides whether to ask and only then
+/// stamps, and a `record_pending` from the daemon can land inside that gap.
+/// Writing the whole state the hook had read would erase it; stamping the one
+/// field under the lock cannot. `now` is the caller's instant, the same one the
+/// decision was made against, rather than a fresh clock read. Failures are
+/// logged at debug and swallowed, like every writer here.
+pub fn record_nudge(now: DateTime<Utc>) {
+    if let Err(e) = path().and_then(|p| record_nudge_at(&p, now)) {
+        tracing::debug!("maintenance state not stamped with the nudge: {e}");
+    }
+}
+
+/// Start this machine's clock at `now`, unless it is already running.
+///
+/// The other half of what the Stop hook owns: the first hook call this machine
+/// ever makes seeds [`MaintenanceState::first_seen`], which is what the weekly
+/// arm measures against until a sweep is recorded. Merging rather than saving
+/// for exactly the reason [`record_nudge`] does, and a no-op once the stamp
+/// exists, so a later call never restarts the quiet week. Failures are logged
+/// at debug and swallowed.
+pub fn record_first_seen(now: DateTime<Utc>) {
+    if let Err(e) = path().and_then(|p| record_first_seen_at(&p, now)) {
+        tracing::debug!("maintenance state clock not started: {e}");
+    }
+}
+
 // --- path-taking internals ---------------------------------------------------
 //
-// The four functions above resolve `path()` and swallow; these do the work
+// The functions above resolve `path()` and swallow; these do the work
 // against an explicit file, which is what the unit tests drive so they need
 // neither the real state directory nor a process-global environment override.
 
@@ -263,6 +301,29 @@ fn record_run_at(path: &Path, swept_domains: &[String]) -> Result<(), ConfigErro
     if state.pending_domains.is_empty() {
         state.pending_since = None;
     }
+    write_locked(path, &state)
+}
+
+/// [`record_nudge`] against an explicit file, one critical section like the
+/// recorders above. `now` comes from the caller rather than the clock because
+/// the hook decided at a particular instant and stamps that same one.
+fn record_nudge_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
+    let _write = write_lock();
+    let mut state = load_from(path);
+    state.last_nudge_at = Some(now);
+    write_locked(path, &state)
+}
+
+/// [`record_first_seen`] against an explicit file, one critical section like
+/// the recorders above. The check is inside it too: the first writer to reach
+/// this wins, and a later one leaves the stamp it finds alone.
+fn record_first_seen_at(path: &Path, now: DateTime<Utc>) -> Result<(), ConfigError> {
+    let _write = write_lock();
+    let mut state = load_from(path);
+    if state.first_seen.is_some() {
+        return Ok(());
+    }
+    state.first_seen = Some(now);
     write_locked(path, &state)
 }
 
@@ -406,6 +467,66 @@ mod tests {
         );
         assert_eq!(after.pending_since, None, "an empty backlog has no age");
         assert!(after.last_run_at.is_some(), "the run was stamped");
+    }
+
+    /// The Stop hook's stamp merges rather than overwrites. The hook reads the
+    /// file, decides whether to ask, and only then stamps; a daemon-side
+    /// `record_pending` landing inside that gap has to survive, which is the one
+    /// thing a whole-file save of the state the hook read cannot do.
+    #[test]
+    fn record_nudge_keeps_a_domain_that_went_pending_after_the_hook_read() {
+        let (_dir, path) = scratch();
+        record_pending_at(&path, "seed").unwrap();
+
+        // What the Stop hook reads before it decides.
+        let read_by_the_hook = load_from(&path);
+        assert_eq!(read_by_the_hook.pending_domains, vec!["seed".to_string()]);
+
+        // A human writes through the daemon while the hook is still deciding.
+        record_pending_at(&path, "landed-late").unwrap();
+
+        let stamped: DateTime<Utc> = "2026-08-20T10:00:00Z".parse().unwrap();
+        record_nudge_at(&path, stamped).unwrap();
+
+        let after = load_from(&path);
+        assert_eq!(after.last_nudge_at, Some(stamped), "the ask was stamped");
+        assert_eq!(
+            after.pending_domains,
+            vec!["seed".to_string(), "landed-late".to_string()],
+            "the domain that went pending during the decision must survive the stamp"
+        );
+        assert_eq!(
+            after.pending_since, read_by_the_hook.pending_since,
+            "the backlog keeps its original age"
+        );
+    }
+
+    /// The machine's clock starts once and merges like the stamp above: a
+    /// second call leaves the first instant standing, and neither call touches
+    /// a backlog recorded in between.
+    #[test]
+    fn record_first_seen_starts_the_clock_once_and_keeps_the_backlog() {
+        let (_dir, path) = scratch();
+        let first: DateTime<Utc> = "2026-08-01T09:00:00Z".parse().unwrap();
+        let later: DateTime<Utc> = "2026-08-20T09:00:00Z".parse().unwrap();
+
+        record_first_seen_at(&path, first).unwrap();
+        assert_eq!(load_from(&path).first_seen, Some(first));
+
+        record_pending_at(&path, "eng").unwrap();
+        record_first_seen_at(&path, later).unwrap();
+
+        let after = load_from(&path);
+        assert_eq!(
+            after.first_seen,
+            Some(first),
+            "a later call never restarts the quiet week"
+        );
+        assert_eq!(
+            after.pending_domains,
+            vec!["eng".to_string()],
+            "seeding the clock never disturbs the backlog"
+        );
     }
 
     /// Concurrent writers in one process never splice their bytes together and

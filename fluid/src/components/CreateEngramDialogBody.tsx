@@ -20,10 +20,14 @@ import { useNavigate } from "react-router";
 import { problemDetail } from "../api/client";
 import { domainTreeKey, treeQuery } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
-import { fetchTags, vocabularyKey } from "../api/vocabulary";
+import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import { createEngram } from "../api/writes";
 import { editRoute } from "../paths";
-import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "../suggestions";
+import {
+  STATUS_SUGGESTIONS,
+  TYPE_SUGGESTIONS,
+  withHouseCounts,
+} from "../suggestions";
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
 import { BUTTON, Field } from "./primitives";
 import { SuggestInput, suggestionsAreOpen } from "./SuggestInput";
@@ -49,11 +53,21 @@ export default function CreateEngramDialogBody({
   const [tags, setTags] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
 
-  // The domain's tag vocabulary, under the same key DomainHome caches it: an
-  // author who arrived from the domain page pays nothing on the wire.
-  const knownTags = useQuery({
-    queryKey: vocabularyKey(domain),
-    queryFn: () => fetchTags(domain),
+  // Everything this domain is written in, in one read: the tags the tag field
+  // suggests and the `type` and `status` words the two suggesting inputs put
+  // beside the recommended sets. One query rather than one per field, under
+  // the key the editor caches the same payload at, so an author who arrived
+  // from the editor pays nothing on the wire. `fullVocabularyKey` rather than
+  // `vocabularyKey`: DomainHome caches a tags-only parse of the same route
+  // under the latter, and two shapes at one key would mean whichever query
+  // resolved second overwrote the other with data it cannot parse.
+  //
+  // An unread or failed query is simply no suggestions: the recommended sets
+  // stand on their own and the tag field was always free text, so there is
+  // nothing here to wait for.
+  const house = useQuery({
+    queryKey: fullVocabularyKey(domain),
+    queryFn: () => fetchVocabulary(domain),
   });
 
   const create = useMutation({
@@ -177,7 +191,7 @@ export default function CreateEngramDialogBody({
                 placeholder="rust, editing"
               />
               <datalist id="create-tags">
-                {(knownTags.data ?? []).map((tag) => (
+                {(house.data?.tags ?? []).map((tag) => (
                   <option key={tag.name} value={tag.name} />
                 ))}
               </datalist>
@@ -185,10 +199,11 @@ export default function CreateEngramDialogBody({
             {/*
               The suggesting input rather than a datalist: focus opens the
               whole recommended vocabulary with a line each on what the words
-              are for, which is what a field nobody has memorized needs. The
-              helper stays anyway - a list of words is what a closed set looks
-              like, and that anything else is allowed is the one thing the
-              popover cannot say for itself.
+              are for, which is what a field nobody has memorized needs, and
+              the words this domain already writes come with it. The helper
+              stays anyway - a list of words is what a closed set looks like,
+              and that anything else is allowed is the one thing the popover
+              cannot say for itself.
             */}
             <Field
               id={typeField}
@@ -201,7 +216,10 @@ export default function CreateEngramDialogBody({
                 describedBy={`${typeField}-help`}
                 className={FIELD_CLASSES}
                 value={engramType}
-                suggestions={TYPE_SUGGESTIONS}
+                suggestions={withHouseCounts(
+                  TYPE_SUGGESTIONS,
+                  house.data?.types ?? [],
+                )}
                 onChange={setEngramType}
                 placeholder="engram"
               />
@@ -219,7 +237,10 @@ export default function CreateEngramDialogBody({
                 describedBy={`${statusField}-help`}
                 className={FIELD_CLASSES}
                 value={status}
-                suggestions={STATUS_SUGGESTIONS}
+                suggestions={withHouseCounts(
+                  STATUS_SUGGESTIONS,
+                  house.data?.statuses ?? [],
+                )}
                 onChange={setStatus}
                 placeholder="stable"
               />

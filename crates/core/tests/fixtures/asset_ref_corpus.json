@@ -1,0 +1,18 @@
+[
+  { "name": "plain ref", "body": "![shot](assets/2026/08/shot.png)", "refs": ["assets/2026/08/shot.png"] },
+  { "name": "dot-slash form", "body": "[log](./assets/a/b.log)", "refs": ["assets/a/b.log"] },
+  { "name": "fragment stripped", "body": "![d](assets/x/diagram.png#left)", "refs": ["assets/x/diagram.png"] },
+  { "name": "width fragment stripped", "body": "![d](assets/x/diagram.png#w=50%)", "refs": ["assets/x/diagram.png"] },
+  { "name": "title clause dropped", "body": "![s](assets/x/pic.png \"the title\")", "refs": ["assets/x/pic.png"] },
+  { "name": "fenced code ignored", "body": "```\n![s](assets/x/hidden.png)\n```\n![s](assets/x/seen.png)", "refs": ["assets/x/seen.png"] },
+  { "name": "prefix-only dropped", "body": "[x](assets/#left)", "refs": [] },
+  { "name": "dedup keeps first order", "body": "![a](assets/one.png) ![b](assets/two.png) ![c](assets/one.png)", "refs": ["assets/one.png", "assets/two.png"] },
+  { "name": "percent-encoded letter decodes", "body": "![s](assets/2026/08/scr%65enshot.png)", "refs": ["assets/2026/08/screenshot.png"] },
+  { "name": "encoded prefix decodes", "body": "![s](%61ssets/pic.png)", "refs": ["assets/pic.png"] },
+  { "name": "encoded hash becomes fragment", "body": "![s](assets/pic.png%23left)", "refs": ["assets/pic.png"] },
+  { "name": "double-encoded stays one level", "body": "![s](assets/scr%2565enshot.png)", "refs": ["assets/scr%65enshot.png"] },
+  { "name": "invalid escape stays raw", "body": "![s](assets/bad%zzname.png)", "refs": ["assets/bad%zzname.png"] },
+  { "name": "utf8 sequence decodes", "body": "![s](assets/caf%C3%A9.png)", "refs": ["assets/café.png"] },
+  { "name": "invalid utf8 stays raw", "body": "![s](assets/bad%FFname.png)", "refs": ["assets/bad%FFname.png"] },
+  { "name": "non-asset link ignored", "body": "[doc](docs/readme.md) ![i](https://example.com/a.png)", "refs": [] }
+]

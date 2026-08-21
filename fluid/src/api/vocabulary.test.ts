@@ -32,6 +32,31 @@ describe("readVocabulary", () => {
     ]);
   });
 
+  it("reads the type and status words the domain actually uses", () => {
+    const vocabulary = readVocabulary({
+      types: [
+        { name: "engram", count: 12 },
+        { name: "playbook", count: 3 },
+      ],
+      statuses: [{ name: "brewing", count: 2 }],
+    });
+
+    expect(vocabulary.types).toEqual([
+      { name: "engram", count: 12 },
+      { name: "playbook", count: 3 },
+    ]);
+    expect(vocabulary.statuses).toEqual([{ name: "brewing", count: 2 }]);
+  });
+
+  it("answers empty lists when the server enumerates neither", () => {
+    // An older server has no `types` or `statuses` in its payload at all, and
+    // a reader that yielded undefined would make every caller guard for it.
+    const vocabulary = readVocabulary({ tags: [] });
+
+    expect(vocabulary.types).toEqual([]);
+    expect(vocabulary.statuses).toEqual([]);
+  });
+
   it("drops an entry with no name and sorts the rest commonest first", () => {
     const vocabulary = readVocabulary({
       categories: [

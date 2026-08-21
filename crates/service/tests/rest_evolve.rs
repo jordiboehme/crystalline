@@ -276,28 +276,73 @@ async fn the_queue_answers_with_findings_and_legend() {
         "every row is ranked: {human}"
     );
 
-    let instruction = body["actions"]
+    let action = body["actions"]
         .as_array()
         .expect("actions is an array")
         .iter()
         .find(|action| action["rule"] == "V006")
-        .map(|action| action["instruction"].as_str().unwrap().to_string())
         .unwrap_or_else(|| panic!("the legend carries V006: {body}"));
+    let catalog = crystalline_index::rule_info("V006").unwrap();
     assert_eq!(
-        instruction,
-        crystalline_index::rule_info("V006").unwrap().instruction,
+        action["instruction"], catalog.instruction,
         "the legend is the catalog's own instruction, passed through unchanged"
     );
+    // The short label beside it: a page renders the heading from the summary and
+    // keeps the instruction for the body, so both have to arrive.
+    assert_eq!(
+        action["summary"], catalog.summary,
+        "the legend carries the catalog's own summary too: {action}"
+    );
 
-    // The families summary counts the whole result rather than the page, which
-    // is what the page's section headings are drawn from.
-    let temporal = body["families"]
+    // The families summary counts the whole filtered result rather than the
+    // page, which is what the page's section headings are drawn from. Summed
+    // across every family, so a fixture that later fires a structural rule
+    // moves the split without breaking the invariant.
+    let counted: u64 = body["families"]
         .as_array()
-        .unwrap()
+        .expect("families is an array")
         .iter()
-        .find(|f| f["family"] == "temporal")
-        .unwrap_or_else(|| panic!("the temporal family is counted: {body}"));
-    assert_eq!(temporal["findings"], body["total"]);
+        .map(|f| {
+            f["findings"]
+                .as_u64()
+                .unwrap_or_else(|| panic!("a family entry counts its findings: {f}"))
+        })
+        .sum();
+    assert_eq!(
+        counted,
+        body["total"].as_u64().unwrap(),
+        "every finding in the result is counted under exactly one family: {body}"
+    );
+}
+
+/// What the queue refuses, and with which code: a scope naming a domain nobody
+/// registered is a 404, and a family or a rule the catalog does not hold is a
+/// 422 - the difference between "that thing is not here" and "there is no such
+/// thing". Each answers `application/problem+json`, because a client that
+/// renders the reason has to be able to parse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_refuses_an_unknown_scope_by_code() {
+    let fixture = serve_anonymous().await;
+
+    for (query, status) in [
+        ("?domains=nope", 404),
+        ("?families=bogus", 422),
+        ("?rules=V999", 422),
+    ] {
+        let resp = get(fixture.addr, &format!("/api/v1/evolve{query}")).await;
+        assert_eq!(
+            resp.status(),
+            status,
+            "GET /api/v1/evolve{query} is a {status}"
+        );
+        assert_eq!(
+            resp.headers()["content-type"],
+            "application/problem+json",
+            "GET /api/v1/evolve{query} explains itself as a problem document"
+        );
+        let body: serde_json::Value = resp.json().await.unwrap();
+        assert_eq!(body["status"], status, "{body}");
+    }
 }
 
 /// The list parameters and the page window reach the engine: a scope naming a
@@ -666,19 +711,58 @@ async fn the_ack_endpoint_holds_the_write_rules() {
     .unwrap();
     assert_eq!(resp.status(), 404);
 
-    // A domain nobody registered.
-    let resp = client()
-        .post(format!(
-            "http://{}/api/v1/domains/nope/evolve/ack",
-            fixture.addr
-        ))
-        .header("cookie", format!("fluid_session={}", editor.0))
-        .header("x-csrf-token", &editor.1)
-        .json(&body)
-        .send()
+    // A domain nobody registered, on both halves: the withdrawal path resolves
+    // the domain before it can report an acknowledgment missing, so it answers
+    // the same 404 as acknowledging into one rather than a 500 on the way.
+    for method in [reqwest::Method::POST, reqwest::Method::DELETE] {
+        let resp = client()
+            .request(
+                method.clone(),
+                format!("http://{}/api/v1/domains/nope/evolve/ack", fixture.addr),
+            )
+            .header("cookie", format!("fluid_session={}", editor.0))
+            .header("x-csrf-token", &editor.1)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{method} into an unregistered domain");
+        assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    }
+}
+
+/// Both halves of the body wrong at once: the rule screen runs before the
+/// engram is resolved, so an unknown rule answers 422 rather than the 404 the
+/// missing engram would have earned. Pinned because the order is a decision -
+/// the rule is the part the caller can fix without another lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_rule_answers_before_a_missing_engram() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
         .await
         .unwrap();
-    assert_eq!(resp.status(), 404);
+    let editor = login_session(fixture.addr, "ada", "s3cret").await;
+
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &editor,
+        serde_json::json!({ "permalink": "not-a-thing", "rule": "V999" }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        422,
+        "the unknown rule is answered, not the missing engram"
+    );
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("V999"), "and it names the rule: {detail}");
 }
 
 /// The note arrives straight off the wire, so the HTTP boundary is where a

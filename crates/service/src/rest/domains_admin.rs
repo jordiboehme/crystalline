@@ -471,6 +471,18 @@ fn single_domain(
 /// resource "team sync status" does not exist for a local or virtual domain.
 /// A client can therefore treat any 404 here as "show no card" while the
 /// detail still says which of the two 404s it got.
+///
+/// A missing GitHub connection is NOT refused here, and that asymmetry with
+/// the pull beside it is deliberate. `Engine::origin_status` is documented to
+/// degrade rather than fail - no saved connection means `behind: None` and a
+/// connection block reporting `connected: false`, never an error - and this
+/// route exists to report state, so it reports that state instead of replacing
+/// it with a refusal. A domain registered while connected and later
+/// disconnected therefore still renders its card, showing what local state
+/// knows and saying the connection is gone. The `connection` block travels out
+/// with the flat per-domain report for exactly that reason: without it a card
+/// could not tell "not connected" from "offline", since both leave `behind`
+/// null.
 #[utoipa::path(
     get,
     path = "/api/v1/domains/{domain}/sync",
@@ -480,17 +492,24 @@ fn single_domain(
     description = "Admin only. A pure read, served even on a read-only \
                    instance. Answers 404 for a domain with no origin - only \
                    a GitHub team domain has sync status - so a client can \
-                   treat any 404 as `no sync card`.",
+                   treat any 404 as `no sync card`. An instance with no \
+                   GitHub connection is reported, not refused: the report \
+                   comes back from local state with `connection.connected` \
+                   false.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     responses(
         (
             status = 200,
             description = "The engine's own status report for this one \
-                           domain, plus the mode it is synced in. \
-                           `local_changes` is the unshared-work count a \
-                           client shows as pending; `probe_error` is set when \
-                           the live check could not reach GitHub and the rest \
-                           of the report came from local state alone.",
+                           domain, plus the mode it is synced in and this \
+                           instance's GitHub connection. `local_changes` is \
+                           the unshared-work count a client shows as pending; \
+                           `probe_error` is set when the live check could not \
+                           reach GitHub and the rest of the report came from \
+                           local state alone; `connection.connected` is false \
+                           when no credential is on file, which is why a \
+                           disconnected instance still answers here instead \
+                           of refusing.",
             body = Object,
             example = json!({
                 "domain": "eng",
@@ -504,7 +523,8 @@ fn single_domain(
                 "declined_proposals": [],
                 "conflicts": [],
                 "last_checked": "2026-08-10T08:00:00Z",
-                "probe_error": null
+                "probe_error": null,
+                "connection": { "connected": true, "user": "octo", "token_store": "keychain" }
             }),
         ),
         (
@@ -530,7 +550,9 @@ fn single_domain(
             status = 409,
             description = "GitHub is switched off on this instance, so no \
                            origin can be reached - the detail says where to \
-                           turn it on.",
+                           turn it on. A missing connection is NOT refused \
+                           here: the report comes back with \
+                           `connection.connected` false instead.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -543,16 +565,24 @@ pub async fn sync_status(
 ) -> Result<Json<Value>, ApiError> {
     identity.require_admin()?;
     // No refuse_read_only: this is a read. See the doc comment.
+    // No connection check either: this route reports the connection rather
+    // than refusing over it. See the doc comment.
     require_team_domain(&state, &domain, Refusal::Missing)?;
-    let mut report = single_domain(
-        state.engine.origin_status(Some(&domain)).await?,
-        &domain,
-        "reading the origin status",
-    )?;
+    let aggregate = state.engine.origin_status(Some(&domain)).await?;
+    // Lifted before `single_domain` takes the per-domain entry, which is all
+    // that survives of the aggregate.
+    let connection = aggregate.get("connection").cloned();
+    let mut report = single_domain(aggregate, &domain, "reading the origin status")?;
     // The engine's per-domain report already names the domain; the mode is
     // this surface's own, since a client that sees a sync card has to know
     // which kind of origin it is looking at.
     report.insert("mode".to_string(), Value::from("github"));
+    // The connection rides along so a card can say WHY a degraded report is
+    // degraded: `connected: false` is "connect GitHub", while a set
+    // `probe_error` on a connected instance is "could not reach it".
+    if let Some(connection) = connection {
+        report.insert("connection".to_string(), connection);
+    }
     Ok(Json(Value::Object(report)))
 }
 
@@ -567,6 +597,15 @@ pub async fn sync_status(
 /// addressed here is the ACTION, which exists on every domain path, and the
 /// server state is what refuses it. That asymmetry is deliberate - a client
 /// hides the card on a 404 and shows the reason on a 409.
+///
+/// A missing GitHub connection is a 409 here and only here. The pull cannot
+/// degrade the way the status read beside it does: with no credential it has
+/// nothing to pull WITH, and left to travel it comes back as the remote's own
+/// "no such repository", which sends the reader hunting for a repository
+/// problem that does not exist. Refusing up front names the connection and the
+/// screen that fixes it, and a missing repository keeps the remote's own
+/// `RemoteError::RepoNotFound` to itself, so the two read differently.
+/// [`sync_status`] deliberately does NOT share this check.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/sync",
@@ -578,7 +617,8 @@ pub async fn sync_status(
                    for the daemon's next poll: the same pull the poller runs, \
                    under the same per-domain lock. Refused on a read-only \
                    instance, and a conflict on a domain that has no origin to \
-                   pull from.",
+                   pull from or on an instance with no GitHub connection to \
+                   pull through.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     responses(
         (
@@ -622,9 +662,12 @@ pub async fn sync_status(
         ),
         (
             status = 409,
-            description = "The domain has no team origin to pull from, or \
-                           GitHub is switched off on this instance - the \
-                           detail says which, and where to fix it.",
+            description = "The domain has no team origin to pull from, GitHub \
+                           is switched off on this instance, or it is on but \
+                           no account is connected - the detail says which, \
+                           and where to fix it. A repository that is simply \
+                           missing is a different answer, carrying the \
+                           remote's own not-found error.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -638,6 +681,13 @@ pub async fn sync_now(
     identity.require_admin()?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
+    // The pull's own gate, not the status read's: see the doc comment.
+    if !state.engine.github_ready().await {
+        return Err(ApiError::conflict(
+            "GitHub is not connected on this instance: connect it under \
+             Settings > GitHub, then retry the sync",
+        ));
+    }
     let report = single_domain(
         state.engine.origin_update(Some(&domain)).await?,
         &domain,
@@ -665,6 +715,13 @@ enum Refusal {
 /// with no origin is refused before the feature flag is consulted, so a local
 /// domain reads as "no sync card" on every instance rather than flipping to a
 /// GitHub complaint when someone turns the feature off.
+///
+/// What this does NOT check is whether an account is connected. The feature
+/// flag is a property of the instance and reads the same to both verbs, while
+/// a missing credential does not: the pull cannot proceed without one (see
+/// [`sync_now`]) and the status read is expected to report the state instead
+/// (see [`sync_status`]). Keeping the connection out of the shared helper is
+/// what lets those two answers differ.
 fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Result<(), ApiError> {
     if !state.engine.domain_has_origin(domain)? {
         return Err(match refusal {

@@ -84,7 +84,9 @@ pub struct EvolveQuery {
 /// finding is a question for a person, never a change to apply.
 ///
 /// The per-rule instruction rides `actions` rather than a column, so a page of
-/// findings from one rule carries it once; only the rules on this page appear.
+/// findings from one rule carries it once; only the rules on this page appear,
+/// each with the catalog's short `summary` beside its `instruction` so a
+/// renderer has both a heading and a body without deriving one from the other.
 /// `families` counts the whole filtered result rather than the page, which is
 /// what section headings are drawn from, and `truncations` names any per-domain
 /// cap that fired so a short queue is never mistaken for a finished one.
@@ -150,6 +152,7 @@ pub struct EvolveQuery {
                 }],
                 "actions": [{
                     "rule": "V006",
+                    "summary": "human capture never reviewed",
                     "instruction": "A person captured this directly and nobody has reviewed it since. ..."
                 }],
                 "guidance": "This queue changes nothing by itself. ...",
