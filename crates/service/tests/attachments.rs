@@ -1111,6 +1111,106 @@ async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
     );
 }
 
+/// **One move, both failure modes, and the healthy attachment still travels.**
+///
+/// The two warnings are pushed at different points of the same plan - a
+/// reference the source domain does not hold is reported while the present
+/// files are being read, a name that cannot be freed at the destination while
+/// the destinations are being settled - so a move that hits both is what proves
+/// they accumulate rather than replace one another. The clean attachment beside
+/// them carries the other half of the contract: one reference failing must not
+/// stop the next one from arriving.
+#[tokio::test]
+async fn a_move_accumulates_every_carry_warning() {
+    let (_tmp, engine, from, into, _scratch) = move_fixture().await;
+    engine
+        .restore_engram(
+            "from",
+            "note.md",
+            &engram_source(
+                "Note",
+                "note",
+                "",
+                "![clean](assets/clean.png) ![ghost](assets/ghost.png) ![shot](assets/shot.png)",
+            ),
+        )
+        .await
+        .unwrap();
+    // Two of the three references have bytes behind them; `assets/ghost.png`
+    // deliberately has none, so the source domain holds nothing to carry for it.
+    engine
+        .attachment_write("from", "assets/clean.png", PNG.to_vec())
+        .await
+        .unwrap();
+    engine
+        .attachment_write("from", "assets/shot.png", PNG.to_vec())
+        .await
+        .unwrap();
+    // And every name the rename is allowed to offer `assets/shot.png` at the
+    // destination is taken by bytes of its own, so no free name can be settled.
+    for attempt in 1..=99u32 {
+        let path = if attempt == 1 {
+            "assets/shot.png".to_string()
+        } else {
+            format!("assets/shot-{attempt}.png")
+        };
+        let bytes = [OTHER_PNG, attempt.to_string().as_bytes()].concat();
+        engine.attachment_write("into", &path, bytes).await.unwrap();
+    }
+
+    let result = engine
+        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .await
+        .unwrap();
+
+    let warnings: Vec<&str> = result["attachment_warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|warning| warning.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        warnings.len(),
+        2,
+        "one warning per failure, and none for the reference that travelled: {result}"
+    );
+    assert!(
+        warnings.contains(
+            &"attachment 'assets/ghost.png' referenced by 'note' is not in 'from'; \
+              the move carries nothing for it"
+        ),
+        "the missing reference is named: {warnings:?}"
+    );
+    assert!(
+        warnings.contains(
+            &"attachment 'assets/shot.png' could not be carried to 'into'; its \
+              reference at the destination may resolve to a different same-name file"
+        ),
+        "and so is the one that found no free name: {warnings:?}"
+    );
+
+    // The clean attachment is the sole referent's, so it moved outright.
+    assert_eq!(
+        std::fs::read(into.join("assets").join("clean.png")).unwrap(),
+        PNG,
+        "a failure elsewhere in the plan does not strand the healthy carry"
+    );
+    assert!(
+        !from.join("assets").join("clean.png").exists(),
+        "and it left the source, the way a sole referent's attachment does"
+    );
+    assert_eq!(
+        std::fs::read(from.join("assets").join("shot.png")).unwrap(),
+        PNG,
+        "the one that could not land stays whole where it already was"
+    );
+    assert_eq!(
+        engine.attachment_list("into").await.unwrap().len(),
+        100,
+        "the ninety-nine squatters plus the one attachment that arrived"
+    );
+}
+
 #[tokio::test]
 async fn a_clean_move_reports_an_empty_warnings_array() {
     let (_tmp, engine, _from, _into, _scratch) = move_fixture().await;

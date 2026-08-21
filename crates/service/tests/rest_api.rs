@@ -2223,6 +2223,44 @@ async fn vocabulary_lists_the_tags_and_relation_types_in_use() {
         serde_json::json!([]),
         "and an empty status list: {scoped}"
     );
+
+    // The other half of the scope, which the empty domain cannot show: a scope
+    // onto a domain that holds something reports what that domain is written
+    // in. The fixture puts everything in `eng`, so the scoped counts and the
+    // unscoped ones agree here - the assertion that matters is that the filter
+    // returns the domain's real vocabulary rather than an empty list, which is
+    // the failure an unwired scope produces.
+    let seeded: serde_json::Value = get(fixture.addr, "/api/v1/vocabulary?domain=eng")
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(seeded["domain"], "eng", "the scope is echoed: {seeded}");
+    assert_eq!(
+        seeded["types"],
+        serde_json::json!([
+            { "name": "engram", "count": 2 },
+            { "name": "guide", "count": 1 },
+            { "name": "manifest", "count": 1 },
+        ]),
+        "the seeded domain's own types, counted: {seeded}"
+    );
+    assert_eq!(
+        seeded["statuses"],
+        serde_json::json!([{ "name": "current", "count": 4 }]),
+        "and its own statuses: {seeded}"
+    );
+    let seeded_tags = names(&seeded["tags"]);
+    for tag in ["eng", "root", "nested", "manifest"] {
+        assert!(
+            seeded_tags.contains(&tag.to_string()),
+            "{tag} missing from the scoped tags: {seeded}"
+        );
+    }
+    assert!(
+        names(&seeded["relation_types"]).contains(&"relates_to".to_string()),
+        "and the relation the fixture declares: {seeded}"
+    );
 }
 
 /// Context walks the graph out from a `crystalline://` anchor: the anchor comes

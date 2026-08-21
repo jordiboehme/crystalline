@@ -633,6 +633,23 @@ async fn modern_post(addr: std::net::SocketAddr, id: u32, method: &str, params: 
     post(addr, &body, Some(ERA), Some(method), name.as_deref(), None).await
 }
 
+/// [`modern_post`] from a client that can put a question to its user: the same
+/// headers, with the elicitation capability declared in the body's `_meta`.
+async fn eliciting_post(
+    addr: std::net::SocketAddr,
+    id: u32,
+    method: &str,
+    params: Value,
+) -> String {
+    let name = params
+        .get("name")
+        .or_else(|| params.get("uri"))
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let body = eliciting(id, method, params).to_string();
+    post(addr, &body, Some(ERA), Some(method), name.as_deref(), None).await
+}
+
 fn head_of(raw: &str) -> String {
     raw.split("\r\n\r\n").next().unwrap_or(raw).to_string()
 }
@@ -1112,6 +1129,92 @@ async fn a_legacy_peer_deletes_immediately_with_no_input_required() {
     assert!(!path.exists(), "the engram is gone: {}", path.display());
 }
 
+/// **A peer outside the gate is not half-served: its answers are not read at
+/// all.**
+///
+/// Both excluded shapes can put an `inputResponses` object on the wire - the
+/// field is ordinary `tools/call` parameters at every revision rmcp parses - so
+/// "the gate is two-sided" has a second, quieter half worth pinning: a peer the
+/// gate excludes is served exactly what 0.15.0 served it, and a decline it was
+/// never asked for changes nothing. The alternative shape, reading the answer
+/// whenever one is present, would let a client that cannot be asked veto its own
+/// calls, which is a different contract than the one shipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn answers_from_a_gate_excluded_peer_are_ignored() {
+    // A modern peer that declared no elicitation capability.
+    let h = Harness::new().await;
+    let (mut wire, path) = doomed_engram(&h).await;
+    let done = wire
+        .call(modern(
+            2,
+            "tools/call",
+            delete_doomed(Some(answer("decline", false))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the unasked-for decline is not read as a refusal: {done}"
+    );
+    assert!(
+        !path.exists(),
+        "and the delete ran on the first call: {}",
+        path.display()
+    );
+
+    // A legacy peer, which cannot be asked whatever it declares.
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+    let written = wire
+        .call(request(
+            2,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": {
+                    "domain": "eng",
+                    "title": "Doomed",
+                    "content": "Delete me.",
+                },
+            }),
+        ))
+        .await;
+    assert!(
+        written["error"].is_null() && written["result"]["isError"] != json!(true),
+        "the write lands: {written}"
+    );
+    let path = h.root.join("eng/doomed.md");
+    assert!(path.exists());
+
+    let done = wire
+        .call(request(
+            3,
+            "tools/call",
+            delete_doomed(Some(answer("decline", false))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "a legacy answer is not read either: {done}"
+    );
+    assert!(
+        !path.exists(),
+        "and the legacy delete is unchanged: {}",
+        path.display()
+    );
+}
+
 /// **An eliciting peer keeps every delete a legacy peer has**, including the
 /// one this verb exists as an escape hatch for: a stray file above the
 /// attachment ceiling, which the walker skips and so never gives a row.
@@ -1163,6 +1266,73 @@ async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
         !stray.exists(),
         "the stray file is gone: {}",
         stray.display()
+    );
+}
+
+/// **The confirmation round exists on the HTTP wire too, not only over stdio.**
+///
+/// Every other test of the round drives the duplex stdio transport, where the
+/// capability reaches the handler through rmcp's metadata latch. Nothing arms
+/// that latch on the streamable-HTTP path, so a request there is classified from
+/// its own `_meta` on each call - a genuinely different route to
+/// `client_capabilities`, and the one a remote client actually takes. Pinned
+/// here so a deployment behind a load balancer is known to ask before it
+/// destroys rather than assumed to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_peer_gets_a_question_over_http() {
+    let h = Harness::new().await;
+    let addr = h.http().await;
+
+    let written = modern_post(
+        addr,
+        1,
+        "tools/call",
+        json!({
+            "name": "write_engram",
+            "arguments": {
+                "domain": "eng",
+                "title": "Doomed",
+                "content": "Delete me.",
+            },
+        }),
+    )
+    .await;
+    assert!(
+        written.starts_with("HTTP/1.1 200 OK"),
+        "the engram to delete has to exist first:\n{}",
+        head_of(&written)
+    );
+    let path = h.root.join("eng/doomed.md");
+    assert!(path.exists(), "the write landed on disk");
+
+    let raw = eliciting_post(addr, 2, "tools/call", delete_doomed(None)).await;
+    assert!(
+        raw.starts_with("HTTP/1.1 200 OK"),
+        "the round is served:\n{}",
+        head_of(&raw)
+    );
+    assert!(
+        !has_session_header(&raw),
+        "and it needs no session to carry it:\n{}",
+        head_of(&raw)
+    );
+    let asked = payload(&raw);
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than a deletion: {asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("eng/doomed"),
+        "the question names what dies: {message}"
+    );
+    assert!(
+        path.exists(),
+        "round one deletes nothing: {}",
+        path.display()
     );
 }
 
@@ -1404,6 +1574,185 @@ async fn a_confirmed_unack_removes_and_reports_evolve_ack_removed() {
             .unwrap()
             .contains("evolve_ack"),
         "the entry is gone from the file"
+    );
+}
+
+/// Round two of a record with a yes: the entry lands, receipt and file alike.
+///
+/// The take-back has had its whole round trip pinned since it shipped; the
+/// record only ever had its question and its refusal, so the one path that
+/// actually writes on a confirmed round was covered by inference.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_ack_record_lands_on_round_two() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            ack_call("V101 lineage citation, keep", None),
+        ))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+    assert!(
+        !std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("evolve_ack"),
+        "round one records nothing"
+    );
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            ack_call("V101 lineage citation, keep", Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the confirmed round records: {done}"
+    );
+    assert_eq!(
+        done["result"]["resultType"],
+        json!("complete"),
+        "and it is an ordinary complete result: {done}"
+    );
+    let entry = &payload_of(&done)["evolve_ack"];
+    assert_eq!(entry["rule"], json!("V101"), "{done}");
+    assert_eq!(entry["note"], json!("lineage citation, keep"), "{done}");
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        on_disk.contains("evolve_ack") && on_disk.contains("V101"),
+        "and it is in the frontmatter: {on_disk}"
+    );
+}
+
+/// Round two of a record with a no: nothing is written, byte for byte, and the
+/// refusal says which half of the verb did not happen.
+///
+/// The two refusals are worded apart on purpose - a declined record leaves
+/// nothing behind, a declined removal leaves the entry standing - so this
+/// asserts the record's wording rather than merely that something was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_ack_record_changes_nothing() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+    let before = std::fs::read(&path).unwrap();
+
+    let asked = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            ack_call("V101 lineage citation, keep", None),
+        ))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let refused = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            ack_call(
+                "V101 lineage citation, keep",
+                Some(answer("decline", false)),
+            ),
+        ))
+        .await;
+    assert_eq!(
+        refused["result"]["isError"],
+        json!(true),
+        "a decline is a refusal the model can read: {refused}"
+    );
+    let text = refused["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("nothing was recorded"),
+        "and it says what did not happen, in the record's own words: {text}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the engram is untouched byte for byte: {}",
+        path.display()
+    );
+}
+
+/// **A yes to a removal whose acknowledgment vanished between the rounds fails
+/// loudly, naming the rule.**
+///
+/// The confirmation round is not a transaction: round one resolves the engram
+/// and asks, round two acts on whatever the file holds by then. Something else -
+/// another agent, a Fluid tab, a CLI run - can take the acknowledgment away
+/// while the user is being asked, and the honest outcome is the engine's own
+/// "nothing to remove", carrying the rule id so the model can tell which
+/// acknowledgment it was. What must not happen is the round silently succeeding
+/// on an engram that no longer carries the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_removal_of_a_vanished_ack_errors_naming_the_rule() {
+    let h = Harness::new().await;
+    let (mut wire, path) = acked_engram(&h).await;
+
+    // Recorded by a peer that cannot be asked, so only the removal has rounds.
+    let recorded = wire
+        .call(modern(2, "tools/call", ack_call("V101 keep it", None)))
+        .await;
+    assert!(
+        recorded["error"].is_null() && recorded["result"]["isError"] != json!(true),
+        "the acknowledgment lands: {recorded}"
+    );
+
+    let asked = wire
+        .call(eliciting(3, "tools/call", ack_call("remove V101", None)))
+        .await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "round one resolves the engram and asks: {asked}"
+    );
+
+    // Out of band, while the user is being asked: the acknowledgment goes. A
+    // modern non-eliciting take-back is the shortest stand-in for the other
+    // agent or Fluid tab that would do it, and it rewrites the file the way any
+    // real removal does rather than leaving a half-edited one behind.
+    let removed = wire
+        .call(modern(4, "tools/call", ack_call("remove V101", None)))
+        .await;
+    assert_eq!(
+        payload_of(&removed)["evolve_ack_removed"],
+        json!("V101"),
+        "the entry is genuinely gone: {removed}"
+    );
+    let before = std::fs::read(&path).unwrap();
+
+    let answered = wire
+        .call(eliciting(
+            5,
+            "tools/call",
+            ack_call("remove V101", Some(answer("accept", true))),
+        ))
+        .await;
+    assert_ne!(
+        answered["result"]["resultType"],
+        json!("input_required"),
+        "the answered round does not ask again: {answered}"
+    );
+    assert!(
+        !answered["error"].is_null(),
+        "a removal with nothing to remove is an error, not a quiet success: {answered}"
+    );
+    let message = answered["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("V101"),
+        "and it names the rule the user said yes about: {message}"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        before,
+        "the file is untouched by the failed round: {}",
+        path.display()
     );
 }
 
