@@ -1134,7 +1134,7 @@ impl McpServer {
     #[tool(
         name = "search_engrams",
         title = "Search engrams",
-        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded.",
+        description = "Search across every registered domain by default (an all-domain sweep) or a chosen few to recall relevant knowledge and experience. Defaults to hybrid lexical-plus-semantic ranking and falls back to plain text when embeddings are not ready. Filter by type, tags, status, arbitrary frontmatter or a recorded-after date; a filter-only search with no query text is allowed. Every hit is labelled with its domain, and a hit inside an observation carries its line. A hit's snippet is a short window around the match, never the whole engram: read_engram returns the full content, so read before citing or summarizing what a hit only previews. The result reports total, page, limit and count; when count is below total, request the next page to see the rest. A tags filter also matches through a domain's tag aliases (the MANIFEST `## Tag Aliases` section), so a merged old tag name still finds its engrams. A status filter on stable or current matches both, since they are one state under two spellings; any other status matches exactly. Hybrid ranking adds a small salience prior, so an engram marked salient at write time ranks above equally relevant unmarked ones without ever excluding a result. Engrams whose status is deprecated, superseded, archived or legacy are softly faded in ranking (the search.retired_weight setting, default 0.6, 1.0 disables), reordered but never excluded. Every hit on the returned page also comes back as a resource_link block beside the text, in hit order: follow the crystalline:// handle with resources/read instead of assembling the address out of the row's domain and permalink.",
         annotations(read_only_hint = true, open_world_hint = false)
     )]
     async fn search_engrams(
@@ -1145,7 +1145,7 @@ impl McpServer {
             .search_engrams(&p)
             .await
             .map_err(to_error)
-            .and_then(|v| self.ok_list(v))
+            .and_then(|v| self.ok_found(v))
     }
 
     #[tool(
@@ -1744,6 +1744,43 @@ impl McpServer {
                 crate::toon::render(&value),
             )])),
         }
+    }
+
+    /// [`Self::ok_list`] for a search result, with one `resource_link` per hit
+    /// on the returned page appended behind the text block, in hit order.
+    ///
+    /// The rows already carry `domain` and `permalink`, so this makes the same
+    /// trade the write receipts make: an address a client assembles out of two
+    /// fields is an address every client has to be taught, and a link is one
+    /// the era already knows how to follow. The links are blocks beside the
+    /// text rather than anything inside it, so a TOON table and a JSON body
+    /// hand back the same handles.
+    ///
+    /// One link per row, so the nth link pairs with the nth hit - two
+    /// observation hits inside one engram therefore link that engram twice,
+    /// which is the pairing holding rather than a duplicate. Only the returned
+    /// page is linked, and a hit missing a field is skipped rather than
+    /// guessed at, the same tolerance as [`ok_written`].
+    fn ok_found(&self, value: Value) -> Result<CallToolResult, ErrorData> {
+        let links: Vec<ContentBlock> = value
+            .get("hits")
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|hit| {
+                let domain = hit.get("domain").and_then(Value::as_str)?;
+                let permalink = hit.get("permalink").and_then(Value::as_str)?;
+                let title = hit
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(permalink);
+                Some(engram_link(domain, permalink, title))
+            })
+            .collect();
+        let mut result = self.ok_list(value)?;
+        result.content.extend(links);
+        Ok(result)
     }
 
     /// Applies `configure`'s `set` map then `unset` list, one key at a time

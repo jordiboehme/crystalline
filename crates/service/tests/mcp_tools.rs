@@ -873,6 +873,136 @@ async fn a_move_links_the_destination_it_resolves_to() {
     assert_eq!(read["domain"], json!("vault"));
 }
 
+/// Seed three findable engrams in `eng`, in a fixed order.
+async fn seed_findable(peer: &Peer<RoleClient>) {
+    for title in ["Alpha", "Beta", "Gamma"] {
+        call(
+            peer,
+            "write_engram",
+            json!({
+                "domain": "eng",
+                "title": title,
+                "content": format!("{title} knowledge, plainly stated."),
+            }),
+        )
+        .await
+        .unwrap();
+    }
+}
+
+/// **Every hit comes back as something a client can follow.**
+///
+/// The rows already name the domain and the permalink, so this is the same
+/// trade the write receipts make: an address a client reconstructs by hand is
+/// an address every client has to be taught, and a `resource_link` is one the
+/// era already knows how to fetch. One link per hit on the returned page, in
+/// hit order, so a client can pair the nth link with the nth row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_search_links_every_hit_on_the_page_it_returns() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    seed_findable(peer).await;
+
+    let found = call_result(
+        peer,
+        "search_engrams",
+        json!({ "query": "knowledge", "search_type": "text" }),
+    )
+    .await;
+    // The payload still leads: the text block is what every client already
+    // reads, and the links ride behind it.
+    let body: Value = serde_json::from_str(&result_text(&found)).unwrap();
+    let hits = body["hits"].as_array().expect("a page of hits").clone();
+    assert_eq!(hits.len(), 3, "three seeded engrams match: {body}");
+
+    let links = resource_links(&found);
+    assert_eq!(links.len(), hits.len(), "one link per hit: {links:?}");
+    for (link, hit) in links.iter().zip(&hits) {
+        assert_eq!(
+            link["uri"],
+            json!(format!(
+                "crystalline://{}/{}",
+                hit["domain"].as_str().unwrap(),
+                hit["permalink"].as_str().unwrap()
+            )),
+            "the nth link addresses the nth hit"
+        );
+        assert_eq!(link["name"], hit["title"], "named by the hit's own title");
+        assert_eq!(link["mimeType"], json!("text/markdown"));
+    }
+
+    // The handles have to resolve, which is the only thing that makes them
+    // worth carrying.
+    let uri = links[0]["uri"].as_str().unwrap().to_string();
+    call(peer, "read_engram", json!({ "identifier": uri }))
+        .await
+        .unwrap_or_else(|e| panic!("a search link must resolve: {uri}: {e}"));
+
+    // A page carries the page's links, not the corpus's.
+    let one = call_result(
+        peer,
+        "search_engrams",
+        json!({ "query": "knowledge", "search_type": "text", "limit": 1 }),
+    )
+    .await;
+    let body: Value = serde_json::from_str(&result_text(&one)).unwrap();
+    assert_eq!(body["total"], json!(3), "the corpus still matches three");
+    assert_eq!(
+        resource_links(&one).len(),
+        1,
+        "the returned page is one hit, so it is one link"
+    );
+
+    // Nothing found is nothing to link.
+    let none = call_result(
+        peer,
+        "search_engrams",
+        json!({ "query": "zzzznotathing", "search_type": "text" }),
+    )
+    .await;
+    assert!(
+        resource_links(&none).is_empty(),
+        "an empty page carries no links"
+    );
+}
+
+/// The links are content blocks beside the text, never inside it, so the
+/// response format cannot reach them: a TOON table gets the same handles a
+/// JSON body does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_toon_search_carries_the_same_links_as_a_json_one() {
+    let h = Harness::new_toon(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    seed_findable(peer).await;
+
+    let found = call_result(
+        peer,
+        "search_engrams",
+        json!({ "query": "knowledge", "search_type": "text" }),
+    )
+    .await;
+    let text = result_text(&found);
+    assert!(
+        serde_json::from_str::<Value>(&text).is_err(),
+        "this harness renders TOON, not JSON: {text}"
+    );
+    let links = resource_links(&found);
+    let uris: Vec<&str> = links.iter().map(|l| l["uri"].as_str().unwrap()).collect();
+    assert_eq!(
+        uris.len(),
+        3,
+        "one link per hit in TOON mode too: {links:?}"
+    );
+    for uri in uris {
+        assert!(
+            uri.starts_with("crystalline://eng/"),
+            "a link addresses the engram it found: {uri}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_read_overwrite_and_domain_errors() {
     let h = Harness::new(&["eng"]).await;
