@@ -776,6 +776,67 @@ describe("the team sync card", () => {
     expect(within(card).getByText(/2026-08-09 \(stale\)/)).toBeVisible();
   });
 
+  it("says the instance is not connected, and where that is fixed", async () => {
+    // The status route reports a missing connection rather than refusing over
+    // it, so the card is the only place that answer is ever seen. Without this
+    // row a disconnected instance shows a stale report and a probe error that
+    // never names the actual cause.
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            connection: { connected: false },
+            probe_error: "no GitHub connection on this instance",
+          }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(
+      await within(card).findByText(
+        /not connected - connect GitHub under Settings to sync/i,
+      ),
+    ).toBeVisible();
+  });
+
+  it("says nothing about the connection when there is one, or no answer", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({ connection: { connected: true, user: "octo" } }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+    expect(within(card).queryByText(/not connected/i)).toBeNull();
+  });
+
+  it("says nothing about the connection when the report carries none", async () => {
+    // A report with no connection block at all is not a report of a missing
+    // connection: an older server, or one that dropped the key, must not make
+    // this card tell somebody to go and connect what is already connected.
+    serve({ "/domains/eng/sync": () => syncResponse() }, "admin");
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("acme/kb")).toBeVisible();
+    expect(within(card).queryByText(/not connected/i)).toBeNull();
+  });
+
   it("pulls the origin and refreshes what the pull changed", async () => {
     const pulled = vi.fn(() => ({
       domain: "eng",

@@ -133,6 +133,19 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
       )}
       {sync !== null && (
         <>
+          {/*
+            Only at a literal false. The status route answers with the
+            connection rather than refusing over it, so this is the one place
+            a disconnected instance is ever told why its report is thin - and
+            the probe error above it says the check failed without ever
+            naming the cause. A report that carries no connection block says
+            nothing, which is not the same as saying no.
+          */}
+          {sync.connected === false && (
+            <p className="text-sm text-slate-500 dark:text-slate-400">
+              Not connected - connect GitHub under Settings to sync.
+            </p>
+          )}
           {sync.probeError !== null && (
             <p role="alert" className={STALE_CLASSES}>
               {`The last origin check failed, so these numbers are this copy's own: ${sync.probeError}`}

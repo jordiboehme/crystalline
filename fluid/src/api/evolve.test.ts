@@ -205,8 +205,50 @@ describe("the evolve payload", () => {
     expect(queue.actions).toContainEqual({
       rule: "V006",
       instruction: "Read it and verify the claim.",
+      // This fixture sends no summaries, and none are invented: a heading is
+      // the catalog's own words or there is no heading.
+      summary: null,
     });
     expect(queue.truncations).toEqual(["eng - findings capped at 200"]);
+  });
+
+  it("reads the catalog's short summary beside the instruction", () => {
+    // The two halves arrive together so a renderer has a heading and a body
+    // without deriving one from the other. Only the instruction is required:
+    // a rule from a catalog older than this key still gets its paragraph.
+    const queue = readEvolveQueue({
+      actions: [
+        {
+          rule: "V006",
+          summary: "human capture never reviewed",
+          instruction: "Read it and verify the claim.",
+        },
+        { rule: "V101", instruction: "Repoint it at the successor." },
+        {
+          rule: "V201",
+          summary: 7,
+          instruction: "Merge into the richest one.",
+        },
+      ],
+    });
+
+    expect(queue.actions).toEqual([
+      {
+        rule: "V006",
+        instruction: "Read it and verify the claim.",
+        summary: "human capture never reviewed",
+      },
+      {
+        rule: "V101",
+        instruction: "Repoint it at the successor.",
+        summary: null,
+      },
+      {
+        rule: "V201",
+        instruction: "Merge into the richest one.",
+        summary: null,
+      },
+    ]);
   });
 
   it("reads the guidance the whole queue is worked under", () => {

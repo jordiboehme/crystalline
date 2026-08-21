@@ -292,6 +292,16 @@ function sentBody(init: RequestInit | undefined): unknown {
   return JSON.parse(body) as unknown;
 }
 
+/** The disclosure panel a "How to work this" button controls. */
+function panelOf(disclose: HTMLElement): HTMLElement {
+  const id = disclose.getAttribute("aria-controls");
+  const panel = id === null ? null : document.getElementById(id);
+  if (panel === null) {
+    throw new Error("expected the disclosure to control a panel");
+  }
+  return panel;
+}
+
 /** The finding row a piece of its text sits in. */
 function rowOf(text: HTMLElement): HTMLElement {
   const row = text.closest("li");
@@ -378,6 +388,51 @@ describe("the maintenance screen", () => {
       ),
     ).toBeVisible();
     expect(disclose).toHaveAttribute("aria-expanded", "true");
+    // A sweep that sends no summary gets no heading line invented for it: the
+    // panel is the instruction and nothing else.
+    expect(panelOf(disclose).textContent).toBe(
+      "Complete the retirement in both halves.",
+    );
+  });
+
+  it("heads the instruction with the catalog's own summary of the rule", async () => {
+    // The summary is the rule in four words and the instruction is the
+    // paragraph under it. Both come off the wire, so neither is derived from
+    // the other and the heading is the catalog's wording rather than a
+    // truncation of the body.
+    await open({
+      "/evolve": () =>
+        evolvePayload({
+          actions: [
+            {
+              rule: "V005",
+              summary: "supersedes target still current",
+              instruction: "Complete the retirement in both halves.",
+            },
+          ],
+        }),
+    });
+
+    const temporal = await section(/^Temporal/);
+    const disclose = within(temporal).getByRole("button", {
+      name: /how to work this/i,
+    });
+    // Folded away, the heading is as absent as the paragraph under it. The
+    // catalog says the rule in the same words the row's finding line does, so
+    // what is counted here is the row's one copy of it, not zero.
+    expect(
+      within(temporal).getAllByText("supersedes target still current"),
+    ).toHaveLength(1);
+
+    await userEvent.click(disclose);
+
+    const panel = panelOf(disclose);
+    expect(
+      within(panel).getByText("supersedes target still current"),
+    ).toBeVisible();
+    expect(
+      within(panel).getByText("Complete the retirement in both halves."),
+    ).toBeVisible();
   });
 
   it("says the engine's guidance once, above the queue", async () => {
@@ -561,11 +616,15 @@ describe("working the queue from the keyboard", () => {
 
     await userEvent.click(disclose);
 
-    expect(
-      await within(temporal).findByText(
-        "Complete the retirement in both halves.",
-      ),
-    ).toHaveAttribute("id", panelId);
+    // Everything the disclosure opened sits inside the element it names, the
+    // heading line included, so following the control lands on the whole
+    // panel rather than on the paragraph at the bottom of it.
+    await within(temporal).findByText(
+      "Complete the retirement in both halves.",
+    );
+    expect(panelOf(disclose)).toContainElement(
+      within(temporal).getByText("Complete the retirement in both halves."),
+    );
   });
 
   it("keeps Refresh under the keyboard while the sweep it asked for runs", async () => {

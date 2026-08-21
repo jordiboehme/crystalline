@@ -147,6 +147,22 @@ export interface EvolveAcknowledged {
   byFamily: Record<string, number>;
 }
 
+/**
+ * What the catalog prescribes for one rule: the paragraph, and the four words
+ * that name it.
+ *
+ * Both halves ride the sweep so a renderer has a heading and a body without
+ * deriving one from the other - a truncated instruction is a worse heading
+ * than the catalog's own summary, and it changes every time the paragraph is
+ * reworded. The summary is null for a sweep that sent none, which draws the
+ * instruction alone rather than an empty line above it.
+ */
+export interface EvolveAction {
+  rule: string;
+  instruction: string;
+  summary: string | null;
+}
+
 /** One sweep, as this app reads it. */
 export interface EvolveQueue {
   /** How many engrams the sweep read. */
@@ -158,7 +174,7 @@ export interface EvolveQueue {
   /** This page of the ranked queue. */
   queue: EvolveFinding[];
   /** The prescribed action, once per rule on this page. */
-  actions: { rule: string; instruction: string }[];
+  actions: EvolveAction[];
   /** Any per-domain cap that fired, so a short queue is never mistaken for a
    * finished one. */
   truncations: string[];
@@ -269,14 +285,14 @@ function readFamilyCount(
   return family === null || findings === null ? null : { family, findings };
 }
 
-/** Read one per-rule instruction, or null when either half is missing. */
-function readAction(
-  value: unknown,
-): { rule: string; instruction: string } | null {
+/** Read one per-rule action, or null when either required half is missing. */
+function readAction(value: unknown): EvolveAction | null {
   const record = asObject(value);
   const rule = asString(record?.rule);
   const instruction = asString(record?.instruction);
-  return rule === null || instruction === null ? null : { rule, instruction };
+  return rule === null || instruction === null
+    ? null
+    : { rule, instruction, summary: asString(record?.summary) };
 }
 
 /** Read a sweep payload. */
@@ -296,10 +312,7 @@ export function readEvolveQueue(payload: unknown): EvolveQueue {
       .filter((finding): finding is EvolveFinding => finding !== null),
     actions: asArray(record?.actions)
       .map(readAction)
-      .filter(
-        (action): action is { rule: string; instruction: string } =>
-          action !== null,
-      ),
+      .filter((action): action is EvolveAction => action !== null),
     truncations: asArray(record?.truncations).filter(
       (entry): entry is string => typeof entry === "string",
     ),

@@ -56,7 +56,7 @@ import { useId, useState } from "react";
 import { Link } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { EvolveFinding, EvolveQueue } from "../api/evolve";
+import type { EvolveAction, EvolveFinding, EvolveQueue } from "../api/evolve";
 import {
   EVOLVE_FAMILIES,
   EVOLVE_FAMILY_BLURBS,
@@ -138,8 +138,11 @@ export default function Maintenance() {
   const domains = [...new Set(findings.map((finding) => finding.domain))].sort(
     (left, right) => left.localeCompare(right),
   );
-  const instructions = new Map(
-    (queue?.actions ?? []).map((action) => [action.rule, action.instruction]),
+  // Keyed by rule and carried whole: a row wants the paragraph and the words
+  // that head it, and splitting them into two lookups here would only put them
+  // back together one component down.
+  const actions = new Map(
+    (queue?.actions ?? []).map((action) => [action.rule, action]),
   );
   const guidance = queue?.guidance ?? null;
 
@@ -237,7 +240,7 @@ export default function Maintenance() {
         <FamilySection
           key={group.key}
           group={group}
-          instructions={instructions}
+          actions={actions}
           canWrite={capabilities.canWrite}
           onChanged={resweep}
         />
@@ -385,12 +388,12 @@ function Acknowledged({
 /** One family, its findings under it. */
 function FamilySection({
   group,
-  instructions,
+  actions,
   canWrite,
   onChanged,
 }: {
   group: FindingGroup;
-  instructions: Map<string, string>;
+  actions: Map<string, EvolveAction>;
   canWrite: boolean;
   onChanged: () => Promise<void>;
 }) {
@@ -409,15 +412,19 @@ function FamilySection({
         </p>
       </div>
       <ul className="flex flex-col gap-2">
-        {group.findings.map((finding) => (
-          <FindingRow
-            key={`${finding.domain}/${finding.permalink}/${finding.rule}/${String(finding.n)}`}
-            finding={finding}
-            instruction={instructions.get(finding.rule) ?? null}
-            canWrite={canWrite}
-            onChanged={onChanged}
-          />
-        ))}
+        {group.findings.map((finding) => {
+          const action = actions.get(finding.rule) ?? null;
+          return (
+            <FindingRow
+              key={`${finding.domain}/${finding.permalink}/${finding.rule}/${String(finding.n)}`}
+              finding={finding}
+              instruction={action?.instruction ?? null}
+              summary={action?.summary ?? null}
+              canWrite={canWrite}
+              onChanged={onChanged}
+            />
+          );
+        })}
       </ul>
     </section>
   );
@@ -450,11 +457,14 @@ type Asking = "ack" | "delete";
 function FindingRow({
   finding,
   instruction,
+  summary,
   canWrite,
   onChanged,
 }: {
   finding: EvolveFinding;
   instruction: string | null;
+  /** The catalog's four-word name for the rule, heading the instruction. */
+  summary: string | null;
   canWrite: boolean;
   onChanged: () => Promise<void>;
 }) {
@@ -627,12 +637,20 @@ function FindingRow({
         )}
       </div>
       {open && instruction !== null && (
-        <p
+        <div
           id={panelId}
           className="mt-1 rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300"
         >
-          {instruction}
-        </p>
+          {/* The catalog's own name for the rule, above its paragraph: the
+              row says what fired here, and this says what the rule is, so
+              whoever opened a panel three screens down still knows which
+              instruction they are reading. A sweep that sent no summary gets
+              no heading rather than a blank one. */}
+          {summary !== null && (
+            <strong className="mb-0.5 block font-medium">{summary}</strong>
+          )}
+          <p>{instruction}</p>
+        </div>
       )}
       {asking === "ack" && (
         <div className="mt-2 flex flex-wrap items-end gap-2">

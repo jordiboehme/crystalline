@@ -233,8 +233,63 @@ describe("the admin client layer", () => {
       conflicts: 0,
       behind: false,
       probeError: null,
+      // Neither key was sent, and neither is invented: a report with no mode
+      // and no connection block says nothing about either rather than
+      // guessing "github" and "connected".
+      mode: null,
+      connected: null,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("reads the mode and the connection the sync report carries", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      mode: "github",
+      repo: "acme/kb",
+      branch: "main",
+      local_changes: 0,
+      open_proposals: [],
+      behind: false,
+      connection: { connected: true, user: "octo", token_store: "keychain" },
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.mode).toBe("github");
+    expect(status.connected).toBe(true);
+  });
+
+  it("reads an instance with no credential on file as not connected", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      mode: "github",
+      repo: "acme/kb",
+      local_changes: 0,
+      open_proposals: [],
+      // The route reports a missing connection rather than refusing over it,
+      // so `false` is an answer the card has to be able to say out loud.
+      connection: { connected: false },
+      probe_error: "no GitHub connection on this instance",
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.connected).toBe(false);
+  });
+
+  it("reads a connection block of nonsense as no answer rather than as false", async () => {
+    // Absent, or present and unreadable, both mean "this report does not say".
+    // Only a literal boolean is an answer, because the card acts on `false`.
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      connection: "nonsense",
+    });
+    expect((await fetchSyncStatus("eng")).connected).toBeNull();
+
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      connection: { connected: "yes" },
+    });
+    expect((await fetchSyncStatus("eng")).connected).toBeNull();
   });
 
   it("counts the declined proposals and the conflicts as well", async () => {
