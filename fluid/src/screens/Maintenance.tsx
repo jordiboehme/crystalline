@@ -636,9 +636,17 @@ function FindingRow({
           </button>
         )}
       </div>
-      {open && instruction !== null && (
+      {instruction !== null && (
+        /*
+          Drawn whenever the button above names it, folded away with `hidden`
+          rather than taken out of the document. A control's `aria-controls`
+          has to point at something that is there: an id that only exists once
+          the panel is open is a dangling reference for exactly as long as the
+          panel is closed, which is the state a reader meets it in.
+        */
         <div
           id={panelId}
+          hidden={!open}
           className="mt-1 rounded bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:bg-slate-900 dark:text-slate-300"
         >
           {/* The catalog's own name for the rule, above its paragraph: the

@@ -376,9 +376,11 @@ describe("the maintenance screen", () => {
       name: /how to work this/i,
     });
     expect(disclose).toHaveAttribute("aria-expanded", "false");
+    // Drawn and hidden rather than absent: the button names this element at
+    // all times, so the element is there at all times.
     expect(
-      within(temporal).queryByText("Complete the retirement in both halves."),
-    ).toBeNull();
+      within(temporal).getByText("Complete the retirement in both halves."),
+    ).not.toBeVisible();
 
     await userEvent.click(disclose);
 
@@ -417,12 +419,14 @@ describe("the maintenance screen", () => {
     const disclose = within(temporal).getByRole("button", {
       name: /how to work this/i,
     });
-    // Folded away, the heading is as absent as the paragraph under it. The
-    // catalog says the rule in the same words the row's finding line does, so
-    // what is counted here is the row's one copy of it, not zero.
-    expect(
-      within(temporal).getAllByText("supersedes target still current"),
-    ).toHaveLength(1);
+    // Folded away, the heading is as unreadable as the paragraph under it.
+    // The catalog says the rule in the same words the row's finding line does,
+    // so the one copy a reader can see is the row's own.
+    const [onTheRow, inThePanel] = within(temporal).getAllByText(
+      "supersedes target still current",
+    );
+    expect(onTheRow).toBeVisible();
+    expect(inThePanel).not.toBeVisible();
 
     await userEvent.click(disclose);
 
@@ -625,6 +629,34 @@ describe("working the queue from the keyboard", () => {
     expect(panelOf(disclose)).toContainElement(
       within(temporal).getByText("Complete the retirement in both halves."),
     );
+  });
+
+  it("keeps the panel in the document while it is folded away", async () => {
+    // An `aria-controls` that names nothing is a broken reference rather than
+    // a closed one: a reader who follows it lands nowhere, and some clients
+    // read the dangling id as a control that does not work at all. So the
+    // panel is drawn whenever the button names it and the `hidden` attribute
+    // is what folds it away.
+    await open();
+
+    const temporal = await section(/^Temporal/);
+    const disclose = within(temporal).getByRole("button", {
+      name: /how to work this/i,
+    });
+
+    expect(panelOf(disclose)).toHaveAttribute("hidden");
+    expect(panelOf(disclose)).not.toBeVisible();
+
+    await userEvent.click(disclose);
+
+    expect(panelOf(disclose)).not.toHaveAttribute("hidden");
+    expect(panelOf(disclose)).toBeVisible();
+
+    await userEvent.click(disclose);
+
+    // Closing folds it back rather than taking it out of the document again.
+    expect(panelOf(disclose)).toHaveAttribute("hidden");
+    expect(disclose).toHaveAttribute("aria-expanded", "false");
   });
 
   it("keeps Refresh under the keyboard while the sweep it asked for runs", async () => {
