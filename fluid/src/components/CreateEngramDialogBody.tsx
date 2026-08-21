@@ -20,12 +20,7 @@ import { useNavigate } from "react-router";
 import { problemDetail } from "../api/client";
 import { domainTreeKey, treeQuery } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
-import {
-  fetchTags,
-  fetchVocabulary,
-  fullVocabularyKey,
-  vocabularyKey,
-} from "../api/vocabulary";
+import { fetchVocabulary, fullVocabularyKey } from "../api/vocabulary";
 import { createEngram } from "../api/writes";
 import { editRoute } from "../paths";
 import {
@@ -58,19 +53,18 @@ export default function CreateEngramDialogBody({
   const [tags, setTags] = useState("");
   const [problem, setProblem] = useState<string | null>(null);
 
-  // The domain's tag vocabulary, under the same key DomainHome caches it: an
-  // author who arrived from the domain page pays nothing on the wire.
-  const knownTags = useQuery({
-    queryKey: vocabularyKey(domain),
-    queryFn: () => fetchTags(domain),
-  });
-
-  // The `type` and `status` words this domain already writes, under the key
-  // the editor caches the same payload at. A key of its own rather than the
-  // tag one above, because the two parse the same route into different
-  // shapes - see `fullVocabularyKey`. An unread or failed query is simply no
-  // house words: the recommended sets stand on their own and the form works
-  // exactly as it did before, so there is nothing here to wait for.
+  // Everything this domain is written in, in one read: the tags the tag field
+  // suggests and the `type` and `status` words the two suggesting inputs put
+  // beside the recommended sets. One query rather than one per field, under
+  // the key the editor caches the same payload at, so an author who arrived
+  // from the editor pays nothing on the wire. `fullVocabularyKey` rather than
+  // `vocabularyKey`: DomainHome caches a tags-only parse of the same route
+  // under the latter, and two shapes at one key would mean whichever query
+  // resolved second overwrote the other with data it cannot parse.
+  //
+  // An unread or failed query is simply no suggestions: the recommended sets
+  // stand on their own and the tag field was always free text, so there is
+  // nothing here to wait for.
   const house = useQuery({
     queryKey: fullVocabularyKey(domain),
     queryFn: () => fetchVocabulary(domain),
@@ -197,7 +191,7 @@ export default function CreateEngramDialogBody({
                 placeholder="rust, editing"
               />
               <datalist id="create-tags">
-                {(knownTags.data ?? []).map((tag) => (
+                {(house.data?.tags ?? []).map((tag) => (
                   <option key={tag.name} value={tag.name} />
                 ))}
               </datalist>

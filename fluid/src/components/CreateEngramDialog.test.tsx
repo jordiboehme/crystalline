@@ -49,6 +49,20 @@ function trees(): string[] {
     .filter((path) => path.startsWith("/domains/eng/tree"));
 }
 
+/** Every read of the vocabulary route, in order. */
+function vocabularyReads(): string[] {
+  return apiMock.mock.calls
+    .map(([path]) => path)
+    .filter((path) => path.startsWith("/vocabulary"));
+}
+
+/** The tag names the dialog offers, in the order it offers them. */
+function suggestedTags(): string[] {
+  return [...(document.getElementById("create-tags")?.children ?? [])].map(
+    (option) => option.getAttribute("value") ?? "",
+  );
+}
+
 describe("the create flow", () => {
   it("creates in the picked folder and lands in the editor", async () => {
     const created = vi.fn(() => ({
@@ -332,6 +346,61 @@ describe("the create flow", () => {
     expect(form.getByRole("option", { name: /^brewing/ })).toHaveTextContent(
       "5",
     );
+  });
+
+  it("reads the vocabulary once for the whole dialog", async () => {
+    // Opened from the engram screen, which reads no vocabulary of its own, so
+    // every call counted here is one this dialog made. Tags and the house
+    // type/status words are one payload on the wire, not two reads of the
+    // same route parsed into different shapes.
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams/notes/beta": () => ({
+          domain: "eng",
+          permalink: "notes/beta",
+          title: "Beta",
+          content: "---\ntitle: Beta\n---\n\n",
+          checksum: "b1",
+          frontmatter: {},
+          observations: [],
+          relations: [],
+          links: [],
+        }),
+        "/graph": () => ({ nodes: [], edges: [], truncated: false, hidden: 0 }),
+        "/validate": () => ({ findings: [], errors: 0 }),
+        "/vocabulary": () => ({
+          tags: [
+            { name: "rust", engrams: 3 },
+            { name: "editing", engrams: 9 },
+          ],
+          categories: [],
+          relation_types: [],
+          types: [{ name: "playbook", count: 7 }],
+          statuses: [],
+        }),
+      }),
+    );
+    renderApp("/d/eng/e/notes/beta");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New engram" }),
+    );
+    await screen.findByRole("dialog", { name: /new engram/i });
+
+    // Commonest first, exactly as the tag input has always ordered them.
+    await waitFor(() => {
+      expect(suggestedTags()).toEqual(["editing", "rust"]);
+    });
+    // The same payload backs the house words beside the recommended ones.
+    const form = within(screen.getByRole("dialog"));
+    await userEvent.click(form.getByLabelText("Type"));
+    expect(
+      await form.findByRole("option", { name: /^playbook/ }),
+    ).toHaveTextContent("7");
+
+    expect(vocabularyReads()).toHaveLength(1);
   });
 
   it("omits the tags key entirely when the field is left empty", async () => {
