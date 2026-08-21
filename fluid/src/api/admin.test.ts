@@ -319,11 +319,37 @@ describe("the admin client layer", () => {
           ],
         },
       ],
+      newEntries: 0,
+      collides: 0,
       written: 0,
       skipped: 0,
       invalid: 1,
       ignored: 0,
     });
+  });
+
+  it("carries the preview's own counters, and reads an absent one as none", async () => {
+    const data = new ArrayBuffer(4);
+    apiMock.mockResolvedValueOnce({
+      ...PREVIEW_REPORT,
+      new: 3,
+      collides: 2,
+    });
+    const counted = await previewArchive("eng", data);
+    // The wire key and the field a screen reads are spelled differently on
+    // purpose, so the rename is part of what this pins.
+    expect(counted.newEntries).toBe(3);
+    expect(counted.collides).toBe(2);
+
+    // An import's report tallies nothing under either key. Reading that as
+    // none rather than as undefined is what keeps a counter line a number.
+    const withoutCounters: Record<string, unknown> = { ...PREVIEW_REPORT };
+    delete withoutCounters.new;
+    delete withoutCounters.collides;
+    apiMock.mockResolvedValueOnce(withoutCounters);
+    const bare = await previewArchive("eng", data);
+    expect(bare.newEntries).toBe(0);
+    expect(bare.collides).toBe(0);
   });
 
   it("names the policy on the import only when it is not the default", async () => {

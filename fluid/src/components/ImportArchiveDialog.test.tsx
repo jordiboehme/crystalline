@@ -261,6 +261,11 @@ describe("importing an archive", () => {
       within(rowFor(table, "README.txt")).getByText("ignored"),
     ).toBeVisible();
 
+    // And what the rows add up to, so the size of the decision is readable
+    // without counting rows: this is a dry run, so it counts what would be
+    // created and what is already taken.
+    expect(within(dialog).getByText("1 new, 1 collide.")).toBeVisible();
+
     // The dry run went out as the bytes that were picked, announced as a zip.
     const sent = callTo("/domains/eng/archive/preview");
     expect(sent.method).toBe("POST");
@@ -307,6 +312,9 @@ describe("importing an archive", () => {
         /2 written, 0 skipped, 1 invalid, 1 ignored/,
       ),
     ).toBeVisible();
+    // The preview's counters go with the preview: what would have happened is
+    // not left standing beside what did.
+    expect(within(dialog).queryByText(/collide\./)).toBeNull();
     expect(
       requested().includes("/domains/eng/archive/import?policy=overwrite"),
     ).toBe(true);

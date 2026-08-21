@@ -305,6 +305,13 @@ export interface ArchiveEntry {
 /** The per-entry report of a preview or an import, with its counters. */
 export interface ArchiveReport {
   entries: ArchiveEntry[];
+  /**
+   * Preview only: entries that would be created. Renamed off the wire's `new`,
+   * which reads as the operator rather than as a count at every use site.
+   */
+  newEntries: number;
+  /** Preview only: entries whose path or permalink is already taken. */
+  collides: number;
   written: number;
   skipped: number;
   invalid: number;
@@ -337,6 +344,12 @@ function readArchiveReport(report: ArchiveReportWire): ArchiveReport {
         line: finding.line ?? null,
       })),
     })),
+    // A preview tallies these two and an import tallies the four below, so
+    // each pair arrives at zero in the other's report. Read tolerantly all the
+    // same: a counter a report does not carry is none of them, not a hole a
+    // counter line would print as `undefined`.
+    newEntries: asCount(report.new),
+    collides: asCount(report.collides),
     written: report.written,
     skipped: report.skipped,
     invalid: report.invalid,
