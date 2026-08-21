@@ -260,7 +260,7 @@ mkdir -p ./crystalline-data
 sudo chown 65532:65532 ./crystalline-data
 ```
 
-The same applies to the bind-mounted knowledge folder whenever the daemon writes into it (an agent's `write_engram`, or the generated `index.md` files), which includes the case where `docker run` creates a missing bind-mount source itself: Docker creates it root-owned. A knowledge folder mounted read-only, as in `compose.git-sync.yaml`, needs nothing.
+The same applies to the bind-mounted knowledge folder whenever the daemon writes into it (an agent's `write_engram`, or the generated `index.md` files), which includes the case where `docker run` creates a missing bind-mount source itself: Docker creates it root-owned. A named volume put in that folder's place is no different, because the ownership Docker copies into a fresh volume is the mount point's in the image and the image ships no `/knowledge`: it comes up root-owned exactly like a bind-mount source Docker created, so give it to the daemon's uid once - `docker run --rm -v crystalline-knowledge:/knowledge alpine chown -R 65532:65532 /knowledge`, from an image that has a shell, since Crystalline's is distroless - before `domain init` writes anything into it. A knowledge folder mounted read-only, as in `compose.git-sync.yaml`, needs nothing.
 
 The `with-model` variant sets `CRYSTALLINE_MODELS_DIR` (also settable directly, on any install, to relocate the model cache anywhere else) to a path outside `/data` so the baked model is never shadowed by the `/data` volume mount. The bundled model is [BAAI/bge-small-en-v1.5](https://huggingface.co/BAAI/bge-small-en-v1.5), MIT licensed.
 

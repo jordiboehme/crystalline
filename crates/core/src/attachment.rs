@@ -287,6 +287,11 @@ fn hex_nibble(byte: Option<&u8>) -> Option<u8> {
 /// the same catch-and-keep fallback Fluid's `decodeTarget` uses, so the two
 /// scanners read one spelling.
 fn percent_decode_target(target: &str) -> String {
+    // The common case by far: nothing to decode, so the target allocates once
+    // as a whole instead of being pushed back together byte by byte.
+    if !target.contains('%') {
+        return target.to_string();
+    }
     let bytes = target.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;

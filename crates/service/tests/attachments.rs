@@ -1325,6 +1325,12 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
     let msg = err.to_string();
     assert!(msg.contains("unreadable"), "got: {msg}");
     assert!(msg.contains("resync"), "got: {msg}");
+    // The file that could not be read, named outright: an operator reading the
+    // refusal should not have to reconstruct the path from the domain root.
+    assert!(
+        msg.contains(&from.join("note.md").display().to_string()),
+        "got: {msg}"
+    );
 
     assert!(
         !into.join("note.md").exists(),

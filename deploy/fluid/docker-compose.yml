@@ -32,8 +32,12 @@
 # and stays plain markdown. The path is relative to this compose file wherever
 # it is run from, so create that folder before `up`: Docker creates a missing
 # bind-mount source itself, as an empty directory owned by root, which the
-# container's non-root user cannot then write to. Register a domain the same
-# way the single-container example does:
+# container's non-root user cannot then write to. A named volume mounted at
+# /knowledge instead comes up root-owned for the same reason - the image ships
+# no /knowledge whose ownership Docker could copy into the fresh volume - so it
+# needs a one-off `chown -R 65532:65532 /knowledge` from an image that has a
+# shell before `domain init`. Register a domain the same way the
+# single-container example does:
 #
 #   docker compose -f deploy/fluid/docker-compose.yml run --rm crystalline domain init /knowledge/team --name team
 #   docker compose -f deploy/fluid/docker-compose.yml run --rm crystalline domain add team /knowledge/team

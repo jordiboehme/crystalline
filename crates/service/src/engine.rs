@@ -2173,15 +2173,9 @@ impl Engine {
                     // points at did not come with it. The trace keeps the store
                     // error, which is an operator's detail; the receipt gets
                     // the same sentence without it.
-                    tracing::warn!(
-                        "attachment '{path}' referenced by '{}' is not in '{}' ({e}); the move carries nothing for it",
-                        src.permalink,
-                        src.domain
-                    );
-                    warnings.push(format!(
-                        "attachment '{path}' referenced by '{}' is not in '{}'; the move carries nothing for it",
-                        src.permalink, src.domain
-                    ));
+                    let warning = attachment_missing_warning(&path, &src.permalink, &src.domain);
+                    tracing::warn!("{warning} ({e})");
+                    warnings.push(warning);
                 }
             }
         }
@@ -2203,9 +2197,7 @@ impl Engine {
                 // being told is that the reference travelling with the engram
                 // now points at whatever the destination happens to hold under
                 // that name.
-                warnings.push(format!(
-                    "attachment '{from}' could not be carried to '{dest_domain}'; its reference at the destination may resolve to a different same-name file"
-                ));
+                warnings.push(attachment_not_carried_warning(&from, dest_domain));
                 continue;
             };
             claimed.insert(to.clone());
@@ -3500,8 +3492,10 @@ impl Engine {
                     let abs = join_rel(root, &src.path);
                     std::fs::read_to_string(&abs).map_err(|e| {
                         EngineError::NotFound(format!(
-                            "the source file for '{}' is unreadable ({e}); resync '{}' and retry the move",
-                            src.permalink, p.domain
+                            "the source file for '{}' at {} is unreadable ({e}); resync '{}' and retry the move",
+                            src.permalink,
+                            abs.display(),
+                            p.domain
                         ))
                     })?
                 }
@@ -10115,6 +10109,26 @@ struct AttachmentCarry {
     /// Whether another engram in the source domain still references or claims
     /// it, so the source copy stays behind.
     shared: bool,
+}
+
+/// The receipt sentence for an attachment the source domain does not hold, so
+/// the move takes nothing along for the reference that names it.
+///
+/// The wire text lives here alone: the trace line the planner also writes
+/// formats this same sentence and adds the store error beside it, which is an
+/// operator's detail rather than something a caller's receipt should carry.
+fn attachment_missing_warning(path: &str, permalink: &str, domain: &str) -> String {
+    format!(
+        "attachment '{path}' referenced by '{permalink}' is not in '{domain}'; the move carries nothing for it"
+    )
+}
+
+/// The receipt sentence for an attachment that stays in the source domain
+/// because no free name for it could be settled at the destination.
+fn attachment_not_carried_warning(path: &str, dest_domain: &str) -> String {
+    format!(
+        "attachment '{path}' could not be carried to '{dest_domain}'; its reference at the destination may resolve to a different same-name file"
+    )
 }
 
 /// The counting's verdict, resolved so that not knowing can only point the
