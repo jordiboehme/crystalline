@@ -175,6 +175,15 @@
 //! [`resolved_overwrite`]) and a third condition beside the gate: a call that
 //! already passed `overwrite` answered the question before it was put.
 //!
+//! **A question is only put about a call that can run.** Both rounds that take
+//! an identifier resolve it before they ask - `delete_engram` through
+//! [`crate::engine::Engine::delete_preview`], the `evolve_ack` round through
+//! [`crate::engine::Engine::ack_preview`] - so a read-only server, a domain
+//! nobody registered and an identifier nobody has each fail in round one, and
+//! the question names what resolution found rather than what was typed. The
+//! collision round needs no such step: the write itself is what discovers the
+//! collision, and the question is built from the failure.
+//!
 //! **An answer is not bound to the arguments it was asked about.** The client
 //! re-sends the original arguments beside the answer and nothing on this side
 //! remembers what was asked, so a buggy client that changes an argument on the
