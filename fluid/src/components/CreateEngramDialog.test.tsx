@@ -13,6 +13,12 @@ import {
   userFixture,
 } from "../test/harness";
 
+// Above roughly load average 33 this file's slower tests exceed the 5000 ms
+// default (a threshold effect measured 2026-08-14, plans history); the raise
+// keeps a loaded machine from reading as a failure. Never raise the global
+// default to hide this.
+vi.setConfig({ testTimeout: 15000 });
+
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
   return { ...actual, api: vi.fn(), setCsrfToken: vi.fn() };
