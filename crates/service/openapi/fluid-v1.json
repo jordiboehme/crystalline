@@ -2993,7 +2993,7 @@
           "domains"
         ],
         "summary": "Where a team domain stands relative to its GitHub origin.",
-        "description": "Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`.",
+        "description": "Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`. An instance with no GitHub connection is reported, not refused: the report comes back from local state with `connection.connected` false.",
         "operationId": "get_domain_sync_status",
         "parameters": [
           {
@@ -3008,7 +3008,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own status report for this one domain, plus the mode it is synced in. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone.",
+            "description": "The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3019,6 +3019,11 @@
                   "behind": false,
                   "branch": "main",
                   "conflicts": [],
+                  "connection": {
+                    "connected": true,
+                    "token_store": "keychain",
+                    "user": "octo"
+                  },
                   "declined_proposals": [],
                   "domain": "eng",
                   "last_checked": "2026-08-10T08:00:00Z",
@@ -3062,7 +3067,7 @@
             }
           },
           "409": {
-            "description": "GitHub is switched off on this instance, or it is on but no account is connected, so no origin can be reached - the detail says which of the two it is and where to fix it. A repository that is simply missing is a different answer, carrying the remote's own not-found error.",
+            "description": "GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on. A missing connection is NOT refused here: the report comes back with `connection.connected` false instead.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3078,7 +3083,7 @@
           "domains"
         ],
         "summary": "Pull a team domain's origin now.",
-        "description": "Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from.",
+        "description": "Admin only. Brings this instance's copy up to date with the domain's GitHub origin immediately, instead of waiting for the daemon's next poll: the same pull the poller runs, under the same per-domain lock. Refused on a read-only instance, and a conflict on a domain that has no origin to pull from or on an instance with no GitHub connection to pull through.",
         "operationId": "sync_domain",
         "parameters": [
           {
