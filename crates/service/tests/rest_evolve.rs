@@ -731,6 +731,40 @@ async fn the_ack_endpoint_holds_the_write_rules() {
     }
 }
 
+/// Both halves of the body wrong at once: the rule screen runs before the
+/// engram is resolved, so an unknown rule answers 422 rather than the 404 the
+/// missing engram would have earned. Pinned because the order is a decision -
+/// the rule is the part the caller can fix without another lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_rule_answers_before_a_missing_engram() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    let editor = login_session(fixture.addr, "ada", "s3cret").await;
+
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &editor,
+        serde_json::json!({ "permalink": "not-a-thing", "rule": "V999" }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        422,
+        "the unknown rule is answered, not the missing engram"
+    );
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let body: serde_json::Value = resp.json().await.unwrap();
+    let detail = body["detail"].as_str().unwrap_or_default();
+    assert!(detail.contains("V999"), "and it names the rule: {detail}");
+}
+
 /// The note arrives straight off the wire, so the HTTP boundary is where a
 /// pasted multi-line justification - or a crafted `\n---\n` - would reach the
 /// frontmatter. It is folded to one line, and the engram it lands in stays

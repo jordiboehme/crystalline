@@ -3316,11 +3316,7 @@ impl Engine {
                 // The draft was completed before the lock (see
                 // `Engine::ack_draft`), because a record's scope is the sweep's
                 // verdict about this engram and no text edit can know it.
-                let draft = ack.ok_or_else(|| {
-                    EngineError::Invalid(format!(
-                        "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
-                    ))
-                })?;
+                let draft = ack.ok_or_else(|| EngineError::Invalid(ack_value_message()))?;
                 let entry = match draft {
                     AckDraft::Record(entry) => entry,
                     // A removal reads the entries the file holds right now,
@@ -3332,7 +3328,11 @@ impl Engine {
                                 "no acknowledgment for {rule} on '{permalink}'; nothing to remove"
                             )));
                         }
-                        return Ok(without_ack(source, rule));
+                        return guarded_ack_write(
+                            without_ack(source, rule),
+                            "removal",
+                            &p.identifier,
+                        );
                     }
                 };
                 // An engram whose frontmatter no longer parses would have its
@@ -3344,18 +3344,13 @@ impl Engine {
                         "cannot acknowledge a finding on an engram that does not parse ({e}); repair the frontmatter first"
                     ))
                 })?;
-                let out = set_evolve_ack(source, &merged_acks(source, entry.clone()));
                 // Defense in depth: whatever the note carried, the bytes about
-                // to be persisted have to be readable. Refusing here is the last
-                // stop before a write that would make the engram invisible to
-                // the sweep, to read_engram and to search.
-                parse_engram(&out).map_err(|e| {
-                    EngineError::Invalid(format!(
-                        "the acknowledgment would leave '{}' unparseable ({e}); nothing was written",
-                        p.identifier
-                    ))
-                })?;
-                Ok(out)
+                // to be persisted have to be readable.
+                guarded_ack_write(
+                    set_evolve_ack(source, &merged_acks(source, entry.clone())),
+                    "acknowledgment",
+                    &p.identifier,
+                )
             }
             other => Err(EngineError::Invalid(format!(
                 "set_frontmatter cannot set '{other}'; the settable keys are {}",
@@ -5432,6 +5427,33 @@ impl Engine {
         parse_ack_value(raw).map(Some)
     }
 
+    /// What an `evolve_ack` confirmation round names: `{domain, permalink}` for
+    /// the engram the assignment would land on.
+    ///
+    /// Shaped after [`Engine::delete_preview`] and there for the same reason: a
+    /// question is only worth putting to a user about a call that can run.
+    /// Read-only is checked first and the identifier is resolved next, so a
+    /// server that never writes, a domain nobody registered and an identifier
+    /// nobody has each fail in round one - rather than collecting a yes and
+    /// reporting the miss in round two, against a name the user already
+    /// approved.
+    ///
+    /// It resolves and nothing else. The `expected_checksum` comparison and the
+    /// "is that acknowledgment even there" test both read what the file holds,
+    /// the file can change between the rounds, and both already run in the
+    /// round that writes; repeating them here would buy a guarantee that does
+    /// not survive the gap.
+    pub async fn ack_preview(&self, p: &EditParams) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let (desc, _) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        Ok(json!({
+            "domain": desc.domain,
+            "permalink": desc.permalink,
+        }))
+    }
+
     /// The acknowledgment an `evolve_ack` assignment is asking for, completed
     /// with the scope only the sweep can supply, or `None` when this edit is
     /// not one.
@@ -5510,6 +5532,14 @@ impl Engine {
     /// into one value: the screen is what keeps a rule field that happens to
     /// read `remove` an unknown-rule refusal rather than a value the parser
     /// would take for a removal.
+    ///
+    /// **The screen runs before resolution by design, so an unknown rule
+    /// answers before a missing engram does**: a request that gets both halves
+    /// wrong is refused for the rule (a 422 on the REST surface) rather than
+    /// for the permalink (a 404). The rule is the half the caller can fix
+    /// without another lookup - the catalog is right there in the message - and
+    /// an acknowledgment of a rule nobody has could not be recorded even on an
+    /// engram that does exist.
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
@@ -10110,9 +10140,7 @@ enum AckDraft {
 fn parse_ack_value(raw: &str) -> Result<AckIntent> {
     let raw = raw.trim();
     if raw.is_empty() {
-        return Err(EngineError::Invalid(format!(
-            "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note, for example 'V101 lineage citation, keep'"
-        )));
+        return Err(EngineError::Invalid(ack_value_message()));
     }
     let (head, rest) = match raw.split_once(char::is_whitespace) {
         Some((head, rest)) => (head, rest.trim()),
@@ -10149,6 +10177,39 @@ fn parse_ack_value(raw: &str) -> Result<AckIntent> {
 
 /// The first token that makes an `evolve_ack` value a removal.
 const REMOVE_VERB: &str = "remove";
+
+/// The last stop before an `evolve_ack` rewrite is persisted: the bytes have to
+/// parse, or nothing is written and the caller hears why.
+///
+/// Both halves of the key run through it, because neither edits lines in place:
+/// a record and a removal each re-render the whole value from the entries that
+/// survive ([`set_evolve_ack`]), so what lands is emitter output rather than the
+/// file minus a line. A write that persisted unparseable bytes would make the
+/// engram invisible to the sweep, to `read_engram` and to search - the one
+/// failure this path must never cause while claiming to tidy knowledge up.
+/// `act` names which half refused, so a caller reads what did not happen rather
+/// than a generic parse complaint.
+fn guarded_ack_write(out: String, act: &str, identifier: &str) -> Result<String> {
+    parse_engram(&out).map_err(|e| {
+        EngineError::Invalid(format!(
+            "the {act} would leave '{identifier}' unparseable ({e}); nothing was written"
+        ))
+    })?;
+    Ok(out)
+}
+
+/// What a caller hears when an `evolve_ack` assignment carries no value at all.
+///
+/// It names **both** forms rather than only the record, because this is the
+/// message an agent that guessed at the key reads, and the take-back has no
+/// other discovery path: nothing in a value it typed wrong hints that `remove
+/// <rule-id>` exists. An error text is a teaching surface here, so the cost of
+/// the second clause is a line and the benefit is the other half of the verb.
+fn ack_value_message() -> String {
+    format!(
+        "{EVOLVE_ACK_KEY} takes a rule id optionally followed by a note ('V101 lineage citation, keep'), or 'remove <rule-id>' to take an acknowledgment back"
+    )
+}
 
 /// What a caller hears when the removal form is malformed: the form itself,
 /// then the fix.

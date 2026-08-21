@@ -1176,11 +1176,17 @@ async fn an_eliciting_peer_can_still_delete_an_over_cap_attachment() {
 
 /// One `edit_engram` call assigning `value` to `evolve_ack` on `acked`.
 fn ack_call(value: &str, responses: Option<Value>) -> Value {
+    ack_call_on("acked", value, responses)
+}
+
+/// The same call aimed at `identifier`, for the tests that care what round one
+/// resolves before it asks.
+fn ack_call_on(identifier: &str, value: &str, responses: Option<Value>) -> Value {
     let mut params = json!({
         "name": "edit_engram",
         "arguments": {
             "domain": "eng",
-            "identifier": "acked",
+            "identifier": identifier,
             "operation": "set_frontmatter",
             "key": "evolve_ack",
             "value": value,
@@ -1227,6 +1233,11 @@ async fn acked_engram(h: &Harness) -> (Wire, std::path::PathBuf) {
 }
 
 /// Round one of a record: the peer is asked, and nothing is written yet.
+///
+/// The call names the engram by its title, so the question can only carry the
+/// permalink if round one resolved the engram before asking - which is the
+/// point: a user confirms the engram the write would land on, not the string
+/// the model typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_eliciting_ack_gets_a_confirmation_question() {
     let h = Harness::new().await;
@@ -1236,7 +1247,7 @@ async fn an_eliciting_ack_gets_a_confirmation_question() {
         .call(eliciting(
             2,
             "tools/call",
-            ack_call("V101 lineage citation, keep", None),
+            ack_call_on("Acked", "V101 lineage citation, keep", None),
         ))
         .await;
     let result = &asked["result"];
@@ -1254,8 +1265,8 @@ async fn an_eliciting_ack_gets_a_confirmation_question() {
         "the question names the rule: {message}"
     );
     assert!(
-        message.contains("acked") && message.contains("eng"),
-        "and the engram it lands on: {message}"
+        message.contains("'acked'") && message.contains("'eng'"),
+        "and the engram it lands on, by resolved permalink: {message}"
     );
     assert!(
         message.contains("lineage citation, keep"),
@@ -1266,6 +1277,64 @@ async fn an_eliciting_ack_gets_a_confirmation_question() {
     assert!(
         !on_disk.contains("evolve_ack"),
         "round one records nothing: {on_disk}"
+    );
+}
+
+/// Round one resolves before it asks: a call naming an engram nobody has fails
+/// in round one rather than putting a question about it to the user.
+///
+/// The seam this closes is a user confirming an acknowledgment against a
+/// mistyped identifier and only round two reporting that there was nothing
+/// there - a yes given to a question that was never answerable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_ack_round_one_resolves_before_asking() {
+    let h = Harness::new().await;
+    let (mut wire, _path) = acked_engram(&h).await;
+
+    let answered = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            ack_call_on("no-such-engram", "V101 lineage citation, keep", None),
+        ))
+        .await;
+    assert_ne!(
+        answered["result"]["resultType"],
+        json!("input_required"),
+        "an unresolvable identifier is never put to a user: {answered}"
+    );
+    assert!(
+        !answered["error"].is_null(),
+        "it errors in round one instead: {answered}"
+    );
+    let message = answered["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("no-such-engram"),
+        "and the error names what could not be found: {message}"
+    );
+}
+
+/// The same for a take-back, which resolves on the same path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_unack_round_one_resolves_before_asking() {
+    let h = Harness::new().await;
+    let (mut wire, _path) = acked_engram(&h).await;
+
+    let answered = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            ack_call_on("no-such-engram", "remove V101", None),
+        ))
+        .await;
+    assert_ne!(
+        answered["result"]["resultType"],
+        json!("input_required"),
+        "an unresolvable identifier is never put to a user: {answered}"
+    );
+    assert!(
+        !answered["error"].is_null(),
+        "it errors in round one instead: {answered}"
     );
 }
 

@@ -1562,6 +1562,28 @@ async fn a_removal_value_takes_exactly_one_rule_id() {
     assert!(rows_on(&audited, "live-doc").is_empty(), "{audited}");
 }
 
+/// An `evolve_ack` assignment with no value is where an agent learns the key's
+/// two forms, so the refusal names both: the record form it probably meant, and
+/// the take-back form it has no other way to discover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_empty_ack_value_names_both_forms() {
+    let (_tmp, engine) = fixture().await;
+
+    let empty = ack_edit(&engine, "live-doc", "   ").await.unwrap_err();
+    assert!(
+        empty.contains("V101 lineage citation, keep"),
+        "the record form is shown: {empty}"
+    );
+    assert!(
+        empty.contains("remove <rule-id>"),
+        "and so is the take-back: {empty}"
+    );
+    assert!(
+        empty.contains("take an acknowledgment back"),
+        "in words that say what it does: {empty}"
+    );
+}
+
 /// `remove` is only the removal verb as the whole first token: a note that
 /// happens to start with the word still records, because the rule id comes
 /// first in the record form.

@@ -1034,12 +1034,17 @@ impl McpServer {
         // parse failure is swallowed rather than reported here on purpose: the
         // engine is the one place that words it, and asking a user about an
         // edit that cannot run is worse than letting it fail where it always
-        // failed.
+        // failed. Round one resolves before it asks, exactly as the delete's
+        // preview does, so the same rule holds for the identifier as for the
+        // value: what cannot run is never put to a user.
         if confirmation_supported(&ctx)
             && let Ok(Some(intent)) = Engine::ack_intent(&p)
         {
             match confirmed(&responses.0) {
-                None => return Ok(confirm_question(ack_question(&p, &intent)).into()),
+                None => {
+                    let preview = self.engine.ack_preview(&p).await.map_err(to_error)?;
+                    return Ok(confirm_question(ack_question(&preview, &intent)).into());
+                }
                 Some(false) => return refuse(ack_refusal(&intent)).map(CallToolResponse::from),
                 Some(true) => {}
             }
@@ -2514,16 +2519,19 @@ fn collision_question_text(p: &WriteParams, permalink: &str) -> String {
 /// one argument that would have replaced it.
 const COLLISION_REFUSAL: &str = "The overwrite was not confirmed, so the existing engram was left in place; nothing was written. Call write_engram again with overwrite=true if the user asks for it.";
 
-/// The sentence an `evolve_ack` assignment asks before it acts.
+/// The sentence an `evolve_ack` assignment asks before it acts, rendered from
+/// [`crate::engine::Engine::ack_preview`].
 ///
 /// Both halves name the consequence rather than the write, because that is
 /// what the user is deciding: a record keeps a finding out of every future
 /// sweep, a removal puts it back into the next one. The engram is named by the
-/// identifier the call carried, which is what the user would recognize, and
-/// resolving it to a permalink would cost a lookup to say the same thing.
-fn ack_question(p: &EditParams, intent: &AckIntent) -> String {
-    let identifier = p.identifier.trim();
-    let domain = p.domain.trim();
+/// permalink the identifier resolved to rather than by the identifier itself,
+/// so a yes is given to the engram the write lands on - a title, a bare
+/// permalink and a `crystalline://` URL all reach the same question, and an
+/// identifier that reaches nothing never becomes one.
+fn ack_question(preview: &Value, intent: &AckIntent) -> String {
+    let permalink = preview["permalink"].as_str().unwrap_or_default();
+    let domain = preview["domain"].as_str().unwrap_or_default();
     match intent {
         AckIntent::Record { rule, note } => {
             let note = note
@@ -2531,11 +2539,11 @@ fn ack_question(p: &EditParams, intent: &AckIntent) -> String {
                 .map(|note| format!(" The note reads: '{note}'."))
                 .unwrap_or_default();
             format!(
-                "Acknowledge {rule} on '{identifier}' in '{domain}'? This records the finding as intentional until its evidence changes.{note}"
+                "Acknowledge {rule} on '{permalink}' in '{domain}'? This records the finding as intentional until its evidence changes.{note}"
             )
         }
         AckIntent::Remove { rule } => format!(
-            "Remove the {rule} acknowledgment on '{identifier}' in '{domain}'? The finding resurfaces on the next sweep."
+            "Remove the {rule} acknowledgment on '{permalink}' in '{domain}'? The finding resurfaces on the next sweep."
         ),
     }
 }
