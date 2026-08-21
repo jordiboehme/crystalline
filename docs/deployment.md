@@ -251,6 +251,8 @@ What persists where:
 
 Local domains created from Fluid land under the server's domains root, which defaults to `~/Documents/Crystalline` in the daemon's home; in a container set `CRYSTALLINE_DOMAINS_ROOT` to a persistent path (a bind mount, or a folder under the `/data` volume such as `/data/domains`) so UI-created domains survive the container.
 
+The maintenance pending state lives in the daemon's state directory, so a containerized daemon paired with a host-side Stop hook never arms the pending ask: the two processes see different state directories, and the domains one records a human writing to are not the ones the other reads before it nudges. The hook still asks on its weekly arm, from its own clock on the host.
+
 The image runs as the non-root user `65532:65532` and ships `/data` owned by it, so an empty named volume mounted there is writable from the first start: Docker copies the image directory's ownership into the volume when it initializes it. A bind mount never inherits that - the host directory keeps its own ownership - so a host folder mounted at `/data` instead of a named volume has to be made writable by that uid first, or the daemon cannot create its state directory and the container restarts in a loop:
 
 ```sh
