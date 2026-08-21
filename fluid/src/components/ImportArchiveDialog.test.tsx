@@ -301,6 +301,29 @@ describe("importing an archive", () => {
     expect(within(dialog).getByText("0 new, 3 collide.")).toBeVisible();
   });
 
+  it("counts no collision at all in the plural too", async () => {
+    // The happy archive, and the case a singular/plural switch written around
+    // "is it one" gets wrong in the other direction: zero takes the plural
+    // verb, so a clean import reads "0 collide" rather than "0 collides".
+    serve({
+      "/domains/eng/archive/preview": () => ({
+        ...previewReport(),
+        new: 2,
+        collides: 0,
+      }),
+    });
+
+    const dialog = await openWithFile();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Preview" }),
+    );
+    await within(dialog).findByRole("table", {
+      name: /what an import would do/i,
+    });
+
+    expect(within(dialog).getByText("2 new, 0 collide.")).toBeVisible();
+  });
+
   it("imports with the chosen policy and refreshes what it changed", async () => {
     serve({
       "/domains/eng/archive/preview": () => previewReport(),

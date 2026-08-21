@@ -717,6 +717,47 @@ describe("the team sync card", () => {
     expect(within(card).getByText("1 conflict to settle")).toBeVisible();
   });
 
+  it("names the declined proposals without inventing a conflict row", async () => {
+    // The two exceptional counts are two independent rows, and the test above
+    // shows them together, which cannot tell a pair of rows apart from one row
+    // that recites both counts. Each half on its own is what pins that: no
+    // connection block in the fixture, so the not-connected hint is not on the
+    // card either and the row assertions are about the counts alone.
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({ declined_proposals: 2, conflicts: 0 }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("2 declined proposals")).toBeVisible();
+    expect(within(card).queryByText(/to settle/)).toBeNull();
+  });
+
+  it("names the conflicts without inventing a declined row", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({ declined_proposals: 0, conflicts: 2 }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await within(await screenBody()).findByRole("region", {
+      name: "Team sync",
+    });
+
+    expect(within(card).getByText("2 conflicts to settle")).toBeVisible();
+    expect(within(card).queryByText(/declined proposal/)).toBeNull();
+  });
+
   it("counts the proposals the real endpoint actually sends", async () => {
     // The wire spelling: `origin_status`'s report embeds the open proposals
     // themselves rather than a count, so the card has to read a list here and

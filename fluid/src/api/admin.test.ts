@@ -301,9 +301,21 @@ describe("the admin client layer", () => {
       local_changes: 0,
       open_proposals: [],
       // The two exceptional lists, in the spelling `status_report_json` sends:
-      // the records themselves, which the card wants as counts.
+      // the records themselves, which the card wants as counts. A conflict is
+      // the wire record and not the path string it is easy to mistake it for -
+      // counting by length works either way, so the fixture carries the real
+      // shape to keep the reader honest about what it is reading past.
       declined_proposals: [{ number: 3 }, { number: 4 }],
-      conflicts: ["notes/a.md"],
+      conflicts: [
+        {
+          id: "9f3c1ab0",
+          path: "notes/a.md",
+          kind: "EditEdit",
+          base_commit: "1111111111111111111111111111111111111111",
+          upstream_commit: "2222222222222222222222222222222222222222",
+          detected_at: "2026-08-10T07:59:00Z",
+        },
+      ],
       behind: false,
     });
     const status = await fetchSyncStatus("eng");

@@ -124,13 +124,27 @@ export default function MoveDialogBody({
           </Dialog.Description>
           {warned !== null ? (
             <div className="mt-3 flex flex-col gap-3">
+              {/*
+                Amber on purpose, not the red the form branch gives a refusal:
+                the move landed, and this names what it could not carry rather
+                than something that failed. The two tones are the difference
+                between "go and look at this" and "this did not happen", and
+                borrowing the error red would make a move that succeeded read
+                as a move that broke.
+              */}
               <div
                 role="alert"
                 className="rounded bg-amber-50 px-2 py-1 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-100"
               >
                 <ul className="list-disc pl-4">
-                  {warned.attachmentWarnings.map((warning) => (
-                    <li key={warning}>{warning}</li>
+                  {/* Keyed by position as well as text: a warning is a
+                      sentence the server composed, not an identity this side
+                      can lean on, and two identical sentences would collide as
+                      one key. The list arrives whole and is never reordered or
+                      filtered, so the position is stable for as long as it is
+                      on screen. */}
+                  {warned.attachmentWarnings.map((warning, index) => (
+                    <li key={`${index}-${warning}`}>{warning}</li>
                   ))}
                 </ul>
               </div>
