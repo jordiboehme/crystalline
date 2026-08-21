@@ -1824,16 +1824,22 @@ impl Engine {
 
         // Read back after the reindex, exactly as a save does: the index takes
         // the permalink from the restored frontmatter, which need not match
-        // the path slug.
+        // the path slug. Tolerantly, for the same reason a save asks
+        // tolerantly: the restore is committed by this line, so a missing row
+        // and a failing lookup alike fall back to the path-derived name rather
+        // than reporting a done write as failed - see [`receipt_permalink`].
         let permalink = {
             let store = self.store.lock().await;
-            store
+            let found = store
                 .list_engrams(domain, Some(path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == path)
-                .map(|found| found.permalink)
-                .unwrap_or_else(|| path.trim_end_matches(".md").to_string())
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == path)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
         Ok(json!({
             "domain": domain,
