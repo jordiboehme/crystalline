@@ -1493,6 +1493,11 @@ async fn a_delete_preview_names_only_the_attachments_this_engram_is_the_last_ref
     assert_eq!(preview["permalink"], "note", "{preview}");
     assert_eq!(preview["title"], "Note", "{preview}");
     assert_eq!(preview["path"], "note.md", "{preview}");
+    assert!(
+        preview["attachments"].is_array(),
+        "a domain this far inside MAX_PREVIEW_SCAN_ENGRAMS is enumerated, so the \
+         field is a list rather than the null that says nobody looked: {preview}"
+    );
     assert_eq!(
         preview["attachments"],
         serde_json::json!(["assets/solo.png"]),

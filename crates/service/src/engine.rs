@@ -135,6 +135,28 @@ const EVOLVE_MAX_LIMIT: usize = 100;
 /// screenful of rows.
 const MAX_INBOUND_LIMIT: usize = 100;
 
+/// The largest domain [`Engine::delete_preview`] enumerates sole-referent
+/// attachments on.
+///
+/// The enumeration is a full-domain read, and the cost is worth naming exactly:
+/// [`Engine::sole_referent_attachments`] lists every engram in the domain and
+/// loads the text of each one that could hold a reference, so asking "what does
+/// this delete orphan" on a domain of fifty thousand engrams reads fifty
+/// thousand engrams - to build a question, before anything is deleted. The
+/// scan stops early only when every candidate is already accounted for, which a
+/// domain that shares none of them never reaches.
+///
+/// So the bound caps **when** the enumeration runs, never what the delete does.
+/// Past it the question says the attachments were not enumerated instead of
+/// naming them, and [`Engine::delete_engram`] behaves exactly as it always has:
+/// it removes the markdown and the rows and leaves every file alone, on a
+/// domain of five hundred engrams and on a domain of fifty thousand alike.
+///
+/// Five hundred is the same shape of number as [`TREE_LEVEL_CAP`] and picked
+/// the same way: past any archive a person curates by hand, and small enough
+/// that the read behind the question stays a fraction of a second.
+pub const MAX_PREVIEW_SCAN_ENGRAMS: usize = 500;
+
 /// The fixed instruction every `evolve_engrams` response carries. It states the
 /// authority the queue does and does not have, so an agent working it never
 /// treats detection as permission to rewrite the archive.
@@ -4023,6 +4045,12 @@ impl Engine {
     /// markdown and its rows and nothing else - so what the list says is which
     /// attachments the delete leaves with no referent at all.
     ///
+    /// `attachments` is `null` rather than a list on a domain past
+    /// [`MAX_PREVIEW_SCAN_ENGRAMS`], where enumerating them would read the
+    /// whole domain to build one sentence. The delete is the same delete
+    /// either way; only the question is worded differently, and `null` says
+    /// nobody looked where `[]` says somebody looked and found none.
+    ///
     /// The `expected_checksum` comparison is deliberately not repeated here:
     /// the file can change between the two rounds, so the guard is worth
     /// nothing unless it runs in the round that actually deletes, which is
@@ -4056,7 +4084,7 @@ impl Engine {
         }
         let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         let content = self.load_content(&source, &desc).await?;
-        let attachments = self.sole_referent_attachments(&desc, &content).await;
+        let attachments = self.previewable_attachments(&desc, &content).await;
         Ok(json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
@@ -4064,6 +4092,51 @@ impl Engine {
             "path": desc.path,
             "attachments": attachments,
         }))
+    }
+
+    /// [`Engine::sole_referent_attachments`] under
+    /// [`MAX_PREVIEW_SCAN_ENGRAMS`], and [`None`] above it.
+    ///
+    /// The two answers are different facts and the shape says which is which:
+    /// an array is "these are the attachments the delete orphans", empty
+    /// included, and `null` is "nobody looked". The caller that renders the
+    /// question reads the difference and words the clause accordingly; nothing
+    /// here changes what the delete removes.
+    async fn previewable_attachments(
+        &self,
+        desc: &EngramDescriptor,
+        content: &str,
+    ) -> Option<Vec<String>> {
+        if !self.within_preview_scan_bound(&desc.domain).await {
+            return None;
+        }
+        Some(self.sole_referent_attachments(desc, content).await)
+    }
+
+    /// Whether `domain` is small enough for the preview to enumerate, one
+    /// metadata query and no bodies.
+    ///
+    /// **A count that cannot be taken answers `true`.** The bound exists to
+    /// keep a question cheap, not to give round one a new way to fail, and a
+    /// preview that is stricter than the delete it previews is the one thing
+    /// this whole surface must never be. It costs nothing in practice either:
+    /// the listing this failed on is the same listing the enumeration opens
+    /// with, so it fails there immediately and resolves the safe way, which
+    /// names no attachments at all.
+    async fn within_preview_scan_bound(&self, domain: &str) -> bool {
+        let counted = {
+            let store = self.store.lock().await;
+            store.list_engrams(domain, None, None).await
+        };
+        match counted {
+            Ok(rows) => count_within_preview_bound(rows.len()),
+            Err(e) => {
+                tracing::warn!(
+                    "the engrams of '{domain}' could not be counted ({e}); the delete preview enumerates attachments as it would on a small domain"
+                );
+                true
+            }
+        }
     }
 
     /// How many bytes [`Engine::attachment_delete`] would remove, or
@@ -10051,6 +10124,16 @@ fn resolve_shared(counted: Result<HashSet<String>>, candidates: &[String]) -> Ha
     }
 }
 
+/// Whether a domain holding `engrams` engrams is inside
+/// [`MAX_PREVIEW_SCAN_ENGRAMS`].
+///
+/// A line of arithmetic with its own name so the boundary is pinned by a test
+/// rather than by a reading: exactly the bound still enumerates, one past it
+/// does not.
+fn count_within_preview_bound(engrams: usize) -> bool {
+    engrams <= MAX_PREVIEW_SCAN_ENGRAMS
+}
+
 /// Every attachment one engram's own text points at: the `assets/` references
 /// in its body plus the one an `analyzes` claim in its frontmatter names,
 /// deduplicated and in reference order.
@@ -11338,6 +11421,19 @@ mod attachment_carry_tests {
         let counted: HashSet<String> = std::iter::once(candidates[0].clone()).collect();
         assert_eq!(resolve_shared(Ok(counted.clone()), &candidates), counted);
         assert!(resolve_shared(Ok(HashSet::new()), &candidates).is_empty());
+    }
+
+    /// The bound the delete preview enumerates under, pinned at the edge:
+    /// exactly [`MAX_PREVIEW_SCAN_ENGRAMS`] engrams still gets the full
+    /// enumeration, one more does not. The number itself may move; which side
+    /// of it each count falls on must not drift by an off-by-one.
+    #[test]
+    fn the_preview_scan_bound_includes_its_own_number() {
+        assert!(count_within_preview_bound(0));
+        assert!(count_within_preview_bound(1));
+        assert!(count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS));
+        assert!(!count_within_preview_bound(MAX_PREVIEW_SCAN_ENGRAMS + 1));
+        assert!(!count_within_preview_bound(50_000));
     }
 
     #[test]

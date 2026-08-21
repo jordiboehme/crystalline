@@ -2480,20 +2480,39 @@ fn delete_question(preview: &Value) -> String {
     }
     let title = preview["title"].as_str().unwrap_or_default();
     let permalink = preview["permalink"].as_str().unwrap_or_default();
-    let listed = preview["attachments"]
-        .as_array()
-        .map(|paths| {
-            paths
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
+    let enumerated: Option<Vec<String>> = preview["attachments"].as_array().map(|paths| {
+        paths
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    });
+    let clause = preview_attachment_clause(enumerated.as_deref());
+    format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
+}
+
+/// The middle sentence of [`delete_question`]: what the delete does to the
+/// engram's attachments.
+///
+/// `Some` is an answer and `None` is the absence of one. A list - empty
+/// included - was enumerated by
+/// [`crate::engine::Engine::delete_preview`] and names exactly what the delete
+/// orphans. `None` is a domain past
+/// [`crate::engine::MAX_PREVIEW_SCAN_ENGRAMS`], where naming them would mean
+/// reading every engram in the domain to write one sentence.
+///
+/// **The unenumerated wording promises less, never more.** It says the
+/// attachments were not looked at and that any sole-referent ones are left
+/// orphaned, which is true of every delete this verb performs; what changes
+/// past the bound is what the question can tell the user, not what saying yes
+/// to it does.
+fn preview_attachment_clause(enumerated: Option<&[String]>) -> String {
+    let Some(paths) = enumerated else {
+        return "Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned.".to_string();
+    };
+    let listed = paths.join(", ");
     let attachments = if listed.is_empty() { "none" } else { &listed };
-    format!(
-        "Delete '{title}' ({domain}/{permalink})? This leaves its sole-referent attachments orphaned: {attachments}. This cannot be undone."
-    )
+    format!("This leaves its sole-referent attachments orphaned: {attachments}.")
 }
 
 /// The permalink the engine's collision message names, when it names one.
@@ -2829,6 +2848,65 @@ mod tests {
                 "a message naming no permalink yields none: {message}"
             );
         }
+    }
+
+    /// The three things the attachment clause can say, and the one it must
+    /// never say: that a domain too large to enumerate has no sole-referent
+    /// attachments.
+    ///
+    /// A list is an answer, an empty list is the answer "none", and `None` is
+    /// the absence of one. The unenumerated wording is asserted verbatim
+    /// because it is the sentence a user decides a delete on.
+    #[test]
+    fn the_attachment_clause_says_nothing_it_did_not_look_for() {
+        assert_eq!(
+            preview_attachment_clause(Some(&[
+                "assets/solo.png".to_string(),
+                "assets/deck.pptx".to_string(),
+            ])),
+            "This leaves its sole-referent attachments orphaned: assets/solo.png, assets/deck.pptx.",
+            "an enumerated list names every path the delete orphans"
+        );
+        assert_eq!(
+            preview_attachment_clause(Some(&[])),
+            "This leaves its sole-referent attachments orphaned: none.",
+            "an empty enumeration is the answer 'none', not a missing one"
+        );
+        assert_eq!(
+            preview_attachment_clause(None),
+            "Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned.",
+            "past the scan bound the question says nobody looked"
+        );
+    }
+
+    /// And the whole sentence, both ways round, because the clause is only
+    /// ever read inside it: the engram is named, the consequence is stated and
+    /// the delete is still called what it is.
+    #[test]
+    fn the_delete_question_wraps_whichever_clause_the_preview_earned() {
+        let asked = delete_question(&json!({
+            "domain": "eng",
+            "permalink": "eng/doomed",
+            "title": "Doomed",
+            "path": "eng/doomed.md",
+            "attachments": ["assets/solo.png"],
+        }));
+        assert_eq!(
+            asked,
+            "Delete 'Doomed' (eng/eng/doomed)? This leaves its sole-referent attachments orphaned: assets/solo.png. This cannot be undone."
+        );
+
+        let unenumerated = delete_question(&json!({
+            "domain": "eng",
+            "permalink": "eng/doomed",
+            "title": "Doomed",
+            "path": "eng/doomed.md",
+            "attachments": Value::Null,
+        }));
+        assert_eq!(
+            unenumerated,
+            "Delete 'Doomed' (eng/eng/doomed)? Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned. This cannot be undone."
+        );
     }
 
     #[test]
