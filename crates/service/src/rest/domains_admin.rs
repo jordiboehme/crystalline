@@ -528,9 +528,12 @@ fn single_domain(
         ),
         (
             status = 409,
-            description = "GitHub is switched off on this instance, so no \
-                           origin can be reached - the detail says where to \
-                           turn it on.",
+            description = "GitHub is switched off on this instance, or it is \
+                           on but no account is connected, so no origin can be \
+                           reached - the detail says which of the two it is \
+                           and where to fix it. A repository that is simply \
+                           missing is a different answer, carrying the \
+                           remote's own not-found error.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -543,7 +546,7 @@ pub async fn sync_status(
 ) -> Result<Json<Value>, ApiError> {
     identity.require_admin()?;
     // No refuse_read_only: this is a read. See the doc comment.
-    require_team_domain(&state, &domain, Refusal::Missing)?;
+    require_team_domain(&state, &domain, Refusal::Missing).await?;
     let mut report = single_domain(
         state.engine.origin_status(Some(&domain)).await?,
         &domain,
@@ -622,9 +625,12 @@ pub async fn sync_status(
         ),
         (
             status = 409,
-            description = "The domain has no team origin to pull from, or \
-                           GitHub is switched off on this instance - the \
-                           detail says which, and where to fix it.",
+            description = "The domain has no team origin to pull from, GitHub \
+                           is switched off on this instance, or it is on but \
+                           no account is connected - the detail says which, \
+                           and where to fix it. A repository that is simply \
+                           missing is a different answer, carrying the \
+                           remote's own not-found error.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -637,7 +643,7 @@ pub async fn sync_now(
 ) -> Result<Json<Value>, ApiError> {
     identity.require_admin()?;
     refuse_read_only(&state)?;
-    require_team_domain(&state, &domain, Refusal::Conflict)?;
+    require_team_domain(&state, &domain, Refusal::Conflict).await?;
     let report = single_domain(
         state.engine.origin_update(Some(&domain)).await?,
         &domain,
@@ -655,17 +661,32 @@ enum Refusal {
 }
 
 /// The shared pre-check both sync endpoints open with: the domain exists (a
-/// 404 straight out of the engine otherwise), it has an origin, and the
-/// feature that reaches origins at all is on.
+/// 404 straight out of the engine otherwise), it has an origin, the feature
+/// that reaches origins at all is on, and a credential is on file to reach
+/// them with.
 ///
 /// The GitHub check is here rather than left to the engine because both origin
 /// verbs answer `RemoteError::NotEnabled`, which this surface classifies as a
 /// bare 422: true, but useless to a card that would then have to explain a
-/// state it cannot see. The order matters as much as the checks - a domain
-/// with no origin is refused before the feature flag is consulted, so a local
-/// domain reads as "no sync card" on every instance rather than flipping to a
-/// GitHub complaint when someone turns the feature off.
-fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Result<(), ApiError> {
+/// state it cannot see. The connection check that follows it is the same one
+/// the create route runs (see [`create`]) and exists for the same reason:
+/// without credentials the call travels to the remote and comes back as that
+/// remote's own "no such repository", which sends the reader hunting for a
+/// repository problem that does not exist. With credentials present a missing
+/// repository still surfaces as `RemoteError::RepoNotFound`, so the two
+/// failures read differently rather than as one sentence.
+///
+/// The order matters as much as the checks - a domain with no origin is
+/// refused before the feature flag is consulted, so a local domain reads as
+/// "no sync card" on every instance rather than flipping to a GitHub complaint
+/// when someone turns the feature off, and the flag is consulted before the
+/// credential, so an instance with the feature off says so rather than
+/// blaming a connection nobody could have made.
+async fn require_team_domain(
+    state: &RestState,
+    domain: &str,
+    refusal: Refusal,
+) -> Result<(), ApiError> {
     if !state.engine.domain_has_origin(domain)? {
         return Err(match refusal {
             Refusal::Missing => ApiError::not_found(format!(
@@ -682,6 +703,12 @@ fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Res
         return Err(ApiError::conflict(
             "GitHub is switched off on this instance, so its origin cannot be \
              reached: turn it on under Settings > GitHub",
+        ));
+    }
+    if !state.engine.github_ready().await {
+        return Err(ApiError::conflict(
+            "GitHub is not connected on this instance: connect it under \
+             Settings > GitHub, then retry the sync",
         ));
     }
     Ok(())

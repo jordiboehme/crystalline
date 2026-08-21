@@ -3062,7 +3062,7 @@
             }
           },
           "409": {
-            "description": "GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on.",
+            "description": "GitHub is switched off on this instance, or it is on but no account is connected, so no origin can be reached - the detail says which of the two it is and where to fix it. A repository that is simply missing is a different answer, carrying the remote's own not-found error.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3145,7 +3145,7 @@
             }
           },
           "409": {
-            "description": "The domain has no team origin to pull from, or GitHub is switched off on this instance - the detail says which, and where to fix it.",
+            "description": "The domain has no team origin to pull from, GitHub is switched off on this instance, or it is on but no account is connected - the detail says which, and where to fix it. A repository that is simply missing is a different answer, carrying the remote's own not-found error.",
             "content": {
               "application/problem+json": {
                 "schema": {

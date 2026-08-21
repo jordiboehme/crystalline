@@ -590,6 +590,57 @@ async fn a_disabled_github_names_the_fix_on_both_sync_endpoints() {
     }
 }
 
+/// GitHub switched ON but no credential on file: both endpoints answer 409
+/// naming the connection rather than letting the call travel to the remote,
+/// where a missing token reads as a missing repository. The two failures have
+/// different fixes, so they get different sentences.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disconnected_github_names_the_connection_on_both_sync_endpoints() {
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    for method in [reqwest::Method::GET, reqwest::Method::POST] {
+        let resp = as_session(fx.addr, method.clone(), "/api/v1/domains/kb/sync", &admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409, "{method} on a disconnected instance");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap().to_lowercase();
+        assert!(
+            detail.contains("not connected"),
+            "the refusal names the connection, not a missing repo: {problem}"
+        );
+        assert!(
+            detail.contains("settings"),
+            "and it points at the screen that fixes it: {problem}"
+        );
+    }
+
+    // The no-origin refusal still comes first, so a local domain reads the
+    // same on a disconnected instance as on a connected one: 404 on the GET,
+    // 409 on the POST, both naming the missing origin rather than the missing
+    // credential.
+    for (method, expected) in [(reqwest::Method::GET, 404), (reqwest::Method::POST, 409)] {
+        let resp = as_session(fx.addr, method.clone(), "/api/v1/domains/eng/sync", &admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), expected, "{method} on a local domain");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("team") && !detail.contains("not connected"),
+            "the no-origin sentence still wins the ordering: {problem}"
+        );
+    }
+}
+
 /// The read-only ruling on this pair: the status is a pure read and stays
 /// served (a read-only mirror still shows its sync card), the pull is a
 /// mutation of this instance's copy and is refused. The GET is asserted as
