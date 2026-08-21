@@ -3634,9 +3634,28 @@ impl Engine {
             self.refresh_index_files(&dest_domain).await;
         }
 
+        // The address the engram answers to at its destination, asked rather
+        // than assumed, exactly as `save_engram` asks: a permalink that was
+        // derived from the path follows the move (the store's rename says so
+        // in as many words), so a receipt repeating the one it went in with
+        // would name a permalink that no longer resolves on the very calls
+        // that changed it.
+        let dest_permalink = {
+            let store = self.store.lock().await;
+            store
+                .list_engrams(&dest_domain, Some(&dest_rel), None)
+                .await?
+                .into_iter()
+                .find(|found| found.path == dest_rel)
+                .map(|found| found.permalink)
+                // Unreachable while the move above succeeded; the name it went
+                // in with is the honest fallback rather than a panic.
+                .unwrap_or_else(|| src.permalink.clone())
+        };
+
         Ok(json!({
             "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
-            "to": { "domain": dest_domain, "path": dest_rel },
+            "to": { "domain": dest_domain, "permalink": dest_permalink, "path": dest_rel },
             "cross_domain": cross,
             "links_rewritten": rewritten,
             "attachment_warnings": attachment_warnings,

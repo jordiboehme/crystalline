@@ -1063,6 +1063,77 @@ fn project_scope_writes_relative_to_the_working_directory() {
     );
 }
 
+/// **An uninstall names the scope it removes from**, exactly as the install
+/// names the scope it writes to.
+///
+/// The bare `claude mcp remove crystalline` this used to run takes whichever
+/// scope happens to hold the name, so tearing down a project install beside a
+/// user install could deregister the user's server and leave the project entry
+/// standing - the removal doing the opposite of what was asked, in both
+/// directions.
+#[test]
+fn uninstall_removes_from_the_scope_it_was_asked_for() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let user_log = work.path().join("user.log");
+    write_shim(&bin_dir, "claude", &user_log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .assert()
+        .success();
+    assert!(
+        read_log(&user_log).contains("mcp remove crystalline --scope user"),
+        "the user uninstall names the user scope: {}",
+        read_log(&user_log)
+    );
+
+    // A second shim writing its own log, so the project run is read on its
+    // own rather than through what the user run left behind.
+    let project = work.path().join("repo");
+    std::fs::create_dir_all(&project).unwrap();
+    let project_log = work.path().join("project.log");
+    write_shim(&bin_dir, "claude", &project_log);
+
+    install_cmd(&home, &bin_dir)
+        .current_dir(&project)
+        .args(["uninstall", "claude-code", "--project"])
+        .assert()
+        .success();
+    assert!(
+        read_log(&project_log).contains("mcp remove crystalline --scope project"),
+        "the project uninstall names the project scope: {}",
+        read_log(&project_log)
+    );
+}
+
+/// The harness CLIs that register per user only take no scope, so their
+/// uninstall must keep passing the bare form rather than a flag they would
+/// refuse.
+#[test]
+fn a_scopeless_harness_uninstall_stays_scopeless() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("copilot.log");
+    write_shim(&bin_dir, "copilot", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["uninstall", "copilot"])
+        .assert()
+        .success();
+    let logged = read_log(&log);
+    assert!(
+        logged.contains("mcp remove crystalline"),
+        "the removal still runs: {logged}"
+    );
+    assert!(
+        !logged.contains("--scope"),
+        "and carries no scope Copilot has no place to put: {logged}"
+    );
+}
+
 #[test]
 fn a_missing_harness_cli_prints_a_manual_command_and_still_succeeds() {
     let work = tempfile::tempdir().unwrap();

@@ -147,9 +147,47 @@ pub struct Ownership {
     socket_path: PathBuf,
 }
 
+/// The usable byte budget of a `sockaddr_un` path: 104 on the BSD family
+/// (macOS included), 108 on Linux, minus the trailing NUL.
+#[cfg(unix)]
+fn socket_path_budget() -> usize {
+    if cfg!(any(target_os = "macos", target_os = "ios")) {
+        103
+    } else {
+        107
+    }
+}
+
+/// Refuse an over-long socket path in words, before the kernel refuses it in
+/// an errno.
+///
+/// A long `HOME` is enough to spend the whole budget, and what a user saw then
+/// was two unhelpful things at once: a bare "invalid argument" from `bind` in
+/// `daemon.log`, which nobody reads, and a client that waited out its 15s
+/// readiness budget before blaming the daemon it spawned. The length, the
+/// limit and the way out are all knowable before either happens, so they are
+/// said before either happens.
+#[cfg(unix)]
+fn check_socket_path(path: &Path) -> io::Result<()> {
+    let len = path.as_os_str().as_encoded_bytes().len();
+    let budget = socket_path_budget();
+    if len > budget {
+        return Err(io::Error::other(format!(
+            "the daemon socket path '{}' is {len} bytes but a unix socket path holds at most {budget}; \
+             point XDG_STATE_HOME at a shorter directory and retry",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 impl Ownership {
     /// Bind the local socket, removing any stale socket file first.
     pub fn bind_listener(&self) -> io::Result<IpcListener> {
+        // The diagnosis first, so a daemon that cannot bind says why in
+        // daemon.log instead of leaving an errno there.
+        #[cfg(unix)]
+        check_socket_path(&self.socket_path)?;
         // On unix a leftover socket file blocks binding; remove it.
         #[cfg(unix)]
         {
@@ -837,6 +875,15 @@ pub async fn ensure_daemon(
         anyhow::bail!("no Crystalline daemon is running; start one with `crystalline serve`");
     }
 
+    // The daemon we are about to spawn is detached, so its own bind failure
+    // only ever reaches `daemon.log`. Asked here as well as there, the person
+    // running the command is told what is wrong instead of waiting out the 15s
+    // readiness budget for a daemon that could never have bound.
+    #[cfg(unix)]
+    if let Ok(sock) = config::service_sock_path() {
+        check_socket_path(&sock)?;
+    }
+
     // Attaching failed. If the lock is already held at this point, a spawn
     // would only lose the race, which is the 2026-07-28 wedge: nothing to
     // attach to and nothing to take. Diagnosing here rather than after the
@@ -1490,6 +1537,74 @@ mod tests {
             }
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    // --- the unix socket path budget ----------------------------------------
+
+    /// A `sockaddr_un` path is ~104 bytes on macOS and ~108 on Linux, and a
+    /// deep enough `HOME` spends them on its own. The check has to say all
+    /// three things a stuck user needs: how long the path is, how long it may
+    /// be and which variable moves it.
+    #[cfg(unix)]
+    #[test]
+    fn an_over_long_socket_path_is_refused_with_both_numbers() {
+        let long = PathBuf::from(format!("/tmp/{}/service.sock", "d".repeat(110)));
+        let len = long.as_os_str().as_encoded_bytes().len();
+        assert!(len > 110, "past every platform's budget: {len}");
+
+        let message = check_socket_path(&long)
+            .expect_err("a path this long can never bind")
+            .to_string();
+        assert!(
+            message.contains(&long.display().to_string()),
+            "the path itself is named: {message}"
+        );
+        assert!(
+            message.contains(&format!("is {len} bytes")),
+            "the measured length is named: {message}"
+        );
+        assert!(
+            message.contains(&format!("at most {}", socket_path_budget())),
+            "the budget is named: {message}"
+        );
+        assert!(
+            message.contains("XDG_STATE_HOME"),
+            "the way out is named: {message}"
+        );
+
+        // A path that fits is not this check's business.
+        check_socket_path(Path::new("/tmp/crystalline/service.sock"))
+            .expect("a short path passes untouched");
+    }
+
+    /// The same diagnosis, on the client's own stderr rather than in a log
+    /// nobody opens. The daemon `ensure_daemon` spawns is detached, so without
+    /// this the caller spends the whole 15s readiness budget and is then
+    /// pointed at `daemon.log` for an errno.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ensure_daemon_diagnoses_an_over_long_socket_path_instead_of_waiting() {
+        let _home = ScratchHome::new(&"deep".repeat(30));
+        let sock = config::service_sock_path().unwrap();
+        assert!(
+            sock.as_os_str().as_encoded_bytes().len() > socket_path_budget(),
+            "the scratch home has to overrun the budget for this to test anything: {}",
+            sock.display()
+        );
+
+        let started = Instant::now();
+        let message = match ensure_daemon(true, None, None, false).await {
+            Ok(_) => panic!("no daemon can bind under this state directory"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            message.contains("unix socket path holds at most"),
+            "the bind diagnosis, not the generic timeout: {message}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "refused up front rather than after the 15s readiness budget"
+        );
     }
 
     /// An old-version lock record whose pid is a real, killable child: the

@@ -966,7 +966,7 @@ impl McpServer {
         let Some(permalink) = collision else {
             return written
                 .map_err(to_error)
-                .and_then(ok)
+                .and_then(ok_written)
                 .map(CallToolResponse::from);
         };
 
@@ -990,7 +990,7 @@ impl McpServer {
                     .write_engram_as(&retry, actor.as_deref())
                     .await
                     .map_err(to_error)
-                    .and_then(ok)
+                    .and_then(ok_written)
                     .map(CallToolResponse::from)
             }
         }
@@ -1048,7 +1048,7 @@ impl McpServer {
             .edit_engram_as(&p, client_actor(&ctx).as_deref())
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(ok_written)
             .map(CallToolResponse::from)
     }
 
@@ -1071,7 +1071,7 @@ impl McpServer {
             .move_engram(&p)
             .await
             .map_err(to_error)
-            .and_then(ok)
+            .and_then(ok_moved)
     }
 
     #[tool(
@@ -2391,6 +2391,59 @@ fn ok(value: Value) -> Result<CallToolResult, ErrorData> {
     let text = serde_json::to_string(&value)
         .map_err(|e| ErrorData::internal_error(e.to_string(), None))?;
     Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+}
+
+/// A `resource_link` content block addressing the engram a write touched, so
+/// an era-aware client can follow the handle instead of rebuilding the address
+/// out of two payload fields. Same unconditional policy as `read_engram`'s
+/// attachment links: a link, never bytes.
+fn engram_link(domain: &str, permalink: &str, title: &str) -> ContentBlock {
+    ContentBlock::resource_link(
+        Resource::new(
+            format!("crystalline://{domain}/{permalink}"),
+            title.to_string(),
+        )
+        .with_mime_type("text/markdown"),
+    )
+}
+
+/// [`ok`] for a `write_engram` or `edit_engram` result, with the link to the
+/// engram appended: `domain` and `permalink` read off the result itself, named
+/// by its `title` when it carries one (a write does, an edit does not).
+///
+/// A shape this does not recognize simply gets no link. A result that grew a
+/// different spelling costs a client one lookup it was doing anyway; a link
+/// built from half a shape would send it somewhere else entirely, and no
+/// engine result is worth a panic in the layer that only reports it.
+fn ok_written(value: Value) -> Result<CallToolResult, ErrorData> {
+    let link = (|| {
+        let domain = value.get("domain").and_then(Value::as_str)?;
+        let permalink = value.get("permalink").and_then(Value::as_str)?;
+        let title = value
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(permalink);
+        Some(engram_link(domain, permalink, title))
+    })();
+    let mut result = ok(value)?;
+    result.content.extend(link);
+    Ok(result)
+}
+
+/// [`ok`] for a `move_engram` result, with the link to where the engram
+/// landed: the destination is the point of the call, so the handle names the
+/// address the engram answers to now, off the result's own `to` block. Same
+/// tolerance as [`ok_written`] for a shape that is not there.
+fn ok_moved(value: Value) -> Result<CallToolResult, ErrorData> {
+    let link = (|| {
+        let to = value.get("to")?;
+        let domain = to.get("domain").and_then(Value::as_str)?;
+        let permalink = to.get("permalink").and_then(Value::as_str)?;
+        Some(engram_link(domain, permalink, permalink))
+    })();
+    let mut result = ok(value)?;
+    result.content.extend(link);
+    Ok(result)
 }
 
 /// The sentence `delete_engram` asks before it acts, rendered from

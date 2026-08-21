@@ -2792,7 +2792,7 @@
         },
         "responses": {
           "200": {
-            "description": "The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.\n\n`attachment_warnings` lists the attachments the move could not carry, one sentence each and empty when everything travelled; those files stay whole in the source domain.",
+            "description": "The move receipt: where the engram came from, where it landed, whether the move crossed domains and how many inbound links were rewritten.\n\n`to.permalink` is the address the engram answers to after the move, which is not always the one it went in with: a permalink that was derived from the path follows the file.\n\n`attachment_warnings` lists the attachments the move could not carry, one sentence each and empty when everything travelled; those files stay whole in the source domain.",
             "content": {
               "application/json": {
                 "schema": {
@@ -2809,7 +2809,8 @@
                   "links_rewritten": 0,
                   "to": {
                     "domain": "eng",
-                    "path": "guides/beta.md"
+                    "path": "guides/beta.md",
+                    "permalink": "guides/beta"
                   }
                 }
               }

@@ -738,6 +738,141 @@ async fn read_only_engine_guard_refuses_mutations() {
     );
 }
 
+/// The resource links a tool result carries, in order.
+fn resource_links(result: &rmcp::model::CallToolResult) -> Vec<Value> {
+    serde_json::to_value(result).unwrap()["content"]
+        .as_array()
+        .expect("a tool result carries content blocks")
+        .iter()
+        .filter(|block| block["type"] == json!("resource_link"))
+        .cloned()
+        .collect()
+}
+
+/// **A write hands back a handle to what it touched.**
+///
+/// The permalink is in the payload either way, so this is not about the
+/// address being knowable - it is about the address being *addressable*: a
+/// resource link is a thing an era-aware client follows, and reconstructing
+/// `crystalline://domain/permalink` out of two JSON fields is a thing every
+/// client has to be taught separately.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_and_an_edit_link_the_engram_they_touched() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let written = call_result(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Alpha", "content": "Alpha knowledge" }),
+    )
+    .await;
+    let links = resource_links(&written);
+    assert_eq!(
+        links.len(),
+        1,
+        "one link, for the one engram written: {links:?}"
+    );
+    assert_eq!(links[0]["uri"], json!("crystalline://eng/alpha"));
+    assert_eq!(
+        links[0]["name"],
+        json!("Alpha"),
+        "named by the title a person would recognize"
+    );
+    assert_eq!(links[0]["mimeType"], json!("text/markdown"));
+    // The payload still leads, so every client that reads the first block
+    // reads exactly what it always did.
+    assert_eq!(
+        serde_json::to_value(&written).unwrap()["content"][0]["type"],
+        json!("text")
+    );
+
+    let edited = call_result(
+        peer,
+        "edit_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "alpha",
+            "operation": "append",
+            "content": "\nMore alpha.\n",
+        }),
+    )
+    .await;
+    let links = resource_links(&edited);
+    assert_eq!(links.len(), 1, "the edited engram, once: {links:?}");
+    assert_eq!(links[0]["uri"], json!("crystalline://eng/alpha"));
+}
+
+/// **A move links where the engram landed, not where it came from.** The
+/// destination is the whole point of the call, and a handle pointing at the
+/// old address would be worse than no handle at all.
+///
+/// Which is not the same thing as the permalink it went in with: a permalink
+/// that was derived from the path follows the file, so an `alpha.md` re-filed
+/// as `notes/alpha.md` answers to `notes/alpha` afterwards. That is why the
+/// receipt's `to` block names the permalink the destination resolves by
+/// instead of repeating `from`'s.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_move_links_the_destination_it_resolves_to() {
+    let h = Harness::new(&["eng", "vault"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    for (title, content) in [("Alpha", "Alpha knowledge"), ("Beta", "Beta knowledge")] {
+        call(
+            peer,
+            "write_engram",
+            json!({ "domain": "eng", "title": title, "content": content }),
+        )
+        .await
+        .unwrap();
+    }
+
+    // A same-domain re-file into a folder.
+    let moved = call_result(
+        peer,
+        "move_engram",
+        json!({ "domain": "eng", "identifier": "alpha", "destination": "notes/alpha.md" }),
+    )
+    .await;
+    let links = resource_links(&moved);
+    assert_eq!(links.len(), 1, "the moved engram, once: {links:?}");
+    let uri = links[0]["uri"].as_str().unwrap().to_string();
+    assert_eq!(
+        uri, "crystalline://eng/notes/alpha",
+        "a path-derived permalink follows its file, so the handle follows it too"
+    );
+
+    // The handle has to resolve, which is the only thing that makes it worth
+    // carrying: read it back by the address the link names.
+    let read = call(peer, "read_engram", json!({ "identifier": uri }))
+        .await
+        .unwrap_or_else(|e| panic!("the link a move hands back must resolve: {uri}: {e}"));
+    assert_eq!(read["path"], json!("notes/alpha.md"));
+
+    // A cross-domain move names the domain it landed in.
+    let moved = call_result(
+        peer,
+        "move_engram",
+        json!({
+            "domain": "eng",
+            "identifier": "beta",
+            "destination": "beta.md",
+            "destination_domain": "vault",
+        }),
+    )
+    .await;
+    let links = resource_links(&moved);
+    assert_eq!(links.len(), 1, "the moved engram, once: {links:?}");
+    let uri = links[0]["uri"].as_str().unwrap().to_string();
+    assert_eq!(uri, "crystalline://vault/beta");
+    let read = call(peer, "read_engram", json!({ "identifier": uri }))
+        .await
+        .unwrap_or_else(|e| panic!("the link a move hands back must resolve: {uri}: {e}"));
+    assert_eq!(read["domain"], json!("vault"));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn write_read_overwrite_and_domain_errors() {
     let h = Harness::new(&["eng"]).await;
