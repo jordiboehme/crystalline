@@ -149,10 +149,13 @@ pub fn render_context(v: &Value, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// `vocabulary`: three labelled sections - the tags in use with their engram
-/// and observation counts, the observation categories with counts and the
-/// relation types with counts. An empty facet prints a `(none)` line so the
-/// section headers stay stable.
+/// `vocabulary`: five labelled sections - the tags in use with their engram
+/// and observation counts, the observation categories with counts, the relation
+/// types with counts and the engram `type` and `status` values with counts. An
+/// empty facet prints a `(none)` line so the section headers stay stable, and
+/// the two value lists print that line when the response omits them as well:
+/// the envelope always carries them, so a missing key is a stale response
+/// rather than a shape the reader should be shown raw.
 pub fn render_vocabulary(v: &Value, out: &mut impl Write) -> io::Result<()> {
     let (Some(tags), Some(categories), Some(relation_types)) = (
         v.get("tags").and_then(Value::as_array),
@@ -188,6 +191,14 @@ pub fn render_vocabulary(v: &Value, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "Relation types:")?;
     render_named_counts(relation_types, out)?;
 
+    let types = v.get("types").and_then(Value::as_array);
+    writeln!(out, "Types:")?;
+    render_named_counts(types.map(Vec::as_slice).unwrap_or_default(), out)?;
+
+    let statuses = v.get("statuses").and_then(Value::as_array);
+    writeln!(out, "Statuses:")?;
+    render_named_counts(statuses.map(Vec::as_slice).unwrap_or_default(), out)?;
+
     // Near-duplicate tag clusters, present only when the engine found any.
     if let Some(clusters) = v.get("clusters").and_then(Value::as_array)
         && !clusters.is_empty()
@@ -220,9 +231,9 @@ pub fn render_vocabulary(v: &Value, out: &mut impl Write) -> io::Result<()> {
     Ok(())
 }
 
-/// The shared body of the `Categories` and `Relation types` sections: one
-/// `name  count` line per term, or a single `(none)` line when the facet is
-/// empty.
+/// The shared body of the `Categories`, `Relation types`, `Types` and
+/// `Statuses` sections: one `name  count` line per term, or a single `(none)`
+/// line when the facet is empty.
 fn render_named_counts(items: &[Value], out: &mut impl Write) -> io::Result<()> {
     if items.is_empty() {
         return writeln!(out, "  (none)");
@@ -536,11 +547,18 @@ mod tests {
             "relation_types": [
                 { "name": "depends_on", "count": 1 },
             ],
+            "types": [
+                { "name": "engram", "count": 3 },
+                { "name": "guide", "count": 1 },
+            ],
+            "statuses": [
+                { "name": "stable", "count": 4 },
+            ],
         });
         let out = render_to_string(render_vocabulary, &v);
         assert_eq!(
             out,
-            "Tags:\n  database  2 engrams, 2 observations\n  api  1 engram, 1 observation\nCategories:\n  decision  2\n  pattern  1\nRelation types:\n  depends_on  1\n"
+            "Tags:\n  database  2 engrams, 2 observations\n  api  1 engram, 1 observation\nCategories:\n  decision  2\n  pattern  1\nRelation types:\n  depends_on  1\nTypes:\n  engram  3\n  guide  1\nStatuses:\n  stable  4\n"
         );
     }
 
@@ -551,6 +569,8 @@ mod tests {
             "tags": [{ "name": "color", "engrams": 2, "observations": 0 }],
             "categories": [],
             "relation_types": [],
+            "types": [],
+            "statuses": [],
             "aliases": [
                 { "alias": "colour", "canonical": "color" },
                 { "alias": "hue", "canonical": "color" },
@@ -559,25 +579,53 @@ mod tests {
         let out = render_to_string(render_vocabulary, &v);
         assert_eq!(
             out,
-            "Tags:\n  color  2 engrams, 0 observations\nCategories:\n  (none)\nRelation types:\n  (none)\nAliases:\n  colour -> color\n  hue -> color\n"
+            "Tags:\n  color  2 engrams, 0 observations\nCategories:\n  (none)\nRelation types:\n  (none)\nTypes:\n  (none)\nStatuses:\n  (none)\nAliases:\n  colour -> color\n  hue -> color\n"
         );
     }
 
     #[test]
     fn vocabulary_omits_the_aliases_section_when_absent() {
         // The existing shape without an `aliases` key prints no Aliases section.
-        let v = json!({ "domain": "eng", "tags": [], "categories": [], "relation_types": [] });
+        let v = json!({
+            "domain": "eng",
+            "tags": [],
+            "categories": [],
+            "relation_types": [],
+            "types": [],
+            "statuses": [],
+        });
         let out = render_to_string(render_vocabulary, &v);
         assert!(!out.contains("Aliases:"), "no Aliases section: {out}");
     }
 
+    /// The two count lists are always present in the envelope, so a response
+    /// without them is not a shape the renderer has to fall back on: the
+    /// sections print their `(none)` line and the reader still sees a stable
+    /// set of headers.
     #[test]
-    fn vocabulary_empty_facets_print_none() {
-        let v = json!({ "domain": null, "tags": [], "categories": [], "relation_types": [] });
+    fn vocabulary_prints_empty_type_and_status_sections_when_the_keys_are_missing() {
+        let v = json!({ "domain": "eng", "tags": [], "categories": [], "relation_types": [] });
         let out = render_to_string(render_vocabulary, &v);
         assert_eq!(
             out,
-            "Tags:\n  (none)\nCategories:\n  (none)\nRelation types:\n  (none)\n"
+            "Tags:\n  (none)\nCategories:\n  (none)\nRelation types:\n  (none)\nTypes:\n  (none)\nStatuses:\n  (none)\n"
+        );
+    }
+
+    #[test]
+    fn vocabulary_empty_facets_print_none() {
+        let v = json!({
+            "domain": null,
+            "tags": [],
+            "categories": [],
+            "relation_types": [],
+            "types": [],
+            "statuses": [],
+        });
+        let out = render_to_string(render_vocabulary, &v);
+        assert_eq!(
+            out,
+            "Tags:\n  (none)\nCategories:\n  (none)\nRelation types:\n  (none)\nTypes:\n  (none)\nStatuses:\n  (none)\n"
         );
     }
 

@@ -567,7 +567,8 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// List the tags, observation categories and relation types in use.
+    /// List the tags, observation categories, relation types and engram types
+    /// and statuses in use.
     Vocabulary {
         /// Restrict to one domain. Omit for a vocabulary across every domain.
         #[arg(long)]

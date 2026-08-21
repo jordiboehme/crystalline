@@ -359,7 +359,8 @@ fn vocabulary_json_shape_and_human_sections() {
         "the seeded relation type surfaces: {vocab}"
     );
 
-    // Human output shows the three labelled sections, scoped to one domain.
+    // Human output shows every labelled section the envelope carries, scoped to
+    // one domain, so the human view never lags the JSON.
     let human = bin()
         .args(["vocabulary", "--domain", "eng", "--config"])
         .arg(&config)
@@ -369,7 +370,14 @@ fn vocabulary_json_shape_and_human_sections() {
         .unwrap();
     assert!(human.status.success());
     let stdout = String::from_utf8_lossy(&human.stdout);
-    for needle in ["Tags:", "Categories:", "Relation types:", "depends_on"] {
+    for needle in [
+        "Tags:",
+        "Categories:",
+        "Relation types:",
+        "Types:",
+        "Statuses:",
+        "depends_on",
+    ] {
         assert!(
             stdout.contains(needle),
             "vocabulary human output missing {needle:?}: {stdout}"
