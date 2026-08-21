@@ -1727,18 +1727,22 @@ impl Engine {
         // engram's permalink from its frontmatter, so an author who edited that
         // line has just moved the address, and a receipt naming the old one
         // would send its caller to a permalink nothing resolves. The saved
-        // content is the truth here, so the truth is what is asked.
+        // content is the truth here, so the truth is what is asked. Asked
+        // tolerantly, though: the save is committed by this line, so neither a
+        // missing row nor a failing lookup may turn it into a reported error -
+        // see [`receipt_permalink`], which answers both with the resolved name.
         let permalink = {
             let store = self.store.lock().await;
-            store
+            let found = store
                 .list_engrams(&desc.domain, Some(&desc.path), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == desc.path)
-                .map(|found| found.permalink)
-                // Unreachable while the write above succeeded; the resolved
-                // name is the honest fallback rather than a panic.
-                .unwrap_or_else(|| desc.permalink.clone())
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == desc.path)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, desc.permalink.clone())
         };
 
         // A save can rewrite the MANIFEST engram of a virtual domain or the
@@ -3656,18 +3660,22 @@ impl Engine {
         // derived from the path follows the move (the store's rename says so
         // in as many words), so a receipt repeating the one it went in with
         // would name a permalink that no longer resolves on the very calls
-        // that changed it.
+        // that changed it. The move is committed by this line, so the asking is
+        // tolerant: a missing row and a failing lookup alike fall back to the
+        // name it went in with rather than failing a done move - see
+        // [`receipt_permalink`].
         let dest_permalink = {
             let store = self.store.lock().await;
-            store
+            let found = store
                 .list_engrams(&dest_domain, Some(&dest_rel), None)
-                .await?
-                .into_iter()
-                .find(|found| found.path == dest_rel)
-                .map(|found| found.permalink)
-                // Unreachable while the move above succeeded; the name it went
-                // in with is the honest fallback rather than a panic.
-                .unwrap_or_else(|| src.permalink.clone())
+                .await
+                .map_err(EngineError::from)
+                .map(|rows| {
+                    rows.into_iter()
+                        .find(|found| found.path == dest_rel)
+                        .map(|found| found.permalink)
+                });
+            receipt_permalink(found, src.permalink.clone())
         };
 
         Ok(json!({
@@ -10124,6 +10132,30 @@ fn resolve_shared(counted: Result<HashSet<String>>, candidates: &[String]) -> Ha
     }
 }
 
+/// The address a write's receipt names, resolved so that decorating a receipt
+/// can never fail the write it describes.
+///
+/// Every caller asks the index for the permalink of something it has just
+/// written, after the write and its reindex are committed. That read-back is
+/// worth doing (the index takes an engram's permalink from its frontmatter, so
+/// an author or a rename may have moved the address), but it is the last step
+/// of an operation that is already done: a store error here would report a
+/// committed write as failed and invite a caller to retry something that
+/// already happened. So a failure is logged at debug and answered the same way
+/// a missing row is, with the name the caller went in with.
+fn receipt_permalink(found: Result<Option<String>>, fallback: String) -> String {
+    match found {
+        Ok(Some(permalink)) => permalink,
+        Ok(None) => fallback,
+        Err(e) => {
+            tracing::debug!(
+                "the address of the engram just written could not be read back ({e}); the receipt names '{fallback}', the address it went in with"
+            );
+            fallback
+        }
+    }
+}
+
 /// Whether a domain holding `engrams` engrams is inside
 /// [`MAX_PREVIEW_SCAN_ENGRAMS`].
 ///
@@ -11481,5 +11513,49 @@ mod attachment_carry_tests {
         // rewritten into something no write would take.
         let hopeless = format!("assets/{}/x.png", "d".repeat(246));
         assert!(suffixed_asset_path(&hopeless, 2).is_none());
+    }
+}
+
+#[cfg(test)]
+mod receipt_permalink_tests {
+    use super::*;
+
+    /// The address the index answers with is the one the receipt names: that
+    /// read-back is the whole point of asking, so a hit must pass through.
+    #[test]
+    fn the_address_the_index_answers_with_is_the_one_reported() {
+        assert_eq!(
+            receipt_permalink(Ok(Some("notes/moved".to_string())), "notes/old".to_string()),
+            "notes/moved"
+        );
+    }
+
+    /// No row for the path (the write is committed, the index has not caught
+    /// up) falls back to the name the caller already knows.
+    #[test]
+    fn a_missing_row_falls_back_to_the_known_name() {
+        assert_eq!(
+            receipt_permalink(Ok(None), "notes/old".to_string()),
+            "notes/old"
+        );
+    }
+
+    /// And the case this function exists for: the lookup itself failed. The
+    /// write it decorates is already committed on disk and in the index, so
+    /// the failure can only cost the receipt its freshest address, never turn
+    /// a done write into a reported error.
+    #[test]
+    fn a_lookup_failure_falls_back_rather_than_failing_a_committed_write() {
+        for failure in [
+            EngineError::Internal("the database went away".into()),
+            EngineError::Invalid("broken".into()),
+            EngineError::Conflict("busy".into()),
+        ] {
+            assert_eq!(
+                receipt_permalink(Err(failure), "notes/old".to_string()),
+                "notes/old",
+                "a receipt lookup must never fail the write it describes"
+            );
+        }
     }
 }
