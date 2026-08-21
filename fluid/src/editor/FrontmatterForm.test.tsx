@@ -303,6 +303,8 @@ describe("the frontmatter form", () => {
       ],
       categories: [],
       relationTypes: [],
+      types: [],
+      statuses: [],
     });
     const suggestions = screen
       .getByLabelText("Add tag")
@@ -336,6 +338,30 @@ describe("the frontmatter form", () => {
     await userEvent.type(status, "brewing");
     await userEvent.tab();
     expect(view.state.doc.toString()).toContain("status: brewing");
+  });
+
+  it("offers the type words the domain itself uses, with how used they are", async () => {
+    mounted({
+      tags: [],
+      categories: [],
+      relationTypes: [],
+      types: [
+        { name: "playbook", count: 7 },
+        { name: "guide", count: 2 },
+      ],
+      statuses: [],
+    });
+
+    await userEvent.click(screen.getByLabelText("Type"));
+    // A word this app has never heard of, because the domain writes it: it is
+    // one keystroke away rather than something to remember and retype.
+    expect(screen.getByRole("option", { name: /^playbook/ })).toHaveTextContent(
+      "7",
+    );
+    // And a recommended word keeps its line while gaining the live count.
+    const known = screen.getByRole("option", { name: /^guide/ });
+    expect(known).toHaveTextContent("how to do something, start to finish");
+    expect(known).toHaveTextContent("2");
   });
 
   it("writes the value that was picked out of the suggestions", async () => {

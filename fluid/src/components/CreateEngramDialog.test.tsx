@@ -282,6 +282,58 @@ describe("the create flow", () => {
     });
   });
 
+  it("offers the words the domain itself writes, with how used they are", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () => meResponse({ user: userFixture() }),
+        "/domains": domainsResponse,
+        "/domains/eng/manifest": () => ({
+          domain: "eng",
+          markdown: "# eng",
+          checksum: "m1",
+        }),
+        "/domains/eng/tree": (path) => tree(path),
+        "/domains/eng/engrams": () => ({
+          total: 0,
+          page: 1,
+          limit: 50,
+          count: 0,
+          hits: [],
+        }),
+        "/vocabulary": () => ({
+          tags: [],
+          categories: [],
+          relation_types: [],
+          types: [
+            { name: "playbook", count: 7 },
+            { name: "guide", count: 2 },
+          ],
+          statuses: [{ name: "brewing", count: 5 }],
+        }),
+      }),
+    );
+    renderApp("/d/eng");
+    await userEvent.click(
+      await screen.findByRole("button", { name: "New engram" }),
+    );
+    const form = within(await screen.findByRole("dialog"));
+
+    await userEvent.click(form.getByLabelText("Type"));
+    // A word this app has never heard of, because the domain writes it.
+    expect(
+      await form.findByRole("option", { name: /^playbook/ }),
+    ).toHaveTextContent("7");
+    // A recommended word keeps its line and gains the live count.
+    const known = form.getByRole("option", { name: /^guide/ });
+    expect(known).toHaveTextContent("how to do something, start to finish");
+    expect(known).toHaveTextContent("2");
+
+    await userEvent.click(form.getByLabelText("Status"));
+    expect(form.getByRole("option", { name: /^brewing/ })).toHaveTextContent(
+      "5",
+    );
+  });
+
   it("omits the tags key entirely when the field is left empty", async () => {
     const created = vi.fn(() => ({
       domain: "eng",

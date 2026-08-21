@@ -14,9 +14,11 @@
  * The recommended `type` and `status` values are the app's one list, offered
  * through the suggesting input: the words are on screen with a line each on
  * what they are for, so nobody has to have memorized the set to write one
- * down. Anything can be typed and nothing here treats an unlisted value as
- * wrong - the fields are free form by design, and a select would quietly
- * claim otherwise.
+ * down. Beside them are the words this domain has already written, each with
+ * how many engrams carry it, so a house word is picked rather than retyped
+ * from memory. Anything can be typed and nothing here treats an unlisted
+ * value as wrong - the fields are free form by design, and a select would
+ * quietly claim otherwise.
  */
 
 import type { Text } from "@codemirror/state";
@@ -29,7 +31,11 @@ import type { Vocabulary } from "../api/vocabulary";
 import { FIELD_CLASSES } from "../components/FilterControls";
 import { BUTTON, FOCUS_RING, IconButton } from "../components/primitives";
 import { SuggestInput } from "../components/SuggestInput";
-import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "../suggestions";
+import {
+  STATUS_SUGGESTIONS,
+  TYPE_SUGGESTIONS,
+  withHouseCounts,
+} from "../suggestions";
 import type { FieldEdit } from "./frontmatterFields";
 import {
   hasFrontmatterBlock,
@@ -45,7 +51,11 @@ export interface FrontmatterFormProps {
   doc: string;
   /** Where edits dispatch. Null until the view has mounted. */
   view: EditorView | null;
-  /** The domain's words, for the tag suggestions. */
+  /**
+   * The domain's own words: the tag suggestions, and the `type` and `status`
+   * values it already uses. Null while it is still being read, which simply
+   * leaves the recommended sets standing on their own.
+   */
   vocabulary: Vocabulary | null;
 }
 
@@ -172,7 +182,10 @@ export function FrontmatterForm({
           label="Type"
           className={`w-full ${FIELD_CLASSES}`}
           value={type}
-          suggestions={TYPE_SUGGESTIONS}
+          suggestions={withHouseCounts(
+            TYPE_SUGGESTIONS,
+            vocabulary?.types ?? [],
+          )}
           onCommit={scalar("type")}
           describedBy={guidance}
         />
@@ -186,7 +199,10 @@ export function FrontmatterForm({
           label="Status"
           className={`w-full ${FIELD_CLASSES}`}
           value={status}
-          suggestions={STATUS_SUGGESTIONS}
+          suggestions={withHouseCounts(
+            STATUS_SUGGESTIONS,
+            vocabulary?.statuses ?? [],
+          )}
           onCommit={scalar("status")}
           describedBy={guidance}
         />

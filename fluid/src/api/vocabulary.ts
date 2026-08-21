@@ -1,10 +1,10 @@
 /**
  * The words a domain is written in.
  *
- * Only the tags are read here, because they are the one filter axis the server
- * can enumerate completely: `type` and `status` are free form by design and no
- * endpoint lists the values in use, so a screen offers those as suggestions
- * rather than as a closed set.
+ * `type` and `status` stay free form by design, and the lists read here do not
+ * change that: they are what the domain HAS written, counted, not what it is
+ * allowed to write. A screen offers them beside the recommended words so a
+ * house word is one keystroke away, and still writes whatever was typed.
  *
  * The domain is a filter on this route rather than a path segment, so an
  * unknown name answers an empty vocabulary rather than a 404, and leaving it
@@ -77,6 +77,10 @@ export interface Vocabulary {
   tags: TagCount[];
   categories: NamedCount[];
   relationTypes: NamedCount[];
+  /** The `type` values in use, exactly as the engrams carry them. */
+  types: NamedCount[];
+  /** The `status` values in use, exactly as the engrams carry them. */
+  statuses: NamedCount[];
 }
 
 /** Read one named-count list off the payload, commonest first. */
@@ -105,6 +109,11 @@ export function readVocabulary(payload: unknown): Vocabulary {
     tags: readTags(payload),
     categories: readNamedCounts(record?.categories),
     relationTypes: readNamedCounts(record?.relation_types),
+    // Absent on a server older than these two lists, which is an empty list
+    // rather than a missing one: the caller merges them into the recommended
+    // words, and merging nothing is the recommended words themselves.
+    types: readNamedCounts(record?.types),
+    statuses: readNamedCounts(record?.statuses),
   };
 }
 

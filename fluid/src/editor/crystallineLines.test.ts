@@ -24,6 +24,8 @@ const VOCAB: Vocabulary = {
     { name: "relates_to", count: 5 },
     { name: "supersedes", count: 1 },
   ],
+  types: [],
+  statuses: [],
 };
 
 /**

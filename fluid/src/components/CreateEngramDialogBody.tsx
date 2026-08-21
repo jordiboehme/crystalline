@@ -20,10 +20,19 @@ import { useNavigate } from "react-router";
 import { problemDetail } from "../api/client";
 import { domainTreeKey, treeQuery } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
-import { fetchTags, vocabularyKey } from "../api/vocabulary";
+import {
+  fetchTags,
+  fetchVocabulary,
+  fullVocabularyKey,
+  vocabularyKey,
+} from "../api/vocabulary";
 import { createEngram } from "../api/writes";
 import { editRoute } from "../paths";
-import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "../suggestions";
+import {
+  STATUS_SUGGESTIONS,
+  TYPE_SUGGESTIONS,
+  withHouseCounts,
+} from "../suggestions";
 import type { CreateEngramDialogProps } from "./CreateEngramDialog";
 import { BUTTON, Field } from "./primitives";
 import { SuggestInput, suggestionsAreOpen } from "./SuggestInput";
@@ -54,6 +63,17 @@ export default function CreateEngramDialogBody({
   const knownTags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
+  });
+
+  // The `type` and `status` words this domain already writes, under the key
+  // the editor caches the same payload at. A key of its own rather than the
+  // tag one above, because the two parse the same route into different
+  // shapes - see `fullVocabularyKey`. An unread or failed query is simply no
+  // house words: the recommended sets stand on their own and the form works
+  // exactly as it did before, so there is nothing here to wait for.
+  const house = useQuery({
+    queryKey: fullVocabularyKey(domain),
+    queryFn: () => fetchVocabulary(domain),
   });
 
   const create = useMutation({
@@ -185,10 +205,11 @@ export default function CreateEngramDialogBody({
             {/*
               The suggesting input rather than a datalist: focus opens the
               whole recommended vocabulary with a line each on what the words
-              are for, which is what a field nobody has memorized needs. The
-              helper stays anyway - a list of words is what a closed set looks
-              like, and that anything else is allowed is the one thing the
-              popover cannot say for itself.
+              are for, which is what a field nobody has memorized needs, and
+              the words this domain already writes come with it. The helper
+              stays anyway - a list of words is what a closed set looks like,
+              and that anything else is allowed is the one thing the popover
+              cannot say for itself.
             */}
             <Field
               id={typeField}
@@ -201,7 +222,10 @@ export default function CreateEngramDialogBody({
                 describedBy={`${typeField}-help`}
                 className={FIELD_CLASSES}
                 value={engramType}
-                suggestions={TYPE_SUGGESTIONS}
+                suggestions={withHouseCounts(
+                  TYPE_SUGGESTIONS,
+                  house.data?.types ?? [],
+                )}
                 onChange={setEngramType}
                 placeholder="engram"
               />
@@ -219,7 +243,10 @@ export default function CreateEngramDialogBody({
                 describedBy={`${statusField}-help`}
                 className={FIELD_CLASSES}
                 value={status}
-                suggestions={STATUS_SUGGESTIONS}
+                suggestions={withHouseCounts(
+                  STATUS_SUGGESTIONS,
+                  house.data?.statuses ?? [],
+                )}
                 onChange={setStatus}
                 placeholder="stable"
               />

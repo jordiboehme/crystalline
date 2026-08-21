@@ -8,7 +8,11 @@
 import { describe, expect, it } from "vitest";
 
 import { SUGGESTED_STATUSES, SUGGESTED_TYPES } from "./filters";
-import { STATUS_SUGGESTIONS, TYPE_SUGGESTIONS } from "./suggestions";
+import {
+  STATUS_SUGGESTIONS,
+  TYPE_SUGGESTIONS,
+  withHouseCounts,
+} from "./suggestions";
 
 describe("the recommended vocabulary", () => {
   it("offers exactly what the filters offer, in the same order", () => {
@@ -30,5 +34,46 @@ describe("the recommended vocabulary", () => {
     // canonical word.
     const alias = STATUS_SUGGESTIONS.find((each) => each.name === "current");
     expect(alias?.gloss).toContain("stable");
+  });
+});
+
+describe("the words a domain already uses", () => {
+  it("gives a recommended word the count the domain has for it", () => {
+    const merged = withHouseCounts(
+      [{ name: "guide", gloss: "how to do something" }, { name: "decision" }],
+      [{ name: "guide", count: 4 }],
+    );
+
+    expect(merged).toStrictEqual([
+      { name: "guide", gloss: "how to do something", count: 4 },
+      { name: "decision" },
+    ]);
+  });
+
+  it("appends the domain's own words, commonest first, with no gloss", () => {
+    const merged = withHouseCounts(
+      [{ name: "engram", gloss: "a unit of knowledge" }],
+      [
+        { name: "sketch", count: 1 },
+        { name: "playbook", count: 9 },
+        { name: "essay", count: 1 },
+      ],
+    );
+
+    expect(merged).toStrictEqual([
+      { name: "engram", gloss: "a unit of knowledge" },
+      { name: "playbook", count: 9 },
+      { name: "essay", count: 1 },
+      { name: "sketch", count: 1 },
+    ]);
+  });
+
+  it("is the recommendations themselves when the domain adds nothing", () => {
+    expect(withHouseCounts(TYPE_SUGGESTIONS, [])).toStrictEqual([
+      ...TYPE_SUGGESTIONS,
+    ]);
+    expect(withHouseCounts(STATUS_SUGGESTIONS, [])).toStrictEqual([
+      ...STATUS_SUGGESTIONS,
+    ]);
   });
 });
