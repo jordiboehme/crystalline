@@ -4,3 +4,12 @@
 # 127.0.0.1:0), and without a terminate-after nextest waits forever.
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 2 }
+
+# The same two loopback suites, given a far longer ceiling rather than a mute:
+# they finish in under a second standalone, but a machine under environmental
+# load (a post-update Gatekeeper scan, a sandbox) has been seen stalling them
+# past the 240s the default override allows, killing tests that were only slow.
+# They still terminate, so a genuine hang cannot wedge the run.
+[[profile.default.overrides]]
+filter = 'binary(github_auth) or binary(github_client)'
+slow-timeout = { period = "120s", terminate-after = 10 }
