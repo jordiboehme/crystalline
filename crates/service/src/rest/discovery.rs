@@ -181,9 +181,9 @@ pub struct VocabularyQuery {
 }
 
 /// `GET /vocabulary` - the words the domains are written in: the tags in use
-/// with their counts, the observation categories and the relation types, plus
-/// the near-duplicate clusters and tag aliases the engine reports when there are
-/// any.
+/// with their counts, the observation categories, the relation types and the
+/// engram types and statuses, plus the near-duplicate clusters and tag aliases
+/// the engine reports when there are any.
 ///
 /// The domain is a filter here rather than a path segment, so an unknown name
 /// answers an empty vocabulary rather than a 404: this route asks what is in
@@ -198,14 +198,20 @@ pub struct VocabularyQuery {
         (
             status = 200,
             description = "The engine's own vocabulary payload, unchanged. \
-                           `clusters` and `aliases` are omitted when there are \
-                           none.",
+                           `tags`, `categories`, `relation_types`, `types` and \
+                           `statuses` are always present, empty when nothing is \
+                           in use; `clusters` and `aliases` are omitted when \
+                           there are none. `types` and `statuses` count the \
+                           engram `type` and `status` values as stored, with no \
+                           folding and no retirement filter.",
             body = Object,
             example = json!({
                 "domain": "eng",
                 "tags": [{ "name": "eng", "engrams": 3, "observations": 5 }],
                 "categories": [{ "name": "decision", "count": 4 }],
                 "relation_types": [{ "name": "relates_to", "count": 2 }],
+                "types": [{ "name": "engram", "count": 3 }],
+                "statuses": [{ "name": "stable", "count": 3 }],
                 "aliases": [{ "alias": "engineering", "canonical": "eng" }]
             }),
         ),

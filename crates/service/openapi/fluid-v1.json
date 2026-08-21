@@ -4576,7 +4576,7 @@
         "tags": [
           "discovery"
         ],
-        "summary": "`GET /vocabulary` - the words the domains are written in: the tags in use\nwith their counts, the observation categories and the relation types, plus\nthe near-duplicate clusters and tag aliases the engine reports when there are\nany.",
+        "summary": "`GET /vocabulary` - the words the domains are written in: the tags in use\nwith their counts, the observation categories, the relation types and the\nengram types and statuses, plus the near-duplicate clusters and tag aliases\nthe engine reports when there are any.",
         "description": "The domain is a filter here rather than a path segment, so an unknown name\nanswers an empty vocabulary rather than a 404: this route asks what is in\nuse, and the answer to that can legitimately be nothing.",
         "operationId": "get_vocabulary",
         "parameters": [
@@ -4593,7 +4593,7 @@
         ],
         "responses": {
           "200": {
-            "description": "The engine's own vocabulary payload, unchanged. `clusters` and `aliases` are omitted when there are none.",
+            "description": "The engine's own vocabulary payload, unchanged. `tags`, `categories`, `relation_types`, `types` and `statuses` are always present, empty when nothing is in use; `clusters` and `aliases` are omitted when there are none. `types` and `statuses` count the engram `type` and `status` values as stored, with no folding and no retirement filter.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4619,11 +4619,23 @@
                       "name": "relates_to"
                     }
                   ],
+                  "statuses": [
+                    {
+                      "count": 3,
+                      "name": "stable"
+                    }
+                  ],
                   "tags": [
                     {
                       "engrams": 3,
                       "name": "eng",
                       "observations": 5
+                    }
+                  ],
+                  "types": [
+                    {
+                      "count": 3,
+                      "name": "engram"
                     }
                   ]
                 }

@@ -2657,6 +2657,95 @@ async fn vocabulary_counts(store: &dyn Store) {
 }
 parity!(vocabulary_reports_usage_counts, vocabulary_counts);
 
+async fn vocabulary_types_and_statuses(store: &dyn Store) {
+    // Three engrams in one domain spell out both new aggregates: the types read
+    // `note, note, decision` and the statuses `stable, draft, stable`, so each
+    // list has one clear winner and one runner-up. A second domain adds a
+    // `guide` typed engram that is `deprecated`, which gives the domain filter
+    // something to exclude and proves a retired status is reported as written
+    // rather than folded away or dropped.
+    let eng = tempfile::tempdir().unwrap();
+    write(
+        eng.path(),
+        "alpha.md",
+        "---\ntype: note\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "beta.md",
+        "---\ntype: note\ntitle: Beta\npermalink: beta\ntags:\n  - t\nstatus: draft\nrecorded_at: 2026-01-01\n---\n\n# Beta\n\nbody\n",
+    );
+    write(
+        eng.path(),
+        "gamma.md",
+        "---\ntype: decision\ntitle: Gamma\npermalink: gamma\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Gamma\n\nbody\n",
+    );
+    sync_domain(store, "eng", eng.path()).await.unwrap();
+
+    let ops = tempfile::tempdir().unwrap();
+    write(
+        ops.path(),
+        "delta.md",
+        "---\ntype: guide\ntitle: Delta\npermalink: delta\ntags:\n  - t\nstatus: deprecated\nrecorded_at: 2026-01-01\n---\n\n# Delta\n\nbody\n",
+    );
+    sync_domain(store, "ops", ops.path()).await.unwrap();
+
+    let named_shape = |rows: &[NamedCount]| -> Vec<(String, i64)> {
+        rows.iter().map(|n| (n.name.clone(), n.count)).collect()
+    };
+
+    // The all-domain sweep counts every engram row and orders by count
+    // descending then name, so the three singletons sort alphabetically behind
+    // the pair.
+    let all = store.vocabulary(None).await.unwrap();
+    assert_eq!(
+        named_shape(&all.types),
+        vec![
+            ("note".to_string(), 2),
+            ("decision".to_string(), 1),
+            ("guide".to_string(), 1),
+        ],
+        "types count engrams and sort by count then name: {:?}",
+        all.types
+    );
+    assert_eq!(
+        named_shape(&all.statuses),
+        vec![
+            ("stable".to_string(), 2),
+            ("deprecated".to_string(), 1),
+            ("draft".to_string(), 1),
+        ],
+        "statuses are reported as written, retirement included: {:?}",
+        all.statuses
+    );
+
+    // The domain filter narrows both lists to one domain's engrams.
+    let scoped = store.vocabulary(Some("eng")).await.unwrap();
+    assert_eq!(
+        named_shape(&scoped.types),
+        vec![("note".to_string(), 2), ("decision".to_string(), 1)],
+        "the eng domain excludes the ops guide: {:?}",
+        scoped.types
+    );
+    assert_eq!(
+        named_shape(&scoped.statuses),
+        vec![("stable".to_string(), 2), ("draft".to_string(), 1)],
+        "and excludes the ops deprecated status: {:?}",
+        scoped.statuses
+    );
+
+    // An unknown domain yields empty vectors here too, matching the other lists.
+    let missing = store.vocabulary(Some("nope")).await.unwrap();
+    assert!(
+        missing.types.is_empty() && missing.statuses.is_empty(),
+        "an unknown domain is written in no types or statuses: {missing:?}"
+    );
+}
+parity!(
+    vocabulary_reports_types_and_statuses,
+    vocabulary_types_and_statuses
+);
+
 async fn tag_identity_folds(store: &dyn Store) {
     // Two engrams carry the same tag in different cases on their frontmatter,
     // plus an observation hashtag in a third case. Tag identity is case-folded

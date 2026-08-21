@@ -5775,20 +5775,27 @@ impl Engine {
 
     // --- vocabulary ----------------------------------------------------------
 
-    /// List the tags, observation categories and relation types already in use,
-    /// each with a usage count, for one domain or across every domain. An unknown
-    /// domain reports empty lists rather than erroring, matching the store
-    /// contract, so an agent can probe a fresh domain safely. `domain` echoes the
-    /// request, `null` for an all-domain sweep.
+    /// List the tags, observation categories, relation types and engram `type`
+    /// and `status` values already in use, each with a usage count, for one
+    /// domain or across every domain. An unknown domain reports empty lists
+    /// rather than erroring, matching the store contract, so an agent can probe a
+    /// fresh domain safely. `domain` echoes the request, `null` for an all-domain
+    /// sweep.
     pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
         let store = self.store.lock().await;
         let vocab = store.vocabulary(p.domain.as_deref()).await?;
         drop(store);
+        // Every count list is present unconditionally, empty when nothing is in
+        // use, so a client reads a list rather than testing for a missing key.
+        // Only the two advisory keys below (clusters, aliases) are omitted when
+        // they have nothing to say.
         let mut out = json!({
             "domain": p.domain,
             "tags": vocab.tags,
             "categories": vocab.categories,
             "relation_types": vocab.relation_types,
+            "types": vocab.types,
+            "statuses": vocab.statuses,
         });
         // Near-duplicate tag clusters, omitted entirely when there are none so a
         // clean vocabulary stays quiet. They point at tags to consolidate with

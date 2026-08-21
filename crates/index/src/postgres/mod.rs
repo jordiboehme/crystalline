@@ -2101,12 +2101,13 @@ impl Store for PostgresStore {
     }
 
     async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
-        // Four grouped scans mirroring the Turso backend exactly: engram tags,
-        // observation tags, observation categories and relation types. When a
-        // domain is named each aggregate joins back to the owning engram's
-        // domain by name, so an unknown name matches no rows and the vocabulary
-        // comes back empty. The maps are merged and every vector sorted in Rust
-        // (see `build_vocabulary`) so the order does not depend on SQL grouping.
+        // Six grouped scans mirroring the Turso backend exactly: engram tags,
+        // observation tags, observation categories, relation types and the
+        // engram `type` and `status` columns. When a domain is named each
+        // aggregate joins back to the owning engram's domain by name, so an
+        // unknown name matches no rows and the vocabulary comes back empty. The
+        // maps are merged and every vector sorted in Rust (see
+        // `build_vocabulary`) so the order does not depend on SQL grouping.
         let dparam = || match domain {
             Some(d) => vec![Param::Text(d.to_string())],
             None => vec![],
@@ -2156,7 +2157,26 @@ impl Store for PostgresStore {
         } else {
             "SELECT r.rel_type, COUNT(*) FROM relation r GROUP BY r.rel_type"
         };
-        // The fifth scan surfaces the derived tag aliases in effect. Scoped by
+        // The engram `type` and `status` columns, counted as stored: no folding
+        // of `stable` and `current` and no retirement filter, because this
+        // surface reports what the engrams are literally written in. The empty
+        // guard matches the category scan; both columns default to `''`, and a
+        // nameless entry would say nothing.
+        let type_sql = if domain.is_some() {
+            "SELECT e.engram_type, COUNT(*) FROM engram e \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE e.engram_type <> '' AND d.name=$1 GROUP BY e.engram_type"
+        } else {
+            "SELECT e.engram_type, COUNT(*) FROM engram e WHERE e.engram_type <> '' GROUP BY e.engram_type"
+        };
+        let status_sql = if domain.is_some() {
+            "SELECT e.status, COUNT(*) FROM engram e \
+             JOIN domain d ON d.id=e.domain_id \
+             WHERE e.status <> '' AND d.name=$1 GROUP BY e.status"
+        } else {
+            "SELECT e.status, COUNT(*) FROM engram e WHERE e.status <> '' GROUP BY e.status"
+        };
+        // The last scan surfaces the derived tag aliases in effect. Scoped by
         // domain name like the counts; `build_vocabulary` dedupes and sorts.
         let alias_sql = if domain.is_some() {
             "SELECT DISTINCT ta.alias, ta.canonical FROM tag_alias ta \
@@ -2170,6 +2190,8 @@ impl Store for PostgresStore {
         let observation_tags = decode(&query_all(conn.as_mut(), obs_tag_sql, dparam()).await?);
         let categories = decode(&query_all(conn.as_mut(), category_sql, dparam()).await?);
         let relation_types = decode(&query_all(conn.as_mut(), rel_sql, dparam()).await?);
+        let types = decode(&query_all(conn.as_mut(), type_sql, dparam()).await?);
+        let statuses = decode(&query_all(conn.as_mut(), status_sql, dparam()).await?);
         let aliases: Vec<(String, String)> = query_all(conn.as_mut(), alias_sql, dparam())
             .await?
             .iter()
@@ -2186,6 +2208,8 @@ impl Store for PostgresStore {
             observation_tags,
             categories,
             relation_types,
+            types,
+            statuses,
             aliases,
         ))
     }
