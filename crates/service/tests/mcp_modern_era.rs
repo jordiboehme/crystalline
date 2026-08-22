@@ -2428,13 +2428,56 @@ fn share_kb(responses: Option<Value>) -> Value {
     params
 }
 
-/// Edit one engram in the team domain so there is something to share.
-fn edit_kb(h: &Harness) {
+/// Write one engram straight into the team domain's working tree, the way a
+/// person editing files beside the agent would.
+fn write_kb_engram(h: &Harness, path: &str, title: &str, permalink: &str, body: &str) {
     std::fs::write(
-        h.root.join("kb/notes/a.md"),
-        "---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha, refined\n",
+        h.root.join("kb").join(path),
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
+        ),
     )
     .unwrap();
+}
+
+/// Edit one engram in the team domain so there is something to share.
+fn edit_kb(h: &Harness) {
+    write_kb_engram(h, "notes/a.md", "Alpha", "notes/a", "alpha, refined");
+}
+
+/// Edit one engram and put the domain's first proposal on the mock forge
+/// through the real two-round flow, on a fresh eliciting connection. Returns
+/// the open wire (ids 1 and 2 are spent), the proposal's number and its
+/// branch, which is what a test needs to amend the branch behind the agent's
+/// back.
+async fn first_shared_proposal(h: &Harness) -> (Wire, u64, String) {
+    edit_kb(h);
+    let mut wire = h.stdio().await;
+    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            share_kb(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "{body}");
+    (
+        wire,
+        body["number"].as_u64().unwrap(),
+        body["branch"].as_str().unwrap().to_string(),
+    )
 }
 
 /// Round one: the question names the action and the files, and the forge sees
@@ -2457,11 +2500,11 @@ async fn an_eliciting_share_is_asked_before_anything_is_shared() {
         .unwrap_or_default();
     assert!(message.contains("Open a new proposal"), "{message}");
     assert!(message.contains("notes/a.md"), "names the file: {message}");
+    // Every `create_` prefix, not just `create_proposal:`: a round that
+    // uploaded blobs, built a tree or cut a branch and then asked would have
+    // published most of the share already.
     assert!(
-        !mock
-            .calls()
-            .iter()
-            .any(|c| c.starts_with("create_proposal:")),
+        !mock.calls().iter().any(|c| c.starts_with("create_")),
         "round one shares nothing: {:?}",
         mock.calls()
     );
@@ -2470,15 +2513,44 @@ async fn an_eliciting_share_is_asked_before_anything_is_shared() {
 /// Round two with a yes shares, and the next round one names the update.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
-    let (h, mock) = Harness::team().await;
-    edit_kb(&h);
-    let mut wire = h.stdio().await;
+    let (h, _mock) = Harness::team().await;
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
 
-    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
-    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+    // A second edited share's round 1 names the update rather than a create.
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Update open proposal #{number}")),
+        "{message}"
+    );
+}
+
+/// Round two with a yes on an *update* lands on the open proposal rather than
+/// opening a second one.
+///
+/// The confirmed create is proved above; this is the other half, and it is
+/// the half the description promises hardest ("same proposal number, same
+/// URL, it never opens a duplicate"), so the number is asserted rather than
+/// just the outcome word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_update_round_two_lands_on_the_same_proposal() {
+    let (h, mock) = Harness::team().await;
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "an update is confirmed too, not waved through: {asked}"
+    );
+
     let done = wire
         .call(eliciting(
-            2,
+            4,
             "tools/call",
             share_kb(Some(answer("accept", true))),
         ))
@@ -2489,20 +2561,72 @@ async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
     );
     let body: Value =
         serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(body["outcome"], "proposed", "{body}");
-    let number = body["number"].as_u64().unwrap();
-
-    // A second edited share's round 1 names the update rather than a create.
-    std::fs::write(h.root.join("kb/notes/b.md"), "---\ntype: engram\ntitle: Beta\npermalink: notes/b\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbeta\n").unwrap();
-    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
-    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
-        .as_str()
-        .unwrap_or_default();
-    assert!(
-        message.contains(&format!("Update open proposal #{number}")),
-        "{message}"
+    assert_eq!(body["outcome"], "updated", "{body}");
+    assert_eq!(
+        body["proposal"]["number"].as_u64(),
+        Some(number),
+        "the same proposal, not a duplicate: {body}"
     );
-    let _ = mock;
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("update_proposal:")),
+        "the open proposal was patched: {:?}",
+        mock.calls()
+    );
+}
+
+/// A diverged proposal is reported in round one rather than asked about.
+///
+/// There is nothing to confirm: the share cannot proceed at all until the
+/// user settles the review on GitHub or withdraws, so putting a yes/no
+/// question in front of them would offer a choice neither answer to changes
+/// anything. The guidance that names both ways out has to survive the round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_diverged_proposal_answers_round_one_with_guidance() {
+    let (h, mock) = Harness::team().await;
+    let (mut wire, number, branch) = first_shared_proposal(&h).await;
+
+    // A reviewer pushes a commit onto the proposal branch.
+    let amended = mock.add_commit(
+        [(
+            "MANIFEST.md".to_string(),
+            b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything, reviewed\n\n## When to Use\n\n- Always\n".to_vec(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    mock.set_branch(&branch, &amended);
+    write_kb_engram(&h, "notes/c.md", "Gamma", "notes/c", "gamma");
+
+    // Everything the forge was told before the diverged round, so the
+    // assertion below is about this round rather than about the share that
+    // legitimately opened the proposal.
+    let before = mock.calls().len();
+
+    let done = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a share that cannot proceed is reported, not negotiated: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposal_diverged", "{body}");
+    assert_eq!(body["proposal"]["number"].as_u64(), Some(number), "{body}");
+    let guidance = body["guidance"].as_str().unwrap_or_default();
+    assert!(
+        guidance.contains("withdraw") && guidance.contains("GitHub"),
+        "both ways out are named: {guidance}"
+    );
+
+    let during = &mock.calls()[before..];
+    assert!(
+        !during
+            .iter()
+            .any(|c| c.starts_with("create_") || c.starts_with("update_")),
+        "the diverged round publishes nothing: {during:?}"
+    );
 }
 
 /// Round two with a no refuses, and the forge is never written to.
@@ -2529,11 +2653,9 @@ async fn a_declined_share_refuses_with_no_provider_writes() {
         "and it says what did not happen, exactly as the delete refusal does: {refused}"
     );
     assert!(
-        !mock
-            .calls()
-            .iter()
-            .any(|c| c.starts_with("create_proposal:")),
-        "{:?}",
+        !mock.calls().iter().any(|c| c.starts_with("create_")),
+        "a decline uploads no blob, builds no tree, cuts no branch and opens \
+         no proposal: {:?}",
         mock.calls()
     );
 }

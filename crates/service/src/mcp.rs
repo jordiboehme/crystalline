@@ -1446,11 +1446,17 @@ impl McpServer {
                         .origin_share_preview(&p.domain, p.title.as_deref())
                         .await
                         .map_err(to_error)?;
-                    // Only a share that would write gets a question;
+                    // Only a share that would publish gets a question;
                     // nothing_to_share, conflicts_pending and
-                    // proposal_diverged answer in round one, and executing
-                    // the share produces exactly those canonical shapes
-                    // without a provider write.
+                    // proposal_diverged answer in round one, because
+                    // executing the share produces exactly those canonical
+                    // shapes with no publishing write - no commit, no branch
+                    // update, no proposal opened or patched. Stated that way
+                    // rather than as "no provider write": the pull the share
+                    // runs first can reconcile a proposal the forge already
+                    // closed, so a diverged answer may be preceded by
+                    // bookkeeping calls. Those record what the forge already
+                    // decided; they never publish this domain's changes.
                     if matches!(preview["action"].as_str(), Some("create") | Some("update")) {
                         return Ok(confirm_question(share_question(&preview)).into());
                     }
@@ -2559,17 +2565,28 @@ fn delete_question(preview: &Value) -> String {
 /// keeps the proposal's number and URL in front of the user), the effective
 /// title and the change mix, naming at most ten files.
 ///
-/// **The title named here is the one the share writes, not a promise to
-/// retitle the proposal.** An update keeps whatever title the proposal was
-/// opened with on GitHub; `effective_title` is what its fresh commit says.
+/// **The two actions label the title line differently, because the value
+/// means different things to each.** On a create it is the proposal's title
+/// on GitHub, so it is labelled `Title`. On an update it is always the fresh
+/// commit's message, so it is labelled `Commit message` - which stays honest
+/// either way the caller went: with no `title` argument
+/// [`crystalline_remote::ops`]'s update forwards `None` and the pull request
+/// keeps whatever title it was opened with, and with a `title` argument the
+/// same value is both the commit message and the retitling PATCH the update
+/// sends. Labelling it `Title` would promise a retitle in the first case,
+/// which is the one a caller lands on by default.
 fn share_question(preview: &Value) -> String {
-    let action = match preview["action"].as_str().unwrap_or_default() {
-        "update" => format!(
-            "Update open proposal #{} ({})",
-            preview["number"].as_u64().unwrap_or_default(),
-            preview["url"].as_str().unwrap_or_default()
+    // `label` rides along with the action for exactly the reason above.
+    let (action, label) = match preview["action"].as_str().unwrap_or_default() {
+        "update" => (
+            format!(
+                "Update open proposal #{} ({})",
+                preview["number"].as_u64().unwrap_or_default(),
+                preview["url"].as_str().unwrap_or_default()
+            ),
+            "Commit message",
         ),
-        _ => "Open a new proposal".to_string(),
+        _ => ("Open a new proposal".to_string(), "Title"),
     };
     let title = preview["effective_title"].as_str().unwrap_or_default();
     let empty = Vec::new();
@@ -2595,7 +2612,7 @@ fn share_question(preview: &Value) -> String {
         names.join(", ")
     };
     format!(
-        "{action}? Title: '{title}'. {added} added, {updated} modified, {deleted} deleted: {listed}. Reviewers see the result on GitHub."
+        "{action}? {label}: '{title}'. {added} added, {updated} modified, {deleted} deleted: {listed}. Reviewers see the result on GitHub."
     )
 }
 
@@ -3032,7 +3049,16 @@ mod tests {
             update.contains("Update open proposal #4 (https://github.test/pulls/4)"),
             "{update}"
         );
-        assert!(update.contains("Refine 1 engram in kb"), "{update}");
+        // An update's title line is the commit message, never a promise to
+        // retitle a proposal the caller passed no title for.
+        assert!(
+            update.contains("Commit message: 'Refine 1 engram in kb'"),
+            "{update}"
+        );
+        assert!(
+            !update.contains("Title: '"),
+            "an update never labels it Title: {update}"
+        );
         assert!(
             update.contains("0 added, 1 modified, 0 deleted: notes/a.md"),
             "{update}"
@@ -3046,6 +3072,11 @@ mod tests {
             "changes": changes,
         }));
         assert!(create.contains("Open a new proposal"), "{create}");
+        // A create really does title the proposal, so it says so.
+        assert!(
+            create.contains("Title: 'Share 12 new engrams from kb'"),
+            "{create}"
+        );
         assert!(create.contains("and 2 more"), "{create}");
         assert!(!create.contains("notes/f10.md"), "capped at ten: {create}");
     }
