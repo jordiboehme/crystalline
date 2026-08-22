@@ -49,7 +49,9 @@ const DEFAULT_API_URL: &str = "https://api.github.com";
 /// The API version pinned in every request's `X-GitHub-Api-Version` header.
 const API_VERSION: &str = "2022-11-28";
 
-/// How many changed files [`GitHubProvider::compare`] asks for per page.
+/// How many entries this client asks for per page on every paginated list it
+/// walks: the compare endpoint's changed files, the open-proposal list and
+/// each of the three feedback channels. 100 is GitHub's documented maximum.
 const COMPARE_PER_PAGE: usize = 100;
 
 /// The documented cap on how many changed files the compare endpoint reports
@@ -156,6 +158,35 @@ impl GitHubProvider {
             status: status.as_u16(),
             message,
         })
+    }
+
+    /// Walks every page of a list endpoint that takes no query parameters of
+    /// its own, following `page` for as long as a page comes back full.
+    ///
+    /// The three feedback channels need this rather than a single capped
+    /// request: GitHub returns reviews and comments oldest first, so a
+    /// proposal with a long thread would drop exactly the newest feedback,
+    /// which is the part the consumer keeps.
+    async fn paged_list<T: DeserializeOwned>(
+        &self,
+        repo: &str,
+        path: &str,
+    ) -> Result<Vec<T>, RemoteError> {
+        let mut out = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let url = format!("{path}?per_page={COMPARE_PER_PAGE}&page={page}");
+            let response = self.send(self.request(Method::GET, &url)).await?;
+            let response = self.check(response, Some(repo)).await?;
+            let items: Vec<T> = parse_json(response).await?;
+            let count = items.len();
+            out.extend(items);
+            if count < COMPARE_PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
     }
 }
 
@@ -422,20 +453,24 @@ impl Provider for GitHubProvider {
     ) -> Result<Feedback, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
 
-        let path = format!("/repos/{owner}/{name}/pulls/{number}/reviews?per_page=100");
-        let response = self.send(self.request(Method::GET, &path)).await?;
-        let response = self.check(response, Some(&origin.repo)).await?;
-        let reviews: Vec<ReviewResponse> = parse_json(response).await?;
-
-        let path = format!("/repos/{owner}/{name}/pulls/{number}/comments?per_page=100");
-        let response = self.send(self.request(Method::GET, &path)).await?;
-        let response = self.check(response, Some(&origin.repo)).await?;
-        let review_comments: Vec<ReviewCommentResponse> = parse_json(response).await?;
-
-        let path = format!("/repos/{owner}/{name}/issues/{number}/comments?per_page=100");
-        let response = self.send(self.request(Method::GET, &path)).await?;
-        let response = self.check(response, Some(&origin.repo)).await?;
-        let issue_comments: Vec<IssueCommentResponse> = parse_json(response).await?;
+        let reviews: Vec<ReviewResponse> = self
+            .paged_list(
+                &origin.repo,
+                &format!("/repos/{owner}/{name}/pulls/{number}/reviews"),
+            )
+            .await?;
+        let review_comments: Vec<ReviewCommentResponse> = self
+            .paged_list(
+                &origin.repo,
+                &format!("/repos/{owner}/{name}/pulls/{number}/comments"),
+            )
+            .await?;
+        let issue_comments: Vec<IssueCommentResponse> = self
+            .paged_list(
+                &origin.repo,
+                &format!("/repos/{owner}/{name}/issues/{number}/comments"),
+            )
+            .await?;
 
         Ok(build_feedback(reviews, review_comments, issue_comments))
     }
@@ -623,8 +658,11 @@ fn map_compare_file(file: CompareFile) -> UpstreamChange {
 
 /// Folds the three feedback channels into the forge-neutral [`Feedback`].
 ///
-/// Review state: the latest non-empty state per reviewer wins (a bare
-/// COMMENTED event with no body does not displace an earlier verdict), then
+/// Review state: the last reported non-empty state per reviewer wins, "last"
+/// meaning last in `reviews` rather than by any timestamp - GitHub returns
+/// reviews in chronological order, and this trusts that array order rather
+/// than re-sorting on `submitted_at`, which is optional on the wire. A bare
+/// COMMENTED event with no body does not displace an earlier verdict, then
 /// any reviewer at CHANGES_REQUESTED makes the whole state
 /// "changes_requested", else any APPROVED makes it "approved", else any
 /// COMMENTED makes it "commented". Review bodies become items only when

@@ -209,7 +209,12 @@ pub trait Provider: Send + Sync {
     /// The commit an arbitrary branch points at, or `None` when the branch
     /// does not exist. Unlike [`Provider::branch_head`] this reads any branch
     /// rather than only the tracked one, and reports a missing branch as an
-    /// answer rather than as a repository problem.
+    /// answer rather than as a repository problem. That widening cuts both
+    /// ways: a repository that is gone, renamed or no longer readable with
+    /// this token answers `None` too, so `None` means "no branch found here"
+    /// and never on its own means "the repository is fine and the branch was
+    /// deleted". Callers must not make it the sole basis for a success
+    /// verdict.
     async fn branch_ref(
         &self,
         origin: &OriginSpec,

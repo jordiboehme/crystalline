@@ -510,6 +510,9 @@ impl Provider for MockProvider {
 
     async fn close_proposal(&self, _origin: &OriginSpec, number: u64) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        // Logged before the failure check, like every other call here, so an
+        // injected failure still leaves a trace of the attempt.
+        inner.calls.push(format!("close_proposal:{number}"));
         if inner.close_failures.contains(&number) {
             return Err(RemoteError::Api {
                 status: 500,
@@ -517,7 +520,6 @@ impl Provider for MockProvider {
             });
         }
         inner.proposals.insert(number, ProposalState::Declined);
-        inner.calls.push(format!("close_proposal:{number}"));
         Ok(())
     }
 
@@ -563,6 +565,9 @@ impl Provider for MockProvider {
                 head_sha,
             });
         }
+        // `proposals` is a HashMap, so sort before returning: tests assert on
+        // the order the caller then works through these in.
+        out.sort_by_key(|p| p.number);
         Ok(out)
     }
 

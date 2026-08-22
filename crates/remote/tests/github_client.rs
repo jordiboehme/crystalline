@@ -803,3 +803,64 @@ async fn list_open_proposals_pages_until_a_short_page() {
     assert_eq!(open[0].head_sha, "s1");
     assert_eq!(open[100].number, 101);
 }
+
+#[tokio::test]
+async fn proposal_feedback_pages_every_channel_until_a_short_page() {
+    // GitHub returns each of the three channels oldest first, so a client that
+    // read only the first page would drop exactly the newest feedback. Every
+    // channel here is one full page plus a short one; all three tails must
+    // survive into the result.
+    fn page_of(q: &HashMap<String, String>, tail: serde_json::Value) -> serde_json::Value {
+        assert_eq!(q.get("per_page").map(String::as_str), Some("100"));
+        let page: usize = q.get("page").unwrap().parse().unwrap();
+        if page == 1 {
+            let rows: Vec<serde_json::Value> = (0..100).map(|_| tail.clone()).collect();
+            serde_json::Value::Array(rows)
+        } else {
+            serde_json::Value::Array(vec![tail])
+        }
+    }
+
+    let app = Router::new()
+        .route(
+            "/repos/acme/brand-knowledge/pulls/4/reviews",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                Json(page_of(
+                    &q,
+                    serde_json::json!({"user": {"login": "ana"}, "state": "COMMENTED", "body": "a review body", "submitted_at": "2026-08-20T09:00:00Z"}),
+                ))
+            }),
+        )
+        .route(
+            "/repos/acme/brand-knowledge/pulls/4/comments",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                Json(page_of(
+                    &q,
+                    serde_json::json!({"user": {"login": "bob"}, "body": "inline", "path": "notes/a.md", "line": 3, "created_at": "2026-08-20T10:00:00Z"}),
+                ))
+            }),
+        )
+        .route(
+            "/repos/acme/brand-knowledge/issues/4/comments",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                Json(page_of(
+                    &q,
+                    serde_json::json!({"user": {"login": "ana"}, "body": "chat", "created_at": "2026-08-20T11:00:00Z"}),
+                ))
+            }),
+        );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    let fb = provider.proposal_feedback(&origin(), 4).await.unwrap();
+
+    let count = |kind: crystalline_remote::state::FeedbackKind| {
+        fb.items.iter().filter(|i| i.kind == kind).count()
+    };
+    assert_eq!(count(crystalline_remote::state::FeedbackKind::Review), 101);
+    assert_eq!(
+        count(crystalline_remote::state::FeedbackKind::ReviewComment),
+        101
+    );
+    assert_eq!(count(crystalline_remote::state::FeedbackKind::Comment), 101);
+    assert_eq!(fb.review_state.as_deref(), Some("commented"));
+}
