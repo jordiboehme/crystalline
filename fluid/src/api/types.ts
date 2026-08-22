@@ -534,6 +534,106 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/sync/changes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Preview what sharing this team domain would do.
+         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
+         */
+        get: operations["get_domain_share_changes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/sync/conflicts/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * One recorded conflict, with every side.
+         * @description Admin only. Reads the conflict the domain's origin state recorded under this id: the base and upstream sides kept beside it, plus the current local content. A side that exists but is not UTF-8 comes back null with `note` saying so. Entirely local - no GitHub connection is needed, and a read-only instance serves it.
+         */
+        get: operations["get_domain_conflict"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/sync/conflicts/{id}/resolve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Resolve one recorded conflict by id.
+         * @description Admin only. Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.
+         */
+        post: operations["resolve_domain_conflict"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/sync/proposals/{number}/withdraw": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Withdraw one of a team domain's open proposals.
+         * @description Admin only. Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
+         */
+        post: operations["withdraw_domain_proposal"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/sync/share": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Share a team domain's local changes as a proposal.
+         * @description Admin only. Opens a pull request against the domain's origin, or updates the one already open in place. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
+         */
+        post: operations["share_domain"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/tree": {
         parameters: {
             query?: never;
@@ -1352,6 +1452,23 @@ export interface components {
              */
             type: string;
         };
+        /** @description How to settle the conflict: keep `mine`, take `theirs`, or write `merged` content of your own. `content` belongs to `merged` and to nothing else. */
+        ResolveBody: {
+            /**
+             * @description The merged markdown. Required for `merged`, meaningless otherwise.
+             * @example ---
+             *     title: A
+             *     ---
+             *
+             *     both points, one file
+             */
+            content?: string | null;
+            /**
+             * @description mine | theirs | merged
+             * @example theirs
+             */
+            resolution: string;
+        };
         /** @description Guided retirement of one engram: a `status` from a fixed set, an optional close-out date, and, for `superseded`, the successor that wires the reciprocal relation pair. */
         RetireBody: {
             /**
@@ -1427,6 +1544,19 @@ export interface components {
              * @example a1b2c3d4e5f60718293a4b5c6d7e8f90
              */
             token?: string | null;
+        };
+        /** @description The proposal's title and description. Both optional: with neither, the share carries a title the engine generates from the changes themselves. */
+        ShareBody: {
+            /**
+             * @description A longer description of what changed and why.
+             * @example Sharper wording on the routing rules.
+             */
+            description?: string | null;
+            /**
+             * @description The pull request title. Defaults to a generated summary.
+             * @example Refine 2 engrams in kb
+             */
+            title?: string | null;
         };
         /** @description A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is. */
         TokenBody: {
@@ -1569,6 +1699,14 @@ export interface components {
             errors: number;
             /** @description Every finding, format and temporal families, default severities. */
             findings: components["schemas"]["ValidateFinding"][];
+        };
+        /** @description Whether withdrawing also puts the shared files back the way the team has them. Absent means false: the proposal closes and the working tree is left alone. */
+        WithdrawBody: {
+            /**
+             * @description Restore the shared files from the origin as the proposal closes.
+             * @example false
+             */
+            revert?: boolean | null;
         };
     };
     responses: never;
@@ -4083,6 +4221,416 @@ export interface operations {
             };
             /** @description The domain has no team origin to pull from, GitHub is switched off on this instance, or it is on but no account is connected - the detail says which, and where to fix it. A repository that is simply missing is a different answer, carrying the remote's own not-found error. */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_domain_share_changes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "action": "update",
+                     *       "changes": [
+                     *         {
+                     *           "kind": "modified",
+                     *           "path": "notes/a.md"
+                     *         }
+                     *       ],
+                     *       "effective_title": "Refine 2 engrams in kb",
+                     *       "number": 4,
+                     *       "url": "https://github.com/acme/knowledge/pull/4"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or a domain with no team origin. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance, or it is on but no account is connected - the detail says which, and where to fix it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_domain_conflict: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+                /** @description The conflict id from the sync status. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The conflict and its three sides. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "base": "---\ntitle: A\n---\n\nthe shared start\n",
+                     *       "detected_at": "2026-08-10T08:00:00Z",
+                     *       "id": "a1b2c3d4",
+                     *       "kind": "both_modified",
+                     *       "local": "---\ntitle: A\n---\n\nmy version\n",
+                     *       "note": null,
+                     *       "path": "notes/a.md",
+                     *       "upstream": "---\ntitle: A\n---\n\nthe team's version\n"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, a domain with no team origin, or no open conflict with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    resolve_domain_conflict: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+                /** @description The conflict id from the sync status. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ResolveBody"];
+            };
+        };
+        responses: {
+            /** @description The path that was resolved and how many conflicts this domain still has open. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "remaining": 0,
+                     *       "resolved": "notes/a.md"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, a domain with no team origin, or no open conflict with that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain has no team origin, or GitHub is switched off on this instance. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An unknown `resolution`, or `merged` with no `content` to write. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    withdraw_domain_proposal: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+                /** @description The proposal number to withdraw. */
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WithdrawBody"];
+            };
+        };
+        responses: {
+            /** @description The engine's own withdraw report: the number, whether a live pull request was closed, the `withdrawn` status the record now carries and the working-tree lists a revert produced. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "closed": true,
+                     *       "deleted": [],
+                     *       "number": 4,
+                     *       "restored": [
+                     *         "notes/a.md"
+                     *       ],
+                     *       "skipped_diverged": [],
+                     *       "status": "withdrawn"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or no such proposal. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain has no team origin, GitHub is switched off on this instance, or it is on but no account is connected. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    share_domain: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered team domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShareBody"];
+            };
+        };
+        responses: {
+            /** @description The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "added": [
+                     *         "notes/b.md"
+                     *       ],
+                     *       "branch": "crystalline/kb-20260821",
+                     *       "deleted": [],
+                     *       "number": 4,
+                     *       "outcome": "proposed",
+                     *       "skipped_large": [],
+                     *       "summary": "Refine 2 engrams in kb",
+                     *       "updated": [
+                     *         "notes/a.md"
+                     *       ],
+                     *       "url": "https://github.com/acme/knowledge/pull/4"
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain has no team origin to share with, GitHub is switched off on this instance, or it is on but no account is connected. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
                 headers: {
                     [name: string]: unknown;
                 };

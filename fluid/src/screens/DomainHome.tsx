@@ -42,6 +42,7 @@ import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
+import { ProposalsCard } from "../components/ProposalsCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
 import { BUTTON, Chip, FOCUS_RING } from "../components/primitives";
@@ -229,6 +230,13 @@ export default function DomainHome() {
         here, the not-found branch above returns first.
       */}
       {capabilities.canAdminister && <SyncCard domain={domain} />}
+      {/*
+        The same gate, and the same query behind it: the card beside this one
+        says how many proposals there are and this one says which they are, off
+        one fetch. It draws nothing when there are none, so a team domain
+        between proposals looks exactly like it did before.
+      */}
+      {capabilities.canAdminister && <ProposalsCard domain={domain} />}
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">
