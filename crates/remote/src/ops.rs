@@ -133,6 +133,11 @@ pub struct OriginStatusReport {
     pub conflicts: Vec<Conflict>,
     /// When the branch was last checked for new upstream commits.
     pub last_checked: Option<chrono::DateTime<chrono::Utc>>,
+    /// Numbers of open proposals whose live branch head no longer matches the
+    /// recorded head_commit: a reviewer amended the branch. Empty when the
+    /// live list was not consulted (offline, no probe, or the list call
+    /// failed and status degraded to local state).
+    pub amended_upstream: Vec<u64>,
 }
 
 /// What [`propose`] did with a domain's local changes.
@@ -366,14 +371,15 @@ pub async fn pull(
     }
 
     // Refresh open proposals first so a just-merged one can override its own
-    // files in the merge loop below.
-    let transitions = refresh_proposals(provider, spec, &mut state).await?;
+    // files in the merge loop below. Every Merged record is collected, not
+    // only the ones that flipped in this refresh: `status` can flip a record
+    // to Merged between pulls, and such a record is un-consumed work this
+    // pull has to finish.
+    let (transitions, _) = refresh_proposals(provider, spec, &mut state).await?;
     let merged_this_pull: Vec<Proposal> = state
         .proposals
         .iter()
-        .filter(|p| {
-            p.status == ProposalStatus::Merged && transitions.iter().any(|(n, _)| *n == p.number)
-        })
+        .filter(|p| p.status == ProposalStatus::Merged)
         .cloned()
         .collect();
 
@@ -541,6 +547,17 @@ pub async fn pull(
 /// local change detection alone. With a provider, one conditional branch probe
 /// fills `behind` and refreshes the stored etag and last-checked time, saved
 /// only when the probe reports the branch has moved.
+///
+/// With a provider and at least one open proposal, exactly one
+/// [`Provider::list_open_proposals`] call brings the proposal picture up to
+/// date: a record still on the list whose live head differs from the recorded
+/// `head_commit` is reported in `amended_upstream`, and a record that left the
+/// list is classified by a single state GET and flipped to Merged or Declined
+/// in saved state. A flipped record is not consumed - it stays in
+/// `state.proposals` and simply leaves this report's open list; moving it to
+/// history stays [`pull`]'s job. The list call is best-effort: a failure logs
+/// and degrades to the offline picture (local statuses unchanged, no amended
+/// flags), never failing the status.
 pub async fn status(
     spec: &OriginSpec,
     domain_root: &Path,
@@ -579,6 +596,63 @@ pub async fn status(
         }
     }
 
+    // One live list call, made only when there is an open record for it to
+    // say something about, tells two things at once: which open proposals a
+    // reviewer amended out from under us, and which ones left the open list
+    // upstream (merged or declined elsewhere). A failure degrades to today's
+    // offline behavior rather than failing the status.
+    let mut amended_upstream = Vec::new();
+    if let Some(provider) = probe
+        && state
+            .proposals
+            .iter()
+            .any(|p| p.status == ProposalStatus::Open)
+    {
+        match provider.list_open_proposals(spec).await {
+            Ok(open_list) => {
+                let mut dirty = false;
+                for prop in state.proposals.iter_mut() {
+                    if prop.status != ProposalStatus::Open {
+                        continue;
+                    }
+                    match open_list.iter().find(|o| o.number == prop.number) {
+                        Some(live) => {
+                            if let Some(recorded) = &prop.head_commit
+                                && recorded != &live.head_sha
+                            {
+                                amended_upstream.push(prop.number);
+                            }
+                        }
+                        None => {
+                            // Gone from the open list: one GET classifies it.
+                            // The flip is applied and saved, but NOT consumed -
+                            // consumption stays a pull concern; status only
+                            // makes the user see the truth.
+                            if let Ok(refreshed) = provider.proposal_state(spec, prop.number).await
+                            {
+                                let new_status = match refreshed {
+                                    ProposalState::Merged => ProposalStatus::Merged,
+                                    ProposalState::Declined => ProposalStatus::Declined,
+                                    ProposalState::Open => continue,
+                                };
+                                prop.status = new_status;
+                                dirty = true;
+                            }
+                        }
+                    }
+                }
+                if dirty {
+                    state.save(state_dir)?;
+                }
+            }
+            Err(e) => {
+                // Degrade to today's offline behavior: local statuses
+                // unchanged, no amended flags.
+                tracing::debug!("open-proposal list failed; reporting local state: {e}");
+            }
+        }
+    }
+
     let open_proposals = state
         .proposals
         .iter()
@@ -603,6 +677,7 @@ pub async fn status(
         declined_proposals,
         conflicts: state.conflicts.clone(),
         last_checked: state.last_checked,
+        amended_upstream,
     })
 }
 
@@ -1285,8 +1360,8 @@ async fn settle_up_to_date(
     mut state: OriginState,
     new_etag: Option<Option<String>>,
 ) -> Result<PullReport, RemoteError> {
-    let transitions = refresh_proposals(provider, spec, &mut state).await?;
-    let mut dirty = !transitions.is_empty();
+    let (transitions, touched) = refresh_proposals(provider, spec, &mut state).await?;
+    let mut dirty = touched;
     if let Some(etag) = new_etag
         && state.ref_etag != etag
     {
@@ -1363,15 +1438,20 @@ async fn rebaseline(
     })
 }
 
-/// Refreshes the status of every open proposal against the provider and
-/// records the transitions. Merged proposals are marked but not yet consumed;
-/// the caller decides when to move them to history. Returns the changed
-/// proposals as `(number, new status)`.
+/// Refreshes the status of every open proposal against the provider, records
+/// the transitions and pulls fresh review feedback onto every record still
+/// open afterwards. Merged proposals are marked but not yet consumed; the
+/// caller decides when to move them to history.
+///
+/// Returns the changed proposals as `(number, new status)` together with
+/// whether any record was touched at all. The two are not the same thing: a
+/// feedback refresh with no status transition still changes a record, and the
+/// caller has to know that to persist it.
 async fn refresh_proposals(
     provider: &dyn Provider,
     spec: &OriginSpec,
     state: &mut OriginState,
-) -> Result<Vec<(u64, ProposalStatus)>, RemoteError> {
+) -> Result<(Vec<(u64, ProposalStatus)>, bool), RemoteError> {
     let mut transitions = Vec::new();
     for prop in state.proposals.iter_mut() {
         if prop.status != ProposalStatus::Open {
@@ -1385,7 +1465,33 @@ async fn refresh_proposals(
         prop.status = new_status;
         transitions.push((prop.number, new_status));
     }
-    Ok(transitions)
+
+    // Feedback rides on every still-open proposal, best-effort: a failed
+    // fetch keeps the previous feedback and never fails the pull.
+    let mut touched = !transitions.is_empty();
+    for prop in state.proposals.iter_mut() {
+        if prop.status != ProposalStatus::Open {
+            continue;
+        }
+        match provider.proposal_feedback(spec, prop.number).await {
+            Ok(feedback) => {
+                prop.review_state = feedback.review_state;
+                let mut items = feedback.items;
+                items.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+                items.truncate(crate::state::FEEDBACK_CAP);
+                prop.feedback = items;
+                prop.updated_at = Some(Utc::now());
+                touched = true;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "feedback fetch for proposal #{} failed; keeping the previous feedback: {e}",
+                    prop.number
+                );
+            }
+        }
+    }
+    Ok((transitions, touched))
 }
 
 /// Builds the domain-relative upstream change set from a compare result,

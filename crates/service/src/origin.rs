@@ -536,6 +536,7 @@ mod tests {
             declined_proposals: vec![],
             conflicts: vec![],
             last_checked: None,
+            amended_upstream: vec![],
         };
         let v = status_report_json("eng", &report, None);
         assert_eq!(v["domain"], "eng");
@@ -558,6 +559,7 @@ mod tests {
             declined_proposals: vec![],
             conflicts: vec![],
             last_checked: None,
+            amended_upstream: vec![],
         };
         let message = RemoteError::Offline.to_string();
         let v = status_report_json("eng", &report, Some(message.clone()));
@@ -580,6 +582,7 @@ mod tests {
             declined_proposals: vec![],
             conflicts: vec![],
             last_checked: None,
+            amended_upstream: vec![],
         }
     }
 

@@ -26,10 +26,10 @@ use crystalline_remote::ops::{
     PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, discard, propose,
     propose_preview, pull, resolve, status, subscribe,
 };
-use crystalline_remote::provider::{OriginSpec, ProposalState, Provider};
+use crystalline_remote::provider::{Feedback, OriginSpec, ProposalState, Provider};
 use crystalline_remote::state::{
-    BaseStamp, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
-    read_conflict_files,
+    BaseStamp, FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange,
+    ProposedFile, read_conflict_files,
 };
 
 use mock::{MockProvider, sha256_hex};
@@ -94,6 +94,18 @@ async fn subscribe_at(mock: &MockProvider, commit: &str) -> (Subscribed, Subscri
 
 fn load_state(state_dir: &Path) -> OriginState {
     OriginState::load(state_dir).unwrap().unwrap()
+}
+
+/// Whether a recorded mock call mutated the forge: the creating and updating
+/// calls plus the two cleanup calls a supersede performs. Every read-only
+/// operation (a probe, a compare, a blob or tarball fetch, a state or feedback
+/// read, an open-proposal listing) is excluded, so a filter over this counts
+/// exactly the writes a preview must never make.
+fn is_write_call(call: &str) -> bool {
+    call.starts_with("create_")
+        || call.starts_with("update_")
+        || call.starts_with("delete_branch")
+        || call.starts_with("close_proposal")
 }
 
 /// Subscribes a fresh domain at `commit` against `spec`, with the working
@@ -2734,11 +2746,7 @@ async fn scenario_35_preview_reports_update_for_an_open_proposal_without_writing
     let mock = MockProvider::new();
     let (sub, first) = shared_once(&mock).await;
     write(&sub.domain_root.join("notes/h.md"), b"theta\n");
-    let writes_before = mock
-        .calls()
-        .iter()
-        .filter(|c| c.starts_with("create_") || c.starts_with("update_"))
-        .count();
+    let writes_before = mock.calls().iter().filter(|c| is_write_call(c)).count();
 
     let plan = propose_preview(
         &mock,
@@ -2764,11 +2772,7 @@ async fn scenario_35_preview_reports_update_for_an_open_proposal_without_writing
     );
     assert!(!plan.effective_title.is_empty());
 
-    let writes_after = mock
-        .calls()
-        .iter()
-        .filter(|c| c.starts_with("create_") || c.starts_with("update_"))
-        .count();
+    let writes_after = mock.calls().iter().filter(|c| is_write_call(c)).count();
     assert_eq!(writes_after, writes_before, "a preview never writes");
     // And the record did not move.
     assert_eq!(load_state(&sub.state_dir).proposals[0].number, first.number);
@@ -2875,4 +2879,224 @@ async fn scenario_35_preview_still_pulls_first() {
     .await
     .unwrap();
     assert_eq!(read(&sub.domain_root.join("notes/new.md")), b"upstream\n");
+}
+
+// Scenario 35 (b): the two preview branches the first pass left untested -
+// conflicts pending, and a declined-only record that reads as Create without
+// the supersede cleanup a real share would perform.
+
+#[tokio::test]
+async fn scenario_35_preview_reports_conflicts_pending() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // A same-line conflict from a previous pull.
+    write(&sub.domain_root.join("notes/a.md"), b"line one LOCAL\n");
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one UPSTREAM\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
+
+    // An unrelated local change would otherwise be shareable; the outstanding
+    // conflict alone decides the plan.
+    write(&sub.domain_root.join("notes/new.md"), b"brand new\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::ConflictsPending { count: 1 });
+}
+
+#[tokio::test]
+async fn scenario_35_preview_of_a_declined_record_creates_without_cleanup() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1);
+    assert_eq!(st.proposals[0].status, ProposalStatus::Declined);
+
+    let writes_before = mock.calls().iter().filter(|c| is_write_call(c)).count();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    // A real share would supersede the declined record; a preview only says
+    // what would happen.
+    assert_eq!(plan.action, PlannedAction::Create);
+    let writes_after = mock.calls().iter().filter(|c| is_write_call(c)).count();
+    assert_eq!(
+        writes_after, writes_before,
+        "a preview never cleans up: no delete_branch, no close_proposal"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1, "the declined record stays put");
+    assert!(st.history.is_empty());
+}
+
+// Scenario 36: a pull fetches feedback for still-open proposals and caps it.
+
+#[tokio::test]
+async fn scenario_36_pull_fetches_and_caps_feedback_on_open_proposals() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let items: Vec<FeedbackItem> = (0..60)
+        .map(|i| FeedbackItem {
+            author: "bob".to_string(),
+            body: format!("comment {i}"),
+            path: None,
+            line: None,
+            submitted_at: format!("2026-08-21T10:{:02}:00Z", i % 60),
+            kind: FeedbackKind::Comment,
+        })
+        .collect();
+    mock.set_feedback(
+        first.number,
+        Feedback {
+            review_state: Some("changes_requested".to_string()),
+            items,
+        },
+    );
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let st = load_state(&sub.state_dir);
+    let prop = &st.proposals[0];
+    assert_eq!(prop.review_state.as_deref(), Some("changes_requested"));
+    assert_eq!(prop.feedback.len(), 50, "capped at the 50 newest");
+    // Newest by submitted_at survive: comment 59 down to comment 10.
+    assert!(prop.feedback.iter().any(|f| f.body == "comment 59"));
+    assert!(!prop.feedback.iter().any(|f| f.body == "comment 5"));
+    assert!(prop.updated_at.is_some());
+}
+
+// Scenario 36 (b): a feedback failure is non-fatal and keeps the previous
+// feedback.
+
+#[tokio::test]
+async fn scenario_36_feedback_failure_is_non_fatal_and_keeps_previous() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_feedback(
+        first.number,
+        Feedback {
+            review_state: Some("commented".to_string()),
+            items: vec![FeedbackItem {
+                author: "ana".to_string(),
+                body: "looks close".to_string(),
+                path: None,
+                line: None,
+                submitted_at: "2026-08-21T09:00:00Z".to_string(),
+                kind: FeedbackKind::Comment,
+            }],
+        },
+    );
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    mock.fail_feedback(first.number);
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .expect("a feedback failure never fails the pull");
+    assert!(report.up_to_date);
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals[0].feedback.len(), 1, "previous feedback kept");
+    assert_eq!(st.proposals[0].review_state.as_deref(), Some("commented"));
+}
+
+// Scenario 37: status consults the live open-proposal list.
+
+#[tokio::test]
+async fn scenario_37_status_flips_a_merged_elsewhere_proposal_without_consuming() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    // Merged on GitHub: gone from the open list, and the single GET says merged.
+    mock.set_proposal_state(first.number, ProposalState::Merged);
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
+        .await
+        .unwrap();
+    assert!(
+        report.open_proposals.is_empty(),
+        "the merged proposal left the open list"
+    );
+    let st = load_state(&sub.state_dir);
+    let prop = st
+        .proposals
+        .iter()
+        .find(|p| p.number == first.number)
+        .expect("still in proposals: status never consumes");
+    assert_eq!(prop.status, ProposalStatus::Merged);
+    // Consumption stays a pull concern. Merging is what moved the branch
+    // upstream in the first place, so let the mock forge reflect that (as
+    // every other merge scenario does) and pull: the record lands in history.
+    let branch_commit = mock.branch_commit(&first.branch).unwrap();
+    mock.set_branch("main", &branch_commit);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.iter().all(|p| p.number != first.number));
+    assert_eq!(st.history[0].number, first.number);
+}
+
+#[tokio::test]
+async fn scenario_37_status_flags_an_amended_branch() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let amended = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&first.branch, &amended);
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
+        .await
+        .unwrap();
+    assert_eq!(report.amended_upstream, vec![first.number]);
+    assert_eq!(report.open_proposals.len(), 1, "still open, just amended");
+}
+
+#[tokio::test]
+async fn scenario_37_status_list_failure_degrades_to_local_state() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_open_proposals();
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
+        .await
+        .expect("a list failure never fails status");
+    assert_eq!(report.open_proposals[0].number, first.number);
+    assert!(report.amended_upstream.is_empty());
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals[0].status, ProposalStatus::Open, "unchanged");
 }
