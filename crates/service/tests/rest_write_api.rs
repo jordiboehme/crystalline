@@ -1861,6 +1861,29 @@ fn write_ops() -> Vec<WriteOp> {
             body: None,
             admin_only: true,
         },
+        // The three share-surface writes, for the same reason and with the
+        // same answer: `eng` has no origin, so every allowed leg is a 409.
+        // Each carries a body, because these three parse one before the
+        // handler's own gates run - a bodyless row would answer 415 on the
+        // read-only leg instead of the 403 that leg is asserting.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync/share",
+            body: Some(serde_json::json!({})),
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync/proposals/1/withdraw",
+            body: Some(serde_json::json!({})),
+            admin_only: true,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/domains/eng/sync/conflicts/abc12345/resolve",
+            body: Some(serde_json::json!({"resolution": "mine"})),
+            admin_only: true,
+        },
         // Both archive uploads: admin-only writes, and their allowed legs
         // answer 422 (an empty body is not a zip), which passes this matrix's
         // "anything but 401/403" contract while mutating nothing.
@@ -2108,11 +2131,12 @@ async fn the_write_matrix_holds_on_every_route() {
 /// Maps a matrix fixture's concrete path to the template form
 /// `support::MOUNTED_OPERATIONS` spells operation paths in, e.g.
 /// `/api/v1/domains/eng/engrams/alpha` becomes
-/// `/api/v1/domains/{domain}/engrams/{permalink}`. `write_ops()` has exactly
-/// four fixture names in play - `eng` the one domain and `scrap` the throwaway
-/// one the unregister row deletes, `alpha` the one engram, `mark`/`tina` the
-/// two user-admin targets - so a fixed per-segment substitution is enough;
-/// nothing here needs to be a general router.
+/// `/api/v1/domains/{domain}/engrams/{permalink}`. `write_ops()` has a fixed
+/// handful of fixture names in play - `eng` the one domain and `scrap` the
+/// throwaway one the unregister row deletes, `alpha` the one engram,
+/// `mark`/`tina` the two user-admin targets, and the share surface's `1` and
+/// `abc12345` - so a fixed per-segment substitution is enough; nothing here
+/// needs to be a general router.
 fn canonicalize(path: &str) -> String {
     // The attachment routes take a wildcard rather than a segment: everything
     // after `files/` is the one `{path}` parameter, however many slashes it
@@ -2125,6 +2149,9 @@ fn canonicalize(path: &str) -> String {
             "eng" | "scrap" => "{domain}",
             "alpha" => "{permalink}",
             "mark" | "tina" => "{name}",
+            // The share-surface rows: one proposal number and one conflict id.
+            "1" => "{number}",
+            "abc12345" => "{id}",
             other => other,
         })
         .collect::<Vec<_>>()

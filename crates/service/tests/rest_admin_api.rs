@@ -400,11 +400,11 @@ async fn a_team_domain_registers_under_the_trimmed_name() {
     );
 }
 
-/// A team instance: GitHub on, a stub-validated credential already on file
-/// and a mock forge serving `acme/kb` at the tracked branch head, so nothing
-/// this fixture's tests do - registering, reading status, pulling - ever
-/// leaves the machine or touches the developer's real GitHub connection.
-async fn serve_team() -> Fixture {
+/// [`serve_team`], also handing back the mock forge so the share tests can
+/// move branches and read what was proposed. The registered domain's working
+/// tree lands under the server's domains root:
+/// `fx._tmp.path().join("domains-root/kb")`.
+async fn serve_team_with_mock() -> (Fixture, Arc<support::MockProvider>) {
     let mock = Arc::new(support::MockProvider::new());
     let commit = mock.add_commit(std::collections::BTreeMap::from([
         (
@@ -419,7 +419,7 @@ async fn serve_team() -> Fixture {
     mock.set_branch("main", &commit);
     let fx = serve(Options {
         github: true,
-        origin_provider: Some(mock),
+        origin_provider: Some(mock.clone()),
         ..Options::default()
     })
     .await;
@@ -439,7 +439,26 @@ async fn serve_team() -> Fixture {
         200,
         "the team fixture needs a credential on file before any registration"
     );
-    fx
+    (fx, mock)
+}
+
+/// A team instance: GitHub on, a stub-validated credential already on file
+/// and a mock forge serving `acme/kb` at the tracked branch head, so nothing
+/// this fixture's tests do - registering, reading status, pulling - ever
+/// leaves the machine or touches the developer's real GitHub connection.
+async fn serve_team() -> Fixture {
+    serve_team_with_mock().await.0
+}
+
+/// Registers acme/kb through POST /domains, exactly as the sync contract test
+/// opens.
+async fn register_kb(fx: &Fixture, admin: &(String, String)) {
+    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", admin)
+        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
 }
 
 /// The team fixture registers acme/kb through POST /domains, and the sync
@@ -567,6 +586,312 @@ async fn team_sync_status_and_sync_now_walk_the_contract() {
         .unwrap();
         assert_eq!(resp.status(), 403, "{name} must not read sync status");
     }
+}
+
+/// The share half of the sync surface, walked end to end against the mock
+/// forge: preview what a share would do, share it, read the enriched status
+/// the card renders, share again into the same proposal, then withdraw it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_share_routes_walk_the_loop() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    // Edit an engram so there is something to share, then preview.
+    std::fs::write(
+        kb_root.join("shared.md"),
+        b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nA sharper rule.\n",
+    )
+    .unwrap();
+    let changes = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(changes.status(), 200, "{}", changes.text().await.unwrap());
+    let changes: serde_json::Value = changes.json().await.unwrap();
+    assert_eq!(changes["action"], "create");
+    assert_eq!(changes["changes"][0]["path"], "shared.md", "{changes}");
+    assert!(changes["effective_title"].as_str().is_some());
+
+    // Share it.
+    let shared = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({"title": "From the UI"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(shared.status(), 200, "{}", shared.text().await.unwrap());
+    let shared: serde_json::Value = shared.json().await.unwrap();
+    assert_eq!(shared["outcome"], "proposed");
+    let number = shared["number"].as_u64().unwrap();
+
+    // The enriched status carries the full proposal object.
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let status: serde_json::Value = status.json().await.unwrap();
+    let prop = &status["open_proposals"][0];
+    assert_eq!(prop["number"], number, "{status}");
+    assert_eq!(prop["title"], "From the UI");
+    assert!(prop["feedback"].is_array(), "{status}");
+    assert_eq!(prop["amended_upstream"], false);
+
+    // A second share updates in place.
+    std::fs::write(
+        kb_root.join("second.md"),
+        b"---\ntype: engram\ntitle: Second\npermalink: second\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nMore.\n",
+    )
+    .unwrap();
+    let again = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(again.status(), 200, "{}", again.text().await.unwrap());
+    let again: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(again["outcome"], "updated", "{again}");
+    assert_eq!(again["proposal"]["number"], number);
+
+    // Withdraw it.
+    let withdrawn = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/kb/sync/proposals/{number}/withdraw"),
+        &admin,
+    )
+    .json(&serde_json::json!({"revert": false}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        withdrawn.status(),
+        200,
+        "{}",
+        withdrawn.text().await.unwrap()
+    );
+    let withdrawn: serde_json::Value = withdrawn.json().await.unwrap();
+    assert_eq!(withdrawn["status"], "withdrawn");
+    assert_eq!(withdrawn["closed"], true);
+}
+
+/// The conflict half: a pull that collides records a conflict the status
+/// lists by id, the detail route serves both sides, and the resolve route
+/// addresses it by that same id rather than by path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_conflict_routes_read_and_resolve_by_id() {
+    let (fx, mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    // Local and upstream edit the same engram differently, then pull.
+    std::fs::write(
+        kb_root.join("shared.md"),
+        b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nmy local text\n",
+    )
+    .unwrap();
+    let c2 = mock.add_commit(std::collections::BTreeMap::from([
+        (
+            "MANIFEST.md".to_string(),
+            std::fs::read(kb_root.join("MANIFEST.md")).unwrap(),
+        ),
+        (
+            "shared.md".to_string(),
+            b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nthe team's text\n".to_vec(),
+        ),
+    ]));
+    mock.set_branch("main", &c2);
+    let pulled = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(pulled.status(), 200, "{}", pulled.text().await.unwrap());
+
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let status: serde_json::Value = status.json().await.unwrap();
+    let conflict = &status["conflicts"][0];
+    let id = conflict["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{status}"));
+    let id = id.to_string();
+    assert!(conflict["detected_at"].is_string(), "{status}");
+
+    let detail = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/kb/sync/conflicts/{id}"),
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(detail.status(), 200, "{}", detail.text().await.unwrap());
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["id"], id.as_str());
+    assert!(
+        detail["local"].as_str().unwrap().contains("my local text"),
+        "{detail}"
+    );
+    assert!(
+        detail["upstream"]
+            .as_str()
+            .unwrap()
+            .contains("the team's text"),
+        "{detail}"
+    );
+
+    // merged without content is a 422, and nothing is resolved by it.
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/kb/sync/conflicts/{id}/resolve"),
+        &admin,
+    )
+    .json(&serde_json::json!({"resolution": "merged"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422);
+
+    let resolved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/kb/sync/conflicts/{id}/resolve"),
+        &admin,
+    )
+    .json(&serde_json::json!({"resolution": "theirs"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resolved.status(), 200, "{}", resolved.text().await.unwrap());
+    let resolved: serde_json::Value = resolved.json().await.unwrap();
+    assert_eq!(resolved["remaining"], 0);
+    let after = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let after: serde_json::Value = after.json().await.unwrap();
+    assert!(after["conflicts"].as_array().unwrap().is_empty(), "{after}");
+}
+
+/// What the five new routes refuse: a domain with no origin, a read-only
+/// instance (the three writes AND the pulling preview) and an id that names
+/// no open conflict.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_new_sync_routes_refuse_what_they_must() {
+    // Non-team domain: 404 on the GET routes, per require_team_domain(Missing).
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    for path in [
+        "/api/v1/domains/eng/sync/changes",
+        "/api/v1/domains/eng/sync/conflicts/abc12345",
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::GET, path, &admin)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404, "{path}");
+    }
+
+    // Read-only instance: 403 on the writes AND on the pulling preview.
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        read_only: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        resp.status(),
+        403,
+        "the preview pulls, so read-only refuses it"
+    );
+    for (path, body) in [
+        ("/api/v1/domains/kb/sync/share", serde_json::json!({})),
+        (
+            "/api/v1/domains/kb/sync/proposals/1/withdraw",
+            serde_json::json!({}),
+        ),
+        (
+            "/api/v1/domains/kb/sync/conflicts/abc12345/resolve",
+            serde_json::json!({"resolution": "mine"}),
+        ),
+    ] {
+        let resp = as_session(fx.addr, reqwest::Method::POST, path, &admin)
+            .json(&body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path}");
+    }
+
+    // An unknown conflict id on a real team domain is 404.
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let resp = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/conflicts/ffffffff",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 404);
 }
 
 /// GitHub switched off on an instance that still has a team domain

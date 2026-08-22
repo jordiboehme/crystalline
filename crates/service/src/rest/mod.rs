@@ -91,6 +91,11 @@ use crate::engine::Engine;
         domains_admin::remove,
         domains_admin::sync_status,
         domains_admin::sync_now,
+        domains_admin::share_changes_preview,
+        domains_admin::share_now,
+        domains_admin::withdraw_proposal,
+        domains_admin::conflict_detail,
+        domains_admin::resolve_conflict,
         archive::download,
         archive::preview,
         archive::import,
@@ -136,6 +141,9 @@ use crate::engine::Engine;
         Role,
         domains::SaveManifestBody,
         domains_admin::CreateDomainBody,
+        domains_admin::ShareBody,
+        domains_admin::WithdrawBody,
+        domains_admin::ResolveBody,
         archive::ArchiveEntryReport,
         archive::ArchiveReport,
         files::AttachmentView,
@@ -412,6 +420,29 @@ pub fn router(state: RestState) -> Router {
         .route(
             "/domains/{domain}/sync",
             get(domains_admin::sync_status).post(domains_admin::sync_now),
+        )
+        // The share half of the same card. The preview is a GET that pulls,
+        // so it is refused on a read-only instance like the writes below it;
+        // the two conflict routes are offline verbs and need no connection.
+        .route(
+            "/domains/{domain}/sync/changes",
+            get(domains_admin::share_changes_preview),
+        )
+        .route(
+            "/domains/{domain}/sync/share",
+            post(domains_admin::share_now),
+        )
+        .route(
+            "/domains/{domain}/sync/proposals/{number}/withdraw",
+            post(domains_admin::withdraw_proposal),
+        )
+        .route(
+            "/domains/{domain}/sync/conflicts/{id}",
+            get(domains_admin::conflict_detail),
+        )
+        .route(
+            "/domains/{domain}/sync/conflicts/{id}/resolve",
+            post(domains_admin::resolve_conflict),
         )
         // Admin only as well, and a pure read: the archive download is the
         // backup story of a read-only mirror, so it stays served there.
