@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crystalline_remote::ops::{
-    ProposeOutcome, PullReport, Resolution, SubscribeReport, discard, propose, pull, resolve,
-    status, subscribe,
+    PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, discard, propose,
+    propose_preview, pull, resolve, status, subscribe,
 };
 use crystalline_remote::provider::{OriginSpec, ProposalState, Provider};
 use crystalline_remote::state::{
@@ -2497,6 +2497,9 @@ async fn scenario_29_diverged_branch_refuses_with_no_writes() {
         .iter()
         .filter(|c| {
             c.starts_with("create_blob:")
+                || c.starts_with("create_tree:")
+                || c.starts_with("create_commit:")
+                || c.starts_with("create_branch:")
                 || c.starts_with("update_branch:")
                 || c.starts_with("update_proposal:")
                 || c.starts_with("create_proposal:")
@@ -2532,6 +2535,9 @@ async fn scenario_29_diverged_branch_refuses_with_no_writes() {
         .iter()
         .filter(|c| {
             c.starts_with("create_blob:")
+                || c.starts_with("create_tree:")
+                || c.starts_with("create_commit:")
+                || c.starts_with("create_branch:")
                 || c.starts_with("update_branch:")
                 || c.starts_with("update_proposal:")
                 || c.starts_with("create_proposal:")
@@ -2719,4 +2725,154 @@ async fn scenario_34_nothing_to_share_leaves_the_open_proposal_untouched() {
         Some(first.number)
     );
     assert_eq!(before.proposals[0].status, after.proposals[0].status);
+}
+
+// Scenario 35: the preview classifies without writing.
+
+#[tokio::test]
+async fn scenario_35_preview_reports_update_for_an_open_proposal_without_writing() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    write(&sub.domain_root.join("notes/h.md"), b"theta\n");
+    let writes_before = mock
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("create_") || c.starts_with("update_"))
+        .count();
+
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    match plan.action {
+        PlannedAction::Update { number, ref url } => {
+            assert_eq!(number, first.number);
+            assert_eq!(url, &first.url);
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+    assert_eq!(
+        plan.changes.changes.len(),
+        2,
+        "the old edit and the new file"
+    );
+    assert!(!plan.effective_title.is_empty());
+
+    let writes_after = mock
+        .calls()
+        .iter()
+        .filter(|c| c.starts_with("create_") || c.starts_with("update_"))
+        .count();
+    assert_eq!(writes_after, writes_before, "a preview never writes");
+    // And the record did not move.
+    assert_eq!(load_state(&sub.state_dir).proposals[0].number, first.number);
+}
+
+#[tokio::test]
+async fn scenario_35_preview_reports_create_nothing_and_diverged() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Clean tree: nothing to share.
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::NothingToShare);
+
+    // A local change with no open proposal: create, and the caller's title
+    // wins over the generated one.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        Some("My title"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::Create);
+    assert_eq!(plan.effective_title, "My title");
+
+    // Share it, amend the branch, preview again: diverged.
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("{other:?}"),
+    };
+    let amended = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&report.branch, &amended);
+    write(&sub.domain_root.join("notes/i.md"), b"iota\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { number, .. } if number == report.number),
+        "{:?}",
+        plan.action
+    );
+}
+
+#[tokio::test]
+async fn scenario_35_preview_still_pulls_first() {
+    // Freshness is part of previewing honestly: the pull's working-tree
+    // writes DO happen.
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/new.md", b"upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let _ = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&sub.domain_root.join("notes/new.md")), b"upstream\n");
 }

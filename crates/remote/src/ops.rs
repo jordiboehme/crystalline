@@ -815,6 +815,140 @@ pub async fn propose(
     }))
 }
 
+/// What a share would do, computed without a single provider write.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SharePlan {
+    /// What a share run right now would do with the detected changes.
+    pub action: PlannedAction,
+    /// The local changes a share would carry, exactly as [`propose`] would
+    /// detect them against the freshly pulled base.
+    pub changes: crate::changes::LocalChanges,
+    /// The caller's title, or the generated one for this change mix. Empty
+    /// when there is nothing to title (nothing to share, conflicts pending).
+    pub effective_title: String,
+}
+
+/// The single thing a share would do, as [`propose_preview`] classifies it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlannedAction {
+    /// A share would open a new proposal.
+    Create,
+    /// A share would update this open proposal in place.
+    Update {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+    },
+    /// Nothing to share.
+    NothingToShare,
+    /// Conflicts block a share until resolved.
+    ConflictsPending {
+        /// How many conflicts are still open.
+        count: usize,
+    },
+    /// The open proposal's branch was amended by a reviewer.
+    ProposalDiverged {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+        /// The branch a reviewer moved out from under us.
+        branch: String,
+    },
+}
+
+/// The read-only twin of [`propose`]: runs the same pull, conflicts guard,
+/// change detection and open/declined/divergence classification, but performs
+/// no provider write and moves no record. It DOES perform the pull's writes
+/// to the working tree - freshness is part of previewing honestly, and a plan
+/// computed against a stale base would name changes a real share would never
+/// make.
+///
+/// `domain_name` plays the same role it plays in [`propose`]: it is what the
+/// generated title calls the domain when the caller supplies none.
+pub async fn propose_preview(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    title: Option<&str>,
+) -> Result<SharePlan, RemoteError> {
+    pull(provider, spec, domain_root, state_dir).await?;
+    let state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::State(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+    let local = detect_local_changes(domain_root, &state.files)?;
+
+    if !state.conflicts.is_empty() {
+        return Ok(SharePlan {
+            action: PlannedAction::ConflictsPending {
+                count: state.conflicts.len(),
+            },
+            changes: local,
+            effective_title: String::new(),
+        });
+    }
+    if local.changes.is_empty() {
+        return Ok(SharePlan {
+            action: PlannedAction::NothingToShare,
+            changes: local,
+            effective_title: String::new(),
+        });
+    }
+
+    let (added, updated, deleted) = count_changes(&local);
+    let effective_title = title
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+
+    // Classification mirrors propose's, read-only: a declined record would be
+    // superseded (so it reads as Create), an open one is an Update unless a
+    // reviewer amended its branch, and a gone ref would be re-created.
+    let open = state
+        .proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open);
+    let action = match open {
+        None => PlannedAction::Create,
+        Some(prop) => match provider.branch_ref(spec, &prop.branch).await? {
+            Some(live_head) => match &prop.head_commit {
+                Some(recorded) if recorded != &live_head => PlannedAction::ProposalDiverged {
+                    number: prop.number,
+                    url: prop.url.clone(),
+                    branch: prop.branch.clone(),
+                },
+                _ => PlannedAction::Update {
+                    number: prop.number,
+                    url: prop.url.clone(),
+                },
+            },
+            None => PlannedAction::Create,
+        },
+    };
+    Ok(SharePlan {
+        action,
+        changes: local,
+        effective_title,
+    })
+}
+
+/// The (added, updated, deleted) counts of a detected change set.
+fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize);
+    for change in &local.changes {
+        match change {
+            LocalChange::Added { .. } => counts.0 += 1,
+            LocalChange::Modified { .. } => counts.1 += 1,
+            LocalChange::Deleted { .. } => counts.2 += 1,
+        }
+    }
+    counts
+}
+
 /// Everything a share commit is built from, collected in one pass over the
 /// detected local changes: the tree writes (blobs already uploaded), the
 /// proposal file records, the per-kind path lists and the body entries.
