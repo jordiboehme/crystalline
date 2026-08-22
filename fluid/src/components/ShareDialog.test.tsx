@@ -161,6 +161,7 @@ describe("the share dialog", () => {
     renderApp("/d/eng");
     const dialog = await openShareDialog();
     const statusReads = reads("/domains/eng/sync");
+    const planReads = reads("/domains/eng/sync/changes");
 
     // The action line names the update rather than promising a new proposal.
     expect(
@@ -198,6 +199,15 @@ describe("the share dialog", () => {
     await waitFor(() => {
       expect(reads("/domains/eng/sync")).toBeGreaterThan(statusReads);
     });
+    // The plan does not. Its key sits under the `["domains"]` prefix the
+    // domain listing is invalidated by, so a plan query left enabled would
+    // answer that invalidation with a second `GET /sync/changes` - a route
+    // that pulls the origin - to re-plan a share that already happened, and a
+    // refetch that then failed would put the planning-error line over an
+    // outcome saying the share landed. Waiting for the status above is what
+    // makes this a settled answer rather than a race: both invalidations are
+    // fired from the one success handler.
+    expect(reads("/domains/eng/sync/changes")).toBe(planReads);
   });
 
   it("sends no title when the prefilled one was left alone", async () => {
@@ -241,6 +251,44 @@ describe("the share dialog", () => {
     ).toBeInTheDocument();
   });
 
+  it("sends the description somebody wrote, trimmed", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "proposed",
+      number: 7,
+      url: "https://github.com/acme/knowledge/pull/7",
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await userEvent.type(
+      await within(dialog).findByLabelText("Description"),
+      "  Sharper wording on the routing rules.  ",
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // The body of the proposal is the one thing here nobody else can write,
+    // so it travels; the whitespace around it does not, and an untouched
+    // title still stays behind.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      description: "Sharper wording on the routing rules.",
+    });
+  });
+
   it("disables the share with the reason when there is nothing to confirm", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({
@@ -259,8 +307,71 @@ describe("the share dialog", () => {
         within(dialog).getByRole("button", { name: "Share" }),
       ).toBeDisabled();
     });
-    expect(within(dialog).getByText(/conflicts/i)).toBeInTheDocument();
+    // With the count the report carried: "conflicts need settling" is advice,
+    // and two of them is a size somebody can decide to sit down with now.
+    expect(
+      within(dialog).getByText("2 conflicts need settling before sharing."),
+    ).toBeInTheDocument();
   });
+
+  it("counts one conflict as one", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "conflicts_pending",
+        count: 1,
+        effective_title: "",
+        changes: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(
+      await within(dialog).findByText(
+        "1 conflict needs settling before sharing.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it.each([
+    {
+      action: "nothing_to_share",
+      plan: {},
+      says: /the team already has all of this/i,
+    },
+    {
+      action: "proposal_diverged",
+      plan: {
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        branch: "crystalline/eng-20260821",
+      },
+      says: /a reviewer amended proposal #4/i,
+    },
+  ])(
+    "refuses to offer a share on a $action plan, and says why",
+    async ({ action, plan, says }) => {
+      serve({
+        "/domains/eng/sync/changes": () => ({
+          action,
+          effective_title: "",
+          changes: [],
+          ...plan,
+        }),
+      });
+
+      renderApp("/d/eng");
+      const dialog = await openShareDialog();
+
+      // The sentence is the whole of the help here: neither of these is a
+      // failure to report, and neither is something pressing Share could fix.
+      expect(await within(dialog).findByText(says)).toBeInTheDocument();
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeDisabled();
+    },
+  );
 
   it("keeps a refused share in the dialog rather than swallowing it", async () => {
     serve({

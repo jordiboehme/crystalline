@@ -475,7 +475,24 @@ describe("the admin client layer", () => {
       changes: [{ path: "notes/a.md", kind: "modified" }],
       number: 4,
       url: "https://github.example/acme/kb/pull/4",
+      // An update carries no conflict count, and none is invented for it.
+      count: null,
     });
+  });
+
+  it("reads the conflict count off a plan that is waiting on them", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "conflicts_pending",
+      count: 2,
+      effective_title: "",
+      changes: [],
+    });
+    const plan = await fetchShareChanges("eng");
+
+    // The one number that says how much work settling them is, before the
+    // screen that settles them is opened.
+    expect(plan.count).toBe(2);
+    expect(plan.action).toBe("conflicts_pending");
   });
 
   it("shares a domain with the title and description it was given", async () => {

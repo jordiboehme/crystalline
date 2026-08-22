@@ -452,6 +452,14 @@ export interface SharePlan {
   /** The proposal an `update` would go into; null for the other actions. */
   number: number | null;
   url: string | null;
+  /**
+   * How many conflicts are waiting, on a `conflicts_pending` plan; null on
+   * every other action, and on a report that named none.
+   *
+   * The one number that turns "settle the conflicts first" into something a
+   * reader can size the work from before opening the screen that settles them.
+   */
+  count: number | null;
 }
 
 /**
@@ -481,6 +489,7 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
       ),
     number: asNumber(record?.number),
     url: asString(record?.url),
+    count: asNumber(record?.count),
   };
 }
 

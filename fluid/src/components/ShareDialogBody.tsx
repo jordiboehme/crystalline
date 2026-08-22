@@ -15,7 +15,10 @@
  * a rename nobody asked for. Only a title somebody actually wrote travels, and
  * on an update it becomes both the proposal's title and the commit message;
  * leaving it alone keeps the proposal's title and lets the generated line be
- * the commit message.
+ * the commit message. The description does not work that way and the field
+ * says so: the engine rebuilds the proposal's body on every update, so an
+ * empty description replaces the previous one with a generated summary rather
+ * than leaving it standing.
  *
  * The outcome replaces the form rather than closing the dialog. A share is the
  * one write here whose answer is five different things, three of which mean
@@ -32,6 +35,7 @@ import { fetchShareChanges, shareDomain, syncStatusKey } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { asNumber, asObject, asString } from "../api/json";
+import { plural } from "../format";
 import type { ShareDialogProps } from "./ShareDialog";
 import { BUTTON, Field } from "./primitives";
 
@@ -60,11 +64,27 @@ export default function ShareDialogBody({
   // this, a cached one would describe a share somebody else's session already
   // made, and the refusals this call can carry - read-only, GitHub off - are
   // immediate and final.
+  //
+  // Switched off the moment a share lands, and that is load bearing rather
+  // than tidy: nothing should re-plan a share that already happened, and a
+  // refetch that failed would put the planning-error line above an outcome
+  // saying the share succeeded.
+  //
+  // The key deliberately sits outside the `["domains", ...]` family every
+  // other read of a domain is filed under, which is the one place this app
+  // breaks that pattern. `DOMAINS_QUERY_KEY` is the bare `["domains"]` prefix
+  // and TanStack invalidates by prefix, so a plan filed in there would be
+  // refetched by every bulk domain invalidation in the app - including this
+  // component's own success handler, which fires it in the same tick as the
+  // state above and so beats `enabled` to the punch. This is not a cache of
+  // domain content: reading it pulls the origin, and re-reading it as a side
+  // effect of somebody else's write is a write nobody asked for.
   const plan = useQuery({
-    queryKey: ["domains", domain, "share-plan"],
+    queryKey: ["share-plan", domain],
     queryFn: () => fetchShareChanges(domain),
     staleTime: 0,
     retry: false,
+    enabled: outcome === null,
   });
 
   const effectiveTitle = plan.data?.effectiveTitle ?? "";
@@ -119,7 +139,11 @@ export default function ShareDialogBody({
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
             {planProblem === null
-              ? actionLine(action, plan.data?.number ?? null)
+              ? actionLine(
+                  action,
+                  plan.data?.number ?? null,
+                  plan.data?.count ?? null,
+                )
               : "This share could not be planned."}
           </Dialog.Description>
           {outcome === null ? (
@@ -179,7 +203,11 @@ export default function ShareDialogBody({
               <Field
                 id={descriptionField}
                 label="Description"
-                helper="Optional. The engine writes a summary when this is empty."
+                // The clause matters next to the title's: the body is
+                // rewritten on every update whether or not anybody typed
+                // here, so the title's "left alone, it keeps what it has" must
+                // not be generalized into a description that survives.
+                helper="Optional. The engine writes a summary when this is empty; on an update it replaces the proposal's previous description either way."
               >
                 <textarea
                   id={descriptionField}
@@ -243,7 +271,11 @@ export default function ShareDialogBody({
  * shared. A plan that was refused never reaches here - the caller says so in
  * the server's own words instead.
  */
-function actionLine(action: string | null, number: number | null): string {
+function actionLine(
+  action: string | null,
+  number: number | null,
+  count: number | null,
+): string {
   const named =
     number === null ? "the proposal" : `proposal #${String(number)}`;
   switch (action) {
@@ -254,7 +286,11 @@ function actionLine(action: string | null, number: number | null): string {
     case "nothing_to_share":
       return "Nothing to share: the team already has all of this.";
     case "conflicts_pending":
-      return "Conflicts need settling before sharing.";
+      // With the number when the report carried one: how much is waiting is
+      // the difference between settling it now and coming back later.
+      return count === null
+        ? "Conflicts need settling before sharing."
+        : `${plural(count, "conflict needs", "conflicts need")} settling before sharing.`;
     case "proposal_diverged":
       return `A reviewer amended ${named}; withdraw it or let the review finish.`;
     default:
