@@ -2692,6 +2692,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::NotADomain { .. }
         | RemoteError::ConflictsPending { .. }
         | RemoteError::ProposalNotFound { .. }
+        | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }

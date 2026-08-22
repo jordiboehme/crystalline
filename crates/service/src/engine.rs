@@ -338,6 +338,25 @@ fn stale_edit_message(expected: &str, found: &str) -> String {
     )
 }
 
+/// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
+/// absent side is `null`, a UTF-8 one is a JSON string, and a side that
+/// exists but is not UTF-8 is `null` with `note` set to say which side was
+/// omitted and why. A later non-UTF-8 side overwrites an earlier note, so the
+/// note names whichever side was last found unreadable; a caller reading it
+/// learns that at least one side is binary, and the null tells it which.
+fn utf8_side(bytes: Option<Vec<u8>>, name: &str, note: &mut Option<String>) -> Value {
+    match bytes {
+        None => Value::Null,
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Value::String(text),
+            Err(_) => {
+                *note = Some(format!("the {name} side is not UTF-8 and is omitted"));
+                Value::Null
+            }
+        },
+    }
+}
+
 impl From<crystalline_index::IndexError> for EngineError {
     fn from(e: crystalline_index::IndexError) -> Self {
         match e {
@@ -7896,8 +7915,22 @@ impl Engine {
             .ok()
             .flatten();
         let proposals = origin::proposal_transitions_json(&report.proposals, state.as_ref());
-
-        Ok(origin::pull_report_json(name, &report, proposals))
+        // Every still-open proposal rides along in full, review feedback
+        // included: an update is where a pull refreshes it, so this is the
+        // channel an agent reads reviewer comments from without a second call.
+        let open_proposals: Vec<Value> = state
+            .as_ref()
+            .map(|s| {
+                s.proposals
+                    .iter()
+                    .filter(|p| p.status == crystalline_remote::state::ProposalStatus::Open)
+                    .map(|p| serde_json::to_value(p).expect("a proposal serializes"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut v = origin::pull_report_json(name, &report, proposals);
+        v["open_proposals"] = Value::Array(open_proposals);
+        Ok(v)
     }
 
     /// Bootstraps an env-defined team domain on its first contact with GitHub:
@@ -8353,14 +8386,14 @@ impl Engine {
         }
     }
 
-    /// Discards a declined, or still-open ("never mind"), share proposal for
-    /// one domain, under its origin lock, then syncs the domain (and
-    /// embeds) since discarding can restore or delete working-tree files.
+    /// Previews what a share of one domain would do, under its origin lock,
+    /// without making a single provider write.
     ///
-    /// Refuses with `github.enabled`'s message when collaboration is off,
-    /// and with `EngineError::ReadOnly` on a read-only instance (a discard
-    /// writes the working tree).
-    pub async fn origin_discard(&self, domain: &str, proposal_number: u64) -> Result<Value> {
+    /// The same three gates `origin_share` applies apply here: a preview runs
+    /// the real pull first (freshness is part of previewing honestly), so it
+    /// writes the working tree and is refused on a read-only instance exactly
+    /// as a share is.
+    pub async fn origin_share_preview(&self, domain: &str, title: Option<&str>) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
@@ -8369,22 +8402,112 @@ impl Engine {
         }
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
-        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let report = ops::discard(&root, &state_dir, proposal_number)?;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let provider = self.resolve_origin_provider()?;
+        let plan = ops::propose_preview(provider.as_ref(), &spec, &root, domain, &state_dir, title)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        Ok(origin::share_plan_json(&plan))
+    }
 
-        self.sync(Some(domain)).await?;
-        if !self.request_embed()
-            && let Err(e) = self.embed_pending().await
-        {
-            tracing::warn!(
-                "embedding after discarding proposal #{proposal_number} for '{domain}' failed: {e}"
-            );
+    /// Withdraws a share proposal for one domain: closes its pull request on
+    /// the forge, best-effort deletes its branch, optionally restores the
+    /// shared files (`revert`) and records it as withdrawn. Under the
+    /// domain's origin lock; syncs and embeds afterward only when files
+    /// moved. Refuses when collaboration is off and on a read-only instance.
+    pub async fn origin_withdraw(
+        &self,
+        domain: &str,
+        proposal: Option<u64>,
+        revert: bool,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
         }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let provider = self.resolve_origin_provider()?;
+        let report = ops::withdraw(
+            provider.as_ref(),
+            &spec,
+            &root,
+            &state_dir,
+            proposal,
+            revert,
+        )
+        .await
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
+        if !report.restored.is_empty() || !report.deleted.is_empty() {
+            self.sync(Some(domain)).await?;
+            if !self.request_embed()
+                && let Err(e) = self.embed_pending().await
+            {
+                tracing::warn!(
+                    "embedding after withdrawing proposal #{} for '{domain}' failed: {e}",
+                    report.number
+                );
+            }
+        }
+        Ok(origin::withdraw_report_json(&report))
+    }
+
+    /// One conflict's full detail: both recorded sides plus the current local
+    /// content, addressed by id or by path (exactly one must be given).
+    /// Sides are returned as UTF-8 strings; a side that exists but is not
+    /// UTF-8 comes back null with `note` saying so. A pure read: no gate
+    /// beyond the domain being registered with an origin, no lock needed.
+    pub async fn origin_conflict_detail(
+        &self,
+        domain: &str,
+        id: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Value> {
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
+            EngineError::Invalid(format!("domain '{domain}' has no origin state"))
+        })?;
+        let conflict = state
+            .conflicts
+            .iter()
+            .find(|c| id.is_some_and(|id| c.id == id) || path.is_some_and(|p| c.path == p))
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no open conflict {} for '{domain}'",
+                    id.or(path).unwrap_or("(none named)")
+                ))
+            })?;
+        let (base, upstream) =
+            crystalline_remote::state::read_conflict_files(&state_dir, &conflict.id)?;
+        let local_path = root.join(&conflict.path);
+        let local = match std::fs::read(&local_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(EngineError::Io {
+                    path: local_path.display().to_string(),
+                    source: e,
+                });
+            }
+        };
+        let mut note: Option<String> = None;
+        let base_v = utf8_side(base, "base", &mut note);
+        let local_v = utf8_side(local, "local", &mut note);
+        let upstream_v = utf8_side(upstream, "upstream", &mut note);
         Ok(json!({
-            "restored": report.restored,
-            "deleted": report.deleted,
-            "skipped_diverged": report.skipped_diverged,
+            "id": conflict.id,
+            "path": conflict.path,
+            "kind": conflict.kind,
+            "detected_at": conflict.detected_at,
+            "base": base_v,
+            "local": local_v,
+            "upstream": upstream_v,
+            "note": note,
         }))
     }
 
@@ -8429,7 +8552,7 @@ impl Engine {
     }
 
     /// Resolves a single domain's `OriginSpec`, root and state directory for
-    /// `origin_share`, `origin_discard` and `origin_resolve`: each a
+    /// `origin_share`, `origin_withdraw` and `origin_resolve`: each a
     /// single-domain operation unlike `origin_update`/`origin_status`'s
     /// optional "every domain" mode. Errors with `UnknownDomain` when
     /// unregistered, and with the same "has no origin" message

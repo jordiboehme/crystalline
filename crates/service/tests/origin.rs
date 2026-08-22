@@ -1,5 +1,6 @@
 //! Engine-level tests for GitHub origin collaboration: `origin_add`,
-//! `origin_update`, `origin_status`, `origin_share`, `origin_discard` and
+//! `origin_update`, `origin_status`, `origin_share`, `origin_share_preview`,
+//! `origin_withdraw`, `origin_conflict_detail` and
 //! `origin_resolve`, plus the gating matrix (the `github.enabled` refusal
 //! and the read-only mode's asymmetric refusal). The embed-worker
 //! scheduling checks also live here, beside the harness they share; they
@@ -19,9 +20,9 @@ use std::sync::Arc;
 use crystalline_core::config::{GitHubConfig, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::RemoteError;
-use crystalline_remote::provider::ProposalState;
+use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
-    OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
+    FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
 use crystalline_service::engine::EngineError;
 use crystalline_service::params::{ReadParams, SearchParams};
@@ -187,7 +188,7 @@ async fn read_only_refuses_add_but_allows_update_and_status() {
 }
 
 #[tokio::test]
-async fn github_disabled_refuses_share_discard_and_resolve() {
+async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let eng = engine_with(
@@ -205,10 +206,16 @@ async fn github_disabled_refuses_share_discard_and_resolve() {
         "{share_err}"
     );
 
-    let discard_err = eng.origin_discard("brand", 1).await.unwrap_err();
+    let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
     assert!(
-        matches!(discard_err, EngineError::Remote(RemoteError::NotEnabled)),
-        "{discard_err}"
+        matches!(withdraw_err, EngineError::Remote(RemoteError::NotEnabled)),
+        "{withdraw_err}"
+    );
+
+    let preview_err = eng.origin_share_preview("brand", None).await.unwrap_err();
+    assert!(
+        matches!(preview_err, EngineError::Remote(RemoteError::NotEnabled)),
+        "{preview_err}"
     );
 
     let resolve_err = eng
@@ -222,7 +229,7 @@ async fn github_disabled_refuses_share_discard_and_resolve() {
 }
 
 #[tokio::test]
-async fn read_only_refuses_share_discard_and_resolve() {
+async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let eng = engine_with(
@@ -239,10 +246,16 @@ async fn read_only_refuses_share_discard_and_resolve() {
     let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
     assert!(matches!(share_err, EngineError::ReadOnly), "{share_err}");
 
-    let discard_err = eng.origin_discard("brand", 1).await.unwrap_err();
+    let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
     assert!(
-        matches!(discard_err, EngineError::ReadOnly),
-        "{discard_err}"
+        matches!(withdraw_err, EngineError::ReadOnly),
+        "{withdraw_err}"
+    );
+
+    let preview_err = eng.origin_share_preview("brand", None).await.unwrap_err();
+    assert!(
+        matches!(preview_err, EngineError::ReadOnly),
+        "{preview_err}"
     );
 
     let resolve_err = eng
@@ -1527,10 +1540,210 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     assert_eq!(conflicts[0]["path"], "notes/a.md");
 }
 
-// --- origin_discard --------------------------------------------------------------
+// --- origin_withdraw, origin_share_preview, origin_conflict_detail -------------
+
+/// A team engine over the mock: domain "kb" subscribed at a two-file commit,
+/// one engram edited locally and already shared. Returns the engine, the
+/// mock, the working-tree root and the open proposal's number.
+async fn shared_team_engine(
+    tmp: &tempfile::TempDir,
+) -> (Engine, Arc<MockProvider>, std::path::PathBuf, u64) {
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let root = tmp.path().join("kb");
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha v2"),
+    )
+    .unwrap();
+    let shared = eng.origin_share("kb", None, None).await.unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    let number = shared["number"].as_u64().unwrap();
+    (eng, mock, root, number)
+}
 
 #[tokio::test]
-async fn origin_discard_restores_files_and_syncs_the_index() {
+async fn origin_withdraw_closes_the_pr_and_records_withdrawn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, _number) = shared_team_engine(&tmp).await;
+    let v = eng.origin_withdraw("kb", None, false).await.unwrap();
+    assert_eq!(v["status"], "withdrawn");
+    assert_eq!(v["closed"], true);
+    assert!(v["restored"].as_array().unwrap().is_empty());
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "{:?}",
+        mock.calls()
+    );
+    // The local edit stays: no revert was asked for.
+    let text = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
+    assert!(text.contains("alpha v2"), "{text}");
+}
+
+#[tokio::test]
+async fn origin_withdraw_with_revert_restores_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
+    let v = eng.origin_withdraw("kb", Some(number), true).await.unwrap();
+    assert_eq!(v["restored"][0], "notes/a.md");
+    let text = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
+    assert!(!text.contains("alpha v2"), "restored to base: {text}");
+}
+
+#[tokio::test]
+async fn origin_share_maps_updated_and_diverged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, number) = shared_team_engine(&tmp).await;
+
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+    let second = eng.origin_share("kb", None, None).await.unwrap();
+    assert_eq!(second["outcome"], "updated");
+    assert_eq!(second["proposal"]["number"], number);
+
+    // A reviewer amends the proposal branch.
+    let branch = second["proposal"]["branch"].as_str().unwrap().to_string();
+    let amended = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch(&branch, &amended);
+    std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
+    let third = eng.origin_share("kb", None, None).await.unwrap();
+    assert_eq!(third["outcome"], "proposal_diverged");
+    assert_eq!(third["proposal"]["number"], number);
+    assert!(
+        third["guidance"].as_str().unwrap().contains("withdraw"),
+        "{third}"
+    );
+}
+
+#[tokio::test]
+async fn origin_share_preview_names_the_action_and_changes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+    let v = eng.origin_share_preview("kb", None).await.unwrap();
+    assert_eq!(v["action"], "update");
+    assert_eq!(v["number"].as_u64(), Some(number));
+    let changes = v["changes"].as_array().unwrap();
+    assert!(!changes.is_empty());
+    assert!(
+        changes
+            .iter()
+            .all(|c| c["path"].is_string() && c["kind"].is_string()),
+        "{changes:?}"
+    );
+    assert!(v["effective_title"].as_str().is_some());
+}
+
+#[tokio::test]
+async fn origin_update_response_carries_open_proposal_feedback() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, _root, number) = shared_team_engine(&tmp).await;
+    mock.set_feedback(
+        number,
+        Feedback {
+            review_state: Some("changes_requested".to_string()),
+            items: vec![FeedbackItem {
+                author: "ana".to_string(),
+                body: "tighten the wording".to_string(),
+                path: None,
+                line: None,
+                submitted_at: "2026-08-21T10:00:00Z".to_string(),
+                kind: FeedbackKind::Comment,
+            }],
+        },
+    );
+    let v = eng.origin_update(Some("kb")).await.unwrap();
+    let prop = &v["domains"][0]["open_proposals"][0];
+    assert_eq!(prop["feedback"][0]["body"], "tighten the wording", "{v}");
+    assert_eq!(prop["review_state"], "changes_requested");
+}
+
+#[tokio::test]
+async fn origin_status_flags_an_amended_open_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, _root, number) = shared_team_engine(&tmp).await;
+    let branch = {
+        let state_dir = tmp.path().join("origins").join("kb");
+        let state = OriginState::load(&state_dir).unwrap().unwrap();
+        state.proposals[0].branch.clone()
+    };
+    let amended = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch(&branch, &amended);
+
+    let v = eng.origin_status(Some("kb")).await.unwrap();
+    let open = &v["domains"][0]["open_proposals"][0];
+    assert_eq!(open["number"].as_u64(), Some(number), "{v}");
+    assert_eq!(open["amended_upstream"], true, "{v}");
+}
+
+#[tokio::test]
+async fn origin_conflict_detail_reads_both_sides_by_id_or_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, _number) = shared_team_engine(&tmp).await;
+    // Clear the open proposal so the conflict setup is the only moving part.
+    eng.origin_withdraw("kb", None, false).await.unwrap();
+    // Local and upstream edit the same engram differently, then pull.
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "mine mine"),
+    )
+    .unwrap();
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "theirs theirs")),
+    ]));
+    mock.set_branch("main", &c2);
+    eng.origin_update(Some("kb")).await.unwrap();
+
+    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let id = status["domains"][0]["conflicts"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let by_id = eng
+        .origin_conflict_detail("kb", Some(&id), None)
+        .await
+        .unwrap();
+    assert_eq!(by_id["id"], id.as_str());
+    assert!(by_id["local"].as_str().unwrap().contains("mine mine"));
+    assert!(
+        by_id["upstream"]
+            .as_str()
+            .unwrap()
+            .contains("theirs theirs")
+    );
+    let path = by_id["path"].as_str().unwrap().to_string();
+    let by_path = eng
+        .origin_conflict_detail("kb", None, Some(&path))
+        .await
+        .unwrap();
+    assert_eq!(by_path["id"], id.as_str());
+}
+
+#[tokio::test]
+async fn origin_withdraw_restores_files_and_syncs_the_index() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let commit = mock.add_commit(commit_files(&[
@@ -1579,19 +1792,23 @@ async fn origin_discard_restores_files_and_syncs_the_index() {
     });
     state.save(&state_dir).unwrap();
 
-    let result = eng.origin_discard("brand", 5).await.unwrap();
+    let result = eng.origin_withdraw("brand", Some(5), true).await.unwrap();
     assert_eq!(result["restored"][0], "notes/keep.md");
+    assert_eq!(
+        result["closed"], false,
+        "a declined proposal is already closed"
+    );
 
     // The working tree is back to the base content.
     let content = std::fs::read_to_string(root.join("notes/keep.md")).unwrap();
     assert!(content.contains("base content"), "{content}");
 
-    // The record moved to history, declined status preserved.
+    // The record moved to history, recorded as withdrawn.
     let reloaded = OriginState::load(&state_dir).unwrap().unwrap();
     assert!(reloaded.proposals.is_empty());
-    assert_eq!(reloaded.history[0].status, ProposalStatus::Declined);
+    assert_eq!(reloaded.history[0].status, ProposalStatus::Withdrawn);
 
-    // The index reflects the restored content: sync ran after discard.
+    // The index reflects the restored content: sync ran after the withdraw.
     let hits = eng
         .search_engrams(&SearchParams {
             query: Some("base content".to_string()),
@@ -1603,7 +1820,7 @@ async fn origin_discard_restores_files_and_syncs_the_index() {
 }
 
 #[tokio::test]
-async fn origin_discard_schedules_embedding_on_the_worker_channel() {
+async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
     let tmp = tempfile::tempdir().unwrap();
     let mock = Arc::new(MockProvider::new());
     let commit = mock.add_commit(commit_files(&[
@@ -1629,7 +1846,7 @@ async fn origin_discard_schedules_embedding_on_the_worker_channel() {
     .await
     .unwrap();
     // Drain the connect's own scheduled embed so the assertion below sees
-    // only the discard's pass.
+    // only the withdraw's pass.
     while rx.try_recv().is_ok() {}
 
     // A previously opened, now declined proposal touching keep.md, without
@@ -1658,10 +1875,10 @@ async fn origin_discard_schedules_embedding_on_the_worker_channel() {
     });
     state.save(&state_dir).unwrap();
 
-    eng.origin_discard("brand", 5).await.unwrap();
+    eng.origin_withdraw("brand", Some(5), true).await.unwrap();
     assert!(
         rx.try_recv().is_ok(),
-        "origin_discard must schedule a background embed instead of embedding inline"
+        "origin_withdraw must schedule a background embed instead of embedding inline"
     );
 }
 

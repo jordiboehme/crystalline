@@ -1689,9 +1689,13 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             proposal,
             config,
         } => {
-            let data = crystalline_service::origin_discard(
+            // Interim: the `discard` verb still speaks discard's contract
+            // (restore the shared files), which `withdraw --revert` is a
+            // superset of. Task 13 replaces the verb itself.
+            let data = crystalline_service::origin_withdraw(
                 &domain,
-                proposal,
+                Some(proposal),
+                true,
                 db.as_deref(),
                 config.as_deref(),
             )

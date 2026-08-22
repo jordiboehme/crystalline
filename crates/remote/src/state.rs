@@ -83,7 +83,7 @@ pub struct OriginState {
     pub files: BTreeMap<String, BaseStamp>,
     /// Share proposals still open for review.
     pub proposals: Vec<Proposal>,
-    /// Merged or discarded proposals kept for status display, newest first,
+    /// Merged or withdrawn proposals kept for status display, newest first,
     /// capped at 20 by [`OriginState::push_history`].
     pub history: Vec<Proposal>,
     /// Conflicts from a previous pull still waiting to be resolved.

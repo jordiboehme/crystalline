@@ -1,6 +1,6 @@
 //! End-to-end lifecycle tests for the pull-side and share-side orchestration
 //! in `crystalline_remote::ops` (`subscribe`, `pull`, `status`, `propose`,
-//! `discard`, `resolve`), driven by an in-memory forge
+//! `withdraw`, `resolve`), driven by an in-memory forge
 //! ([`mock::MockProvider`]) rather than a live GitHub. Each test is a
 //! scenario over throwaway tempdirs: subscribe a domain, move the mock forge
 //! or edit the working tree, run the operation under test and assert what
@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crystalline_remote::ops::{
-    PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, discard, propose,
-    propose_preview, pull, resolve, status, subscribe,
+    PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, propose,
+    propose_preview, pull, resolve, status, subscribe, withdraw,
 };
 use crystalline_remote::provider::{Feedback, OriginSpec, ProposalState, Provider};
 use crystalline_remote::state::{
@@ -997,7 +997,7 @@ async fn scenario_14_truncated_compare_falls_back_to_tarball_diff() {
     );
 }
 
-// --- share-side: propose, discard, resolve ------------------------------------
+// --- share-side: propose, withdraw, resolve -----------------------------------
 
 /// The origin every share-side scenario tracks, rooted at a `knowledge/`
 /// subpath so tree writes exercise contract 3's repo-relative prefixing.
@@ -1410,13 +1410,253 @@ async fn scenario_20_propose_amended_merge_upstream_wins_silently() {
     assert_eq!(st.history[0].status, ProposalStatus::Merged);
 }
 
-// Scenario 21 (g): discard. A declined proposal touching three files: one
-// verbatim (restored to its base content), one diverged since sharing
-// (skipped, untouched) and one proposed addition (deleted). The record
-// lands in history with its declined status preserved.
+// Scenario 20: withdraw. Closing an open proposal on the forge, the optional
+// revert, the declined and merged cases, a close failure and the targeting
+// rules.
 
 #[tokio::test]
-async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
+async fn scenario_20_withdraw_open_closes_the_pr_and_keeps_files() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+
+    let report = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.number, first.number);
+    assert!(report.closed);
+    assert!(report.restored.is_empty() && report.deleted.is_empty());
+
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("close_proposal:{}", first.number)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.history[0].number, first.number);
+    assert_eq!(st.history[0].status, ProposalStatus::Withdrawn);
+    // The local edit survives: withdraw without revert never touches files.
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_revert_restores_undiverged_files() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/edit.md", b"before\n"),
+            ("notes/gone.md", b"bye\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/edit.md"), b"after\n");
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("{other:?}"),
+    };
+    // One file diverges after sharing: it must be left alone.
+    write(
+        &sub.domain_root.join("notes/added.md"),
+        b"kept working on it\n",
+    );
+
+    let w = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(report.number),
+        true,
+    )
+    .await
+    .unwrap();
+    let mut restored = w.restored.clone();
+    restored.sort();
+    assert_eq!(
+        restored,
+        vec!["notes/edit.md".to_string(), "notes/gone.md".to_string()]
+    );
+    assert!(w.deleted.is_empty());
+    assert_eq!(w.skipped_diverged, vec!["notes/added.md".to_string()]);
+    assert_eq!(read(&sub.domain_root.join("notes/edit.md")), b"before\n");
+    assert_eq!(read(&sub.domain_root.join("notes/gone.md")), b"bye\n");
+    assert_eq!(
+        read(&sub.domain_root.join("notes/added.md")),
+        b"kept working on it\n"
+    );
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_declined_skips_the_close() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let report = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(!report.closed);
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&format!("close_proposal:{}", first.number)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.history[0].status, ProposalStatus::Withdrawn);
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_refuses_a_merged_proposal() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    // A status flip can leave a Merged record standing in `proposals` until
+    // the next pull consumes it; withdrawing one is refused outright.
+    let mut st = load_state(&sub.state_dir);
+    st.proposals[0].status = ProposalStatus::Merged;
+    st.save(&sub.state_dir).unwrap();
+
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        crystalline_remote::RemoteError::State(msg) => {
+            assert!(msg.contains("already merged"), "{msg}");
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1, "the record is untouched");
+    assert!(st.history.is_empty());
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_close_failure_aborts_untouched() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_close_proposal(first.number);
+
+    let err = withdraw(&mock, &spec(), &sub.domain_root, &sub.state_dir, None, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crystalline_remote::RemoteError::Api { status: 500, .. }
+        ),
+        "{err:?}"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].status,
+        ProposalStatus::Open,
+        "record untouched"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha v2\n",
+        "no revert happened"
+    );
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_targeting_names_candidates() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // No open proposal, no number: the error lists candidates (none).
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        crystalline_remote::RemoteError::NoWithdrawTarget { open, declined } => {
+            assert!(open.is_empty() && declined.is_empty());
+        }
+        other => panic!("expected NoWithdrawTarget, got {other:?}"),
+    }
+
+    // An unknown number stays ProposalNotFound.
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(99),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crystalline_remote::RemoteError::ProposalNotFound { number: 99 }
+        ),
+        "{err:?}"
+    );
+}
+
+// Scenario 21 (g): withdraw --revert. A declined proposal touching three
+// files: one verbatim (restored to its base content), one diverged since
+// sharing (skipped, untouched) and one proposed addition (deleted). The
+// record lands in history as withdrawn.
+
+#[tokio::test]
+async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
     let mock = MockProvider::new();
     let spec = share_spec();
     let c1 = mock.add_commit(
@@ -1477,7 +1717,18 @@ async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
         b"further edited after sharing\n",
     );
 
-    let report = discard(&sub.domain_root, &sub.state_dir, 9).unwrap();
+    let report = withdraw(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(9),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.number, 9);
+    assert!(!report.closed, "a declined proposal is already closed");
     assert_eq!(report.restored, vec!["notes/keep.md".to_string()]);
     assert_eq!(report.deleted, vec!["notes/added.md".to_string()]);
     assert_eq!(
@@ -1497,7 +1748,7 @@ async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
     assert!(st.proposals.is_empty());
     assert_eq!(st.history.len(), 1);
     assert_eq!(st.history[0].number, 9);
-    assert_eq!(st.history[0].status, ProposalStatus::Declined);
+    assert_eq!(st.history[0].status, ProposalStatus::Withdrawn);
 }
 
 // Scenario 22 (h): resolve. Mine, theirs (both EditEdit and the
@@ -3084,6 +3335,14 @@ async fn scenario_37_status_flags_an_amended_branch() {
         .unwrap();
     assert_eq!(report.amended_upstream, vec![first.number]);
     assert_eq!(report.open_proposals.len(), 1, "still open, just amended");
+    // Exactly one live list call answers both questions this status asks.
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|c| *c == "list_open_proposals")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]

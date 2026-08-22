@@ -86,13 +86,28 @@ pub enum RemoteError {
         count: usize,
     },
 
-    /// A discard named a proposal number that is not among this domain's
-    /// open or declined proposals: never registered, already discarded, or
-    /// merged (and so already moved to history, not discardable).
+    /// A withdraw named a proposal number that is not among this domain's
+    /// open or declined proposals: never registered, already withdrawn, or
+    /// merged (and so already moved to history, not withdrawable).
     #[error("no open or declined proposal #{number} found for this domain")]
     ProposalNotFound {
         /// The proposal number that was not found.
         number: u64,
+    },
+
+    /// A withdraw with no proposal number found no single open proposal to
+    /// act on: none is open, or (only possible in pre-living-proposal state)
+    /// several are. Lists every candidate so the caller can retry naming one.
+    #[error(
+        "no single proposal to withdraw; pass a proposal number. Open: {}; declined: {}",
+        join_numbers(open),
+        join_numbers(declined)
+    )]
+    NoWithdrawTarget {
+        /// The numbers of every open proposal this domain records.
+        open: Vec<u64>,
+        /// The numbers of every declined proposal this domain records.
+        declined: Vec<u64>,
     },
 
     /// A resolve named a path with no recorded conflict for this domain.
@@ -156,6 +171,20 @@ fn manifest_location(path: &Option<String>) -> String {
     match path {
         Some(p) => format!("at {p}"),
         None => "at the repository root".to_string(),
+    }
+}
+
+/// Renders a proposal-number list for the `NoWithdrawTarget` message:
+/// `"none"` for an empty list, `"#3, #7"` otherwise.
+fn join_numbers(numbers: &[u64]) -> String {
+    if numbers.is_empty() {
+        "none".to_string()
+    } else {
+        numbers
+            .iter()
+            .map(|n| format!("#{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
@@ -297,6 +326,29 @@ mod tests {
     }
 
     #[test]
+    fn no_withdraw_target_reports_none_when_nothing_is_open_or_declined() {
+        let err = RemoteError::NoWithdrawTarget {
+            open: vec![],
+            declined: vec![],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("pass a proposal number"), "{msg}");
+        assert!(msg.contains("Open: none"), "{msg}");
+        assert!(msg.contains("declined: none"), "{msg}");
+    }
+
+    #[test]
+    fn no_withdraw_target_lists_every_candidate_number() {
+        let err = RemoteError::NoWithdrawTarget {
+            open: vec![3, 7],
+            declined: vec![1],
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("Open: #3, #7"), "{msg}");
+        assert!(msg.contains("declined: #1"), "{msg}");
+    }
+
+    #[test]
     fn conflict_not_found_names_the_path_and_lists_open_conflicts() {
         let err = RemoteError::ConflictNotFound {
             path: "notes/missing.md".to_string(),
@@ -385,6 +437,11 @@ mod tests {
             .to_string(),
             RemoteError::ConflictsPending { count: 1 }.to_string(),
             RemoteError::ProposalNotFound { number: 1 }.to_string(),
+            RemoteError::NoWithdrawTarget {
+                open: vec![3],
+                declined: vec![],
+            }
+            .to_string(),
             RemoteError::ConflictNotFound {
                 path: "notes/a.md".to_string(),
                 open: vec!["notes/b.md".to_string()],

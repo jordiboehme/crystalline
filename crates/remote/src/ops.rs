@@ -193,18 +193,23 @@ pub struct ProposeReport {
     pub summary: String,
 }
 
-/// What [`discard`] did with a declined or still-open proposal's files.
+/// What [`withdraw`] did with a declined or still-open proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct DiscardReport {
-    /// Domain-relative paths restored to their base-tree content (a
+pub struct WithdrawReport {
+    /// The proposal that was withdrawn.
+    pub number: u64,
+    /// True when a live pull request was closed on the forge (an Open
+    /// proposal); false for a Declined one, already closed by a reviewer.
+    pub closed: bool,
+    /// Domain-relative paths restored to base-tree content (revert only): a
     /// proposed `Modified` or `Deleted` file whose local copy still matched
-    /// what was proposed).
+    /// what was proposed.
     pub restored: Vec<String>,
     /// Domain-relative paths deleted (a proposed `Added` file whose local
-    /// copy still matched what was proposed).
+    /// copy still matched what was proposed; revert only).
     pub deleted: Vec<String>,
-    /// Domain-relative paths left untouched because the local file no
-    /// longer matches what was proposed: newer work is never destroyed.
+    /// Paths left untouched because the local file diverged since sharing:
+    /// newer work is never destroyed.
     pub skipped_diverged: Vec<String>,
 }
 
@@ -371,12 +376,12 @@ pub async fn pull(
     }
 
     // Refresh open proposals first so a just-merged one can override its own
-    // files in the merge loop below. Every Merged record is collected, not
-    // only the ones that flipped in this refresh: `status` can flip a record
-    // to Merged between pulls, and such a record is un-consumed work this
-    // pull has to finish.
+    // files in the merge loop below. Every Merged record is collected,
+    // however it came to be flagged, not only the ones that flipped in this
+    // refresh: `status` can flip a record to Merged between pulls, and such a
+    // record is un-consumed work this pull has to finish.
     let (transitions, _) = refresh_proposals(provider, spec, &mut state).await?;
-    let merged_this_pull: Vec<Proposal> = state
+    let merged_to_consume: Vec<Proposal> = state
         .proposals
         .iter()
         .filter(|p| p.status == ProposalStatus::Merged)
@@ -445,7 +450,7 @@ pub async fn pull(
         // local file takes upstream unconditionally, so a reviewer's
         // amendments win over the proposed-but-unamended local copy. A user
         // who edited after sharing (hashes differ) falls through to merge.
-        if proposal_override_applies(&merged_this_pull, rel, local.as_deref()) {
+        if proposal_override_applies(&merged_to_consume, rel, local.as_deref()) {
             match &edit.content {
                 Some(bytes) => write_working_file(&wt_path, bytes)?,
                 None => remove_working_file(&wt_path)?,
@@ -516,7 +521,7 @@ pub async fn pull(
     // Consume merged proposals in memory, then persist base advance,
     // conflicts and history together in one atomic save so a crash cannot
     // leave a merged proposal half-consumed.
-    for prop in &merged_this_pull {
+    for prop in &merged_to_consume {
         state.proposals.retain(|p| p.number != prop.number);
         let mut consumed = prop.clone();
         consumed.status = ProposalStatus::Merged;
@@ -526,7 +531,7 @@ pub async fn pull(
 
     // Best-effort branch cleanup, after the state is durable; errors are
     // ignored entirely (the branch lingering upstream harms nothing).
-    for prop in &merged_this_pull {
+    for prop in &merged_to_consume {
         let _ = provider.delete_branch(spec, &prop.branch).await;
     }
 
@@ -628,15 +633,25 @@ pub async fn status(
                             // The flip is applied and saved, but NOT consumed -
                             // consumption stays a pull concern; status only
                             // makes the user see the truth.
-                            if let Ok(refreshed) = provider.proposal_state(spec, prop.number).await
-                            {
-                                let new_status = match refreshed {
-                                    ProposalState::Merged => ProposalStatus::Merged,
-                                    ProposalState::Declined => ProposalStatus::Declined,
-                                    ProposalState::Open => continue,
-                                };
-                                prop.status = new_status;
-                                dirty = true;
+                            match provider.proposal_state(spec, prop.number).await {
+                                Ok(refreshed) => {
+                                    let new_status = match refreshed {
+                                        ProposalState::Merged => ProposalStatus::Merged,
+                                        ProposalState::Declined => ProposalStatus::Declined,
+                                        ProposalState::Open => continue,
+                                    };
+                                    prop.status = new_status;
+                                    dirty = true;
+                                }
+                                Err(e) => {
+                                    // Same degradation as a failed list: the
+                                    // record keeps its local status rather
+                                    // than failing the status.
+                                    tracing::debug!(
+                                        "classifying proposal #{} failed; keeping its local status: {e}",
+                                        prop.number
+                                    );
+                                }
                             }
                         }
                     }
@@ -1203,91 +1218,135 @@ async fn update_open_proposal(
     }))
 }
 
-/// Discards a declined, or still-open ("never mind"), share proposal:
-/// restores each proposed file that still matches what was proposed to its
-/// pre-proposal content (the base tree, or plain deletion for a proposed
-/// addition), leaves any file whose local content has since diverged
-/// untouched, then moves the proposal record to history with whatever
-/// status it currently holds (discarding never rewrites `status` itself).
+/// Withdraws a share proposal: closes its pull request on the forge (an Open
+/// one), best-effort deletes its branch, optionally restores the shared files
+/// to their pre-share content, and moves the record to history as
+/// [`ProposalStatus::Withdrawn`].
 ///
-/// Offline: this never talks to a provider. Discarding an `Open` proposal
-/// does not close its pull request on the origin; that happens on GitHub
-/// itself, and the next pull's proposal refresh marks it `Declined` once it
-/// is closed there.
-pub fn discard(
+/// Target: `proposal_number`, or the single Open proposal when `None`;
+/// no open proposal (or more than one, possible only in pre-living-proposal
+/// state) is [`RemoteError::NoWithdrawTarget`] listing every candidate, and a
+/// named number that is not among the open or declined records is
+/// [`RemoteError::ProposalNotFound`]. A close failure aborts the whole
+/// withdraw with the error and nothing else changed. Without `revert` the
+/// working tree is untouched; with it, files still matching what was proposed
+/// are restored (base-tree content for Modified/Deleted, deletion for Added)
+/// and diverged ones are skipped - newer work is never destroyed.
+pub async fn withdraw(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
-    proposal_number: u64,
-) -> Result<DiscardReport, RemoteError> {
+    proposal_number: Option<u64>,
+    revert: bool,
+) -> Result<WithdrawReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
 
-    let proposal = state
-        .proposals
-        .iter()
-        .find(|p| p.number == proposal_number)
-        .cloned()
-        .ok_or(RemoteError::ProposalNotFound {
-            number: proposal_number,
-        })?;
+    let proposal = match proposal_number {
+        Some(number) => state
+            .proposals
+            .iter()
+            .find(|p| p.number == number)
+            .cloned()
+            .ok_or(RemoteError::ProposalNotFound { number })?,
+        None => {
+            let open: Vec<&Proposal> = state
+                .proposals
+                .iter()
+                .filter(|p| p.status == ProposalStatus::Open)
+                .collect();
+            match open.as_slice() {
+                [single] => (*single).clone(),
+                _ => {
+                    return Err(RemoteError::NoWithdrawTarget {
+                        open: open.iter().map(|p| p.number).collect(),
+                        declined: state
+                            .proposals
+                            .iter()
+                            .filter(|p| p.status == ProposalStatus::Declined)
+                            .map(|p| p.number)
+                            .collect(),
+                    });
+                }
+            }
+        }
+    };
     if proposal.status == ProposalStatus::Merged {
-        // Not reachable through the normal pull/propose lifecycle (a merged
-        // proposal is consumed straight to history), but guarded explicitly
-        // since a discard must never apply to one.
+        // A Merged record can genuinely stand here: `status` flips one to
+        // Merged without consuming it, and only the next pull moves it to
+        // history. Withdrawing a merged proposal is refused outright.
         return Err(RemoteError::State(format!(
-            "proposal #{proposal_number} has already merged and cannot be discarded"
+            "proposal #{} has already merged and cannot be withdrawn",
+            proposal.number
         )));
     }
+
+    // Close first: a failure here aborts with nothing else changed. A
+    // Declined proposal is already closed on the forge, so only the branch
+    // cleanup applies to it.
+    let closed = if proposal.status == ProposalStatus::Open {
+        provider.close_proposal(spec, proposal.number).await?;
+        true
+    } else {
+        false
+    };
+    let _ = provider.delete_branch(spec, &proposal.branch).await;
 
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
     let mut skipped_diverged = Vec::new();
+    if revert {
+        for pf in &proposal.files {
+            let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
+            let current = read_optional_file(&wt_path)?;
+            let current_sha = current.as_deref().map(state::sha256_hex);
 
-    for pf in &proposal.files {
-        let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
-        let current = read_optional_file(&wt_path)?;
-        let current_sha = current.as_deref().map(state::sha256_hex);
-
-        let diverged = match pf.change {
-            ProposedChange::Added | ProposedChange::Modified => {
-                current_sha.as_deref() != pf.sha256.as_deref()
+            let diverged = match pf.change {
+                ProposedChange::Added | ProposedChange::Modified => {
+                    current_sha.as_deref() != pf.sha256.as_deref()
+                }
+                ProposedChange::Deleted => current.is_some(),
+            };
+            if diverged {
+                skipped_diverged.push(pf.path.clone());
+                continue;
             }
-            ProposedChange::Deleted => current.is_some(),
-        };
-        if diverged {
-            skipped_diverged.push(pf.path.clone());
-            continue;
-        }
 
-        match pf.change {
-            ProposedChange::Added => {
-                remove_working_file(&wt_path)?;
-                deleted.push(pf.path.clone());
-            }
-            ProposedChange::Modified | ProposedChange::Deleted => {
-                match state::read_base_file(state_dir, &pf.path)? {
-                    Some(bytes) => {
-                        write_working_file(&wt_path, &bytes)?;
-                        restored.push(pf.path.clone());
+            match pf.change {
+                ProposedChange::Added => {
+                    remove_working_file(&wt_path)?;
+                    deleted.push(pf.path.clone());
+                }
+                ProposedChange::Modified | ProposedChange::Deleted => {
+                    match state::read_base_file(state_dir, &pf.path)? {
+                        Some(bytes) => {
+                            write_working_file(&wt_path, &bytes)?;
+                            restored.push(pf.path.clone());
+                        }
+                        // No base copy to restore from (should not happen: a
+                        // Modified or Deleted change always had a base entry);
+                        // never destroy the local file over it, so this is left
+                        // alone like a genuine divergence.
+                        None => skipped_diverged.push(pf.path.clone()),
                     }
-                    // No base copy to restore from (should not happen: a
-                    // Modified or Deleted change always had a base entry);
-                    // never destroy the local file over it, so this is left
-                    // alone like a genuine divergence.
-                    None => skipped_diverged.push(pf.path.clone()),
                 }
             }
         }
     }
 
-    state.proposals.retain(|p| p.number != proposal_number);
-    state.push_history(proposal);
+    state.proposals.retain(|p| p.number != proposal.number);
+    let mut record = proposal.clone();
+    record.status = ProposalStatus::Withdrawn;
+    state.push_history(record);
     state.save(state_dir)?;
 
-    Ok(DiscardReport {
+    Ok(WithdrawReport {
+        number: proposal.number,
+        closed,
         restored,
         deleted,
         skipped_diverged,
