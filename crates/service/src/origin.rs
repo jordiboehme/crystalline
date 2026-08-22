@@ -240,12 +240,15 @@ fn poll_outcome_json(outcome: &DomainPollOutcome) -> Value {
 
 /// Shapes [`ops::propose`]'s outcome into `origin_share`'s JSON: `{ outcome:
 /// "proposed", url, number, branch, added, updated, deleted, skipped_large,
-/// summary }` when a pull request was opened, or `{ outcome:
+/// summary }` when a pull request was opened, `{ outcome: "updated", proposal
+/// }` when the one open proposal was updated in place, `{ outcome:
 /// "nothing_to_share", skipped_large }` when the team already has everything
-/// the domain knows. The third outcome a caller may see, `conflicts_pending`,
-/// is not shaped here: `Engine::origin_share` builds it directly from the
-/// reloaded conflict list when `ops::propose` itself refuses, since
-/// `RemoteError::ConflictsPending` alone carries only a count.
+/// the domain knows, or `{ outcome: "proposal_diverged", proposal, guidance }`
+/// when a reviewer moved the proposal branch and nothing was written. The
+/// further outcome a caller may see, `conflicts_pending`, is not shaped here:
+/// `Engine::origin_share` builds it directly from the reloaded conflict list
+/// when `ops::propose` itself refuses, since `RemoteError::ConflictsPending`
+/// alone carries only a count.
 pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
     match outcome {
         ProposeOutcome::Proposed(report) => json!({
@@ -259,12 +262,37 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "skipped_large": report.skipped_large,
             "summary": report.summary,
         }),
+        ProposeOutcome::Updated(report) => json!({
+            "outcome": "updated",
+            "proposal": {
+                "url": report.url,
+                "number": report.number,
+                "branch": report.branch,
+                "added": report.added,
+                "updated": report.updated,
+                "deleted": report.deleted,
+                "skipped_large": report.skipped_large,
+                "summary": report.summary,
+            },
+        }),
         ProposeOutcome::NothingToShare { skipped_large } => json!({
             "outcome": "nothing_to_share",
             "skipped_large": skipped_large,
         }),
+        ProposeOutcome::ProposalDiverged {
+            number,
+            url,
+            branch,
+        } => json!({
+            "outcome": "proposal_diverged",
+            "proposal": { "number": number, "url": url, "branch": branch },
+            "guidance": DIVERGED_GUIDANCE,
+        }),
     }
 }
+
+/// What a caller relays when a reviewer amended the proposal branch.
+pub(crate) const DIVERGED_GUIDANCE: &str = "A reviewer pushed commits onto this proposal's branch. Let the review finish and merge on GitHub, or withdraw the proposal and share again.";
 
 /// Builds the [`ops::Resolution`] `origin_resolve` acts on from its `keep`
 /// and `content` arguments, which must be exactly one of: `keep` is
