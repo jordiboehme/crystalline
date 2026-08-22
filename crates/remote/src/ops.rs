@@ -713,7 +713,12 @@ pub async fn propose(
         .create_tree(spec, &state.base_commit, &writes)
         .await?;
     let commit_sha = provider
-        .create_commit(spec, &effective_title, &tree_sha, &state.base_commit)
+        .create_commit(
+            spec,
+            &effective_title,
+            &tree_sha,
+            std::slice::from_ref(&state.base_commit),
+        )
         .await?;
     let branch = share_branch_name(domain_name);
     provider.create_branch(spec, &branch, &commit_sha).await?;

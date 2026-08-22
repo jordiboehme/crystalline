@@ -339,7 +339,12 @@ async fn create_blob_tree_commit_and_branch_send_the_documented_bodies() {
     assert_eq!(tree_sha, "treesha1");
 
     let commit_sha = provider
-        .create_commit(&origin(), "message here", &tree_sha, "parentsha1")
+        .create_commit(
+            &origin(),
+            "message here",
+            &tree_sha,
+            &["parentsha1".to_string()],
+        )
         .await
         .unwrap();
     assert_eq!(commit_sha, "commitsha1");
@@ -603,4 +608,198 @@ async fn authorization_header_is_sent_only_when_a_token_is_configured() {
         login, "",
         "no Authorization header reaches the server at all"
     );
+}
+
+// --- branch_ref --------------------------------------------------------------
+
+#[tokio::test]
+async fn branch_ref_reports_the_sha_and_none_on_404() {
+    // A wildcard, not `{name}`: a share branch is `crystalline/share-<domain>`
+    // and spans two path segments, exactly as it does against GitHub.
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/git/ref/heads/{*name}",
+        get(|Path(name): Path<String>| async move {
+            if name == "crystalline/share-eng-1" {
+                Json(serde_json::json!({"object": {"sha": "feedbead"}})).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    assert_eq!(
+        provider
+            .branch_ref(&origin(), "crystalline/share-eng-1")
+            .await
+            .unwrap(),
+        Some("feedbead".to_string())
+    );
+    assert_eq!(provider.branch_ref(&origin(), "gone").await.unwrap(), None);
+}
+
+// --- update_branch -----------------------------------------------------------
+
+#[tokio::test]
+async fn update_branch_patches_the_ref_without_force() {
+    let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/git/refs/heads/{*name}",
+        axum::routing::patch(move |body: Json<serde_json::Value>| {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() = Some(body.0);
+                Json(serde_json::json!({"object": {"sha": "cafe"}}))
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    provider
+        .update_branch(&origin(), "crystalline/share-eng-1", "cafe")
+        .await
+        .unwrap();
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["sha"], "cafe");
+    assert_eq!(body["force"], false);
+}
+
+// --- update_proposal / close_proposal ---------------------------------------
+
+#[tokio::test]
+async fn update_proposal_patches_body_and_only_a_supplied_title() {
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls/{number}",
+        axum::routing::patch(move |body: Json<serde_json::Value>| {
+            let state = state.clone();
+            async move {
+                state.lock().unwrap().push(body.0);
+                Json(serde_json::json!({"number": 4}))
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    provider
+        .update_proposal(&origin(), 4, None, "fresh body")
+        .await
+        .unwrap();
+    provider
+        .update_proposal(&origin(), 4, Some("New title"), "fresh body")
+        .await
+        .unwrap();
+    let bodies = seen.lock().unwrap().clone();
+    assert_eq!(bodies[0]["body"], "fresh body");
+    assert!(bodies[0].get("title").is_none(), "{:?}", bodies[0]);
+    assert_eq!(bodies[1]["title"], "New title");
+}
+
+#[tokio::test]
+async fn close_proposal_patches_state_closed() {
+    let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls/{number}",
+        axum::routing::patch(move |body: Json<serde_json::Value>| {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() = Some(body.0);
+                Json(serde_json::json!({"number": 4}))
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    provider.close_proposal(&origin(), 4).await.unwrap();
+    assert_eq!(seen.lock().unwrap().clone().unwrap()["state"], "closed");
+}
+
+// --- proposal_feedback -------------------------------------------------------
+
+#[tokio::test]
+async fn proposal_feedback_maps_the_three_channels_and_the_review_state_table() {
+    let app = Router::new()
+        .route(
+            "/repos/acme/brand-knowledge/pulls/4/reviews",
+            get(|| async {
+                Json(serde_json::json!([
+                    {"user": {"login": "ana"}, "state": "APPROVED", "body": "", "submitted_at": "2026-08-20T09:00:00Z"},
+                    {"user": {"login": "bob"}, "state": "CHANGES_REQUESTED", "body": "needs sources", "submitted_at": "2026-08-20T10:00:00Z"},
+                    {"user": {"login": "bob"}, "state": "COMMENTED", "body": "", "submitted_at": "2026-08-20T11:00:00Z"}
+                ]))
+            }),
+        )
+        .route(
+            "/repos/acme/brand-knowledge/pulls/4/comments",
+            get(|| async {
+                Json(serde_json::json!([
+                    {"user": {"login": "bob"}, "body": "cite the incident", "path": "notes/a.md", "line": 12, "created_at": "2026-08-20T10:01:00Z"}
+                ]))
+            }),
+        )
+        .route(
+            "/repos/acme/brand-knowledge/issues/4/comments",
+            get(|| async {
+                Json(serde_json::json!([
+                    {"user": {"login": "ana"}, "body": "thanks!", "created_at": "2026-08-20T12:00:00Z"}
+                ]))
+            }),
+        );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    let fb = provider.proposal_feedback(&origin(), 4).await.unwrap();
+    // bob's latest non-empty state is CHANGES_REQUESTED (the later bare
+    // COMMENTED with an empty body does not displace it), and any reviewer at
+    // changes_requested wins over ana's approval.
+    assert_eq!(fb.review_state.as_deref(), Some("changes_requested"));
+    // One review item (only non-empty review bodies become items), one review
+    // comment with path and line, one issue comment; nobody is filtered out.
+    let kinds: Vec<_> = fb.items.iter().map(|i| i.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            crystalline_remote::state::FeedbackKind::Review,
+            crystalline_remote::state::FeedbackKind::ReviewComment,
+            crystalline_remote::state::FeedbackKind::Comment,
+        ]
+    );
+    let inline = &fb.items[1];
+    assert_eq!(inline.path.as_deref(), Some("notes/a.md"));
+    assert_eq!(inline.line, Some(12));
+    assert_eq!(inline.author, "bob");
+}
+
+// --- list_open_proposals -----------------------------------------------------
+
+#[tokio::test]
+async fn list_open_proposals_pages_until_a_short_page() {
+    // Page 1 full (100 entries), page 2 short (1 entry): the client follows
+    // `page` exactly like compare does.
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls",
+        get(|Query(q): Query<HashMap<String, String>>| async move {
+            assert_eq!(q.get("state").map(String::as_str), Some("open"));
+            assert_eq!(q.get("per_page").map(String::as_str), Some("100"));
+            let page: usize = q.get("page").unwrap().parse().unwrap();
+            let rows: Vec<serde_json::Value> = if page == 1 {
+                (1..=100)
+                    .map(|n| serde_json::json!({"number": n, "head": {"ref": format!("b{n}"), "sha": format!("s{n}")}}))
+                    .collect()
+            } else {
+                vec![serde_json::json!({"number": 101, "head": {"ref": "b101", "sha": "s101"}})]
+            };
+            Json(serde_json::Value::Array(rows))
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    let open = provider.list_open_proposals(&origin()).await.unwrap();
+    assert_eq!(open.len(), 101);
+    assert_eq!(open[0].number, 1);
+    assert_eq!(open[0].branch, "b1");
+    assert_eq!(open[0].head_sha, "s1");
+    assert_eq!(open[100].number, 101);
 }

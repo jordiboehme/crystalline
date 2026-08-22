@@ -32,14 +32,15 @@ use serde::de::DeserializeOwned;
 
 use crate::error::RemoteError;
 use crate::provider::{
-    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
-    ProposalState, Provider, TreeWrite, UpstreamChange,
+    ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
+    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
 };
 use types::{
-    BlobResponse, CommitResponse, CompareFile, CompareResponse, CreateBlobRequest,
-    CreateCommitRequest, CreateProposalRequest, CreateProposalResponse, CreateRefRequest,
-    CreateTreeRequest, CurrentUserResponse, ErrorBody, ProposalStateResponse, RefResponse,
-    ShaResponse, TreeEntryRequest,
+    BlobResponse, CloseProposalRequest, CommitResponse, CompareFile, CompareResponse,
+    CreateBlobRequest, CreateCommitRequest, CreateProposalRequest, CreateProposalResponse,
+    CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, IssueCommentResponse,
+    OpenProposalListItem, ProposalStateResponse, RefResponse, ReviewCommentResponse,
+    ReviewResponse, ShaResponse, TreeEntryRequest, UpdateProposalRequest, UpdateRefRequest,
 };
 
 /// The default GitHub REST API base url.
@@ -302,14 +303,14 @@ impl Provider for GitHubProvider {
         origin: &OriginSpec,
         message: &str,
         tree: &str,
-        parent: &str,
+        parents: &[String],
     ) -> Result<String, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/git/commits");
         let body = CreateCommitRequest {
             message: message.to_string(),
             tree: tree.to_string(),
-            parents: vec![parent.to_string()],
+            parents: parents.to_vec(),
         };
         let response = self
             .send(self.request(Method::POST, &path).json(&body))
@@ -344,6 +345,129 @@ impl Provider for GitHubProvider {
         let response = self.send(self.request(Method::DELETE, &path)).await?;
         self.check(response, Some(&origin.repo)).await?;
         Ok(())
+    }
+
+    async fn branch_ref(
+        &self,
+        origin: &OriginSpec,
+        name: &str,
+    ) -> Result<Option<String>, RemoteError> {
+        let (owner, repo_name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{repo_name}/git/ref/heads/{name}");
+        let response = self.send(self.request(Method::GET, &path)).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            // A missing share branch is an answer, not a repository problem:
+            // check() would map this 404 to RepoNotFound, so it is read here.
+            return Ok(None);
+        }
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let body: RefResponse = parse_json(response).await?;
+        Ok(Some(body.object.sha))
+    }
+
+    async fn update_branch(
+        &self,
+        origin: &OriginSpec,
+        name: &str,
+        commit: &str,
+    ) -> Result<(), RemoteError> {
+        let (owner, repo_name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{repo_name}/git/refs/heads/{name}");
+        let body = UpdateRefRequest {
+            sha: commit.to_string(),
+            force: false,
+        };
+        let response = self
+            .send(self.request(Method::PATCH, &path).json(&body))
+            .await?;
+        self.check(response, Some(&origin.repo)).await?;
+        Ok(())
+    }
+
+    async fn update_proposal(
+        &self,
+        origin: &OriginSpec,
+        number: u64,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{name}/pulls/{number}");
+        let body = UpdateProposalRequest {
+            title: title.map(str::to_string),
+            body: body.to_string(),
+        };
+        let response = self
+            .send(self.request(Method::PATCH, &path).json(&body))
+            .await?;
+        self.check(response, Some(&origin.repo)).await?;
+        Ok(())
+    }
+
+    async fn close_proposal(&self, origin: &OriginSpec, number: u64) -> Result<(), RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{name}/pulls/{number}");
+        let body = CloseProposalRequest { state: "closed" };
+        let response = self
+            .send(self.request(Method::PATCH, &path).json(&body))
+            .await?;
+        self.check(response, Some(&origin.repo)).await?;
+        Ok(())
+    }
+
+    async fn proposal_feedback(
+        &self,
+        origin: &OriginSpec,
+        number: u64,
+    ) -> Result<Feedback, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+
+        let path = format!("/repos/{owner}/{name}/pulls/{number}/reviews?per_page=100");
+        let response = self.send(self.request(Method::GET, &path)).await?;
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let reviews: Vec<ReviewResponse> = parse_json(response).await?;
+
+        let path = format!("/repos/{owner}/{name}/pulls/{number}/comments?per_page=100");
+        let response = self.send(self.request(Method::GET, &path)).await?;
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let review_comments: Vec<ReviewCommentResponse> = parse_json(response).await?;
+
+        let path = format!("/repos/{owner}/{name}/issues/{number}/comments?per_page=100");
+        let response = self.send(self.request(Method::GET, &path)).await?;
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let issue_comments: Vec<IssueCommentResponse> = parse_json(response).await?;
+
+        Ok(build_feedback(reviews, review_comments, issue_comments))
+    }
+
+    async fn list_open_proposals(
+        &self,
+        origin: &OriginSpec,
+    ) -> Result<Vec<OpenProposalRef>, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        let mut out = Vec::new();
+        let mut page = 1usize;
+        loop {
+            let path = format!(
+                "/repos/{owner}/{name}/pulls?state=open&per_page={COMPARE_PER_PAGE}&page={page}"
+            );
+            let response = self.send(self.request(Method::GET, &path)).await?;
+            let response = self.check(response, Some(&origin.repo)).await?;
+            let items: Vec<OpenProposalListItem> = parse_json(response).await?;
+            let count = items.len();
+            for item in items {
+                out.push(OpenProposalRef {
+                    number: item.number,
+                    branch: item.head.reference,
+                    head_sha: item.head.sha,
+                });
+            }
+            if count < COMPARE_PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
     }
 
     async fn create_proposal(
@@ -494,5 +618,82 @@ fn map_compare_file(file: CompareFile) -> UpstreamChange {
         path: file.filename,
         kind,
         blob_sha: if removed { None } else { Some(file.sha) },
+    }
+}
+
+/// Folds the three feedback channels into the forge-neutral [`Feedback`].
+///
+/// Review state: the latest non-empty state per reviewer wins (a bare
+/// COMMENTED event with no body does not displace an earlier verdict), then
+/// any reviewer at CHANGES_REQUESTED makes the whole state
+/// "changes_requested", else any APPROVED makes it "approved", else any
+/// COMMENTED makes it "commented". Review bodies become items only when
+/// non-empty; comments by the connected user are kept - they are part of the
+/// thread, and filtering them would hide half the conversation.
+fn build_feedback(
+    reviews: Vec<ReviewResponse>,
+    review_comments: Vec<ReviewCommentResponse>,
+    issue_comments: Vec<IssueCommentResponse>,
+) -> Feedback {
+    use std::collections::BTreeMap;
+    let mut latest: BTreeMap<String, String> = BTreeMap::new();
+    let mut items = Vec::new();
+    for review in &reviews {
+        let login = review
+            .user
+            .as_ref()
+            .map(|u| u.login.clone())
+            .unwrap_or_default();
+        let meaningful = matches!(
+            review.state.as_str(),
+            "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED"
+        );
+        let body_empty = review.body.as_deref().unwrap_or("").trim().is_empty();
+        if meaningful && !(review.state == "COMMENTED" && body_empty) {
+            latest.insert(login.clone(), review.state.clone());
+        }
+        if !body_empty {
+            items.push(crate::state::FeedbackItem {
+                author: login,
+                body: review.body.clone().unwrap_or_default(),
+                path: None,
+                line: None,
+                submitted_at: review.submitted_at.clone().unwrap_or_default(),
+                kind: crate::state::FeedbackKind::Review,
+            });
+        }
+    }
+    let review_state = if latest.values().any(|s| s == "CHANGES_REQUESTED") {
+        Some("changes_requested".to_string())
+    } else if latest.values().any(|s| s == "APPROVED") {
+        Some("approved".to_string())
+    } else if latest.values().any(|s| s == "COMMENTED") {
+        Some("commented".to_string())
+    } else {
+        None
+    };
+    for comment in review_comments {
+        items.push(crate::state::FeedbackItem {
+            author: comment.user.map(|u| u.login).unwrap_or_default(),
+            body: comment.body,
+            path: comment.path,
+            line: comment.line,
+            submitted_at: comment.created_at.unwrap_or_default(),
+            kind: crate::state::FeedbackKind::ReviewComment,
+        });
+    }
+    for comment in issue_comments {
+        items.push(crate::state::FeedbackItem {
+            author: comment.user.map(|u| u.login).unwrap_or_default(),
+            body: comment.body,
+            path: None,
+            line: None,
+            submitted_at: comment.created_at.unwrap_or_default(),
+            kind: crate::state::FeedbackKind::Comment,
+        });
+    }
+    Feedback {
+        review_state,
+        items,
     }
 }
