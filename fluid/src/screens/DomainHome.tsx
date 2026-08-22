@@ -233,8 +233,9 @@ export default function DomainHome() {
       {/*
         The same gate, and the same query behind it: the card beside this one
         says how many proposals there are and this one says which they are, off
-        one fetch. It draws nothing when there are none, so a team domain
-        between proposals looks exactly like it did before.
+        one fetch. It draws nothing on a domain with no origin, and stays with
+        an empty list on a team domain between proposals - sharing starts in
+        its header, and that is exactly the moment somebody reaches for it.
       */}
       {capabilities.canAdminister && <ProposalsCard domain={domain} />}
 

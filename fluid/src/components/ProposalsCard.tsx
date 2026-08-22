@@ -8,20 +8,22 @@
  * able to act on it. Both read the same query - same key, same fetcher - so
  * mounting the pair costs one request rather than two.
  *
- * Drawn only when there is something to draw. A domain with no origin answers
- * 404 and a team domain between proposals answers an empty pair of lists, and
- * neither of those is a state worth a heading and an empty box: the card
- * appears when it has rows, exactly as the sync card appears when it has a
- * status.
+ * Drawn once the status behind it has answered, and not before: a domain with
+ * no origin answers 404, and neither that nor a status still in flight is a
+ * state worth a heading. A team domain between proposals is, though, because
+ * the way to make one is in this card's header - a card that vanished when the
+ * list emptied would take the share button with it, exactly when somebody has
+ * something to share.
  *
  * Feedback is folded away behind a press. A proposal under review carries a
  * thread, and spreading every thread over the card would bury the row below it;
  * what the collapsed row keeps is the verdict, which is the part somebody
  * scanning the card is looking for.
  *
- * The withdraw confirm is behind the house lazy seam, so a session that only
- * reads this card never loads a dialog's worth of code: this file draws rows,
- * and `WithdrawProposalDialog` is what mounts once somebody presses Withdraw.
+ * Both dialogs are behind the house lazy seam, so a session that only reads
+ * this card never loads a dialog's worth of code: this file draws rows, and
+ * `WithdrawProposalDialog` and `ShareDialog` are what mount once somebody
+ * presses Withdraw or Share changes.
  */
 
 import { useQuery } from "@tanstack/react-query";
@@ -30,6 +32,7 @@ import { useState } from "react";
 
 import type { SyncProposal } from "../api/admin";
 import { fetchSyncStatus, syncStatusKey } from "../api/admin";
+import { ShareDialog } from "./ShareDialog";
 import { WithdrawProposalDialog } from "./WithdrawProposalDialog";
 import { BUTTON, Chip } from "./primitives";
 import type { ChipVariant } from "./primitives";
@@ -39,6 +42,8 @@ export function ProposalsCard({
 }: {
   domain: string;
 }): ReactElement | null {
+  const [sharing, setSharing] = useState(false);
+
   // The sync card's own query, to the letter: react-query hands the second
   // subscriber the first one's result, so this is a cache read rather than a
   // second call. `retry: false` for the reason it gives - the two answers this
@@ -49,32 +54,62 @@ export function ProposalsCard({
     retry: false,
   });
 
-  // One condition covers all three of the nothing-to-draw states: a status
-  // still in flight, a first read that was refused (404 or otherwise) and a
-  // team domain with no proposals. A refetch that failed after one succeeded
-  // keeps its rows, the way the sync card keeps its numbers.
-  const proposals = status.data?.proposals ?? [];
-  if (proposals.length === 0) {
+  // Both of the nothing-to-draw states in one condition: a status still in
+  // flight, and a first read that was refused (404 for a domain with no
+  // origin, and anything else the same way - the sync card beside this one is
+  // where a refusal is reported). A refetch that failed after one succeeded
+  // keeps its rows, the way that card keeps its numbers.
+  const answered = status.data;
+  if (!answered) {
     return null;
   }
+  const proposals = answered.proposals;
 
   return (
     <section
       aria-labelledby="domain-proposals"
       className="flex flex-col gap-3 rounded border border-slate-200 p-4 dark:border-slate-800"
     >
-      <h2 id="domain-proposals" className="text-section">
-        Proposals
-      </h2>
-      <ul className="flex flex-col gap-3">
-        {proposals.map((proposal) => (
-          <ProposalRow
-            key={proposal.number}
-            domain={domain}
-            proposal={proposal}
-          />
-        ))}
-      </ul>
+      <div className="flex flex-wrap items-baseline justify-between gap-3">
+        <h2 id="domain-proposals" className="text-section">
+          Proposals
+        </h2>
+        {/* Primary, and in the header rather than beside a row: sharing is
+            what somebody opens this card to do, and it is about the domain
+            rather than about any one proposal already on it. */}
+        <button
+          type="button"
+          onClick={() => {
+            setSharing(true);
+          }}
+          className={BUTTON.primary}
+        >
+          Share changes
+        </button>
+      </div>
+      {proposals.length === 0 ? (
+        <p className="text-sm text-slate-500 dark:text-slate-400">
+          No open proposals.
+        </p>
+      ) : (
+        <ul className="flex flex-col gap-3">
+          {proposals.map((proposal) => (
+            <ProposalRow
+              key={proposal.number}
+              domain={domain}
+              proposal={proposal}
+            />
+          ))}
+        </ul>
+      )}
+      {sharing && (
+        <ShareDialog
+          domain={domain}
+          onClose={() => {
+            setSharing(false);
+          }}
+        />
+      )}
     </section>
   );
 }

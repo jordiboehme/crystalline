@@ -428,20 +428,24 @@ describe("the proposals card", () => {
     expect(screen.queryByText(/no team origin/)).toBeNull();
   });
 
-  it("draws nothing for a team domain with no proposals", async () => {
+  it("keeps the card, and the way to share, with no proposals on it", async () => {
     serve({
       "/domains/eng/sync": () =>
         syncResponse({ open_proposals: [], declined_proposals: [] }),
     });
 
     renderApp("/d/eng");
-    // The sync card is up, so the status has landed and the absence below is
-    // a decision rather than a race.
-    await within(await screen.findByRole("main")).findByRole("region", {
-      name: "Team sync",
-    });
+    const card = await proposalsCard();
 
-    expect(screen.queryByRole("region", { name: "Proposals" })).toBeNull();
+    // An empty list is a state worth drawing, unlike a domain with no origin:
+    // the way to make a proposal is this card's header, and a card that
+    // vanished when the list emptied would take it away exactly when there is
+    // something to share.
+    expect(within(card).getByText("No open proposals.")).toBeVisible();
+    expect(
+      within(card).getByRole("button", { name: "Share changes" }),
+    ).toBeVisible();
+    expect(within(card).queryByRole("listitem")).toBeNull();
   });
 
   it("draws no proposals below admin", async () => {
