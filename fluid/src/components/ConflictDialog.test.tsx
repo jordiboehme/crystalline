@@ -176,6 +176,23 @@ beforeEach(() => {
 });
 
 describe("the conflict dialog", () => {
+  it("lists a conflict that can be opened as a path, after a colon", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await screen.findByRole("region", { name: "Team sync" });
+
+    // The count still leads, and the colon is what turns it into an
+    // introduction to the paths under it. The two no-colon cases - a report
+    // that carried a bare count, and one that listed paths with no id to
+    // address them by - are pinned on the domain screen's own tests, and this
+    // is the branch that has somewhere to go.
+    expect(within(card).getByText("1 conflict to settle:")).toBeVisible();
+    expect(
+      within(card).getByRole("button", { name: "notes/a.md" }),
+    ).toBeVisible();
+  });
+
   it("shows both sides and takes theirs", async () => {
     const resolve = resolveRoute();
     serve({ "/domains/eng/sync/conflicts/abc12345/resolve": resolve.route });
@@ -260,6 +277,32 @@ describe("the conflict dialog", () => {
     expect(
       sentBody("/domains/eng/sync/conflicts/abc12345/resolve", "POST"),
     ).toEqual({ resolution: "merged", content: "reconciled text" });
+  });
+
+  it("keeps a hand-written merge when the editor is toggled shut", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const dialog = await openConflictDialog();
+
+    const toggle = await within(dialog).findByRole("button", {
+      name: "Edit merged",
+    });
+    await userEvent.click(toggle);
+    const editor = within(dialog).getByLabelText("Merged content");
+    await userEvent.clear(editor);
+    await userEvent.type(editor, "reconciled text");
+
+    // Closing the editor hides it and nothing else. The toggle sits one button
+    // away from "Save merged", so a misclick here must not be the thing that
+    // deletes a merge somebody wrote by hand.
+    await userEvent.click(toggle);
+    expect(within(dialog).queryByLabelText("Merged content")).toBeNull();
+    await userEvent.click(toggle);
+
+    expect(within(dialog).getByLabelText("Merged content")).toHaveValue(
+      "reconciled text",
+    );
   });
 
   it("says a side is unreadable rather than deleted when a note explains it", async () => {

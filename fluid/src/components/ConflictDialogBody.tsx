@@ -15,12 +15,14 @@
  * it is set exactly when a side could not be decoded - and it is quoted whole,
  * because it is also the only sentence that says WHICH side that was.
  *
- * What a resolve invalidates is not only the sync status. Taking a side or
- * saving a merge writes the file in the domain and the engine re-indexes it, so
- * the tree, the listings and the engram count every sidebar and card draws are
- * all about to be stale - the same reasoning the withdraw dialog's revert
- * branch carries, minus the conditional: there is no resolve here that leaves
- * the working tree alone.
+ * What a resolve invalidates is not only the sync status, and the reason is the
+ * engine rather than the file: `origin_resolve` re-syncs the domain after every
+ * resolve, including the one that writes nothing at all - keeping this copy's
+ * own side is an empty arm on the engine's side. So the tree, the listings and
+ * the engram count every sidebar and card draws are all about to be stale
+ * whichever way the conflict was settled, which is why this invalidates
+ * unconditionally where the withdraw dialog's revert branch asks the receipt
+ * first.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -51,9 +53,16 @@ export default function ConflictDialogBody({
 }: ConflictDialogProps): ReactElement {
   const queryClient = useQueryClient();
   const mergedField = useId();
-  // `null` is "the merge editor is closed"; a string is the text somebody is
-  // writing, empty string included - a merge that deletes everything is a
-  // decision, not an unopened editor.
+  // Whether the merge editor is showing, kept APART from the text in it. One
+  // piece of state would mean closing the editor threw the text away, and the
+  // toggle sits one button away from "Save merged": a misclick would delete a
+  // hand-written merge with no undo and no warning. So closing hides the
+  // editor and nothing else, and reopening shows what was written rather than
+  // the prefill again.
+  const [mergeOpen, setMergeOpen] = useState(false);
+  // `null` is "nobody has opened the editor yet", which is what makes the
+  // prefill happen once; a string is the text, empty string included - a merge
+  // that deletes everything is a decision, not an unseeded editor.
   const [merged, setMerged] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
 
@@ -78,8 +87,9 @@ export default function ConflictDialogBody({
     onSuccess: () => {
       onClose();
       // The status the card that opened this is drawn from, and then
-      // everything drawn from what is in the domain: a settled conflict wrote
-      // a file and the engine re-indexed it.
+      // everything drawn from what is in the domain: the engine re-syncs after
+      // every resolve, so what is in it has moved even when this side of the
+      // choice wrote nothing.
       void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
       void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
       void queryClient.invalidateQueries({
@@ -158,13 +168,13 @@ export default function ConflictDialogBody({
                 />
               </div>
 
-              {merged !== null && (
+              {mergeOpen && (
                 <div className="mt-3 flex flex-col gap-1 text-sm">
                   <label htmlFor={mergedField}>Merged content</label>
                   <textarea
                     id={mergedField}
                     rows={8}
-                    value={merged}
+                    value={merged ?? ""}
                     onChange={(event) => {
                       setMerged(event.target.value);
                     }}
@@ -186,11 +196,13 @@ export default function ConflictDialogBody({
                     reading the merge is often what decides one of them. */}
                 <button
                   type="button"
-                  aria-expanded={merged !== null}
+                  aria-expanded={mergeOpen}
                   onClick={() => {
-                    setMerged((open) =>
-                      open === null ? (conflict.local ?? "") : null,
-                    );
+                    // Seeded once, on the first opening: after that the text
+                    // is whatever it was left as, so reopening never
+                    // overwrites a merge with the prefill it started from.
+                    setMerged((text) => text ?? conflict.local ?? "");
+                    setMergeOpen((open) => !open);
                   }}
                   className={BUTTON.secondary}
                 >
@@ -219,12 +231,12 @@ export default function ConflictDialogBody({
                 {/* The primary tier only on the merge, because it is the only
                     one of the three that commits something somebody wrote
                     rather than picking a side that already exists. */}
-                {merged !== null && (
+                {mergeOpen && (
                   <button
                     type="button"
                     disabled={resolve.isPending}
                     onClick={() => {
-                      settle("merged", merged);
+                      settle("merged", merged ?? "");
                     }}
                     className={BUTTON.primary}
                   >
