@@ -837,7 +837,7 @@ fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> b
 /// Whether collaboration tool `name` is hidden given the engine's `read_only`
 /// state. Not meaningful for a non-collab tool name; callers check
 /// [`is_write_tool`] separately for those. The net matrix: read-write shows
-/// all five, read-only shows `update_domain` and `origin_status` only.
+/// all six, read-only shows `update_domain` and `origin_status` only.
 ///
 /// `github.enabled` used to be the other half of this predicate. It left the
 /// listing for [`refused_collab_tool`]: `configure` can flip it on this very
@@ -2795,11 +2795,12 @@ const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared.
 /// only in the second case. Reading every null as a deletion would tell a user
 /// a file they can see on disk was deleted, so a null under a standing note
 /// quotes the note instead. The engine's `note` is one field for the whole
-/// detail, set by whichever side was checked last (base, then local, then
-/// upstream) - base included, and the question never previews base - so any
-/// unreadable side at all makes a genuinely absent side quote a note about
-/// another side. What it can no longer do is claim a present file was deleted,
-/// which is the reading that would have cost the user the choice.
+/// detail, overwritten by whichever side was last found *unreadable* as it
+/// checks base, then local, then upstream - base included, and the question
+/// never previews base. A readable later side leaves an earlier note standing,
+/// so any unreadable side at all makes a genuinely absent side quote a note
+/// about another side. What it can no longer do is claim a present file was
+/// deleted, which is the reading that would have cost the user the choice.
 fn conflict_resolution_question(detail: &Value) -> String {
     let path = detail["path"].as_str().unwrap_or_default();
     let kind = detail["kind"].as_str().unwrap_or("conflict");
@@ -3615,6 +3616,117 @@ mod tests {
         assert!(skill_for_uri("skill://crystalline-routing").is_none());
         assert!(skill_for_uri("skill://nonesuch/SKILL.md").is_none());
         assert!(skill_for_uri("https://example.com/SKILL.md").is_none());
+    }
+
+    /// `origin_status`'s trim, over both proposal arrays at once.
+    ///
+    /// The bodies leaving is the assertion that earns this test: a status
+    /// glance that carried reviewer comment text would spend a session's
+    /// context on prose nobody asked for, and `update_domain` is the surface
+    /// that returns it. The declined entry is the second half: the engine
+    /// decorates only the open list with `amended_upstream`, so the trim has
+    /// to supply the missing key rather than leave the two arrays different
+    /// shapes.
+    #[test]
+    fn lean_origin_status_trims_both_proposal_arrays_to_the_eight_keys() {
+        const LEAN_KEYS: [&str; 8] = [
+            "number",
+            "url",
+            "title",
+            "status",
+            "review_state",
+            "amended_upstream",
+            "feedback_count",
+            "updated_at",
+        ];
+
+        let leaned = lean_origin_status(json!({
+            "domains": [{
+                "domain": "kb",
+                "repo": "team/knowledge",
+                "open_proposals": [{
+                    "number": 7,
+                    "url": "https://example.invalid/pull/7",
+                    "branch": "crystalline/kb-7",
+                    "title": "Refine alpha",
+                    "status": "Open",
+                    "review_state": "changes_requested",
+                    "amended_upstream": true,
+                    "files": [{ "path": "notes/a.md" }],
+                    "feedback": [
+                        { "author": "ana", "body": "needs a source" },
+                        { "author": "bo", "body": "and a date" },
+                    ],
+                    "updated_at": "2026-08-21T10:00:00Z",
+                }],
+                // No `amended_upstream` here: the engine decorates the open
+                // list only, so the trim has to default it.
+                "declined_proposals": [{
+                    "number": 4,
+                    "url": "https://example.invalid/pull/4",
+                    "branch": "crystalline/kb-4",
+                    "title": "Superseded",
+                    "status": "Declined",
+                    "review_state": null,
+                    "files": [],
+                    "feedback": [{ "author": "cy", "body": "not this one" }],
+                    "updated_at": "2026-08-20T09:00:00Z",
+                }],
+            }],
+        }));
+
+        let domain = &leaned["domains"][0];
+        assert_eq!(domain["domain"], "kb", "the domain's own fields survive");
+        assert_eq!(domain["repo"], "team/knowledge");
+
+        let open = &domain["open_proposals"][0];
+        let declined = &domain["declined_proposals"][0];
+        for (label, entry) in [("open", open), ("declined", declined)] {
+            let object = entry.as_object().unwrap_or_else(|| panic!("{label}"));
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let mut expected = LEAN_KEYS.to_vec();
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{label} carries exactly the lean keys");
+            assert!(
+                entry.get("feedback").is_none(),
+                "{label} must not carry comment bodies: {entry}"
+            );
+            // The other fat fields go too, for the same reason.
+            assert!(entry.get("files").is_none(), "{label}: {entry}");
+            assert!(entry.get("branch").is_none(), "{label}: {entry}");
+        }
+
+        assert_eq!(open["number"], json!(7));
+        assert_eq!(open["title"], "Refine alpha");
+        assert_eq!(open["review_state"], "changes_requested");
+        assert_eq!(open["feedback_count"], json!(2));
+        assert_eq!(open["amended_upstream"], json!(true));
+        assert_eq!(open["updated_at"], "2026-08-21T10:00:00Z");
+
+        assert_eq!(declined["number"], json!(4));
+        assert_eq!(declined["status"], "Declined");
+        assert_eq!(declined["review_state"], Value::Null);
+        assert_eq!(declined["feedback_count"], json!(1));
+        assert_eq!(
+            declined["amended_upstream"],
+            json!(false),
+            "a declined proposal the engine never decorated defaults to false"
+        );
+    }
+
+    /// A payload with no `domains` array, and one whose entries carry no
+    /// proposal arrays, pass through untouched rather than gaining empty keys.
+    #[test]
+    fn lean_origin_status_leaves_a_payload_with_nothing_to_trim_alone() {
+        let bare = json!({ "domains": [] });
+        assert_eq!(lean_origin_status(bare.clone()), bare);
+
+        let no_arrays = json!({ "domains": [{ "domain": "kb", "conflicts": [] }] });
+        assert_eq!(lean_origin_status(no_arrays.clone()), no_arrays);
+
+        let not_a_report = json!({ "error": "offline" });
+        assert_eq!(lean_origin_status(not_a_report.clone()), not_a_report);
     }
 
     /// The listing half of the collaboration gating, which is `read_only`

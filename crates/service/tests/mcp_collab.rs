@@ -1,5 +1,5 @@
-//! MCP-layer tests for the five GitHub collaboration tools: the runtime
-//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the four
+//! MCP-layer tests for the six GitHub collaboration tools: the runtime
+//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the five
 //! GitHub-gated ones give while collaboration is off, the `configure` tool's snapshot, set
 //! flow and GitHub connect state machine, and wiring smoke tests for the
 //! origin tools against the engine with an injected `MockProvider`. Also the
@@ -589,7 +589,7 @@ impl ClientHandler for NotifyClient {
 /// Flipping `github.enabled` announces **nothing**, which is the inversion of
 /// `configure_flipping_github_enabled_pushes_a_tool_list_changed_notification`.
 ///
-/// The four collaboration tools are listed whatever the setting says and refuse
+/// The five collaboration tools are listed whatever the setting says and refuse
 /// at call time instead, so the flip moves no list and the push described a
 /// change that had not happened. MCP 2026-07-28 removes the unsolicited channel
 /// as well: `tests/mcp_subscriptions.rs` carries the subscription stream that
