@@ -2744,3 +2744,170 @@ async fn the_share_round_runs_over_http_too() {
         "{answered}"
     );
 }
+
+// --- the conflict resolution round ------------------------------------------
+
+/// Manufacture one conflict in the team domain: edit locally, advance the
+/// origin with a different edit of the same engram, pull.
+async fn conflicted_kb(h: &Harness, mock: &MockProvider) -> String {
+    std::fs::write(
+        h.root.join("kb/notes/a.md"),
+        "---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha, my local edit\n",
+    )
+    .unwrap();
+    let c2 = mock.add_commit(
+        [
+            ("MANIFEST.md".to_string(), std::fs::read(h.root.join("kb/MANIFEST.md")).unwrap()),
+            ("notes/a.md".to_string(), b"---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha, the team's edit\n".to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    mock.set_branch("main", &c2);
+    let update = h.engine.origin_update(Some("kb")).await.unwrap();
+    let conflicts = update["domains"][0]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{update}");
+    conflicts[0]["path"].as_str().unwrap().to_string()
+}
+
+fn resolve_kb(path: &str, resolution: Option<&str>, responses: Option<Value>) -> Value {
+    let mut arguments = json!({ "domain": "kb", "path": path });
+    if let Some(resolution) = resolution {
+        arguments["resolution"] = json!(resolution);
+    }
+    let mut params = json!({ "name": "resolve_conflict", "arguments": arguments });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The client's enum answer to the `resolution` question.
+fn resolution_answer(action: &str, choice: &str) -> Value {
+    json!({ "resolution": { "action": action, "content": { "resolution": choice } } })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_resolve_without_a_resolution_is_offered_the_choice() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+
+    let asked = wire
+        .open(eliciting(1, "tools/call", resolve_kb(&path, None, None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
+    let question = &result["inputRequests"]["resolution"];
+    let schema = &question["params"]["requestedSchema"];
+    assert_eq!(schema["required"], json!(["resolution"]), "{asked}");
+    // A titled single-select is rendered as `oneOf` rather than a flat `enum`,
+    // the same shape the collision question already ships.
+    let property = &schema["properties"]["resolution"];
+    let options: Vec<&str> = property["oneOf"]
+        .as_array()
+        .expect("a titled single-select carries oneOf")
+        .iter()
+        .map(|option| option["const"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(options, vec!["mine", "theirs"], "{asked}");
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&path), "names the path: {message}");
+    assert!(message.contains("local (mine)"), "{message}");
+    assert!(message.contains("upstream (theirs)"), "{message}");
+    assert!(
+        message.contains("my local edit"),
+        "previews my side: {message}"
+    );
+    assert!(
+        message.contains("the team's edit"),
+        "previews theirs: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_resolution_round_two_applies_it() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+    let _ = wire
+        .open(eliciting(1, "tools/call", resolve_kb(&path, None, None)))
+        .await;
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            resolve_kb(&path, None, Some(resolution_answer("accept", "theirs"))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let text = std::fs::read_to_string(h.root.join("kb").join(&path)).unwrap();
+    assert!(text.contains("the team's edit"), "theirs won: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+    let refused = wire
+        .open(modern(1, "tools/call", resolve_kb(&path, None, None)))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("mine"), "{text}");
+    assert!(text.contains("theirs"), "{text}");
+    assert!(text.contains("merged"), "{text}");
+    // And the conflict is still open.
+    let status = h.engine.origin_status(Some("kb")).await.unwrap();
+    assert_eq!(
+        status["domains"][0]["conflicts"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_resolution_stays_single_round_for_everyone() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+    let done = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            resolve_kb(&path, Some("mine"), None),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
+    assert!(done["result"]["isError"] != json!(true), "{done}");
+}
+
+/// A share over a domain with an unresolved conflict is answered in round one
+/// rather than asked about: the share cannot proceed until the conflict is
+/// settled, so there is nothing for the user to say yes to, and the count of
+/// what needs resolving has to survive the round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conflicted_share_answers_round_one_with_the_pending_count() {
+    let (h, mock) = Harness::team().await;
+    let _path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a share that cannot proceed is reported, not negotiated: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "conflicts_pending", "{body}");
+    assert_eq!(body["count"], json!(1), "{body}");
+}

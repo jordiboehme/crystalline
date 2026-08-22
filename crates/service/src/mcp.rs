@@ -389,6 +389,15 @@ const RESOLUTION_KEY: &str = "resolution";
 const RESOLUTION_OVERWRITE: &str = "overwrite";
 const RESOLUTION_CANCEL: &str = "cancel";
 
+/// The two sides `resolve_conflict`'s question offers, under the same key.
+///
+/// Both are spelled exactly as that tool's own `resolution` parameter, so the
+/// answer a client sends back is the word the retry would have carried; the
+/// third resolution, merged, is not offered here because a merge body is not a
+/// choice a form can collect.
+const RESOLUTION_MINE: &str = "mine";
+const RESOLUTION_THEIRS: &str = "theirs";
+
 /// The substring of the engine's permalink-collision error that identifies it.
 ///
 /// The engine words one message for this failure
@@ -536,6 +545,57 @@ fn resolved_overwrite(responses: &Option<rmcp::model::InputResponses>) -> Option
         return Some(false);
     }
     Some(answer["content"][RESOLUTION_KEY] == json!(RESOLUTION_OVERWRITE))
+}
+
+/// The choice an unresolved conflict offers when the caller named no
+/// resolution: mine or theirs, titled so a client renders two sentences.
+///
+/// merged is deliberately not an option - a free-text merge body does not fit
+/// a confirm form; the tool description says to call again with
+/// resolution merged and content instead. The two words are spelled exactly as
+/// `resolve_conflict`'s own `resolution` parameter, so the answer and the
+/// retry say the same thing, which is [`collision_question`]'s discipline
+/// applied to a second pair of choices.
+fn conflict_choice(message: String) -> InputRequiredResult {
+    let choices = EnumSchema::builder(vec![
+        RESOLUTION_MINE.to_string(),
+        RESOLUTION_THEIRS.to_string(),
+    ])
+    .title("Resolution")
+    .description("Which side of the conflict to keep.")
+    .enum_titles(vec![
+        "Keep my local version".to_string(),
+        "Take the team's version".to_string(),
+    ])
+    .expect("two titles for two choices")
+    .build();
+    let requested_schema = ElicitationSchema::builder()
+        .required_enum_schema(RESOLUTION_KEY, choices)
+        .build()
+        .expect("the resolution schema names the property it requires");
+    form_question(RESOLUTION_KEY, message, requested_schema)
+}
+
+/// Which side the client chose, with [`confirmed`]'s tri-state discipline:
+/// `None` has not been asked, `Some(None)` is any answer that is not exactly
+/// an accepted mine or theirs, and only those two strings pass through.
+///
+/// Read as plain JSON for [`confirmed`]'s reason, and narrowed to two static
+/// strings rather than handing the client's own text on to the engine: a
+/// resolution that reaches [`crate::engine::Engine::origin_resolve`] is one of
+/// ours, never one a malformed answer smuggled in.
+fn chosen_resolution(
+    responses: &Option<rmcp::model::InputResponses>,
+) -> Option<Option<&'static str>> {
+    let answer = responses.as_ref()?.get(RESOLUTION_KEY)?;
+    if answer["action"] != json!("accept") {
+        return Some(None);
+    }
+    Some(match answer["content"][RESOLUTION_KEY].as_str() {
+        Some(RESOLUTION_MINE) => Some(RESOLUTION_MINE),
+        Some(RESOLUTION_THEIRS) => Some(RESOLUTION_THEIRS),
+        _ => None,
+    })
 }
 
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
@@ -1523,7 +1583,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1534,13 +1594,37 @@ impl McpServer {
     async fn resolve_conflict(
         &self,
         Parameters(p): Parameters<ResolveConflictParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
-            return refuse(RemoteError::NotEnabled.to_string());
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
-        let (keep, content): (Option<&str>, Option<&[u8]>) = match p.resolution.as_str() {
-            "mine" => (Some("mine"), None),
-            "theirs" => (Some("theirs"), None),
+        // Three ways to arrive at a resolution, and the arm order is the
+        // behaviour: an explicit one is honoured for every peer and never
+        // asked about, an eliciting peer that named none is asked, and any
+        // other peer is refused in words it can read.
+        let resolution: String = match &p.resolution {
+            Some(resolution) => resolution.clone(),
+            None if confirmation_supported(&ctx) => match chosen_resolution(&responses.0) {
+                None => {
+                    let detail = self
+                        .engine
+                        .origin_conflict_detail(&p.domain, None, Some(&p.path))
+                        .await
+                        .map_err(to_error)?;
+                    return Ok(conflict_choice(conflict_resolution_question(&detail)).into());
+                }
+                Some(None) => {
+                    return refuse(RESOLVE_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(Some(choice)) => choice.to_string(),
+            },
+            None => return refuse(RESOLVE_NEEDS_RESOLUTION).map(CallToolResponse::from),
+        };
+        let (keep, content): (Option<&str>, Option<&[u8]>) = match resolution.as_str() {
+            RESOLUTION_MINE => (Some(RESOLUTION_MINE), None),
+            RESOLUTION_THEIRS => (Some(RESOLUTION_THEIRS), None),
             "merged" => {
                 let Some(content) = p.content.as_deref() else {
                     return Err(ErrorData::invalid_params(
@@ -1564,6 +1648,7 @@ impl McpServer {
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -2619,6 +2704,58 @@ fn share_question(preview: &Value) -> String {
 /// What an unconfirmed share tells the model, naming what did not happen.
 const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared. Call share_changes again if the user asks for it.";
 
+/// The sentence a conflict asks when the caller named no resolution: the
+/// conflict's path and kind, then a bounded preview of both sides.
+///
+/// The preview is the whole point of asking rather than refusing - a user
+/// choosing between "mine" and "theirs" is choosing between two texts, and
+/// only one of them is anywhere near the conversation. It is bounded at the
+/// first 20 lines a side because a question is rendered in a dialog, not in a
+/// pager; a cut side ends in an ellipsis line so the reader knows there is
+/// more, and a side that is absent or unreadable says so rather than
+/// rendering as empty (an empty file and a deleted one are different
+/// decisions).
+fn conflict_resolution_question(detail: &Value) -> String {
+    let path = detail["path"].as_str().unwrap_or_default();
+    let kind = detail["kind"].as_str().unwrap_or("conflict");
+    let preview = |side: &Value| -> String {
+        match side.as_str() {
+            None => "(file deleted)".to_string(),
+            Some(text) => {
+                let mut out = text
+                    .lines()
+                    .take(CONFLICT_PREVIEW_LINES)
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                if text.lines().count() > CONFLICT_PREVIEW_LINES {
+                    out.push_str("\n...");
+                }
+                out
+            }
+        }
+    };
+    format!(
+        "Conflict on {path} ({kind}). Keep which side?\n\n--- local (mine) ---\n{}\n\n--- upstream (theirs) ---\n{}",
+        preview(&detail["local"]),
+        preview(&detail["upstream"]),
+    )
+}
+
+/// How much of each side [`conflict_resolution_question`] shows.
+const CONFLICT_PREVIEW_LINES: usize = 20;
+
+/// The non-eliciting refusal for a call that named no resolution: a tool error
+/// the model can read, replacing the framework's opaque InvalidParams.
+///
+/// A peer that cannot be asked has to be told what to send instead, so all
+/// three resolutions are named, merged included - it is the one the question
+/// itself never offers.
+const RESOLVE_NEEDS_RESOLUTION: &str = "resolve_conflict needs a resolution: mine (keep your version), theirs (take the team's version), or merged with the reconciled content.";
+
+/// What an unanswered resolution question tells the model, naming what is
+/// still true rather than what failed.
+const RESOLVE_REFUSAL: &str = "The resolution was not chosen, so the conflict is still open. Call resolve_conflict again if the user asks for it.";
+
 /// The middle sentence of [`delete_question`]: what the delete does to the
 /// engram's attachments.
 ///
@@ -2946,6 +3083,141 @@ mod tests {
             resolved_overwrite(&Some(elsewhere)),
             None,
             "an answer filed under the confirmation key answers another question"
+        );
+    }
+
+    /// The third parser under the same key, and the same invariant read for a
+    /// three-valued answer: only the two words the schema offered come back,
+    /// and everything else that is an answer resolves nothing.
+    ///
+    /// The distinction this one has to keep that the boolean ones do not is
+    /// between two yeses. `mine` and `theirs` write opposite files, so an
+    /// answer that is nearly one of them must not fall through to the other;
+    /// it falls into `Some(None)`, which leaves the conflict open.
+    #[test]
+    fn only_the_two_offered_sides_resolve_a_conflict() {
+        let responses = |value: Value| {
+            let mut map = rmcp::model::InputResponses::new();
+            map.insert(RESOLUTION_KEY.to_string(), value);
+            Some(map)
+        };
+
+        assert_eq!(
+            chosen_resolution(&responses(
+                json!({ "action": "accept", "content": { "resolution": "mine" } })
+            )),
+            Some(Some("mine")),
+            "an accepted mine keeps the local version"
+        );
+        assert_eq!(
+            chosen_resolution(&responses(
+                json!({ "action": "accept", "content": { "resolution": "theirs" } })
+            )),
+            Some(Some("theirs")),
+            "an accepted theirs takes the team's version"
+        );
+
+        let unresolved = [
+            // The one resolution the question never offers.
+            json!({ "action": "accept", "content": { "resolution": "merged" } }),
+            // Accepted with nothing in it, or with the wrong thing in it.
+            json!({ "action": "accept" }),
+            json!({ "action": "accept", "content": {} }),
+            json!({ "action": "accept", "content": null }),
+            json!({ "action": "accept", "content": { "resolution": "Mine" } }),
+            json!({ "action": "accept", "content": { "resolution": "theirs " } }),
+            json!({ "action": "accept", "content": { "resolution": true } }),
+            json!({ "action": "accept", "content": { "resolution": ["mine"] } }),
+            // The title rather than the value behind it.
+            json!({ "action": "accept", "content": { "resolution": "Keep my local version" } }),
+            // The right value under the wrong key.
+            json!({ "action": "accept", "content": { "confirm": "mine" } }),
+            // The two refusals the specification names, and one it does not.
+            json!({ "action": "decline" }),
+            json!({ "action": "cancel", "content": { "resolution": "theirs" } }),
+            json!({ "action": "deferred", "content": { "resolution": "theirs" } }),
+            // Shapes that are not an `ElicitResult` at all.
+            json!({ "content": { "resolution": "mine" } }),
+            json!("mine"),
+            json!(null),
+        ];
+        for value in unresolved {
+            assert_eq!(
+                chosen_resolution(&responses(value.clone())),
+                Some(None),
+                "nothing but an accepted mine or theirs resolves: {value}"
+            );
+        }
+
+        // Round one: no answer at all, or an answer to some other question.
+        assert_eq!(chosen_resolution(&None), None, "no responses is round one");
+        assert_eq!(
+            chosen_resolution(&Some(rmcp::model::InputResponses::new())),
+            None,
+            "an empty map is round one"
+        );
+        let mut elsewhere = rmcp::model::InputResponses::new();
+        elsewhere.insert(
+            CONFIRM_KEY.to_string(),
+            json!({ "action": "accept", "content": { "resolution": "mine" } }),
+        );
+        assert_eq!(
+            chosen_resolution(&Some(elsewhere)),
+            None,
+            "an answer filed under the confirmation key answers another question"
+        );
+    }
+
+    /// The question shows both sides, bounded, and says so when a side is not
+    /// there at all.
+    ///
+    /// The two things asserted are the two a user's decision rests on: a side
+    /// that is null is a deleted file rather than an empty one, and a side
+    /// longer than the budget is visibly cut rather than silently truncated.
+    #[test]
+    fn the_conflict_question_previews_both_sides_within_a_budget() {
+        let long: String = (1..=25)
+            .map(|n| format!("line {n}\n"))
+            .collect::<Vec<String>>()
+            .join("");
+        let detail = json!({
+            "path": "notes/a.md",
+            "kind": "EditEdit",
+            "local": long,
+            "upstream": Value::Null,
+        });
+        let message = conflict_resolution_question(&detail);
+
+        assert!(
+            message.starts_with("Conflict on notes/a.md (EditEdit). Keep which side?"),
+            "{message}"
+        );
+        assert!(
+            message.contains("--- local (mine) ---\nline 1\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("line 20\n..."),
+            "cut at the budget: {message}"
+        );
+        assert!(
+            !message.contains("line 21"),
+            "and nothing past it: {message}"
+        );
+        assert!(
+            message.contains("--- upstream (theirs) ---\n(file deleted)"),
+            "an absent side says what it is: {message}"
+        );
+
+        // A side exactly at the budget is whole and carries no ellipsis.
+        let exact: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let detail = json!({ "path": "a.md", "local": exact, "upstream": "one line" });
+        let message = conflict_resolution_question(&detail);
+        assert!(!message.contains("\n..."), "nothing was cut: {message}");
+        // And a detail with no kind still reads as a sentence.
+        assert!(
+            message.starts_with("Conflict on a.md (conflict)."),
+            "{message}"
         );
     }
 
