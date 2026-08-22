@@ -948,7 +948,7 @@ fn http_smoke_initialize_list_and_search() {
     // at call time now, because a tool list may not vary per connection or as
     // a side effect of another request on it (see crystalline-service's
     // mcp_collab test suite for the full gating matrix).
-    assert_eq!(tools.len(), 22, "every tool over HTTP");
+    assert_eq!(tools.len(), 23, "every tool over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");

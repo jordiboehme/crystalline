@@ -522,6 +522,22 @@ pub struct ResolveConflictParams {
     pub content: Option<String>,
 }
 
+/// Parameters for `withdraw_proposal`.
+#[derive(Debug, Clone, Deserialize, JsonSchema)]
+pub struct WithdrawProposalParams {
+    /// The team domain the proposal belongs to.
+    pub domain: String,
+    /// The proposal number. Omit to withdraw the domain's single open
+    /// proposal.
+    #[serde(default)]
+    pub proposal: Option<u64>,
+    /// Also restore the shared files to their pre-share content (files
+    /// edited since sharing are left alone). Default false: the knowledge
+    /// stays local, only the proposal goes away.
+    #[serde(default)]
+    pub revert: Option<bool>,
+}
+
 /// Parameters for `skills`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct SkillsParams {

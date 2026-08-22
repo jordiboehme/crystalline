@@ -52,12 +52,12 @@
 //! because the mode is fixed for the engine's lifetime.
 //!
 //! The collaboration tools (`configure`, `add_domain`, `share_changes`,
-//! `update_domain`, `origin_status`, `resolve_conflict`) split their two
-//! gates across the two sides of the rule above.
-//! `configure`/`add_domain`/`share_changes`/`resolve_conflict` disappear
-//! read-only, which stays on the listing. `github.enabled` is needed by every
-//! collaboration tool but `configure`, and it refuses at call time: the four
-//! tools that need it are listed whatever it says and answer with
+//! `update_domain`, `origin_status`, `resolve_conflict`, `withdraw_proposal`)
+//! split their two gates across the two sides of the rule above.
+//! `configure`/`add_domain`/`share_changes`/`resolve_conflict`/`withdraw_proposal`
+//! disappear read-only, which stays on the listing. `github.enabled` is needed
+//! by every collaboration tool but `configure`, and it refuses at call time:
+//! the five tools that need it are listed whatever it says and answer with
 //! `RemoteError::NotEnabled`'s message, which names the setting and both ways
 //! to change it. Their descriptions say the same thing, so a client's tool
 //! search reads the dependency without having to call. See `COLLAB_TOOLS`,
@@ -210,8 +210,8 @@
 //! non-destructive because its default behaviour is additive (it errors on an
 //! existing permalink unless `overwrite`), and `open_world` is true only for
 //! the tools that talk to GitHub - `configure` through its connect flow,
-//! `add_domain` through team mode, `share_changes`, `update_domain` and
-//! `origin_status`.
+//! `add_domain` through team mode, `share_changes`, `update_domain`,
+//! `origin_status` and `withdraw_proposal`.
 
 use std::sync::Arc;
 
@@ -649,32 +649,39 @@ impl_cache_hinted!(
     ReadResourceResult,
 );
 
-/// The five GitHub collaboration tools, gated on the engine's live
+/// The six GitHub collaboration tools, gated on the engine's live
 /// `github.enabled` setting (all but `configure`) and `read_only` flag (see
 /// `COLLAB_WRITE_TOOLS`). `add_domain` is not among them: it creates domains of
 /// every kind, so it is a write-gated tool (see `WRITE_TOOLS`), and only its
 /// team-domain branch needs `github.enabled`, enforced in the engine.
-const COLLAB_TOOLS: [&str; 5] = [
+const COLLAB_TOOLS: [&str; 6] = [
     "configure",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
+    "withdraw_proposal",
 ];
 
-/// Of the five collaboration tools, the three also hidden in read-only mode:
+/// Of the six collaboration tools, the four also hidden in read-only mode:
 /// `configure` (settings and this machine's GitHub identity are frozen the
-/// same way content is), `share_changes` and `resolve_conflict` (each writes a
-/// proposal or config). `update_domain` and `origin_status` stay visible
-/// read-only, mirroring their engine-level exemption (a pull is a derived-truth
-/// update like sync; status is a pure read).
-const COLLAB_WRITE_TOOLS: [&str; 3] = ["configure", "share_changes", "resolve_conflict"];
+/// same way content is), `share_changes`, `resolve_conflict` and
+/// `withdraw_proposal` (each writes a proposal or config). `update_domain` and
+/// `origin_status` stay visible read-only, mirroring their engine-level
+/// exemption (a pull is a derived-truth update like sync; status is a pure
+/// read).
+const COLLAB_WRITE_TOOLS: [&str; 4] = [
+    "configure",
+    "share_changes",
+    "resolve_conflict",
+    "withdraw_proposal",
+];
 
 /// Appended to the initialize instructions while TOON responses are active,
 /// so a client model reads list results as structured data rather than prose.
 const TOON_INSTRUCTIONS_NOTE: &str = "\n\nList-shaped tool results (search hits, activity, listings and status reports) arrive TOON-encoded rather than as JSON: indentation nests objects, `name[N]{field1,field2}:` heads a uniform array with one comma-separated row per record and a tags cell joins its values with commas. Read them as data with exactly those fields.";
 
-/// Whether `name` is one of the five collaboration tools.
+/// Whether `name` is one of the six collaboration tools.
 fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
 }
@@ -1484,7 +1491,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. While a proposal is already open for the domain, calling this again UPDATES it in place - same proposal number, same URL, a fresh commit reviewers are notified about - it never opens a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, edit the engrams, share again to the same proposal. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (update proposal #N or open a new one), the title and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. While a proposal is already open for the domain, calling this again UPDATES it in place - same proposal number, same URL, a fresh commit reviewers are notified about - it never opens a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, edit the engrams, share again to the same proposal. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (update proposal #N or open a new one), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1541,7 +1548,7 @@ impl McpServer {
     #[tool(
         name = "update_domain",
         title = "Update domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then share_changes again to update the same proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1566,7 +1573,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, open and declined proposals and any conflicts to settle. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -1579,6 +1586,7 @@ impl McpServer {
         self.engine
             .origin_status(p.domain.as_deref())
             .await
+            .map(lean_origin_status)
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
@@ -1654,6 +1662,31 @@ impl McpServer {
             .map_err(to_error)
             .and_then(ok)
             .map(CallToolResponse::from)
+    }
+
+    #[tool(
+        name = "withdraw_proposal",
+        title = "Withdraw proposal",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn withdraw_proposal(
+        &self,
+        Parameters(p): Parameters<WithdrawProposalParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string());
+        }
+        self.engine
+            .origin_withdraw(&p.domain, p.proposal, p.revert.unwrap_or(false))
+            .await
+            .map_err(to_error)
+            .and_then(ok)
     }
 
     #[tool(
@@ -2706,6 +2739,41 @@ fn share_question(preview: &Value) -> String {
     )
 }
 
+/// Trims `origin_status`'s per-domain proposal records to what a status
+/// glance needs: number, url, title, status, review_state, amended_upstream,
+/// feedback_count, updated_at. The bodies stay out on purpose - update_domain
+/// and the REST payload carry them - so status never bloats a session with
+/// comment text the agent did not ask for.
+fn lean_origin_status(mut value: Value) -> Value {
+    if let Some(domains) = value.get_mut("domains").and_then(Value::as_array_mut) {
+        for domain in domains {
+            for key in ["open_proposals", "declined_proposals"] {
+                if let Some(entries) = domain.get_mut(key).and_then(Value::as_array_mut) {
+                    for entry in entries.iter_mut() {
+                        *entry = json!({
+                            "number": entry["number"],
+                            "url": entry["url"],
+                            "title": entry["title"],
+                            "status": entry["status"],
+                            "review_state": entry["review_state"],
+                            "amended_upstream": entry
+                                .get("amended_upstream")
+                                .cloned()
+                                .unwrap_or(json!(false)),
+                            "feedback_count": entry["feedback"]
+                                .as_array()
+                                .map(Vec::len)
+                                .unwrap_or(0),
+                            "updated_at": entry["updated_at"],
+                        });
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+
 /// What an unconfirmed share tells the model, naming what did not happen.
 const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared. Call share_changes again if the user asks for it.";
 
@@ -2726,11 +2794,12 @@ const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared.
 /// is not there *and* a side that is there but is not UTF-8, setting `note`
 /// only in the second case. Reading every null as a deletion would tell a user
 /// a file they can see on disk was deleted, so a null under a standing note
-/// quotes the note instead. The engine's note names whichever side was last
-/// found unreadable, so with more than one unreadable side the sentence beside
-/// a null may quote a note about another side; what it can no longer do is
-/// claim a present file was deleted, which is the reading that would have cost
-/// the user the choice.
+/// quotes the note instead. The engine's `note` is one field for the whole
+/// detail, set by whichever side was checked last (base, then local, then
+/// upstream) - base included, and the question never previews base - so any
+/// unreadable side at all makes a genuinely absent side quote a note about
+/// another side. What it can no longer do is claim a present file was deleted,
+/// which is the reading that would have cost the user the choice.
 fn conflict_resolution_question(detail: &Value) -> String {
     let path = detail["path"].as_str().unwrap_or_default();
     let kind = detail["kind"].as_str().unwrap_or("conflict");
@@ -3465,7 +3534,7 @@ mod tests {
     }
 
     #[test]
-    fn is_collab_tool_recognizes_exactly_the_five() {
+    fn is_collab_tool_recognizes_exactly_the_six() {
         for name in COLLAB_TOOLS {
             assert!(is_collab_tool(name), "{name}");
         }
@@ -3549,7 +3618,7 @@ mod tests {
     }
 
     /// The listing half of the collaboration gating, which is `read_only`
-    /// alone now: read-write shows all five, read-only shows the two that a
+    /// alone now: read-write shows all six, read-only shows the two that a
     /// read-only instance still exempts.
     #[test]
     fn hidden_collab_tool_matches_the_locked_read_only_matrix() {
@@ -3575,6 +3644,7 @@ mod tests {
             "update_domain",
             "origin_status",
             "resolve_conflict",
+            "withdraw_proposal",
         ] {
             assert!(refused_collab_tool(name, false), "{name}");
         }

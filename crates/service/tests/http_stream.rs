@@ -519,9 +519,11 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // and `provisioning_declared` are settable by a request on the connection,
     // so they gate the call instead of the listing (SEP-2567), which puts
     // `share_changes`, `update_domain`, `origin_status`, `resolve_conflict` and
-    // `provision` on every list. The `tools/list` payload measured 32288 bytes
-    // at 17 tools and 36959 bytes at 22, both recorded here rather than
-    // re-derived. Task 5 decides the skills surface at construction instead.
+    // `provision` on every list. Task 5 decides the skills surface at
+    // construction instead. The list has grown since - `withdraw_proposal` is
+    // the newest entry - so the byte figures this comment used to record are
+    // gone rather than restated: the assertion below is the count, and it is
+    // read off a failing run rather than computed here.
     let list = |id: u8, method: &'static str| {
         let body = format!(r#"{{"jsonrpc":"2.0","id":{id},"method":"{method}","params":{{}}}}"#);
         let session_id = session_id.clone();
@@ -537,7 +539,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         .collect();
     assert_eq!(
         names.len(),
-        22,
+        23,
         "every tool, the `skills` surface among them: {names:?}"
     );
     let mut sorted = names.clone();
@@ -642,7 +644,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
             .as_array()
             .unwrap()
             .len(),
-        22
+        23
     );
 
     // **Task 9 moved this assertion, deliberately.** The same shape at
@@ -653,7 +655,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // revision matches, which
     // `a_version_we_do_not_serve_is_refused_at_the_http_handshake` pins in both
     // of its shapes. Here the era is served: statelessly, with its caching
-    // hints, and with the same 22 tools every other client is served.
+    // hints, and with the same 23 tools every other client is served.
     // `tests/mcp_modern_era.rs` is where the rest of that surface lives.
     let era = post_with_standard_headers(
         addr,
@@ -674,7 +676,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         head_of(&era)
     );
     let era_result = &payload(&era)["result"];
-    assert_eq!(era_result["tools"].as_array().unwrap().len(), 22);
+    assert_eq!(era_result["tools"].as_array().unwrap().len(), 23);
     assert_eq!(era_result["resultType"], "complete");
     assert_eq!(era_result["ttlMs"], 0);
     assert_eq!(era_result["cacheScope"], "public");

@@ -266,8 +266,9 @@ async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
         "infer_schema",
         "list_domains",
         "move_engram",
-        // GitHub collaboration is off in this harness and these four are
-        // listed all the same; calling one refuses and says how to turn it on.
+        // GitHub collaboration is off in this harness and these four (plus
+        // `withdraw_proposal`, further down the sorted list) are listed all
+        // the same; calling one refuses and says how to turn it on.
         "origin_status",
         "resolve_conflict",
         "share_changes",
@@ -281,11 +282,12 @@ async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
         "skills",
         "validate_engrams",
         "vocabulary",
+        "withdraw_proposal",
         "write_engram",
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    assert_eq!(names.len(), 22, "every tool, exactly once: {names:?}");
+    assert_eq!(names.len(), 23, "every tool, exactly once: {names:?}");
 
     // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
     // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`
@@ -657,7 +659,7 @@ async fn read_only_hides_the_write_gated_tools() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    // Read-only hides the three write-shaped collaboration tools and
+    // Read-only hides the four write-shaped collaboration tools and
     // `provision` (the full gating matrix lives in tests/mcp_collab.rs).
     // `evolve_engrams` is hidden on its own gate: it is a read, but every
     // finding it returns prescribes a mutation, so the queue is noise where
@@ -666,6 +668,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "configure",
         "share_changes",
         "resolve_conflict",
+        "withdraw_proposal",
         "evolve_engrams",
         "provision",
     ] {

@@ -353,7 +353,7 @@ async fn a_modern_client_is_served_with_no_handshake_at_all() {
         .unwrap_or_else(|| panic!("no tool list in {answer}"));
     assert_eq!(
         tools.len(),
-        22,
+        23,
         "the one invariant list, unchanged by the era"
     );
     assert_hinted("tools/list", &answer["result"]);
@@ -2910,4 +2910,137 @@ async fn a_conflicted_share_answers_round_one_with_the_pending_count() {
         serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(body["outcome"], "conflicts_pending", "{body}");
     assert_eq!(body["count"], json!(1), "{body}");
+}
+
+// --- withdraw_proposal -------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withdraw_proposal_closes_the_open_proposal_single_round() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert!(shared["error"].is_null(), "{shared}");
+
+    // Single round even for an eliciting peer: no MRTR on withdraw (spec).
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            json!({
+                "name": "withdraw_proposal",
+                "arguments": { "domain": "kb" },
+            }),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
+    assert!(done["result"]["isError"] != json!(true), "{done}");
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["status"], "withdrawn");
+    assert_eq!(body["closed"], true);
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "{:?}",
+        mock.calls()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withdraw_proposal_is_gated_exactly_like_share_changes() {
+    // The default (github off) harness lists the tool and refuses the call
+    // with the enablement message, byte for byte the share_changes refusal.
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let listed = wire.open(modern(1, "tools/list", json!({}))).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"withdraw_proposal"), "{names:?}");
+
+    let refused = wire
+        .call(modern(
+            2,
+            "tools/call",
+            json!({ "name": "withdraw_proposal", "arguments": { "domain": "eng" } }),
+        ))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("github.enabled"),
+        "{refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_is_lean_and_update_domain_carries_the_bodies() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    let body: Value =
+        serde_json::from_str(shared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let number = body["number"].as_u64().unwrap();
+    mock.set_feedback(
+        number,
+        crystalline_remote::provider::Feedback {
+            review_state: Some("changes_requested".to_string()),
+            items: vec![crystalline_remote::state::FeedbackItem {
+                author: "ana".to_string(),
+                body: "needs a source".to_string(),
+                path: None,
+                line: None,
+                submitted_at: "2026-08-21T10:00:00Z".to_string(),
+                kind: crystalline_remote::state::FeedbackKind::Comment,
+            }],
+        },
+    );
+
+    // update_domain fetches and carries the comment text.
+    let updated = wire
+        .call(modern(
+            2,
+            "tools/call",
+            json!({ "name": "update_domain", "arguments": { "domain": "kb" } }),
+        ))
+        .await;
+    let update_body: Value =
+        serde_json::from_str(updated["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let prop = &update_body["domains"][0]["open_proposals"][0];
+    assert_eq!(
+        prop["feedback"][0]["body"], "needs a source",
+        "{update_body}"
+    );
+
+    // origin_status stays lean: count, not bodies.
+    let status = wire
+        .call(modern(
+            3,
+            "tools/call",
+            json!({ "name": "origin_status", "arguments": { "domain": "kb" } }),
+        ))
+        .await;
+    let status_body: Value =
+        serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let entry = &status_body["domains"][0]["open_proposals"][0];
+    assert_eq!(entry["number"], number);
+    assert_eq!(entry["review_state"], "changes_requested");
+    assert_eq!(entry["feedback_count"], 1);
+    assert!(
+        entry.get("feedback").is_none(),
+        "no bodies in status: {entry}"
+    );
+    assert_eq!(entry["amended_upstream"], false);
 }

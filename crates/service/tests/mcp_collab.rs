@@ -152,14 +152,15 @@ where
     panic!("condition was not met within two seconds");
 }
 
-/// The five collaboration tool names. `add_domain` is deliberately not here:
+/// The six collaboration tool names. `add_domain` is deliberately not here:
 /// it is write-gated, not collaboration-gated (see `add_domain_*` tests below).
-const ALL_FIVE: [&str; 5] = [
+const ALL_SIX: [&str; 6] = [
     "configure",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
+    "withdraw_proposal",
 ];
 
 // --- gating matrix -----------------------------------------------------------
@@ -171,9 +172,9 @@ const ALL_FIVE: [&str; 5] = [
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &ALL_FIVE),
+        (false, false, &ALL_SIX),
         (false, true, &["update_domain", "origin_status"]),
-        (true, false, &ALL_FIVE),
+        (true, false, &ALL_SIX),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -183,7 +184,7 @@ async fn gating_matrix_over_list_tools() {
         let (client, _server) = connect(eng).await;
         let tools = client.peer().list_tools(Default::default()).await.unwrap();
         let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
-        for name in ALL_FIVE {
+        for name in ALL_SIX {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 names.contains(&name.to_string()),
@@ -200,9 +201,9 @@ async fn gating_matrix_over_get_tool() {
     use rmcp::ServerHandler;
 
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &ALL_FIVE),
+        (false, false, &ALL_SIX),
         (false, true, &["update_domain", "origin_status"]),
-        (true, false, &ALL_FIVE),
+        (true, false, &ALL_SIX),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -210,7 +211,7 @@ async fn gating_matrix_over_get_tool() {
         let eng =
             Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
         let server = McpServer::new(eng);
-        for name in ALL_FIVE {
+        for name in ALL_SIX {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 server.get_tool(name).is_some(),
@@ -320,7 +321,7 @@ async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
 
 // --- listed tools refuse at call time ---------------------------------------
 
-/// The four GitHub-gated tools are listed whatever `github.enabled` says
+/// The five GitHub-gated tools are listed whatever `github.enabled` says
 /// (SEP-2567: the setting is `configure`-settable on this very connection, so
 /// it cannot gate a listing) and refuse when it is off. The refusal is a
 /// tool-level error rather than a JSON-RPC one, because a listed tool's
@@ -332,7 +333,7 @@ async fn listed_collab_tools_refuse_at_call_time_when_github_is_disabled() {
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, Value); 5] = [
         ("share_changes", json!({"domain": "eng"})),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -340,6 +341,7 @@ async fn listed_collab_tools_refuse_at_call_time_when_github_is_disabled() {
             "resolve_conflict",
             json!({"domain": "eng", "path": "a.md", "resolution": "mine"}),
         ),
+        ("withdraw_proposal", json!({"domain": "eng"})),
     ];
     for (tool, args) in cases {
         let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
@@ -419,6 +421,11 @@ async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only
     )
     .await
     .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(peer, "withdraw_proposal", json!({"domain": "eng"}))
+        .await
+        .unwrap_err();
     assert!(err.contains("read-only"), "{err}");
 }
 
