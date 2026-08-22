@@ -338,6 +338,9 @@ describe("importing an archive", () => {
       name: /what an import would do/i,
     });
     const before = requested().filter((path) => path === "/domains").length;
+    const listings = requested().filter((path) =>
+      path.startsWith("/domains/eng/engrams"),
+    ).length;
 
     // Skipping what is already there is the default, here as on the server.
     expect(
@@ -367,14 +370,20 @@ describe("importing an archive", () => {
     expect(callTo("/domains/eng/archive/import").headers).toMatchObject({
       "Content-Type": "application/zip",
     });
-    // An import moves the shape of the domain and its engram count, so both
-    // the tree every folder view walks and the listing every sidebar draws are
-    // asked again.
+    // An import moves the shape of the domain and its engram count, so the
+    // tree every folder view walks, the listing this screen is paging behind
+    // the dialog and the domain listing every sidebar draws are all asked
+    // again rather than left showing the domain as it was before the archive
+    // landed in it.
     await waitFor(() => {
       expect(
         requested().filter((path) => path.startsWith("/domains/eng/tree"))
           .length,
       ).toBeGreaterThan(1);
+      expect(
+        requested().filter((path) => path.startsWith("/domains/eng/engrams"))
+          .length,
+      ).toBeGreaterThan(listings);
       expect(
         requested().filter((path) => path === "/domains").length,
       ).toBeGreaterThan(before);

@@ -30,6 +30,7 @@ import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { engramDetailKey } from "../api/engram";
 import type { EngramDetail } from "../api/engram";
+import { domainEngramsRoot } from "../api/engrams";
 import { NEIGHBORHOOD_DEPTH, graphKey } from "../api/graph";
 import type { Backlink } from "../api/graph";
 import {
@@ -160,6 +161,15 @@ export default function RetireDialogBody({
       void queryClient.invalidateQueries({
         queryKey: domainTreeKey(engram.domain),
       });
+      // And so are the listings, for the same reason and none of the same
+      // visibility: a listing row carries the status too, and the domain
+      // screen's lists are not mounted while this dialog is open, so nothing
+      // here would ever notice them going stale. Marked rather than refetched
+      // by that alone, which is exactly what is wanted - the next mount of one
+      // reads the retired status instead of the row it cached before.
+      void queryClient.invalidateQueries({
+        queryKey: domainEngramsRoot(engram.domain),
+      });
     },
   });
 
@@ -172,9 +182,14 @@ export default function RetireDialogBody({
         queryKey: engramDetailKey(engram.domain, engram.permalink),
       });
       // The row is gone from the domain, so it goes from the tree the reader
-      // is about to land in front of.
+      // is about to land in front of - and from every listing of that domain,
+      // which is the half of that screen a deleted engram would otherwise
+      // still be sitting in.
       void queryClient.invalidateQueries({
         queryKey: domainTreeKey(engram.domain),
+      });
+      void queryClient.invalidateQueries({
+        queryKey: domainEngramsRoot(engram.domain),
       });
       void navigate(domainRoute(engram.domain));
     },

@@ -194,6 +194,12 @@ describe("the share dialog", () => {
     expect(
       await within(dialog).findByText(/updated proposal #4/i),
     ).toBeInTheDocument();
+    // And the line that said what a share WOULD do goes with it. Left
+    // standing, the header would sit above the outcome telling somebody their
+    // share is still about to happen, which is the one thing the dialog is
+    // there to settle.
+    expect(within(dialog).queryByText(/sharing updates/i)).toBeNull();
+    expect(within(dialog).getByText("Done.")).toBeInTheDocument();
     // And the card behind it reads the status again: the proposal it lists
     // just moved.
     await waitFor(() => {

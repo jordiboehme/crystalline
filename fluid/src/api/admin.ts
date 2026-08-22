@@ -314,6 +314,21 @@ export function syncStatusKey(domain: string): readonly unknown[] {
 }
 
 /**
+ * The cache key of one domain's share plan, and the one key in this app that
+ * deliberately sits outside the `["domains", ...]` family.
+ *
+ * Reading a plan pulls the origin, so this is not a cache of domain content:
+ * react-query invalidates by prefix, and a plan filed under `["domains"]`
+ * would be refetched - which is to say, would pull - by every bulk domain
+ * invalidation in the app. The share dialog's own comment carries the rest of
+ * the reasoning, because that is where the invalidation it would collide with
+ * is fired from.
+ */
+export function sharePlanKey(domain: string): readonly unknown[] {
+  return ["share-plan", domain];
+}
+
+/**
  * A count that may arrive as a number or as the list it counts.
  *
  * The engine's status report embeds the proposals and the conflicts themselves

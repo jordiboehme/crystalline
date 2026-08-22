@@ -51,6 +51,18 @@ const STALE_CLASSES =
 const ALERT_CLASSES =
   "rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200";
 
+/**
+ * How many conflicting paths this line draws before it starts counting the
+ * rest in words.
+ *
+ * A copy that drifted for a week can come back with dozens, and every one of
+ * them is a button: uncapped, the line becomes a wall of paths that pushes the
+ * rest of the card off the screen, and nobody settles thirty conflicts by
+ * reading them all at once anyway. Eight is enough to start, and the count in
+ * the lead sentence still says how many there really are.
+ */
+const CONFLICTS_SHOWN = 8;
+
 export function SyncCard({ domain }: { domain: string }): ReactElement | null {
   const queryClient = useQueryClient();
   const [problem, setProblem] = useState<string | null>(null);
@@ -201,7 +213,7 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
                     how many there are - it just has nothing to open, and the
                     colon goes with the list rather than promising one. */}
                 {conflictLead(sync)}
-                {sync.conflictList.map((conflict) => (
+                {sync.conflictList.slice(0, CONFLICTS_SHOWN).map((conflict) => (
                   <button
                     key={conflict.id}
                     type="button"
@@ -213,6 +225,14 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
                     {conflict.path}
                   </button>
                 ))}
+                {/* Plain text, deliberately: there is nothing behind it to
+                    press, and the ones it stands for are settled by working
+                    through the eight above until the list runs short. */}
+                {sync.conflictList.length > CONFLICTS_SHOWN && (
+                  <span className="text-slate-500 dark:text-slate-400">
+                    {`and ${String(sync.conflictList.length - CONFLICTS_SHOWN)} more`}
+                  </span>
+                )}
               </span>
             )}
           </p>

@@ -191,6 +191,38 @@ describe("the proposals card", () => {
     expect(within(card).getByText(/notes\/a\.md:12/)).toBeInTheDocument();
   });
 
+  it("will not link a proposal whose url is not a web address", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "javascript:alert(1)",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The url comes from the forge rather than from this app, and a
+    // self-hosted one is a machine somebody else administers. A title that
+    // cannot be followed anywhere is still worth reading; a link that runs
+    // something on press is not worth having.
+    expect(within(card).queryByRole("link")).toBeNull();
+    expect(
+      within(card).getByText("Refine 2 engrams in eng"),
+    ).toBeInTheDocument();
+  });
+
   it("says when a reviewer moved the proposal branch", async () => {
     serve({
       "/domains/eng/sync": () =>

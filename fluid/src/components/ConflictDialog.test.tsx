@@ -193,6 +193,38 @@ describe("the conflict dialog", () => {
     ).toBeVisible();
   });
 
+  it("draws at most eight paths and counts the rest in words", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          conflicts: Array.from({ length: 10 }, (_unused, index) => ({
+            id: `conflict-${String(index)}`,
+            path: `notes/${String(index)}.md`,
+            kind: "EditEdit",
+            base_commit: "9f3c1a2",
+            upstream_commit: "b2c3d4e",
+            detected_at: "2026-08-21T09:00:00Z",
+          })),
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await screen.findByRole("region", { name: "Team sync" });
+
+    // The sentence counts every one of them, because how far behind this copy
+    // has fallen is the fact the card is there to state.
+    expect(within(card).getByText("10 conflicts to settle:")).toBeVisible();
+    // The list does not. A domain that drifted for a week would otherwise be a
+    // wall of paths with everything under it pushed off the screen, and eight
+    // is enough to start settling them one at a time.
+    expect(
+      within(card).getAllByRole("button", { name: /^notes\// }),
+    ).toHaveLength(8);
+    // What was left out is said rather than silently dropped, and as plain
+    // text: there is nothing behind it to press.
+    expect(within(card).getByText("and 2 more")).toBeVisible();
+  });
+
   it("shows both sides and takes theirs", async () => {
     const resolve = resolveRoute();
     serve({ "/domains/eng/sync/conflicts/abc12345/resolve": resolve.route });
@@ -228,6 +260,7 @@ describe("the conflict dialog", () => {
 
     renderApp("/d/eng");
     const dialog = await openConflictDialog();
+    const [trees, listings, listed] = contentReads();
 
     await userEvent.click(
       await within(dialog).findByRole("button", { name: "Keep mine" }),
@@ -241,6 +274,16 @@ describe("the conflict dialog", () => {
     expect(
       sentBody("/domains/eng/sync/conflicts/abc12345/resolve", "POST"),
     ).toEqual({ resolution: "mine" });
+    // And the domain is read again even though this side of the choice wrote
+    // no file at all: the engine re-syncs after every resolve, keeping this
+    // copy's own version included, so the tree, the listing and the count are
+    // all about to be stale whichever way the conflict was settled.
+    await waitFor(() => {
+      const [after, afterListings, afterListed] = contentReads();
+      expect(after).toBeGreaterThan(trees);
+      expect(afterListings).toBeGreaterThan(listings);
+      expect(afterListed).toBeGreaterThan(listed);
+    });
   });
 
   it("labels a deleted side and saves a hand merge", async () => {

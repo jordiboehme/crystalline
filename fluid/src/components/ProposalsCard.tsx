@@ -115,6 +115,20 @@ export function ProposalsCard({
 }
 
 /**
+ * Whether a proposal's url is an address this card will hand a reader.
+ *
+ * The url is the forge's own word, and on an enterprise install the forge is a
+ * machine somebody else administers. Nothing about a review needs a scheme
+ * other than http or https, so anything else - `javascript:` first among them -
+ * is drawn as text instead of as a link that runs on press. Defence in depth
+ * rather than a known hole: the engine builds these from the API's own fields,
+ * and this is the line that holds if one day it does not.
+ */
+function isWebAddress(url: string): boolean {
+  return url.startsWith("https://") || url.startsWith("http://");
+}
+
+/**
  * Which face a proposal's standing wears. Anything unrecognized stays plain.
  *
  * Named apart from `primitives.tsx`'s exported `statusVariant`, which this file
@@ -159,14 +173,19 @@ function ProposalRow({
   return (
     <li className="flex flex-col gap-1 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <a
-          href={proposal.url}
-          target="_blank"
-          rel="noreferrer"
-          className="font-medium underline underline-offset-2 hover:no-underline"
-        >
-          {proposal.title}
-        </a>
+        {isWebAddress(proposal.url) ? (
+          <a
+            href={proposal.url}
+            target="_blank"
+            rel="noreferrer"
+            className="font-medium underline underline-offset-2 hover:no-underline"
+          >
+            {proposal.title}
+          </a>
+        ) : (
+          // The title is still worth reading; the link is not worth having.
+          <span className="font-medium">{proposal.title}</span>
+        )}
         <Chip variant={proposalStatusVariant(proposal.status)}>
           {proposal.status}
         </Chip>

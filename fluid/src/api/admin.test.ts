@@ -23,6 +23,7 @@ import {
   readGithubStatus,
   resolveConflict,
   shareDomain,
+  sharePlanKey,
   startGithubConnect,
   submitGithubToken,
   syncDomain,
@@ -478,6 +479,12 @@ describe("the admin client layer", () => {
       // An update carries no conflict count, and none is invented for it.
       count: null,
     });
+    // And the key it is cached under, which is deliberately not one of the
+    // `["domains", ...]` keys every other read of a domain is filed under:
+    // reading this route pulls the origin, so a bulk domain invalidation must
+    // never reach it.
+    expect(sharePlanKey("eng")).toEqual(["share-plan", "eng"]);
+    expect(sharePlanKey("eng")[0]).not.toBe(syncStatusKey("eng")[0]);
   });
 
   it("reads the conflict count off a plan that is waiting on them", async () => {

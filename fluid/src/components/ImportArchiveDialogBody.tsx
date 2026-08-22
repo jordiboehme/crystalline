@@ -32,6 +32,7 @@ import type { ArchiveEntry, ArchiveReport } from "../api/admin";
 import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
+import { domainEngramsRoot } from "../api/engrams";
 import type { ImportArchiveDialogProps } from "./ImportArchiveDialog";
 import { BUTTON, Chip, FIELD } from "./primitives";
 import type { ChipVariant } from "./primitives";
@@ -141,8 +142,15 @@ export default function ImportArchiveDialogBody({
       setResult(report);
       // An import moves the shape of the domain and the number of engrams in
       // it: every folder of the tree this domain draws its navigation from,
-      // and the listing every sidebar, card and switcher reads.
+      // every listing either view of the domain screen behind this dialog has
+      // paged, and the listing every sidebar, card and switcher reads. The
+      // middle one is the screen this dialog was opened from, so leaving it
+      // out would put the reader back in front of the domain as it was before
+      // the archive landed in it.
       void queryClient.invalidateQueries({ queryKey: domainTreeKey(domain) });
+      void queryClient.invalidateQueries({
+        queryKey: domainEngramsRoot(domain),
+      });
       void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
     },
     onError: (error: Error) => {

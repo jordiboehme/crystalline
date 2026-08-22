@@ -31,7 +31,12 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 import { useId, useState } from "react";
 
-import { fetchShareChanges, shareDomain, syncStatusKey } from "../api/admin";
+import {
+  fetchShareChanges,
+  shareDomain,
+  sharePlanKey,
+  syncStatusKey,
+} from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { asNumber, asObject, asString } from "../api/json";
@@ -80,7 +85,7 @@ export default function ShareDialogBody({
   // domain content: reading it pulls the origin, and re-reading it as a side
   // effect of somebody else's write is a write nobody asked for.
   const plan = useQuery({
-    queryKey: ["share-plan", domain],
+    queryKey: sharePlanKey(domain),
     queryFn: () => fetchShareChanges(domain),
     staleTime: 0,
     retry: false,
@@ -138,13 +143,24 @@ export default function ShareDialogBody({
             Share changes
           </Dialog.Title>
           <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            {planProblem === null
-              ? actionLine(
-                  action,
-                  plan.data?.number ?? null,
-                  plan.data?.count ?? null,
-                )
-              : "This share could not be planned."}
+            {/*
+              Once there is an outcome the header says nothing of its own. The
+              plan's line is written in the future tense - "Sharing updates
+              proposal #4." - and left standing it would sit directly above a
+              sentence saying that share already happened, which reads as the
+              dialog contradicting itself about the one thing it is for. The
+              outcome below is the whole answer, so this steps out of its way
+              rather than paraphrasing it in a second voice.
+            */}
+            {outcome !== null
+              ? "Done."
+              : planProblem === null
+                ? actionLine(
+                    action,
+                    plan.data?.number ?? null,
+                    plan.data?.count ?? null,
+                  )
+                : "This share could not be planned."}
           </Dialog.Description>
           {outcome === null ? (
             <form
