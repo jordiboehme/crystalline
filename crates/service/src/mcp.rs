@@ -389,14 +389,17 @@ const RESOLUTION_KEY: &str = "resolution";
 const RESOLUTION_OVERWRITE: &str = "overwrite";
 const RESOLUTION_CANCEL: &str = "cancel";
 
-/// The two sides `resolve_conflict`'s question offers, under the same key.
+/// The three resolutions `resolve_conflict` accepts, spelled once.
 ///
-/// Both are spelled exactly as that tool's own `resolution` parameter, so the
-/// answer a client sends back is the word the retry would have carried; the
-/// third resolution, merged, is not offered here because a merge body is not a
-/// choice a form can collect.
+/// Each is spelled exactly as that tool's own `resolution` parameter, so the
+/// word the question offers, the word a client answers with and the word the
+/// dispatch acts on cannot drift apart. Only the first two are offered as
+/// choices: merged is not a choice a form can collect, because it needs a
+/// document rather than a pick, so it appears in the schema nowhere and in the
+/// guidance everywhere.
 const RESOLUTION_MINE: &str = "mine";
 const RESOLUTION_THEIRS: &str = "theirs";
+const RESOLUTION_MERGED: &str = "merged";
 
 /// The substring of the engine's permalink-collision error that identifies it.
 ///
@@ -1625,10 +1628,12 @@ impl McpServer {
         let (keep, content): (Option<&str>, Option<&[u8]>) = match resolution.as_str() {
             RESOLUTION_MINE => (Some(RESOLUTION_MINE), None),
             RESOLUTION_THEIRS => (Some(RESOLUTION_THEIRS), None),
-            "merged" => {
+            RESOLUTION_MERGED => {
                 let Some(content) = p.content.as_deref() else {
                     return Err(ErrorData::invalid_params(
-                        "resolve_conflict requires content when resolution is merged".to_string(),
+                        format!(
+                            "resolve_conflict requires content when resolution is {RESOLUTION_MERGED}"
+                        ),
                         None,
                     ));
                 };
@@ -1637,7 +1642,7 @@ impl McpServer {
             other => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "resolve_conflict resolution must be mine, theirs or merged, got '{other}'"
+                        "resolve_conflict resolution must be {RESOLUTION_MINE}, {RESOLUTION_THEIRS} or {RESOLUTION_MERGED}, got '{other}'"
                     ),
                     None,
                 ));
@@ -2715,12 +2720,27 @@ const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared.
 /// more, and a side that is absent or unreadable says so rather than
 /// rendering as empty (an empty file and a deleted one are different
 /// decisions).
+///
+/// **A null side is two different facts, and `note` is what tells them
+/// apart.** [`crate::engine::Engine::origin_conflict_detail`] nulls a side that
+/// is not there *and* a side that is there but is not UTF-8, setting `note`
+/// only in the second case. Reading every null as a deletion would tell a user
+/// a file they can see on disk was deleted, so a null under a standing note
+/// quotes the note instead. The engine's note names whichever side was last
+/// found unreadable, so with more than one unreadable side the sentence beside
+/// a null may quote a note about another side; what it can no longer do is
+/// claim a present file was deleted, which is the reading that would have cost
+/// the user the choice.
 fn conflict_resolution_question(detail: &Value) -> String {
     let path = detail["path"].as_str().unwrap_or_default();
     let kind = detail["kind"].as_str().unwrap_or("conflict");
+    let note = detail["note"].as_str();
     let preview = |side: &Value| -> String {
         match side.as_str() {
-            None => "(file deleted)".to_string(),
+            None => match note {
+                Some(note) => format!("(no readable content: {note})"),
+                None => "(file deleted)".to_string(),
+            },
             Some(text) => {
                 let mut out = text
                     .lines()
@@ -3168,12 +3188,16 @@ mod tests {
         );
     }
 
-    /// The question shows both sides, bounded, and says so when a side is not
-    /// there at all.
+    /// The question shows both sides, bounded, and says which kind of nothing
+    /// it is showing when a side has no text.
     ///
-    /// The two things asserted are the two a user's decision rests on: a side
-    /// that is null is a deleted file rather than an empty one, and a side
-    /// longer than the budget is visibly cut rather than silently truncated.
+    /// The three things asserted are the three a user's decision rests on: a
+    /// side longer than the budget is visibly cut rather than silently
+    /// truncated, a null side with no note is a deleted file rather than an
+    /// empty one, and a null side under a standing note is a file that is
+    /// there and cannot be read - which must never be reported as a deletion,
+    /// because a user told their file was deleted decides differently from one
+    /// told it is binary.
     #[test]
     fn the_conflict_question_previews_both_sides_within_a_budget() {
         let long: String = (1..=25)
@@ -3218,6 +3242,28 @@ mod tests {
         assert!(
             message.starts_with("Conflict on a.md (conflict)."),
             "{message}"
+        );
+
+        // The same null side, under the note the engine sets when it nulled a
+        // side that is there but is not UTF-8: the file is present, so the
+        // question must not say it was deleted.
+        let detail = json!({
+            "path": "notes/a.md",
+            "kind": "EditEdit",
+            "local": "alpha, my local edit",
+            "upstream": Value::Null,
+            "note": "the upstream side is not UTF-8 and is omitted",
+        });
+        let message = conflict_resolution_question(&detail);
+        assert!(
+            message.contains(
+                "--- upstream (theirs) ---\n(no readable content: the upstream side is not UTF-8 and is omitted)"
+            ),
+            "an unreadable side quotes the note: {message}"
+        );
+        assert!(
+            !message.contains("(file deleted)"),
+            "and is never reported as a deletion: {message}"
         );
     }
 
