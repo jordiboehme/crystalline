@@ -21,7 +21,7 @@ Review feedback reaches you without leaving the conversation: `update_domain` re
 
 ## Withdrawing a proposal
 
-A proposal the team no longer wants - declined, stalled or superseded by better local work - is closed with the `withdraw_proposal` tool: it closes the pull request on GitHub, deletes the share branch and clears the record. Pass `revert: true` only when the person wants the shared files restored to their pre-share content; by default the knowledge stays local and only the proposal goes away. A declined proposal can be withdrawn too, which tidies its record out of `origin_status`.
+A proposal the team no longer wants - declined, stalled or superseded by better local work - is closed with the `withdraw_proposal` tool: it closes the pull request on GitHub, deletes the share branch (best effort) and clears the record. Pass `revert: true` only when the person wants the shared files restored to their pre-share content; by default the knowledge stays local and only the proposal goes away. A declined proposal can be withdrawn too, which tidies its record out of `origin_status`.
 
 ## Conflict etiquette
 
