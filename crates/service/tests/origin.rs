@@ -1140,6 +1140,11 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
         created_at: chrono::Utc::now(),
         status: ProposalStatus::Open,
         files: vec![],
+        head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(&state_dir).unwrap();
     mock.set_proposal_state(7, ProposalState::Merged);
@@ -1566,6 +1571,11 @@ async fn origin_discard_restores_files_and_syncs_the_index() {
             change: ProposedChange::Modified,
             sha256: Some(sha256_hex(&proposed)),
         }],
+        head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(&state_dir).unwrap();
 
@@ -1640,6 +1650,11 @@ async fn origin_discard_schedules_embedding_on_the_worker_channel() {
             change: ProposedChange::Modified,
             sha256: Some(sha256_hex(&proposed)),
         }],
+        head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(&state_dir).unwrap();
 

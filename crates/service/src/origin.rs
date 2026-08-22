@@ -425,6 +425,11 @@ mod tests {
             created_at: chrono::Utc::now(),
             status: ProposalStatus::Open,
             files: vec![],
+            head_commit: None,
+            base_commit: None,
+            review_state: None,
+            feedback: Vec::new(),
+            updated_at: None,
         }
     }
 

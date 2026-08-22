@@ -737,6 +737,11 @@ pub async fn propose(
         created_at: Utc::now(),
         status: ProposalStatus::Open,
         files,
+        head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(state_dir)?;
 

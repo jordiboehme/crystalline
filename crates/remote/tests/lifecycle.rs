@@ -149,6 +149,11 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
             change: ProposedChange::Added,
             sha256,
         }],
+        head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     st.save(state_dir).unwrap();
 }
@@ -1417,6 +1422,11 @@ async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
                 sha256: Some(sha256_hex(b"newly added\n")),
             },
         ],
+        head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(&sub.state_dir).unwrap();
 
