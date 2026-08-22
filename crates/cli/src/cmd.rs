@@ -436,12 +436,14 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
     println!("Run: crystalline origin status --domain {name}");
 }
 
-// --- origin share, discard and resolve ----------------------------------------
+// --- origin share, withdraw and resolve ---------------------------------------
 
 /// Print `origin share`'s result: the proposal URL and change summary when
-/// one was opened, the friendly "nothing to share" line when the team
-/// already has everything the domain knows, or (when conflicts are still
-/// pending) every conflicting path plus a pointer at `origin resolve`.
+/// one was opened or an already-open one was updated in place, the friendly
+/// "nothing to share" line when the team already has everything the domain
+/// knows, the refusal when a reviewer amended the proposal's branch, or
+/// (when conflicts are still pending) every conflicting path plus a pointer
+/// at `origin resolve`.
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -450,7 +452,7 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
     let empty = Vec::new();
     match data["outcome"].as_str().unwrap_or("") {
         "proposed" => {
-            println!("Shared: {}", data["url"].as_str().unwrap_or(""));
+            println!("Opened proposal: {}", data["url"].as_str().unwrap_or(""));
             if let Some(summary) = data["summary"].as_str() {
                 println!("  {summary}");
             }
@@ -459,6 +461,33 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             let deleted = data["deleted"].as_array().map(Vec::len).unwrap_or(0);
             println!("  {added} added, {updated} updated, {deleted} deleted");
             print_skipped_large(&data["skipped_large"]);
+        }
+        "updated" => {
+            let prop = &data["proposal"];
+            println!(
+                "Updated proposal #{}: {}",
+                prop["number"].as_u64().unwrap_or(0),
+                prop["url"].as_str().unwrap_or("")
+            );
+            if let Some(summary) = prop["summary"].as_str() {
+                println!("  {summary}");
+            }
+            let added = prop["added"].as_array().map(Vec::len).unwrap_or(0);
+            let updated = prop["updated"].as_array().map(Vec::len).unwrap_or(0);
+            let deleted = prop["deleted"].as_array().map(Vec::len).unwrap_or(0);
+            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_skipped_large(&prop["skipped_large"]);
+        }
+        "proposal_diverged" => {
+            let prop = &data["proposal"];
+            println!(
+                "Cannot update proposal #{} ({}): a reviewer amended its branch.",
+                prop["number"].as_u64().unwrap_or(0),
+                prop["url"].as_str().unwrap_or("")
+            );
+            if let Some(guidance) = data["guidance"].as_str() {
+                println!("  {guidance}");
+            }
         }
         "nothing_to_share" => {
             println!("Nothing to share: '{domain}' already matches its origin.");
@@ -489,29 +518,27 @@ fn print_skipped_large(skipped_large: &serde_json::Value) {
     }
 }
 
-/// Print `origin discard`'s result: the restored, deleted and skipped
-/// (diverged since sharing) paths, or a friendly line when there was
-/// nothing to discard.
-pub(crate) fn print_origin_discard(data: &serde_json::Value, json: bool) {
+/// Print `origin withdraw`'s result: what was closed, what was restored and
+/// what was left alone because it diverged since sharing.
+pub(crate) fn print_origin_withdraw(data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
         return;
     }
-    let empty = Vec::new();
-    let restored = data["restored"].as_array().unwrap_or(&empty);
-    let deleted = data["deleted"].as_array().unwrap_or(&empty);
-    let skipped = data["skipped_diverged"].as_array().unwrap_or(&empty);
-    if restored.is_empty() && deleted.is_empty() && skipped.is_empty() {
-        println!("Nothing to discard.");
-        return;
+    let number = data["number"].as_u64().unwrap_or(0);
+    if data["closed"].as_bool().unwrap_or(false) {
+        println!("Withdrew proposal #{number}: closed on GitHub.");
+    } else {
+        println!("Withdrew proposal #{number} (already closed).");
     }
-    for p in restored {
+    let empty = Vec::new();
+    for p in data["restored"].as_array().unwrap_or(&empty) {
         println!("restored: {}", p.as_str().unwrap_or(""));
     }
-    for p in deleted {
+    for p in data["deleted"].as_array().unwrap_or(&empty) {
         println!("deleted: {}", p.as_str().unwrap_or(""));
     }
-    for p in skipped {
+    for p in data["skipped_diverged"].as_array().unwrap_or(&empty) {
         println!(
             "left alone (diverged since sharing): {}",
             p.as_str().unwrap_or("")
