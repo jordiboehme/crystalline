@@ -1421,7 +1421,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. While a proposal is already open for the domain, calling this again UPDATES it in place - same proposal number, same URL, a fresh commit reviewers are notified about - it never opens a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, edit the engrams, share again to the same proposal. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (update proposal #N or open a new one), the title and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1432,15 +1432,41 @@ impl McpServer {
     async fn share_changes(
         &self,
         Parameters(p): Parameters<ShareChangesParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
-            return refuse(RemoteError::NotEnabled.to_string());
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
+        }
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    let preview = self
+                        .engine
+                        .origin_share_preview(&p.domain, p.title.as_deref())
+                        .await
+                        .map_err(to_error)?;
+                    // Only a share that would write gets a question;
+                    // nothing_to_share, conflicts_pending and
+                    // proposal_diverged answer in round one, and executing
+                    // the share produces exactly those canonical shapes
+                    // without a provider write.
+                    if matches!(preview["action"].as_str(), Some("create") | Some("update")) {
+                        return Ok(confirm_question(share_question(&preview)).into());
+                    }
+                }
+                Some(false) => {
+                    return refuse(SHARE_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
         }
         self.engine
             .origin_share(&p.domain, p.title.as_deref(), p.description.as_deref())
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -2528,6 +2554,54 @@ fn delete_question(preview: &Value) -> String {
     format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
 }
 
+/// The sentence `share_changes` asks before it publishes, rendered from
+/// [`crate::engine::Engine::origin_share_preview`]'s plan: the action (update
+/// keeps the proposal's number and URL in front of the user), the effective
+/// title and the change mix, naming at most ten files.
+///
+/// **The title named here is the one the share writes, not a promise to
+/// retitle the proposal.** An update keeps whatever title the proposal was
+/// opened with on GitHub; `effective_title` is what its fresh commit says.
+fn share_question(preview: &Value) -> String {
+    let action = match preview["action"].as_str().unwrap_or_default() {
+        "update" => format!(
+            "Update open proposal #{} ({})",
+            preview["number"].as_u64().unwrap_or_default(),
+            preview["url"].as_str().unwrap_or_default()
+        ),
+        _ => "Open a new proposal".to_string(),
+    };
+    let title = preview["effective_title"].as_str().unwrap_or_default();
+    let empty = Vec::new();
+    let changes = preview["changes"].as_array().unwrap_or(&empty);
+    let (mut added, mut updated, mut deleted) = (0usize, 0usize, 0usize);
+    for c in changes {
+        match c["kind"].as_str() {
+            Some("added") => added += 1,
+            Some("modified") => updated += 1,
+            Some("deleted") => deleted += 1,
+            _ => {}
+        }
+    }
+    let names: Vec<&str> = changes
+        .iter()
+        .take(10)
+        .filter_map(|c| c["path"].as_str())
+        .collect();
+    let more = changes.len().saturating_sub(10);
+    let listed = if more > 0 {
+        format!("{} and {more} more", names.join(", "))
+    } else {
+        names.join(", ")
+    };
+    format!(
+        "{action}? Title: '{title}'. {added} added, {updated} modified, {deleted} deleted: {listed}. Reviewers see the result on GitHub."
+    )
+}
+
+/// What an unconfirmed share tells the model, naming what did not happen.
+const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared. Call share_changes again if the user asks for it.";
+
 /// The middle sentence of [`delete_question`]: what the delete does to the
 /// engram's attachments.
 ///
@@ -2945,6 +3019,35 @@ mod tests {
             unenumerated,
             "Delete 'Doomed' (eng/eng/doomed)? Its attachments are not enumerated on this large domain; any sole-referent ones are left orphaned. This cannot be undone."
         );
+    }
+
+    #[test]
+    fn the_share_question_names_update_create_and_caps_the_file_list() {
+        let update = share_question(&json!({
+            "action": "update", "number": 4, "url": "https://github.test/pulls/4",
+            "effective_title": "Refine 1 engram in kb",
+            "changes": [{ "path": "notes/a.md", "kind": "modified" }],
+        }));
+        assert!(
+            update.contains("Update open proposal #4 (https://github.test/pulls/4)"),
+            "{update}"
+        );
+        assert!(update.contains("Refine 1 engram in kb"), "{update}");
+        assert!(
+            update.contains("0 added, 1 modified, 0 deleted: notes/a.md"),
+            "{update}"
+        );
+
+        let changes: Vec<Value> = (0..12)
+            .map(|i| json!({ "path": format!("notes/f{i}.md"), "kind": "added" }))
+            .collect();
+        let create = share_question(&json!({
+            "action": "create", "effective_title": "Share 12 new engrams from kb",
+            "changes": changes,
+        }));
+        assert!(create.contains("Open a new proposal"), "{create}");
+        assert!(create.contains("and 2 more"), "{create}");
+        assert!(!create.contains("notes/f10.md"), "capped at ten: {create}");
     }
 
     #[test]
