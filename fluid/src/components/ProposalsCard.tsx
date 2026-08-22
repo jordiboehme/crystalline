@@ -18,16 +18,19 @@
  * thread, and spreading every thread over the card would bury the row below it;
  * what the collapsed row keeps is the verdict, which is the part somebody
  * scanning the card is looking for.
+ *
+ * The withdraw confirm is behind the house lazy seam, so a session that only
+ * reads this card never loads a dialog's worth of code: this file draws rows,
+ * and `WithdrawProposalDialog` is what mounts once somebody presses Withdraw.
  */
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Dialog } from "radix-ui";
+import { useQuery } from "@tanstack/react-query";
 import type { ReactElement } from "react";
 import { useState } from "react";
 
 import type { SyncProposal } from "../api/admin";
-import { fetchSyncStatus, syncStatusKey, withdrawProposal } from "../api/admin";
-import { problemDetail } from "../api/client";
+import { fetchSyncStatus, syncStatusKey } from "../api/admin";
+import { WithdrawProposalDialog } from "./WithdrawProposalDialog";
 import { BUTTON, Chip } from "./primitives";
 import type { ChipVariant } from "./primitives";
 
@@ -76,8 +79,15 @@ export function ProposalsCard({
   );
 }
 
-/** Which face a proposal's standing wears. Anything unrecognized stays plain. */
-function statusVariant(status: string): ChipVariant {
+/**
+ * Which face a proposal's standing wears. Anything unrecognized stays plain.
+ *
+ * Named apart from `primitives.tsx`'s exported `statusVariant`, which this file
+ * imports from: that one maps an engram's lifecycle status and these are a
+ * proposal's four states, and two different tables under one name in one module
+ * is a trap for whoever edits this next.
+ */
+function proposalStatusVariant(status: string): ChipVariant {
   if (status === "merged") {
     return "positive";
   }
@@ -107,29 +117,9 @@ function ProposalRow({
   domain: string;
   proposal: SyncProposal;
 }): ReactElement {
-  const queryClient = useQueryClient();
   const [confirming, setConfirming] = useState(false);
-  const [revert, setRevert] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
-
-  const withdraw = useMutation({
-    mutationFn: () => withdrawProposal(domain, proposal.number, revert),
-    onSuccess: () => {
-      setConfirming(false);
-      // This proposal is not open any more, and a revert may have moved the
-      // pending-changes count with it: the status both cards draw from is read
-      // again rather than left saying what was just taken back.
-      void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
-    },
-    onError: (error: Error) => {
-      // The confirm closes with the refusal, so the message lands on the row
-      // rather than under an open dialog that has taken the page's focus and
-      // hidden the rest of it from anything reading the screen.
-      setConfirming(false);
-      setProblem(problemDetail(error));
-    },
-  });
 
   return (
     <li className="flex flex-col gap-1 text-sm">
@@ -142,7 +132,9 @@ function ProposalRow({
         >
           {proposal.title}
         </a>
-        <Chip variant={statusVariant(proposal.status)}>{proposal.status}</Chip>
+        <Chip variant={proposalStatusVariant(proposal.status)}>
+          {proposal.status}
+        </Chip>
         {proposal.reviewState !== null && (
           <Chip variant={reviewVariant(proposal.reviewState)}>
             {/* The wire's underscores are a key, not a word somebody reads. */}
@@ -218,62 +210,20 @@ function ProposalRow({
       )}
 
       {confirming && (
-        <Dialog.Root
-          open
-          onOpenChange={(next) => {
-            if (!next) {
-              setConfirming(false);
-            }
+        <WithdrawProposalDialog
+          domain={domain}
+          proposal={proposal}
+          onClose={() => {
+            setConfirming(false);
           }}
-        >
-          <Dialog.Portal>
-            <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-900/40" />
-            <Dialog.Content className="fixed top-1/2 left-1/2 z-50 w-[min(26rem,calc(100vw-2rem))] -translate-x-1/2 -translate-y-1/2 rounded border border-slate-200 bg-white p-4 shadow-xl dark:border-slate-700 dark:bg-slate-900">
-              <Dialog.Title className="text-lg font-semibold">
-                Withdraw proposal #{String(proposal.number)}
-              </Dialog.Title>
-              <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-                Closes the proposal on the origin and records it as withdrawn.
-                The review stays readable there.
-              </Dialog.Description>
-              {/* Off by default: withdrawing is about the proposal, and
-                  rewriting the working tree is a second thing somebody asks
-                  for rather than a consequence they discover. Files a reviewer
-                  amended on the branch are left alone either way. */}
-              <label className="mt-3 flex items-center gap-2 text-sm">
-                <input
-                  type="checkbox"
-                  checked={revert}
-                  onChange={(event) => {
-                    setRevert(event.target.checked);
-                  }}
-                />
-                Restore shared files
-              </label>
-              <div className="mt-3 flex justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setConfirming(false);
-                  }}
-                  className={BUTTON.secondary}
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  disabled={withdraw.isPending}
-                  onClick={() => {
-                    withdraw.mutate();
-                  }}
-                  className={BUTTON.destructive}
-                >
-                  Withdraw proposal
-                </button>
-              </div>
-            </Dialog.Content>
-          </Dialog.Portal>
-        </Dialog.Root>
+          onProblem={(detail) => {
+            // The dialog closes with the refusal, so the message lands on the
+            // row: an open dialog `aria-hidden`s the page behind it, and an
+            // alert under one reaches nothing that reads the screen.
+            setConfirming(false);
+            setProblem(detail);
+          }}
+        />
       )}
     </li>
   );

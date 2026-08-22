@@ -16,7 +16,7 @@
  */
 
 import { API_BASE, api, encodeSegment } from "./client";
-import { asArray, asNumber, asObject, asString } from "./json";
+import { asArray, asNumber, asObject, asString, asStrings } from "./json";
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
@@ -502,16 +502,48 @@ export async function shareDomain(
   });
 }
 
+/**
+ * What a withdraw did, on the forge and on this copy.
+ *
+ * The three file lists are the reason this is read rather than passed through
+ * as the engine's own JSON: a revert rewrites the working tree and re-indexes
+ * the domain, so a caller has to be able to tell a withdraw that only closed a
+ * pull request from one that moved files under every list on the screen.
+ */
+export interface WithdrawReceipt {
+  number: number;
+  /** Whether a live pull request was closed, as opposed to only a record. */
+  closed: boolean;
+  /** What the record now says, which is `withdrawn`. */
+  status: string;
+  /** Files a revert put back from the origin, and files it removed. */
+  restored: string[];
+  deleted: string[];
+  /** Files a reviewer amended on the branch, which a revert leaves alone. */
+  skippedDiverged: string[];
+}
+
 /** Close a proposal on the forge; `revert` also restores the shared files. */
 export async function withdrawProposal(
   domain: string,
   number: number,
   revert: boolean,
-): Promise<unknown> {
-  return api<unknown>(
-    `/domains/${encodeSegment(domain)}/sync/proposals/${number}/withdraw`,
-    { method: "POST", body: JSON.stringify({ revert }) },
+): Promise<WithdrawReceipt> {
+  const record = asObject(
+    await api<unknown>(
+      `/domains/${encodeSegment(domain)}/sync/proposals/${number}/withdraw`,
+      { method: "POST", body: JSON.stringify({ revert }) },
+    ),
   );
+  return {
+    // The number that was asked for, when the answer did not repeat it.
+    number: asNumber(record?.number) ?? number,
+    closed: record?.closed === true,
+    status: asString(record?.status) ?? "withdrawn",
+    restored: asStrings(record?.restored),
+    deleted: asStrings(record?.deleted),
+    skippedDiverged: asStrings(record?.skipped_diverged),
+  };
 }
 
 /** One conflict with every side of it, for the screen that settles it. */

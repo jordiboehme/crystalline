@@ -245,8 +245,11 @@ describe("the admin client layer", () => {
       connected: null,
       // The same two records the count above was taken from, as themselves.
       // Everything the fixture left out is filled in rather than left
-      // undefined: a row draws a title and a status whatever arrived, and the
-      // status a record without one gets is the one it is in by being listed.
+      // undefined: a row draws a title and a status whatever arrived. The
+      // default status is `open` for both lists, not the list's own name - a
+      // record that arrives with no status at all is a report this side cannot
+      // read, and guessing `declined` from the key it came under would put a
+      // word on a chip that nothing said.
       proposals: [
         {
           number: 7,
@@ -489,8 +492,15 @@ describe("the admin client layer", () => {
   });
 
   it("withdraws a proposal by number, with the revert flag on the body", async () => {
-    apiMock.mockResolvedValueOnce({ number: 4, closed: true });
-    await withdrawProposal("eng", 4, true);
+    apiMock.mockResolvedValueOnce({
+      number: 4,
+      closed: true,
+      status: "withdrawn",
+      restored: ["notes/a.md"],
+      deleted: [],
+      skipped_diverged: ["notes/b.md"],
+    });
+    const receipt = await withdrawProposal("eng", 4, true);
 
     expect(apiMock).toHaveBeenLastCalledWith(
       "/domains/eng/sync/proposals/4/withdraw",
@@ -499,6 +509,33 @@ describe("the admin client layer", () => {
         body: JSON.stringify({ revert: true }),
       }),
     );
+    // The three file lists are read rather than passed through: they are how a
+    // caller tells a withdraw that only closed a pull request from one that
+    // moved files under every list on the screen.
+    expect(receipt).toEqual({
+      number: 4,
+      closed: true,
+      status: "withdrawn",
+      restored: ["notes/a.md"],
+      deleted: [],
+      skippedDiverged: ["notes/b.md"],
+    });
+  });
+
+  it("reads a withdraw that moved nothing as having moved nothing", async () => {
+    // The lists a plain withdraw leaves out entirely. None of them becomes
+    // undefined, because the caller counts them to decide what to re-read.
+    apiMock.mockResolvedValueOnce({ number: 4, closed: true });
+    const receipt = await withdrawProposal("eng", 4, false);
+
+    expect(receipt).toEqual({
+      number: 4,
+      closed: true,
+      status: "withdrawn",
+      restored: [],
+      deleted: [],
+      skippedDiverged: [],
+    });
   });
 
   it("reads one conflict's three sides, and keeps the id it asked by", async () => {

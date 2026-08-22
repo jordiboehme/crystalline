@@ -117,6 +117,24 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/** How many times a route was asked for, by path prefix. */
+function reads(prefix: string): number {
+  return requested().filter((path) => path.startsWith(prefix)).length;
+}
+
+/**
+ * Every read a revert can invalidate, counted at once: the folders the
+ * navigation walks, the listing the screen pages and the domain listing every
+ * sidebar, card and switcher draws from.
+ */
+function contentReads(): [number, number, number] {
+  return [
+    reads("/domains/eng/tree"),
+    reads("/domains/eng/engrams"),
+    requested().filter((path) => path === "/domains").length,
+  ];
+}
+
 /** The body of the request the app sent to `path` with `method`, parsed. */
 function sentBody(path: string, method: string): unknown {
   const call = apiMock.mock.calls.find(
@@ -253,9 +271,10 @@ describe("the proposals card", () => {
 
     renderApp("/d/eng");
     const card = await proposalsCard();
-    const reads = requested().filter(
+    const statusReads = requested().filter(
       (path) => path === "/domains/eng/sync",
     ).length;
+    const [trees, listings, listed] = contentReads();
 
     await userEvent.click(
       within(card).getByRole("button", { name: "Withdraw" }),
@@ -284,7 +303,16 @@ describe("the proposals card", () => {
     await waitFor(() => {
       expect(
         requested().filter((path) => path === "/domains/eng/sync").length,
-      ).toBeGreaterThan(reads);
+      ).toBeGreaterThan(statusReads);
+    });
+    // And the revert restored a file, which re-indexed the domain server-side:
+    // everything drawn from what is in the domain is read again rather than
+    // left showing the tree, the list and the count from before the restore.
+    await waitFor(() => {
+      const [after, afterListings, afterListed] = contentReads();
+      expect(after).toBeGreaterThan(trees);
+      expect(afterListings).toBeGreaterThan(listings);
+      expect(afterListed).toBeGreaterThan(listed);
     });
   });
 
@@ -304,6 +332,10 @@ describe("the proposals card", () => {
 
     renderApp("/d/eng");
     const card = await proposalsCard();
+    const statusReads = requested().filter(
+      (path) => path === "/domains/eng/sync",
+    ).length;
+    const before = contentReads();
 
     await userEvent.click(
       within(card).getByRole("button", { name: "Withdraw" }),
@@ -321,6 +353,16 @@ describe("the proposals card", () => {
     expect(sentBody("/domains/eng/sync/proposals/4/withdraw", "POST")).toEqual({
       revert: false,
     });
+    // The counterweight to the test above: this withdraw moved no file, so
+    // nothing about the domain's contents is asked again. The status is - it
+    // is what lists the proposal - and waiting for that is what makes the
+    // three counts below a settled answer rather than a race.
+    await waitFor(() => {
+      expect(
+        requested().filter((path) => path === "/domains/eng/sync").length,
+      ).toBeGreaterThan(statusReads);
+    });
+    expect(contentReads()).toEqual(before);
   });
 
   it("keeps a refused withdraw on the row rather than swallowing it", async () => {
