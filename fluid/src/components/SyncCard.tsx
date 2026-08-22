@@ -32,7 +32,8 @@ import { fetchSyncStatus, syncDomain, syncStatusKey } from "../api/admin";
 import { ApiProblem, problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { formatDay, plural } from "../format";
-import { BUTTON } from "./primitives";
+import { ConflictDialog } from "./ConflictDialog";
+import { BUTTON, FOCUS_RING } from "./primitives";
 
 /**
  * The warning face, for the one thing here that is neither fine nor a failure:
@@ -53,6 +54,9 @@ const ALERT_CLASSES =
 export function SyncCard({ domain }: { domain: string }): ReactElement | null {
   const queryClient = useQueryClient();
   const [problem, setProblem] = useState<string | null>(null);
+  // The conflict being settled, by id, or null while none is. One at a time:
+  // settling one is a decision that wants the whole screen.
+  const [openConflict, setOpenConflict] = useState<string | null>(null);
 
   // No retry: the two answers this call has to distinguish are both immediate
   // and final - a domain with no origin, and an instance with GitHub off - and
@@ -190,12 +194,25 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
               </span>
             )}
             {sync.conflicts > 0 && (
-              <span>
-                {plural(
-                  sync.conflicts,
-                  "conflict to settle",
-                  "conflicts to settle",
-                )}
+              <span className="flex flex-wrap items-center gap-2">
+                {/* The count is the sentence; the paths are what turns it
+                    into somewhere to go. A report that carried a bare count,
+                    or paths with no id to address a conflict by, still says
+                    how many there are - it just has nothing to open, and the
+                    colon goes with the list rather than promising one. */}
+                {conflictLead(sync)}
+                {sync.conflictList.map((conflict) => (
+                  <button
+                    key={conflict.id}
+                    type="button"
+                    onClick={() => {
+                      setOpenConflict(conflict.id);
+                    }}
+                    className={`font-mono underline ${FOCUS_RING}`}
+                  >
+                    {conflict.path}
+                  </button>
+                ))}
               </span>
             )}
           </p>
@@ -221,8 +238,40 @@ export function SyncCard({ domain }: { domain: string }): ReactElement | null {
           {problem}
         </p>
       )}
+
+      {openConflict !== null && (
+        <ConflictDialog
+          domain={domain}
+          conflictId={openConflict}
+          onClose={() => {
+            setOpenConflict(null);
+          }}
+        />
+      )}
     </section>
   );
+}
+
+/**
+ * The lead-in the conflict line wears: the count, and a colon exactly when
+ * there are paths after it.
+ *
+ * The count and the list are read from the same field and can still disagree.
+ * The status route embeds the conflicts themselves, but the poll overview
+ * counts them and an older report lists bare paths with no id, and a conflict
+ * with no id is one nothing on this side can open. So the sentence is drawn
+ * from the count either way, and only the buttons depend on the list.
+ */
+function conflictLead(sync: {
+  conflicts: number;
+  conflictList: unknown[];
+}): string {
+  const line = plural(
+    sync.conflicts,
+    "conflict to settle",
+    "conflicts to settle",
+  );
+  return sync.conflictList.length === 0 ? line : `${line}:`;
 }
 
 /**
