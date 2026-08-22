@@ -1232,6 +1232,13 @@ async fn update_open_proposal(
 /// working tree is untouched; with it, files still matching what was proposed
 /// are restored (base-tree content for Modified/Deleted, deletion for Added)
 /// and diverged ones are skipped - newer work is never destroyed.
+///
+/// Only the close is atomic: a failure later, inside the revert loop, leaves
+/// the pull request closed on the forge while the record is still locally
+/// Open, since the state save comes last. That heals itself rather than
+/// needing repair - the next [`status`] or [`pull`] classifies the closed
+/// pull request and flips the record to Declined, and a retried withdraw then
+/// takes the Declined path (no second close, the remaining files reverted).
 pub async fn withdraw(
     provider: &dyn Provider,
     spec: &OriginSpec,

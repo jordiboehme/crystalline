@@ -1,11 +1,11 @@
 //! Pure helpers for GitHub-origin collaboration, factored out of
 //! [`crate::engine::Engine`] so its `origin_add`, `origin_update`,
 //! `origin_status`, `origin_share`, `origin_share_preview`, `origin_withdraw`
-//! and `origin_resolve`
-//! methods stay orchestration-only: everything here is a free function over
-//! plain data, with no access to `Engine`'s private state, mirroring how
-//! [`crate::settings`] operates on [`crystalline_core::config::GlobalConfig`]
-//! rather than reaching into the engine itself.
+//! and `origin_resolve` methods stay orchestration-only: everything here is a
+//! free function over plain data, with no access to `Engine`'s private state,
+//! mirroring how [`crate::settings`] operates on
+//! [`crystalline_core::config::GlobalConfig`] rather than reaching into the
+//! engine itself.
 //!
 //! Nothing here talks to GitHub, the filesystem or the token store; that is
 //! `crystalline_remote::ops` and `crystalline_remote::token`'s job. This

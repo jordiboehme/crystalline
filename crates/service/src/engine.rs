@@ -357,6 +357,37 @@ fn utf8_side(bytes: Option<Vec<u8>>, name: &str, note: &mut Option<String>) -> V
     }
 }
 
+#[cfg(test)]
+mod utf8_side_tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_side_is_null_without_a_note() {
+        let mut note = None;
+        assert_eq!(utf8_side(None, "local", &mut note), Value::Null);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_utf8_side_is_the_text_itself() {
+        let mut note = None;
+        let v = utf8_side(Some(b"line one\n".to_vec()), "base", &mut note);
+        assert_eq!(v, Value::String("line one\n".to_string()));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_non_utf8_side_is_null_and_names_itself_in_the_note() {
+        let mut note = None;
+        // A lone 0x80 continuation byte is never valid UTF-8.
+        let v = utf8_side(Some(vec![0x80, 0x00, 0xff]), "upstream", &mut note);
+        assert_eq!(v, Value::Null);
+        let note = note.expect("a binary side sets the note");
+        assert!(note.contains("upstream"), "{note}");
+        assert!(note.contains("not UTF-8"), "{note}");
+    }
+}
+
 impl From<crystalline_index::IndexError> for EngineError {
     fn from(e: crystalline_index::IndexError) -> Self {
         match e {
@@ -8457,16 +8488,25 @@ impl Engine {
     }
 
     /// One conflict's full detail: both recorded sides plus the current local
-    /// content, addressed by id or by path (exactly one must be given).
-    /// Sides are returned as UTF-8 strings; a side that exists but is not
-    /// UTF-8 comes back null with `note` saying so. A pure read: no gate
-    /// beyond the domain being registered with an origin, no lock needed.
+    /// content, addressed by id or by path (exactly one must be given; if
+    /// both arrive the id wins and the path is ignored, never mixed, so an id
+    /// lookup can never be answered by some other conflict that happens to
+    /// match the path). Neither is `EngineError::Invalid` rather than a
+    /// misleading not-found. Sides are returned as UTF-8 strings; a side that
+    /// exists but is not UTF-8 comes back null with `note` saying so. A pure
+    /// read: no gate beyond the domain being registered with an origin, no
+    /// lock needed.
     pub async fn origin_conflict_detail(
         &self,
         domain: &str,
         id: Option<&str>,
         path: Option<&str>,
     ) -> Result<Value> {
+        if id.is_none() && path.is_none() {
+            return Err(EngineError::Invalid(
+                "origin_conflict_detail needs an id or a path".to_string(),
+            ));
+        }
         let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
             EngineError::Invalid(format!("domain '{domain}' has no origin state"))
@@ -8474,7 +8514,11 @@ impl Engine {
         let conflict = state
             .conflicts
             .iter()
-            .find(|c| id.is_some_and(|id| c.id == id) || path.is_some_and(|p| c.path == p))
+            .find(|c| match (id, path) {
+                (Some(id), _) => c.id == id,
+                (None, Some(path)) => c.path == path,
+                (None, None) => false,
+            })
             .cloned()
             .ok_or_else(|| {
                 EngineError::NotFound(format!(

@@ -1698,10 +1698,12 @@ async fn origin_status_flags_an_amended_open_proposal() {
     assert_eq!(open["amended_upstream"], true, "{v}");
 }
 
-#[tokio::test]
-async fn origin_conflict_detail_reads_both_sides_by_id_or_path() {
-    let tmp = tempfile::tempdir().unwrap();
-    let (eng, mock, root, _number) = shared_team_engine(&tmp).await;
+/// [`shared_team_engine`] carried one step further: the open proposal is
+/// withdrawn, then a local and an upstream edit of the same engram are pulled
+/// into a genuine EditEdit conflict. Returns the engine, the working-tree root
+/// and the recorded conflict's id.
+async fn conflicted_team_engine(tmp: &tempfile::TempDir) -> (Engine, std::path::PathBuf, String) {
+    let (eng, mock, root, _number) = shared_team_engine(tmp).await;
     // Clear the open proposal so the conflict setup is the only moving part.
     eng.origin_withdraw("kb", None, false).await.unwrap();
     // Local and upstream edit the same engram differently, then pull.
@@ -1720,8 +1722,15 @@ async fn origin_conflict_detail_reads_both_sides_by_id_or_path() {
     let status = eng.origin_status(Some("kb")).await.unwrap();
     let id = status["domains"][0]["conflicts"][0]["id"]
         .as_str()
-        .unwrap()
+        .expect("the pull recorded a conflict")
         .to_string();
+    (eng, root, id)
+}
+
+#[tokio::test]
+async fn origin_conflict_detail_reads_both_sides_by_id_or_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _root, id) = conflicted_team_engine(&tmp).await;
     let by_id = eng
         .origin_conflict_detail("kb", Some(&id), None)
         .await
@@ -1740,6 +1749,42 @@ async fn origin_conflict_detail_reads_both_sides_by_id_or_path() {
         .await
         .unwrap();
     assert_eq!(by_path["id"], id.as_str());
+    assert!(by_id["note"].is_null(), "every side is UTF-8 here");
+}
+
+#[tokio::test]
+async fn origin_conflict_detail_addressing_rules_and_a_missing_local_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, root, id) = conflicted_team_engine(&tmp).await;
+
+    // Neither an id nor a path is a malformed request, not a missing one.
+    let err = eng
+        .origin_conflict_detail("kb", None, None)
+        .await
+        .unwrap_err();
+    match err {
+        EngineError::Invalid(msg) => assert!(msg.contains("an id or a path"), "{msg}"),
+        other => panic!("expected Invalid, got {other}"),
+    }
+
+    // An id that matches nothing is not found, even though the path of the
+    // one real conflict is passed alongside it: the id wins outright.
+    let err = eng
+        .origin_conflict_detail("kb", Some("deadbeef"), Some("notes/a.md"))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, EngineError::NotFound(_)), "{err}");
+
+    // A conflict whose local file is gone reports a null local side rather
+    // than failing: the recorded base and upstream still answer.
+    std::fs::remove_file(root.join("notes/a.md")).unwrap();
+    let v = eng
+        .origin_conflict_detail("kb", Some(&id), None)
+        .await
+        .unwrap();
+    assert!(v["local"].is_null(), "{v}");
+    assert!(v["upstream"].as_str().unwrap().contains("theirs theirs"));
+    assert!(v["note"].is_null(), "a missing side is not a binary side");
 }
 
 #[tokio::test]

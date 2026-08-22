@@ -1012,7 +1012,8 @@ enum OriginCommand {
         config: Option<PathBuf>,
     },
     /// Discard a declined, or still-open ("never mind"), share proposal,
-    /// restoring local files that were not changed since sharing them.
+    /// restoring local files that were not changed since sharing them. A
+    /// still-open proposal is also closed on GitHub.
     Discard {
         /// The team domain the proposal belongs to.
         domain: String,
