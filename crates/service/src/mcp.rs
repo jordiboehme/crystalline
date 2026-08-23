@@ -1,8 +1,8 @@
 //! The rmcp tool router: the core tools of the v1 MCP surface plus the
-//! collaboration tools, which are always listed and refuse while team
-//! collaboration is off.
+//! collaboration tools, which are listed once team collaboration is on and
+//! refuse - rather than vanish from dispatch - while it is off.
 //!
-//! # One list for every client (SEP-2567)
+//! # One list for every client, at any given instant (SEP-2567)
 //!
 //! MCP 2026-07-28 says a server's `tools/list` result "MAY change over time
 //! [...] but MUST NOT vary per-connection or as a side effect of other
@@ -12,22 +12,30 @@
 //!
 //! > A gate may stay on the listing if and only if (a) its input is not
 //! > derived from the identity, capabilities or configuration of the
-//! > connecting client, and (b) its input cannot be changed by any request on
-//! > that connection. Anything failing either half refuses at call time.
+//! > connecting client, and (b) its input is a single value on the shared
+//! > instance, so that every client listing at the same moment is served the
+//! > same list. A gate whose input is instance-wide but mutable owes an
+//! > announcement; one failing (a), or with no single value to point at,
+//! > refuses at call time instead.
 //!
-//! `read_only` passes both: it is a construction field on the engine
-//! (`Engine::with_read_only` takes `self` by value) and the engine is shared
-//! behind an `Arc`, so nothing a client sends can move it. `github.enabled`
-//! and whether any domain declares provisioning both fail (b) - `configure`,
-//! `add_domain` and `update_domain` change them on the very connection that
-//! then lists - so they refuse at call time. The client's install-receipt
-//! match failed (a) and is gone from the listing entirely.
+//! `read_only` passes with nothing to announce: it is a construction field on
+//! the engine (`Engine::with_read_only` takes `self` by value) and the engine
+//! is shared behind an `Arc`, so nothing a client sends can move it.
+//! `skills.serve` is snapshotted at the same point and behaves the same way.
+//! `github.enabled` passes with an announcement: it is one setting on the
+//! shared engine, `configure` can flip it, and a flip pushes
+//! `notifications/tools/list_changed` to every open subscription. Whether any
+//! domain declares provisioning has no single setting behind it - `add_domain`
+//! and `update_domain` can create a declaration mid-call - so `provision` is
+//! listed always and refuses its mutating actions. The client's
+//! install-receipt match failed (a) and is gone from the listing entirely.
 //!
-//! Refusing rather than hiding is SEP-2567's own prescription: expose the tool
-//! unconditionally and put the dependency "in the tool's input schema and
-//! description rather than in the list result". Half of it was already true
-//! here, since every gate hid a tool without unregistering its route, so what
-//! changed is the listing rather than the guarding.
+//! Refusing rather than hiding is SEP-2567's own prescription where hiding
+//! would be per-connection: expose the tool unconditionally and put the
+//! dependency "in the tool's input schema and description rather than in the
+//! list result". Every gate here hides without unregistering a route either
+//! way, so a client calling a tool it cannot see is always told why rather
+//! than answered "no such tool".
 //!
 //! Each tool is a thin wrapper over [`crate::engine::Engine`], which does the
 //! real work and is shared with the CLI data commands. Tool descriptions are
@@ -53,14 +61,17 @@
 //!
 //! The collaboration tools (`configure`, `add_domain`, `share_changes`,
 //! `update_domain`, `origin_status`, `resolve_conflict`, `withdraw_proposal`)
-//! split their two gates across the two sides of the rule above.
+//! carry two gates that compose.
 //! `configure`/`add_domain`/`share_changes`/`resolve_conflict`/`withdraw_proposal`
-//! disappear read-only, which stays on the listing. `github.enabled` is needed
-//! by every collaboration tool but `configure`, and it refuses at call time:
-//! the five tools that need it are listed whatever it says and answer with
+//! disappear read-only. `github.enabled` is needed by every collaboration tool
+//! but `configure`, and while it is off the five that need it are hidden from
+//! the listing too, so a default install spends no context on a forge surface
+//! nobody connected; `configure` is never hidden by it, since it is the only
+//! way to turn the rest on. Calling a hidden one still answers with
 //! `RemoteError::NotEnabled`'s message, which names the setting and both ways
-//! to change it. Their descriptions say the same thing, so a client's tool
-//! search reads the dependency without having to call. See `COLLAB_TOOLS`,
+//! to change it, so a stale cached list teaches rather than dead-ends. Turning
+//! the setting on makes all five appear on the next list and announces the
+//! change to every open subscription. See `COLLAB_TOOLS`,
 //! `COLLAB_WRITE_TOOLS`, `hidden_collab_tool` and `refused_collab_tool`.
 //!
 //! `evolve_engrams` is gated a third way, on the read-only flag alone. It is a
@@ -143,20 +154,23 @@
 //! `#[prompt_handler]` replaces any `list_prompts` in its impl block and the
 //! gate needs one it can empty.
 //!
-//! # Nothing is pushed, because nothing can change
+//! # One list can change, and it is announced to subscribers only
 //!
-//! This server sends no `notifications/*/list_changed` at all. `configure`
-//! used to push one whenever it flipped `github.enabled`, and `add_domain` and
-//! `update_domain` whenever they flipped whether any domain declares
-//! provisioning; after those gates moved to call-time refusals and
-//! `skills.serve` was snapshotted at engine construction, every input to every
-//! list is fixed before the first request arrives, so each of those pushes
-//! announced a change that had not happened. MCP 2026-07-28 removes the
-//! unsolicited channel outright - a notification either rides a
-//! `subscriptions/listen` stream the client opened or it does not exist - so
-//! [`McpServer::accepted_subscription_filter`] and [`McpServer::listen`] serve
-//! that stream, and its doc comment carries what a future dynamic list would
-//! have to do to announce itself.
+//! `configure` flipping `github.enabled` moves the tool list, because the five
+//! GitHub-gated collaboration tools are listed only while it is on. That is
+//! the single mover on this server: `resources/list` and `prompts/list` read
+//! `skills.serve` and `harness_onboarded`, both fixed before the first request
+//! arrives, and the provisioning gate that `add_domain` and `update_domain`
+//! could once move became a call-time refusal instead.
+//!
+//! MCP 2026-07-28 removes the unsolicited channel outright - a notification
+//! either rides a `subscriptions/listen` stream the client opened or it does
+//! not exist - so the flip announces itself through
+//! [`McpServer::accepted_subscription_filter`] and [`McpServer::listen`], on
+//! the sink registry the shared engine holds (`crate::subscribers`). A legacy
+//! peer cannot subscribe and is therefore told nothing at all; it re-reads
+//! `tools/list` at its own discretion, which is the same contract it had
+//! before.
 //!
 //! # Asking before destroying (SEP-2322)
 //!
@@ -834,26 +848,51 @@ fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> b
     skills_serve == SkillsServe::Auto && harness_onboarded
 }
 
-/// Whether collaboration tool `name` is hidden given the engine's `read_only`
-/// state. Not meaningful for a non-collab tool name; callers check
-/// [`is_write_tool`] separately for those. The net matrix: read-write shows
-/// all six, read-only shows `update_domain` and `origin_status` only.
+/// Whether collaboration tool `name` is hidden, given the engine's `read_only`
+/// state and its live `github.enabled` setting. Not meaningful for a non-collab
+/// tool name; callers check [`is_write_tool`] separately for those.
 ///
-/// `github.enabled` used to be the other half of this predicate. It left the
-/// listing for [`refused_collab_tool`]: `configure` can flip it on this very
-/// connection, and SEP-2567 forbids a list varying "as a side effect of other
-/// requests on the connection". `read_only` stays because it cannot move -
-/// `Engine::with_read_only` (`engine.rs:788-791`) takes `self` by value at
-/// construction and the engine is shared behind an `Arc`, so no request can
-/// reach it.
-fn hidden_collab_tool(name: &str, read_only: bool) -> bool {
-    read_only && COLLAB_WRITE_TOOLS.contains(&name)
+/// The net matrix, and the two gates compose rather than override:
+///
+/// - `github.enabled` off hides all five gated tools whatever the mode is, and
+///   never hides `configure`, which is the only way to turn them on.
+/// - read-only additionally hides the [`COLLAB_WRITE_TOOLS`] set, so a
+///   read-only instance with collaboration on lists `update_domain` and
+///   `origin_status` and nothing else of the six.
+///
+/// # Invariance is per instant, not per process
+///
+/// SEP-2567 says a tool list "MUST NOT vary per-connection or as a side effect
+/// of other requests on the connection". `github.enabled` is read live here,
+/// the same way [`refused_collab_tool`] reads it, so a `configure` call does
+/// move this list - and that is the deliberate reading of the rule taken on
+/// 2026-08-21: what may not vary is the answer two clients get at the same
+/// moment, and this gate reads one shared setting, so it never does. A list
+/// that may "change over time" is the same sentence's first clause; what it
+/// owes is an announcement, which [`McpServer::configure`] sends to every open
+/// subscription (see [`crate::subscribers`]).
+///
+/// `read_only` is the gate that genuinely cannot move: `Engine::with_read_only`
+/// (`engine.rs:788-791`) takes `self` by value at construction and the engine
+/// is shared behind an `Arc`, so no request can reach it.
+///
+/// Hidden means hidden, not disabled. Every route stays registered and
+/// [`refused_collab_tool`] still answers a direct call with the message naming
+/// the setting, so a client holding a stale list is taught rather than told
+/// "no such tool".
+fn hidden_collab_tool(name: &str, read_only: bool, github_enabled: bool) -> bool {
+    refused_collab_tool(name, github_enabled) || (read_only && COLLAB_WRITE_TOOLS.contains(&name))
 }
 
 /// Whether collaboration tool `name` refuses at call time because
 /// `github.enabled` is off. Every collaboration tool but `configure` needs it,
 /// and `configure` is deliberately exempt: it is how the setting gets turned
 /// on.
+///
+/// [`hidden_collab_tool`] is built on this predicate rather than beside it, so
+/// the listing and the refusal can never disagree about which tools the
+/// setting governs: whatever is withheld from the list is exactly what refuses
+/// when it is called anyway.
 ///
 /// The refusal itself is [`RemoteError::NotEnabled`]'s message, which names
 /// the setting and both ways to change it. The engine keeps its own copy of
@@ -1389,14 +1428,33 @@ impl McpServer {
             return result.map_err(to_error).and_then(ok);
         }
 
-        // No list-changed notification follows, and none is owed: nothing this
-        // call can write moves a list. `github.enabled` refuses at call time
-        // instead of shaping the listing, and `skills.serve` is frozen at
-        // engine construction ([`Engine::skills_serve`]). The unsolicited push
-        // that used to fire here announced a change that had not happened, and
-        // from MCP 2026-07-28 an unsolicited notification has no channel at all
-        // (see [`McpServer::listen`]).
-        self.apply_settings(&p).await?;
+        // `github.enabled` gates the listing of five collaboration tools
+        // ([`hidden_collab_tool`]), so this is the one call on this server that
+        // can move a list - and the one that owes an announcement. It is read
+        // either side of the write rather than parsed out of `p`: a key can be
+        // set to the value it already had, unset back to the default, or
+        // overridden by the environment, and only the effective setting
+        // actually decides what the next `tools/list` returns.
+        //
+        // The announcement is made whether or not the batch succeeded. A
+        // `configure` that flips the setting and then fails on a later key has
+        // still moved the list, and `apply_settings` reports what applied
+        // before it stopped, so the error is returned after the notification
+        // rather than instead of it.
+        //
+        // It reaches subscribers only. MCP 2026-07-28 removed the unsolicited
+        // channel outright, so a legacy peer - which cannot subscribe at all -
+        // is told nothing and re-reads the list at its own discretion. See
+        // [`McpServer::listen`] and [`crate::subscribers`].
+        let github_before = self.engine.github_enabled();
+        let applied = self.apply_settings(&p).await;
+        if self.engine.github_enabled() != github_before {
+            self.engine
+                .list_subscribers()
+                .notify_tool_list_changed()
+                .await;
+        }
+        applied?;
 
         self.engine
             .configure_snapshot()
@@ -2251,41 +2309,37 @@ impl ServerHandler for McpServer {
         )
     }
 
-    /// Hold one acknowledged subscription open until the client ends it.
+    /// Hold one acknowledged subscription open until the client ends it, and
+    /// keep its sink where a list change can find it.
     ///
-    /// # This stream is silent, and that is the finding rather than a shortcut
+    /// # What can move, and what cannot
     ///
-    /// Nothing this server can be asked to do moves any of the three lists.
-    /// [`McpServer::list_tools`] reads `Engine::read_only`,
-    /// `Engine::skills_serve` and `harness_onboarded`; `list_resources` and
-    /// `list_prompts` read the last two. All three are fixed before the first
-    /// request arrives - read-only at engine construction, `skills.serve`
-    /// snapshotted there too, the harness answer resolved by the spawned
-    /// process before the session started - so no request on any transport can
-    /// change what a later `tools/list`, `resources/list` or `prompts/list`
-    /// returns. There is therefore no truthful `notifications/*/list_changed`
-    /// to send, and the three unsolicited pushes that used to fire from
-    /// `configure`, `add_domain` and `update_domain` were deleted rather than
-    /// routed here: after the gates they keyed on moved to call-time refusals,
-    /// each announced a change that had not happened.
+    /// One thing this server can be asked to do moves a list: `configure` can
+    /// flip `github.enabled`, and five collaboration tools appear or disappear
+    /// with it (see [`hidden_collab_tool`]). That is the only mover.
+    /// `resources/list` and `prompts/list` read `skills.serve` and
+    /// `harness_onboarded`, both fixed before the first request arrives, so
+    /// those two categories are accepted on a subscription and then never
+    /// carry anything - accepting a category is a statement about what this
+    /// server may deliver, not a promise that it will.
     ///
-    /// **So no sink is registered anywhere, deliberately.** The plan for this
-    /// work called for a registry of cloned `SubscriptionSink`s on the shared
-    /// `Arc<Engine>`; a registry nothing writes to is worse than none, because
-    /// it reads as implemented. What the registry would have needed is recorded
-    /// here instead, since the next person to add a genuinely dynamic list has
-    /// to get it right: the sink cannot live on this handler, because on the
-    /// stateless HTTP path rmcp builds a fresh service per request
+    /// # The sink lives on the engine, not on this handler
+    ///
+    /// On the stateless HTTP path rmcp builds a fresh service per request
     /// (`get_service()` at rmcp 3.1.2 `tower.rs:1822` and `:1948`) and every
-    /// modern peer routes statelessly, so the handler that would push and the
-    /// handler that took the subscription are different objects sharing only
-    /// the engine. (The legacy session path builds one service per session,
-    /// `tower.rs:1855`, and stdio one per connection, so a handler-local
-    /// registry would have worked there and nowhere else.) `SubscriptionSink`
-    /// is `Clone` and every field is `Send + Sync + 'static`
-    /// (`service/server.rs:139-144`), so `Arc<Engine>` can hold one; it also
-    /// holds a `Peer` and a child cancellation token, so it must be removed
-    /// when this method returns or the engine accumulates dead peers.
+    /// modern peer routes statelessly, so the handler that takes this
+    /// subscription and the handler that later runs `configure` are different
+    /// objects sharing only the `Arc<Engine>`. (The legacy session path builds
+    /// one service per session, `tower.rs:1855`, and stdio one per connection,
+    /// so a handler-local registry would have worked there and nowhere else -
+    /// which is exactly the bug that would have shipped silently.) The registry
+    /// is therefore [`crate::subscribers::ListSubscribers`], reached through
+    /// `Engine::list_subscribers`.
+    ///
+    /// `SubscriptionSink` holds a `Peer` and a child cancellation token
+    /// (`service/server.rs:139-144`), so an entry outliving its stream would
+    /// pin a dead peer. The guard returned by `register` is held for exactly
+    /// the body of this method and drops the entry however the stream ends.
     ///
     /// # What the client is guaranteed before this runs
     ///
@@ -2297,9 +2351,14 @@ impl ServerHandler for McpServer {
     /// filter on anything sent later (`:184-257`). Both are pinned by
     /// `tests/mcp_subscriptions.rs` off the wire, not assumed.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let _registered = crate::subscribers::ListSubscribers::register(
+            self.engine.list_subscribers(),
+            context.sink().clone(),
+        );
         tracing::debug!(
             accepted = ?context.accepted(),
-            "subscription opened; this server has no list that can change, so the stream stays silent"
+            listening = self.engine.list_subscribers().len(),
+            "subscription opened"
         );
         context.cancelled().await;
         Ok(())
@@ -2307,31 +2366,41 @@ impl ServerHandler for McpServer {
 
     /// List the exposed tools.
     ///
-    /// # Only inputs no request can move may gate this list
+    /// # Every client listing at the same instant sees the same list
     ///
     /// MCP 2026-07-28 (SEP-2567, `/server/tools`) says a server's tool list
     /// "MAY change over time [...] but MUST NOT vary per-connection or as a
     /// side effect of other requests on the connection", and the identical
-    /// sentence governs `resources/list` and `prompts/list`. So a gate may
-    /// stay here only if its input is neither derived from the connecting
-    /// client nor changeable by a request on that connection.
+    /// sentence governs `resources/list` and `prompts/list`. The invariant this
+    /// method keeps is the first half read literally: a gate here may read
+    /// deployment or instance state, never anything derived from who is asking.
     ///
-    /// What is left is `read_only`, which is fixed at engine construction
-    /// (`Engine::with_read_only`, `engine.rs:788-791`, takes `self` by value;
-    /// the engine is shared behind an `Arc`), plus the `skills.serve` setting,
-    /// snapshotted at the same point (`Engine::skills_serve`), and the harness
-    /// answer the spawned process resolved before the session started - see
-    /// [`hidden_skills_surface`]. All three are fixed before the first request,
-    /// which is why this list can never move and why [`McpServer::listen`] has
-    /// nothing to announce.
+    /// Three of the four gates cannot move at all. `read_only` is fixed at
+    /// engine construction (`Engine::with_read_only`, `engine.rs:788-791`,
+    /// takes `self` by value; the engine is shared behind an `Arc`),
+    /// `skills.serve` is snapshotted at the same point
+    /// (`Engine::skills_serve`) and the harness answer was resolved by the
+    /// spawned process before the session started - see
+    /// [`hidden_skills_surface`].
     ///
-    /// `github.enabled` and whether any domain declares provisioning both left
-    /// this list for a call-time refusal, which is the remedy SEP-2567
-    /// prescribes itself: expose the tool unconditionally and put the
-    /// dependency "in the tool's input schema and description rather than in
-    /// the list result". The routes were always registered - the gates hid
-    /// rather than disabled - so what changed is the listing, not the
-    /// guarding.
+    /// The fourth, `github.enabled`, is read **live**, and is the one gate that
+    /// makes this list dynamic (see [`hidden_collab_tool`]). It is a single
+    /// setting on the shared engine, so two clients listing at the same moment
+    /// still get the same answer; what varies is the moment, which is the
+    /// "MAY change over time" clause rather than a violation of the one after
+    /// it. The obligation that comes with it is discharged in
+    /// [`McpServer::configure`]: a flip announces itself on every open
+    /// subscription stream, and to nobody who did not open one.
+    ///
+    /// Whether any domain declares provisioning is the gate that did leave this
+    /// list for a call-time refusal, which is the remedy SEP-2567 prescribes
+    /// itself: expose the tool unconditionally and put the dependency "in the
+    /// tool's input schema and description rather than in the list result".
+    /// It stays gone, because `add_domain` and `update_domain` can create a
+    /// declaration mid-call and there is no one setting to point at.
+    ///
+    /// Every route stays registered whatever is hidden, so a client calling a
+    /// tool it cannot see reaches the handler and is refused with a reason.
     ///
     /// Both this method and `get_tool` run every surviving tool's schema
     /// through `crate::tool_schema::sanitize_tool` before returning it, so
@@ -2342,6 +2411,7 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
+        let github_enabled = self.engine.github_enabled();
         let skills_hidden =
             hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded);
         let mut tools = Self::tool_router().list_all();
@@ -2349,7 +2419,7 @@ impl ServerHandler for McpServer {
             if is_write_tool(&t.name) && read_only {
                 return false;
             }
-            if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, read_only) {
+            if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, read_only, github_enabled) {
                 return false;
             }
             if t.name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
@@ -2376,7 +2446,8 @@ impl ServerHandler for McpServer {
         if is_write_tool(name) && read_only {
             return None;
         }
-        if is_collab_tool(name) && hidden_collab_tool(name, read_only) {
+        if is_collab_tool(name) && hidden_collab_tool(name, read_only, self.engine.github_enabled())
+        {
             return None;
         }
         if name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
@@ -3729,19 +3800,52 @@ mod tests {
         assert_eq!(lean_origin_status(not_a_report.clone()), not_a_report);
     }
 
-    /// The listing half of the collaboration gating, which is `read_only`
-    /// alone now: read-write shows all six, read-only shows the two that a
-    /// read-only instance still exempts.
+    /// The listing gate's full matrix, both inputs. `github.enabled` off hides
+    /// the five whatever the mode is and never hides `configure`; on top of
+    /// that read-only hides the write set, so an enabled read-only instance
+    /// shows the two collaboration tools it still exempts and nothing else.
     #[test]
-    fn hidden_collab_tool_matches_the_locked_read_only_matrix() {
-        for name in COLLAB_TOOLS {
-            assert!(!hidden_collab_tool(name, false), "{name}");
+    fn hidden_collab_tool_matches_the_locked_matrix() {
+        // github off: the five are hidden whatever the mode is.
+        for read_only in [false, true] {
+            for name in COLLAB_TOOLS.iter().filter(|n| **n != "configure") {
+                assert!(hidden_collab_tool(name, read_only, false), "{name}");
+            }
         }
+        assert!(
+            !hidden_collab_tool("configure", false, false),
+            "a writable default install still lists the enable path"
+        );
+        assert!(
+            hidden_collab_tool("configure", true, false),
+            "read-only hides configure on its own gate, unchanged"
+        );
+
+        // github on, writable: all six.
+        for name in COLLAB_TOOLS {
+            assert!(!hidden_collab_tool(name, false, true), "{name}");
+        }
+
+        // github on, read-only: the two exempt reads only.
         for name in ["update_domain", "origin_status"] {
-            assert!(!hidden_collab_tool(name, true), "{name}");
+            assert!(!hidden_collab_tool(name, true, true), "{name}");
         }
         for name in COLLAB_WRITE_TOOLS {
-            assert!(hidden_collab_tool(name, true), "{name}");
+            assert!(hidden_collab_tool(name, true, true), "{name}");
+        }
+    }
+
+    /// The listing and the refusal cannot disagree about which tools the
+    /// setting governs: whatever the github gate withholds is exactly what
+    /// refuses when a stale client calls it anyway.
+    #[test]
+    fn the_github_listing_gate_and_the_refusal_name_the_same_tools() {
+        for name in COLLAB_TOOLS {
+            assert_eq!(
+                hidden_collab_tool(name, false, false),
+                refused_collab_tool(name, false),
+                "{name}"
+            );
         }
     }
 

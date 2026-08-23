@@ -683,6 +683,13 @@ pub struct Engine {
     // activity block. Behind an `Arc` so a guard owns its own handle and a
     // panicking or early-returning operation still clears its entry on drop.
     activity: Arc<std::sync::Mutex<ActivityState>>,
+    // Every open `subscriptions/listen` stream that accepted the tools
+    // category, so a `configure` call that moves the tool list can announce it
+    // to whoever asked to hear about it. It lives here rather than on the MCP
+    // handler because over streamable HTTP rmcp builds a fresh handler per
+    // request and the engine is the only thing the subscriber and the flipper
+    // share; see `crate::subscribers`.
+    list_subscribers: Arc<crate::subscribers::ListSubscribers>,
 }
 
 /// One host's cached GitHub credential: the resolved store and the token it
@@ -828,6 +835,7 @@ impl Engine {
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
+            list_subscribers: Arc::default(),
         }
     }
 
@@ -964,6 +972,14 @@ impl Engine {
     /// a full snapshot.
     pub fn github_enabled(&self) -> bool {
         self.config.read().unwrap().github_enabled()
+    }
+
+    /// The open `subscriptions/listen` streams a moved tool list is announced
+    /// on. Shared rather than per-handler on purpose - see
+    /// [`crate::subscribers`] for why the streamable-HTTP transport forces the
+    /// registry down to the engine.
+    pub fn list_subscribers(&self) -> &Arc<crate::subscribers::ListSubscribers> {
+        &self.list_subscribers
     }
 
     /// How the shipped agent skills are served over MCP: the value this engine

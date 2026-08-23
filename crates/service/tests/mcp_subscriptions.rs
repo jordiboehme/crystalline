@@ -34,6 +34,14 @@
 //! rather than written by us. `the_acknowledgment_is_the_first_message_and_names_the_subscription`
 //! reads them off the wire, so an upstream change that stopped honouring either
 //! fails here instead of in a client's log.
+//!
+//! **What actually travels on the stream.** One thing a client can ask this
+//! server to do moves a list: `configure` flipping `github.enabled`, which
+//! decides whether the five GitHub collaboration tools are listed at all. So a
+//! subscriber gets `notifications/tools/list_changed` on the flip, a peer that
+//! opened no stream gets nothing whichever era it speaks, and the resources and
+//! prompts categories are accepted and then stay quiet, because the settings
+//! behind those two lists are frozen at engine construction.
 
 use std::sync::Arc;
 
@@ -362,8 +370,9 @@ async fn the_acknowledgment_is_the_first_message_and_names_the_subscription() {
         "the accepted filter names what this stream will carry: {first}"
     );
 
-    // Nothing follows it unasked: the call that used to push a list-changed
-    // notification now says nothing, because it moves no list.
+    // What follows it is the announcement, and it names this subscription in
+    // the same `_meta` slot the acknowledgment used - `SubscriptionSink::send`
+    // re-attaches the id to everything it carries (`:184-257`).
     wire.send(json!({
         "jsonrpc": "2.0",
         "id": 3,
@@ -390,9 +399,16 @@ async fn the_acknowledgment_is_the_first_message_and_names_the_subscription() {
         .iter()
         .filter(|m| m["method"] == "notifications/tools/list_changed")
         .collect();
-    assert!(
-        pushed.is_empty(),
-        "no list moved, so nothing may be announced on the stream: {seen:?}"
+    assert_eq!(
+        pushed.len(),
+        1,
+        "the moved list is announced exactly once: {seen:?}"
+    );
+    assert_eq!(
+        pushed[0]["params"]["_meta"]["io.modelcontextprotocol/subscriptionId"],
+        json!(2),
+        "and it names the subscription it rode in on: {}",
+        pushed[0]
     );
 
     drop(wire);
@@ -460,11 +476,16 @@ async fn a_category_this_server_cannot_deliver_is_narrowed_away() {
     );
 }
 
-/// The subscription stream stays silent because no list can move: the call that
-/// used to push a `tools/list_changed` changes a setting that no longer shapes
-/// any listing, and the list is identical either side of it.
+/// **A subscriber is told when the tool list moves, and told only on the
+/// stream.**
+///
+/// `github.enabled` gates the listing of the five collaboration tools, so
+/// flipping it is the one thing a client can ask this server to do that
+/// changes what `tools/list` returns. The notification rides the subscription
+/// - `Recorder` watches the off-stream channel and must stay empty, since from
+/// 2026-07-28 an unsolicited push has no channel at all.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_subscribed_client_is_told_nothing_because_no_list_can_move() {
+async fn a_subscribed_client_is_told_when_the_tool_list_moves() {
     let h = Harness::new().await;
     let (client, _server, recorder) = h.connect_modern().await;
 
@@ -483,16 +504,96 @@ async fn a_subscribed_client_is_told_nothing_because_no_list_can_move() {
     let before = tool_names(client.peer()).await;
     flip_github_enabled(client.peer()).await;
     let after = tool_names(client.peer()).await;
-    assert_eq!(before, after, "the list did not move, so nothing is owed");
+    assert_eq!(
+        after.len(),
+        before.len() + 5,
+        "the five collaboration tools arrived: {before:?} -> {after:?}"
+    );
 
+    let announced = next_within(&mut subscription)
+        .await
+        .expect("a moved list is announced on the stream");
+    assert!(
+        matches!(
+            &announced,
+            ServerNotification::ToolListChangedNotification(_)
+        ),
+        "and what is announced is the tool list: {announced:?}"
+    );
     assert!(
         next_within(&mut subscription).await.is_none(),
-        "an unchanged list must not be announced"
+        "one flip, one notification: the resources and prompts lists did not move"
     );
     assert!(
         recorder.seen().is_empty(),
-        "and nothing arrives off the stream either: {:?}",
+        "nothing arrives off the stream: an unsolicited push has no channel in this era: {:?}",
         recorder.seen()
+    );
+}
+
+/// The other half of the same rule: a modern peer that opened no subscription
+/// is told nothing, even though its list moved exactly as the subscriber's
+/// did. Being on the modern lifecycle is not consent; opening the stream is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_client_that_never_subscribed_is_told_nothing() {
+    let h = Harness::new().await;
+    let (client, _server, recorder) = h.connect_modern().await;
+
+    let before = tool_names(client.peer()).await;
+    flip_github_enabled(client.peer()).await;
+    let after = tool_names(client.peer()).await;
+    assert_eq!(
+        after.len(),
+        before.len() + 5,
+        "the list really did move for this peer too: {before:?} -> {after:?}"
+    );
+
+    // The send is fire-and-forget, so give it a moment to be wrong in.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        recorder.seen().is_empty(),
+        "a peer that opened no stream has nowhere to be notified: {:?}",
+        recorder.seen()
+    );
+}
+
+/// A subscription that ended leaves nothing behind that a later flip would
+/// try to write to. `SubscriptionSink` holds a `Peer` and a child cancellation
+/// token (`service/server.rs:139-144`), so a registry that kept dead entries
+/// would pin them for the process's life; the guard in `McpServer::listen`
+/// drops the entry when the stream ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_subscription_is_unregistered_rather_than_written_to() {
+    let h = Harness::new().await;
+    let (client, _server, _recorder) = h.connect_modern().await;
+
+    let subscription = client
+        .peer()
+        .listen(SubscriptionFilter::builder().tools_list_changed().build())
+        .await
+        .expect("subscriptions/listen is served on the modern lifecycle");
+    assert_eq!(
+        h.engine.list_subscribers().len(),
+        1,
+        "the open stream is registered"
+    );
+
+    drop(subscription);
+    // Cancellation travels to the server as a notification, so the
+    // unregistration is not synchronous with the drop.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        h.engine.list_subscribers().is_empty(),
+        "the ended stream left no sink behind"
+    );
+
+    // And the flip still works with nobody listening.
+    flip_github_enabled(client.peer()).await;
+    assert!(
+        tool_names(client.peer())
+            .await
+            .contains(&"share_changes".to_string()),
+        "the list moved even with no subscriber to tell"
     );
 }
 
@@ -523,10 +624,11 @@ async fn dropping_a_subscription_leaves_the_session_serving() {
 /// **No unsolicited push reaches a client that never asked for one.**
 ///
 /// This is V3 itself. `configure` used to send `notifications/tools/list_changed`
-/// whenever it flipped `github.enabled`, to whoever happened to be connected;
-/// after Task 4 that setting shapes no listing, so the notification announced a
-/// change that had not happened, and from 2026-07-28 an unsolicited
-/// notification has no channel at all. A legacy peer is the strictest case,
+/// whenever it flipped `github.enabled`, to whoever happened to be connected.
+/// The flip does move the tool list again - the five collaboration tools are
+/// listed only while the setting is on - but from 2026-07-28 an unsolicited
+/// notification has no channel at all, so the announcement rides a
+/// subscription or it does not happen. A legacy peer is the strictest case,
 /// since it cannot subscribe and therefore can only ever be pushed at.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_legacy_peer_is_never_pushed_a_list_change_it_did_not_ask_for() {
@@ -536,7 +638,11 @@ async fn a_legacy_peer_is_never_pushed_a_list_change_it_did_not_ask_for() {
     let before = tool_names(client.peer()).await;
     flip_github_enabled(client.peer()).await;
     let after = tool_names(client.peer()).await;
-    assert_eq!(before, after);
+    assert_eq!(
+        after.len(),
+        before.len() + 5,
+        "its list moved, and it will only learn that by asking again: {before:?} -> {after:?}"
+    );
 
     // The push was fire-and-forget, so give it a moment to be wrong in.
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -634,15 +740,15 @@ async fn the_advertised_list_changed_capabilities_match_what_a_subscription_acce
     );
 }
 
-/// A client that connects, subscribes and asks for the same list twice gets the
-/// same answer, which is the property that makes the silence correct rather
-/// than merely convenient.
+/// Of the three lists, only the tool list moves, and only on the one setting
+/// that gates it.
 ///
-/// **This passes before and after this task**: Tasks 4 and 5 are what made the
-/// lists invariant. It is here because it is the premise the silence rests on,
-/// and a change that made a list dynamic again would have to fail something.
+/// The resources and prompts lists read `skills.serve` and `harness_onboarded`,
+/// both fixed before the first request arrives, so they are accepted on a
+/// subscription and then never carry anything. That is the premise behind
+/// sending exactly one notification per flip rather than three.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_three_lists_are_the_same_before_and_after_everything_a_client_can_do() {
+async fn only_the_tool_list_moves_and_only_on_the_setting_that_gates_it() {
     let h = Harness::new().await;
     let (client, _server, _recorder) = h.connect_modern().await;
     let peer = client.peer();
@@ -686,7 +792,18 @@ async fn the_three_lists_are_the_same_before_and_after_everything_a_client_can_d
             .prompts
             .len(),
     );
-    assert_eq!(before, after);
+    assert_eq!(
+        after.0.len(),
+        before.0.len() + 5,
+        "the tool list moved by the five collaboration tools: {:?} -> {:?}",
+        before.0,
+        after.0
+    );
+    assert_eq!(
+        (before.1, before.2),
+        (after.1, after.2),
+        "and neither of the other two lists moved at all"
+    );
 }
 
 /// The lifecycle these tests drive really is the modern one, so none of the

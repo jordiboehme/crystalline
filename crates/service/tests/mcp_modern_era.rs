@@ -353,8 +353,8 @@ async fn a_modern_client_is_served_with_no_handshake_at_all() {
         .unwrap_or_else(|| panic!("no tool list in {answer}"));
     assert_eq!(
         tools.len(),
-        23,
-        "the one invariant list, unchanged by the era"
+        18,
+        "a default install's list, unchanged by the era"
     );
     assert_hinted("tools/list", &answer["result"]);
 }
@@ -561,11 +561,14 @@ async fn a_request_missing_its_required_meta_is_refused_with_invalid_params() {
 /// The tool list does not move across a `configure` that flips a setting the
 /// list used to depend on, and both readings carry their hints.
 ///
-/// SEP-2567 forbids a list varying "as a side effect of other requests on the
-/// connection". Task 4 moved the two request-mutable gates to call time and
-/// Task 5 froze `skills.serve` at engine construction; this is the same
-/// invariance seen by a modern peer, which is the connection the rule was
-/// written for.
+/// `skills.serve` is the case: it is `configure`-settable and it once shaped
+/// three lists live, so a flip moved them on the very connection that made the
+/// call. The effective value is snapshotted while the engine is built
+/// (`Engine::skills_serve`), so the write applies at the next daemon start and
+/// nothing on this connection moves. `github.enabled` is deliberately not this
+/// test's subject - that one does move the list, on purpose, and
+/// `enabling_github_through_configure_makes_the_five_appear_on_the_next_list`
+/// below is where it is pinned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tool_list_does_not_move_across_a_configure_for_a_modern_client() {
     let h = Harness::new().await;
@@ -578,16 +581,23 @@ async fn the_tool_list_does_not_move_across_a_configure_for_a_modern_client() {
         .call(modern(
             2,
             "tools/call",
-            json!({ "name": "configure", "arguments": { "set": { "github.enabled": "true" } } }),
+            json!({ "name": "configure", "arguments": { "set": { "skills.serve": "false" } } }),
         ))
         .await;
     let text = configured["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
     let snapshot: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-    assert_ne!(
-        snapshot["github"]["github_enabled"],
-        json!(false),
+    let written = snapshot["settings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no settings snapshot in {configured}"))
+        .iter()
+        .find(|s| s["key"] == json!("skills.serve"))
+        .unwrap_or_else(|| panic!("skills.serve is not in the snapshot: {configured}"))
+        .clone();
+    assert_eq!(
+        written["value"],
+        json!("false"),
         "the write has to land, or the invariance below proves nothing: {configured}"
     );
 
@@ -823,8 +833,12 @@ async fn discovery_over_http_answers_the_routing_block() {
 /// The two server MUSTs are rmcp's (`SubscriptionContext::establish`,
 /// `service/server.rs:337-375`): the acknowledgment is the first message on
 /// the stream and it carries the subscription id in `_meta`. Nothing follows
-/// it, and that silence is the point rather than a gap - after Tasks 4 and 5
-/// no request can move any list, so there is no list-changed event to send.
+/// it here because nothing moved a list during this request - the one mover is
+/// a `configure` flipping `github.enabled`, and
+/// `tests/mcp_subscriptions.rs::a_subscribed_client_is_told_when_the_tool_list_moves`
+/// is where the announcement itself is pinned. This POST reads its stream once
+/// and returns, so a second connection would be needed to make the flip land
+/// while it is open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_http_subscription_stream_acknowledges_first_and_stays_silent() {
     let h = Harness::new().await;
@@ -2954,8 +2968,9 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn withdraw_proposal_is_gated_exactly_like_share_changes() {
-    // The default (github off) harness lists the tool and refuses the call
-    // with the enablement message, byte for byte the share_changes refusal.
+    // The default (github off) harness withholds the tool from the listing and
+    // still refuses the call with the enablement message, byte for byte the
+    // share_changes refusal.
     let h = Harness::new().await;
     let mut wire = h.stdio().await;
     let listed = wire.open(modern(1, "tools/list", json!({}))).await;
@@ -2965,7 +2980,7 @@ async fn withdraw_proposal_is_gated_exactly_like_share_changes() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert!(names.contains(&"withdraw_proposal"), "{names:?}");
+    assert!(!names.contains(&"withdraw_proposal"), "{names:?}");
 
     let refused = wire
         .call(modern(
@@ -3043,4 +3058,122 @@ async fn origin_status_is_lean_and_update_domain_carries_the_bodies() {
         "no bodies in status: {entry}"
     );
     assert_eq!(entry["amended_upstream"], false);
+}
+
+// --- the collaboration surface appears when it is enabled -------------------
+
+/// The five GitHub-gated tool names, in the order the listing carries them.
+const COLLAB_GATED: [&str; 5] = [
+    "share_changes",
+    "update_domain",
+    "origin_status",
+    "resolve_conflict",
+    "withdraw_proposal",
+];
+
+fn listed_names(answer: &Value) -> Vec<String> {
+    answer["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tool list in {answer}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// **A default install does not list the collaboration tools at all.**
+///
+/// `github.enabled` is off out of the box, and five of the six collaboration
+/// tools do nothing but talk to a forge nobody connected. They are withheld
+/// from the listing rather than listed-and-refusing, so a default install
+/// spends no context on a surface it cannot use. `configure` is the one that
+/// stays, because it is the only way to turn the rest on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_install_lists_configure_but_none_of_the_gated_collaboration_tools() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let answer = wire.open(modern(1, "tools/list", json!({}))).await;
+    let names = listed_names(&answer);
+    assert!(
+        names.contains(&"configure".to_string()),
+        "configure is the enable path and is always listed: {names:?}"
+    );
+    for tool in COLLAB_GATED {
+        assert!(
+            !names.contains(&tool.to_string()),
+            "{tool} must not be listed while github.enabled is off: {names:?}"
+        );
+    }
+}
+
+/// **Turning the setting on through the tool makes the five appear.**
+///
+/// The listing gate reads `github.enabled` live, exactly as the call-time
+/// refusal does, so the very connection that flipped the setting sees the
+/// wider list on its next `tools/list`. The invariance MCP 2026-07-28 requires
+/// is per-instant: every client listing at the same moment gets the same
+/// answer, and the change is announced to whoever subscribed for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_github_through_configure_makes_the_five_appear_on_the_next_list() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let before = listed_names(&wire.open(modern(1, "tools/list", json!({}))).await);
+    let flip = wire
+        .call(modern(
+            2,
+            "tools/call",
+            json!({
+                "name": "configure",
+                "arguments": { "set": { "github.enabled": "true" } },
+            }),
+        ))
+        .await;
+    assert_ne!(
+        flip["result"]["isError"],
+        json!(true),
+        "the flip must land, or the list below proves nothing: {flip}"
+    );
+
+    let after = listed_names(&wire.call(modern(3, "tools/list", json!({}))).await);
+    for tool in COLLAB_GATED {
+        assert!(
+            after.contains(&tool.to_string()),
+            "{tool} appears once collaboration is on: {after:?}"
+        );
+    }
+    assert_eq!(
+        after.len(),
+        before.len() + COLLAB_GATED.len(),
+        "exactly the five arrived: {before:?} -> {after:?}"
+    );
+}
+
+/// **Hidden is not disabled.** A client holding a cached list from before the
+/// setting went off - or one that simply guessed the name - still reaches the
+/// handler and is told which setting to turn on, rather than being answered
+/// "no such tool" and left to guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calling_a_hidden_collaboration_tool_still_teaches_rather_than_vanishing() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let answer = wire
+        .open(modern(
+            1,
+            "tools/call",
+            json!({ "name": "share_changes", "arguments": { "domain": "eng" } }),
+        ))
+        .await;
+    assert!(
+        answer["error"].is_null(),
+        "a hidden tool answers rather than failing at the protocol level: {answer}"
+    );
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("not enabled") && text.contains("github.enabled"),
+        "the refusal names the setting to turn on: {answer}"
+    );
 }

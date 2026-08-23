@@ -273,7 +273,7 @@ The reminder costs about 120 tokens, at most once per session. Remove it with `c
 
 ## Teach and learn
 
-The MCP server exposes 23 tools on a writable instance - 22 in a harness whose install already carries the skills as files, 12 serving read-only - and always the same list for every client that connects to that instance (see [Share knowledge with a team](#share-knowledge-with-a-team) for the five that need collaboration turned on before a call succeeds); capturing knowledge as a byproduct of work is the core loop:
+The MCP server exposes 18 tools on a default writable instance - 17 in a harness whose install already carries the skills as files, 10 serving read-only - and the five collaboration tools appear beside them once `github.enabled` is turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)), the same list for every client connected at that moment; capturing knowledge as a byproduct of work is the core loop:
 
 - **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
 - **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
