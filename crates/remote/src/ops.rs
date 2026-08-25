@@ -622,9 +622,10 @@ pub async fn status(
                     }
                     match open_list.iter().find(|o| o.number == prop.number) {
                         Some(live) => {
-                            if let Some(recorded) = &prop.head_commit
-                                && recorded != &live.head_sha
-                            {
+                            // `head_is_ours` rather than a bare comparison, so
+                            // this machine's own interrupted update is not
+                            // reported to the user as a reviewer's amendment.
+                            if !head_is_ours(prop, &live.head_sha) {
                                 amended_upstream.push(prop.number);
                             }
                         }
@@ -717,7 +718,9 @@ pub async fn status(
 /// pushes a fresh commit onto its branch and rewrites its body rather than
 /// opening a second pull request ([`ProposeOutcome::Updated`]), and refuses
 /// with [`ProposeOutcome::ProposalDiverged`] - before any provider write -
-/// when a reviewer has moved the branch away from the recorded head. An open
+/// when a reviewer has moved the branch away from every head this machine
+/// recorded (see [`head_is_ours`]: the settled head, a half-finished push this
+/// machine announced before making it, or no recorded head at all). An open
 /// record whose branch ref is gone is settled from the proposal's own state
 /// (an open pull request with no branch counts as declined) and the share
 /// falls through to a fresh creation.
@@ -786,9 +789,7 @@ pub async fn propose(
     if let Some(prop) = open {
         match provider.branch_ref(spec, &prop.branch).await? {
             Some(live_head) => {
-                if let Some(recorded) = &prop.head_commit
-                    && recorded != &live_head
-                {
+                if !head_is_ours(&prop, &live_head) {
                     // A reviewer pushed commits; refuse before any write.
                     return Ok(ProposeOutcome::ProposalDiverged {
                         number: prop.number,
@@ -796,9 +797,10 @@ pub async fn propose(
                         branch: prop.branch.clone(),
                     });
                 }
-                // head_commit None is a pre-extension record: adopt the live
-                // head silently; divergence cannot be detected on this first
-                // update (there was nothing recorded to compare against).
+                // The live head is one of ours (see `head_is_ours`), so this
+                // is an ordinary update. Adopting an interrupted push needs no
+                // separate write: `update_open_proposal` rewrites both head
+                // fields on the record before it returns.
                 return update_open_proposal(
                     provider,
                     spec,
@@ -826,6 +828,9 @@ pub async fn propose(
                     ProposalState::Merged => ProposalStatus::Merged,
                     ProposalState::Declined | ProposalState::Open => ProposalStatus::Declined,
                 };
+                // A settled record can never be updated again, so any push it
+                // was still announcing is over: keep no pending sha in history.
+                settled.pending_head_commit = None;
                 state.push_history(settled);
                 state.save(state_dir)?;
             }
@@ -886,6 +891,9 @@ pub async fn propose(
         status: ProposalStatus::Open,
         files: collected.files,
         head_commit: Some(commit_sha),
+        // A fresh record carries no half-finished push: the create path either
+        // opened the proposal on this commit or failed before recording it.
+        pending_head_commit: None,
         base_commit: Some(state.base_commit.clone()),
         review_state: None,
         feedback: Vec::new(),
@@ -906,7 +914,7 @@ pub async fn propose(
 }
 
 /// What a share would do, computed without a single provider write.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharePlan {
     /// What a share run right now would do with the detected changes.
     pub action: PlannedAction,
@@ -919,7 +927,7 @@ pub struct SharePlan {
 }
 
 /// The single thing a share would do, as [`propose_preview`] classifies it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlannedAction {
     /// A share would open a new proposal.
     Create,
@@ -1005,17 +1013,24 @@ pub async fn propose_preview(
     let action = match open {
         None => PlannedAction::Create,
         Some(prop) => match provider.branch_ref(spec, &prop.branch).await? {
-            Some(live_head) => match &prop.head_commit {
-                Some(recorded) if recorded != &live_head => PlannedAction::ProposalDiverged {
-                    number: prop.number,
-                    url: prop.url.clone(),
-                    branch: prop.branch.clone(),
-                },
-                _ => PlannedAction::Update {
-                    number: prop.number,
-                    url: prop.url.clone(),
-                },
-            },
+            Some(live_head) => {
+                // The same acceptance `propose` applies, including the
+                // interrupted-update case: a preview that called our own
+                // half-finished push a divergence would send the caller to
+                // withdraw a proposal the next share heals by itself.
+                if head_is_ours(prop, &live_head) {
+                    PlannedAction::Update {
+                        number: prop.number,
+                        url: prop.url.clone(),
+                    }
+                } else {
+                    PlannedAction::ProposalDiverged {
+                        number: prop.number,
+                        url: prop.url.clone(),
+                        branch: prop.branch.clone(),
+                    }
+                }
+            }
             None => PlannedAction::Create,
         },
     };
@@ -1130,6 +1145,30 @@ async fn collect_changes(
     Ok(out)
 }
 
+/// Whether `live_head` is a commit this machine put on the proposal branch,
+/// which is what separates an ordinary update from a reviewer's amendment.
+///
+/// Three ways it is ours, and every other head is a divergence:
+///
+/// 1. it equals the recorded [`Proposal::head_commit`] - the settled case, the
+///    branch is exactly where the last completed share left it;
+/// 2. it equals [`Proposal::pending_head_commit`] - our own interrupted
+///    update: the branch move landed and the step after it did not, so the
+///    record never caught up. Adopting it is the only outcome that can heal,
+///    since retrying is what a caller does and a retry that still refused
+///    would refuse forever;
+/// 3. no head was ever recorded (`head_commit` is `None`) - a record written
+///    before the field existed, adopted silently because there is nothing to
+///    compare against.
+fn head_is_ours(prop: &Proposal, live_head: &str) -> bool {
+    match &prop.head_commit {
+        None => true,
+        Some(recorded) => {
+            recorded == live_head || prop.pending_head_commit.as_deref() == Some(live_head)
+        }
+    }
+}
+
 /// Updates the one open proposal in place: a new commit on its branch (a
 /// merge commit when the base advanced), the ref fast-forwarded, the PR body
 /// regenerated (title PATCHed only when the caller supplied one) and the
@@ -1185,6 +1224,24 @@ async fn update_open_proposal(
     let commit_sha = provider
         .create_commit(spec, &effective_title, &tree_sha, &parents)
         .await?;
+    // Announce the push before making it. Everything from here to the final
+    // save is one logical step that the network, or a dying process, can cut
+    // in half; the only half that leaves a mark upstream is a landed
+    // `update_branch`, and a landed branch move whose `head_commit` never
+    // caught up reads exactly like a reviewer's amendment. Recording the sha
+    // first turns that into a recognizable "our own interrupted update"
+    // (see `Proposal::pending_head_commit` and `head_is_ours`), which the next
+    // share adopts. Saving twice costs one small file write per update.
+    {
+        let record = state
+            .proposals
+            .iter_mut()
+            .find(|p| p.number == prop.number)
+            .expect("the open proposal was just read out of this state");
+        record.pending_head_commit = Some(commit_sha.clone());
+    }
+    state.save(state_dir)?;
+
     provider
         .update_branch(spec, &prop.branch, &commit_sha)
         .await?;
@@ -1199,6 +1256,8 @@ async fn update_open_proposal(
         .expect("the open proposal was just read out of this state");
     record.files = collected.files;
     record.head_commit = Some(commit_sha);
+    // The push is finished and recorded: nothing is pending any more.
+    record.pending_head_commit = None;
     record.base_commit = Some(state.base_commit.clone());
     record.updated_at = Some(Utc::now());
     if let Some(t) = title {

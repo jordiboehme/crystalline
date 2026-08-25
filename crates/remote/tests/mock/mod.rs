@@ -73,6 +73,10 @@ struct Inner {
     feedback_failures: HashSet<u64>,
     /// Proposal numbers whose `close_proposal` call fails with a 500.
     close_failures: HashSet<u64>,
+    /// Proposal numbers whose `update_proposal` call fails with a 500, which
+    /// is how a test cuts a share-update in half exactly where it hurts:
+    /// after the branch already moved.
+    update_proposal_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers [`RemoteError::Offline`].
     open_list_fails: bool,
     /// Trees built by `create_tree`, keyed by a generated tree id: the
@@ -239,6 +243,28 @@ impl MockProvider {
     /// Makes [`Provider::proposal_feedback`] fail with a 500 for `number`.
     pub fn fail_feedback(&self, number: u64) {
         self.inner.lock().unwrap().feedback_failures.insert(number);
+    }
+
+    /// Makes [`Provider::update_proposal`] fail with a 500 for `number`, so a
+    /// share-update lands its `update_branch` and then fails - the one
+    /// interruption that leaves the live branch head ahead of what the local
+    /// record knows about.
+    pub fn fail_update_proposal(&self, number: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .update_proposal_failures
+            .insert(number);
+    }
+
+    /// Lets [`Provider::update_proposal`] succeed again for `number`, so a
+    /// test can retry the share the injected failure interrupted.
+    pub fn heal_update_proposal(&self, number: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .update_proposal_failures
+            .remove(&number);
     }
 }
 
@@ -498,13 +524,21 @@ impl Provider for MockProvider {
         body: &str,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
+        // Logged before the failure check, like `close_proposal`, so an
+        // injected failure still leaves a trace of the attempt.
+        inner.calls.push(format!("update_proposal:{number}"));
+        if inner.update_proposal_failures.contains(&number) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("injected update failure for {number}"),
+            });
+        }
         if let Some(req) = inner.proposal_requests.get_mut(&number) {
             if let Some(title) = title {
                 req.title = title.to_string();
             }
             req.body = body.to_string();
         }
-        inner.calls.push(format!("update_proposal:{number}"));
         Ok(())
     }
 

@@ -191,6 +191,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
             sha256,
         }],
         head_commit: None,
+        pending_head_commit: None,
         base_commit: None,
         review_state: None,
         feedback: Vec::new(),
@@ -1704,6 +1705,7 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
             },
         ],
         head_commit: None,
+        pending_head_commit: None,
         base_commit: None,
         review_state: None,
         feedback: Vec::new(),
@@ -2918,6 +2920,152 @@ async fn scenario_32_migration_none_head_commit_adopts_live_head() {
         Some(mock.branch_commit(&first.branch).unwrap().as_str())
     );
     assert_eq!(st.proposals[0].number, first.number);
+}
+
+// An interrupted share-update - the branch moved, the proposal patch failed -
+// heals on the next share instead of blaming a reviewer forever.
+
+#[tokio::test]
+async fn an_interrupted_update_heals_on_the_next_share() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let head_before = mock.branch_commit(&first.branch).unwrap();
+
+    // Cut the update in half at the worst possible place: `update_branch`
+    // lands, `update_proposal` fails, so the branch is ahead of the last head
+    // this machine finished recording.
+    mock.fail_update_proposal(first.number);
+    write(&sub.domain_root.join("notes/h.md"), b"theta\n");
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crystalline_remote::RemoteError::Api { status: 500, .. }
+        ),
+        "{err:?}"
+    );
+    let pushed = mock.branch_commit(&first.branch).unwrap();
+    assert_ne!(pushed, head_before, "the branch really did move");
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].pending_head_commit.as_deref(),
+        Some(pushed.as_str()),
+        "the push was announced before it was made, so the record can name it"
+    );
+
+    // The retry is an ordinary update, not a divergence, and it leaves the
+    // record settled again.
+    mock.heal_update_proposal(first.number);
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::Update { number, .. } if number == first.number),
+        "the preview reads our own half-finished push as ours: {:?}",
+        plan.action
+    );
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    match outcome {
+        ProposeOutcome::Updated(r) => assert_eq!(r.number, first.number),
+        other => panic!("expected Updated, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].head_commit.as_deref(),
+        Some(mock.branch_commit(&first.branch).unwrap().as_str()),
+        "the record caught up with the branch"
+    );
+    assert_eq!(
+        st.proposals[0].pending_head_commit, None,
+        "and nothing is left pending"
+    );
+}
+
+// The heal is narrow: a head that matches neither the recorded one nor the
+// announced one is still a reviewer's, and is still refused.
+
+#[tokio::test]
+async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+
+    mock.fail_update_proposal(first.number);
+    write(&sub.domain_root.join("notes/i.md"), b"iota\n");
+    let _ = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    mock.heal_update_proposal(first.number);
+
+    // A reviewer pushes on top of the interrupted push: the live head is now
+    // neither the recorded head nor the announced one.
+    let reviewer = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&first.branch, &reviewer);
+
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { number, .. } if number == first.number),
+        "{:?}",
+        plan.action
+    );
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::ProposalDiverged { number, .. } if number == first.number),
+        "{outcome:?}"
+    );
 }
 
 // The branch name carries 4 random hex chars after the timestamp, killing the

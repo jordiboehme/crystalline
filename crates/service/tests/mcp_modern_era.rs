@@ -2674,6 +2674,58 @@ async fn a_declined_share_refuses_with_no_provider_writes() {
     );
 }
 
+/// The same no on the *update* path, which the create-path test above cannot
+/// speak for: a declined update has an open proposal standing behind it, so
+/// "nothing happened" has to mean the forge was not written to AND the record
+/// still describes the proposal the reviewer is looking at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_update_leaves_the_open_proposal_exactly_as_it_was() {
+    let (h, mock) = Harness::team().await;
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+    let state_path = h.root.join("origins").join("kb").join("state.json");
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "round one asks about the update: {asked}"
+    );
+    // Snapshotted after round one, so the subject is what the DECLINE changed:
+    // round one previews, and a preview legitimately pulls and saves.
+    let before = std::fs::read_to_string(&state_path).unwrap();
+    let calls_before = mock.calls().len();
+
+    let refused = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            share_kb(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was shared"),
+        "{refused}"
+    );
+
+    let during = &mock.calls()[calls_before..];
+    assert!(
+        !during
+            .iter()
+            .any(|c| c.starts_with("create_") || c.starts_with("update_")),
+        "a declined update pushes no commit and patches no proposal: {during:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_path).unwrap(),
+        before,
+        "and proposal #{number}'s record is byte for byte what it was"
+    );
+}
+
 /// A modern peer that declared no elicitation capability shares on the first
 /// call, exactly as it did before the round existed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

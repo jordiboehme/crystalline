@@ -536,6 +536,7 @@ mod tests {
             status: ProposalStatus::Open,
             files: vec![],
             head_commit: None,
+            pending_head_commit: None,
             base_commit: None,
             review_state: None,
             feedback: Vec::new(),

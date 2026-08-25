@@ -1154,6 +1154,7 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
         status: ProposalStatus::Open,
         files: vec![],
         head_commit: None,
+        pending_head_commit: None,
         base_commit: None,
         review_state: None,
         feedback: Vec::new(),
@@ -1540,6 +1541,95 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     assert_eq!(conflicts[0]["path"], "notes/a.md");
 }
 
+/// A preview and a share both pull first, and a pull writes files. Those files
+/// have to reach the index in the same call, exactly as `origin_update` makes
+/// them reach it: leaving them out means an engram is on disk and unsearchable
+/// until the poller happens to run, which is the shape of a bug nobody
+/// attributes to a share.
+#[tokio::test]
+async fn a_preview_and_a_share_index_what_their_pull_applied() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &c1);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    let found = |needle: &'static str| {
+        let eng = &eng;
+        async move {
+            eng.search_engrams(&SearchParams {
+                query: Some(needle.to_string()),
+                ..SearchParams::default()
+            })
+            .await
+            .unwrap()["total"]
+                .as_u64()
+                .unwrap()
+        }
+    };
+
+    // Upstream gains a file. The preview's pull applies it.
+    let c2 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/upstream-one.md",
+            engram("Upstream One", "upstream-one", "first upstream arrival"),
+        ),
+    ]));
+    mock.set_branch("main", &c2);
+
+    let plan = eng.origin_share_preview("brand", None).await.unwrap();
+    assert_eq!(plan["action"], "nothing_to_share", "{plan}");
+    assert!(root.join("notes/upstream-one.md").exists());
+    assert_eq!(
+        found("first upstream arrival").await,
+        1,
+        "the preview's pull reached the index"
+    );
+
+    // And again for a share, whose own pull applies a second one.
+    let c3 = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        (
+            "notes/upstream-one.md",
+            engram("Upstream One", "upstream-one", "first upstream arrival"),
+        ),
+        (
+            "notes/upstream-two.md",
+            engram("Upstream Two", "upstream-two", "second upstream arrival"),
+        ),
+    ]));
+    mock.set_branch("main", &c3);
+
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/local.md"),
+        engram("Local", "local", "locally captured"),
+    )
+    .unwrap();
+
+    let result = eng.origin_share("brand", None, None).await.unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+    assert_eq!(
+        found("second upstream arrival").await,
+        1,
+        "the share's pull reached the index too"
+    );
+}
+
 // --- origin_withdraw, origin_share_preview, origin_conflict_detail -------------
 
 /// A team engine over the mock: domain "kb" subscribed at a two-file commit,
@@ -1830,6 +1920,7 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
             sha256: Some(sha256_hex(&proposed)),
         }],
         head_commit: None,
+        pending_head_commit: None,
         base_commit: None,
         review_state: None,
         feedback: Vec::new(),
@@ -1913,6 +2004,7 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
             sha256: Some(sha256_hex(&proposed)),
         }],
         head_commit: None,
+        pending_head_commit: None,
         base_commit: None,
         review_state: None,
         feedback: Vec::new(),

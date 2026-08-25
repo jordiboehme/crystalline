@@ -459,7 +459,7 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve(
     );
 }
 
-/// Hiding a tool never disables it. All four GitHub-gated tools here are
+/// Hiding a tool never disables it. All five GitHub-gated tools here are
 /// withheld from the listing while the setting is off and still answer a call
 /// by name, with a **tool-level** error - the shape whose text the caller's
 /// client actually renders - naming the setting and the call that flips it.
@@ -469,7 +469,7 @@ async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, Value); 5] = [
         ("share_changes", json!({ "domain": "eng" })),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -477,6 +477,7 @@ async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
             "resolve_conflict",
             json!({ "domain": "eng", "path": "a.md", "resolution": "mine" }),
         ),
+        ("withdraw_proposal", json!({ "domain": "eng" })),
     ];
     for (tool, args) in cases {
         let result = call_result(peer, tool, args).await;
@@ -531,6 +532,7 @@ async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
         "update_domain",
         "origin_status",
         "resolve_conflict",
+        "withdraw_proposal",
     ] {
         let text = description(name);
         assert!(

@@ -8386,8 +8386,10 @@ impl Engine {
     /// durable on disk since the inline pull inside `propose` already
     /// persisted them) rather than the bare count `RemoteError` alone
     /// carries, so a caller never needs to make a second round trip to learn
-    /// what needs resolving. Nothing local changes on a share, so no sync
-    /// runs afterward.
+    /// what needs resolving. The share itself never touches local files, but
+    /// the pull it opens with does, so it ends with the same sync and embed
+    /// tail `origin_update_one` runs (see
+    /// `Engine::index_what_the_share_pull_applied`).
     pub async fn origin_share(
         &self,
         domain: &str,
@@ -8416,8 +8418,18 @@ impl Engine {
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
         {
-            Ok(outcome) => Ok(origin::propose_outcome_json(&outcome)),
+            Ok(outcome) => {
+                self.index_what_the_share_pull_applied(domain, "sharing")
+                    .await;
+                Ok(origin::propose_outcome_json(&outcome))
+            }
             Err(RemoteError::ConflictsPending { count }) => {
+                // The conflicts refusal is the loudest case for syncing: the
+                // pull ran, applied everything that merged cleanly and only
+                // then refused, so this shape carries the most unindexed work
+                // of any share outcome.
+                self.index_what_the_share_pull_applied(domain, "sharing")
+                    .await;
                 let conflicts = crystalline_remote::state::OriginState::load(&state_dir)
                     .ok()
                     .flatten()
@@ -8433,13 +8445,42 @@ impl Engine {
         }
     }
 
+    /// Indexes whatever the pull inside a share or a preview wrote to the
+    /// working tree.
+    ///
+    /// Both `ops::propose` and `ops::propose_preview` pull first - freshness is
+    /// part of proposing honestly - and a pull applies upstream files. Without
+    /// this, those files sit on disk unsearchable until the poller's next tick
+    /// happens to sync them, which is `origin_update_one`'s bug with a
+    /// different call in front of it. Run unconditionally rather than only when
+    /// something looks applied: the sync is incremental, so a pull that changed
+    /// nothing costs a cheap no-op scan, and there is no cheaper signal here
+    /// that is also correct (a preview reports the share's plan, not the pull's
+    /// effect).
+    ///
+    /// Best effort in the same sense `origin_update_one`'s embed tail is: a
+    /// failure is logged, never turned into a failed share whose proposal is
+    /// already open on the forge.
+    async fn index_what_the_share_pull_applied(&self, domain: &str, verb: &str) {
+        if let Err(e) = self.sync(Some(domain)).await {
+            tracing::warn!("syncing '{domain}' after {verb} failed: {e}");
+            return;
+        }
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
+            tracing::warn!("embedding after {verb} '{domain}' failed: {e}");
+        }
+    }
+
     /// Previews what a share of one domain would do, under its origin lock,
     /// without making a single provider write.
     ///
     /// The same three gates `origin_share` applies apply here: a preview runs
     /// the real pull first (freshness is part of previewing honestly), so it
     /// writes the working tree and is refused on a read-only instance exactly
-    /// as a share is.
+    /// as a share is - and, for the same reason, it ends with the same sync and
+    /// embed tail (see `Engine::index_what_the_share_pull_applied`).
     pub async fn origin_share_preview(&self, domain: &str, title: Option<&str>) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
@@ -8454,6 +8495,8 @@ impl Engine {
         let plan = ops::propose_preview(provider.as_ref(), &spec, &root, domain, &state_dir, title)
             .await
             .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        self.index_what_the_share_pull_applied(domain, "previewing a share")
+            .await;
         Ok(origin::share_plan_json(&plan))
     }
 

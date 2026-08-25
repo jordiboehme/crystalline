@@ -59,12 +59,15 @@
 //! guard and gets a clean error. That gate is legitimate on the listing
 //! because the mode is fixed for the engine's lifetime.
 //!
-//! The collaboration tools (`configure`, `add_domain`, `share_changes`,
-//! `update_domain`, `origin_status`, `resolve_conflict`, `withdraw_proposal`)
-//! carry two gates that compose.
-//! `configure`/`add_domain`/`share_changes`/`resolve_conflict`/`withdraw_proposal`
-//! disappear read-only. `github.enabled` is needed by every collaboration tool
-//! but `configure`, and while it is off the five that need it are hidden from
+//! The six collaboration tools (`configure`, `share_changes`, `update_domain`,
+//! `origin_status`, `resolve_conflict`, `withdraw_proposal`) carry two gates
+//! that compose. `configure`, `share_changes`, `resolve_conflict` and
+//! `withdraw_proposal` disappear read-only. `add_domain` is deliberately not
+//! one of the six: it creates domains of every kind, so it is write-gated like
+//! any other writer (see `WRITE_TOOLS`) and only its team-domain branch needs
+//! `github.enabled`, enforced in the engine rather than on the listing.
+//! `github.enabled` is needed by every collaboration tool but `configure`, and
+//! while it is off the five that need it are hidden from
 //! the listing too, so a default install spends no context on a forge surface
 //! nobody connected; `configure` is never hidden by it, since it is the only
 //! way to turn the rest on. Calling a hidden one still answers with

@@ -167,6 +167,15 @@ impl GitHubProvider {
     /// request: GitHub returns reviews and comments oldest first, so a
     /// proposal with a long thread would drop exactly the newest feedback,
     /// which is the part the consumer keeps.
+    ///
+    /// There is deliberately no page ceiling, and that is a trust assumption
+    /// rather than an oversight: GitHub terminates a listing with a short
+    /// page, so the loop ends on real data. A hostile or broken forge that
+    /// answered every page full would keep this walking. The exposure is
+    /// bounded by who can be an origin - a repository the user pointed this
+    /// machine at - and a cap would trade an honest listing for a silently
+    /// truncated one on the very repositories that legitimately have long
+    /// review threads, which is the failure this function exists to avoid.
     async fn paged_list<T: DeserializeOwned>(
         &self,
         repo: &str,

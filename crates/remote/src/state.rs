@@ -159,6 +159,21 @@ pub struct Proposal {
     /// be detected until the first share-update adopts the live head.
     #[serde(default)]
     pub head_commit: Option<String>,
+    /// The sha of a commit this machine is in the middle of pushing onto the
+    /// proposal branch: written and saved BEFORE the branch is moved, cleared
+    /// in the same save that promotes it to `head_commit` once the whole
+    /// update landed.
+    ///
+    /// It exists so a half-finished update heals instead of wedging. If the
+    /// branch move succeeds and the step after it fails (or the process dies
+    /// before the final save), the live branch head is ahead of `head_commit`
+    /// and every later share would otherwise read that as a reviewer's
+    /// amendment and refuse forever, with no retry that could ever clear it.
+    /// A live head equal to this field is our own interrupted push, so the
+    /// next share adopts it and carries on. `None` on a settled record and on
+    /// every record written before this field existed.
+    #[serde(default)]
+    pub pending_head_commit: Option<String>,
     /// The upstream base commit the proposal's tree was last built on.
     #[serde(default)]
     pub base_commit: Option<String>,
@@ -1126,6 +1141,7 @@ mod tests {
                 status: ProposalStatus::Merged,
                 files: Vec::new(),
                 head_commit: None,
+                pending_head_commit: None,
                 base_commit: None,
                 review_state: None,
                 feedback: Vec::new(),
@@ -1303,6 +1319,7 @@ mod tests {
             status: ProposalStatus::Open,
             files: vec![],
             head_commit: Some("cafe".to_string()),
+            pending_head_commit: None,
             base_commit: Some("deadbeef".to_string()),
             review_state: Some("changes_requested".to_string()),
             feedback: vec![FeedbackItem {

@@ -173,7 +173,7 @@ fn origin_update_and_status_succeed_with_no_team_domains_once_enabled() {
     assert!(human.contains("No team domains"), "{human}");
 }
 
-// --- origin share, discard, resolve: flag validation and gating -------------
+// --- origin share, withdraw, resolve: flag validation and gating ------------
 
 #[test]
 fn origin_resolve_requires_exactly_one_of_keep_or_content_file() {

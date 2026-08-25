@@ -772,38 +772,6 @@ async fn proposal_feedback_maps_the_three_channels_and_the_review_state_table() 
     assert_eq!(inline.author, "bob");
 }
 
-// --- list_open_proposals -----------------------------------------------------
-
-#[tokio::test]
-async fn list_open_proposals_pages_until_a_short_page() {
-    // Page 1 full (100 entries), page 2 short (1 entry): the client follows
-    // `page` exactly like compare does.
-    let app = Router::new().route(
-        "/repos/acme/brand-knowledge/pulls",
-        get(|Query(q): Query<HashMap<String, String>>| async move {
-            assert_eq!(q.get("state").map(String::as_str), Some("open"));
-            assert_eq!(q.get("per_page").map(String::as_str), Some("100"));
-            let page: usize = q.get("page").unwrap().parse().unwrap();
-            let rows: Vec<serde_json::Value> = if page == 1 {
-                (1..=100)
-                    .map(|n| serde_json::json!({"number": n, "head": {"ref": format!("b{n}"), "sha": format!("s{n}")}}))
-                    .collect()
-            } else {
-                vec![serde_json::json!({"number": 101, "head": {"ref": "b101", "sha": "s101"}})]
-            };
-            Json(serde_json::Value::Array(rows))
-        }),
-    );
-    let base = spawn(app).await;
-    let provider = GitHubProvider::new(Some(base), None);
-    let open = provider.list_open_proposals(&origin()).await.unwrap();
-    assert_eq!(open.len(), 101);
-    assert_eq!(open[0].number, 1);
-    assert_eq!(open[0].branch, "b1");
-    assert_eq!(open[0].head_sha, "s1");
-    assert_eq!(open[100].number, 101);
-}
-
 #[tokio::test]
 async fn proposal_feedback_pages_every_channel_until_a_short_page() {
     // GitHub returns each of the three channels oldest first, so a client that
@@ -863,4 +831,36 @@ async fn proposal_feedback_pages_every_channel_until_a_short_page() {
     );
     assert_eq!(count(crystalline_remote::state::FeedbackKind::Comment), 101);
     assert_eq!(fb.review_state.as_deref(), Some("commented"));
+}
+
+// --- list_open_proposals -----------------------------------------------------
+
+#[tokio::test]
+async fn list_open_proposals_pages_until_a_short_page() {
+    // Page 1 full (100 entries), page 2 short (1 entry): the client follows
+    // `page` exactly like compare does.
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls",
+        get(|Query(q): Query<HashMap<String, String>>| async move {
+            assert_eq!(q.get("state").map(String::as_str), Some("open"));
+            assert_eq!(q.get("per_page").map(String::as_str), Some("100"));
+            let page: usize = q.get("page").unwrap().parse().unwrap();
+            let rows: Vec<serde_json::Value> = if page == 1 {
+                (1..=100)
+                    .map(|n| serde_json::json!({"number": n, "head": {"ref": format!("b{n}"), "sha": format!("s{n}")}}))
+                    .collect()
+            } else {
+                vec![serde_json::json!({"number": 101, "head": {"ref": "b101", "sha": "s101"}})]
+            };
+            Json(serde_json::Value::Array(rows))
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    let open = provider.list_open_proposals(&origin()).await.unwrap();
+    assert_eq!(open.len(), 101);
+    assert_eq!(open[0].number, 1);
+    assert_eq!(open[0].branch, "b1");
+    assert_eq!(open[0].head_sha, "s1");
+    assert_eq!(open[100].number, 101);
 }

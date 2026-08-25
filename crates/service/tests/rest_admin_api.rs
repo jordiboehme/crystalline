@@ -468,13 +468,7 @@ async fn register_kb(fx: &Fixture, admin: &(String, String)) {
 async fn team_sync_status_and_sync_now_walk_the_contract() {
     let fx = serve_team().await;
     let admin = login(fx.addr, "root", "rootpw").await;
-
-    let created = as_session(fx.addr, reqwest::Method::POST, "/api/v1/domains", &admin)
-        .json(&serde_json::json!({"mode": "github", "repo": "acme/kb"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(created.status(), 201, "{}", created.text().await.unwrap());
+    register_kb(&fx, &admin).await;
 
     let status = as_session(
         fx.addr,
@@ -979,6 +973,57 @@ async fn a_disconnected_github_refuses_the_pull_and_names_the_connection() {
         assert!(
             detail.contains("team") && !detail.contains("not connected"),
             "the no-origin sentence still wins the ordering: {problem}"
+        );
+    }
+}
+
+/// The same gate on the three share routes, which had no coverage of it: the
+/// preview, the share and the withdraw each travel to the forge, so each one
+/// refuses a disconnected instance with a 409 naming the connection rather
+/// than letting a missing token come back as a missing repository.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disconnected_github_refuses_the_share_routes_and_names_the_connection() {
+    let fx = serve(Options {
+        github: true,
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let cases: [(reqwest::Method, &str, Option<serde_json::Value>); 3] = [
+        (
+            reqwest::Method::GET,
+            "/api/v1/domains/kb/sync/changes",
+            None,
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/v1/domains/kb/sync/share",
+            Some(serde_json::json!({})),
+        ),
+        (
+            reqwest::Method::POST,
+            "/api/v1/domains/kb/sync/proposals/1/withdraw",
+            Some(serde_json::json!({})),
+        ),
+    ];
+    for (method, path, body) in cases {
+        let mut request = as_session(fx.addr, method.clone(), path, &admin);
+        if let Some(body) = &body {
+            request = request.json(body);
+        }
+        let resp = request.send().await.unwrap();
+        assert_eq!(resp.status(), 409, "{method} {path}");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap().to_lowercase();
+        assert!(
+            detail.contains("not connected"),
+            "{path} names the connection, not a missing repo: {problem}"
+        );
+        assert!(
+            detail.contains("settings"),
+            "{path} points at the screen that fixes it: {problem}"
         );
     }
 }
