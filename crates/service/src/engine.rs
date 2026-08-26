@@ -7084,6 +7084,10 @@ impl Engine {
     /// was started with (or the default path) and update the in-memory config
     /// so a later read (including a concurrent one, once the write lock
     /// releases) sees it.
+    ///
+    /// A change that moves the MCP tool list is announced here, by
+    /// [`Engine::announce_a_moved_tool_list`], because this method is the one
+    /// seam all three settings callers share.
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
@@ -7094,39 +7098,82 @@ impl Engine {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Take the file-config write lock first to serialize against a
-                // concurrent configure call, so two tasks cannot both clone the
-                // old file and clobber each other's change. `persist_config` is
-                // synchronous (no .await), so holding the guard across it is
-                // safe. Lock order is always file_config then config.
-                let mut file_guard = self.file_config.write().unwrap();
-                let mut file = file_guard.clone();
-                settings::apply(&mut file, key, value)?;
-                self.persist_config(&file)?;
-                // Recompute the effective config from the freshly saved file
-                // plus the overlay, so an env-overridden key keeps reading its
-                // env value even after the file value changes underneath it.
-                let effective = self.overlay.apply(&file);
-                let view = self.setting_view_json(&file, key);
-                *file_guard = file;
-                *self.config.write().unwrap() = effective;
+                let github_before = self.github_enabled();
+                // The inner block scopes the lock guards, so they are released
+                // before the announcement below awaits.
+                let view = {
+                    // Take the file-config write lock first to serialize against a
+                    // concurrent configure call, so two tasks cannot both clone the
+                    // old file and clobber each other's change. `persist_config` is
+                    // synchronous (no .await), so holding the guard across it is
+                    // safe. Lock order is always file_config then config.
+                    let mut file_guard = self.file_config.write().unwrap();
+                    let mut file = file_guard.clone();
+                    settings::apply(&mut file, key, value)?;
+                    self.persist_config(&file)?;
+                    // Recompute the effective config from the freshly saved file
+                    // plus the overlay, so an env-overridden key keeps reading its
+                    // env value even after the file value changes underneath it.
+                    let effective = self.overlay.apply(&file);
+                    let view = self.setting_view_json(&file, key);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                    view
+                };
+                self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Same write-lock-first discipline and lock order as Set above.
-                let mut file_guard = self.file_config.write().unwrap();
-                let mut file = file_guard.clone();
-                settings::unset(&mut file, key)?;
-                self.persist_config(&file)?;
-                let effective = self.overlay.apply(&file);
-                let view = self.setting_view_json(&file, key);
-                *file_guard = file;
-                *self.config.write().unwrap() = effective;
+                let github_before = self.github_enabled();
+                let view = {
+                    // Same write-lock-first discipline and lock order as Set above.
+                    let mut file_guard = self.file_config.write().unwrap();
+                    let mut file = file_guard.clone();
+                    settings::unset(&mut file, key)?;
+                    self.persist_config(&file)?;
+                    let effective = self.overlay.apply(&file);
+                    let view = self.setting_view_json(&file, key);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                    view
+                };
+                self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
+        }
+    }
+
+    /// Announce a moved `tools/list` on every open subscription stream, when
+    /// the write that just landed changed what `github.enabled` effectively
+    /// reads.
+    ///
+    /// `github.enabled` gates the listing of the five GitHub collaboration
+    /// tools (`crate::mcp`'s `hidden_collab_tool`), so a settings write that
+    /// flips it is the one thing on this server that moves a tool list - and
+    /// the one that owes an announcement. It lives on the engine rather than
+    /// in the MCP handler because three callers write that setting and all
+    /// three move every connected peer's list: the `configure` MCP tool,
+    /// `crystalline config set` over the control socket (`crate::control`) and
+    /// Fluid's Connect button through the REST API
+    /// (`crate::rest::github_settings`'s `ensure_enabled`). All three go
+    /// through [`Engine::configure`], so putting it here is what makes the
+    /// notification unconditional on the route taken.
+    ///
+    /// The setting is read either side of the write rather than parsed out of
+    /// the request: a key can be set to the value it already had, unset back
+    /// to the default, or overridden by the environment, and only the
+    /// effective setting decides what the next `tools/list` returns.
+    ///
+    /// It reaches subscribers only. MCP 2026-07-28 removed the unsolicited
+    /// channel outright, so a legacy peer - which cannot subscribe at all - is
+    /// told nothing and re-reads the list at its own discretion. See
+    /// [`crate::subscribers`].
+    async fn announce_a_moved_tool_list(&self, github_before: bool) {
+        if self.github_enabled() != github_before {
+            self.list_subscribers().notify_tool_list_changed().await;
         }
     }
 

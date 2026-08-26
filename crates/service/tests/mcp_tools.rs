@@ -288,7 +288,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     // GitHub collaboration is off in this harness, so the five tools that need
     // it are withheld rather than listed-and-refusing. Calling one by name
     // still reaches the handler and says how to turn it on
-    // (`listed_collab_tools_refuse_at_call_time_when_github_is_disabled` in
+    // (`hidden_collab_tools_refuse_at_call_time_when_github_is_disabled` in
     // tests/mcp_collab.rs).
     for hidden in [
         "share_changes",

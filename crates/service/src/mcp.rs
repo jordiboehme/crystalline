@@ -872,8 +872,9 @@ fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> b
 /// 2026-08-21: what may not vary is the answer two clients get at the same
 /// moment, and this gate reads one shared setting, so it never does. A list
 /// that may "change over time" is the same sentence's first clause; what it
-/// owes is an announcement, which [`McpServer::configure`] sends to every open
-/// subscription (see [`crate::subscribers`]).
+/// owes is an announcement, which `Engine::configure` sends to every open
+/// subscription - from whichever surface wrote the setting, the tool, the
+/// control socket or the REST API (see [`crate::subscribers`]).
 ///
 /// `read_only` is the gate that genuinely cannot move: `Engine::with_read_only`
 /// (`engine.rs:788-791`) takes `self` by value at construction and the engine
@@ -1432,32 +1433,18 @@ impl McpServer {
         }
 
         // `github.enabled` gates the listing of five collaboration tools
-        // ([`hidden_collab_tool`]), so this is the one call on this server that
-        // can move a list - and the one that owes an announcement. It is read
-        // either side of the write rather than parsed out of `p`: a key can be
-        // set to the value it already had, unset back to the default, or
-        // overridden by the environment, and only the effective setting
-        // actually decides what the next `tools/list` returns.
+        // ([`hidden_collab_tool`]), so a call that flips it moves this
+        // server's tool list and owes subscribers an announcement. That does
+        // not live here: it lives on `Engine::configure`, which every key in
+        // this batch goes through and which the control socket and the REST
+        // API write the same setting through, so the notification does not
+        // depend on the route the flip took.
         //
-        // The announcement is made whether or not the batch succeeded. A
-        // `configure` that flips the setting and then fails on a later key has
-        // still moved the list, and `apply_settings` reports what applied
-        // before it stopped, so the error is returned after the notification
-        // rather than instead of it.
-        //
-        // It reaches subscribers only. MCP 2026-07-28 removed the unsolicited
-        // channel outright, so a legacy peer - which cannot subscribe at all -
-        // is told nothing and re-reads the list at its own discretion. See
-        // [`McpServer::listen`] and [`crate::subscribers`].
-        let github_before = self.engine.github_enabled();
-        let applied = self.apply_settings(&p).await;
-        if self.engine.github_enabled() != github_before {
-            self.engine
-                .list_subscribers()
-                .notify_tool_list_changed()
-                .await;
-        }
-        applied?;
+        // The announcement therefore rides the individual key that flipped
+        // rather than the batch. A `configure` that turns collaboration on and
+        // then fails on a later key has still moved the list, has still
+        // announced it, and reports what applied before it stopped.
+        self.apply_settings(&p).await?;
 
         self.engine
             .configure_snapshot()
@@ -2392,8 +2379,9 @@ impl ServerHandler for McpServer {
     /// still get the same answer; what varies is the moment, which is the
     /// "MAY change over time" clause rather than a violation of the one after
     /// it. The obligation that comes with it is discharged in
-    /// [`McpServer::configure`]: a flip announces itself on every open
-    /// subscription stream, and to nobody who did not open one.
+    /// `Engine::configure`, the seam every writer of that setting goes
+    /// through: a flip announces itself on every open subscription stream, and
+    /// to nobody who did not open one.
     ///
     /// Whether any domain declares provisioning is the gate that did leave this
     /// list for a call-time refusal, which is the remedy SEP-2567 prescribes

@@ -35,10 +35,14 @@
 //! reads them off the wire, so an upstream change that stopped honouring either
 //! fails here instead of in a client's log.
 //!
-//! **What actually travels on the stream.** One thing a client can ask this
-//! server to do moves a list: `configure` flipping `github.enabled`, which
-//! decides whether the five GitHub collaboration tools are listed at all. So a
-//! subscriber gets `notifications/tools/list_changed` on the flip, a peer that
+//! **What actually travels on the stream.** One setting moves a list:
+//! `github.enabled`, which decides whether the five GitHub collaboration tools
+//! are listed at all. A client flips it with `configure`, and so do two
+//! callers with no MCP connection of their own - `crystalline config set` over
+//! the control socket and Fluid's Connect button through the REST API - which
+//! is why the announcement lives on `Engine::configure` and why one test here
+//! drives that seam directly. So a subscriber gets
+//! `notifications/tools/list_changed` on the flip whoever made it, a peer that
 //! opened no stream gets nothing whichever era it speaks, and the resources and
 //! prompts categories are accepted and then stay quiet, because the settings
 //! behind those two lists are frozen at engine construction.
@@ -48,6 +52,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::engine::ConfigureAction;
 use crystalline_service::mcp::McpServer;
 use rmcp::model::{
     CallToolRequestParams, ClientInfo, ProtocolVersion, ServerNotification, SubscriptionFilter,
@@ -203,18 +208,18 @@ fn newest_served() -> ProtocolVersion {
         .clone()
 }
 
-/// Turn `github.enabled` on through the tool, and prove the write landed.
+/// Set `github.enabled` through the tool, and prove the write landed.
 ///
 /// This is the call that used to push an unsolicited
 /// `notifications/tools/list_changed`. Asserting the snapshot matters: in rmcp
 /// 3.1.2 a parameter-deserialization failure comes back as a **tool-level**
 /// error, so a malformed `configure` call answers `Ok` with `is_error` set and
 /// changes nothing - a silence test would then pass for the wrong reason.
-async fn flip_github_enabled(peer: &rmcp::service::Peer<RoleClient>) {
+async fn set_github_enabled(peer: &rmcp::service::Peer<RoleClient>, want: bool) {
     let result = peer
         .call_tool(
             CallToolRequestParams::new("configure".to_string()).with_arguments(
-                json!({ "set": { "github.enabled": "true" } })
+                json!({ "set": { "github.enabled": want.to_string() } })
                     .as_object()
                     .unwrap()
                     .clone(),
@@ -230,9 +235,15 @@ async fn flip_github_enabled(peer: &rmcp::service::Peer<RoleClient>) {
     let snapshot: Value = serde_json::from_str(text).unwrap_or(Value::Null);
     assert_ne!(
         snapshot["github"]["github_enabled"],
-        json!(false),
-        "the setting must actually be on, or the silence below proves nothing: {body}"
+        json!(!want),
+        "the setting must actually read {want}, or the silence below proves nothing: {body}"
     );
+}
+
+/// Turn `github.enabled` on through the tool, the direction every test here
+/// starts from.
+async fn flip_github_enabled(peer: &rmcp::service::Peer<RoleClient>) {
+    set_github_enabled(peer, true).await;
 }
 
 async fn tool_names(peer: &rmcp::service::Peer<RoleClient>) -> Vec<String> {
@@ -524,9 +535,82 @@ async fn a_subscribed_client_is_told_when_the_tool_list_moves() {
         next_within(&mut subscription).await.is_none(),
         "one flip, one notification: the resources and prompts lists did not move"
     );
+
+    // A configure call that writes the value the setting already had moves no
+    // list, so it announces nothing. This is why the gate is read either side
+    // of the write rather than parsed out of the request.
+    set_github_enabled(client.peer(), true).await;
+    assert!(
+        next_within(&mut subscription).await.is_none(),
+        "a configure call that changed no effective setting announced nothing"
+    );
+
+    // And the gate closing is a moved list exactly as the gate opening was.
+    set_github_enabled(client.peer(), false).await;
+    assert!(
+        matches!(
+            next_within(&mut subscription).await,
+            Some(ServerNotification::ToolListChangedNotification(_))
+        ),
+        "the off direction is announced too: the five tools left the list"
+    );
+
     assert!(
         recorder.seen().is_empty(),
         "nothing arrives off the stream: an unsolicited push has no channel in this era: {:?}",
+        recorder.seen()
+    );
+}
+
+/// **A flip that never touches the MCP server still reaches its subscribers.**
+///
+/// `github.enabled` is one shared setting on one shared engine, and three
+/// callers write it: the `configure` tool, `crystalline config set` over the
+/// control socket (`control.rs`, which calls exactly the engine method below)
+/// and Fluid's Connect button through the REST API (`rest::github_settings::
+/// ensure_enabled`, which calls it too). All three move every connected peer's
+/// tool list, so the announcement lives on `Engine::configure` rather than on
+/// the MCP handler - this test drives that seam with no MCP `configure` call
+/// anywhere in it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_flip_from_outside_the_mcp_server_still_reaches_a_subscriber() {
+    let h = Harness::new().await;
+    let (client, _server, recorder) = h.connect_modern().await;
+
+    let mut subscription = client
+        .peer()
+        .listen(SubscriptionFilter::builder().tools_list_changed().build())
+        .await
+        .expect("subscriptions/listen is served on the modern lifecycle");
+
+    let before = tool_names(client.peer()).await;
+    h.engine
+        .configure(&ConfigureAction::Set {
+            key: "github.enabled".to_string(),
+            value: "true".to_string(),
+        })
+        .await
+        .expect("the control and REST paths write the setting through this method");
+    let after = tool_names(client.peer()).await;
+    assert_eq!(
+        after.len(),
+        before.len() + 5,
+        "the list moved for this peer: {before:?} -> {after:?}"
+    );
+
+    let announced = next_within(&mut subscription)
+        .await
+        .expect("a list moved by the control or REST path is announced too");
+    assert!(
+        matches!(
+            &announced,
+            ServerNotification::ToolListChangedNotification(_)
+        ),
+        "and what is announced is the tool list: {announced:?}"
+    );
+    assert!(
+        recorder.seen().is_empty(),
+        "still only on the stream: {:?}",
         recorder.seen()
     );
 }
