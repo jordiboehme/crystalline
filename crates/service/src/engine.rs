@@ -338,6 +338,56 @@ fn stale_edit_message(expected: &str, found: &str) -> String {
     )
 }
 
+/// Renders one side of a conflict for [`Engine::origin_conflict_detail`]: an
+/// absent side is `null`, a UTF-8 one is a JSON string, and a side that
+/// exists but is not UTF-8 is `null` with `note` set to say which side was
+/// omitted and why. A later non-UTF-8 side overwrites an earlier note, so the
+/// note names whichever side was last found unreadable; a caller reading it
+/// learns that at least one side is binary, and the null tells it which.
+fn utf8_side(bytes: Option<Vec<u8>>, name: &str, note: &mut Option<String>) -> Value {
+    match bytes {
+        None => Value::Null,
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => Value::String(text),
+            Err(_) => {
+                *note = Some(format!("the {name} side is not UTF-8 and is omitted"));
+                Value::Null
+            }
+        },
+    }
+}
+
+#[cfg(test)]
+mod utf8_side_tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_side_is_null_without_a_note() {
+        let mut note = None;
+        assert_eq!(utf8_side(None, "local", &mut note), Value::Null);
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_utf8_side_is_the_text_itself() {
+        let mut note = None;
+        let v = utf8_side(Some(b"line one\n".to_vec()), "base", &mut note);
+        assert_eq!(v, Value::String("line one\n".to_string()));
+        assert!(note.is_none());
+    }
+
+    #[test]
+    fn a_non_utf8_side_is_null_and_names_itself_in_the_note() {
+        let mut note = None;
+        // A lone 0x80 continuation byte is never valid UTF-8.
+        let v = utf8_side(Some(vec![0x80, 0x00, 0xff]), "upstream", &mut note);
+        assert_eq!(v, Value::Null);
+        let note = note.expect("a binary side sets the note");
+        assert!(note.contains("upstream"), "{note}");
+        assert!(note.contains("not UTF-8"), "{note}");
+    }
+}
+
 impl From<crystalline_index::IndexError> for EngineError {
     fn from(e: crystalline_index::IndexError) -> Self {
         match e {
@@ -633,6 +683,13 @@ pub struct Engine {
     // activity block. Behind an `Arc` so a guard owns its own handle and a
     // panicking or early-returning operation still clears its entry on drop.
     activity: Arc<std::sync::Mutex<ActivityState>>,
+    // Every open `subscriptions/listen` stream that accepted the tools
+    // category, so a `configure` call that moves the tool list can announce it
+    // to whoever asked to hear about it. It lives here rather than on the MCP
+    // handler because over streamable HTTP rmcp builds a fresh handler per
+    // request and the engine is the only thing the subscriber and the flipper
+    // share; see `crate::subscribers`.
+    list_subscribers: Arc<crate::subscribers::ListSubscribers>,
 }
 
 /// One host's cached GitHub credential: the resolved store and the token it
@@ -778,6 +835,7 @@ impl Engine {
             origin_poller: poller::OriginPollerState::default(),
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
+            list_subscribers: Arc::default(),
         }
     }
 
@@ -914,6 +972,14 @@ impl Engine {
     /// a full snapshot.
     pub fn github_enabled(&self) -> bool {
         self.config.read().unwrap().github_enabled()
+    }
+
+    /// The open `subscriptions/listen` streams a moved tool list is announced
+    /// on. Shared rather than per-handler on purpose - see
+    /// [`crate::subscribers`] for why the streamable-HTTP transport forces the
+    /// registry down to the engine.
+    pub fn list_subscribers(&self) -> &Arc<crate::subscribers::ListSubscribers> {
+        &self.list_subscribers
     }
 
     /// How the shipped agent skills are served over MCP: the value this engine
@@ -7018,6 +7084,10 @@ impl Engine {
     /// was started with (or the default path) and update the in-memory config
     /// so a later read (including a concurrent one, once the write lock
     /// releases) sees it.
+    ///
+    /// A change that moves the MCP tool list is announced here, by
+    /// [`Engine::announce_a_moved_tool_list`], because this method is the one
+    /// seam all three settings callers share.
     pub async fn configure(&self, action: &ConfigureAction) -> Result<Value> {
         match action {
             ConfigureAction::Show => {
@@ -7028,39 +7098,82 @@ impl Engine {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Take the file-config write lock first to serialize against a
-                // concurrent configure call, so two tasks cannot both clone the
-                // old file and clobber each other's change. `persist_config` is
-                // synchronous (no .await), so holding the guard across it is
-                // safe. Lock order is always file_config then config.
-                let mut file_guard = self.file_config.write().unwrap();
-                let mut file = file_guard.clone();
-                settings::apply(&mut file, key, value)?;
-                self.persist_config(&file)?;
-                // Recompute the effective config from the freshly saved file
-                // plus the overlay, so an env-overridden key keeps reading its
-                // env value even after the file value changes underneath it.
-                let effective = self.overlay.apply(&file);
-                let view = self.setting_view_json(&file, key);
-                *file_guard = file;
-                *self.config.write().unwrap() = effective;
+                let github_before = self.github_enabled();
+                // The inner block scopes the lock guards, so they are released
+                // before the announcement below awaits.
+                let view = {
+                    // Take the file-config write lock first to serialize against a
+                    // concurrent configure call, so two tasks cannot both clone the
+                    // old file and clobber each other's change. `persist_config` is
+                    // synchronous (no .await), so holding the guard across it is
+                    // safe. Lock order is always file_config then config.
+                    let mut file_guard = self.file_config.write().unwrap();
+                    let mut file = file_guard.clone();
+                    settings::apply(&mut file, key, value)?;
+                    self.persist_config(&file)?;
+                    // Recompute the effective config from the freshly saved file
+                    // plus the overlay, so an env-overridden key keeps reading its
+                    // env value even after the file value changes underneath it.
+                    let effective = self.overlay.apply(&file);
+                    let view = self.setting_view_json(&file, key);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                    view
+                };
+                self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
             ConfigureAction::Unset { key } => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                // Same write-lock-first discipline and lock order as Set above.
-                let mut file_guard = self.file_config.write().unwrap();
-                let mut file = file_guard.clone();
-                settings::unset(&mut file, key)?;
-                self.persist_config(&file)?;
-                let effective = self.overlay.apply(&file);
-                let view = self.setting_view_json(&file, key);
-                *file_guard = file;
-                *self.config.write().unwrap() = effective;
+                let github_before = self.github_enabled();
+                let view = {
+                    // Same write-lock-first discipline and lock order as Set above.
+                    let mut file_guard = self.file_config.write().unwrap();
+                    let mut file = file_guard.clone();
+                    settings::unset(&mut file, key)?;
+                    self.persist_config(&file)?;
+                    let effective = self.overlay.apply(&file);
+                    let view = self.setting_view_json(&file, key);
+                    *file_guard = file;
+                    *self.config.write().unwrap() = effective;
+                    view
+                };
+                self.announce_a_moved_tool_list(github_before).await;
                 Ok(view)
             }
+        }
+    }
+
+    /// Announce a moved `tools/list` on every open subscription stream, when
+    /// the write that just landed changed what `github.enabled` effectively
+    /// reads.
+    ///
+    /// `github.enabled` gates the listing of the five GitHub collaboration
+    /// tools (`crate::mcp`'s `hidden_collab_tool`), so a settings write that
+    /// flips it is the one thing on this server that moves a tool list - and
+    /// the one that owes an announcement. It lives on the engine rather than
+    /// in the MCP handler because three callers write that setting and all
+    /// three move every connected peer's list: the `configure` MCP tool,
+    /// `crystalline config set` over the control socket (`crate::control`) and
+    /// Fluid's Connect button through the REST API
+    /// (`crate::rest::github_settings`'s `ensure_enabled`). All three go
+    /// through [`Engine::configure`], so putting it here is what makes the
+    /// notification unconditional on the route taken.
+    ///
+    /// The setting is read either side of the write rather than parsed out of
+    /// the request: a key can be set to the value it already had, unset back
+    /// to the default, or overridden by the environment, and only the
+    /// effective setting decides what the next `tools/list` returns.
+    ///
+    /// It reaches subscribers only. MCP 2026-07-28 removed the unsolicited
+    /// channel outright, so a legacy peer - which cannot subscribe at all - is
+    /// told nothing and re-reads the list at its own discretion. See
+    /// [`crate::subscribers`].
+    async fn announce_a_moved_tool_list(&self, github_before: bool) {
+        if self.github_enabled() != github_before {
+            self.list_subscribers().notify_tool_list_changed().await;
         }
     }
 
@@ -7896,8 +8009,22 @@ impl Engine {
             .ok()
             .flatten();
         let proposals = origin::proposal_transitions_json(&report.proposals, state.as_ref());
-
-        Ok(origin::pull_report_json(name, &report, proposals))
+        // Every still-open proposal rides along in full, review feedback
+        // included: an update is where a pull refreshes it, so this is the
+        // channel an agent reads reviewer comments from without a second call.
+        let open_proposals: Vec<Value> = state
+            .as_ref()
+            .map(|s| {
+                s.proposals
+                    .iter()
+                    .filter(|p| p.status == crystalline_remote::state::ProposalStatus::Open)
+                    .map(|p| serde_json::to_value(p).expect("a proposal serializes"))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut v = origin::pull_report_json(name, &report, proposals);
+        v["open_proposals"] = Value::Array(open_proposals);
+        Ok(v)
     }
 
     /// Bootstraps an env-defined team domain on its first contact with GitHub:
@@ -8306,8 +8433,10 @@ impl Engine {
     /// durable on disk since the inline pull inside `propose` already
     /// persisted them) rather than the bare count `RemoteError` alone
     /// carries, so a caller never needs to make a second round trip to learn
-    /// what needs resolving. Nothing local changes on a share, so no sync
-    /// runs afterward.
+    /// what needs resolving. The share itself never touches local files, but
+    /// the pull it opens with does, so it ends with the same sync and embed
+    /// tail `origin_update_one` runs (see
+    /// `Engine::index_what_the_share_pull_applied`).
     pub async fn origin_share(
         &self,
         domain: &str,
@@ -8336,8 +8465,18 @@ impl Engine {
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
         {
-            Ok(outcome) => Ok(origin::propose_outcome_json(&outcome)),
+            Ok(outcome) => {
+                self.index_what_the_share_pull_applied(domain, "sharing")
+                    .await;
+                Ok(origin::propose_outcome_json(&outcome))
+            }
             Err(RemoteError::ConflictsPending { count }) => {
+                // The conflicts refusal is the loudest case for syncing: the
+                // pull ran, applied everything that merged cleanly and only
+                // then refused, so this shape carries the most unindexed work
+                // of any share outcome.
+                self.index_what_the_share_pull_applied(domain, "sharing")
+                    .await;
                 let conflicts = crystalline_remote::state::OriginState::load(&state_dir)
                     .ok()
                     .flatten()
@@ -8353,14 +8492,43 @@ impl Engine {
         }
     }
 
-    /// Discards a declined, or still-open ("never mind"), share proposal for
-    /// one domain, under its origin lock, then syncs the domain (and
-    /// embeds) since discarding can restore or delete working-tree files.
+    /// Indexes whatever the pull inside a share or a preview wrote to the
+    /// working tree.
     ///
-    /// Refuses with `github.enabled`'s message when collaboration is off,
-    /// and with `EngineError::ReadOnly` on a read-only instance (a discard
-    /// writes the working tree).
-    pub async fn origin_discard(&self, domain: &str, proposal_number: u64) -> Result<Value> {
+    /// Both `ops::propose` and `ops::propose_preview` pull first - freshness is
+    /// part of proposing honestly - and a pull applies upstream files. Without
+    /// this, those files sit on disk unsearchable until the poller's next tick
+    /// happens to sync them, which is `origin_update_one`'s bug with a
+    /// different call in front of it. Run unconditionally rather than only when
+    /// something looks applied: the sync is incremental, so a pull that changed
+    /// nothing costs a cheap no-op scan, and there is no cheaper signal here
+    /// that is also correct (a preview reports the share's plan, not the pull's
+    /// effect).
+    ///
+    /// Best effort in the same sense `origin_update_one`'s embed tail is: a
+    /// failure is logged, never turned into a failed share whose proposal is
+    /// already open on the forge.
+    async fn index_what_the_share_pull_applied(&self, domain: &str, verb: &str) {
+        if let Err(e) = self.sync(Some(domain)).await {
+            tracing::warn!("syncing '{domain}' after {verb} failed: {e}");
+            return;
+        }
+        if !self.request_embed()
+            && let Err(e) = self.embed_pending().await
+        {
+            tracing::warn!("embedding after {verb} '{domain}' failed: {e}");
+        }
+    }
+
+    /// Previews what a share of one domain would do, under its origin lock,
+    /// without making a single provider write.
+    ///
+    /// The same three gates `origin_share` applies apply here: a preview runs
+    /// the real pull first (freshness is part of previewing honestly), so it
+    /// writes the working tree and is refused on a read-only instance exactly
+    /// as a share is - and, for the same reason, it ends with the same sync and
+    /// embed tail (see `Engine::index_what_the_share_pull_applied`).
+    pub async fn origin_share_preview(&self, domain: &str, title: Option<&str>) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
@@ -8369,22 +8537,127 @@ impl Engine {
         }
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
-        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let report = ops::discard(&root, &state_dir, proposal_number)?;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let provider = self.resolve_origin_provider()?;
+        let plan = ops::propose_preview(provider.as_ref(), &spec, &root, domain, &state_dir, title)
+            .await
+            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        self.index_what_the_share_pull_applied(domain, "previewing a share")
+            .await;
+        Ok(origin::share_plan_json(&plan))
+    }
 
-        self.sync(Some(domain)).await?;
-        if !self.request_embed()
-            && let Err(e) = self.embed_pending().await
-        {
-            tracing::warn!(
-                "embedding after discarding proposal #{proposal_number} for '{domain}' failed: {e}"
-            );
+    /// Withdraws a share proposal for one domain: closes its pull request on
+    /// the forge, best-effort deletes its branch, optionally restores the
+    /// shared files (`revert`) and records it as withdrawn. Under the
+    /// domain's origin lock; syncs and embeds afterward only when files
+    /// moved. Refuses when collaboration is off and on a read-only instance.
+    pub async fn origin_withdraw(
+        &self,
+        domain: &str,
+        proposal: Option<u64>,
+        revert: bool,
+    ) -> Result<Value> {
+        if !self.config.read().unwrap().github_enabled() {
+            return Err(RemoteError::NotEnabled.into());
         }
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let provider = self.resolve_origin_provider()?;
+        let report = ops::withdraw(
+            provider.as_ref(),
+            &spec,
+            &root,
+            &state_dir,
+            proposal,
+            revert,
+        )
+        .await
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
 
+        if !report.restored.is_empty() || !report.deleted.is_empty() {
+            self.sync(Some(domain)).await?;
+            if !self.request_embed()
+                && let Err(e) = self.embed_pending().await
+            {
+                tracing::warn!(
+                    "embedding after withdrawing proposal #{} for '{domain}' failed: {e}",
+                    report.number
+                );
+            }
+        }
+        Ok(origin::withdraw_report_json(&report))
+    }
+
+    /// One conflict's full detail: both recorded sides plus the current local
+    /// content, addressed by id or by path (exactly one must be given; if
+    /// both arrive the id wins and the path is ignored, never mixed, so an id
+    /// lookup can never be answered by some other conflict that happens to
+    /// match the path). Neither is `EngineError::Invalid` rather than a
+    /// misleading not-found. Sides are returned as UTF-8 strings; a side that
+    /// exists but is not UTF-8 comes back null with `note` saying so. A pure
+    /// read: no gate beyond the domain being registered with an origin, no
+    /// lock needed.
+    pub async fn origin_conflict_detail(
+        &self,
+        domain: &str,
+        id: Option<&str>,
+        path: Option<&str>,
+    ) -> Result<Value> {
+        if id.is_none() && path.is_none() {
+            return Err(EngineError::Invalid(
+                "origin_conflict_detail needs an id or a path".to_string(),
+            ));
+        }
+        let (_, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let state = crystalline_remote::state::OriginState::load(&state_dir)?.ok_or_else(|| {
+            EngineError::Invalid(format!("domain '{domain}' has no origin state"))
+        })?;
+        let conflict = state
+            .conflicts
+            .iter()
+            .find(|c| match (id, path) {
+                (Some(id), _) => c.id == id,
+                (None, Some(path)) => c.path == path,
+                (None, None) => false,
+            })
+            .cloned()
+            .ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no open conflict {} for '{domain}'",
+                    id.or(path).unwrap_or("(none named)")
+                ))
+            })?;
+        let (base, upstream) =
+            crystalline_remote::state::read_conflict_files(&state_dir, &conflict.id)?;
+        let local_path = root.join(&conflict.path);
+        let local = match std::fs::read(&local_path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => {
+                return Err(EngineError::Io {
+                    path: local_path.display().to_string(),
+                    source: e,
+                });
+            }
+        };
+        let mut note: Option<String> = None;
+        let base_v = utf8_side(base, "base", &mut note);
+        let local_v = utf8_side(local, "local", &mut note);
+        let upstream_v = utf8_side(upstream, "upstream", &mut note);
         Ok(json!({
-            "restored": report.restored,
-            "deleted": report.deleted,
-            "skipped_diverged": report.skipped_diverged,
+            "id": conflict.id,
+            "path": conflict.path,
+            "kind": conflict.kind,
+            "detected_at": conflict.detected_at,
+            "base": base_v,
+            "local": local_v,
+            "upstream": upstream_v,
+            "note": note,
         }))
     }
 
@@ -8429,7 +8702,7 @@ impl Engine {
     }
 
     /// Resolves a single domain's `OriginSpec`, root and state directory for
-    /// `origin_share`, `origin_discard` and `origin_resolve`: each a
+    /// `origin_share`, `origin_withdraw` and `origin_resolve`: each a
     /// single-domain operation unlike `origin_update`/`origin_status`'s
     /// optional "every domain" mode. Errors with `UnknownDomain` when
     /// unregistered, and with the same "has no origin" message

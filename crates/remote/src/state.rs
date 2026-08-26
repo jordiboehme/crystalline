@@ -83,7 +83,7 @@ pub struct OriginState {
     pub files: BTreeMap<String, BaseStamp>,
     /// Share proposals still open for review.
     pub proposals: Vec<Proposal>,
-    /// Merged or discarded proposals kept for status display, newest first,
+    /// Merged or withdrawn proposals kept for status display, newest first,
     /// capped at 20 by [`OriginState::push_history`].
     pub history: Vec<Proposal>,
     /// Conflicts from a previous pull still waiting to be resolved.
@@ -98,6 +98,43 @@ pub struct BaseStamp {
     pub sha256: String,
     /// The file's size in bytes as of the base snapshot.
     pub size: u64,
+}
+
+/// How many feedback items a proposal record keeps (the newest by
+/// `submitted_at`); older items fall off on each refresh.
+pub const FEEDBACK_CAP: usize = 50;
+
+/// One piece of review feedback on a proposal: a review body, an inline
+/// review comment (with its file and line), or a plain conversation comment.
+/// Read-only: Crystalline surfaces these, it never posts any.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FeedbackItem {
+    /// The commenting user's login.
+    pub author: String,
+    /// The comment or review body, verbatim.
+    pub body: String,
+    /// The file the comment is anchored to, for a review comment.
+    #[serde(default)]
+    pub path: Option<String>,
+    /// The line the comment is anchored to, for a review comment.
+    #[serde(default)]
+    pub line: Option<u64>,
+    /// When it was submitted, RFC 3339 as the forge reported it.
+    pub submitted_at: String,
+    /// Which of the three feedback channels it came through.
+    pub kind: FeedbackKind,
+}
+
+/// The channel a [`FeedbackItem`] came through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedbackKind {
+    /// The body of a submitted review.
+    Review,
+    /// An inline review comment, anchored to a file and line.
+    ReviewComment,
+    /// A plain conversation (issue) comment.
+    Comment,
 }
 
 /// A share proposal (a GitHub pull request) opened from local changes.
@@ -117,6 +154,40 @@ pub struct Proposal {
     pub status: ProposalStatus,
     /// The files the proposal changes.
     pub files: Vec<ProposedFile>,
+    /// The sha of the last commit Crystalline put on the proposal branch,
+    /// `None` on a record from before this field existed - divergence cannot
+    /// be detected until the first share-update adopts the live head.
+    #[serde(default)]
+    pub head_commit: Option<String>,
+    /// The sha of a commit this machine is in the middle of pushing onto the
+    /// proposal branch: written and saved BEFORE the branch is moved, cleared
+    /// in the same save that promotes it to `head_commit` once the whole
+    /// update landed.
+    ///
+    /// It exists so a half-finished update heals instead of wedging. If the
+    /// branch move succeeds and the step after it fails (or the process dies
+    /// before the final save), the live branch head is ahead of `head_commit`
+    /// and every later share would otherwise read that as a reviewer's
+    /// amendment and refuse forever, with no retry that could ever clear it.
+    /// A live head equal to this field is our own interrupted push, so the
+    /// next share adopts it and carries on. `None` on a settled record and on
+    /// every record written before this field existed.
+    #[serde(default)]
+    pub pending_head_commit: Option<String>,
+    /// The upstream base commit the proposal's tree was last built on.
+    #[serde(default)]
+    pub base_commit: Option<String>,
+    /// approved, changes_requested or commented, absent when no review
+    /// exists.
+    #[serde(default)]
+    pub review_state: Option<String>,
+    /// Review feedback on the proposal, capped at [`FEEDBACK_CAP`] newest
+    /// items.
+    #[serde(default)]
+    pub feedback: Vec<FeedbackItem>,
+    /// Set on every share-update and feedback refresh.
+    #[serde(default)]
+    pub updated_at: Option<DateTime<Utc>>,
 }
 
 /// The lifecycle state of a [`Proposal`].
@@ -128,6 +199,9 @@ pub enum ProposalStatus {
     Merged,
     /// Closed without merging.
     Declined,
+    /// Closed by this machine's own withdraw, not by a reviewer.
+    #[serde(rename = "withdrawn")]
+    Withdrawn,
 }
 
 /// One file changed by a [`Proposal`].
@@ -1066,6 +1140,12 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 status: ProposalStatus::Merged,
                 files: Vec::new(),
+                head_commit: None,
+                pending_head_commit: None,
+                base_commit: None,
+                review_state: None,
+                feedback: Vec::new(),
+                updated_at: None,
             });
         }
         assert_eq!(state.history.len(), 20);
@@ -1167,5 +1247,93 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let err = read_conflict_files(dir.path(), "ABCDEF12").unwrap_err();
         assert!(matches!(err, RemoteError::State(_)));
+    }
+
+    #[test]
+    fn a_pre_extension_state_json_loads_with_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = r#"{
+            "version": 1,
+            "repo": "acme/brand-knowledge",
+            "branch": "main",
+            "base_commit": "deadbeef",
+            "ref_etag": null,
+            "last_checked": null,
+            "files": {},
+            "proposals": [{
+                "number": 7,
+                "url": "https://github.com/acme/brand-knowledge/pull/7",
+                "branch": "crystalline/share-eng-260101120000",
+                "title": "Share updates from eng",
+                "created_at": "2026-01-01T12:00:00Z",
+                "status": "Open",
+                "files": []
+            }],
+            "history": [],
+            "conflicts": []
+        }"#;
+        std::fs::write(dir.path().join("state.json"), json).unwrap();
+        let state = OriginState::load(dir.path()).unwrap().unwrap();
+        let prop = &state.proposals[0];
+        assert_eq!(prop.head_commit, None);
+        assert_eq!(prop.base_commit, None);
+        assert_eq!(prop.review_state, None);
+        assert!(prop.feedback.is_empty());
+        assert_eq!(prop.updated_at, None);
+    }
+
+    #[test]
+    fn withdrawn_status_serializes_as_lowercase_withdrawn() {
+        let v = serde_json::to_value(ProposalStatus::Withdrawn).unwrap();
+        assert_eq!(v, serde_json::json!("withdrawn"));
+        let back: ProposalStatus = serde_json::from_value(v).unwrap();
+        assert_eq!(back, ProposalStatus::Withdrawn);
+    }
+
+    #[test]
+    fn feedback_kind_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_value(FeedbackKind::ReviewComment).unwrap(),
+            serde_json::json!("review_comment")
+        );
+        assert_eq!(
+            serde_json::to_value(FeedbackKind::Review).unwrap(),
+            serde_json::json!("review")
+        );
+        assert_eq!(
+            serde_json::to_value(FeedbackKind::Comment).unwrap(),
+            serde_json::json!("comment")
+        );
+    }
+
+    #[test]
+    fn an_extended_proposal_round_trips_through_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sample_state();
+        state.proposals.push(Proposal {
+            number: 3,
+            url: "https://github.com/acme/brand-knowledge/pull/3".to_string(),
+            branch: "crystalline/share-eng-260101120000-ab12".to_string(),
+            title: "Share updates from eng".to_string(),
+            created_at: chrono::Utc::now(),
+            status: ProposalStatus::Open,
+            files: vec![],
+            head_commit: Some("cafe".to_string()),
+            pending_head_commit: None,
+            base_commit: Some("deadbeef".to_string()),
+            review_state: Some("changes_requested".to_string()),
+            feedback: vec![FeedbackItem {
+                author: "octo".to_string(),
+                body: "tighten the wording".to_string(),
+                path: Some("notes/a.md".to_string()),
+                line: Some(4),
+                submitted_at: "2026-08-21T10:00:00Z".to_string(),
+                kind: FeedbackKind::ReviewComment,
+            }],
+            updated_at: Some(chrono::Utc::now()),
+        });
+        state.save(dir.path()).unwrap();
+        let loaded = OriginState::load(dir.path()).unwrap();
+        assert_eq!(loaded, Some(state));
     }
 }

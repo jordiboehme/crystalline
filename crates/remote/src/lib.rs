@@ -29,9 +29,12 @@ pub mod token;
 pub use error::RemoteError;
 pub use github::GitHubProvider;
 pub use github::auth::{DeviceFlowStart, DevicePoll, GITHUB_CLIENT_ID};
-pub use ops::{OriginStatusReport, PullReport, SubscribeReport, pull, status, subscribe};
+pub use ops::{
+    OriginStatusReport, PlannedAction, ProposeOutcome, ProposeReport, PullReport, SharePlan,
+    SubscribeReport, propose, propose_preview, pull, status, subscribe,
+};
 pub use provider::{
-    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
-    ProposalState, Provider, TreeWrite, UpstreamChange,
+    ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
+    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
 };
 pub use token::{StoredToken, TokenStore};

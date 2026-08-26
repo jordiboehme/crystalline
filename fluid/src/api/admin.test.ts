@@ -14,16 +14,22 @@ import {
   archiveDownloadUrl,
   createDomain,
   disconnectGithub,
+  fetchConflict,
   fetchGithubStatus,
+  fetchShareChanges,
   fetchSyncStatus,
   importArchive,
   previewArchive,
   readGithubStatus,
+  resolveConflict,
+  shareDomain,
+  sharePlanKey,
   startGithubConnect,
   submitGithubToken,
   syncDomain,
   syncStatusKey,
   unregisterDomain,
+  withdrawProposal,
 } from "./admin";
 import { api } from "./client";
 
@@ -238,6 +244,36 @@ describe("the admin client layer", () => {
       // guessing "github" and "connected".
       mode: null,
       connected: null,
+      // The same two records the count above was taken from, as themselves.
+      // Everything the fixture left out is filled in rather than left
+      // undefined: a row draws a title and a status whatever arrived. The
+      // default status is `open` for both lists, not the list's own name - a
+      // record that arrives with no status at all is a report this side cannot
+      // read, and guessing `declined` from the key it came under would put a
+      // word on a chip that nothing said.
+      proposals: [
+        {
+          number: 7,
+          url: "",
+          title: "",
+          status: "open",
+          reviewState: null,
+          amendedUpstream: false,
+          feedback: [],
+          updatedAt: null,
+        },
+        {
+          number: 9,
+          url: "",
+          title: "",
+          status: "open",
+          reviewState: null,
+          amendedUpstream: false,
+          feedback: [],
+          updatedAt: null,
+        },
+      ],
+      conflictList: [],
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
   });
@@ -341,6 +377,244 @@ describe("the admin client layer", () => {
 
     expect(status.probeError).toBe("offline: could not reach api.github.com");
     expect(status.behind).toBeNull();
+  });
+
+  it("reads the proposals and the conflicts as themselves, both lists as one", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [
+        {
+          number: 4,
+          url: "https://github.example/acme/kb/pull/4",
+          title: "Refine 2 engrams",
+          // PascalCase on the wire, because the engine spells three of the
+          // four states that way and only `withdrawn` lowercase.
+          status: "Open",
+          review_state: "changes_requested",
+          amended_upstream: true,
+          feedback: [
+            {
+              author: "ana",
+              body: "needs a source",
+              path: "notes/a.md",
+              line: 12,
+              submitted_at: "2026-08-21T10:00:00Z",
+              kind: "review_comment",
+            },
+            // No body is nothing to show, so it never becomes a row.
+            { author: "bo", submitted_at: "2026-08-21T11:00:00Z" },
+          ],
+          updated_at: "2026-08-21T10:05:00Z",
+        },
+        // No number is no handle to withdraw or link by: dropped rather than
+        // drawn as a row nothing can be done to.
+        { title: "A proposal with no number" },
+      ],
+      declined_proposals: [{ number: 2, status: "Declined" }],
+      conflicts: [
+        {
+          id: "9f3c1ab0",
+          path: "notes/a.md",
+          kind: "EditEdit",
+          detected_at: "2026-08-10T07:59:00Z",
+        },
+        // A bare path still counts above, but there is no id to open it by.
+        "notes/b.md",
+      ],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    // One list, open first: a row says which it is by the status it wears.
+    expect(status.proposals.map((proposal) => proposal.number)).toEqual([4, 2]);
+    expect(status.proposals.map((proposal) => proposal.status)).toEqual([
+      "open",
+      "declined",
+    ]);
+    expect(status.proposals[0]?.amendedUpstream).toBe(true);
+    expect(status.proposals[0]?.reviewState).toBe("changes_requested");
+    expect(status.proposals[0]?.feedback).toEqual([
+      {
+        author: "ana",
+        body: "needs a source",
+        path: "notes/a.md",
+        line: 12,
+        submittedAt: "2026-08-21T10:00:00Z",
+        kind: "review_comment",
+      },
+    ]);
+    expect(status.conflictList).toEqual([
+      {
+        id: "9f3c1ab0",
+        path: "notes/a.md",
+        kind: "EditEdit",
+        detectedAt: "2026-08-10T07:59:00Z",
+      },
+    ]);
+    // The counts still count everything, including what the lists dropped.
+    expect(status.conflicts).toBe(2);
+  });
+
+  it("reads what a share would do, defaults included", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "update",
+      effective_title: "Refine 2 engrams in kb",
+      changes: [
+        { path: "notes/a.md", kind: "modified" },
+        // A change with no path is not a file anybody can be shown.
+        { kind: "modified" },
+      ],
+      number: 4,
+      url: "https://github.example/acme/kb/pull/4",
+    });
+    const plan = await fetchShareChanges("eng");
+
+    expect(apiMock).toHaveBeenLastCalledWith("/domains/eng/sync/changes");
+    expect(plan).toEqual({
+      action: "update",
+      effectiveTitle: "Refine 2 engrams in kb",
+      changes: [{ path: "notes/a.md", kind: "modified" }],
+      number: 4,
+      url: "https://github.example/acme/kb/pull/4",
+      // An update carries no conflict count, and none is invented for it.
+      count: null,
+    });
+    // And the key it is cached under, which is deliberately not one of the
+    // `["domains", ...]` keys every other read of a domain is filed under:
+    // reading this route pulls the origin, so a bulk domain invalidation must
+    // never reach it.
+    expect(sharePlanKey("eng")).toEqual(["share-plan", "eng"]);
+    expect(sharePlanKey("eng")[0]).not.toBe(syncStatusKey("eng")[0]);
+  });
+
+  it("reads the conflict count off a plan that is waiting on them", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "conflicts_pending",
+      count: 2,
+      effective_title: "",
+      changes: [],
+    });
+    const plan = await fetchShareChanges("eng");
+
+    // The one number that says how much work settling them is, before the
+    // screen that settles them is opened.
+    expect(plan.count).toBe(2);
+    expect(plan.action).toBe("conflicts_pending");
+  });
+
+  it("shares a domain with the title and description it was given", async () => {
+    apiMock.mockResolvedValueOnce({ outcome: "proposed", number: 4 });
+    await shareDomain("team eng", { title: "From the UI" });
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/team%20eng/sync/share",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ title: "From the UI" }),
+      }),
+    );
+  });
+
+  it("withdraws a proposal by number, with the revert flag on the body", async () => {
+    apiMock.mockResolvedValueOnce({
+      number: 4,
+      closed: true,
+      status: "withdrawn",
+      restored: ["notes/a.md"],
+      deleted: [],
+      skipped_diverged: ["notes/b.md"],
+    });
+    const receipt = await withdrawProposal("eng", 4, true);
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/sync/proposals/4/withdraw",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({ revert: true }),
+      }),
+    );
+    // The three file lists are read rather than passed through: they are how a
+    // caller tells a withdraw that only closed a pull request from one that
+    // moved files under every list on the screen.
+    expect(receipt).toEqual({
+      number: 4,
+      closed: true,
+      status: "withdrawn",
+      restored: ["notes/a.md"],
+      deleted: [],
+      skippedDiverged: ["notes/b.md"],
+    });
+  });
+
+  it("reads a withdraw that moved nothing as having moved nothing", async () => {
+    // The lists a plain withdraw leaves out entirely. None of them becomes
+    // undefined, because the caller counts them to decide what to re-read.
+    apiMock.mockResolvedValueOnce({ number: 4, closed: true });
+    const receipt = await withdrawProposal("eng", 4, false);
+
+    expect(receipt).toEqual({
+      number: 4,
+      closed: true,
+      status: "withdrawn",
+      restored: [],
+      deleted: [],
+      skippedDiverged: [],
+    });
+  });
+
+  it("reads one conflict's three sides, and keeps the id it asked by", async () => {
+    apiMock.mockResolvedValueOnce({
+      // The answer left the id out; the handle the resolve below is addressed
+      // by is the one that was asked for.
+      path: "notes/a.md",
+      kind: "both_modified",
+      base: "the shared start",
+      local: "my version",
+      upstream: null,
+      note: "the upstream side is not UTF-8",
+    });
+    const detail = await fetchConflict("eng", "9f 3c");
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/sync/conflicts/9f%203c",
+    );
+    expect(detail).toEqual({
+      id: "9f 3c",
+      path: "notes/a.md",
+      kind: "both_modified",
+      base: "the shared start",
+      local: "my version",
+      upstream: null,
+      note: "the upstream side is not UTF-8",
+    });
+  });
+
+  it("resolves one conflict by id, with the merged content when there is any", async () => {
+    apiMock.mockResolvedValueOnce({ resolved: "notes/a.md", remaining: 0 });
+    await resolveConflict("eng", "9f3c1ab0", "merged", "the settled text");
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/sync/conflicts/9f3c1ab0/resolve",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          resolution: "merged",
+          content: "the settled text",
+        }),
+      }),
+    );
+
+    apiMock.mockResolvedValueOnce({ resolved: "notes/a.md", remaining: 0 });
+    await resolveConflict("eng", "9f3c1ab0", "mine");
+
+    // No content to write, so no `content` key at all rather than a null the
+    // server would have to read past.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/sync/conflicts/9f3c1ab0/resolve",
+      expect.objectContaining({
+        body: JSON.stringify({ resolution: "mine" }),
+      }),
+    );
   });
 
   it("pulls a team domain on the same path with a POST", async () => {

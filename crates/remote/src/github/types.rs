@@ -133,6 +133,84 @@ pub(super) struct CurrentUserResponse {
     pub(super) login: String,
 }
 
+/// `PATCH .../git/refs/heads/{name}` request body. `force: false` always:
+/// a share-update is a fast-forward on a branch only this machine writes.
+#[derive(Debug, Serialize)]
+pub(super) struct UpdateRefRequest {
+    pub(super) sha: String,
+    pub(super) force: bool,
+}
+
+/// `PATCH .../pulls/{number}` request body for a share-update. The title is
+/// omitted entirely (not sent null) unless the caller supplied one.
+#[derive(Debug, Serialize)]
+pub(super) struct UpdateProposalRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) title: Option<String>,
+    pub(super) body: String,
+}
+
+/// `PATCH .../pulls/{number}` request body for a withdraw.
+#[derive(Debug, Serialize)]
+pub(super) struct CloseProposalRequest {
+    pub(super) state: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct UserRef {
+    pub(super) login: String,
+}
+
+/// `GET .../pulls/{number}/reviews` entry.
+#[derive(Debug, Deserialize)]
+pub(super) struct ReviewResponse {
+    #[serde(default)]
+    pub(super) user: Option<UserRef>,
+    pub(super) state: String,
+    #[serde(default)]
+    pub(super) body: Option<String>,
+    #[serde(default)]
+    pub(super) submitted_at: Option<String>,
+}
+
+/// `GET .../pulls/{number}/comments` entry (an inline review comment).
+#[derive(Debug, Deserialize)]
+pub(super) struct ReviewCommentResponse {
+    #[serde(default)]
+    pub(super) user: Option<UserRef>,
+    pub(super) body: String,
+    #[serde(default)]
+    pub(super) path: Option<String>,
+    #[serde(default)]
+    pub(super) line: Option<u64>,
+    #[serde(default)]
+    pub(super) created_at: Option<String>,
+}
+
+/// `GET .../issues/{number}/comments` entry (a conversation comment).
+#[derive(Debug, Deserialize)]
+pub(super) struct IssueCommentResponse {
+    #[serde(default)]
+    pub(super) user: Option<UserRef>,
+    pub(super) body: String,
+    #[serde(default)]
+    pub(super) created_at: Option<String>,
+}
+
+/// `GET .../pulls?state=open` entry, trimmed to the head ref and sha.
+#[derive(Debug, Deserialize)]
+pub(super) struct OpenProposalListItem {
+    pub(super) number: u64,
+    pub(super) head: HeadRef,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct HeadRef {
+    #[serde(rename = "ref")]
+    pub(super) reference: String,
+    pub(super) sha: String,
+}
+
 /// The `message` field GitHub includes on most JSON error bodies.
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ErrorBody {

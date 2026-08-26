@@ -9,12 +9,13 @@
  * retire status change lands optimistically, before any round trip answers.
  */
 
+import { QueryClient } from "@tanstack/react-query";
 import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import { api } from "../api/client";
-import { singlePage } from "../api/engrams";
+import { domainEngramsRoot, singlePage } from "../api/engrams";
 import {
   answersFor,
   domainsResponse,
@@ -210,7 +211,7 @@ describe("the retire dialog", () => {
     expect(call?.[1]?.headers).toEqual({ "If-Match": '"3f8a1c05e2"' });
   });
 
-  it("moves the tree on, so the sidebar stops showing what was retired", async () => {
+  it("moves the tree and the listings on, so nothing keeps showing what was retired", async () => {
     const retired = vi.fn(() => ({
       domain: "eng",
       permalink: "alpha",
@@ -240,6 +241,13 @@ describe("the retire dialog", () => {
     // The tree is fresh for a minute, so nothing but an invalidation can make
     // it be asked for again while this screen sits still.
     const before = trees().length;
+    // The listings are the other half, and they cannot be watched the same
+    // way: retiring happens on the engram screen, where no list of the domain
+    // is mounted to refetch. The call itself is the fact under test - every
+    // listing of this domain marked stale, so the next mount of one reads the
+    // retired status instead of serving the row it cached before the write.
+    // The spy calls through, so nothing about the run changes.
+    const invalidated = vi.spyOn(QueryClient.prototype, "invalidateQueries");
 
     await userEvent.click(
       await screen.findByRole("button", { name: "More actions" }),
@@ -260,6 +268,12 @@ describe("the retire dialog", () => {
     await waitFor(() => {
       expect(trees().length).toBeGreaterThan(before);
     });
+    await waitFor(() => {
+      expect(invalidated).toHaveBeenCalledWith(
+        expect.objectContaining({ queryKey: domainEngramsRoot("eng") }),
+      );
+    });
+    invalidated.mockRestore();
   });
 });
 

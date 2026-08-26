@@ -1,6 +1,6 @@
 //! End-to-end lifecycle tests for the pull-side and share-side orchestration
 //! in `crystalline_remote::ops` (`subscribe`, `pull`, `status`, `propose`,
-//! `discard`, `resolve`), driven by an in-memory forge
+//! `withdraw`, `resolve`), driven by an in-memory forge
 //! ([`mock::MockProvider`]) rather than a live GitHub. Each test is a
 //! scenario over throwaway tempdirs: subscribe a domain, move the mock forge
 //! or edit the working tree, run the operation under test and assert what
@@ -23,13 +23,13 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crystalline_remote::ops::{
-    ProposeOutcome, PullReport, Resolution, SubscribeReport, discard, propose, pull, resolve,
-    status, subscribe,
+    PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, propose,
+    propose_preview, pull, resolve, status, subscribe, withdraw,
 };
-use crystalline_remote::provider::{OriginSpec, ProposalState};
+use crystalline_remote::provider::{Feedback, OriginSpec, ProposalState, Provider};
 use crystalline_remote::state::{
-    BaseStamp, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
-    read_conflict_files,
+    BaseStamp, FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange,
+    ProposedFile, read_conflict_files,
 };
 
 use mock::{MockProvider, sha256_hex};
@@ -96,6 +96,18 @@ fn load_state(state_dir: &Path) -> OriginState {
     OriginState::load(state_dir).unwrap().unwrap()
 }
 
+/// Whether a recorded mock call mutated the forge: the creating and updating
+/// calls plus the two cleanup calls a supersede performs. Every read-only
+/// operation (a probe, a compare, a blob or tarball fetch, a state or feedback
+/// read, an open-proposal listing) is excluded, so a filter over this counts
+/// exactly the writes a preview must never make.
+fn is_write_call(call: &str) -> bool {
+    call.starts_with("create_")
+        || call.starts_with("update_")
+        || call.starts_with("delete_branch")
+        || call.starts_with("close_proposal")
+}
+
 /// Subscribes a fresh domain at `commit` against `spec`, with the working
 /// tree rooted at a directory named `domain_name` (rather than the fixed
 /// `"domain"` name [`subscribe_at`] uses), for share-side tests that need a
@@ -125,6 +137,35 @@ async fn subscribe_named(
     }
 }
 
+/// Subscribe a fresh single-file domain, make one local edit and share it,
+/// returning the subscription and the created proposal's report. The starting
+/// point for every living-proposal scenario: one open proposal, one commit on
+/// its branch, one recorded head.
+async fn shared_once(mock: &MockProvider) -> (Subscribed, crystalline_remote::ops::ProposeReport) {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let outcome = propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    (sub, report)
+}
+
 /// Overwrites the saved base commit, the corruption scenario 11 needs to force
 /// the compare-404 re-baseline path.
 fn set_base_commit(state_dir: &Path, commit: &str) {
@@ -149,6 +190,12 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
             change: ProposedChange::Added,
             sha256,
         }],
+        head_commit: None,
+        pending_head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     st.save(state_dir).unwrap();
 }
@@ -951,7 +998,7 @@ async fn scenario_14_truncated_compare_falls_back_to_tarball_diff() {
     );
 }
 
-// --- share-side: propose, discard, resolve ------------------------------------
+// --- share-side: propose, withdraw, resolve -----------------------------------
 
 /// The origin every share-side scenario tracks, rooted at a `knowledge/`
 /// subpath so tree writes exercise contract 3's repo-relative prefixing.
@@ -1364,13 +1411,253 @@ async fn scenario_20_propose_amended_merge_upstream_wins_silently() {
     assert_eq!(st.history[0].status, ProposalStatus::Merged);
 }
 
-// Scenario 21 (g): discard. A declined proposal touching three files: one
-// verbatim (restored to its base content), one diverged since sharing
-// (skipped, untouched) and one proposed addition (deleted). The record
-// lands in history with its declined status preserved.
+// Scenario 20: withdraw. Closing an open proposal on the forge, the optional
+// revert, the declined and merged cases, a close failure and the targeting
+// rules.
 
 #[tokio::test]
-async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
+async fn scenario_20_withdraw_open_closes_the_pr_and_keeps_files() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+
+    let report = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.number, first.number);
+    assert!(report.closed);
+    assert!(report.restored.is_empty() && report.deleted.is_empty());
+
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("close_proposal:{}", first.number)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.is_empty());
+    assert_eq!(st.history[0].number, first.number);
+    assert_eq!(st.history[0].status, ProposalStatus::Withdrawn);
+    // The local edit survives: withdraw without revert never touches files.
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_revert_restores_undiverged_files() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/edit.md", b"before\n"),
+            ("notes/gone.md", b"bye\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/edit.md"), b"after\n");
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("{other:?}"),
+    };
+    // One file diverges after sharing: it must be left alone.
+    write(
+        &sub.domain_root.join("notes/added.md"),
+        b"kept working on it\n",
+    );
+
+    let w = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(report.number),
+        true,
+    )
+    .await
+    .unwrap();
+    let mut restored = w.restored.clone();
+    restored.sort();
+    assert_eq!(
+        restored,
+        vec!["notes/edit.md".to_string(), "notes/gone.md".to_string()]
+    );
+    assert!(w.deleted.is_empty());
+    assert_eq!(w.skipped_diverged, vec!["notes/added.md".to_string()]);
+    assert_eq!(read(&sub.domain_root.join("notes/edit.md")), b"before\n");
+    assert_eq!(read(&sub.domain_root.join("notes/gone.md")), b"bye\n");
+    assert_eq!(
+        read(&sub.domain_root.join("notes/added.md")),
+        b"kept working on it\n"
+    );
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_declined_skips_the_close() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let report = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+    )
+    .await
+    .unwrap();
+    assert!(!report.closed);
+    let calls = mock.calls();
+    assert!(
+        !calls.contains(&format!("close_proposal:{}", first.number)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("delete_branch:{}", first.branch)),
+        "{calls:?}"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.history[0].status, ProposalStatus::Withdrawn);
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_refuses_a_merged_proposal() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    // A status flip can leave a Merged record standing in `proposals` until
+    // the next pull consumes it; withdrawing one is refused outright.
+    let mut st = load_state(&sub.state_dir);
+    st.proposals[0].status = ProposalStatus::Merged;
+    st.save(&sub.state_dir).unwrap();
+
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(first.number),
+        false,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        crystalline_remote::RemoteError::State(msg) => {
+            assert!(msg.contains("already merged"), "{msg}");
+        }
+        other => panic!("expected State, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1, "the record is untouched");
+    assert!(st.history.is_empty());
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_close_failure_aborts_untouched() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_close_proposal(first.number);
+
+    let err = withdraw(&mock, &spec(), &sub.domain_root, &sub.state_dir, None, true)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crystalline_remote::RemoteError::Api { status: 500, .. }
+        ),
+        "{err:?}"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].status,
+        ProposalStatus::Open,
+        "record untouched"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha v2\n",
+        "no revert happened"
+    );
+}
+
+#[tokio::test]
+async fn scenario_20_withdraw_targeting_names_candidates() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // No open proposal, no number: the error lists candidates (none).
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+    )
+    .await
+    .unwrap_err();
+    match err {
+        crystalline_remote::RemoteError::NoWithdrawTarget { open, declined } => {
+            assert!(open.is_empty() && declined.is_empty());
+        }
+        other => panic!("expected NoWithdrawTarget, got {other:?}"),
+    }
+
+    // An unknown number stays ProposalNotFound.
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(99),
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crystalline_remote::RemoteError::ProposalNotFound { number: 99 }
+        ),
+        "{err:?}"
+    );
+}
+
+// Scenario 21 (g): withdraw --revert. A declined proposal touching three
+// files: one verbatim (restored to its base content), one diverged since
+// sharing (skipped, untouched) and one proposed addition (deleted). The
+// record lands in history as withdrawn.
+
+#[tokio::test]
+async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
     let mock = MockProvider::new();
     let spec = share_spec();
     let c1 = mock.add_commit(
@@ -1417,6 +1704,12 @@ async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
                 sha256: Some(sha256_hex(b"newly added\n")),
             },
         ],
+        head_commit: None,
+        pending_head_commit: None,
+        base_commit: None,
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(&sub.state_dir).unwrap();
 
@@ -1426,7 +1719,18 @@ async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
         b"further edited after sharing\n",
     );
 
-    let report = discard(&sub.domain_root, &sub.state_dir, 9).unwrap();
+    let report = withdraw(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(9),
+        true,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.number, 9);
+    assert!(!report.closed, "a declined proposal is already closed");
     assert_eq!(report.restored, vec!["notes/keep.md".to_string()]);
     assert_eq!(report.deleted, vec!["notes/added.md".to_string()]);
     assert_eq!(
@@ -1446,7 +1750,7 @@ async fn scenario_21_discard_restores_verbatim_deletes_added_skips_diverged() {
     assert!(st.proposals.is_empty());
     assert_eq!(st.history.len(), 1);
     assert_eq!(st.history[0].number, 9);
-    assert_eq!(st.history[0].status, ProposalStatus::Declined);
+    assert_eq!(st.history[0].status, ProposalStatus::Withdrawn);
 }
 
 // Scenario 22 (h): resolve. Mine, theirs (both EditEdit and the
@@ -2309,4 +2613,897 @@ async fn mirror_flows_through_resolve_scan_and_desired_set() {
     // Keep the scratch directories alive until every assertion has run.
     drop(home);
     drop(work);
+}
+
+// Scenario 27: a second share while the first proposal is open updates it in
+// place: one new commit on the same branch, ref advanced, body PATCHed, still
+// exactly one Proposal record and no second create_proposal.
+
+#[tokio::test]
+async fn scenario_27_consecutive_shares_update_one_proposal() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let head_after_create = mock.branch_commit(&first.branch).unwrap();
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let updated = match outcome {
+        ProposeOutcome::Updated(r) => r,
+        other => panic!("expected Updated, got {other:?}"),
+    };
+    assert_eq!(updated.number, first.number, "same PR");
+    assert_eq!(updated.url, first.url, "same URL");
+    assert_eq!(updated.branch, first.branch, "same branch");
+
+    // The branch advanced by exactly one new commit whose parent is the
+    // previous head, and the record moved with it.
+    let head_after_update = mock.branch_commit(&first.branch).unwrap();
+    assert_ne!(head_after_update, head_after_create);
+    assert_eq!(
+        mock.commit_parents(&head_after_update).unwrap(),
+        vec![head_after_create.clone()]
+    );
+    let calls = mock.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.starts_with("create_proposal:"))
+            .count(),
+        1,
+        "never a second PR: {calls:?}"
+    );
+    assert!(
+        calls.contains(&format!(
+            "update_branch:{}:{head_after_update}",
+            first.branch
+        )),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("update_proposal:{}", first.number)),
+        "{calls:?}"
+    );
+    // The body was regenerated from the fresh change list.
+    let req = mock.proposal_request(first.number).unwrap();
+    assert!(req.body.contains("notes/b.md"), "{}", req.body);
+
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1);
+    let prop = &st.proposals[0];
+    assert_eq!(
+        prop.head_commit.as_deref(),
+        Some(head_after_update.as_str())
+    );
+    assert_eq!(prop.base_commit.as_deref(), Some(st.base_commit.as_str()));
+    assert!(prop.updated_at.is_some());
+    // Both changed files are on the record now.
+    let mut paths: Vec<_> = prop.files.iter().map(|f| f.path.clone()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["notes/a.md".to_string(), "notes/b.md".to_string()]
+    );
+}
+
+// Scenario 28: when upstream advanced between shares, the update commit gets
+// two parents (branch head first, then the new base) so the PR's merge base
+// moves forward and the diff never shows upstream changes as ours.
+
+#[tokio::test]
+async fn scenario_28_share_update_after_upstream_advance_makes_a_merge_commit() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let head_after_create = mock.branch_commit(&first.branch).unwrap();
+
+    // Upstream gains an unrelated file; the pull inside the next propose
+    // integrates it and advances base_commit past the recorded one.
+    let old_base = load_state(&sub.state_dir).base_commit.clone();
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/upstream.md", b"from the team\n"),
+        ]),
+        Some(&old_base),
+    );
+    mock.set_branch("main", &c2);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ProposeOutcome::Updated(_)), "{outcome:?}");
+
+    let head_after_update = mock.branch_commit(&first.branch).unwrap();
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        mock.commit_parents(&head_after_update).unwrap(),
+        vec![head_after_create, st.base_commit.clone()],
+        "branch head first, then the advanced base"
+    );
+    assert_eq!(
+        st.proposals[0].base_commit.as_deref(),
+        Some(st.base_commit.as_str()),
+        "the record's base moved with the merge"
+    );
+}
+
+// Scenario 29: a reviewer-amended branch refuses the update with no writes.
+
+#[tokio::test]
+async fn scenario_29_diverged_branch_refuses_with_no_writes() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+
+    // A reviewer pushes a commit onto the proposal branch: the live head no
+    // longer matches the recorded head_commit.
+    let reviewer = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&first.branch, &reviewer);
+    let writes_before = mock
+        .calls()
+        .iter()
+        .filter(|c| {
+            c.starts_with("create_blob:")
+                || c.starts_with("create_tree:")
+                || c.starts_with("create_commit:")
+                || c.starts_with("create_branch:")
+                || c.starts_with("update_branch:")
+                || c.starts_with("update_proposal:")
+                || c.starts_with("create_proposal:")
+        })
+        .count();
+
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    match outcome {
+        ProposeOutcome::ProposalDiverged {
+            number,
+            url,
+            branch,
+        } => {
+            assert_eq!(number, first.number);
+            assert_eq!(url, first.url);
+            assert_eq!(branch, first.branch);
+        }
+        other => panic!("expected ProposalDiverged, got {other:?}"),
+    }
+    let writes_after = mock
+        .calls()
+        .iter()
+        .filter(|c| {
+            c.starts_with("create_blob:")
+                || c.starts_with("create_tree:")
+                || c.starts_with("create_commit:")
+                || c.starts_with("create_branch:")
+                || c.starts_with("update_branch:")
+                || c.starts_with("update_proposal:")
+                || c.starts_with("create_proposal:")
+        })
+        .count();
+    assert_eq!(writes_after, writes_before, "no provider write happened");
+    // The record is untouched: still Open, still the old head.
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals[0].status, ProposalStatus::Open);
+}
+
+// Scenario 30: a declined proposal is superseded by the next share - moved to
+// history keeping Declined, its branch best-effort deleted, and a fresh PR
+// opened.
+
+#[tokio::test]
+async fn scenario_30_declined_proposal_is_superseded_on_next_share() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    // The pull inside the next propose marks it Declined first.
+
+    write(&sub.domain_root.join("notes/e.md"), b"epsilon\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let second = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected a fresh Proposed, got {other:?}"),
+    };
+    assert_ne!(second.number, first.number);
+
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1, "only the new proposal remains");
+    assert_eq!(st.proposals[0].number, second.number);
+    assert_eq!(st.history[0].number, first.number);
+    assert_eq!(st.history[0].status, ProposalStatus::Declined);
+    assert!(
+        mock.calls()
+            .contains(&format!("delete_branch:{}", first.branch)),
+        "{:?}",
+        mock.calls()
+    );
+}
+
+// Scenario 31: an open record whose branch ref is gone refreshes once; still
+// open with no branch means it is treated as declined and a new share opens.
+
+#[tokio::test]
+async fn scenario_31_gone_ref_with_open_pr_treats_as_declined_and_creates_new() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    // Someone deleted the branch out from under the still-open PR.
+    let _ = mock.delete_branch(&spec(), &first.branch).await;
+
+    write(&sub.domain_root.join("notes/f.md"), b"zeta\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let second = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    assert_ne!(second.number, first.number);
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.history[0].number, first.number);
+    assert_eq!(st.history[0].status, ProposalStatus::Declined);
+}
+
+// Scenario 32 (migration): a pre-extension record with head_commit None
+// adopts the live branch head silently on its first update.
+
+#[tokio::test]
+async fn scenario_32_migration_none_head_commit_adopts_live_head() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    // Erase the recorded head, simulating a record written before the field.
+    let mut st = load_state(&sub.state_dir);
+    st.proposals[0].head_commit = None;
+    st.proposals[0].base_commit = None;
+    st.save(&sub.state_dir).unwrap();
+
+    write(&sub.domain_root.join("notes/g.md"), b"eta\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ProposeOutcome::Updated(_)), "{outcome:?}");
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].head_commit.as_deref(),
+        Some(mock.branch_commit(&first.branch).unwrap().as_str())
+    );
+    assert_eq!(st.proposals[0].number, first.number);
+}
+
+// An interrupted share-update - the branch moved, the proposal patch failed -
+// heals on the next share instead of blaming a reviewer forever.
+
+#[tokio::test]
+async fn an_interrupted_update_heals_on_the_next_share() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let head_before = mock.branch_commit(&first.branch).unwrap();
+
+    // Cut the update in half at the worst possible place: `update_branch`
+    // lands, `update_proposal` fails, so the branch is ahead of the last head
+    // this machine finished recording.
+    mock.fail_update_proposal(first.number);
+    write(&sub.domain_root.join("notes/h.md"), b"theta\n");
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            crystalline_remote::RemoteError::Api { status: 500, .. }
+        ),
+        "{err:?}"
+    );
+    let pushed = mock.branch_commit(&first.branch).unwrap();
+    assert_ne!(pushed, head_before, "the branch really did move");
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].pending_head_commit.as_deref(),
+        Some(pushed.as_str()),
+        "the push was announced before it was made, so the record can name it"
+    );
+
+    // The retry is an ordinary update, not a divergence, and it leaves the
+    // record settled again.
+    mock.heal_update_proposal(first.number);
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::Update { number, .. } if number == first.number),
+        "the preview reads our own half-finished push as ours: {:?}",
+        plan.action
+    );
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    match outcome {
+        ProposeOutcome::Updated(r) => assert_eq!(r.number, first.number),
+        other => panic!("expected Updated, got {other:?}"),
+    }
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.proposals[0].head_commit.as_deref(),
+        Some(mock.branch_commit(&first.branch).unwrap().as_str()),
+        "the record caught up with the branch"
+    );
+    assert_eq!(
+        st.proposals[0].pending_head_commit, None,
+        "and nothing is left pending"
+    );
+}
+
+// The heal is narrow: a head that matches neither the recorded one nor the
+// announced one is still a reviewer's, and is still refused.
+
+#[tokio::test]
+async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+
+    mock.fail_update_proposal(first.number);
+    write(&sub.domain_root.join("notes/i.md"), b"iota\n");
+    let _ = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap_err();
+    mock.heal_update_proposal(first.number);
+
+    // A reviewer pushes on top of the interrupted push: the live head is now
+    // neither the recorded head nor the announced one.
+    let reviewer = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&first.branch, &reviewer);
+
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { number, .. } if number == first.number),
+        "{:?}",
+        plan.action
+    );
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::ProposalDiverged { number, .. } if number == first.number),
+        "{outcome:?}"
+    );
+}
+
+// The branch name carries 4 random hex chars after the timestamp, killing the
+// same-second 422 on two rapid creates.
+
+#[tokio::test]
+async fn scenario_33_branch_name_ends_with_a_hex4_suffix() {
+    let mock = MockProvider::new();
+    let (_sub, report) = shared_once(&mock).await;
+    let mut parts = report.branch.rsplit('-');
+    let suffix = parts.next().unwrap();
+    let timestamp = parts.next().unwrap();
+    assert_eq!(suffix.len(), 4, "{}", report.branch);
+    assert!(
+        suffix.chars().all(|c| c.is_ascii_hexdigit()),
+        "{}",
+        report.branch
+    );
+    assert_eq!(timestamp.len(), 12, "{}", report.branch);
+    assert!(
+        timestamp.chars().all(|c| c.is_ascii_digit()),
+        "{}",
+        report.branch
+    );
+}
+
+// NothingToShare leaves an open proposal exactly as it is.
+
+#[tokio::test]
+async fn scenario_34_nothing_to_share_leaves_the_open_proposal_untouched() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let before = load_state(&sub.state_dir);
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    // Everything local is already on the open proposal's branch? No: the base
+    // has not moved, so the same local edit is re-detected. Delete the edit
+    // first to make the tree truly clean.
+    drop(outcome);
+    write(&sub.domain_root.join("notes/a.md"), b"alpha\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "{outcome:?}"
+    );
+    let after = load_state(&sub.state_dir);
+    assert_eq!(
+        after.proposals.first().map(|p| p.number),
+        Some(first.number)
+    );
+    assert_eq!(before.proposals[0].status, after.proposals[0].status);
+}
+
+// Scenario 35: the preview classifies without writing.
+
+#[tokio::test]
+async fn scenario_35_preview_reports_update_for_an_open_proposal_without_writing() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    write(&sub.domain_root.join("notes/h.md"), b"theta\n");
+    let writes_before = mock.calls().iter().filter(|c| is_write_call(c)).count();
+
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    match plan.action {
+        PlannedAction::Update { number, ref url } => {
+            assert_eq!(number, first.number);
+            assert_eq!(url, &first.url);
+        }
+        other => panic!("expected Update, got {other:?}"),
+    }
+    assert_eq!(
+        plan.changes.changes.len(),
+        2,
+        "the old edit and the new file"
+    );
+    assert!(!plan.effective_title.is_empty());
+
+    let writes_after = mock.calls().iter().filter(|c| is_write_call(c)).count();
+    assert_eq!(writes_after, writes_before, "a preview never writes");
+    // And the record did not move.
+    assert_eq!(load_state(&sub.state_dir).proposals[0].number, first.number);
+}
+
+#[tokio::test]
+async fn scenario_35_preview_reports_create_nothing_and_diverged() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Clean tree: nothing to share.
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::NothingToShare);
+
+    // A local change with no open proposal: create, and the caller's title
+    // wins over the generated one.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        Some("My title"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::Create);
+    assert_eq!(plan.effective_title, "My title");
+
+    // Share it, amend the branch, preview again: diverged.
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+        None,
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("{other:?}"),
+    };
+    let amended = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&report.branch, &amended);
+    write(&sub.domain_root.join("notes/i.md"), b"iota\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { number, .. } if number == report.number),
+        "{:?}",
+        plan.action
+    );
+}
+
+#[tokio::test]
+async fn scenario_35_preview_still_pulls_first() {
+    // Freshness is part of previewing honestly: the pull's working-tree
+    // writes DO happen.
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(commit_files(&[("MANIFEST.md", b"# Manifest")]), None);
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/new.md", b"upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let _ = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(read(&sub.domain_root.join("notes/new.md")), b"upstream\n");
+}
+
+// Scenario 35 (b): the two preview branches the first pass left untested -
+// conflicts pending, and a declined-only record that reads as Create without
+// the supersede cleanup a real share would perform.
+
+#[tokio::test]
+async fn scenario_35_preview_reports_conflicts_pending() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // A same-line conflict from a previous pull.
+    write(&sub.domain_root.join("notes/a.md"), b"line one LOCAL\n");
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one UPSTREAM\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).conflicts.len(), 1);
+
+    // An unrelated local change would otherwise be shareable; the outstanding
+    // conflict alone decides the plan.
+    write(&sub.domain_root.join("notes/new.md"), b"brand new\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::ConflictsPending { count: 1 });
+}
+
+#[tokio::test]
+async fn scenario_35_preview_of_a_declined_record_creates_without_cleanup() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_proposal_state(first.number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1);
+    assert_eq!(st.proposals[0].status, ProposalStatus::Declined);
+
+    let writes_before = mock.calls().iter().filter(|c| is_write_call(c)).count();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        None,
+    )
+    .await
+    .unwrap();
+    // A real share would supersede the declined record; a preview only says
+    // what would happen.
+    assert_eq!(plan.action, PlannedAction::Create);
+    let writes_after = mock.calls().iter().filter(|c| is_write_call(c)).count();
+    assert_eq!(
+        writes_after, writes_before,
+        "a preview never cleans up: no delete_branch, no close_proposal"
+    );
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals.len(), 1, "the declined record stays put");
+    assert!(st.history.is_empty());
+}
+
+// Scenario 36: a pull fetches feedback for still-open proposals and caps it.
+
+#[tokio::test]
+async fn scenario_36_pull_fetches_and_caps_feedback_on_open_proposals() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let items: Vec<FeedbackItem> = (0..60)
+        .map(|i| FeedbackItem {
+            author: "bob".to_string(),
+            body: format!("comment {i}"),
+            path: None,
+            line: None,
+            submitted_at: format!("2026-08-21T10:{:02}:00Z", i % 60),
+            kind: FeedbackKind::Comment,
+        })
+        .collect();
+    mock.set_feedback(
+        first.number,
+        Feedback {
+            review_state: Some("changes_requested".to_string()),
+            items,
+        },
+    );
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let st = load_state(&sub.state_dir);
+    let prop = &st.proposals[0];
+    assert_eq!(prop.review_state.as_deref(), Some("changes_requested"));
+    assert_eq!(prop.feedback.len(), 50, "capped at the 50 newest");
+    // Newest by submitted_at survive: comment 59 down to comment 10.
+    assert!(prop.feedback.iter().any(|f| f.body == "comment 59"));
+    assert!(!prop.feedback.iter().any(|f| f.body == "comment 5"));
+    assert!(prop.updated_at.is_some());
+}
+
+// Scenario 36 (b): a feedback failure is non-fatal and keeps the previous
+// feedback.
+
+#[tokio::test]
+async fn scenario_36_feedback_failure_is_non_fatal_and_keeps_previous() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.set_feedback(
+        first.number,
+        Feedback {
+            review_state: Some("commented".to_string()),
+            items: vec![FeedbackItem {
+                author: "ana".to_string(),
+                body: "looks close".to_string(),
+                path: None,
+                line: None,
+                submitted_at: "2026-08-21T09:00:00Z".to_string(),
+                kind: FeedbackKind::Comment,
+            }],
+        },
+    );
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    mock.fail_feedback(first.number);
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .expect("a feedback failure never fails the pull");
+    assert!(report.up_to_date);
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals[0].feedback.len(), 1, "previous feedback kept");
+    assert_eq!(st.proposals[0].review_state.as_deref(), Some("commented"));
+}
+
+// Scenario 37: status consults the live open-proposal list.
+
+#[tokio::test]
+async fn scenario_37_status_flips_a_merged_elsewhere_proposal_without_consuming() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    // Merged on GitHub: gone from the open list, and the single GET says merged.
+    mock.set_proposal_state(first.number, ProposalState::Merged);
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
+        .await
+        .unwrap();
+    assert!(
+        report.open_proposals.is_empty(),
+        "the merged proposal left the open list"
+    );
+    let st = load_state(&sub.state_dir);
+    let prop = st
+        .proposals
+        .iter()
+        .find(|p| p.number == first.number)
+        .expect("still in proposals: status never consumes");
+    assert_eq!(prop.status, ProposalStatus::Merged);
+    // Consumption stays a pull concern. Merging is what moved the branch
+    // upstream in the first place, so let the mock forge reflect that (as
+    // every other merge scenario does) and pull: the record lands in history.
+    let branch_commit = mock.branch_commit(&first.branch).unwrap();
+    mock.set_branch("main", &branch_commit);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let st = load_state(&sub.state_dir);
+    assert!(st.proposals.iter().all(|p| p.number != first.number));
+    assert_eq!(st.history[0].number, first.number);
+}
+
+#[tokio::test]
+async fn scenario_37_status_flags_an_amended_branch() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    let amended = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
+    mock.set_branch(&first.branch, &amended);
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
+        .await
+        .unwrap();
+    assert_eq!(report.amended_upstream, vec![first.number]);
+    assert_eq!(report.open_proposals.len(), 1, "still open, just amended");
+    // Exactly one live list call answers both questions this status asks.
+    assert_eq!(
+        mock.calls()
+            .iter()
+            .filter(|c| *c == "list_open_proposals")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn scenario_37_status_list_failure_degrades_to_local_state() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    mock.fail_open_proposals();
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
+        .await
+        .expect("a list failure never fails status");
+    assert_eq!(report.open_proposals[0].number, first.number);
+    assert!(report.amended_upstream.is_empty());
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.proposals[0].status, ProposalStatus::Open, "unchanged");
 }

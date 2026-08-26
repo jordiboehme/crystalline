@@ -1,8 +1,8 @@
 //! The rmcp tool router: the core tools of the v1 MCP surface plus the
-//! collaboration tools, which are always listed and refuse while team
-//! collaboration is off.
+//! collaboration tools, which are listed once team collaboration is on and
+//! refuse - rather than vanish from dispatch - while it is off.
 //!
-//! # One list for every client (SEP-2567)
+//! # One list for every client, at any given instant (SEP-2567)
 //!
 //! MCP 2026-07-28 says a server's `tools/list` result "MAY change over time
 //! [...] but MUST NOT vary per-connection or as a side effect of other
@@ -12,22 +12,30 @@
 //!
 //! > A gate may stay on the listing if and only if (a) its input is not
 //! > derived from the identity, capabilities or configuration of the
-//! > connecting client, and (b) its input cannot be changed by any request on
-//! > that connection. Anything failing either half refuses at call time.
+//! > connecting client, and (b) its input is a single value on the shared
+//! > instance, so that every client listing at the same moment is served the
+//! > same list. A gate whose input is instance-wide but mutable owes an
+//! > announcement; one failing (a), or with no single value to point at,
+//! > refuses at call time instead.
 //!
-//! `read_only` passes both: it is a construction field on the engine
-//! (`Engine::with_read_only` takes `self` by value) and the engine is shared
-//! behind an `Arc`, so nothing a client sends can move it. `github.enabled`
-//! and whether any domain declares provisioning both fail (b) - `configure`,
-//! `add_domain` and `update_domain` change them on the very connection that
-//! then lists - so they refuse at call time. The client's install-receipt
-//! match failed (a) and is gone from the listing entirely.
+//! `read_only` passes with nothing to announce: it is a construction field on
+//! the engine (`Engine::with_read_only` takes `self` by value) and the engine
+//! is shared behind an `Arc`, so nothing a client sends can move it.
+//! `skills.serve` is snapshotted at the same point and behaves the same way.
+//! `github.enabled` passes with an announcement: it is one setting on the
+//! shared engine, `configure` can flip it, and a flip pushes
+//! `notifications/tools/list_changed` to every open subscription. Whether any
+//! domain declares provisioning has no single setting behind it - `add_domain`
+//! and `update_domain` can create a declaration mid-call - so `provision` is
+//! listed always and refuses its mutating actions. The client's
+//! install-receipt match failed (a) and is gone from the listing entirely.
 //!
-//! Refusing rather than hiding is SEP-2567's own prescription: expose the tool
-//! unconditionally and put the dependency "in the tool's input schema and
-//! description rather than in the list result". Half of it was already true
-//! here, since every gate hid a tool without unregistering its route, so what
-//! changed is the listing rather than the guarding.
+//! Refusing rather than hiding is SEP-2567's own prescription where hiding
+//! would be per-connection: expose the tool unconditionally and put the
+//! dependency "in the tool's input schema and description rather than in the
+//! list result". Every gate here hides without unregistering a route either
+//! way, so a client calling a tool it cannot see is always told why rather
+//! than answered "no such tool".
 //!
 //! Each tool is a thin wrapper over [`crate::engine::Engine`], which does the
 //! real work and is shared with the CLI data commands. Tool descriptions are
@@ -51,16 +59,22 @@
 //! guard and gets a clean error. That gate is legitimate on the listing
 //! because the mode is fixed for the engine's lifetime.
 //!
-//! The collaboration tools (`configure`, `add_domain`, `share_changes`,
-//! `update_domain`, `origin_status`, `resolve_conflict`) split their two
-//! gates across the two sides of the rule above.
-//! `configure`/`add_domain`/`share_changes`/`resolve_conflict` disappear
-//! read-only, which stays on the listing. `github.enabled` is needed by every
-//! collaboration tool but `configure`, and it refuses at call time: the four
-//! tools that need it are listed whatever it says and answer with
+//! The six collaboration tools (`configure`, `share_changes`, `update_domain`,
+//! `origin_status`, `resolve_conflict`, `withdraw_proposal`) carry two gates
+//! that compose. `configure`, `share_changes`, `resolve_conflict` and
+//! `withdraw_proposal` disappear read-only. `add_domain` is deliberately not
+//! one of the six: it creates domains of every kind, so it is write-gated like
+//! any other writer (see `WRITE_TOOLS`) and only its team-domain branch needs
+//! `github.enabled`, enforced in the engine rather than on the listing.
+//! `github.enabled` is needed by every collaboration tool but `configure`, and
+//! while it is off the five that need it are hidden from
+//! the listing too, so a default install spends no context on a forge surface
+//! nobody connected; `configure` is never hidden by it, since it is the only
+//! way to turn the rest on. Calling a hidden one still answers with
 //! `RemoteError::NotEnabled`'s message, which names the setting and both ways
-//! to change it. Their descriptions say the same thing, so a client's tool
-//! search reads the dependency without having to call. See `COLLAB_TOOLS`,
+//! to change it, so a stale cached list teaches rather than dead-ends. Turning
+//! the setting on makes all five appear on the next list and announces the
+//! change to every open subscription. See `COLLAB_TOOLS`,
 //! `COLLAB_WRITE_TOOLS`, `hidden_collab_tool` and `refused_collab_tool`.
 //!
 //! `evolve_engrams` is gated a third way, on the read-only flag alone. It is a
@@ -143,20 +157,23 @@
 //! `#[prompt_handler]` replaces any `list_prompts` in its impl block and the
 //! gate needs one it can empty.
 //!
-//! # Nothing is pushed, because nothing can change
+//! # One list can change, and it is announced to subscribers only
 //!
-//! This server sends no `notifications/*/list_changed` at all. `configure`
-//! used to push one whenever it flipped `github.enabled`, and `add_domain` and
-//! `update_domain` whenever they flipped whether any domain declares
-//! provisioning; after those gates moved to call-time refusals and
-//! `skills.serve` was snapshotted at engine construction, every input to every
-//! list is fixed before the first request arrives, so each of those pushes
-//! announced a change that had not happened. MCP 2026-07-28 removes the
-//! unsolicited channel outright - a notification either rides a
-//! `subscriptions/listen` stream the client opened or it does not exist - so
-//! [`McpServer::accepted_subscription_filter`] and [`McpServer::listen`] serve
-//! that stream, and its doc comment carries what a future dynamic list would
-//! have to do to announce itself.
+//! `configure` flipping `github.enabled` moves the tool list, because the five
+//! GitHub-gated collaboration tools are listed only while it is on. That is
+//! the single mover on this server: `resources/list` and `prompts/list` read
+//! `skills.serve` and `harness_onboarded`, both fixed before the first request
+//! arrives, and the provisioning gate that `add_domain` and `update_domain`
+//! could once move became a call-time refusal instead.
+//!
+//! MCP 2026-07-28 removes the unsolicited channel outright - a notification
+//! either rides a `subscriptions/listen` stream the client opened or it does
+//! not exist - so the flip announces itself through
+//! [`McpServer::accepted_subscription_filter`] and [`McpServer::listen`], on
+//! the sink registry the shared engine holds (`crate::subscribers`). A legacy
+//! peer cannot subscribe and is therefore told nothing at all; it re-reads
+//! `tools/list` at its own discretion, which is the same contract it had
+//! before.
 //!
 //! # Asking before destroying (SEP-2322)
 //!
@@ -210,8 +227,8 @@
 //! non-destructive because its default behaviour is additive (it errors on an
 //! existing permalink unless `overwrite`), and `open_world` is true only for
 //! the tools that talk to GitHub - `configure` through its connect flow,
-//! `add_domain` through team mode, `share_changes`, `update_domain` and
-//! `origin_status`.
+//! `add_domain` through team mode, `share_changes`, `update_domain`,
+//! `origin_status` and `withdraw_proposal`.
 
 use std::sync::Arc;
 
@@ -389,6 +406,18 @@ const RESOLUTION_KEY: &str = "resolution";
 const RESOLUTION_OVERWRITE: &str = "overwrite";
 const RESOLUTION_CANCEL: &str = "cancel";
 
+/// The three resolutions `resolve_conflict` accepts, spelled once.
+///
+/// Each is spelled exactly as that tool's own `resolution` parameter, so the
+/// word the question offers, the word a client answers with and the word the
+/// dispatch acts on cannot drift apart. Only the first two are offered as
+/// choices: merged is not a choice a form can collect, because it needs a
+/// document rather than a pick, so it appears in the schema nowhere and in the
+/// guidance everywhere.
+const RESOLUTION_MINE: &str = "mine";
+const RESOLUTION_THEIRS: &str = "theirs";
+const RESOLUTION_MERGED: &str = "merged";
+
 /// The substring of the engine's permalink-collision error that identifies it.
 ///
 /// The engine words one message for this failure
@@ -538,6 +567,57 @@ fn resolved_overwrite(responses: &Option<rmcp::model::InputResponses>) -> Option
     Some(answer["content"][RESOLUTION_KEY] == json!(RESOLUTION_OVERWRITE))
 }
 
+/// The choice an unresolved conflict offers when the caller named no
+/// resolution: mine or theirs, titled so a client renders two sentences.
+///
+/// merged is deliberately not an option - a free-text merge body does not fit
+/// a confirm form; the tool description says to call again with
+/// resolution merged and content instead. The two words are spelled exactly as
+/// `resolve_conflict`'s own `resolution` parameter, so the answer and the
+/// retry say the same thing, which is [`collision_question`]'s discipline
+/// applied to a second pair of choices.
+fn conflict_choice(message: String) -> InputRequiredResult {
+    let choices = EnumSchema::builder(vec![
+        RESOLUTION_MINE.to_string(),
+        RESOLUTION_THEIRS.to_string(),
+    ])
+    .title("Resolution")
+    .description("Which side of the conflict to keep.")
+    .enum_titles(vec![
+        "Keep my local version".to_string(),
+        "Take the team's version".to_string(),
+    ])
+    .expect("two titles for two choices")
+    .build();
+    let requested_schema = ElicitationSchema::builder()
+        .required_enum_schema(RESOLUTION_KEY, choices)
+        .build()
+        .expect("the resolution schema names the property it requires");
+    form_question(RESOLUTION_KEY, message, requested_schema)
+}
+
+/// Which side the client chose, with [`confirmed`]'s tri-state discipline:
+/// `None` has not been asked, `Some(None)` is any answer that is not exactly
+/// an accepted mine or theirs, and only those two strings pass through.
+///
+/// Read as plain JSON for [`confirmed`]'s reason, and narrowed to two static
+/// strings rather than handing the client's own text on to the engine: a
+/// resolution that reaches [`crate::engine::Engine::origin_resolve`] is one of
+/// ours, never one a malformed answer smuggled in.
+fn chosen_resolution(
+    responses: &Option<rmcp::model::InputResponses>,
+) -> Option<Option<&'static str>> {
+    let answer = responses.as_ref()?.get(RESOLUTION_KEY)?;
+    if answer["action"] != json!("accept") {
+        return Some(None);
+    }
+    Some(match answer["content"][RESOLUTION_KEY].as_str() {
+        Some(RESOLUTION_MINE) => Some(RESOLUTION_MINE),
+        Some(RESOLUTION_THEIRS) => Some(RESOLUTION_THEIRS),
+        _ => None,
+    })
+}
+
 /// Attach the SEP-2549 caching hints a modern peer is owed, and nothing to a
 /// legacy one.
 ///
@@ -586,32 +666,39 @@ impl_cache_hinted!(
     ReadResourceResult,
 );
 
-/// The five GitHub collaboration tools, gated on the engine's live
+/// The six GitHub collaboration tools, gated on the engine's live
 /// `github.enabled` setting (all but `configure`) and `read_only` flag (see
 /// `COLLAB_WRITE_TOOLS`). `add_domain` is not among them: it creates domains of
 /// every kind, so it is a write-gated tool (see `WRITE_TOOLS`), and only its
 /// team-domain branch needs `github.enabled`, enforced in the engine.
-const COLLAB_TOOLS: [&str; 5] = [
+const COLLAB_TOOLS: [&str; 6] = [
     "configure",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
+    "withdraw_proposal",
 ];
 
-/// Of the five collaboration tools, the three also hidden in read-only mode:
+/// Of the six collaboration tools, the four also hidden in read-only mode:
 /// `configure` (settings and this machine's GitHub identity are frozen the
-/// same way content is), `share_changes` and `resolve_conflict` (each writes a
-/// proposal or config). `update_domain` and `origin_status` stay visible
-/// read-only, mirroring their engine-level exemption (a pull is a derived-truth
-/// update like sync; status is a pure read).
-const COLLAB_WRITE_TOOLS: [&str; 3] = ["configure", "share_changes", "resolve_conflict"];
+/// same way content is), `share_changes`, `resolve_conflict` and
+/// `withdraw_proposal` (each writes a proposal or config). `update_domain` and
+/// `origin_status` stay visible read-only, mirroring their engine-level
+/// exemption (a pull is a derived-truth update like sync; status is a pure
+/// read).
+const COLLAB_WRITE_TOOLS: [&str; 4] = [
+    "configure",
+    "share_changes",
+    "resolve_conflict",
+    "withdraw_proposal",
+];
 
 /// Appended to the initialize instructions while TOON responses are active,
 /// so a client model reads list results as structured data rather than prose.
 const TOON_INSTRUCTIONS_NOTE: &str = "\n\nList-shaped tool results (search hits, activity, listings and status reports) arrive TOON-encoded rather than as JSON: indentation nests objects, `name[N]{field1,field2}:` heads a uniform array with one comma-separated row per record and a tags cell joins its values with commas. Read them as data with exactly those fields.";
 
-/// Whether `name` is one of the five collaboration tools.
+/// Whether `name` is one of the six collaboration tools.
 fn is_collab_tool(name: &str) -> bool {
     COLLAB_TOOLS.contains(&name)
 }
@@ -764,26 +851,52 @@ fn minimal_instructions(skills_serve: SkillsServe, harness_onboarded: bool) -> b
     skills_serve == SkillsServe::Auto && harness_onboarded
 }
 
-/// Whether collaboration tool `name` is hidden given the engine's `read_only`
-/// state. Not meaningful for a non-collab tool name; callers check
-/// [`is_write_tool`] separately for those. The net matrix: read-write shows
-/// all five, read-only shows `update_domain` and `origin_status` only.
+/// Whether collaboration tool `name` is hidden, given the engine's `read_only`
+/// state and its live `github.enabled` setting. Not meaningful for a non-collab
+/// tool name; callers check [`is_write_tool`] separately for those.
 ///
-/// `github.enabled` used to be the other half of this predicate. It left the
-/// listing for [`refused_collab_tool`]: `configure` can flip it on this very
-/// connection, and SEP-2567 forbids a list varying "as a side effect of other
-/// requests on the connection". `read_only` stays because it cannot move -
-/// `Engine::with_read_only` (`engine.rs:788-791`) takes `self` by value at
-/// construction and the engine is shared behind an `Arc`, so no request can
-/// reach it.
-fn hidden_collab_tool(name: &str, read_only: bool) -> bool {
-    read_only && COLLAB_WRITE_TOOLS.contains(&name)
+/// The net matrix, and the two gates compose rather than override:
+///
+/// - `github.enabled` off hides all five gated tools whatever the mode is, and
+///   never hides `configure`, which is the only way to turn them on.
+/// - read-only additionally hides the [`COLLAB_WRITE_TOOLS`] set, so a
+///   read-only instance with collaboration on lists `update_domain` and
+///   `origin_status` and nothing else of the six.
+///
+/// # Invariance is per instant, not per process
+///
+/// SEP-2567 says a tool list "MUST NOT vary per-connection or as a side effect
+/// of other requests on the connection". `github.enabled` is read live here,
+/// the same way [`refused_collab_tool`] reads it, so a `configure` call does
+/// move this list - and that is the deliberate reading of the rule taken on
+/// 2026-08-21: what may not vary is the answer two clients get at the same
+/// moment, and this gate reads one shared setting, so it never does. A list
+/// that may "change over time" is the same sentence's first clause; what it
+/// owes is an announcement, which `Engine::configure` sends to every open
+/// subscription - from whichever surface wrote the setting, the tool, the
+/// control socket or the REST API (see [`crate::subscribers`]).
+///
+/// `read_only` is the gate that genuinely cannot move: `Engine::with_read_only`
+/// (`engine.rs:788-791`) takes `self` by value at construction and the engine
+/// is shared behind an `Arc`, so no request can reach it.
+///
+/// Hidden means hidden, not disabled. Every route stays registered and
+/// [`refused_collab_tool`] still answers a direct call with the message naming
+/// the setting, so a client holding a stale list is taught rather than told
+/// "no such tool".
+fn hidden_collab_tool(name: &str, read_only: bool, github_enabled: bool) -> bool {
+    refused_collab_tool(name, github_enabled) || (read_only && COLLAB_WRITE_TOOLS.contains(&name))
 }
 
 /// Whether collaboration tool `name` refuses at call time because
 /// `github.enabled` is off. Every collaboration tool but `configure` needs it,
 /// and `configure` is deliberately exempt: it is how the setting gets turned
 /// on.
+///
+/// [`hidden_collab_tool`] is built on this predicate rather than beside it, so
+/// the listing and the refusal can never disagree about which tools the
+/// setting governs: whatever is withheld from the list is exactly what refuses
+/// when it is called anyway.
 ///
 /// The refusal itself is [`RemoteError::NotEnabled`]'s message, which names
 /// the setting and both ways to change it. The engine keeps its own copy of
@@ -1319,13 +1432,18 @@ impl McpServer {
             return result.map_err(to_error).and_then(ok);
         }
 
-        // No list-changed notification follows, and none is owed: nothing this
-        // call can write moves a list. `github.enabled` refuses at call time
-        // instead of shaping the listing, and `skills.serve` is frozen at
-        // engine construction ([`Engine::skills_serve`]). The unsolicited push
-        // that used to fire here announced a change that had not happened, and
-        // from MCP 2026-07-28 an unsolicited notification has no channel at all
-        // (see [`McpServer::listen`]).
+        // `github.enabled` gates the listing of five collaboration tools
+        // ([`hidden_collab_tool`]), so a call that flips it moves this
+        // server's tool list and owes subscribers an announcement. That does
+        // not live here: it lives on `Engine::configure`, which every key in
+        // this batch goes through and which the control socket and the REST
+        // API write the same setting through, so the notification does not
+        // depend on the route the flip took.
+        //
+        // The announcement therefore rides the individual key that flipped
+        // rather than the batch. A `configure` that turns collaboration on and
+        // then fails on a later key has still moved the list, has still
+        // announced it, and reports what applied before it stopped.
         self.apply_settings(&p).await?;
 
         self.engine
@@ -1421,7 +1539,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. While a proposal is already open for the domain, calling this again UPDATES it in place - same proposal number, same URL, a fresh commit reviewers are notified about - it never opens a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, edit the engrams, share again to the same proposal. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (update proposal #N or open a new one), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1432,21 +1550,53 @@ impl McpServer {
     async fn share_changes(
         &self,
         Parameters(p): Parameters<ShareChangesParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
-            return refuse(RemoteError::NotEnabled.to_string());
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
+        }
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    let preview = self
+                        .engine
+                        .origin_share_preview(&p.domain, p.title.as_deref())
+                        .await
+                        .map_err(to_error)?;
+                    // Only a share that would publish gets a question;
+                    // nothing_to_share, conflicts_pending and
+                    // proposal_diverged answer in round one, because
+                    // executing the share produces exactly those canonical
+                    // shapes with no publishing write - no commit, no branch
+                    // update, no proposal opened or patched. Stated that way
+                    // rather than as "no provider write": the pull the share
+                    // runs first can reconcile a proposal the forge already
+                    // closed, so a diverged answer may be preceded by
+                    // bookkeeping calls. Those record what the forge already
+                    // decided; they never publish this domain's changes.
+                    if matches!(preview["action"].as_str(), Some("create") | Some("update")) {
+                        return Ok(confirm_question(share_question(&preview)).into());
+                    }
+                }
+                Some(false) => {
+                    return refuse(SHARE_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
         }
         self.engine
             .origin_share(&p.domain, p.title.as_deref(), p.description.as_deref())
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
         name = "update_domain",
         title = "Update domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then share_changes again to update the same proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1471,7 +1621,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, open and declined proposals and any conflicts to settle. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -1484,6 +1634,7 @@ impl McpServer {
         self.engine
             .origin_status(p.domain.as_deref())
             .await
+            .map(lean_origin_status)
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
     }
@@ -1491,7 +1642,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1502,17 +1653,43 @@ impl McpServer {
     async fn resolve_conflict(
         &self,
         Parameters(p): Parameters<ResolveConflictParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
-            return refuse(RemoteError::NotEnabled.to_string());
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
-        let (keep, content): (Option<&str>, Option<&[u8]>) = match p.resolution.as_str() {
-            "mine" => (Some("mine"), None),
-            "theirs" => (Some("theirs"), None),
-            "merged" => {
+        // Three ways to arrive at a resolution, and the arm order is the
+        // behaviour: an explicit one is honoured for every peer and never
+        // asked about, an eliciting peer that named none is asked, and any
+        // other peer is refused in words it can read.
+        let resolution: String = match &p.resolution {
+            Some(resolution) => resolution.clone(),
+            None if confirmation_supported(&ctx) => match chosen_resolution(&responses.0) {
+                None => {
+                    let detail = self
+                        .engine
+                        .origin_conflict_detail(&p.domain, None, Some(&p.path))
+                        .await
+                        .map_err(to_error)?;
+                    return Ok(conflict_choice(conflict_resolution_question(&detail)).into());
+                }
+                Some(None) => {
+                    return refuse(RESOLVE_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(Some(choice)) => choice.to_string(),
+            },
+            None => return refuse(RESOLVE_NEEDS_RESOLUTION).map(CallToolResponse::from),
+        };
+        let (keep, content): (Option<&str>, Option<&[u8]>) = match resolution.as_str() {
+            RESOLUTION_MINE => (Some(RESOLUTION_MINE), None),
+            RESOLUTION_THEIRS => (Some(RESOLUTION_THEIRS), None),
+            RESOLUTION_MERGED => {
                 let Some(content) = p.content.as_deref() else {
                     return Err(ErrorData::invalid_params(
-                        "resolve_conflict requires content when resolution is merged".to_string(),
+                        format!(
+                            "resolve_conflict requires content when resolution is {RESOLUTION_MERGED}"
+                        ),
                         None,
                     ));
                 };
@@ -1521,7 +1698,7 @@ impl McpServer {
             other => {
                 return Err(ErrorData::invalid_params(
                     format!(
-                        "resolve_conflict resolution must be mine, theirs or merged, got '{other}'"
+                        "resolve_conflict resolution must be {RESOLUTION_MINE}, {RESOLUTION_THEIRS} or {RESOLUTION_MERGED}, got '{other}'"
                     ),
                     None,
                 ));
@@ -1529,6 +1706,32 @@ impl McpServer {
         };
         self.engine
             .origin_resolve(&p.domain, &p.path, keep, content)
+            .await
+            .map_err(to_error)
+            .and_then(ok)
+            .map(CallToolResponse::from)
+    }
+
+    #[tool(
+        name = "withdraw_proposal",
+        title = "Withdraw proposal",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        )
+    )]
+    async fn withdraw_proposal(
+        &self,
+        Parameters(p): Parameters<WithdrawProposalParams>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
+            return refuse(RemoteError::NotEnabled.to_string());
+        }
+        self.engine
+            .origin_withdraw(&p.domain, p.proposal, p.revert.unwrap_or(false))
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -2096,41 +2299,37 @@ impl ServerHandler for McpServer {
         )
     }
 
-    /// Hold one acknowledged subscription open until the client ends it.
+    /// Hold one acknowledged subscription open until the client ends it, and
+    /// keep its sink where a list change can find it.
     ///
-    /// # This stream is silent, and that is the finding rather than a shortcut
+    /// # What can move, and what cannot
     ///
-    /// Nothing this server can be asked to do moves any of the three lists.
-    /// [`McpServer::list_tools`] reads `Engine::read_only`,
-    /// `Engine::skills_serve` and `harness_onboarded`; `list_resources` and
-    /// `list_prompts` read the last two. All three are fixed before the first
-    /// request arrives - read-only at engine construction, `skills.serve`
-    /// snapshotted there too, the harness answer resolved by the spawned
-    /// process before the session started - so no request on any transport can
-    /// change what a later `tools/list`, `resources/list` or `prompts/list`
-    /// returns. There is therefore no truthful `notifications/*/list_changed`
-    /// to send, and the three unsolicited pushes that used to fire from
-    /// `configure`, `add_domain` and `update_domain` were deleted rather than
-    /// routed here: after the gates they keyed on moved to call-time refusals,
-    /// each announced a change that had not happened.
+    /// One thing this server can be asked to do moves a list: `configure` can
+    /// flip `github.enabled`, and five collaboration tools appear or disappear
+    /// with it (see [`hidden_collab_tool`]). That is the only mover.
+    /// `resources/list` and `prompts/list` read `skills.serve` and
+    /// `harness_onboarded`, both fixed before the first request arrives, so
+    /// those two categories are accepted on a subscription and then never
+    /// carry anything - accepting a category is a statement about what this
+    /// server may deliver, not a promise that it will.
     ///
-    /// **So no sink is registered anywhere, deliberately.** The plan for this
-    /// work called for a registry of cloned `SubscriptionSink`s on the shared
-    /// `Arc<Engine>`; a registry nothing writes to is worse than none, because
-    /// it reads as implemented. What the registry would have needed is recorded
-    /// here instead, since the next person to add a genuinely dynamic list has
-    /// to get it right: the sink cannot live on this handler, because on the
-    /// stateless HTTP path rmcp builds a fresh service per request
+    /// # The sink lives on the engine, not on this handler
+    ///
+    /// On the stateless HTTP path rmcp builds a fresh service per request
     /// (`get_service()` at rmcp 3.1.2 `tower.rs:1822` and `:1948`) and every
-    /// modern peer routes statelessly, so the handler that would push and the
-    /// handler that took the subscription are different objects sharing only
-    /// the engine. (The legacy session path builds one service per session,
-    /// `tower.rs:1855`, and stdio one per connection, so a handler-local
-    /// registry would have worked there and nowhere else.) `SubscriptionSink`
-    /// is `Clone` and every field is `Send + Sync + 'static`
-    /// (`service/server.rs:139-144`), so `Arc<Engine>` can hold one; it also
-    /// holds a `Peer` and a child cancellation token, so it must be removed
-    /// when this method returns or the engine accumulates dead peers.
+    /// modern peer routes statelessly, so the handler that takes this
+    /// subscription and the handler that later runs `configure` are different
+    /// objects sharing only the `Arc<Engine>`. (The legacy session path builds
+    /// one service per session, `tower.rs:1855`, and stdio one per connection,
+    /// so a handler-local registry would have worked there and nowhere else -
+    /// which is exactly the bug that would have shipped silently.) The registry
+    /// is therefore [`crate::subscribers::ListSubscribers`], reached through
+    /// `Engine::list_subscribers`.
+    ///
+    /// `SubscriptionSink` holds a `Peer` and a child cancellation token
+    /// (`service/server.rs:139-144`), so an entry outliving its stream would
+    /// pin a dead peer. The guard returned by `register` is held for exactly
+    /// the body of this method and drops the entry however the stream ends.
     ///
     /// # What the client is guaranteed before this runs
     ///
@@ -2142,9 +2341,14 @@ impl ServerHandler for McpServer {
     /// filter on anything sent later (`:184-257`). Both are pinned by
     /// `tests/mcp_subscriptions.rs` off the wire, not assumed.
     async fn listen(&self, context: SubscriptionContext) -> Result<(), ErrorData> {
+        let _registered = crate::subscribers::ListSubscribers::register(
+            self.engine.list_subscribers(),
+            context.sink().clone(),
+        );
         tracing::debug!(
             accepted = ?context.accepted(),
-            "subscription opened; this server has no list that can change, so the stream stays silent"
+            listening = self.engine.list_subscribers().len(),
+            "subscription opened"
         );
         context.cancelled().await;
         Ok(())
@@ -2152,31 +2356,42 @@ impl ServerHandler for McpServer {
 
     /// List the exposed tools.
     ///
-    /// # Only inputs no request can move may gate this list
+    /// # Every client listing at the same instant sees the same list
     ///
     /// MCP 2026-07-28 (SEP-2567, `/server/tools`) says a server's tool list
     /// "MAY change over time [...] but MUST NOT vary per-connection or as a
     /// side effect of other requests on the connection", and the identical
-    /// sentence governs `resources/list` and `prompts/list`. So a gate may
-    /// stay here only if its input is neither derived from the connecting
-    /// client nor changeable by a request on that connection.
+    /// sentence governs `resources/list` and `prompts/list`. The invariant this
+    /// method keeps is the first half read literally: a gate here may read
+    /// deployment or instance state, never anything derived from who is asking.
     ///
-    /// What is left is `read_only`, which is fixed at engine construction
-    /// (`Engine::with_read_only`, `engine.rs:788-791`, takes `self` by value;
-    /// the engine is shared behind an `Arc`), plus the `skills.serve` setting,
-    /// snapshotted at the same point (`Engine::skills_serve`), and the harness
-    /// answer the spawned process resolved before the session started - see
-    /// [`hidden_skills_surface`]. All three are fixed before the first request,
-    /// which is why this list can never move and why [`McpServer::listen`] has
-    /// nothing to announce.
+    /// Three of the four gates cannot move at all. `read_only` is fixed at
+    /// engine construction (`Engine::with_read_only`, `engine.rs:788-791`,
+    /// takes `self` by value; the engine is shared behind an `Arc`),
+    /// `skills.serve` is snapshotted at the same point
+    /// (`Engine::skills_serve`) and the harness answer was resolved by the
+    /// spawned process before the session started - see
+    /// [`hidden_skills_surface`].
     ///
-    /// `github.enabled` and whether any domain declares provisioning both left
-    /// this list for a call-time refusal, which is the remedy SEP-2567
-    /// prescribes itself: expose the tool unconditionally and put the
-    /// dependency "in the tool's input schema and description rather than in
-    /// the list result". The routes were always registered - the gates hid
-    /// rather than disabled - so what changed is the listing, not the
-    /// guarding.
+    /// The fourth, `github.enabled`, is read **live**, and is the one gate that
+    /// makes this list dynamic (see [`hidden_collab_tool`]). It is a single
+    /// setting on the shared engine, so two clients listing at the same moment
+    /// still get the same answer; what varies is the moment, which is the
+    /// "MAY change over time" clause rather than a violation of the one after
+    /// it. The obligation that comes with it is discharged in
+    /// `Engine::configure`, the seam every writer of that setting goes
+    /// through: a flip announces itself on every open subscription stream, and
+    /// to nobody who did not open one.
+    ///
+    /// Whether any domain declares provisioning is the gate that did leave this
+    /// list for a call-time refusal, which is the remedy SEP-2567 prescribes
+    /// itself: expose the tool unconditionally and put the dependency "in the
+    /// tool's input schema and description rather than in the list result".
+    /// It stays gone, because `add_domain` and `update_domain` can create a
+    /// declaration mid-call and there is no one setting to point at.
+    ///
+    /// Every route stays registered whatever is hidden, so a client calling a
+    /// tool it cannot see reaches the handler and is refused with a reason.
     ///
     /// Both this method and `get_tool` run every surviving tool's schema
     /// through `crate::tool_schema::sanitize_tool` before returning it, so
@@ -2187,6 +2402,7 @@ impl ServerHandler for McpServer {
         context: RequestContext<RoleServer>,
     ) -> Result<ListToolsResult, ErrorData> {
         let read_only = self.engine.read_only();
+        let github_enabled = self.engine.github_enabled();
         let skills_hidden =
             hidden_skills_surface(self.engine.skills_serve(), self.harness_onboarded);
         let mut tools = Self::tool_router().list_all();
@@ -2194,7 +2410,7 @@ impl ServerHandler for McpServer {
             if is_write_tool(&t.name) && read_only {
                 return false;
             }
-            if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, read_only) {
+            if is_collab_tool(&t.name) && hidden_collab_tool(&t.name, read_only, github_enabled) {
                 return false;
             }
             if t.name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
@@ -2221,7 +2437,8 @@ impl ServerHandler for McpServer {
         if is_write_tool(name) && read_only {
             return None;
         }
-        if is_collab_tool(name) && hidden_collab_tool(name, read_only) {
+        if is_collab_tool(name) && hidden_collab_tool(name, read_only, self.engine.github_enabled())
+        {
             return None;
         }
         if name == crate::EVOLVE_TOOL_NAME && hidden_evolve_tool(read_only) {
@@ -2528,6 +2745,169 @@ fn delete_question(preview: &Value) -> String {
     format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
 }
 
+/// The sentence `share_changes` asks before it publishes, rendered from
+/// [`crate::engine::Engine::origin_share_preview`]'s plan: the action (update
+/// keeps the proposal's number and URL in front of the user), the effective
+/// title and the change mix, naming at most ten files.
+///
+/// **The two actions label the title line differently, because the value
+/// means different things to each.** On a create it is the proposal's title
+/// on GitHub, so it is labelled `Title`. On an update it is always the fresh
+/// commit's message, so it is labelled `Commit message` - which stays honest
+/// either way the caller went: with no `title` argument
+/// [`crystalline_remote::ops`]'s update forwards `None` and the pull request
+/// keeps whatever title it was opened with, and with a `title` argument the
+/// same value is both the commit message and the retitling PATCH the update
+/// sends. Labelling it `Title` would promise a retitle in the first case,
+/// which is the one a caller lands on by default.
+fn share_question(preview: &Value) -> String {
+    // `label` rides along with the action for exactly the reason above.
+    let (action, label) = match preview["action"].as_str().unwrap_or_default() {
+        "update" => (
+            format!(
+                "Update open proposal #{} ({})",
+                preview["number"].as_u64().unwrap_or_default(),
+                preview["url"].as_str().unwrap_or_default()
+            ),
+            "Commit message",
+        ),
+        _ => ("Open a new proposal".to_string(), "Title"),
+    };
+    let title = preview["effective_title"].as_str().unwrap_or_default();
+    let empty = Vec::new();
+    let changes = preview["changes"].as_array().unwrap_or(&empty);
+    let (mut added, mut updated, mut deleted) = (0usize, 0usize, 0usize);
+    for c in changes {
+        match c["kind"].as_str() {
+            Some("added") => added += 1,
+            Some("modified") => updated += 1,
+            Some("deleted") => deleted += 1,
+            _ => {}
+        }
+    }
+    let names: Vec<&str> = changes
+        .iter()
+        .take(10)
+        .filter_map(|c| c["path"].as_str())
+        .collect();
+    let more = changes.len().saturating_sub(10);
+    let listed = if more > 0 {
+        format!("{} and {more} more", names.join(", "))
+    } else {
+        names.join(", ")
+    };
+    format!(
+        "{action}? {label}: '{title}'. {added} added, {updated} modified, {deleted} deleted: {listed}. Reviewers see the result on GitHub."
+    )
+}
+
+/// Trims `origin_status`'s per-domain proposal records to what a status
+/// glance needs: number, url, title, status, review_state, amended_upstream,
+/// feedback_count, updated_at. The bodies stay out on purpose - update_domain
+/// and the REST payload carry them - so status never bloats a session with
+/// comment text the agent did not ask for.
+fn lean_origin_status(mut value: Value) -> Value {
+    if let Some(domains) = value.get_mut("domains").and_then(Value::as_array_mut) {
+        for domain in domains {
+            for key in ["open_proposals", "declined_proposals"] {
+                if let Some(entries) = domain.get_mut(key).and_then(Value::as_array_mut) {
+                    for entry in entries.iter_mut() {
+                        *entry = json!({
+                            "number": entry["number"],
+                            "url": entry["url"],
+                            "title": entry["title"],
+                            "status": entry["status"],
+                            "review_state": entry["review_state"],
+                            "amended_upstream": entry
+                                .get("amended_upstream")
+                                .cloned()
+                                .unwrap_or(json!(false)),
+                            "feedback_count": entry["feedback"]
+                                .as_array()
+                                .map(Vec::len)
+                                .unwrap_or(0),
+                            "updated_at": entry["updated_at"],
+                        });
+                    }
+                }
+            }
+        }
+    }
+    value
+}
+
+/// What an unconfirmed share tells the model, naming what did not happen.
+const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared. Call share_changes again if the user asks for it.";
+
+/// The sentence a conflict asks when the caller named no resolution: the
+/// conflict's path and kind, then a bounded preview of both sides.
+///
+/// The preview is the whole point of asking rather than refusing - a user
+/// choosing between "mine" and "theirs" is choosing between two texts, and
+/// only one of them is anywhere near the conversation. It is bounded at the
+/// first 20 lines a side because a question is rendered in a dialog, not in a
+/// pager; a cut side ends in an ellipsis line so the reader knows there is
+/// more, and a side that is absent or unreadable says so rather than
+/// rendering as empty (an empty file and a deleted one are different
+/// decisions).
+///
+/// **A null side is two different facts, and `note` is what tells them
+/// apart.** [`crate::engine::Engine::origin_conflict_detail`] nulls a side that
+/// is not there *and* a side that is there but is not UTF-8, setting `note`
+/// only in the second case. Reading every null as a deletion would tell a user
+/// a file they can see on disk was deleted, so a null under a standing note
+/// quotes the note instead. The engine's `note` is one field for the whole
+/// detail, overwritten by whichever side was last found *unreadable* as it
+/// checks base, then local, then upstream - base included, and the question
+/// never previews base. A readable later side leaves an earlier note standing,
+/// so any unreadable side at all makes a genuinely absent side quote a note
+/// about another side. What it can no longer do is claim a present file was
+/// deleted, which is the reading that would have cost the user the choice.
+fn conflict_resolution_question(detail: &Value) -> String {
+    let path = detail["path"].as_str().unwrap_or_default();
+    let kind = detail["kind"].as_str().unwrap_or("conflict");
+    let note = detail["note"].as_str();
+    let preview = |side: &Value| -> String {
+        match side.as_str() {
+            None => match note {
+                Some(note) => format!("(no readable content: {note})"),
+                None => "(file deleted)".to_string(),
+            },
+            Some(text) => {
+                let mut out = text
+                    .lines()
+                    .take(CONFLICT_PREVIEW_LINES)
+                    .collect::<Vec<&str>>()
+                    .join("\n");
+                if text.lines().count() > CONFLICT_PREVIEW_LINES {
+                    out.push_str("\n...");
+                }
+                out
+            }
+        }
+    };
+    format!(
+        "Conflict on {path} ({kind}). Keep which side?\n\n--- local (mine) ---\n{}\n\n--- upstream (theirs) ---\n{}",
+        preview(&detail["local"]),
+        preview(&detail["upstream"]),
+    )
+}
+
+/// How much of each side [`conflict_resolution_question`] shows.
+const CONFLICT_PREVIEW_LINES: usize = 20;
+
+/// The non-eliciting refusal for a call that named no resolution: a tool error
+/// the model can read, replacing the framework's opaque InvalidParams.
+///
+/// A peer that cannot be asked has to be told what to send instead, so all
+/// three resolutions are named, merged included - it is the one the question
+/// itself never offers.
+const RESOLVE_NEEDS_RESOLUTION: &str = "resolve_conflict needs a resolution: mine (keep your version), theirs (take the team's version), or merged with the reconciled content.";
+
+/// What an unanswered resolution question tells the model, naming what is
+/// still true rather than what failed.
+const RESOLVE_REFUSAL: &str = "The resolution was not chosen, so the conflict is still open. Call resolve_conflict again if the user asks for it.";
+
 /// The middle sentence of [`delete_question`]: what the delete does to the
 /// engram's attachments.
 ///
@@ -2692,6 +3072,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::NotADomain { .. }
         | RemoteError::ConflictsPending { .. }
         | RemoteError::ProposalNotFound { .. }
+        | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }
@@ -2857,6 +3238,167 @@ mod tests {
         );
     }
 
+    /// The third parser under the same key, and the same invariant read for a
+    /// three-valued answer: only the two words the schema offered come back,
+    /// and everything else that is an answer resolves nothing.
+    ///
+    /// The distinction this one has to keep that the boolean ones do not is
+    /// between two yeses. `mine` and `theirs` write opposite files, so an
+    /// answer that is nearly one of them must not fall through to the other;
+    /// it falls into `Some(None)`, which leaves the conflict open.
+    #[test]
+    fn only_the_two_offered_sides_resolve_a_conflict() {
+        let responses = |value: Value| {
+            let mut map = rmcp::model::InputResponses::new();
+            map.insert(RESOLUTION_KEY.to_string(), value);
+            Some(map)
+        };
+
+        assert_eq!(
+            chosen_resolution(&responses(
+                json!({ "action": "accept", "content": { "resolution": "mine" } })
+            )),
+            Some(Some("mine")),
+            "an accepted mine keeps the local version"
+        );
+        assert_eq!(
+            chosen_resolution(&responses(
+                json!({ "action": "accept", "content": { "resolution": "theirs" } })
+            )),
+            Some(Some("theirs")),
+            "an accepted theirs takes the team's version"
+        );
+
+        let unresolved = [
+            // The one resolution the question never offers.
+            json!({ "action": "accept", "content": { "resolution": "merged" } }),
+            // Accepted with nothing in it, or with the wrong thing in it.
+            json!({ "action": "accept" }),
+            json!({ "action": "accept", "content": {} }),
+            json!({ "action": "accept", "content": null }),
+            json!({ "action": "accept", "content": { "resolution": "Mine" } }),
+            json!({ "action": "accept", "content": { "resolution": "theirs " } }),
+            json!({ "action": "accept", "content": { "resolution": true } }),
+            json!({ "action": "accept", "content": { "resolution": ["mine"] } }),
+            // The title rather than the value behind it.
+            json!({ "action": "accept", "content": { "resolution": "Keep my local version" } }),
+            // The right value under the wrong key.
+            json!({ "action": "accept", "content": { "confirm": "mine" } }),
+            // The two refusals the specification names, and one it does not.
+            json!({ "action": "decline" }),
+            json!({ "action": "cancel", "content": { "resolution": "theirs" } }),
+            json!({ "action": "deferred", "content": { "resolution": "theirs" } }),
+            // Shapes that are not an `ElicitResult` at all.
+            json!({ "content": { "resolution": "mine" } }),
+            json!("mine"),
+            json!(null),
+        ];
+        for value in unresolved {
+            assert_eq!(
+                chosen_resolution(&responses(value.clone())),
+                Some(None),
+                "nothing but an accepted mine or theirs resolves: {value}"
+            );
+        }
+
+        // Round one: no answer at all, or an answer to some other question.
+        assert_eq!(chosen_resolution(&None), None, "no responses is round one");
+        assert_eq!(
+            chosen_resolution(&Some(rmcp::model::InputResponses::new())),
+            None,
+            "an empty map is round one"
+        );
+        let mut elsewhere = rmcp::model::InputResponses::new();
+        elsewhere.insert(
+            CONFIRM_KEY.to_string(),
+            json!({ "action": "accept", "content": { "resolution": "mine" } }),
+        );
+        assert_eq!(
+            chosen_resolution(&Some(elsewhere)),
+            None,
+            "an answer filed under the confirmation key answers another question"
+        );
+    }
+
+    /// The question shows both sides, bounded, and says which kind of nothing
+    /// it is showing when a side has no text.
+    ///
+    /// The three things asserted are the three a user's decision rests on: a
+    /// side longer than the budget is visibly cut rather than silently
+    /// truncated, a null side with no note is a deleted file rather than an
+    /// empty one, and a null side under a standing note is a file that is
+    /// there and cannot be read - which must never be reported as a deletion,
+    /// because a user told their file was deleted decides differently from one
+    /// told it is binary.
+    #[test]
+    fn the_conflict_question_previews_both_sides_within_a_budget() {
+        let long: String = (1..=25)
+            .map(|n| format!("line {n}\n"))
+            .collect::<Vec<String>>()
+            .join("");
+        let detail = json!({
+            "path": "notes/a.md",
+            "kind": "EditEdit",
+            "local": long,
+            "upstream": Value::Null,
+        });
+        let message = conflict_resolution_question(&detail);
+
+        assert!(
+            message.starts_with("Conflict on notes/a.md (EditEdit). Keep which side?"),
+            "{message}"
+        );
+        assert!(
+            message.contains("--- local (mine) ---\nline 1\n"),
+            "{message}"
+        );
+        assert!(
+            message.contains("line 20\n..."),
+            "cut at the budget: {message}"
+        );
+        assert!(
+            !message.contains("line 21"),
+            "and nothing past it: {message}"
+        );
+        assert!(
+            message.contains("--- upstream (theirs) ---\n(file deleted)"),
+            "an absent side says what it is: {message}"
+        );
+
+        // A side exactly at the budget is whole and carries no ellipsis.
+        let exact: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        let detail = json!({ "path": "a.md", "local": exact, "upstream": "one line" });
+        let message = conflict_resolution_question(&detail);
+        assert!(!message.contains("\n..."), "nothing was cut: {message}");
+        // And a detail with no kind still reads as a sentence.
+        assert!(
+            message.starts_with("Conflict on a.md (conflict)."),
+            "{message}"
+        );
+
+        // The same null side, under the note the engine sets when it nulled a
+        // side that is there but is not UTF-8: the file is present, so the
+        // question must not say it was deleted.
+        let detail = json!({
+            "path": "notes/a.md",
+            "kind": "EditEdit",
+            "local": "alpha, my local edit",
+            "upstream": Value::Null,
+            "note": "the upstream side is not UTF-8 and is omitted",
+        });
+        let message = conflict_resolution_question(&detail);
+        assert!(
+            message.contains(
+                "--- upstream (theirs) ---\n(no readable content: the upstream side is not UTF-8 and is omitted)"
+            ),
+            "an unreadable side quotes the note: {message}"
+        );
+        assert!(
+            !message.contains("(file deleted)"),
+            "and is never reported as a deletion: {message}"
+        );
+    }
+
     /// The engine message is parsed for the permalink, and a message that does
     /// not carry one never becomes a question naming the wrong thing.
     ///
@@ -2947,6 +3489,49 @@ mod tests {
     }
 
     #[test]
+    fn the_share_question_names_update_create_and_caps_the_file_list() {
+        let update = share_question(&json!({
+            "action": "update", "number": 4, "url": "https://github.test/pulls/4",
+            "effective_title": "Refine 1 engram in kb",
+            "changes": [{ "path": "notes/a.md", "kind": "modified" }],
+        }));
+        assert!(
+            update.contains("Update open proposal #4 (https://github.test/pulls/4)"),
+            "{update}"
+        );
+        // An update's title line is the commit message, never a promise to
+        // retitle a proposal the caller passed no title for.
+        assert!(
+            update.contains("Commit message: 'Refine 1 engram in kb'"),
+            "{update}"
+        );
+        assert!(
+            !update.contains("Title: '"),
+            "an update never labels it Title: {update}"
+        );
+        assert!(
+            update.contains("0 added, 1 modified, 0 deleted: notes/a.md"),
+            "{update}"
+        );
+
+        let changes: Vec<Value> = (0..12)
+            .map(|i| json!({ "path": format!("notes/f{i}.md"), "kind": "added" }))
+            .collect();
+        let create = share_question(&json!({
+            "action": "create", "effective_title": "Share 12 new engrams from kb",
+            "changes": changes,
+        }));
+        assert!(create.contains("Open a new proposal"), "{create}");
+        // A create really does title the proposal, so it says so.
+        assert!(
+            create.contains("Title: 'Share 12 new engrams from kb'"),
+            "{create}"
+        );
+        assert!(create.contains("and 2 more"), "{create}");
+        assert!(!create.contains("notes/f10.md"), "capped at ten: {create}");
+    }
+
+    #[test]
     fn transient_remote_errors_map_to_the_internal_error_class() {
         let cases = [
             RemoteError::Offline,
@@ -3012,7 +3597,7 @@ mod tests {
     }
 
     #[test]
-    fn is_collab_tool_recognizes_exactly_the_five() {
+    fn is_collab_tool_recognizes_exactly_the_six() {
         for name in COLLAB_TOOLS {
             assert!(is_collab_tool(name), "{name}");
         }
@@ -3095,19 +3680,163 @@ mod tests {
         assert!(skill_for_uri("https://example.com/SKILL.md").is_none());
     }
 
-    /// The listing half of the collaboration gating, which is `read_only`
-    /// alone now: read-write shows all five, read-only shows the two that a
-    /// read-only instance still exempts.
+    /// `origin_status`'s trim, over both proposal arrays at once.
+    ///
+    /// The bodies leaving is the assertion that earns this test: a status
+    /// glance that carried reviewer comment text would spend a session's
+    /// context on prose nobody asked for, and `update_domain` is the surface
+    /// that returns it. The declined entry is the second half: the engine
+    /// decorates only the open list with `amended_upstream`, so the trim has
+    /// to supply the missing key rather than leave the two arrays different
+    /// shapes.
     #[test]
-    fn hidden_collab_tool_matches_the_locked_read_only_matrix() {
-        for name in COLLAB_TOOLS {
-            assert!(!hidden_collab_tool(name, false), "{name}");
+    fn lean_origin_status_trims_both_proposal_arrays_to_the_eight_keys() {
+        const LEAN_KEYS: [&str; 8] = [
+            "number",
+            "url",
+            "title",
+            "status",
+            "review_state",
+            "amended_upstream",
+            "feedback_count",
+            "updated_at",
+        ];
+
+        let leaned = lean_origin_status(json!({
+            "domains": [{
+                "domain": "kb",
+                "repo": "team/knowledge",
+                "open_proposals": [{
+                    "number": 7,
+                    "url": "https://example.invalid/pull/7",
+                    "branch": "crystalline/kb-7",
+                    "title": "Refine alpha",
+                    "status": "Open",
+                    "review_state": "changes_requested",
+                    "amended_upstream": true,
+                    "files": [{ "path": "notes/a.md" }],
+                    "feedback": [
+                        { "author": "ana", "body": "needs a source" },
+                        { "author": "bo", "body": "and a date" },
+                    ],
+                    "updated_at": "2026-08-21T10:00:00Z",
+                }],
+                // No `amended_upstream` here: the engine decorates the open
+                // list only, so the trim has to default it.
+                "declined_proposals": [{
+                    "number": 4,
+                    "url": "https://example.invalid/pull/4",
+                    "branch": "crystalline/kb-4",
+                    "title": "Superseded",
+                    "status": "Declined",
+                    "review_state": null,
+                    "files": [],
+                    "feedback": [{ "author": "cy", "body": "not this one" }],
+                    "updated_at": "2026-08-20T09:00:00Z",
+                }],
+            }],
+        }));
+
+        let domain = &leaned["domains"][0];
+        assert_eq!(domain["domain"], "kb", "the domain's own fields survive");
+        assert_eq!(domain["repo"], "team/knowledge");
+
+        let open = &domain["open_proposals"][0];
+        let declined = &domain["declined_proposals"][0];
+        for (label, entry) in [("open", open), ("declined", declined)] {
+            let object = entry.as_object().unwrap_or_else(|| panic!("{label}"));
+            let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            let mut expected = LEAN_KEYS.to_vec();
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{label} carries exactly the lean keys");
+            assert!(
+                entry.get("feedback").is_none(),
+                "{label} must not carry comment bodies: {entry}"
+            );
+            // The other fat fields go too, for the same reason.
+            assert!(entry.get("files").is_none(), "{label}: {entry}");
+            assert!(entry.get("branch").is_none(), "{label}: {entry}");
         }
+
+        assert_eq!(open["number"], json!(7));
+        assert_eq!(open["title"], "Refine alpha");
+        assert_eq!(open["review_state"], "changes_requested");
+        assert_eq!(open["feedback_count"], json!(2));
+        assert_eq!(open["amended_upstream"], json!(true));
+        assert_eq!(open["updated_at"], "2026-08-21T10:00:00Z");
+
+        assert_eq!(declined["number"], json!(4));
+        assert_eq!(declined["status"], "Declined");
+        assert_eq!(declined["review_state"], Value::Null);
+        assert_eq!(declined["feedback_count"], json!(1));
+        assert_eq!(
+            declined["amended_upstream"],
+            json!(false),
+            "a declined proposal the engine never decorated defaults to false"
+        );
+    }
+
+    /// A payload with no `domains` array, and one whose entries carry no
+    /// proposal arrays, pass through untouched rather than gaining empty keys.
+    #[test]
+    fn lean_origin_status_leaves_a_payload_with_nothing_to_trim_alone() {
+        let bare = json!({ "domains": [] });
+        assert_eq!(lean_origin_status(bare.clone()), bare);
+
+        let no_arrays = json!({ "domains": [{ "domain": "kb", "conflicts": [] }] });
+        assert_eq!(lean_origin_status(no_arrays.clone()), no_arrays);
+
+        let not_a_report = json!({ "error": "offline" });
+        assert_eq!(lean_origin_status(not_a_report.clone()), not_a_report);
+    }
+
+    /// The listing gate's full matrix, both inputs. `github.enabled` off hides
+    /// the five whatever the mode is and never hides `configure`; on top of
+    /// that read-only hides the write set, so an enabled read-only instance
+    /// shows the two collaboration tools it still exempts and nothing else.
+    #[test]
+    fn hidden_collab_tool_matches_the_locked_matrix() {
+        // github off: the five are hidden whatever the mode is.
+        for read_only in [false, true] {
+            for name in COLLAB_TOOLS.iter().filter(|n| **n != "configure") {
+                assert!(hidden_collab_tool(name, read_only, false), "{name}");
+            }
+        }
+        assert!(
+            !hidden_collab_tool("configure", false, false),
+            "a writable default install still lists the enable path"
+        );
+        assert!(
+            hidden_collab_tool("configure", true, false),
+            "read-only hides configure on its own gate, unchanged"
+        );
+
+        // github on, writable: all six.
+        for name in COLLAB_TOOLS {
+            assert!(!hidden_collab_tool(name, false, true), "{name}");
+        }
+
+        // github on, read-only: the two exempt reads only.
         for name in ["update_domain", "origin_status"] {
-            assert!(!hidden_collab_tool(name, true), "{name}");
+            assert!(!hidden_collab_tool(name, true, true), "{name}");
         }
         for name in COLLAB_WRITE_TOOLS {
-            assert!(hidden_collab_tool(name, true), "{name}");
+            assert!(hidden_collab_tool(name, true, true), "{name}");
+        }
+    }
+
+    /// The listing and the refusal cannot disagree about which tools the
+    /// setting governs: whatever the github gate withholds is exactly what
+    /// refuses when a stale client calls it anyway.
+    #[test]
+    fn the_github_listing_gate_and_the_refusal_name_the_same_tools() {
+        for name in COLLAB_TOOLS {
+            assert_eq!(
+                hidden_collab_tool(name, false, false),
+                refused_collab_tool(name, false),
+                "{name}"
+            );
         }
     }
 
@@ -3122,6 +3851,7 @@ mod tests {
             "update_domain",
             "origin_status",
             "resolve_conflict",
+            "withdraw_proposal",
         ] {
             assert!(refused_collab_tool(name, false), "{name}");
         }

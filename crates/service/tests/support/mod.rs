@@ -18,8 +18,8 @@ use std::sync::{Arc, Mutex};
 
 use crystalline_index::EmbeddingProvider;
 use crystalline_remote::provider::{
-    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
-    ProposalState, Provider, TreeWrite, UpstreamChange,
+    ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
+    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
 };
 use crystalline_remote::{DeviceFlowStart, RemoteError};
 use crystalline_service::engine::ConnectAuth;
@@ -57,6 +57,11 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/domains/{domain}",
     "GET /api/v1/domains/{domain}/sync",
     "POST /api/v1/domains/{domain}/sync",
+    "GET /api/v1/domains/{domain}/sync/changes",
+    "POST /api/v1/domains/{domain}/sync/share",
+    "POST /api/v1/domains/{domain}/sync/proposals/{number}/withdraw",
+    "GET /api/v1/domains/{domain}/sync/conflicts/{id}",
+    "POST /api/v1/domains/{domain}/sync/conflicts/{id}/resolve",
     "GET /api/v1/domains/{domain}/archive",
     "POST /api/v1/domains/{domain}/archive/preview",
     "POST /api/v1/domains/{domain}/archive/import",
@@ -165,6 +170,22 @@ struct Inner {
     /// gate stays open once released - a second, racing download proceeds
     /// too, rather than hanging.
     tarball_gate: Option<tokio::sync::watch::Receiver<bool>>,
+    /// The branch each proposal carries, filled by `create_proposal` and by
+    /// `MockProvider::register_proposal_branch` for a proposal a test seeded
+    /// straight into origin state.
+    proposal_branches: HashMap<u64, String>,
+    /// The feedback `proposal_feedback` reports per proposal number, set
+    /// through `MockProvider::set_feedback`.
+    feedback: HashMap<u64, Feedback>,
+    /// Proposal numbers whose `proposal_feedback` call fails with a 500.
+    feedback_failures: HashSet<u64>,
+    /// Proposal numbers whose `close_proposal` call fails with a 500.
+    close_failures: HashSet<u64>,
+    /// Whether `list_open_proposals` answers `RemoteError::Offline`.
+    open_list_fails: bool,
+    /// Every provider call made so far, in order, for tests asserting on the
+    /// exact sequence a share-update or withdraw drives.
+    calls: Vec<String>,
 }
 
 /// An in-memory forge implementing [`Provider`] for the origin engine tests.
@@ -303,6 +324,45 @@ impl MockProvider {
     /// request.
     pub fn branch_commit(&self, branch: &str) -> Option<String> {
         self.inner.lock().unwrap().branches.get(branch).cloned()
+    }
+
+    /// The provider calls made so far, in order, for asserting the exact
+    /// sequence a share-update or withdraw drives.
+    pub fn calls(&self) -> Vec<String> {
+        self.inner.lock().unwrap().calls.clone()
+    }
+
+    /// Sets the review standing and feedback items a later
+    /// `proposal_feedback` call reports for `number`.
+    pub fn set_feedback(&self, number: u64, feedback: Feedback) {
+        self.inner.lock().unwrap().feedback.insert(number, feedback);
+    }
+
+    /// Records which branch proposal `number` carries, for a proposal a test
+    /// seeded straight into origin state rather than opening through the
+    /// provider.
+    pub fn register_proposal_branch(&self, number: u64, branch: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .proposal_branches
+            .insert(number, branch.to_string());
+    }
+
+    /// Makes every subsequent `list_open_proposals` call fail with
+    /// `RemoteError::Offline`.
+    pub fn fail_open_proposals(&self) {
+        self.inner.lock().unwrap().open_list_fails = true;
+    }
+
+    /// Makes `close_proposal` fail with a 500 for `number`.
+    pub fn fail_close_proposal(&self, number: u64) {
+        self.inner.lock().unwrap().close_failures.insert(number);
+    }
+
+    /// Makes `proposal_feedback` fail with a 500 for `number`.
+    pub fn fail_feedback(&self, number: u64) {
+        self.inner.lock().unwrap().feedback_failures.insert(number);
     }
 }
 
@@ -453,6 +513,7 @@ impl Provider for MockProvider {
         let sha = sha256_hex(content);
         let mut inner = self.inner.lock().unwrap();
         inner.blobs.insert(sha.clone(), content.to_vec());
+        inner.calls.push(format!("create_blob:{sha}"));
         Ok(sha)
     }
 
@@ -493,6 +554,7 @@ impl Provider for MockProvider {
         inner.tree_counter += 1;
         let id = format!("tree{}", inner.tree_counter);
         inner.trees.insert(id.clone(), files);
+        inner.calls.push(format!("create_tree:{id}"));
         Ok(id)
     }
 
@@ -501,7 +563,7 @@ impl Provider for MockProvider {
         origin: &OriginSpec,
         _message: &str,
         tree: &str,
-        _parent: &str,
+        _parents: &[String],
     ) -> Result<String, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         let files = inner
@@ -514,6 +576,7 @@ impl Provider for MockProvider {
         inner.commit_counter += 1;
         let id = format!("commit{}", inner.commit_counter);
         inner.commits.insert(id.clone(), Commit { files });
+        inner.calls.push(format!("create_commit:{id}"));
         Ok(id)
     }
 
@@ -528,11 +591,118 @@ impl Provider for MockProvider {
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
         inner.etags.insert(name.to_string(), etag);
+        inner.calls.push(format!("create_branch:{name}:{commit}"));
         Ok(())
     }
 
-    async fn delete_branch(&self, _origin: &OriginSpec, _name: &str) -> Result<(), RemoteError> {
+    async fn delete_branch(&self, _origin: &OriginSpec, name: &str) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.branches.remove(name);
+        inner.etags.remove(name);
+        inner.calls.push(format!("delete_branch:{name}"));
         Ok(())
+    }
+
+    async fn branch_ref(
+        &self,
+        _origin: &OriginSpec,
+        name: &str,
+    ) -> Result<Option<String>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("branch_ref:{name}"));
+        Ok(inner.branches.get(name).cloned())
+    }
+
+    async fn update_branch(
+        &self,
+        _origin: &OriginSpec,
+        name: &str,
+        commit: &str,
+    ) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.etag_counter += 1;
+        let etag = format!("etag{}", inner.etag_counter);
+        inner.branches.insert(name.to_string(), commit.to_string());
+        inner.etags.insert(name.to_string(), etag);
+        inner.calls.push(format!("update_branch:{name}:{commit}"));
+        Ok(())
+    }
+
+    async fn update_proposal(
+        &self,
+        _origin: &OriginSpec,
+        number: u64,
+        _title: Option<&str>,
+        _body: &str,
+    ) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("update_proposal:{number}"));
+        Ok(())
+    }
+
+    async fn close_proposal(&self, _origin: &OriginSpec, number: u64) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Logged before the failure check, like every other call here, so an
+        // injected failure still leaves a trace of the attempt.
+        inner.calls.push(format!("close_proposal:{number}"));
+        if inner.close_failures.contains(&number) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("injected close failure for {number}"),
+            });
+        }
+        inner
+            .proposal_states
+            .insert(number, ProposalState::Declined);
+        Ok(())
+    }
+
+    async fn proposal_feedback(
+        &self,
+        _origin: &OriginSpec,
+        number: u64,
+    ) -> Result<Feedback, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("proposal_feedback:{number}"));
+        if inner.feedback_failures.contains(&number) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("injected feedback failure for {number}"),
+            });
+        }
+        Ok(inner.feedback.get(&number).cloned().unwrap_or_default())
+    }
+
+    async fn list_open_proposals(
+        &self,
+        _origin: &OriginSpec,
+    ) -> Result<Vec<OpenProposalRef>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push("list_open_proposals".to_string());
+        if inner.open_list_fails {
+            return Err(RemoteError::Offline);
+        }
+        let mut out = Vec::new();
+        for (number, state) in &inner.proposal_states {
+            if *state != ProposalState::Open {
+                continue;
+            }
+            let branch = inner
+                .proposal_branches
+                .get(number)
+                .cloned()
+                .unwrap_or_default();
+            let head_sha = inner.branches.get(&branch).cloned().unwrap_or_default();
+            out.push(OpenProposalRef {
+                number: *number,
+                branch,
+                head_sha,
+            });
+        }
+        // `proposal_states` is a HashMap, so sort before returning: tests
+        // assert on the order the caller then works through these in.
+        out.sort_by_key(|p| p.number);
+        Ok(out)
     }
 
     async fn create_proposal(
@@ -544,6 +714,8 @@ impl Provider for MockProvider {
         inner.proposal_counter += 1;
         let number = inner.proposal_counter;
         inner.proposal_states.insert(number, ProposalState::Open);
+        inner.proposal_branches.insert(number, req.branch.clone());
+        inner.calls.push(format!("create_proposal:{}", req.branch));
         Ok(ProposalHandle {
             number,
             url: format!("https://github.test/{}/pull/{number}", req.branch),

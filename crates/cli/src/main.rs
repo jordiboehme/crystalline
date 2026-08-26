@@ -1011,14 +1011,19 @@ enum OriginCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Discard a declined, or still-open ("never mind"), share proposal,
-    /// restoring local files that were not changed since sharing them.
-    Discard {
+    /// Withdraw a share proposal: close its pull request on GitHub, delete
+    /// its branch and clear the record. Files stay as they are unless
+    /// --revert restores the ones untouched since sharing.
+    Withdraw {
         /// The team domain the proposal belongs to.
         domain: String,
-        /// The proposal number to discard.
+        /// The proposal number. Omit to withdraw the single open proposal.
         #[arg(long)]
-        proposal: u64,
+        proposal: Option<u64>,
+        /// Also restore shared files to their pre-share content; files
+        /// edited since sharing are left alone.
+        #[arg(long)]
+        revert: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1642,7 +1647,7 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
     }
 }
 
-/// `origin update`/`origin status`/`origin share`/`origin discard`/
+/// `origin update`/`origin status`/`origin share`/`origin withdraw`/
 /// `origin resolve`: socket-first with an in-process fallback, all already
 /// handled inside their respective `crystalline_service` entry points.
 async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> anyhow::Result<()> {
@@ -1684,19 +1689,21 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             cmd::print_origin_share(&domain, &data, json);
             Ok(())
         }
-        OriginCommand::Discard {
+        OriginCommand::Withdraw {
             domain,
             proposal,
+            revert,
             config,
         } => {
-            let data = crystalline_service::origin_discard(
+            let data = crystalline_service::origin_withdraw(
                 &domain,
                 proposal,
+                revert,
                 db.as_deref(),
                 config.as_deref(),
             )
             .await?;
-            cmd::print_origin_discard(&data, json);
+            cmd::print_origin_withdraw(&data, json);
             Ok(())
         }
         OriginCommand::Resolve {
@@ -1735,8 +1742,8 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
 /// Render `origin update`'s aggregate result: one line per team domain (a
 /// freshly bootstrapped env-defined domain, up to date or the
 /// applied/merged counts with conflicts and proposal transitions called
-/// out), then one line per domain that failed to update. Conflicts only name
-/// the path: resolution tooling arrives in a later task.
+/// out), then one line per domain that failed to update. Each conflict names
+/// the path and the `origin resolve` command that settles it.
 fn print_origin_update(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -1766,7 +1773,8 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
         println!("{name}: {applied} file(s) applied ({merged} merged)");
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
             println!(
-                "  conflict: {} (resolution tooling is coming; left as it was)",
+                "  conflict: {} (resolve with: crystalline origin resolve {name} {} --keep mine|theirs)",
+                c["path"].as_str().unwrap_or(""),
                 c["path"].as_str().unwrap_or("")
             );
         }
@@ -1795,8 +1803,10 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
 /// domain its repo, branch, how far ahead (local changes) and behind it is,
 /// a note when the live probe itself failed (offline, rate limited, an
 /// expired connection) rather than the whole domain, open and declined
-/// proposals with their urls, unresolved conflicts and when it was last
-/// checked, then one line per domain that genuinely failed to report.
+/// proposals with their urls (an open one also carrying its review standing,
+/// whether a reviewer amended its branch and how much feedback it has),
+/// unresolved conflicts and when it was last checked, then one line per
+/// domain that genuinely failed to report.
 fn print_origin_status(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -1849,6 +1859,27 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
                 p["title"].as_str().unwrap_or(""),
                 p["url"].as_str().unwrap_or("")
             );
+            // The review standing, read tolerantly: an older record carries
+            // none of these and prints exactly as it used to.
+            let review = p["review_state"].as_str().map(|s| s.replace('_', " "));
+            let amended = p["amended_upstream"].as_bool().unwrap_or(false);
+            let feedback = p["feedback"].as_array().map(Vec::len).unwrap_or(0);
+            let mut notes: Vec<String> = Vec::new();
+            if let Some(review) = review {
+                notes.push(review);
+            }
+            if amended {
+                notes.push("amended upstream".to_string());
+            }
+            if feedback > 0 {
+                notes.push(format!(
+                    "{feedback} comment{}",
+                    if feedback == 1 { "" } else { "s" }
+                ));
+            }
+            if !notes.is_empty() {
+                println!("    {}", notes.join(", "));
+            }
         }
         for p in d["declined_proposals"].as_array().unwrap_or(&empty) {
             println!(

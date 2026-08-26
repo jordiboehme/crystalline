@@ -173,7 +173,7 @@ fn origin_update_and_status_succeed_with_no_team_domains_once_enabled() {
     assert!(human.contains("No team domains"), "{human}");
 }
 
-// --- origin share, discard, resolve: flag validation and gating -------------
+// --- origin share, withdraw, resolve: flag validation and gating ------------
 
 #[test]
 fn origin_resolve_requires_exactly_one_of_keep_or_content_file() {
@@ -215,7 +215,7 @@ fn origin_resolve_rejects_both_keep_and_content_file() {
 }
 
 #[test]
-fn origin_share_discard_and_resolve_refuse_when_github_is_not_enabled() {
+fn origin_share_withdraw_and_resolve_refuse_when_github_is_not_enabled() {
     let work = tempfile::tempdir().unwrap();
     let config = work.path().join("config.yaml");
     let db = work.path().join("state/index.db");
@@ -230,7 +230,7 @@ fn origin_share_discard_and_resolve_refuse_when_github_is_not_enabled() {
         .stderr(predicates::str::contains("github.enabled"));
 
     bin()
-        .args(["origin", "discard", "brand", "--proposal", "1", "--config"])
+        .args(["origin", "withdraw", "brand", "--proposal", "1", "--config"])
         .arg(&config)
         .args(["--db"])
         .arg(&db)
@@ -250,7 +250,7 @@ fn origin_share_discard_and_resolve_refuse_when_github_is_not_enabled() {
 }
 
 #[test]
-fn origin_share_discard_and_resolve_reach_the_engine_once_enabled() {
+fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
     let work = tempfile::tempdir().unwrap();
     let config = work.path().join("config.yaml");
     let db = work.path().join("state/index.db");
@@ -273,7 +273,18 @@ fn origin_share_discard_and_resolve_reach_the_engine_once_enabled() {
         .stderr(predicates::str::contains("not registered"));
 
     bin()
-        .args(["origin", "discard", "brand", "--proposal", "1", "--config"])
+        .args(["origin", "withdraw", "brand", "--proposal", "1", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("not registered"));
+
+    // --proposal is optional now: omitting it means "the single open one",
+    // which still reaches the engine rather than tripping flag parsing.
+    bin()
+        .args(["origin", "withdraw", "brand", "--revert", "--config"])
         .arg(&config)
         .args(["--db"])
         .arg(&db)
@@ -290,4 +301,20 @@ fn origin_share_discard_and_resolve_reach_the_engine_once_enabled() {
         .assert()
         .failure()
         .stderr(predicates::str::contains("not registered"));
+}
+
+#[test]
+fn origin_discard_is_gone_and_withdraw_help_names_its_flags() {
+    bin()
+        .args(["origin", "discard", "brand", "--proposal", "1"])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unrecognized subcommand"));
+
+    bin()
+        .args(["origin", "withdraw", "--help"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("--proposal"))
+        .stdout(predicates::str::contains("--revert"));
 }

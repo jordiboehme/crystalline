@@ -34,15 +34,20 @@
 //! 2026-07-28 past it. Asserted rather than assumed below, because it is the
 //! deployment fact an operator behind a load balancer needs.
 
+mod support;
+
 use std::sync::Arc;
 use std::time::Duration;
 
-use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
+use crystalline_core::config::{
+    DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
 use crystalline_service::mcp::McpServer;
 use serde_json::{Value, json};
+use support::MockProvider;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
@@ -97,6 +102,72 @@ impl Harness {
             root,
             engine,
         }
+    }
+
+    /// A harness whose engine has GitHub enabled, a mock forge injected and
+    /// one team domain "kb" subscribed at a single-engram commit. Returns the
+    /// mock so tests can read its call log and see that round one wrote
+    /// nothing to the forge.
+    ///
+    /// No `sync` runs here: `origin_add` indexes what it downloaded itself,
+    /// and every later edit these tests make is read off disk by the share
+    /// path rather than out of the index.
+    async fn team() -> (Harness, Arc<MockProvider>) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let cfg = GlobalConfig {
+            github: Some(GitHubConfig {
+                enabled: Some(true),
+                ..GitHubConfig::default()
+            }),
+            service: Some(ServiceConfig {
+                response_format: Some(ResponseFormat::Json),
+                ..ServiceConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        let config_path = root.join("config.yaml");
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let token_store = root.join("token-store");
+        std::fs::create_dir_all(&token_store).unwrap();
+
+        let mock = Arc::new(MockProvider::new());
+        let c1 = mock.add_commit(
+            [
+                ("MANIFEST.md".to_string(), b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n".to_vec()),
+                ("notes/a.md".to_string(), b"---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha\n".to_vec()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        mock.set_branch("main", &c1);
+
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let engine = Arc::new(
+            Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+                .with_token_store_dir(token_store)
+                .with_origin_provider(mock.clone())
+                .with_origins_dir(root.join("origins")),
+        );
+        let domain_root = root.join("kb");
+        engine
+            .origin_add(
+                "team/knowledge",
+                Some("kb"),
+                None,
+                None,
+                Some(domain_root.to_str().unwrap()),
+            )
+            .await
+            .unwrap();
+        (
+            Harness {
+                _tmp: tmp,
+                root,
+                engine,
+            },
+            mock,
+        )
     }
 
     /// A raw newline-delimited JSON-RPC conversation over the same duplex
@@ -282,8 +353,8 @@ async fn a_modern_client_is_served_with_no_handshake_at_all() {
         .unwrap_or_else(|| panic!("no tool list in {answer}"));
     assert_eq!(
         tools.len(),
-        22,
-        "the one invariant list, unchanged by the era"
+        18,
+        "a default install's list, unchanged by the era"
     );
     assert_hinted("tools/list", &answer["result"]);
 }
@@ -490,11 +561,14 @@ async fn a_request_missing_its_required_meta_is_refused_with_invalid_params() {
 /// The tool list does not move across a `configure` that flips a setting the
 /// list used to depend on, and both readings carry their hints.
 ///
-/// SEP-2567 forbids a list varying "as a side effect of other requests on the
-/// connection". Task 4 moved the two request-mutable gates to call time and
-/// Task 5 froze `skills.serve` at engine construction; this is the same
-/// invariance seen by a modern peer, which is the connection the rule was
-/// written for.
+/// `skills.serve` is the case: it is `configure`-settable and it once shaped
+/// three lists live, so a flip moved them on the very connection that made the
+/// call. The effective value is snapshotted while the engine is built
+/// (`Engine::skills_serve`), so the write applies at the next daemon start and
+/// nothing on this connection moves. `github.enabled` is deliberately not this
+/// test's subject - that one does move the list, on purpose, and
+/// `enabling_github_through_configure_makes_the_five_appear_on_the_next_list`
+/// below is where it is pinned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_tool_list_does_not_move_across_a_configure_for_a_modern_client() {
     let h = Harness::new().await;
@@ -507,16 +581,23 @@ async fn the_tool_list_does_not_move_across_a_configure_for_a_modern_client() {
         .call(modern(
             2,
             "tools/call",
-            json!({ "name": "configure", "arguments": { "set": { "github.enabled": "true" } } }),
+            json!({ "name": "configure", "arguments": { "set": { "skills.serve": "false" } } }),
         ))
         .await;
     let text = configured["result"]["content"][0]["text"]
         .as_str()
         .unwrap_or_default();
     let snapshot: Value = serde_json::from_str(text).unwrap_or(Value::Null);
-    assert_ne!(
-        snapshot["github"]["github_enabled"],
-        json!(false),
+    let written = snapshot["settings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no settings snapshot in {configured}"))
+        .iter()
+        .find(|s| s["key"] == json!("skills.serve"))
+        .unwrap_or_else(|| panic!("skills.serve is not in the snapshot: {configured}"))
+        .clone();
+    assert_eq!(
+        written["value"],
+        json!("false"),
         "the write has to land, or the invariance below proves nothing: {configured}"
     );
 
@@ -752,8 +833,12 @@ async fn discovery_over_http_answers_the_routing_block() {
 /// The two server MUSTs are rmcp's (`SubscriptionContext::establish`,
 /// `service/server.rs:337-375`): the acknowledgment is the first message on
 /// the stream and it carries the subscription id in `_meta`. Nothing follows
-/// it, and that silence is the point rather than a gap - after Tasks 4 and 5
-/// no request can move any list, so there is no list-changed event to send.
+/// it here because nothing moved a list during this request - the one mover is
+/// a `configure` flipping `github.enabled`, and
+/// `tests/mcp_subscriptions.rs::a_subscribed_client_is_told_when_the_tool_list_moves`
+/// is where the announcement itself is pinned. This POST reads its stream once
+/// and returns, so a second connection would be needed to make the flip land
+/// while it is open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_http_subscription_stream_acknowledges_first_and_stays_silent() {
     let h = Harness::new().await;
@@ -2333,5 +2418,814 @@ async fn a_legacy_collision_still_errors_with_the_overwrite_hint() {
         std::fs::read(&path).unwrap(),
         before,
         "the existing engram is untouched"
+    );
+}
+
+// --- the share confirmation round (SEP-2322 MRTR) ---------------------------
+//
+// `share_changes` publishes to a place the user cannot take it back from
+// unilaterally - a repository their team reviews - so the eliciting peer is
+// asked what would be published before anything is. The gate is the same
+// two-sided one `delete_engram` carries, and the same contrast legs prove
+// both halves: a modern peer that declared no elicitation capability, and a
+// legacy peer, are served exactly one round.
+
+/// A share call's params, optionally carrying a round 2 answer.
+fn share_kb(responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "share_changes",
+        "arguments": { "domain": "kb" },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// Write one engram straight into the team domain's working tree, the way a
+/// person editing files beside the agent would.
+fn write_kb_engram(h: &Harness, path: &str, title: &str, permalink: &str, body: &str) {
+    std::fs::write(
+        h.root.join("kb").join(path),
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n{body}\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Edit one engram in the team domain so there is something to share.
+fn edit_kb(h: &Harness) {
+    write_kb_engram(h, "notes/a.md", "Alpha", "notes/a", "alpha, refined");
+}
+
+/// Edit one engram and put the domain's first proposal on the mock forge
+/// through the real two-round flow, on a fresh eliciting connection. Returns
+/// the open wire (ids 1 and 2 are spent), the proposal's number and its
+/// branch, which is what a test needs to amend the branch behind the agent's
+/// back.
+async fn first_shared_proposal(h: &Harness) -> (Wire, u64, String) {
+    edit_kb(h);
+    let mut wire = h.stdio().await;
+    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            share_kb(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "{body}");
+    (
+        wire,
+        body["number"].as_u64().unwrap(),
+        body["branch"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Round one: the question names the action and the files, and the forge sees
+/// no proposal at all.
+///
+/// The negative half is the point, as it is for the delete round: an
+/// `input_required` answered after the proposal was already opened would be a
+/// confirmation of something the team can already see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_share_is_asked_before_anything_is_shared() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+
+    let asked = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    let result = &asked["result"];
+    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
+    let message = result["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("Open a new proposal"), "{message}");
+    assert!(message.contains("notes/a.md"), "names the file: {message}");
+    // Every `create_` prefix, not just `create_proposal:`: a round that
+    // uploaded blobs, built a tree or cut a branch and then asked would have
+    // published most of the share already.
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("create_")),
+        "round one shares nothing: {:?}",
+        mock.calls()
+    );
+}
+
+/// Round two with a yes shares, and the next round one names the update.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
+    let (h, _mock) = Harness::team().await;
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+
+    // A second edited share's round 1 names the update rather than a create.
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Update open proposal #{number}")),
+        "{message}"
+    );
+}
+
+/// Round two with a yes on an *update* lands on the open proposal rather than
+/// opening a second one.
+///
+/// The confirmed create is proved above; this is the other half, and it is
+/// the half the description promises hardest ("same proposal number, same
+/// URL, it never opens a duplicate"), so the number is asserted rather than
+/// just the outcome word.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_update_round_two_lands_on_the_same_proposal() {
+    let (h, mock) = Harness::team().await;
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "an update is confirmed too, not waved through: {asked}"
+    );
+
+    let done = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            share_kb(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "updated", "{body}");
+    assert_eq!(
+        body["proposal"]["number"].as_u64(),
+        Some(number),
+        "the same proposal, not a duplicate: {body}"
+    );
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("update_proposal:")),
+        "the open proposal was patched: {:?}",
+        mock.calls()
+    );
+}
+
+/// A diverged proposal is reported in round one rather than asked about.
+///
+/// There is nothing to confirm: the share cannot proceed at all until the
+/// user settles the review on GitHub or withdraws, so putting a yes/no
+/// question in front of them would offer a choice neither answer to changes
+/// anything. The guidance that names both ways out has to survive the round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_diverged_proposal_answers_round_one_with_guidance() {
+    let (h, mock) = Harness::team().await;
+    let (mut wire, number, branch) = first_shared_proposal(&h).await;
+
+    // A reviewer pushes a commit onto the proposal branch.
+    let amended = mock.add_commit(
+        [(
+            "MANIFEST.md".to_string(),
+            b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything, reviewed\n\n## When to Use\n\n- Always\n".to_vec(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    mock.set_branch(&branch, &amended);
+    write_kb_engram(&h, "notes/c.md", "Gamma", "notes/c", "gamma");
+
+    // Everything the forge was told before the diverged round, so the
+    // assertion below is about this round rather than about the share that
+    // legitimately opened the proposal.
+    let before = mock.calls().len();
+
+    let done = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a share that cannot proceed is reported, not negotiated: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposal_diverged", "{body}");
+    assert_eq!(body["proposal"]["number"].as_u64(), Some(number), "{body}");
+    let guidance = body["guidance"].as_str().unwrap_or_default();
+    assert!(
+        guidance.contains("withdraw") && guidance.contains("GitHub"),
+        "both ways out are named: {guidance}"
+    );
+
+    let during = &mock.calls()[before..];
+    assert!(
+        !during
+            .iter()
+            .any(|c| c.starts_with("create_") || c.starts_with("update_")),
+        "the diverged round publishes nothing: {during:?}"
+    );
+}
+
+/// Round two with a no refuses, and the forge is never written to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_share_refuses_with_no_provider_writes() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let _ = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+
+    let refused = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            share_kb(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was shared"),
+        "and it says what did not happen, exactly as the delete refusal does: {refused}"
+    );
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("create_")),
+        "a decline uploads no blob, builds no tree, cuts no branch and opens \
+         no proposal: {:?}",
+        mock.calls()
+    );
+}
+
+/// The same no on the *update* path, which the create-path test above cannot
+/// speak for: a declined update has an open proposal standing behind it, so
+/// "nothing happened" has to mean the forge was not written to AND the record
+/// still describes the proposal the reviewer is looking at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declined_update_leaves_the_open_proposal_exactly_as_it_was() {
+    let (h, mock) = Harness::team().await;
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+    let state_path = h.root.join("origins").join("kb").join("state.json");
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "round one asks about the update: {asked}"
+    );
+    // Snapshotted after round one, so the subject is what the DECLINE changed:
+    // round one previews, and a preview legitimately pulls and saves.
+    let before = std::fs::read_to_string(&state_path).unwrap();
+    let calls_before = mock.calls().len();
+
+    let refused = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            share_kb(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("nothing was shared"),
+        "{refused}"
+    );
+
+    let during = &mock.calls()[calls_before..];
+    assert!(
+        !during
+            .iter()
+            .any(|c| c.starts_with("create_") || c.starts_with("update_")),
+        "a declined update pushes no commit and patches no proposal: {during:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&state_path).unwrap(),
+        before,
+        "and proposal #{number}'s record is byte for byte what it was"
+    );
+}
+
+/// A modern peer that declared no elicitation capability shares on the first
+/// call, exactly as it did before the round existed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_eliciting_modern_share_is_single_round() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let done = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert!(done["error"].is_null(), "{done}");
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "one round, shared: {body}");
+}
+
+/// A legacy peer is served byte for byte what it was before, elicitation
+/// capability declared or not: the share happens on the first call and the
+/// result carries no `resultType` at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_legacy_share_is_single_round_with_no_input_required() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+
+    let handshake = wire
+        .open(request(
+            1,
+            "initialize",
+            json!({
+                "protocolVersion": LEGACY,
+                "capabilities": { "elicitation": {} },
+                "clientInfo": { "name": "legacy-era-test", "version": "1.0.0" },
+            }),
+        ))
+        .await;
+    assert_eq!(handshake["result"]["protocolVersion"], json!(LEGACY));
+
+    let done = wire.call(request(2, "tools/call", share_kb(None))).await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    assert!(
+        done["result"]["resultType"].is_null(),
+        "a legacy result carries no discriminator: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "proposed", "{body}");
+}
+
+/// A share that would write nothing is answered in round one rather than
+/// asked about: there is no decision for the user to make.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nothing_to_share_answers_round_one_without_a_question() {
+    let (h, _mock) = Harness::team().await;
+    // No edit: the tree matches the origin.
+    let mut wire = h.stdio().await;
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "nothing to confirm: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "nothing_to_share", "{body}");
+}
+
+/// The same round over streamable HTTP, which reaches the modern dispatch by
+/// a different route than stdio does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_share_round_runs_over_http_too() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    let addr = h.http().await;
+    let raw = eliciting_post(addr, 1, "tools/call", share_kb(None)).await;
+    assert!(raw.starts_with("HTTP/1.1 200 OK"), "{}", head_of(&raw));
+    let answered = payload(&raw);
+    assert_eq!(
+        answered["result"]["resultType"],
+        json!("input_required"),
+        "{answered}"
+    );
+}
+
+// --- the conflict resolution round ------------------------------------------
+
+/// Manufacture one conflict in the team domain: edit locally, advance the
+/// origin with a different edit of the same engram, pull.
+async fn conflicted_kb(h: &Harness, mock: &MockProvider) -> String {
+    std::fs::write(
+        h.root.join("kb/notes/a.md"),
+        "---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha, my local edit\n",
+    )
+    .unwrap();
+    let c2 = mock.add_commit(
+        [
+            ("MANIFEST.md".to_string(), std::fs::read(h.root.join("kb/MANIFEST.md")).unwrap()),
+            ("notes/a.md".to_string(), b"---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha, the team's edit\n".to_vec()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    mock.set_branch("main", &c2);
+    let update = h.engine.origin_update(Some("kb")).await.unwrap();
+    let conflicts = update["domains"][0]["conflicts"].as_array().unwrap();
+    assert_eq!(conflicts.len(), 1, "{update}");
+    conflicts[0]["path"].as_str().unwrap().to_string()
+}
+
+fn resolve_kb(path: &str, resolution: Option<&str>, responses: Option<Value>) -> Value {
+    let mut arguments = json!({ "domain": "kb", "path": path });
+    if let Some(resolution) = resolution {
+        arguments["resolution"] = json!(resolution);
+    }
+    let mut params = json!({ "name": "resolve_conflict", "arguments": arguments });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The client's enum answer to the `resolution` question.
+fn resolution_answer(action: &str, choice: &str) -> Value {
+    json!({ "resolution": { "action": action, "content": { "resolution": choice } } })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_resolve_without_a_resolution_is_offered_the_choice() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+
+    let asked = wire
+        .open(eliciting(1, "tools/call", resolve_kb(&path, None, None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(result["resultType"], json!("input_required"), "{asked}");
+    let question = &result["inputRequests"]["resolution"];
+    let schema = &question["params"]["requestedSchema"];
+    assert_eq!(schema["required"], json!(["resolution"]), "{asked}");
+    // A titled single-select is rendered as `oneOf` rather than a flat `enum`,
+    // the same shape the collision question already ships.
+    let property = &schema["properties"]["resolution"];
+    let options: Vec<&str> = property["oneOf"]
+        .as_array()
+        .expect("a titled single-select carries oneOf")
+        .iter()
+        .map(|option| option["const"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(options, vec!["mine", "theirs"], "{asked}");
+    let message = question["params"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains(&path), "names the path: {message}");
+    assert!(message.contains("local (mine)"), "{message}");
+    assert!(message.contains("upstream (theirs)"), "{message}");
+    assert!(
+        message.contains("my local edit"),
+        "previews my side: {message}"
+    );
+    assert!(
+        message.contains("the team's edit"),
+        "previews theirs: {message}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_chosen_resolution_round_two_applies_it() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+    let _ = wire
+        .open(eliciting(1, "tools/call", resolve_kb(&path, None, None)))
+        .await;
+
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            resolve_kb(&path, None, Some(resolution_answer("accept", "theirs"))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let text = std::fs::read_to_string(h.root.join("kb").join(&path)).unwrap();
+    assert!(text.contains("the team's edit"), "theirs won: {text}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+    let refused = wire
+        .open(modern(1, "tools/call", resolve_kb(&path, None, None)))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    let text = refused["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("mine"), "{text}");
+    assert!(text.contains("theirs"), "{text}");
+    assert!(text.contains("merged"), "{text}");
+    // And the conflict is still open.
+    let status = h.engine.origin_status(Some("kb")).await.unwrap();
+    assert_eq!(
+        status["domains"][0]["conflicts"].as_array().unwrap().len(),
+        1
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_resolution_stays_single_round_for_everyone() {
+    let (h, mock) = Harness::team().await;
+    let path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+    let done = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            resolve_kb(&path, Some("mine"), None),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
+    assert!(done["result"]["isError"] != json!(true), "{done}");
+}
+
+/// A share over a domain with an unresolved conflict is answered in round one
+/// rather than asked about: the share cannot proceed until the conflict is
+/// settled, so there is nothing for the user to say yes to, and the count of
+/// what needs resolving has to survive the round.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conflicted_share_answers_round_one_with_the_pending_count() {
+    let (h, mock) = Harness::team().await;
+    let _path = conflicted_kb(&h, &mock).await;
+    let mut wire = h.stdio().await;
+
+    let done = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "a share that cannot proceed is reported, not negotiated: {done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["outcome"], "conflicts_pending", "{body}");
+    assert_eq!(body["count"], json!(1), "{body}");
+}
+
+// --- withdraw_proposal -------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withdraw_proposal_closes_the_open_proposal_single_round() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert!(shared["error"].is_null(), "{shared}");
+
+    // Single round even for an eliciting peer: no MRTR on withdraw (spec).
+    let done = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            json!({
+                "name": "withdraw_proposal",
+                "arguments": { "domain": "kb" },
+            }),
+        ))
+        .await;
+    assert_ne!(
+        done["result"]["resultType"],
+        json!("input_required"),
+        "{done}"
+    );
+    assert!(done["result"]["isError"] != json!(true), "{done}");
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["status"], "withdrawn");
+    assert_eq!(body["closed"], true);
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "{:?}",
+        mock.calls()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn withdraw_proposal_is_gated_exactly_like_share_changes() {
+    // The default (github off) harness withholds the tool from the listing and
+    // still refuses the call with the enablement message, byte for byte the
+    // share_changes refusal.
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let listed = wire.open(modern(1, "tools/list", json!({}))).await;
+    let names: Vec<&str> = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(!names.contains(&"withdraw_proposal"), "{names:?}");
+
+    let refused = wire
+        .call(modern(
+            2,
+            "tools/call",
+            json!({ "name": "withdraw_proposal", "arguments": { "domain": "eng" } }),
+        ))
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "{refused}");
+    assert!(
+        refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("github.enabled"),
+        "{refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn origin_status_is_lean_and_update_domain_carries_the_bodies() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    let body: Value =
+        serde_json::from_str(shared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let number = body["number"].as_u64().unwrap();
+    mock.set_feedback(
+        number,
+        crystalline_remote::provider::Feedback {
+            review_state: Some("changes_requested".to_string()),
+            items: vec![crystalline_remote::state::FeedbackItem {
+                author: "ana".to_string(),
+                body: "needs a source".to_string(),
+                path: None,
+                line: None,
+                submitted_at: "2026-08-21T10:00:00Z".to_string(),
+                kind: crystalline_remote::state::FeedbackKind::Comment,
+            }],
+        },
+    );
+
+    // update_domain fetches and carries the comment text.
+    let updated = wire
+        .call(modern(
+            2,
+            "tools/call",
+            json!({ "name": "update_domain", "arguments": { "domain": "kb" } }),
+        ))
+        .await;
+    let update_body: Value =
+        serde_json::from_str(updated["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let prop = &update_body["domains"][0]["open_proposals"][0];
+    assert_eq!(
+        prop["feedback"][0]["body"], "needs a source",
+        "{update_body}"
+    );
+
+    // origin_status stays lean: count, not bodies.
+    let status = wire
+        .call(modern(
+            3,
+            "tools/call",
+            json!({ "name": "origin_status", "arguments": { "domain": "kb" } }),
+        ))
+        .await;
+    let status_body: Value =
+        serde_json::from_str(status["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let entry = &status_body["domains"][0]["open_proposals"][0];
+    assert_eq!(entry["number"], number);
+    assert_eq!(entry["review_state"], "changes_requested");
+    assert_eq!(entry["feedback_count"], 1);
+    assert!(
+        entry.get("feedback").is_none(),
+        "no bodies in status: {entry}"
+    );
+    assert_eq!(entry["amended_upstream"], false);
+}
+
+// --- the collaboration surface appears when it is enabled -------------------
+
+/// The five GitHub-gated tool names, in the order the listing carries them.
+const COLLAB_GATED: [&str; 5] = [
+    "share_changes",
+    "update_domain",
+    "origin_status",
+    "resolve_conflict",
+    "withdraw_proposal",
+];
+
+fn listed_names(answer: &Value) -> Vec<String> {
+    answer["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("no tool list in {answer}"))
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect()
+}
+
+/// **A default install does not list the collaboration tools at all.**
+///
+/// `github.enabled` is off out of the box, and five of the six collaboration
+/// tools do nothing but talk to a forge nobody connected. They are withheld
+/// from the listing rather than listed-and-refusing, so a default install
+/// spends no context on a surface it cannot use. `configure` is the one that
+/// stays, because it is the only way to turn the rest on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_default_install_lists_configure_but_none_of_the_gated_collaboration_tools() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let answer = wire.open(modern(1, "tools/list", json!({}))).await;
+    let names = listed_names(&answer);
+    assert!(
+        names.contains(&"configure".to_string()),
+        "configure is the enable path and is always listed: {names:?}"
+    );
+    for tool in COLLAB_GATED {
+        assert!(
+            !names.contains(&tool.to_string()),
+            "{tool} must not be listed while github.enabled is off: {names:?}"
+        );
+    }
+}
+
+/// **Turning the setting on through the tool makes the five appear.**
+///
+/// The listing gate reads `github.enabled` live, exactly as the call-time
+/// refusal does, so the very connection that flipped the setting sees the
+/// wider list on its next `tools/list`. The invariance MCP 2026-07-28 requires
+/// is per-instant: every client listing at the same moment gets the same
+/// answer, and the change is announced to whoever subscribed for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn enabling_github_through_configure_makes_the_five_appear_on_the_next_list() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let before = listed_names(&wire.open(modern(1, "tools/list", json!({}))).await);
+    let flip = wire
+        .call(modern(
+            2,
+            "tools/call",
+            json!({
+                "name": "configure",
+                "arguments": { "set": { "github.enabled": "true" } },
+            }),
+        ))
+        .await;
+    assert_ne!(
+        flip["result"]["isError"],
+        json!(true),
+        "the flip must land, or the list below proves nothing: {flip}"
+    );
+
+    let after = listed_names(&wire.call(modern(3, "tools/list", json!({}))).await);
+    for tool in COLLAB_GATED {
+        assert!(
+            after.contains(&tool.to_string()),
+            "{tool} appears once collaboration is on: {after:?}"
+        );
+    }
+    assert_eq!(
+        after.len(),
+        before.len() + COLLAB_GATED.len(),
+        "exactly the five arrived: {before:?} -> {after:?}"
+    );
+}
+
+/// **Hidden is not disabled.** A client holding a cached list from before the
+/// setting went off - or one that simply guessed the name - still reaches the
+/// handler and is told which setting to turn on, rather than being answered
+/// "no such tool" and left to guess.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn calling_a_hidden_collaboration_tool_still_teaches_rather_than_vanishing() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+
+    let answer = wire
+        .open(modern(
+            1,
+            "tools/call",
+            json!({ "name": "share_changes", "arguments": { "domain": "eng" } }),
+        ))
+        .await;
+    assert!(
+        answer["error"].is_null(),
+        "a hidden tool answers rather than failing at the protocol level: {answer}"
+    );
+    let text = answer["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        text.contains("not enabled") && text.contains("github.enabled"),
+        "the refusal names the setting to turn on: {answer}"
     );
 }

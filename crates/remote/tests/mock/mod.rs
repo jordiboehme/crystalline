@@ -23,8 +23,8 @@ use std::sync::Mutex;
 
 use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{
-    ChangeKind, CompareResult, HeadProbe, OriginSpec, ProposalHandle, ProposalRequest,
-    ProposalState, Provider, TreeWrite, UpstreamChange,
+    ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
+    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -44,10 +44,11 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// A commit in the fake graph: its full tree and a link to its parent.
+/// A commit in the fake graph: its full tree and links to its parents (two
+/// of them for the merge commit a share-update makes after the base moved).
 struct Commit {
     files: BTreeMap<String, Vec<u8>>,
-    parent: Option<String>,
+    parents: Vec<String>,
 }
 
 #[derive(Default)]
@@ -61,6 +62,23 @@ struct Inner {
     /// assert on the generated title or body without threading them through
     /// `calls`.
     proposal_requests: HashMap<u64, ProposalRequest>,
+    /// The branch each proposal carries, filled by `create_proposal` and by
+    /// `register_proposal_branch` for a proposal a test seeded into state
+    /// without ever opening it through the provider.
+    proposal_branches: HashMap<u64, String>,
+    /// The feedback `proposal_feedback` reports per proposal number, set
+    /// through `MockProvider::set_feedback`.
+    feedback: HashMap<u64, Feedback>,
+    /// Proposal numbers whose `proposal_feedback` call fails with a 500.
+    feedback_failures: HashSet<u64>,
+    /// Proposal numbers whose `close_proposal` call fails with a 500.
+    close_failures: HashSet<u64>,
+    /// Proposal numbers whose `update_proposal` call fails with a 500, which
+    /// is how a test cuts a share-update in half exactly where it hurts:
+    /// after the branch already moved.
+    update_proposal_failures: HashSet<u64>,
+    /// Whether `list_open_proposals` answers [`RemoteError::Offline`].
+    open_list_fails: bool,
     /// Trees built by `create_tree`, keyed by a generated tree id: the
     /// parent commit's files with every write applied, ready for
     /// `create_commit` to snapshot into a new [`Commit`].
@@ -108,7 +126,7 @@ impl MockProvider {
             id.clone(),
             Commit {
                 files,
-                parent: parent.map(str::to_string),
+                parents: parent.map(str::to_string).into_iter().collect(),
             },
         );
         id
@@ -182,6 +200,71 @@ impl MockProvider {
     /// best-effort branch delete.
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
+    }
+
+    /// The parent commits of `commit`, for asserting a merge commit's shape.
+    pub fn commit_parents(&self, commit: &str) -> Option<Vec<String>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .commits
+            .get(commit)
+            .map(|c| c.parents.clone())
+    }
+
+    /// Sets the review standing and feedback items a later
+    /// [`Provider::proposal_feedback`] call reports for `number`.
+    pub fn set_feedback(&self, number: u64, feedback: Feedback) {
+        self.inner.lock().unwrap().feedback.insert(number, feedback);
+    }
+
+    /// Records which branch proposal `number` carries, for a proposal a test
+    /// seeded straight into origin state rather than opening through the
+    /// provider (so no `create_proposal` request exists to read it from).
+    pub fn register_proposal_branch(&self, number: u64, branch: &str) {
+        self.inner
+            .lock()
+            .unwrap()
+            .proposal_branches
+            .insert(number, branch.to_string());
+    }
+
+    /// Makes every subsequent [`Provider::list_open_proposals`] call fail with
+    /// [`RemoteError::Offline`].
+    pub fn fail_open_proposals(&self) {
+        self.inner.lock().unwrap().open_list_fails = true;
+    }
+
+    /// Makes [`Provider::close_proposal`] fail with a 500 for `number`.
+    pub fn fail_close_proposal(&self, number: u64) {
+        self.inner.lock().unwrap().close_failures.insert(number);
+    }
+
+    /// Makes [`Provider::proposal_feedback`] fail with a 500 for `number`.
+    pub fn fail_feedback(&self, number: u64) {
+        self.inner.lock().unwrap().feedback_failures.insert(number);
+    }
+
+    /// Makes [`Provider::update_proposal`] fail with a 500 for `number`, so a
+    /// share-update lands its `update_branch` and then fails - the one
+    /// interruption that leaves the live branch head ahead of what the local
+    /// record knows about.
+    pub fn fail_update_proposal(&self, number: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .update_proposal_failures
+            .insert(number);
+    }
+
+    /// Lets [`Provider::update_proposal`] succeed again for `number`, so a
+    /// test can retry the share the injected failure interrupted.
+    pub fn heal_update_proposal(&self, number: u64) {
+        self.inner
+            .lock()
+            .unwrap()
+            .update_proposal_failures
+            .remove(&number);
     }
 }
 
@@ -362,7 +445,7 @@ impl Provider for MockProvider {
         origin: &OriginSpec,
         _message: &str,
         tree: &str,
-        parent: &str,
+        parents: &[String],
     ) -> Result<String, RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         let files = inner
@@ -378,7 +461,7 @@ impl Provider for MockProvider {
             id.clone(),
             Commit {
                 files,
-                parent: Some(parent.to_string()),
+                parents: parents.to_vec(),
             },
         );
         inner.calls.push(format!("create_commit:{id}"));
@@ -401,12 +484,125 @@ impl Provider for MockProvider {
     }
 
     async fn delete_branch(&self, _origin: &OriginSpec, name: &str) -> Result<(), RemoteError> {
-        self.inner
-            .lock()
-            .unwrap()
-            .calls
-            .push(format!("delete_branch:{name}"));
+        let mut inner = self.inner.lock().unwrap();
+        inner.branches.remove(name);
+        inner.etags.remove(name);
+        inner.calls.push(format!("delete_branch:{name}"));
         Ok(())
+    }
+
+    async fn branch_ref(
+        &self,
+        _origin: &OriginSpec,
+        name: &str,
+    ) -> Result<Option<String>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("branch_ref:{name}"));
+        Ok(inner.branches.get(name).cloned())
+    }
+
+    async fn update_branch(
+        &self,
+        _origin: &OriginSpec,
+        name: &str,
+        commit: &str,
+    ) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.etag_counter += 1;
+        let etag = format!("etag{}", inner.etag_counter);
+        inner.branches.insert(name.to_string(), commit.to_string());
+        inner.etags.insert(name.to_string(), etag);
+        inner.calls.push(format!("update_branch:{name}:{commit}"));
+        Ok(())
+    }
+
+    async fn update_proposal(
+        &self,
+        _origin: &OriginSpec,
+        number: u64,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Logged before the failure check, like `close_proposal`, so an
+        // injected failure still leaves a trace of the attempt.
+        inner.calls.push(format!("update_proposal:{number}"));
+        if inner.update_proposal_failures.contains(&number) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("injected update failure for {number}"),
+            });
+        }
+        if let Some(req) = inner.proposal_requests.get_mut(&number) {
+            if let Some(title) = title {
+                req.title = title.to_string();
+            }
+            req.body = body.to_string();
+        }
+        Ok(())
+    }
+
+    async fn close_proposal(&self, _origin: &OriginSpec, number: u64) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        // Logged before the failure check, like every other call here, so an
+        // injected failure still leaves a trace of the attempt.
+        inner.calls.push(format!("close_proposal:{number}"));
+        if inner.close_failures.contains(&number) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("injected close failure for {number}"),
+            });
+        }
+        inner.proposals.insert(number, ProposalState::Declined);
+        Ok(())
+    }
+
+    async fn proposal_feedback(
+        &self,
+        _origin: &OriginSpec,
+        number: u64,
+    ) -> Result<Feedback, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("proposal_feedback:{number}"));
+        if inner.feedback_failures.contains(&number) {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: format!("injected feedback failure for {number}"),
+            });
+        }
+        Ok(inner.feedback.get(&number).cloned().unwrap_or_default())
+    }
+
+    async fn list_open_proposals(
+        &self,
+        _origin: &OriginSpec,
+    ) -> Result<Vec<OpenProposalRef>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push("list_open_proposals".to_string());
+        if inner.open_list_fails {
+            return Err(RemoteError::Offline);
+        }
+        let mut out = Vec::new();
+        for (number, state) in &inner.proposals {
+            if *state != ProposalState::Open {
+                continue;
+            }
+            let branch = inner
+                .proposal_branches
+                .get(number)
+                .cloned()
+                .unwrap_or_default();
+            let head_sha = inner.branches.get(&branch).cloned().unwrap_or_default();
+            out.push(OpenProposalRef {
+                number: *number,
+                branch,
+                head_sha,
+            });
+        }
+        // `proposals` is a HashMap, so sort before returning: tests assert on
+        // the order the caller then works through these in.
+        out.sort_by_key(|p| p.number);
+        Ok(out)
     }
 
     async fn create_proposal(
@@ -419,6 +615,7 @@ impl Provider for MockProvider {
         let number = inner.proposal_counter;
         inner.proposals.insert(number, ProposalState::Open);
         inner.proposal_requests.insert(number, req.clone());
+        inner.proposal_branches.insert(number, req.branch.clone());
         inner.calls.push(format!("create_proposal:{}", req.branch));
         Ok(ProposalHandle {
             number,

@@ -1,6 +1,7 @@
-//! MCP-layer tests for the five GitHub collaboration tools: the runtime
-//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the four
-//! GitHub-gated ones give while collaboration is off, the `configure` tool's snapshot, set
+//! MCP-layer tests for the six GitHub collaboration tools: the runtime
+//! gating matrix over `list_tools`/`get_tool`, the call-time refusal the five
+//! GitHub-gated ones still give when called while withheld from the listing,
+//! the `configure` tool's snapshot, set
 //! flow and GitHub connect state machine, and wiring smoke tests for the
 //! origin tools against the engine with an injected `MockProvider`. Also the
 //! non-GitHub `add_domain` modes (local and virtual), which are not
@@ -152,28 +153,39 @@ where
     panic!("condition was not met within two seconds");
 }
 
-/// The five collaboration tool names. `add_domain` is deliberately not here:
+/// The six collaboration tool names. `add_domain` is deliberately not here:
 /// it is write-gated, not collaboration-gated (see `add_domain_*` tests below).
-const ALL_FIVE: [&str; 5] = [
+const ALL_SIX: [&str; 6] = [
     "configure",
     "share_changes",
     "update_domain",
     "origin_status",
     "resolve_conflict",
+    "withdraw_proposal",
 ];
 
 // --- gating matrix -----------------------------------------------------------
 
-/// The locked matrix, now on `read_only` alone. `github.enabled` left the
-/// listing in the SEP-2567 work: it is settable by `configure` on the same
-/// connection, so a list that varied with it varied as a side effect of
-/// another request. Both rows for a given `read_only` are therefore identical.
+/// The locked matrix, on both gates, which compose rather than override.
+///
+/// `github.enabled` off withholds the five tools that need it and never
+/// withholds `configure`, whatever the mode - so a default install lists the
+/// enable path and nothing else of the six. On top of that, read-only hides
+/// the write-shaped ones, leaving `update_domain` and `origin_status` on an
+/// enabled read-only instance and `configure` alone on a disabled writable
+/// one.
+///
+/// Reading `github.enabled` live is what makes this a listing gate at all.
+/// SEP-2567 forbids a list varying per connection or as a side effect of
+/// another request; the setting is one shared value on the engine, so every
+/// client listing at the same instant is served the same list, and the flip
+/// announces itself to subscribers (see `tests/mcp_subscriptions.rs`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn gating_matrix_over_list_tools() {
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &ALL_FIVE),
-        (false, true, &["update_domain", "origin_status"]),
-        (true, false, &ALL_FIVE),
+        (false, false, &["configure"]),
+        (false, true, &[]),
+        (true, false, &ALL_SIX),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -183,7 +195,7 @@ async fn gating_matrix_over_list_tools() {
         let (client, _server) = connect(eng).await;
         let tools = client.peer().list_tools(Default::default()).await.unwrap();
         let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
-        for name in ALL_FIVE {
+        for name in ALL_SIX {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 names.contains(&name.to_string()),
@@ -194,15 +206,16 @@ async fn gating_matrix_over_list_tools() {
     }
 }
 
-/// `get_tool` agrees with `list_tools`, on the same narrowed matrix.
+/// `get_tool` agrees with `list_tools`, on the same matrix, so the two
+/// enforcement points cannot drift apart.
 #[tokio::test]
 async fn gating_matrix_over_get_tool() {
     use rmcp::ServerHandler;
 
     let cases: [(bool, bool, &[&str]); 4] = [
-        (false, false, &ALL_FIVE),
-        (false, true, &["update_domain", "origin_status"]),
-        (true, false, &ALL_FIVE),
+        (false, false, &["configure"]),
+        (false, true, &[]),
+        (true, false, &ALL_SIX),
         (true, true, &["update_domain", "origin_status"]),
     ];
     for (github_enabled, read_only, visible) in cases {
@@ -210,7 +223,7 @@ async fn gating_matrix_over_get_tool() {
         let eng =
             Arc::new(engine(&tmp.path().join("config.yaml"), github_enabled, read_only).await);
         let server = McpServer::new(eng);
-        for name in ALL_FIVE {
+        for name in ALL_SIX {
             let should_be_visible = visible.contains(&name);
             assert_eq!(
                 server.get_tool(name).is_some(),
@@ -244,12 +257,16 @@ async fn add_domain_is_visible_unless_read_only_regardless_of_github() {
     }
 }
 
-/// Flipping `github.enabled` mid-session moves the refusal, never the
-/// listing. This test used to assert the opposite, which is SEP-2567's second
-/// prohibition word for word: results "MUST NOT vary per-connection or as a
-/// side effect of other requests on the connection".
+/// Flipping `github.enabled` mid-session moves the listing **and** the
+/// refusal, in step: the five appear on the next list, and the same call that
+/// was refused a moment ago now reaches the engine.
+///
+/// The refusal is not made redundant by the hiding. A client that cached the
+/// list, or one that guessed a name out of a skill, still calls a tool it
+/// cannot see, and being told which setting to turn on is what lets it
+/// recover; "no such tool" would not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
+async fn flipping_github_enabled_mid_session_moves_both_the_listing_and_the_refusal() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng.clone()).await;
@@ -263,9 +280,16 @@ async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
-    assert!(before.contains(&"share_changes".to_string()));
+    assert!(
+        !before.contains(&"share_changes".to_string()),
+        "the collaboration surface is withheld while the setting is off: {before:?}"
+    );
+    assert!(
+        before.contains(&"configure".to_string()),
+        "but the enable path is not: {before:?}"
+    );
 
-    // It refuses while the setting is off, and the refusal is what the caller
+    // A tool it cannot see still answers, and the refusal is what the caller
     // reads.
     let refused = peer
         .call_tool(CallToolRequestParams::new("origin_status".to_string()))
@@ -301,9 +325,16 @@ async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
         .iter()
         .map(|t| t.name.to_string())
         .collect();
+    for name in ALL_SIX {
+        assert!(
+            after.contains(&name.to_string()),
+            "{name} is listed once collaboration is on: {after:?}"
+        );
+    }
     assert_eq!(
-        before, after,
-        "the listing is the same on both sides of the flip"
+        after.len(),
+        before.len() + 5,
+        "exactly the five gated tools arrived: {before:?} -> {after:?}"
     );
 
     // And now the same call reaches the engine instead of the gate.
@@ -318,21 +349,23 @@ async fn flipping_github_enabled_mid_session_moves_the_refusal_not_the_list() {
     );
 }
 
-// --- listed tools refuse at call time ---------------------------------------
+// --- hidden tools still refuse at call time ----------------------------------
 
-/// The four GitHub-gated tools are listed whatever `github.enabled` says
-/// (SEP-2567: the setting is `configure`-settable on this very connection, so
-/// it cannot gate a listing) and refuse when it is off. The refusal is a
-/// tool-level error rather than a JSON-RPC one, because a listed tool's
-/// failure has to be readable by the model that called it.
+/// Hidden is not disabled: the five GitHub-gated tools keep their routes while
+/// they are withheld from the listing, and each refuses with the message that
+/// names the setting.
+///
+/// The refusal is a tool-level error rather than a JSON-RPC one, because the
+/// caller is a model working from a stale list or a skill's vocabulary, and
+/// what it needs is a sentence it can act on rather than `-32601`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn listed_collab_tools_refuse_at_call_time_when_github_is_disabled() {
+async fn hidden_collab_tools_refuse_at_call_time_when_github_is_disabled() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, Value); 5] = [
         ("share_changes", json!({"domain": "eng"})),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -340,6 +373,7 @@ async fn listed_collab_tools_refuse_at_call_time_when_github_is_disabled() {
             "resolve_conflict",
             json!({"domain": "eng", "path": "a.md", "resolution": "mine"}),
         ),
+        ("withdraw_proposal", json!({"domain": "eng"})),
     ];
     for (tool, args) in cases {
         let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
@@ -419,6 +453,11 @@ async fn hidden_write_collab_tools_route_to_read_only_when_enabled_and_read_only
     )
     .await
     .unwrap_err();
+    assert!(err.contains("read-only"), "{err}");
+
+    let err = call(peer, "withdraw_proposal", json!({"domain": "eng"}))
+        .await
+        .unwrap_err();
     assert!(err.contains("read-only"), "{err}");
 }
 
@@ -558,7 +597,7 @@ async fn configure_set_stops_at_the_first_bad_key_and_reports_what_applied() {
     assert!(eng.config().github_enabled());
 }
 
-// --- configure: the flip announces nothing ------------------------------------
+// --- configure: the flip announces itself, to subscribers only ---------------
 
 /// A client handler that records whether it ever received
 /// `notifications/tools/list_changed`.
@@ -579,16 +618,17 @@ impl ClientHandler for NotifyClient {
     }
 }
 
-/// Flipping `github.enabled` announces **nothing**, which is the inversion of
-/// `configure_flipping_github_enabled_pushes_a_tool_list_changed_notification`.
+/// The flip really does move this client's list, and it is still told nothing
+/// unasked.
 ///
-/// The four collaboration tools are listed whatever the setting says and refuse
-/// at call time instead, so the flip moves no list and the push described a
-/// change that had not happened. MCP 2026-07-28 removes the unsolicited channel
-/// as well: `tests/mcp_subscriptions.rs` carries the subscription stream that
-/// replaces it, and the same silence asserted for a subscriber.
+/// A legacy peer is the strictest case: it has no `subscriptions/listen` to
+/// open, so the only way it could hear about the change is a push it never
+/// requested, and MCP 2026-07-28 removed that channel outright. It re-reads
+/// `tools/list` at its own discretion instead, which is the contract it always
+/// had. `tests/mcp_subscriptions.rs` carries the other half - a modern peer
+/// that did subscribe is told.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn configure_flipping_github_enabled_announces_nothing() {
+async fn configure_flipping_github_enabled_never_pushes_at_an_unsubscribed_peer() {
     let tmp = tempfile::tempdir().unwrap();
     let eng = Arc::new(engine(&tmp.path().join("config.yaml"), false, false).await);
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -624,7 +664,22 @@ async fn configure_flipping_github_enabled_announces_nothing() {
         )
         .await
         .is_err(),
-        "the flip moves no list, so nothing may be pushed to a client that asked for nothing"
+        "nothing may be pushed at a client that asked for nothing, however much moved"
+    );
+
+    // And the silence is not because nothing happened: this peer's own list
+    // did move, it simply has to ask again to see it.
+    let names: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert!(
+        names.contains(&"share_changes".to_string()),
+        "the flip moved this connection's list: {names:?}"
     );
 }
 

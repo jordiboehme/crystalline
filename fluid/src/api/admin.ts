@@ -16,7 +16,7 @@
  */
 
 import { API_BASE, api, encodeSegment } from "./client";
-import { asArray, asNumber, asObject, asString } from "./json";
+import { asArray, asNumber, asObject, asString, asStrings } from "./json";
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
@@ -208,6 +208,43 @@ export async function unregisterDomain(
   };
 }
 
+/** One comment or review left on a proposal, in the forge's own words. */
+export interface ProposalFeedback {
+  /** The commenting account's login. */
+  author: string;
+  body: string;
+  /** The file an inline comment is anchored to; null for the other channels. */
+  path: string | null;
+  /** The line an inline comment is anchored to; null for the other channels. */
+  line: number | null;
+  submittedAt: string | null;
+  /** `review`, `review_comment` or `comment`. */
+  kind: string;
+}
+
+/** One proposal on the origin, whichever list it arrived in. */
+export interface SyncProposal {
+  number: number;
+  url: string;
+  title: string;
+  /** Lowercased: `open`, `merged`, `declined` or `withdrawn`. */
+  status: string;
+  /** `approved`, `changes_requested` or `commented`; null when unreviewed. */
+  reviewState: string | null;
+  /** Whether a reviewer moved the proposal branch out from under this copy. */
+  amendedUpstream: boolean;
+  feedback: ProposalFeedback[];
+  updatedAt: string | null;
+}
+
+/** One file a pull could not merge, as the status report lists it. */
+export interface SyncConflict {
+  id: string;
+  path: string;
+  kind: string;
+  detectedAt: string | null;
+}
+
 /** Where a team domain stands relative to its GitHub origin. */
 export interface SyncStatus {
   repo: string;
@@ -252,11 +289,43 @@ export interface SyncStatus {
    * `false` would tell somebody to connect what is already connected.
    */
   connected: boolean | null;
+  /**
+   * The open and the declined proposals as themselves, in that order, for the
+   * card that draws a row per proposal.
+   *
+   * One list rather than two, because a row says which it is: the status a
+   * proposal carries is what tells an open one from a turned-down one, and
+   * splitting them here would only make every screen join them again. Empty
+   * when the report counted its proposals instead of embedding them, which is
+   * what the counts above are read out of.
+   */
+  proposals: SyncProposal[];
+  /**
+   * The conflicts as themselves, for the screen that settles them. Empty when
+   * the report carried a count, or a list of bare paths with no id to address
+   * a conflict by.
+   */
+  conflictList: SyncConflict[];
 }
 
 /** The cache key of one domain's sync status. */
 export function syncStatusKey(domain: string): readonly unknown[] {
   return ["domains", domain, "sync"];
+}
+
+/**
+ * The cache key of one domain's share plan, and the one key in this app that
+ * deliberately sits outside the `["domains", ...]` family.
+ *
+ * Reading a plan pulls the origin, so this is not a cache of domain content:
+ * react-query invalidates by prefix, and a plan filed under `["domains"]`
+ * would be refetched - which is to say, would pull - by every bulk domain
+ * invalidation in the app. The share dialog's own comment carries the rest of
+ * the reasoning, because that is where the invalidation it would collide with
+ * is fired from.
+ */
+export function sharePlanKey(domain: string): readonly unknown[] {
+  return ["share-plan", domain];
 }
 
 /**
@@ -268,6 +337,74 @@ export function syncStatusKey(domain: string): readonly unknown[] {
  */
 function asCount(value: unknown): number {
   return asNumber(value) ?? asArray(value).length;
+}
+
+/**
+ * One proposal, whichever list it came from.
+ *
+ * The number is the identity every write here is addressed by, so a record
+ * without one is dropped rather than drawn as a row nothing can be done to.
+ */
+function readProposal(value: unknown): SyncProposal | null {
+  const record = asObject(value);
+  const number = asNumber(record?.number);
+  if (number === null) {
+    return null;
+  }
+  return {
+    number,
+    url: asString(record?.url) ?? "",
+    title: asString(record?.title) ?? "",
+    // The engine spells the three pre-existing statuses PascalCase and the
+    // withdrawn one lowercase; fold them here so screens compare one casing.
+    status: (asString(record?.status) ?? "open").toLowerCase(),
+    reviewState: asString(record?.review_state),
+    amendedUpstream: record?.amended_upstream === true,
+    feedback: asArray(record?.feedback)
+      .map(readFeedback)
+      .filter((item): item is ProposalFeedback => item !== null),
+    updatedAt: asString(record?.updated_at),
+  };
+}
+
+/** One feedback item. A comment with no body is nothing to show. */
+function readFeedback(value: unknown): ProposalFeedback | null {
+  const record = asObject(value);
+  const body = asString(record?.body);
+  if (body === null) {
+    return null;
+  }
+  return {
+    author: asString(record?.author) ?? "",
+    body,
+    path: asString(record?.path),
+    line: asNumber(record?.line),
+    submittedAt: asString(record?.submitted_at),
+    kind: asString(record?.kind) ?? "comment",
+  };
+}
+
+/**
+ * One conflict.
+ *
+ * Both halves or nothing: the id is what the detail and the resolve routes are
+ * addressed by, and a path with no id is a conflict nothing on this side can
+ * open. The count above it is read from the raw list, so a report that carries
+ * bare paths still says how many there are.
+ */
+function readConflict(value: unknown): SyncConflict | null {
+  const record = asObject(value);
+  const id = asString(record?.id);
+  const path = asString(record?.path);
+  if (id === null || path === null) {
+    return null;
+  }
+  return {
+    id,
+    path,
+    kind: asString(record?.kind) ?? "",
+    detectedAt: asString(record?.detected_at),
+  };
 }
 
 /** Read a sync status out of the engine's own per-domain report. */
@@ -290,6 +427,15 @@ function readSyncStatus(payload: unknown): SyncStatus {
     // an absent block, a block of nonsense, a string "true" - is "no answer"
     // rather than "not connected", because only `false` makes the card speak.
     connected: typeof connected === "boolean" ? connected : null,
+    proposals: [
+      ...asArray(record?.open_proposals),
+      ...asArray(record?.declined_proposals),
+    ]
+      .map(readProposal)
+      .filter((proposal): proposal is SyncProposal => proposal !== null),
+    conflictList: asArray(record?.conflicts)
+      .map(readConflict)
+      .filter((conflict): conflict is SyncConflict => conflict !== null),
   };
 }
 
@@ -305,6 +451,173 @@ export async function syncDomain(domain: string): Promise<unknown> {
   return api<unknown>(`/domains/${encodeSegment(domain)}/sync`, {
     method: "POST",
   });
+}
+
+/** What a share would do, before anybody commits to doing it. */
+export interface SharePlan {
+  /**
+   * `create`, `update`, `nothing_to_share`, `conflicts_pending` or
+   * `proposal_diverged` - the server's own word for what the button would do,
+   * which is also what decides whether there is a button at all.
+   */
+  action: string;
+  /** The title the proposal would carry, the server's own if none was given. */
+  effectiveTitle: string;
+  changes: { path: string; kind: string }[];
+  /** The proposal an `update` would go into; null for the other actions. */
+  number: number | null;
+  url: string | null;
+  /**
+   * How many conflicts are waiting, on a `conflicts_pending` plan; null on
+   * every other action, and on a report that named none.
+   *
+   * The one number that turns "settle the conflicts first" into something a
+   * reader can size the work from before opening the screen that settles them.
+   */
+  count: number | null;
+}
+
+/**
+ * What sharing would do right now.
+ *
+ * A read that writes the working tree: the route pulls the origin first so the
+ * plan is about the team's current state rather than about a stale copy, which
+ * is why a read-only instance refuses it.
+ */
+export async function fetchShareChanges(domain: string): Promise<SharePlan> {
+  const record = asObject(
+    await api<unknown>(`/domains/${encodeSegment(domain)}/sync/changes`),
+  );
+  return {
+    action: asString(record?.action) ?? "create",
+    effectiveTitle: asString(record?.effective_title) ?? "",
+    changes: asArray(record?.changes)
+      .map((entry) => {
+        const change = asObject(entry);
+        const path = asString(change?.path);
+        return path === null
+          ? null
+          : { path, kind: asString(change?.kind) ?? "" };
+      })
+      .filter(
+        (change): change is { path: string; kind: string } => change !== null,
+      ),
+    number: asNumber(record?.number),
+    url: asString(record?.url),
+    count: asNumber(record?.count),
+  };
+}
+
+/**
+ * Share this domain's local changes as a proposal, or into the open one.
+ *
+ * The outcome comes back as the engine's own report rather than as a shape read
+ * here: it is five different answers (`proposed`, `updated`,
+ * `nothing_to_share`, `conflicts_pending`, `proposal_diverged`) and the screen
+ * that asked is the one that knows which of them it is looking for.
+ */
+export async function shareDomain(
+  domain: string,
+  body: { title?: string; description?: string },
+): Promise<unknown> {
+  return api<unknown>(`/domains/${encodeSegment(domain)}/sync/share`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+}
+
+/**
+ * What a withdraw did, on the forge and on this copy.
+ *
+ * The three file lists are the reason this is read rather than passed through
+ * as the engine's own JSON: a revert rewrites the working tree and re-indexes
+ * the domain, so a caller has to be able to tell a withdraw that only closed a
+ * pull request from one that moved files under every list on the screen.
+ */
+export interface WithdrawReceipt {
+  number: number;
+  /** Whether a live pull request was closed, as opposed to only a record. */
+  closed: boolean;
+  /** What the record now says, which is `withdrawn`. */
+  status: string;
+  /** Files a revert put back from the origin, and files it removed. */
+  restored: string[];
+  deleted: string[];
+  /** Files a reviewer amended on the branch, which a revert leaves alone. */
+  skippedDiverged: string[];
+}
+
+/** Close a proposal on the forge; `revert` also restores the shared files. */
+export async function withdrawProposal(
+  domain: string,
+  number: number,
+  revert: boolean,
+): Promise<WithdrawReceipt> {
+  const record = asObject(
+    await api<unknown>(
+      `/domains/${encodeSegment(domain)}/sync/proposals/${number}/withdraw`,
+      { method: "POST", body: JSON.stringify({ revert }) },
+    ),
+  );
+  return {
+    // The number that was asked for, when the answer did not repeat it.
+    number: asNumber(record?.number) ?? number,
+    closed: record?.closed === true,
+    status: asString(record?.status) ?? "withdrawn",
+    restored: asStrings(record?.restored),
+    deleted: asStrings(record?.deleted),
+    skippedDiverged: asStrings(record?.skipped_diverged),
+  };
+}
+
+/** One conflict with every side of it, for the screen that settles it. */
+export interface ConflictDetail {
+  id: string;
+  path: string;
+  kind: string;
+  /** The shared start, the local side and the team's, each null when the
+   * stored side is not UTF-8 - `note` says so when one is. */
+  base: string | null;
+  local: string | null;
+  upstream: string | null;
+  note: string | null;
+}
+
+/** Both sides of one conflict, by id. */
+export async function fetchConflict(
+  domain: string,
+  id: string,
+): Promise<ConflictDetail> {
+  const record = asObject(
+    await api<unknown>(
+      `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}`,
+    ),
+  );
+  return {
+    // The id that was asked for, when the answer did not repeat it: this is
+    // the handle the resolve below is addressed by, and losing it would leave
+    // a detail nothing can be done to.
+    id: asString(record?.id) ?? id,
+    path: asString(record?.path) ?? "",
+    kind: asString(record?.kind) ?? "",
+    base: asString(record?.base),
+    local: asString(record?.local),
+    upstream: asString(record?.upstream),
+    note: asString(record?.note),
+  };
+}
+
+/** Settle one conflict by id: `mine`, `theirs`, or `merged` with content. */
+export async function resolveConflict(
+  domain: string,
+  id: string,
+  resolution: string,
+  content?: string,
+): Promise<unknown> {
+  return api<unknown>(
+    `/domains/${encodeSegment(domain)}/sync/conflicts/${encodeSegment(id)}/resolve`,
+    { method: "POST", body: JSON.stringify({ resolution, content }) },
+  );
 }
 
 /** One verify finding raised over an archived entry's markdown. */

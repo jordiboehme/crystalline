@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-core"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -1231,7 +1231,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-index"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1259,7 +1259,7 @@ dependencies = [
 
 [[package]]
 name = "crystalline-remote"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -1277,13 +1277,14 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "uuid",
  "walkdir",
 ]
 
 [[package]]
 name = "crystalline-service"
-version = "0.15.1"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "argon2",

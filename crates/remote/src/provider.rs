@@ -121,6 +121,28 @@ pub enum ProposalState {
     Declined,
 }
 
+/// A proposal's review standing plus its flattened feedback items.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Feedback {
+    /// "approved", "changes_requested" or "commented"; None when no review
+    /// exists.
+    pub review_state: Option<String>,
+    /// Every review body, inline review comment and conversation comment on
+    /// the proposal, flattened into one list.
+    pub items: Vec<crate::state::FeedbackItem>,
+}
+
+/// One open proposal as the forge lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpenProposalRef {
+    /// The proposal number.
+    pub number: u64,
+    /// The branch carrying the proposed commits.
+    pub branch: String,
+    /// The commit that branch currently points at.
+    pub head_sha: String,
+}
+
 /// Forge-neutral access to the operations Crystalline needs to collaborate
 /// over a repository: reading commits, blobs and trees, writing new commits
 /// and branches and opening or checking review proposals.
@@ -161,13 +183,16 @@ pub trait Provider: Send + Sync {
         writes: &[TreeWrite],
     ) -> Result<String, RemoteError>;
 
-    /// Creates a commit with the given tree and parent, returns its sha.
+    /// Creates a commit with the given tree and parents, returns its sha.
+    /// One parent for an ordinary share commit, two for the merge commit a
+    /// share-update makes after the base advanced; order matters, the branch
+    /// head first.
     async fn create_commit(
         &self,
         origin: &OriginSpec,
         message: &str,
         tree: &str,
-        parent: &str,
+        parents: &[String],
     ) -> Result<String, RemoteError>;
 
     /// Creates a branch pointing at `commit`.
@@ -180,6 +205,55 @@ pub trait Provider: Send + Sync {
 
     /// Deletes a branch.
     async fn delete_branch(&self, origin: &OriginSpec, name: &str) -> Result<(), RemoteError>;
+
+    /// The commit an arbitrary branch points at, or `None` when the branch
+    /// does not exist. Unlike [`Provider::branch_head`] this reads any branch
+    /// rather than only the tracked one, and reports a missing branch as an
+    /// answer rather than as a repository problem. That widening cuts both
+    /// ways: a repository that is gone, renamed or no longer readable with
+    /// this token answers `None` too, so `None` means "no branch found here"
+    /// and never on its own means "the repository is fine and the branch was
+    /// deleted". Callers must not make it the sole basis for a success
+    /// verdict.
+    async fn branch_ref(
+        &self,
+        origin: &OriginSpec,
+        name: &str,
+    ) -> Result<Option<String>, RemoteError>;
+
+    /// Moves an existing branch to `commit`.
+    async fn update_branch(
+        &self,
+        origin: &OriginSpec,
+        name: &str,
+        commit: &str,
+    ) -> Result<(), RemoteError>;
+
+    /// Rewrites an open proposal's body, and its title when one is supplied.
+    async fn update_proposal(
+        &self,
+        origin: &OriginSpec,
+        number: u64,
+        title: Option<&str>,
+        body: &str,
+    ) -> Result<(), RemoteError>;
+
+    /// Closes a proposal without merging it.
+    async fn close_proposal(&self, origin: &OriginSpec, number: u64) -> Result<(), RemoteError>;
+
+    /// The review standing and every piece of feedback on a proposal.
+    async fn proposal_feedback(
+        &self,
+        origin: &OriginSpec,
+        number: u64,
+    ) -> Result<Feedback, RemoteError>;
+
+    /// Every proposal still open on the repository, with the branch and head
+    /// commit each one carries.
+    async fn list_open_proposals(
+        &self,
+        origin: &OriginSpec,
+    ) -> Result<Vec<OpenProposalRef>, RemoteError>;
 
     /// Opens a review proposal.
     async fn create_proposal(
@@ -261,7 +335,7 @@ mod tests {
             _origin: &OriginSpec,
             _message: &str,
             _tree: &str,
-            _parent: &str,
+            _parents: &[String],
         ) -> Result<String, RemoteError> {
             Err(RemoteError::Offline)
         }
@@ -280,6 +354,56 @@ mod tests {
             _origin: &OriginSpec,
             _name: &str,
         ) -> Result<(), RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn branch_ref(
+            &self,
+            _origin: &OriginSpec,
+            _name: &str,
+        ) -> Result<Option<String>, RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn update_branch(
+            &self,
+            _origin: &OriginSpec,
+            _name: &str,
+            _commit: &str,
+        ) -> Result<(), RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn update_proposal(
+            &self,
+            _origin: &OriginSpec,
+            _number: u64,
+            _title: Option<&str>,
+            _body: &str,
+        ) -> Result<(), RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn close_proposal(
+            &self,
+            _origin: &OriginSpec,
+            _number: u64,
+        ) -> Result<(), RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn proposal_feedback(
+            &self,
+            _origin: &OriginSpec,
+            _number: u64,
+        ) -> Result<Feedback, RemoteError> {
+            Err(RemoteError::Offline)
+        }
+
+        async fn list_open_proposals(
+            &self,
+            _origin: &OriginSpec,
+        ) -> Result<Vec<OpenProposalRef>, RemoteError> {
             Err(RemoteError::Offline)
         }
 

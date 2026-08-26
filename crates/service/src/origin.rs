@@ -1,10 +1,11 @@
 //! Pure helpers for GitHub-origin collaboration, factored out of
 //! [`crate::engine::Engine`] so its `origin_add`, `origin_update`,
-//! `origin_status`, `origin_share`, `origin_discard` and `origin_resolve`
-//! methods stay orchestration-only: everything here is a free function over
-//! plain data, with no access to `Engine`'s private state, mirroring how
-//! [`crate::settings`] operates on [`crystalline_core::config::GlobalConfig`]
-//! rather than reaching into the engine itself.
+//! `origin_status`, `origin_share`, `origin_share_preview`, `origin_withdraw`
+//! and `origin_resolve` methods stay orchestration-only: everything here is a
+//! free function over plain data, with no access to `Engine`'s private state,
+//! mirroring how [`crate::settings`] operates on
+//! [`crystalline_core::config::GlobalConfig`] rather than reaching into the
+//! engine itself.
 //!
 //! Nothing here talks to GitHub, the filesystem or the token store; that is
 //! `crystalline_remote::ops` and `crystalline_remote::token`'s job. This
@@ -16,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use crystalline_remote::RemoteError;
+use crystalline_remote::changes::LocalChange;
 use crystalline_remote::ops::{self, OriginStatusReport, ProposeOutcome, PullReport};
 use crystalline_remote::state::{OriginState, ProposalStatus};
 use serde_json::{Value, json};
@@ -153,11 +155,26 @@ pub(crate) fn proposal_transitions_json(
 /// transport reason (offline, rate limited, an expired connection) and the
 /// report was produced by retrying with no probe at all; `null` when the
 /// probe succeeded or was never attempted (no connection).
+///
+/// Each open proposal travels as its full record (review feedback included)
+/// decorated with `amended_upstream`: true when the live branch head no
+/// longer matches the recorded one, so the caller can say a reviewer moved
+/// the branch without a second round trip. It is false for every proposal
+/// when the live list was not consulted at all (offline, or a failed list).
 pub(crate) fn status_report_json(
     domain: &str,
     report: &OriginStatusReport,
     probe_error: Option<String>,
 ) -> Value {
+    let open: Vec<Value> = report
+        .open_proposals
+        .iter()
+        .map(|p| {
+            let mut v = serde_json::to_value(p).expect("a proposal serializes");
+            v["amended_upstream"] = json!(report.amended_upstream.contains(&p.number));
+            v
+        })
+        .collect();
     json!({
         "domain": domain,
         "repo": report.repo,
@@ -166,7 +183,7 @@ pub(crate) fn status_report_json(
         "behind": report.behind,
         "local_changes": report.local_changes,
         "skipped_large": report.skipped_large,
-        "open_proposals": report.open_proposals,
+        "open_proposals": open,
         "declined_proposals": report.declined_proposals,
         "conflicts": report.conflicts,
         "last_checked": report.last_checked,
@@ -240,12 +257,15 @@ fn poll_outcome_json(outcome: &DomainPollOutcome) -> Value {
 
 /// Shapes [`ops::propose`]'s outcome into `origin_share`'s JSON: `{ outcome:
 /// "proposed", url, number, branch, added, updated, deleted, skipped_large,
-/// summary }` when a pull request was opened, or `{ outcome:
+/// summary }` when a pull request was opened, `{ outcome: "updated", proposal
+/// }` when the one open proposal was updated in place, `{ outcome:
 /// "nothing_to_share", skipped_large }` when the team already has everything
-/// the domain knows. The third outcome a caller may see, `conflicts_pending`,
-/// is not shaped here: `Engine::origin_share` builds it directly from the
-/// reloaded conflict list when `ops::propose` itself refuses, since
-/// `RemoteError::ConflictsPending` alone carries only a count.
+/// the domain knows, or `{ outcome: "proposal_diverged", proposal, guidance }`
+/// when a reviewer moved the proposal branch and nothing was written. The
+/// further outcome a caller may see, `conflicts_pending`, is not shaped here:
+/// `Engine::origin_share` builds it directly from the reloaded conflict list
+/// when `ops::propose` itself refuses, since `RemoteError::ConflictsPending`
+/// alone carries only a count.
 pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
     match outcome {
         ProposeOutcome::Proposed(report) => json!({
@@ -259,12 +279,102 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "skipped_large": report.skipped_large,
             "summary": report.summary,
         }),
+        ProposeOutcome::Updated(report) => json!({
+            "outcome": "updated",
+            "proposal": {
+                "url": report.url,
+                "number": report.number,
+                "branch": report.branch,
+                "added": report.added,
+                "updated": report.updated,
+                "deleted": report.deleted,
+                "skipped_large": report.skipped_large,
+                "summary": report.summary,
+            },
+        }),
         ProposeOutcome::NothingToShare { skipped_large } => json!({
             "outcome": "nothing_to_share",
             "skipped_large": skipped_large,
         }),
+        ProposeOutcome::ProposalDiverged {
+            number,
+            url,
+            branch,
+        } => json!({
+            "outcome": "proposal_diverged",
+            "proposal": { "number": number, "url": url, "branch": branch },
+            "guidance": DIVERGED_GUIDANCE,
+        }),
     }
 }
+
+/// Shapes [`ops::propose_preview`]'s plan for `origin_share_preview` and the
+/// REST changes route: always `effective_title` and `changes` (one
+/// `{ path, kind }` entry per detected local change), plus the fields the
+/// planned action itself carries - `number` and `url` for an update, all
+/// three of `number`, `url` and `branch` for a diverged proposal, `count` for
+/// pending conflicts and nothing extra for a create or a no-op.
+pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
+    let changes: Vec<Value> = plan
+        .changes
+        .changes
+        .iter()
+        .map(|c| {
+            let kind = match c {
+                LocalChange::Added { .. } => "added",
+                LocalChange::Modified { .. } => "modified",
+                LocalChange::Deleted { .. } => "deleted",
+            };
+            json!({ "path": c.path(), "kind": kind })
+        })
+        .collect();
+    let mut v = json!({
+        "effective_title": plan.effective_title,
+        "changes": changes,
+    });
+    match &plan.action {
+        ops::PlannedAction::Create => v["action"] = json!("create"),
+        ops::PlannedAction::Update { number, url } => {
+            v["action"] = json!("update");
+            v["number"] = json!(number);
+            v["url"] = json!(url);
+        }
+        ops::PlannedAction::NothingToShare => v["action"] = json!("nothing_to_share"),
+        ops::PlannedAction::ConflictsPending { count } => {
+            v["action"] = json!("conflicts_pending");
+            v["count"] = json!(count);
+        }
+        ops::PlannedAction::ProposalDiverged {
+            number,
+            url,
+            branch,
+        } => {
+            v["action"] = json!("proposal_diverged");
+            v["number"] = json!(number);
+            v["url"] = json!(url);
+            v["branch"] = json!(branch);
+        }
+    }
+    v
+}
+
+/// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
+/// proposal number, whether a live pull request was closed on the forge, the
+/// fixed `"withdrawn"` status the record now carries, and the three
+/// working-tree lists a revert produces (all empty without one).
+pub(crate) fn withdraw_report_json(report: &ops::WithdrawReport) -> Value {
+    json!({
+        "number": report.number,
+        "closed": report.closed,
+        "status": "withdrawn",
+        "restored": report.restored,
+        "deleted": report.deleted,
+        "skipped_diverged": report.skipped_diverged,
+    })
+}
+
+/// What a caller relays when a reviewer amended the proposal branch.
+pub(crate) const DIVERGED_GUIDANCE: &str = "A reviewer pushed commits onto this proposal's branch. Let the review finish and merge on GitHub, or withdraw the proposal and share again.";
 
 /// Builds the [`ops::Resolution`] `origin_resolve` acts on from its `keep`
 /// and `content` arguments, which must be exactly one of: `keep` is
@@ -425,6 +535,12 @@ mod tests {
             created_at: chrono::Utc::now(),
             status: ProposalStatus::Open,
             files: vec![],
+            head_commit: None,
+            pending_head_commit: None,
+            base_commit: None,
+            review_state: None,
+            feedback: Vec::new(),
+            updated_at: None,
         }
     }
 
@@ -503,6 +619,7 @@ mod tests {
             declined_proposals: vec![],
             conflicts: vec![],
             last_checked: None,
+            amended_upstream: vec![],
         };
         let v = status_report_json("eng", &report, None);
         assert_eq!(v["domain"], "eng");
@@ -525,6 +642,7 @@ mod tests {
             declined_proposals: vec![],
             conflicts: vec![],
             last_checked: None,
+            amended_upstream: vec![],
         };
         let message = RemoteError::Offline.to_string();
         let v = status_report_json("eng", &report, Some(message.clone()));
@@ -547,6 +665,7 @@ mod tests {
             declined_proposals: vec![],
             conflicts: vec![],
             last_checked: None,
+            amended_upstream: vec![],
         }
     }
 
@@ -633,6 +752,154 @@ mod tests {
         assert_eq!(v["number"], 3);
         assert_eq!(v["added"][0], "notes/new.md");
         assert_eq!(v["summary"], "Shares 1 new engram.");
+    }
+
+    #[test]
+    fn propose_outcome_json_shapes_an_updated_outcome_under_a_proposal_key() {
+        let outcome = ProposeOutcome::Updated(ops::ProposeReport {
+            url: "https://github.com/acme/brand-knowledge/pull/3".to_string(),
+            number: 3,
+            branch: "crystalline/share-brand-240101120000".to_string(),
+            added: vec![],
+            updated: vec!["notes/a.md".to_string()],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Refines 1 engram.".to_string(),
+        });
+        let v = propose_outcome_json(&outcome);
+        assert_eq!(v["outcome"], "updated");
+        assert_eq!(v["proposal"]["number"], 3);
+        assert_eq!(v["proposal"]["updated"][0], "notes/a.md");
+        assert_eq!(v["proposal"]["summary"], "Refines 1 engram.");
+    }
+
+    #[test]
+    fn propose_outcome_json_shapes_a_proposal_diverged_outcome_with_guidance() {
+        let outcome = ProposeOutcome::ProposalDiverged {
+            number: 3,
+            url: "https://github.com/acme/brand-knowledge/pull/3".to_string(),
+            branch: "crystalline/share-brand-240101120000".to_string(),
+        };
+        let v = propose_outcome_json(&outcome);
+        assert_eq!(v["outcome"], "proposal_diverged");
+        assert_eq!(v["proposal"]["number"], 3);
+        assert_eq!(
+            v["proposal"]["branch"],
+            "crystalline/share-brand-240101120000"
+        );
+        assert_eq!(v["guidance"], DIVERGED_GUIDANCE);
+    }
+
+    #[test]
+    fn share_plan_json_names_the_action_and_every_change() {
+        use crystalline_remote::changes::{LocalChange, LocalChanges};
+        let plan = ops::SharePlan {
+            action: ops::PlannedAction::Update {
+                number: 4,
+                url: "https://github.com/acme/brand-knowledge/pull/4".to_string(),
+            },
+            changes: LocalChanges {
+                changes: vec![
+                    LocalChange::Added {
+                        path: "notes/new.md".to_string(),
+                        sha256: "aa".to_string(),
+                    },
+                    LocalChange::Deleted {
+                        path: "notes/old.md".to_string(),
+                    },
+                ],
+                skipped_large: vec![],
+            },
+            effective_title: "Share updates from brand".to_string(),
+        };
+        let v = share_plan_json(&plan);
+        assert_eq!(v["action"], "update");
+        assert_eq!(v["number"], 4);
+        assert_eq!(v["url"], "https://github.com/acme/brand-knowledge/pull/4");
+        assert_eq!(v["effective_title"], "Share updates from brand");
+        assert_eq!(
+            v["changes"][0],
+            json!({"path": "notes/new.md", "kind": "added"})
+        );
+        assert_eq!(
+            v["changes"][1],
+            json!({"path": "notes/old.md", "kind": "deleted"})
+        );
+    }
+
+    #[test]
+    fn share_plan_json_shapes_the_remaining_actions() {
+        use crystalline_remote::changes::LocalChanges;
+        let plan = |action| ops::SharePlan {
+            action,
+            changes: LocalChanges::default(),
+            effective_title: String::new(),
+        };
+        assert_eq!(
+            share_plan_json(&plan(ops::PlannedAction::Create))["action"],
+            "create"
+        );
+        assert_eq!(
+            share_plan_json(&plan(ops::PlannedAction::NothingToShare))["action"],
+            "nothing_to_share"
+        );
+        let conflicts = share_plan_json(&plan(ops::PlannedAction::ConflictsPending { count: 2 }));
+        assert_eq!(conflicts["action"], "conflicts_pending");
+        assert_eq!(conflicts["count"], 2);
+        let diverged = share_plan_json(&plan(ops::PlannedAction::ProposalDiverged {
+            number: 9,
+            url: "https://github.test/pull/9".to_string(),
+            branch: "crystalline/share-brand".to_string(),
+        }));
+        assert_eq!(diverged["action"], "proposal_diverged");
+        assert_eq!(diverged["number"], 9);
+        assert_eq!(diverged["branch"], "crystalline/share-brand");
+    }
+
+    #[test]
+    fn withdraw_report_json_carries_the_number_and_the_file_lists() {
+        let report = ops::WithdrawReport {
+            number: 7,
+            closed: true,
+            restored: vec!["notes/a.md".to_string()],
+            deleted: vec!["notes/b.md".to_string()],
+            skipped_diverged: vec!["notes/c.md".to_string()],
+        };
+        let v = withdraw_report_json(&report);
+        assert_eq!(v["number"], 7);
+        assert_eq!(v["closed"], true);
+        assert_eq!(v["status"], "withdrawn");
+        assert_eq!(v["restored"][0], "notes/a.md");
+        assert_eq!(v["deleted"][0], "notes/b.md");
+        assert_eq!(v["skipped_diverged"][0], "notes/c.md");
+    }
+
+    #[test]
+    fn status_report_json_decorates_open_proposals_with_amended_upstream() {
+        let report = OriginStatusReport {
+            repo: "acme/brand-knowledge".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: Some(false),
+            local_changes: 0,
+            skipped_large: vec![],
+            open_proposals: vec![
+                proposal_fixture(1, "https://github.test/pull/1", "One"),
+                proposal_fixture(2, "https://github.test/pull/2", "Two"),
+            ],
+            declined_proposals: vec![],
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![2],
+        };
+        let v = status_report_json("eng", &report, None);
+        assert_eq!(v["open_proposals"][0]["number"], 1);
+        assert_eq!(v["open_proposals"][0]["amended_upstream"], false);
+        assert_eq!(v["open_proposals"][1]["number"], 2);
+        assert_eq!(v["open_proposals"][1]["amended_upstream"], true);
+        // The full record travels, feedback included: this is the channel a
+        // REST client reads review comments from.
+        assert!(v["open_proposals"][0]["feedback"].is_array(), "{v}");
     }
 
     #[test]

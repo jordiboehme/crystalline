@@ -584,7 +584,11 @@ async fn the_tool_list_is_unchanged_by_the_attachment_surface() {
         .unwrap()
         .tools;
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-    assert_eq!(names.len(), 22, "the one invariant list: {names:?}");
+    assert_eq!(
+        names.len(),
+        18,
+        "a default install's list, unmoved by this surface: {names:?}"
+    );
     assert!(
         !names.iter().any(|n| n.contains("attachment")),
         "no attachment tool was added: {names:?}"

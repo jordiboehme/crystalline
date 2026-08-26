@@ -1,5 +1,7 @@
 //! Domain lifecycle (admin): create in any of the three modes, unregister, and
-//! a team domain's sync status and manual pull.
+//! the whole of a team domain's origin surface - status, manual pull, the
+//! share preview and share, withdrawing a proposal, and reading or resolving
+//! one recorded conflict.
 //! REST is the untrusted surface of the engine verbs MCP and the CLI already
 //! use: names are validated here (an operator typing at the CLI is trusted; a
 //! browser is not), and a local domain is always created under the configured
@@ -694,6 +696,541 @@ pub async fn sync_now(
         "the pull",
     )?;
     Ok(Json(Value::Object(report)))
+}
+
+/// `GET /domains/{domain}/sync/changes` - what a share would do right now.
+///
+/// The preview PULLS first (freshness is part of previewing honestly), so it
+/// writes the working tree and is refused on a read-only instance even though
+/// it is a GET. It never writes to the origin.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/sync/changes",
+    tag = "domains",
+    operation_id = "get_domain_share_changes",
+    summary = "Preview what sharing this team domain would do.",
+    description = "Admin only. Pulls the origin first, then reports the \
+                   action a share would take (`create`, `update` with the \
+                   proposal number and url, `nothing_to_share`, \
+                   `conflicts_pending`, `proposal_diverged`), the effective \
+                   title and the changed files. Writes nothing to the origin; \
+                   refused on a read-only instance because the freshness pull \
+                   writes the working tree.",
+    params(("domain" = String, Path, description = "The registered team domain.")),
+    responses(
+        (
+            status = 200,
+            description = "The share plan: the action it would take, the \
+                           title it would carry and one entry per changed \
+                           file.",
+            body = Object,
+            example = json!({
+                "action": "update",
+                "number": 4,
+                "url": "https://github.com/acme/knowledge/pull/4",
+                "effective_title": "Refine 2 engrams in kb",
+                "changes": [{ "path": "notes/a.md", "kind": "modified" }]
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, this instance is \
+                           read-only, or the trusted-header identity names a \
+                           disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or a domain with no team origin.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "GitHub is switched off on this instance, or it is \
+                           on but no account is connected - the detail says \
+                           which, and where to fix it.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn share_changes_preview(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    require_team_domain(&state, &domain, Refusal::Missing)?;
+    if !state.engine.github_ready().await {
+        return Err(ApiError::conflict(
+            "GitHub is not connected on this instance: connect it under \
+             Settings > GitHub, then retry",
+        ));
+    }
+    Ok(Json(
+        state.engine.origin_share_preview(&domain, None).await?,
+    ))
+}
+
+/// What `POST /domains/{domain}/sync/share` takes: both fields optional, since
+/// the engine writes a summary of its own when neither is given.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "The proposal's title and description. Both optional: \
+                        with neither, the share carries a title the engine \
+                        generates from the changes themselves.")]
+pub struct ShareBody {
+    /// The pull request title. Defaults to a generated summary.
+    #[serde(default)]
+    #[schema(example = "Refine 2 engrams in kb")]
+    pub title: Option<String>,
+    /// A longer description of what changed and why.
+    #[serde(default)]
+    #[schema(example = "Sharper wording on the routing rules.")]
+    pub description: Option<String>,
+}
+
+/// `POST /domains/{domain}/sync/share` - propose this domain's local changes
+/// to the team as a pull request.
+///
+/// A write against the origin, so a read-only instance refuses it, and it
+/// needs a GitHub connection for the same reason the pull does: with no
+/// credential it has nothing to publish with.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/sync/share",
+    tag = "domains",
+    operation_id = "share_domain",
+    summary = "Share a team domain's local changes as a proposal.",
+    description = "Admin only. Opens a pull request against the domain's \
+                   origin, or updates the one already open in place. Answers \
+                   `nothing_to_share` when the team already has everything, \
+                   `conflicts_pending` with the conflicts that need resolving \
+                   first, and `proposal_diverged` when a reviewer moved the \
+                   proposal branch and nothing was written. Refused on a \
+                   read-only instance.",
+    params(("domain" = String, Path, description = "The registered team domain.")),
+    request_body = ShareBody,
+    responses(
+        (
+            status = 200,
+            description = "The engine's own share outcome: `proposed` with the \
+                           new proposal's number and url, `updated` carrying \
+                           the proposal it refreshed, `nothing_to_share`, \
+                           `conflicts_pending` with the conflicts, or \
+                           `proposal_diverged` with guidance.",
+            body = Object,
+            example = json!({
+                "outcome": "proposed",
+                "url": "https://github.com/acme/knowledge/pull/4",
+                "number": 4,
+                "branch": "crystalline/kb-20260821",
+                "added": ["notes/b.md"],
+                "updated": ["notes/a.md"],
+                "deleted": [],
+                "skipped_large": [],
+                "summary": "Refine 2 engrams in kb"
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain has no team origin to share with, \
+                           GitHub is switched off on this instance, or it is \
+                           on but no account is connected.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn share_now(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<ShareBody>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    require_team_domain(&state, &domain, Refusal::Conflict)?;
+    if !state.engine.github_ready().await {
+        return Err(ApiError::conflict(
+            "GitHub is not connected on this instance: connect it under \
+             Settings > GitHub, then retry the share",
+        ));
+    }
+    Ok(Json(
+        state
+            .engine
+            .origin_share(&domain, body.title.as_deref(), body.description.as_deref())
+            .await?,
+    ))
+}
+
+/// What `POST /domains/{domain}/sync/proposals/{number}/withdraw` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "Whether withdrawing also puts the shared files back \
+                        the way the team has them. Absent means false: the \
+                        proposal closes and the working tree is left alone.")]
+pub struct WithdrawBody {
+    /// Restore the shared files from the origin as the proposal closes.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub revert: Option<bool>,
+}
+
+/// `POST /domains/{domain}/sync/proposals/{number}/withdraw` - close a
+/// proposal on the forge, optionally putting the shared files back.
+///
+/// A write on both sides (the forge, and the working tree when `revert` is
+/// asked for), so a read-only instance refuses it and a missing GitHub
+/// connection is a 409 exactly as it is for the share.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/sync/proposals/{number}/withdraw",
+    tag = "domains",
+    operation_id = "withdraw_domain_proposal",
+    summary = "Withdraw one of a team domain's open proposals.",
+    description = "Admin only. Closes the proposal's pull request, deletes \
+                   its branch best-effort and records it as withdrawn. With \
+                   `revert` true the shared files are restored from the \
+                   origin as well, and files a reviewer amended on the \
+                   proposal branch are left alone and reported under \
+                   `skipped_diverged`. Refused on a read-only instance.",
+    params(
+        ("domain" = String, Path, description = "The registered team domain."),
+        ("number" = u64, Path, description = "The proposal number to withdraw."),
+    ),
+    request_body = WithdrawBody,
+    responses(
+        (
+            status = 200,
+            description = "The engine's own withdraw report: the number, \
+                           whether a live pull request was closed, the \
+                           `withdrawn` status the record now carries and the \
+                           working-tree lists a revert produced.",
+            body = Object,
+            example = json!({
+                "number": 4,
+                "closed": true,
+                "status": "withdrawn",
+                "restored": ["notes/a.md"],
+                "deleted": [],
+                "skipped_diverged": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or no such proposal.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain has no team origin, GitHub is switched \
+                           off on this instance, or it is on but no account \
+                           is connected.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn withdraw_proposal(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, number)): ApiPath<(String, u64)>,
+    ApiJson(body): ApiJson<WithdrawBody>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    require_team_domain(&state, &domain, Refusal::Conflict)?;
+    if !state.engine.github_ready().await {
+        return Err(ApiError::conflict(
+            "GitHub is not connected on this instance: connect it under \
+             Settings > GitHub, then retry the withdraw",
+        ));
+    }
+    Ok(Json(
+        state
+            .engine
+            .origin_withdraw(&domain, Some(number), body.revert.unwrap_or(false))
+            .await?,
+    ))
+}
+
+/// `GET /domains/{domain}/sync/conflicts/{id}` - one recorded conflict in
+/// full, both sides included, so a client can render a merge view.
+///
+/// An OFFLINE verb: everything it reads is on this machine already, so unlike
+/// the share routes beside it there is no connection check. A pure read, so a
+/// read-only instance serves it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/domains/{domain}/sync/conflicts/{id}",
+    tag = "domains",
+    operation_id = "get_domain_conflict",
+    summary = "One recorded conflict, with every side.",
+    description = "Admin only. Reads the conflict the domain's origin state \
+                   recorded under this id: the base and upstream sides kept \
+                   beside it, plus the current local content. A side that \
+                   exists but is not UTF-8 comes back null with `note` saying \
+                   so. Entirely local - no GitHub connection is needed, and a \
+                   read-only instance serves it.",
+    params(
+        ("domain" = String, Path, description = "The registered team domain."),
+        ("id" = String, Path, description = "The conflict id from the sync status."),
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The conflict and its three sides.",
+            body = Object,
+            example = json!({
+                "id": "a1b2c3d4",
+                "path": "notes/a.md",
+                "kind": "both_modified",
+                "detected_at": "2026-08-10T08:00:00Z",
+                "base": "---\ntitle: A\n---\n\nthe shared start\n",
+                "local": "---\ntitle: A\n---\n\nmy version\n",
+                "upstream": "---\ntitle: A\n---\n\nthe team's version\n",
+                "note": null
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, a domain with no team origin, or no \
+                           open conflict with that id.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "GitHub is switched off on this instance.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn conflict_detail(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    // No connection check: every side of a conflict is already on this
+    // machine. See the doc comment.
+    require_team_domain(&state, &domain, Refusal::Missing)?;
+    Ok(Json(
+        state
+            .engine
+            .origin_conflict_detail(&domain, Some(&id), None)
+            .await?,
+    ))
+}
+
+/// What `POST /domains/{domain}/sync/conflicts/{id}/resolve` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "How to settle the conflict: keep `mine`, take \
+                        `theirs`, or write `merged` content of your own. \
+                        `content` belongs to `merged` and to nothing else.")]
+pub struct ResolveBody {
+    /// mine | theirs | merged
+    #[schema(example = "theirs")]
+    pub resolution: String,
+    /// The merged markdown. Required for `merged`, meaningless otherwise.
+    #[serde(default)]
+    #[schema(example = "---\ntitle: A\n---\n\nboth points, one file\n")]
+    pub content: Option<String>,
+}
+
+/// `POST /domains/{domain}/sync/conflicts/{id}/resolve` - settle one recorded
+/// conflict, addressed by its id.
+///
+/// Offline like the detail read beside it, so no connection check; a write to
+/// the working tree, so a read-only instance refuses it.
+///
+/// The engine's own resolve verb takes a PATH, because that is what an agent
+/// naming a conflict at the CLI has. A browser has the id the status listed,
+/// which is the stabler handle: this route looks the path up through
+/// [`crate::engine::Engine::origin_conflict_detail`] first, so a resolve can
+/// never land on some other conflict that happens to share a path.
+#[utoipa::path(
+    post,
+    path = "/api/v1/domains/{domain}/sync/conflicts/{id}/resolve",
+    tag = "domains",
+    operation_id = "resolve_domain_conflict",
+    summary = "Resolve one recorded conflict by id.",
+    description = "Admin only. Settles the conflict by keeping the local \
+                   side (`mine`), taking the team's (`theirs`) or writing \
+                   merged content (`merged`, which requires `content`), then \
+                   re-indexes the domain. Entirely local - no GitHub \
+                   connection is needed - but it writes, so a read-only \
+                   instance refuses it.",
+    params(
+        ("domain" = String, Path, description = "The registered team domain."),
+        ("id" = String, Path, description = "The conflict id from the sync status."),
+    ),
+    request_body = ResolveBody,
+    responses(
+        (
+            status = 200,
+            description = "The path that was resolved and how many conflicts \
+                           this domain still has open.",
+            body = Object,
+            example = json!({ "resolved": "notes/a.md", "remaining": 0 }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, a domain with no team origin, or no \
+                           open conflict with that id.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The domain has no team origin, or GitHub is \
+                           switched off on this instance.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 415,
+            description = "The body is not `application/json`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 422,
+            description = "An unknown `resolution`, or `merged` with no \
+                           `content` to write.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn resolve_conflict(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath((domain, id)): ApiPath<(String, String)>,
+    ApiJson(body): ApiJson<ResolveBody>,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    refuse_read_only(&state)?;
+    require_team_domain(&state, &domain, Refusal::Conflict)?;
+    // Resolve BY ID: look the path up first, then run the path-based verb.
+    let detail = state
+        .engine
+        .origin_conflict_detail(&domain, Some(&id), None)
+        .await?;
+    let path = detail["path"]
+        .as_str()
+        .ok_or_else(|| ApiError::not_found(format!("no open conflict {id}")))?
+        .to_string();
+    let (keep, content): (Option<&str>, Option<Vec<u8>>) = match body.resolution.as_str() {
+        "mine" => (Some("mine"), None),
+        "theirs" => (Some("theirs"), None),
+        "merged" => match &body.content {
+            Some(text) => (None, Some(text.clone().into_bytes())),
+            None => {
+                return Err(ApiError::unprocessable(
+                    "resolution merged requires content",
+                ));
+            }
+        },
+        other => {
+            return Err(ApiError::unprocessable(format!(
+                "resolution must be mine, theirs or merged, got '{other}'"
+            )));
+        }
+    };
+    Ok(Json(
+        state
+            .engine
+            .origin_resolve(&domain, &path, keep, content.as_deref())
+            .await?,
+    ))
 }
 
 /// How a sync endpoint refuses a domain that is not a team domain: the status

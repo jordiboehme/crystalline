@@ -4,7 +4,7 @@
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! sessions, tool, configure, origin_add, origin_update, origin_status,
-//! origin_share, origin_discard, origin_resolve, provision, forget_domain,
+//! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
 //! shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
@@ -288,11 +288,17 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
-        // Discard a declined, or still-open, share proposal for one domain.
-        "origin_discard" => {
+        // Withdraw a share proposal for one domain: close it on the forge,
+        // optionally restore the shared files, record it withdrawn.
+        "origin_withdraw" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
-            let proposal = req.get("proposal").and_then(Value::as_u64).unwrap_or(0);
-            match shared.engine.origin_discard(domain, proposal).await {
+            let proposal = req.get("proposal").and_then(Value::as_u64);
+            let revert = req.get("revert").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .origin_withdraw(domain, proposal, revert)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -369,7 +375,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
                  routing_bullets, scaffold_manifest, domain_import, domain_export, retag, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
-                 origin_discard, origin_resolve, provision, forget_domain or shutdown"
+                 origin_withdraw, origin_resolve, provision, forget_domain or shutdown"
             )),
             false,
         ),

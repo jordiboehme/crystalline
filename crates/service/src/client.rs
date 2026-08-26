@@ -1209,19 +1209,20 @@ pub async fn origin_share(
     Ok(engine.origin_share(domain, title, description).await?)
 }
 
-/// Discard a declined, or still-open, share proposal for one team domain,
-/// restoring local files that were not changed since sharing them: over the
-/// daemon when one owns the index, else against a directly opened store.
-pub async fn origin_discard(
+/// Withdraw a share proposal for one team domain: over the daemon when one
+/// owns the index, else against a directly opened store.
+pub async fn origin_withdraw(
     domain: &str,
-    proposal: u64,
+    proposal: Option<u64>,
+    revert: bool,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
         && let Some(data) = ctl_if_running(json!({
-            "v": 1, "cmd": "origin_discard", "domain": domain, "proposal": proposal,
+            "v": 1, "cmd": "origin_withdraw", "domain": domain,
+            "proposal": proposal, "revert": revert,
         }))
         .await?
     {
@@ -1230,7 +1231,7 @@ pub async fn origin_discard(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_discard(domain, proposal).await?)
+    Ok(engine.origin_withdraw(domain, proposal, revert).await?)
 }
 
 /// Resolve one recorded conflict for a team domain: over the daemon when one

@@ -431,12 +431,13 @@ fn read_only_daemon_reports_hides_and_refuses() {
     // tools/list hides the write-gated tools and keeps the reads, `skills`
     // among them: reading a skill is a read. `evolve_engrams` is hidden too,
     // on its own gate: it reads, but every finding it returns prescribes a
-    // mutation. `update_domain` and `origin_status` are listed even with
-    // GitHub off (that gate refuses at call time now) because a read-only
-    // instance exempts them: a pull is a derived-truth update like sync, and
-    // status is a pure read.
+    // mutation. The six collaboration tools are all absent here because the
+    // two gates compose: GitHub is off, which withholds the five that need it,
+    // and read-only withholds `configure`. With collaboration on, a read-only
+    // instance would list `update_domain` and `origin_status` (a pull is a
+    // derived-truth update like sync, status is a pure read).
     let names = c1.list_tools();
-    assert_eq!(names.len(), 12, "read-only exposes 12 tools: {names:?}");
+    assert_eq!(names.len(), 10, "read-only exposes 10 tools: {names:?}");
     for hidden in [
         "write_engram",
         "edit_engram",
@@ -942,13 +943,14 @@ fn http_smoke_initialize_list_and_search() {
         .pointer("/result/tools")
         .and_then(Value::as_array)
         .unwrap();
-    // Every tool this server implements. The instance is writable, and the
-    // only gates left on the listing are the read-only ones: GitHub
-    // collaboration being off and nothing declaring provisioning both refuse
-    // at call time now, because a tool list may not vary per connection or as
-    // a side effect of another request on it (see crystalline-service's
-    // mcp_collab test suite for the full gating matrix).
-    assert_eq!(tools.len(), 22, "every tool over HTTP");
+    // What a writable default install lists. Nothing declaring provisioning
+    // does not hide `provision` - that gate refuses at call time, since
+    // `add_domain` and `update_domain` can create a declaration mid-call - but
+    // GitHub collaboration being off does withhold the five tools that need
+    // it, so the count here is the default one rather than every tool this
+    // server implements (see crystalline-service's mcp_collab suite for the
+    // full gating matrix).
+    assert_eq!(tools.len(), 18, "a default install's tools over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");

@@ -240,17 +240,22 @@ async fn list_shaped_responses_default_to_toon_and_configure_restores_json() {
     );
 }
 
-/// Every tool this server implements is listed on a writable instance,
-/// whatever the GitHub setting says and whether or not anything declares
-/// provisioning. MCP 2026-07-28 (SEP-2567) forbids `tools/list` varying per
-/// connection or as a side effect of another request on the connection, and
-/// both `github.enabled` and `provisioning_declared` are settable by a request
-/// on the same connection (`configure`, `add_domain`, `update_domain`), so
-/// they gate the call instead of the listing. `read_only` still gates the
-/// listing: it is fixed at engine construction (`Engine::with_read_only` takes
-/// `self` by value) and no request can move it.
+/// What a default install actually lists: every tool except the five that do
+/// nothing but talk to a forge nobody connected.
+///
+/// MCP 2026-07-28 (SEP-2567) forbids `tools/list` varying per connection or as
+/// a side effect of another request on the connection. Two gates read that
+/// differently and both are deliberate. `provisioning_declared` has no single
+/// setting to point at - `add_domain` and `update_domain` can create a
+/// declaration mid-call - so `provision` is listed always and refuses its
+/// mutating actions. `github.enabled` is one shared setting, so hiding on it
+/// keeps every client's answer identical at any given instant; what a flip
+/// owes is an announcement, and `tests/mcp_subscriptions.rs` is where that is
+/// pinned. `read_only` gates the listing as it always did: fixed at engine
+/// construction (`Engine::with_read_only` takes `self` by value), no request
+/// can move it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
+async fn a_writable_default_install_lists_everything_but_the_collaboration_surface() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
@@ -259,6 +264,7 @@ async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
         "add_domain",
         "browse_domain",
         "build_context",
+        // The enable path, never hidden by the gate it opens.
         "configure",
         "delete_engram",
         "edit_engram",
@@ -266,14 +272,8 @@ async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
         "infer_schema",
         "list_domains",
         "move_engram",
-        // GitHub collaboration is off in this harness and these four are
-        // listed all the same; calling one refuses and says how to turn it on.
-        "origin_status",
-        "resolve_conflict",
-        "share_changes",
-        "update_domain",
         // Nothing here declares a `## Provisioning` section, and `provision`
-        // is listed all the same, for the same reason.
+        // is listed all the same; its mutating actions refuse instead.
         "provision",
         "read_engram",
         "recent_activity",
@@ -285,7 +285,24 @@ async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    assert_eq!(names.len(), 22, "every tool, exactly once: {names:?}");
+    // GitHub collaboration is off in this harness, so the five tools that need
+    // it are withheld rather than listed-and-refusing. Calling one by name
+    // still reaches the handler and says how to turn it on
+    // (`hidden_collab_tools_refuse_at_call_time_when_github_is_disabled` in
+    // tests/mcp_collab.rs).
+    for hidden in [
+        "share_changes",
+        "update_domain",
+        "origin_status",
+        "resolve_conflict",
+        "withdraw_proposal",
+    ] {
+        assert!(
+            !names.contains(&hidden.to_string()),
+            "{hidden} must be withheld while github.enabled is off: {names:?}"
+        );
+    }
+    assert_eq!(names.len(), 18, "every tool, exactly once: {names:?}");
 
     // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
     // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`
@@ -295,11 +312,17 @@ async fn every_tool_is_listed_on_a_writable_instance_whatever_the_gates_say() {
     assert_eq!(names, sorted, "tools/list is ordered by name");
 }
 
-/// SEP-2567's second prohibition, as a test: `tools/list` must not change as a
-/// side effect of another request on the same connection. `configure` flipping
-/// `github.enabled` used to add four tools to the next listing.
+/// Turning collaboration on adds exactly the five tools it enables, and takes
+/// them away again when it goes back off.
+///
+/// This is the one list on this server that moves, and the reading of SEP-2567
+/// behind it: the prohibition is on two clients getting different answers at
+/// the same moment, not on a shared setting changing what everybody is served
+/// from the next call on. The obligation the "MAY change over time" clause
+/// carries is the announcement, and `tests/mcp_subscriptions.rs` pins who
+/// receives it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_tool_list_does_not_move_across_a_configure_that_flips_github_enabled() {
+async fn flipping_github_enabled_moves_the_tool_list_by_exactly_the_five() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
@@ -336,10 +359,48 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_github_enable
         .iter()
         .map(|t| t.name.to_string())
         .collect();
+    let gated = [
+        "share_changes",
+        "update_domain",
+        "origin_status",
+        "resolve_conflict",
+        "withdraw_proposal",
+    ];
+    for tool in gated {
+        assert!(
+            !before.contains(&tool.to_string()),
+            "{tool} was withheld while the setting was off: {before:?}"
+        );
+        assert!(
+            after.contains(&tool.to_string()),
+            "{tool} appears once it is on: {after:?}"
+        );
+    }
     assert_eq!(
-        before, after,
-        "turning collaboration on must not change what this connection is listed"
+        after.len(),
+        before.len() + gated.len(),
+        "exactly the five arrived and nothing else moved: {before:?} -> {after:?}"
     );
+
+    // And back again: the gate reads the live setting rather than latching on
+    // the first flip, so unsetting the key restores the default install's list.
+    let snapshot = call(peer, "configure", json!({ "unset": ["github.enabled"] }))
+        .await
+        .unwrap();
+    assert_ne!(
+        snapshot["github"]["github_enabled"],
+        json!(true),
+        "the setting must actually be off again: {snapshot}"
+    );
+    let restored: Vec<String> = peer
+        .list_tools(Default::default())
+        .await
+        .unwrap()
+        .tools
+        .iter()
+        .map(|t| t.name.to_string())
+        .collect();
+    assert_eq!(restored, before, "the gate is live in both directions");
 }
 
 /// The same prohibition for the last gate that had a request-mutable input.
@@ -398,17 +459,17 @@ async fn the_tool_list_does_not_move_across_a_configure_that_flips_skills_serve(
     );
 }
 
-/// The other half of the remedy SEP-2567 prescribes: the dependency moves into
-/// the call. All four GitHub-gated tools refuse with a **tool-level** error -
-/// the shape whose text the caller's client actually renders - naming the
-/// setting and the call that flips it.
+/// Hiding a tool never disables it. All five GitHub-gated tools here are
+/// withheld from the listing while the setting is off and still answer a call
+/// by name, with a **tool-level** error - the shape whose text the caller's
+/// client actually renders - naming the setting and the call that flips it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
     let peer = client.peer();
 
-    let cases: [(&str, Value); 4] = [
+    let cases: [(&str, Value); 5] = [
         ("share_changes", json!({ "domain": "eng" })),
         ("update_domain", json!({})),
         ("origin_status", json!({})),
@@ -416,6 +477,7 @@ async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
             "resolve_conflict",
             json!({ "domain": "eng", "path": "a.md", "resolution": "mine" }),
         ),
+        ("withdraw_proposal", json!({ "domain": "eng" })),
     ];
     for (tool, args) in cases {
         let result = call_result(peer, tool, args).await;
@@ -434,13 +496,26 @@ async fn the_github_gated_tools_refuse_at_call_time_and_name_the_setting() {
 
 /// And the descriptions carry the same dependency, because SEP-2567 puts it
 /// "in the tool's input schema and description rather than in the list
-/// result". A tool that is always listed and sometimes refuses has to say so
-/// where a client's tool search can read it.
+/// result". A tool that is listed and sometimes refuses has to say so where a
+/// client's tool search can read it.
+///
+/// `provision` is that shape on any instance. The collaboration tools are that
+/// shape once `github.enabled` is on - which is when they are listed at all -
+/// so the setting is flipped here first, and the descriptions are read off the
+/// list a collaborating client actually sees.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
     let h = Harness::new(&["eng"]).await;
     let (client, _server) = h.connect().await;
-    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    let peer = client.peer();
+    call(
+        peer,
+        "configure",
+        json!({ "set": { "github.enabled": "true" } }),
+    )
+    .await
+    .unwrap();
+    let tools = peer.list_tools(Default::default()).await.unwrap();
     let description = |name: &str| {
         tools
             .tools
@@ -457,6 +532,7 @@ async fn the_descriptions_of_the_call_time_gated_tools_state_their_condition() {
         "update_domain",
         "origin_status",
         "resolve_conflict",
+        "withdraw_proposal",
     ] {
         let text = description(name);
         assert!(
@@ -657,7 +733,7 @@ async fn read_only_hides_the_write_gated_tools() {
     ] {
         assert!(names.contains(&expected.to_string()), "missing {expected}");
     }
-    // Read-only hides the three write-shaped collaboration tools and
+    // Read-only hides the four write-shaped collaboration tools and
     // `provision` (the full gating matrix lives in tests/mcp_collab.rs).
     // `evolve_engrams` is hidden on its own gate: it is a read, but every
     // finding it returns prescribes a mutation, so the queue is noise where
@@ -666,6 +742,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "configure",
         "share_changes",
         "resolve_conflict",
+        "withdraw_proposal",
         "evolve_engrams",
         "provision",
     ] {
@@ -674,17 +751,18 @@ async fn read_only_hides_the_write_gated_tools() {
             "{hidden} must be hidden read-only: {names:?}"
         );
     }
-    // `update_domain` and `origin_status` are listed here even though GitHub
-    // is off: that gate refuses at call time now, and read-only exempts these
-    // two the way it exempts sync (a pull is a derived-truth update, status is
-    // a pure read).
-    for visible in ["update_domain", "origin_status"] {
+    // `update_domain` and `origin_status` are the two collaboration tools
+    // read-only exempts (a pull is a derived-truth update, status is a pure
+    // read) - but the two gates compose, and GitHub is off in this harness, so
+    // they are withheld here too. On a read-only instance with collaboration
+    // on they are the only two of the six that show.
+    for hidden in ["update_domain", "origin_status"] {
         assert!(
-            names.contains(&visible.to_string()),
-            "{visible} stays listed read-only: {names:?}"
+            !names.contains(&hidden.to_string()),
+            "{hidden} needs github.enabled to be listed: {names:?}"
         );
     }
-    assert_eq!(names.len(), 12, "exactly 12 tools in read-only: {names:?}");
+    assert_eq!(names.len(), 10, "exactly 10 tools in read-only: {names:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -172,14 +172,26 @@ export function hasNextPage(page: EngramPage): boolean {
   return page.page * page.limit < page.total;
 }
 
+/**
+ * The cache key prefix covering every listing of one domain, whichever filter
+ * or folder it is scoped to.
+ *
+ * What a write that changed the domain's contents invalidates: react-query
+ * matches a key by prefix, so this reaches the browse view, the frontmatter
+ * view and every folder either of them has paged, without the caller having to
+ * know the filters any of them were asked with.
+ */
+export function domainEngramsRoot(domain: string): readonly unknown[] {
+  return ["domain-engrams", domain];
+}
+
 /** The cache key of one domain's filtered listing. */
 export function domainEngramsKey(
   domain: string,
   filters: EngramFilters,
 ): readonly unknown[] {
   return [
-    "domain-engrams",
-    domain,
+    ...domainEngramsRoot(domain),
     filters.type,
     filters.status,
     filters.tags,

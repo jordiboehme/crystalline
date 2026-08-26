@@ -691,9 +691,19 @@ URL.
 *The agent opens a proposal from your local changes and hands back a review URL.* A
 person at command reads it and merges on GitHub; the agent never merges its own
 work, it only relays the link. If two edits collide, ask the agent to resolve the
-conflict, keeping your side or theirs. A declined proposal is normal - it lapses,
-or you discard it from the [terminal corner](#the-terminal-corner). Hard-won
-knowledge is worth the review.
+conflict, keeping your side or theirs.
+
+Review is a conversation, not a verdict. When command asks for changes:
+
+```text
+What did the review say about my fleet-ops proposal?
+```
+
+*The agent pulls the domain, relays the reviewers' comments, and after you refine
+the engrams, sharing again updates the same proposal - same number, same review
+URL - so the conversation stays in one place.* A declined proposal is normal;
+ask the agent to withdraw it, which closes it on GitHub and tidies the record,
+optionally restoring the shared files. Hard-won knowledge is worth the review.
 
 ## Appendix
 
@@ -714,6 +724,7 @@ knowledge is worth the review.
 | Tidy vocabulary | "Have our hyperdrive tags drifted?" |
 | Ask what needs work | "Sweep ship-ops and tell me what the archive needs." |
 | Share with the team | "Share the clamp findings as a proposal for review." |
+| Withdraw a proposal | "Withdraw the fleet-ops proposal and keep my local edits." |
 
 ### Reference blocks
 
@@ -754,7 +765,7 @@ crystalline install claude-code                     # wire up a harness (Setup)
 crystalline import ./old-notes --domain ship-ops    # convert a legacy markdown tree
 crystalline tags rename <old> <new>                 # rename a tag everywhere
 crystalline tags merge <old> <into>                 # fold one tag into another
-crystalline origin discard fleet-ops --proposal 4   # abandon a declined proposal
+crystalline origin withdraw fleet-ops --proposal 4  # close and clear a proposal
 crystalline verify                                  # static check: frontmatter, links, schema
 crystalline doctor                                  # diagnose index and service; add --fix to repair
 crystalline evolve --domain ship-ops                # the Evolve sweep, run by hand

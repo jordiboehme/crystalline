@@ -133,19 +133,39 @@ pub struct OriginStatusReport {
     pub conflicts: Vec<Conflict>,
     /// When the branch was last checked for new upstream commits.
     pub last_checked: Option<chrono::DateTime<chrono::Utc>>,
+    /// Numbers of open proposals whose live branch head no longer matches the
+    /// recorded head_commit: a reviewer amended the branch. Empty when the
+    /// live list was not consulted (offline, no probe, or the list call
+    /// failed and status degraded to local state).
+    pub amended_upstream: Vec<u64>,
 }
 
 /// What [`propose`] did with a domain's local changes.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ProposeOutcome {
-    /// A pull request was opened.
+    /// A new pull request was opened.
     Proposed(ProposeReport),
+    /// The one open proposal was updated in place: same number, same URL,
+    /// a new commit on the same branch. The report's number/url/branch name
+    /// the existing proposal; added/updated/deleted are the fresh change list.
+    Updated(ProposeReport),
     /// Success-shaped, not an error: the team already has everything this
     /// domain knows, so there was nothing to open a pull request for.
     NothingToShare {
         /// Working-tree files skipped for exceeding
         /// [`MAX_SHARED_FILE_BYTES`], each with its size in bytes.
         skipped_large: Vec<(String, u64)>,
+    },
+    /// A reviewer pushed commits onto the proposal branch; nothing was
+    /// written. The caller relays the guidance: let the reviewer finish
+    /// (merge on GitHub) or withdraw and re-share.
+    ProposalDiverged {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+        /// The branch a reviewer moved out from under us.
+        branch: String,
     },
 }
 
@@ -173,18 +193,23 @@ pub struct ProposeReport {
     pub summary: String,
 }
 
-/// What [`discard`] did with a declined or still-open proposal's files.
+/// What [`withdraw`] did with a declined or still-open proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct DiscardReport {
-    /// Domain-relative paths restored to their base-tree content (a
+pub struct WithdrawReport {
+    /// The proposal that was withdrawn.
+    pub number: u64,
+    /// True when a live pull request was closed on the forge (an Open
+    /// proposal); false for a Declined one, already closed by a reviewer.
+    pub closed: bool,
+    /// Domain-relative paths restored to base-tree content (revert only): a
     /// proposed `Modified` or `Deleted` file whose local copy still matched
-    /// what was proposed).
+    /// what was proposed.
     pub restored: Vec<String>,
     /// Domain-relative paths deleted (a proposed `Added` file whose local
-    /// copy still matched what was proposed).
+    /// copy still matched what was proposed; revert only).
     pub deleted: Vec<String>,
-    /// Domain-relative paths left untouched because the local file no
-    /// longer matches what was proposed: newer work is never destroyed.
+    /// Paths left untouched because the local file diverged since sharing:
+    /// newer work is never destroyed.
     pub skipped_diverged: Vec<String>,
 }
 
@@ -351,14 +376,15 @@ pub async fn pull(
     }
 
     // Refresh open proposals first so a just-merged one can override its own
-    // files in the merge loop below.
-    let transitions = refresh_proposals(provider, spec, &mut state).await?;
-    let merged_this_pull: Vec<Proposal> = state
+    // files in the merge loop below. Every Merged record is collected,
+    // however it came to be flagged, not only the ones that flipped in this
+    // refresh: `status` can flip a record to Merged between pulls, and such a
+    // record is un-consumed work this pull has to finish.
+    let (transitions, _) = refresh_proposals(provider, spec, &mut state).await?;
+    let merged_to_consume: Vec<Proposal> = state
         .proposals
         .iter()
-        .filter(|p| {
-            p.status == ProposalStatus::Merged && transitions.iter().any(|(n, _)| *n == p.number)
-        })
+        .filter(|p| p.status == ProposalStatus::Merged)
         .cloned()
         .collect();
 
@@ -424,7 +450,7 @@ pub async fn pull(
         // local file takes upstream unconditionally, so a reviewer's
         // amendments win over the proposed-but-unamended local copy. A user
         // who edited after sharing (hashes differ) falls through to merge.
-        if proposal_override_applies(&merged_this_pull, rel, local.as_deref()) {
+        if proposal_override_applies(&merged_to_consume, rel, local.as_deref()) {
             match &edit.content {
                 Some(bytes) => write_working_file(&wt_path, bytes)?,
                 None => remove_working_file(&wt_path)?,
@@ -495,7 +521,7 @@ pub async fn pull(
     // Consume merged proposals in memory, then persist base advance,
     // conflicts and history together in one atomic save so a crash cannot
     // leave a merged proposal half-consumed.
-    for prop in &merged_this_pull {
+    for prop in &merged_to_consume {
         state.proposals.retain(|p| p.number != prop.number);
         let mut consumed = prop.clone();
         consumed.status = ProposalStatus::Merged;
@@ -505,7 +531,7 @@ pub async fn pull(
 
     // Best-effort branch cleanup, after the state is durable; errors are
     // ignored entirely (the branch lingering upstream harms nothing).
-    for prop in &merged_this_pull {
+    for prop in &merged_to_consume {
         let _ = provider.delete_branch(spec, &prop.branch).await;
     }
 
@@ -526,6 +552,17 @@ pub async fn pull(
 /// local change detection alone. With a provider, one conditional branch probe
 /// fills `behind` and refreshes the stored etag and last-checked time, saved
 /// only when the probe reports the branch has moved.
+///
+/// With a provider and at least one open proposal, exactly one
+/// [`Provider::list_open_proposals`] call brings the proposal picture up to
+/// date: a record still on the list whose live head differs from the recorded
+/// `head_commit` is reported in `amended_upstream`, and a record that left the
+/// list is classified by a single state GET and flipped to Merged or Declined
+/// in saved state. A flipped record is not consumed - it stays in
+/// `state.proposals` and simply leaves this report's open list; moving it to
+/// history stays [`pull`]'s job. The list call is best-effort: a failure logs
+/// and degrades to the offline picture (local statuses unchanged, no amended
+/// flags), never failing the status.
 pub async fn status(
     spec: &OriginSpec,
     domain_root: &Path,
@@ -564,6 +601,74 @@ pub async fn status(
         }
     }
 
+    // One live list call, made only when there is an open record for it to
+    // say something about, tells two things at once: which open proposals a
+    // reviewer amended out from under us, and which ones left the open list
+    // upstream (merged or declined elsewhere). A failure degrades to today's
+    // offline behavior rather than failing the status.
+    let mut amended_upstream = Vec::new();
+    if let Some(provider) = probe
+        && state
+            .proposals
+            .iter()
+            .any(|p| p.status == ProposalStatus::Open)
+    {
+        match provider.list_open_proposals(spec).await {
+            Ok(open_list) => {
+                let mut dirty = false;
+                for prop in state.proposals.iter_mut() {
+                    if prop.status != ProposalStatus::Open {
+                        continue;
+                    }
+                    match open_list.iter().find(|o| o.number == prop.number) {
+                        Some(live) => {
+                            // `head_is_ours` rather than a bare comparison, so
+                            // this machine's own interrupted update is not
+                            // reported to the user as a reviewer's amendment.
+                            if !head_is_ours(prop, &live.head_sha) {
+                                amended_upstream.push(prop.number);
+                            }
+                        }
+                        None => {
+                            // Gone from the open list: one GET classifies it.
+                            // The flip is applied and saved, but NOT consumed -
+                            // consumption stays a pull concern; status only
+                            // makes the user see the truth.
+                            match provider.proposal_state(spec, prop.number).await {
+                                Ok(refreshed) => {
+                                    let new_status = match refreshed {
+                                        ProposalState::Merged => ProposalStatus::Merged,
+                                        ProposalState::Declined => ProposalStatus::Declined,
+                                        ProposalState::Open => continue,
+                                    };
+                                    prop.status = new_status;
+                                    dirty = true;
+                                }
+                                Err(e) => {
+                                    // Same degradation as a failed list: the
+                                    // record keeps its local status rather
+                                    // than failing the status.
+                                    tracing::debug!(
+                                        "classifying proposal #{} failed; keeping its local status: {e}",
+                                        prop.number
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                if dirty {
+                    state.save(state_dir)?;
+                }
+            }
+            Err(e) => {
+                // Degrade to today's offline behavior: local statuses
+                // unchanged, no amended flags.
+                tracing::debug!("open-proposal list failed; reporting local state: {e}");
+            }
+        }
+    }
+
     let open_proposals = state
         .proposals
         .iter()
@@ -588,6 +693,7 @@ pub async fn status(
         declined_proposals,
         conflicts: state.conflicts.clone(),
         last_checked: state.last_checked,
+        amended_upstream,
     })
 }
 
@@ -604,11 +710,26 @@ pub async fn status(
 /// when any conflict is open afterward, new or pre-existing, before a single
 /// provider write call is made; detect local changes against the
 /// now-current base, reporting [`ProposeOutcome::NothingToShare`] when there
-/// are none; upload each added or modified file's content as a blob, build a
+/// are none; supersede any declined proposal (moved to history keeping
+/// `Declined`, its branch best-effort deleted); then either update the one
+/// open proposal in place or create a new one.
+///
+/// A domain has at most one open proposal at a time. When one is open, this
+/// pushes a fresh commit onto its branch and rewrites its body rather than
+/// opening a second pull request ([`ProposeOutcome::Updated`]), and refuses
+/// with [`ProposeOutcome::ProposalDiverged`] - before any provider write -
+/// when a reviewer has moved the branch away from every head this machine
+/// recorded (see [`head_is_ours`]: the settled head, a half-finished push this
+/// machine announced before making it, or no recorded head at all). An open
+/// record whose branch ref is gone is settled from the proposal's own state
+/// (an open pull request with no branch counts as declined) and the share
+/// falls through to a fresh creation.
+///
+/// Creating uploads each added or modified file's content as a blob, builds a
 /// tree from the base commit with every domain-relative path re-prefixed to
-/// its repo-relative form (see [`to_repo_relative`]), commit it, open a
-/// share branch named per [`share_branch_name`] and open the pull request;
-/// finally record the proposal in state (status `Open`) and save. Local
+/// its repo-relative form (see [`to_repo_relative`]), commits it, opens a
+/// share branch named per [`share_branch_name`] and opens the pull request;
+/// finally the proposal is recorded in state (status `Open`) and saved. Local
 /// files are never touched: a share only ever reads them.
 pub async fn propose(
     provider: &dyn Provider,
@@ -639,81 +760,113 @@ pub async fn propose(
         });
     }
 
-    let mut added = Vec::new();
-    let mut updated = Vec::new();
-    let mut deleted = Vec::new();
-    let mut writes = Vec::new();
-    let mut files = Vec::new();
-    let mut entries = ChangeEntries::default();
+    // 2. A declined proposal is superseded by this share: record to history
+    //    (keeping Declined), branch best-effort deleted, exactly like the
+    //    merged path's cleanup.
+    let declined: Vec<Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Declined)
+        .cloned()
+        .collect();
+    if !declined.is_empty() {
+        for prop in &declined {
+            state.proposals.retain(|p| p.number != prop.number);
+            state.push_history(prop.clone());
+        }
+        state.save(state_dir)?;
+        for prop in &declined {
+            let _ = provider.delete_branch(spec, &prop.branch).await;
+        }
+    }
 
-    for change in &local.changes {
-        match change {
-            LocalChange::Added { path, sha256 } => {
-                let wt_path = checked_working_path(state_dir, domain_root, path)?;
-                let bytes = std::fs::read(&wt_path)?;
-                let blob_sha = provider.create_blob(spec, &bytes).await?;
-                writes.push(TreeWrite {
-                    path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: Some(blob_sha),
-                });
-                entries.added.push((path.clone(), bytes));
-                added.push(path.clone());
-                files.push(ProposedFile {
-                    path: path.clone(),
-                    change: ProposedChange::Added,
-                    sha256: Some(sha256.clone()),
-                });
-            }
-            LocalChange::Modified { path, sha256 } => {
-                let wt_path = checked_working_path(state_dir, domain_root, path)?;
-                let bytes = std::fs::read(&wt_path)?;
-                let blob_sha = provider.create_blob(spec, &bytes).await?;
-                writes.push(TreeWrite {
-                    path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: Some(blob_sha),
-                });
-                entries.updated.push((path.clone(), bytes));
-                updated.push(path.clone());
-                files.push(ProposedFile {
-                    path: path.clone(),
-                    change: ProposedChange::Modified,
-                    sha256: Some(sha256.clone()),
-                });
-            }
-            LocalChange::Deleted { path } => {
-                writes.push(TreeWrite {
-                    path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: None,
-                });
-                // Only worth reading back the retired file's last known
-                // content (for its engram title in the generated body) when
-                // there is a generated body to put it in at all.
-                if description.is_none() {
-                    let base_content = state::read_base_file(state_dir, path)?;
-                    entries.deleted.push((path.clone(), base_content));
+    // 3. An open proposal is updated in place, never paralleled.
+    let open = state
+        .proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open)
+        .cloned();
+    if let Some(prop) = open {
+        match provider.branch_ref(spec, &prop.branch).await? {
+            Some(live_head) => {
+                if !head_is_ours(&prop, &live_head) {
+                    // A reviewer pushed commits; refuse before any write.
+                    return Ok(ProposeOutcome::ProposalDiverged {
+                        number: prop.number,
+                        url: prop.url.clone(),
+                        branch: prop.branch.clone(),
+                    });
                 }
-                deleted.push(path.clone());
-                files.push(ProposedFile {
-                    path: path.clone(),
-                    change: ProposedChange::Deleted,
-                    sha256: None,
-                });
+                // The live head is one of ours (see `head_is_ours`), so this
+                // is an ordinary update. Adopting an interrupted push needs no
+                // separate write: `update_open_proposal` rewrites both head
+                // fields on the record before it returns.
+                return update_open_proposal(
+                    provider,
+                    spec,
+                    domain_root,
+                    domain_name,
+                    state_dir,
+                    state,
+                    prop,
+                    live_head,
+                    local,
+                    title,
+                    description,
+                )
+                .await;
+            }
+            None => {
+                // The ref is gone. Refresh this one proposal's state once:
+                // merged or declined take their normal paths; an open PR with
+                // no branch is treated as declined. Either way fall through
+                // to create.
+                let refreshed = provider.proposal_state(spec, prop.number).await?;
+                state.proposals.retain(|p| p.number != prop.number);
+                let mut settled = prop.clone();
+                settled.status = match refreshed {
+                    ProposalState::Merged => ProposalStatus::Merged,
+                    ProposalState::Declined | ProposalState::Open => ProposalStatus::Declined,
+                };
+                // A settled record can never be updated again, so any push it
+                // was still announcing is over: keep no pending sha in history.
+                settled.pending_head_commit = None;
+                state.push_history(settled);
+                state.save(state_dir)?;
             }
         }
     }
 
-    let generated_title = generate_title(added.len(), updated.len(), deleted.len(), domain_name);
+    // 4. Create, as today, plus head_commit/base_commit on the fresh record.
+    let collected =
+        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+
+    let generated_title = generate_title(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+        domain_name,
+    );
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(added.len(), updated.len(), deleted.len());
+    let summary = generate_summary_line(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+    );
     let body = description
         .map(str::to_string)
-        .unwrap_or_else(|| generate_body(&summary, &entries, domain_name));
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
 
     let tree_sha = provider
-        .create_tree(spec, &state.base_commit, &writes)
+        .create_tree(spec, &state.base_commit, &collected.writes)
         .await?;
     let commit_sha = provider
-        .create_commit(spec, &effective_title, &tree_sha, &state.base_commit)
+        .create_commit(
+            spec,
+            &effective_title,
+            &tree_sha,
+            std::slice::from_ref(&state.base_commit),
+        )
         .await?;
     let branch = share_branch_name(domain_name);
     provider.create_branch(spec, &branch, &commit_sha).await?;
@@ -736,7 +889,15 @@ pub async fn propose(
         title: effective_title,
         created_at: Utc::now(),
         status: ProposalStatus::Open,
-        files,
+        files: collected.files,
+        head_commit: Some(commit_sha),
+        // A fresh record carries no half-finished push: the create path either
+        // opened the proposal on this commit or failed before recording it.
+        pending_head_commit: None,
+        base_commit: Some(state.base_commit.clone()),
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
     });
     state.save(state_dir)?;
 
@@ -744,99 +905,514 @@ pub async fn propose(
         url: handle.url,
         number: handle.number,
         branch,
-        added,
-        updated,
-        deleted,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
         skipped_large: local.skipped_large,
         summary,
     }))
 }
 
-/// Discards a declined, or still-open ("never mind"), share proposal:
-/// restores each proposed file that still matches what was proposed to its
-/// pre-proposal content (the base tree, or plain deletion for a proposed
-/// addition), leaves any file whose local content has since diverged
-/// untouched, then moves the proposal record to history with whatever
-/// status it currently holds (discarding never rewrites `status` itself).
+/// What a share would do, computed without a single provider write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharePlan {
+    /// What a share run right now would do with the detected changes.
+    pub action: PlannedAction,
+    /// The local changes a share would carry, exactly as [`propose`] would
+    /// detect them against the freshly pulled base.
+    pub changes: crate::changes::LocalChanges,
+    /// The caller's title, or the generated one for this change mix. Empty
+    /// when there is nothing to title (nothing to share, conflicts pending).
+    pub effective_title: String,
+}
+
+/// The single thing a share would do, as [`propose_preview`] classifies it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlannedAction {
+    /// A share would open a new proposal.
+    Create,
+    /// A share would update this open proposal in place.
+    Update {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+    },
+    /// Nothing to share.
+    NothingToShare,
+    /// Conflicts block a share until resolved.
+    ConflictsPending {
+        /// How many conflicts are still open.
+        count: usize,
+    },
+    /// The open proposal's branch was amended by a reviewer.
+    ProposalDiverged {
+        /// The open proposal's number.
+        number: u64,
+        /// The web URL a human reviews the proposal at.
+        url: String,
+        /// The branch a reviewer moved out from under us.
+        branch: String,
+    },
+}
+
+/// The read-only twin of [`propose`]: runs the same pull, conflicts guard,
+/// change detection and open/declined/divergence classification, but performs
+/// no provider write and moves no record. It DOES perform the pull's writes
+/// to the working tree - freshness is part of previewing honestly, and a plan
+/// computed against a stale base would name changes a real share would never
+/// make.
 ///
-/// Offline: this never talks to a provider. Discarding an `Open` proposal
-/// does not close its pull request on the origin; that happens on GitHub
-/// itself, and the next pull's proposal refresh marks it `Declined` once it
-/// is closed there.
-pub fn discard(
+/// `domain_name` plays the same role it plays in [`propose`]: it is what the
+/// generated title calls the domain when the caller supplies none.
+pub async fn propose_preview(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    title: Option<&str>,
+) -> Result<SharePlan, RemoteError> {
+    pull(provider, spec, domain_root, state_dir).await?;
+    let state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::State(
+            "this domain has no origin state; add the domain from its origin first".to_string(),
+        )
+    })?;
+    let local = detect_local_changes(domain_root, &state.files)?;
+
+    if !state.conflicts.is_empty() {
+        return Ok(SharePlan {
+            action: PlannedAction::ConflictsPending {
+                count: state.conflicts.len(),
+            },
+            changes: local,
+            effective_title: String::new(),
+        });
+    }
+    if local.changes.is_empty() {
+        return Ok(SharePlan {
+            action: PlannedAction::NothingToShare,
+            changes: local,
+            effective_title: String::new(),
+        });
+    }
+
+    let (added, updated, deleted) = count_changes(&local);
+    let effective_title = title
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+
+    // Classification mirrors propose's, read-only: a declined record would be
+    // superseded (so it reads as Create), an open one is an Update unless a
+    // reviewer amended its branch, and a gone ref would be re-created.
+    let open = state
+        .proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Open);
+    let action = match open {
+        None => PlannedAction::Create,
+        Some(prop) => match provider.branch_ref(spec, &prop.branch).await? {
+            Some(live_head) => {
+                // The same acceptance `propose` applies, including the
+                // interrupted-update case: a preview that called our own
+                // half-finished push a divergence would send the caller to
+                // withdraw a proposal the next share heals by itself.
+                if head_is_ours(prop, &live_head) {
+                    PlannedAction::Update {
+                        number: prop.number,
+                        url: prop.url.clone(),
+                    }
+                } else {
+                    PlannedAction::ProposalDiverged {
+                        number: prop.number,
+                        url: prop.url.clone(),
+                        branch: prop.branch.clone(),
+                    }
+                }
+            }
+            None => PlannedAction::Create,
+        },
+    };
+    Ok(SharePlan {
+        action,
+        changes: local,
+        effective_title,
+    })
+}
+
+/// The (added, updated, deleted) counts of a detected change set.
+fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize);
+    for change in &local.changes {
+        match change {
+            LocalChange::Added { .. } => counts.0 += 1,
+            LocalChange::Modified { .. } => counts.1 += 1,
+            LocalChange::Deleted { .. } => counts.2 += 1,
+        }
+    }
+    counts
+}
+
+/// Everything a share commit is built from, collected in one pass over the
+/// detected local changes: the tree writes (blobs already uploaded), the
+/// proposal file records, the per-kind path lists and the body entries.
+struct CollectedChanges {
+    writes: Vec<TreeWrite>,
+    files: Vec<ProposedFile>,
+    added: Vec<String>,
+    updated: Vec<String>,
+    deleted: Vec<String>,
+    entries: ChangeEntries,
+}
+
+/// Uploads a blob for every added or modified local file and collects
+/// everything both share paths - opening a new proposal and updating the open
+/// one - build their commit and their proposal body from.
+async fn collect_changes(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
-    proposal_number: u64,
-) -> Result<DiscardReport, RemoteError> {
+    local: &crate::changes::LocalChanges,
+    description: Option<&str>,
+) -> Result<CollectedChanges, RemoteError> {
+    let mut out = CollectedChanges {
+        writes: Vec::new(),
+        files: Vec::new(),
+        added: Vec::new(),
+        updated: Vec::new(),
+        deleted: Vec::new(),
+        entries: ChangeEntries::default(),
+    };
+
+    for change in &local.changes {
+        match change {
+            LocalChange::Added { path, sha256 } => {
+                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let bytes = std::fs::read(&wt_path)?;
+                let blob_sha = provider.create_blob(spec, &bytes).await?;
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(path, spec.subpath.as_deref()),
+                    blob_sha: Some(blob_sha),
+                });
+                out.entries.added.push((path.clone(), bytes));
+                out.added.push(path.clone());
+                out.files.push(ProposedFile {
+                    path: path.clone(),
+                    change: ProposedChange::Added,
+                    sha256: Some(sha256.clone()),
+                });
+            }
+            LocalChange::Modified { path, sha256 } => {
+                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let bytes = std::fs::read(&wt_path)?;
+                let blob_sha = provider.create_blob(spec, &bytes).await?;
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(path, spec.subpath.as_deref()),
+                    blob_sha: Some(blob_sha),
+                });
+                out.entries.updated.push((path.clone(), bytes));
+                out.updated.push(path.clone());
+                out.files.push(ProposedFile {
+                    path: path.clone(),
+                    change: ProposedChange::Modified,
+                    sha256: Some(sha256.clone()),
+                });
+            }
+            LocalChange::Deleted { path } => {
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(path, spec.subpath.as_deref()),
+                    blob_sha: None,
+                });
+                // Only worth reading back the retired file's last known
+                // content (for its engram title in the generated body) when
+                // there is a generated body to put it in at all.
+                if description.is_none() {
+                    let base_content = state::read_base_file(state_dir, path)?;
+                    out.entries.deleted.push((path.clone(), base_content));
+                }
+                out.deleted.push(path.clone());
+                out.files.push(ProposedFile {
+                    path: path.clone(),
+                    change: ProposedChange::Deleted,
+                    sha256: None,
+                });
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Whether `live_head` is a commit this machine put on the proposal branch,
+/// which is what separates an ordinary update from a reviewer's amendment.
+///
+/// Three ways it is ours, and every other head is a divergence:
+///
+/// 1. it equals the recorded [`Proposal::head_commit`] - the settled case, the
+///    branch is exactly where the last completed share left it;
+/// 2. it equals [`Proposal::pending_head_commit`] - our own interrupted
+///    update: the branch move landed and the step after it did not, so the
+///    record never caught up. Adopting it is the only outcome that can heal,
+///    since retrying is what a caller does and a retry that still refused
+///    would refuse forever;
+/// 3. no head was ever recorded (`head_commit` is `None`) - a record written
+///    before the field existed, adopted silently because there is nothing to
+///    compare against.
+fn head_is_ours(prop: &Proposal, live_head: &str) -> bool {
+    match &prop.head_commit {
+        None => true,
+        Some(recorded) => {
+            recorded == live_head || prop.pending_head_commit.as_deref() == Some(live_head)
+        }
+    }
+}
+
+/// Updates the one open proposal in place: a new commit on its branch (a
+/// merge commit when the base advanced), the ref fast-forwarded, the PR body
+/// regenerated (title PATCHed only when the caller supplied one) and the
+/// record rewritten. The tree is built on the CURRENT base commit's tree -
+/// the fresh pull inside [`propose`] guarantees local content already carries
+/// everything merged upstream - so the new tree is complete on its own.
+#[allow(clippy::too_many_arguments)]
+async fn update_open_proposal(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    prop: Proposal,
+    live_head: String,
+    local: crate::changes::LocalChanges,
+    title: Option<&str>,
+    description: Option<&str>,
+) -> Result<ProposeOutcome, RemoteError> {
+    let collected =
+        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+
+    let generated_title = generate_title(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+        domain_name,
+    );
+    let effective_title = title.map(str::to_string).unwrap_or(generated_title);
+    let summary = generate_summary_line(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+    );
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+
+    // Parents: plain child of the branch head while the proposal's recorded
+    // base still equals the current one; a two-parent merge commit (head
+    // first, then the advanced base) once the base moved, so the PR's merge
+    // base moves forward and the diff never shows upstream changes as ours.
+    let parents: Vec<String> = if prop.base_commit.as_deref() == Some(state.base_commit.as_str()) {
+        vec![live_head.clone()]
+    } else {
+        vec![live_head.clone(), state.base_commit.clone()]
+    };
+
+    let tree_sha = provider
+        .create_tree(spec, &state.base_commit, &collected.writes)
+        .await?;
+    let commit_sha = provider
+        .create_commit(spec, &effective_title, &tree_sha, &parents)
+        .await?;
+    // Announce the push before making it. Everything from here to the final
+    // save is one logical step that the network, or a dying process, can cut
+    // in half; the only half that leaves a mark upstream is a landed
+    // `update_branch`, and a landed branch move whose `head_commit` never
+    // caught up reads exactly like a reviewer's amendment. Recording the sha
+    // first turns that into a recognizable "our own interrupted update"
+    // (see `Proposal::pending_head_commit` and `head_is_ours`), which the next
+    // share adopts. Saving twice costs one small file write per update.
+    {
+        let record = state
+            .proposals
+            .iter_mut()
+            .find(|p| p.number == prop.number)
+            .expect("the open proposal was just read out of this state");
+        record.pending_head_commit = Some(commit_sha.clone());
+    }
+    state.save(state_dir)?;
+
+    provider
+        .update_branch(spec, &prop.branch, &commit_sha)
+        .await?;
+    provider
+        .update_proposal(spec, prop.number, title, &body)
+        .await?;
+
+    let record = state
+        .proposals
+        .iter_mut()
+        .find(|p| p.number == prop.number)
+        .expect("the open proposal was just read out of this state");
+    record.files = collected.files;
+    record.head_commit = Some(commit_sha);
+    // The push is finished and recorded: nothing is pending any more.
+    record.pending_head_commit = None;
+    record.base_commit = Some(state.base_commit.clone());
+    record.updated_at = Some(Utc::now());
+    if let Some(t) = title {
+        record.title = t.to_string();
+    }
+    state.save(state_dir)?;
+
+    Ok(ProposeOutcome::Updated(ProposeReport {
+        url: prop.url,
+        number: prop.number,
+        branch: prop.branch,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
+        skipped_large: local.skipped_large,
+        summary,
+    }))
+}
+
+/// Withdraws a share proposal: closes its pull request on the forge (an Open
+/// one), best-effort deletes its branch, optionally restores the shared files
+/// to their pre-share content, and moves the record to history as
+/// [`ProposalStatus::Withdrawn`].
+///
+/// Target: `proposal_number`, or the single Open proposal when `None`;
+/// no open proposal (or more than one, possible only in pre-living-proposal
+/// state) is [`RemoteError::NoWithdrawTarget`] listing every candidate, and a
+/// named number that is not among the open or declined records is
+/// [`RemoteError::ProposalNotFound`]. A close failure aborts the whole
+/// withdraw with the error and nothing else changed. Without `revert` the
+/// working tree is untouched; with it, files still matching what was proposed
+/// are restored (base-tree content for Modified/Deleted, deletion for Added)
+/// and diverged ones are skipped - newer work is never destroyed.
+///
+/// Only the close is atomic: a failure later, inside the revert loop, leaves
+/// the pull request closed on the forge while the record is still locally
+/// Open, since the state save comes last. That heals itself rather than
+/// needing repair - the next [`status`] or [`pull`] classifies the closed
+/// pull request and flips the record to Declined, and a retried withdraw then
+/// takes the Declined path (no second close, the remaining files reverted).
+pub async fn withdraw(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    proposal_number: Option<u64>,
+    revert: bool,
+) -> Result<WithdrawReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
 
-    let proposal = state
-        .proposals
-        .iter()
-        .find(|p| p.number == proposal_number)
-        .cloned()
-        .ok_or(RemoteError::ProposalNotFound {
-            number: proposal_number,
-        })?;
+    let proposal = match proposal_number {
+        Some(number) => state
+            .proposals
+            .iter()
+            .find(|p| p.number == number)
+            .cloned()
+            .ok_or(RemoteError::ProposalNotFound { number })?,
+        None => {
+            let open: Vec<&Proposal> = state
+                .proposals
+                .iter()
+                .filter(|p| p.status == ProposalStatus::Open)
+                .collect();
+            match open.as_slice() {
+                [single] => (*single).clone(),
+                _ => {
+                    return Err(RemoteError::NoWithdrawTarget {
+                        open: open.iter().map(|p| p.number).collect(),
+                        declined: state
+                            .proposals
+                            .iter()
+                            .filter(|p| p.status == ProposalStatus::Declined)
+                            .map(|p| p.number)
+                            .collect(),
+                    });
+                }
+            }
+        }
+    };
     if proposal.status == ProposalStatus::Merged {
-        // Not reachable through the normal pull/propose lifecycle (a merged
-        // proposal is consumed straight to history), but guarded explicitly
-        // since a discard must never apply to one.
+        // A Merged record can genuinely stand here: `status` flips one to
+        // Merged without consuming it, and only the next pull moves it to
+        // history. Withdrawing a merged proposal is refused outright.
         return Err(RemoteError::State(format!(
-            "proposal #{proposal_number} has already merged and cannot be discarded"
+            "proposal #{} has already merged and cannot be withdrawn",
+            proposal.number
         )));
     }
+
+    // Close first: a failure here aborts with nothing else changed. A
+    // Declined proposal is already closed on the forge, so only the branch
+    // cleanup applies to it.
+    let closed = if proposal.status == ProposalStatus::Open {
+        provider.close_proposal(spec, proposal.number).await?;
+        true
+    } else {
+        false
+    };
+    let _ = provider.delete_branch(spec, &proposal.branch).await;
 
     let mut restored = Vec::new();
     let mut deleted = Vec::new();
     let mut skipped_diverged = Vec::new();
+    if revert {
+        for pf in &proposal.files {
+            let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
+            let current = read_optional_file(&wt_path)?;
+            let current_sha = current.as_deref().map(state::sha256_hex);
 
-    for pf in &proposal.files {
-        let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
-        let current = read_optional_file(&wt_path)?;
-        let current_sha = current.as_deref().map(state::sha256_hex);
-
-        let diverged = match pf.change {
-            ProposedChange::Added | ProposedChange::Modified => {
-                current_sha.as_deref() != pf.sha256.as_deref()
+            let diverged = match pf.change {
+                ProposedChange::Added | ProposedChange::Modified => {
+                    current_sha.as_deref() != pf.sha256.as_deref()
+                }
+                ProposedChange::Deleted => current.is_some(),
+            };
+            if diverged {
+                skipped_diverged.push(pf.path.clone());
+                continue;
             }
-            ProposedChange::Deleted => current.is_some(),
-        };
-        if diverged {
-            skipped_diverged.push(pf.path.clone());
-            continue;
-        }
 
-        match pf.change {
-            ProposedChange::Added => {
-                remove_working_file(&wt_path)?;
-                deleted.push(pf.path.clone());
-            }
-            ProposedChange::Modified | ProposedChange::Deleted => {
-                match state::read_base_file(state_dir, &pf.path)? {
-                    Some(bytes) => {
-                        write_working_file(&wt_path, &bytes)?;
-                        restored.push(pf.path.clone());
+            match pf.change {
+                ProposedChange::Added => {
+                    remove_working_file(&wt_path)?;
+                    deleted.push(pf.path.clone());
+                }
+                ProposedChange::Modified | ProposedChange::Deleted => {
+                    match state::read_base_file(state_dir, &pf.path)? {
+                        Some(bytes) => {
+                            write_working_file(&wt_path, &bytes)?;
+                            restored.push(pf.path.clone());
+                        }
+                        // No base copy to restore from (should not happen: a
+                        // Modified or Deleted change always had a base entry);
+                        // never destroy the local file over it, so this is left
+                        // alone like a genuine divergence.
+                        None => skipped_diverged.push(pf.path.clone()),
                     }
-                    // No base copy to restore from (should not happen: a
-                    // Modified or Deleted change always had a base entry);
-                    // never destroy the local file over it, so this is left
-                    // alone like a genuine divergence.
-                    None => skipped_diverged.push(pf.path.clone()),
                 }
             }
         }
     }
 
-    state.proposals.retain(|p| p.number != proposal_number);
-    state.push_history(proposal);
+    state.proposals.retain(|p| p.number != proposal.number);
+    let mut record = proposal.clone();
+    record.status = ProposalStatus::Withdrawn;
+    state.push_history(record);
     state.save(state_dir)?;
 
-    Ok(DiscardReport {
+    Ok(WithdrawReport {
+        number: proposal.number,
+        closed,
         restored,
         deleted,
         skipped_diverged,
@@ -909,8 +1485,8 @@ async fn settle_up_to_date(
     mut state: OriginState,
     new_etag: Option<Option<String>>,
 ) -> Result<PullReport, RemoteError> {
-    let transitions = refresh_proposals(provider, spec, &mut state).await?;
-    let mut dirty = !transitions.is_empty();
+    let (transitions, touched) = refresh_proposals(provider, spec, &mut state).await?;
+    let mut dirty = touched;
     if let Some(etag) = new_etag
         && state.ref_etag != etag
     {
@@ -987,15 +1563,20 @@ async fn rebaseline(
     })
 }
 
-/// Refreshes the status of every open proposal against the provider and
-/// records the transitions. Merged proposals are marked but not yet consumed;
-/// the caller decides when to move them to history. Returns the changed
-/// proposals as `(number, new status)`.
+/// Refreshes the status of every open proposal against the provider, records
+/// the transitions and pulls fresh review feedback onto every record still
+/// open afterwards. Merged proposals are marked but not yet consumed; the
+/// caller decides when to move them to history.
+///
+/// Returns the changed proposals as `(number, new status)` together with
+/// whether any record was touched at all. The two are not the same thing: a
+/// feedback refresh with no status transition still changes a record, and the
+/// caller has to know that to persist it.
 async fn refresh_proposals(
     provider: &dyn Provider,
     spec: &OriginSpec,
     state: &mut OriginState,
-) -> Result<Vec<(u64, ProposalStatus)>, RemoteError> {
+) -> Result<(Vec<(u64, ProposalStatus)>, bool), RemoteError> {
     let mut transitions = Vec::new();
     for prop in state.proposals.iter_mut() {
         if prop.status != ProposalStatus::Open {
@@ -1009,7 +1590,33 @@ async fn refresh_proposals(
         prop.status = new_status;
         transitions.push((prop.number, new_status));
     }
-    Ok(transitions)
+
+    // Feedback rides on every still-open proposal, best-effort: a failed
+    // fetch keeps the previous feedback and never fails the pull.
+    let mut touched = !transitions.is_empty();
+    for prop in state.proposals.iter_mut() {
+        if prop.status != ProposalStatus::Open {
+            continue;
+        }
+        match provider.proposal_feedback(spec, prop.number).await {
+            Ok(feedback) => {
+                prop.review_state = feedback.review_state;
+                let mut items = feedback.items;
+                items.sort_by(|a, b| b.submitted_at.cmp(&a.submitted_at));
+                items.truncate(crate::state::FEEDBACK_CAP);
+                prop.feedback = items;
+                prop.updated_at = Some(Utc::now());
+                touched = true;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "feedback fetch for proposal #{} failed; keeping the previous feedback: {e}",
+                    prop.number
+                );
+            }
+        }
+    }
+    Ok((transitions, touched))
 }
 
 /// Builds the domain-relative upstream change set from a compare result,
@@ -1450,14 +2057,16 @@ struct ChangeEntries {
     deleted: Vec<(String, Option<Vec<u8>>)>,
 }
 
-/// Builds a share branch name: `crystalline/share-<slug>-<timestamp>`.
+/// Builds a share branch name: `crystalline/share-<slug>-<timestamp>-<hex4>`.
 ///
 /// `slug` is `domain_name` lowercased with every character outside
 /// `[a-z0-9-]` replaced, one for one, by `-`: a direct character map, not
 /// [`crystalline_core::slugify`]'s segment-aware collapsing (consecutive
 /// replaced characters are not merged into one hyphen). `timestamp` is the
 /// current UTC time as `yymmddHHMMSS`, keeping repeated shares of the same
-/// domain from colliding on the same branch name.
+/// domain from colliding on the same branch name, and a 4-hex-char suffix
+/// drawn from a random UUID v4 keeps two shares in the same second from
+/// colliding on one branch name.
 ///
 /// GitHub's client does not percent-encode URL path segments, so a branch
 /// name carrying any character outside `[a-z0-9-]` would break a proposal's
@@ -1476,7 +2085,8 @@ fn share_branch_name(domain_name: &str) -> String {
         })
         .collect();
     let timestamp = Utc::now().format("%y%m%d%H%M%S");
-    format!("crystalline/share-{slug}-{timestamp}")
+    let suffix = &uuid::Uuid::new_v4().simple().to_string()[..4];
+    format!("crystalline/share-{slug}-{timestamp}-{suffix}")
 }
 
 /// `singular` when `count == 1`, else `plural`. Every noun this module
