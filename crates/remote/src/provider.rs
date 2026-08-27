@@ -110,6 +110,29 @@ pub struct ProposalHandle {
     pub url: String,
 }
 
+/// One proposal inside a stack, as the forge reports it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackMember {
+    /// The proposal number.
+    pub number: u64,
+    /// The proposal's state as the forge spells it, for example `"open"`.
+    pub state: String,
+    /// The commit that member's branch currently points at.
+    pub head_sha: String,
+}
+
+/// A stack of proposals: an ordered group the forge reviews and merges as a
+/// chain, bottom layer first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackInfo {
+    /// The stack's own number on the forge.
+    pub number: u64,
+    /// Whether the stack is still open.
+    pub open: bool,
+    /// The stack's members, bottom layer first.
+    pub members: Vec<StackMember>,
+}
+
 /// The lifecycle state of a proposal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProposalState {
@@ -221,21 +244,28 @@ pub trait Provider: Send + Sync {
         name: &str,
     ) -> Result<Option<String>, RemoteError>;
 
-    /// Moves an existing branch to `commit`.
+    /// Moves an existing branch to `commit`. `force` allows a move that is not
+    /// a fast-forward, which a layer branch needs when the layers below it
+    /// moved and its commits were rewritten on top of the new base.
     async fn update_branch(
         &self,
         origin: &OriginSpec,
         name: &str,
         commit: &str,
+        force: bool,
     ) -> Result<(), RemoteError>;
 
-    /// Rewrites an open proposal's body, and its title when one is supplied.
+    /// Rewrites the parts of an open proposal the caller supplies: its title,
+    /// its body and the branch it targets. Every field is optional and an
+    /// absent one is left untouched, so a retarget can move the base without
+    /// overwriting a body a reviewer is reading.
     async fn update_proposal(
         &self,
         origin: &OriginSpec,
         number: u64,
         title: Option<&str>,
-        body: &str,
+        body: Option<&str>,
+        base: Option<&str>,
     ) -> Result<(), RemoteError>;
 
     /// Closes a proposal without merging it.
@@ -271,6 +301,53 @@ pub trait Provider: Send + Sync {
 
     /// The authenticated user's login, used to report who is connected.
     async fn current_user(&self) -> Result<String, RemoteError>;
+
+    // The stack verbs below all default to `StacksUnsupported`. Stacking is a
+    // forge capability rather than a part of the collaboration contract: a
+    // provider that cannot stack proposals implements none of these and its
+    // shares keep using a single living proposal.
+
+    /// Every stack on the repository, or just the ones `pull_request` belongs
+    /// to when a proposal number is given.
+    async fn list_stacks(
+        &self,
+        origin: &OriginSpec,
+        pull_request: Option<u64>,
+    ) -> Result<Vec<StackInfo>, RemoteError> {
+        let _ = (origin, pull_request);
+        Err(RemoteError::StacksUnsupported)
+    }
+
+    /// Groups the given proposals into a new stack, bottom layer first.
+    async fn create_stack(
+        &self,
+        origin: &OriginSpec,
+        pull_requests: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let _ = (origin, pull_requests);
+        Err(RemoteError::StacksUnsupported)
+    }
+
+    /// Adds the given proposals on top of an existing stack.
+    async fn extend_stack(
+        &self,
+        origin: &OriginSpec,
+        stack_number: u64,
+        pull_requests: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let _ = (origin, stack_number, pull_requests);
+        Err(RemoteError::StacksUnsupported)
+    }
+
+    /// Breaks a stack up again, leaving its members as ordinary proposals.
+    async fn dissolve_stack(
+        &self,
+        origin: &OriginSpec,
+        stack_number: u64,
+    ) -> Result<(), RemoteError> {
+        let _ = (origin, stack_number);
+        Err(RemoteError::StacksUnsupported)
+    }
 }
 
 #[cfg(test)]
@@ -370,6 +447,7 @@ mod tests {
             _origin: &OriginSpec,
             _name: &str,
             _commit: &str,
+            _force: bool,
         ) -> Result<(), RemoteError> {
             Err(RemoteError::Offline)
         }
@@ -379,7 +457,8 @@ mod tests {
             _origin: &OriginSpec,
             _number: u64,
             _title: Option<&str>,
-            _body: &str,
+            _body: Option<&str>,
+            _base: Option<&str>,
         ) -> Result<(), RemoteError> {
             Err(RemoteError::Offline)
         }
@@ -438,15 +517,61 @@ mod tests {
 
     #[test]
     fn provider_is_object_safe_behind_a_trait_object() {
-        // This crate has no async runtime yet (that lands with the GitHub
-        // client in a later task), so this proves object safety at the type
-        // level: `dyn Provider` compiles and calling through it returns a
-        // boxed future without needing one polled. Polling behavior is
-        // exercised once a runtime and a real implementation exist.
+        // This proves object safety at the type level: `dyn Provider`
+        // compiles and calling through it returns a boxed future without
+        // needing one polled. Polling behavior is exercised by the GitHub
+        // client's own tests.
         let provider: Box<dyn Provider> = Box::new(AlwaysOffline);
         let origin = sample_origin();
         let _pending_branch_head = provider.branch_head(&origin, None);
         let _pending_current_user = provider.current_user();
+    }
+
+    #[tokio::test]
+    async fn stack_verbs_default_to_stacks_unsupported() {
+        // AlwaysOffline implements none of the four, so what runs here are the
+        // trait's own default bodies.
+        let provider = AlwaysOffline;
+        let origin = sample_origin();
+        assert!(matches!(
+            provider.list_stacks(&origin, None).await,
+            Err(RemoteError::StacksUnsupported)
+        ));
+        assert!(matches!(
+            provider.create_stack(&origin, &[1, 2]).await,
+            Err(RemoteError::StacksUnsupported)
+        ));
+        assert!(matches!(
+            provider.extend_stack(&origin, 3, &[4]).await,
+            Err(RemoteError::StacksUnsupported)
+        ));
+        assert!(matches!(
+            provider.dissolve_stack(&origin, 3).await,
+            Err(RemoteError::StacksUnsupported)
+        ));
+    }
+
+    #[test]
+    fn stack_info_carries_its_members_bottom_layer_first() {
+        let stack = StackInfo {
+            number: 9,
+            open: true,
+            members: vec![
+                StackMember {
+                    number: 4,
+                    state: "open".to_string(),
+                    head_sha: "aaa".to_string(),
+                },
+                StackMember {
+                    number: 5,
+                    state: "open".to_string(),
+                    head_sha: "bbb".to_string(),
+                },
+            ],
+        };
+        assert!(stack.open);
+        assert_eq!(stack.members[0].number, 4);
+        assert_eq!(stack.members[1].head_sha, "bbb");
     }
 
     #[test]

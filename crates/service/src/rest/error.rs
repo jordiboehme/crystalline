@@ -510,6 +510,7 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         RemoteError::NotEnabled
         | RemoteError::NotConnected
         | RemoteError::NoWithdrawTarget { .. }
+        | RemoteError::StacksUnsupported
         | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }

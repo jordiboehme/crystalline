@@ -2673,7 +2673,7 @@ async fn scenario_27_consecutive_shares_update_one_proposal() {
     );
     assert!(
         calls.contains(&format!(
-            "update_branch:{}:{head_after_update}",
+            "update_branch:{}:{head_after_update}:force=false",
             first.branch
         )),
         "{calls:?}"

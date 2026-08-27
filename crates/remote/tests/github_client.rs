@@ -657,12 +657,40 @@ async fn update_branch_patches_the_ref_without_force() {
     let base = spawn(app).await;
     let provider = GitHubProvider::new(Some(base), None);
     provider
-        .update_branch(&origin(), "crystalline/share-eng-1", "cafe")
+        .update_branch(&origin(), "crystalline/share-eng-1", "cafe", false)
         .await
         .unwrap();
     let body = seen.lock().unwrap().clone().unwrap();
     assert_eq!(body["sha"], "cafe");
     assert_eq!(body["force"], false);
+}
+
+#[tokio::test]
+async fn update_branch_with_force_sends_force_true() {
+    // A layer branch is rewritten in place when the layers below it move, so
+    // its new commit is not a descendant of the old one. That is the one
+    // branch move that must carry `force: true`.
+    let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/git/refs/heads/{*name}",
+        axum::routing::patch(move |body: Json<serde_json::Value>| {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() = Some(body.0);
+                Json(serde_json::json!({"object": {"sha": "beef"}}))
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    provider
+        .update_branch(&origin(), "crystalline/share-eng-1", "beef", true)
+        .await
+        .unwrap();
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body["sha"], "beef");
+    assert_eq!(body["force"], true);
 }
 
 // --- update_proposal / close_proposal ---------------------------------------
@@ -684,17 +712,44 @@ async fn update_proposal_patches_body_and_only_a_supplied_title() {
     let base = spawn(app).await;
     let provider = GitHubProvider::new(Some(base), None);
     provider
-        .update_proposal(&origin(), 4, None, "fresh body")
+        .update_proposal(&origin(), 4, None, Some("fresh body"), None)
         .await
         .unwrap();
     provider
-        .update_proposal(&origin(), 4, Some("New title"), "fresh body")
+        .update_proposal(&origin(), 4, Some("New title"), Some("fresh body"), None)
         .await
         .unwrap();
     let bodies = seen.lock().unwrap().clone();
     assert_eq!(bodies[0]["body"], "fresh body");
     assert!(bodies[0].get("title").is_none(), "{:?}", bodies[0]);
     assert_eq!(bodies[1]["title"], "New title");
+}
+
+#[tokio::test]
+async fn update_proposal_can_retarget_the_base_without_touching_the_body() {
+    // Restacking a layer retargets its proposal at the layer below it. That
+    // PATCH must carry the base and nothing else: a body key would overwrite
+    // whatever a reviewer or a later share left there.
+    let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/pulls/{number}",
+        axum::routing::patch(move |body: Json<serde_json::Value>| {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() = Some(body.0);
+                Json(serde_json::json!({"number": 7}))
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+    provider
+        .update_proposal(&origin(), 7, None, None, Some("layer-a"))
+        .await
+        .unwrap();
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(body, serde_json::json!({"base": "layer-a"}), "{body:?}");
 }
 
 #[tokio::test]

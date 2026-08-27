@@ -131,6 +131,14 @@ pub enum RemoteError {
     #[error("The repository history changed underneath this domain; re-baselining automatically.")]
     BaseUnavailable,
 
+    /// A stack operation was attempted against a provider that does not serve
+    /// stacked pull requests. Every provider answers this by default: only a
+    /// forge that actually stacks proposals overrides the stack verbs.
+    #[error(
+        "This forge does not serve stacked pull requests; shares use a single living proposal instead."
+    )]
+    StacksUnsupported,
+
     /// The GitHub API answered in a shape this client did not expect, with no
     /// more specific variant to map it to.
     #[error("GitHub returned an unexpected answer (status {status}): {message}")]
@@ -379,6 +387,14 @@ mod tests {
     }
 
     #[test]
+    fn stacks_unsupported_says_what_happens_instead() {
+        assert_eq!(
+            RemoteError::StacksUnsupported.to_string(),
+            "This forge does not serve stacked pull requests; shares use a single living proposal instead."
+        );
+    }
+
+    #[test]
     fn api_error_carries_status_and_message() {
         let err = RemoteError::Api {
             status: 502,
@@ -448,6 +464,7 @@ mod tests {
             }
             .to_string(),
             RemoteError::BaseUnavailable.to_string(),
+            RemoteError::StacksUnsupported.to_string(),
             RemoteError::Api {
                 status: 500,
                 message: "boom".to_string(),

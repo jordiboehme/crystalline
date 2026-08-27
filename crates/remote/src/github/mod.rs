@@ -410,12 +410,13 @@ impl Provider for GitHubProvider {
         origin: &OriginSpec,
         name: &str,
         commit: &str,
+        force: bool,
     ) -> Result<(), RemoteError> {
         let (owner, repo_name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{repo_name}/git/refs/heads/{name}");
         let body = UpdateRefRequest {
             sha: commit.to_string(),
-            force: false,
+            force,
         };
         let response = self
             .send(self.request(Method::PATCH, &path).json(&body))
@@ -429,13 +430,15 @@ impl Provider for GitHubProvider {
         origin: &OriginSpec,
         number: u64,
         title: Option<&str>,
-        body: &str,
+        body: Option<&str>,
+        base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/pulls/{number}");
         let body = UpdateProposalRequest {
             title: title.map(str::to_string),
-            body: body.to_string(),
+            body: body.map(str::to_string),
+            base: base.map(str::to_string),
         };
         let response = self
             .send(self.request(Method::PATCH, &path).json(&body))

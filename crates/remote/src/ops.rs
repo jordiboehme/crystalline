@@ -1246,10 +1246,10 @@ async fn update_open_proposal(
     state.save(state_dir)?;
 
     provider
-        .update_branch(spec, &prop.branch, &commit_sha)
+        .update_branch(spec, &prop.branch, &commit_sha, false)
         .await?;
     provider
-        .update_proposal(spec, prop.number, title, &body)
+        .update_proposal(spec, prop.number, title, Some(&body), None)
         .await?;
 
     let record = state

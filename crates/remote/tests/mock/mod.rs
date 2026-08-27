@@ -506,13 +506,19 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         name: &str,
         commit: &str,
+        force: bool,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.etag_counter += 1;
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
         inner.etags.insert(name.to_string(), etag);
-        inner.calls.push(format!("update_branch:{name}:{commit}"));
+        // The recorded string extends the old `update_branch:{name}:{commit}`
+        // with the force flag rather than rewording it, so the `starts_with`
+        // assertions across lifecycle.rs keep matching.
+        inner
+            .calls
+            .push(format!("update_branch:{name}:{commit}:force={force}"));
         Ok(())
     }
 
@@ -521,12 +527,18 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         number: u64,
         title: Option<&str>,
-        body: &str,
+        body: Option<&str>,
+        base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         // Logged before the failure check, like `close_proposal`, so an
         // injected failure still leaves a trace of the attempt.
         inner.calls.push(format!("update_proposal:{number}"));
+        if let Some(base) = base {
+            inner
+                .calls
+                .push(format!("update_proposal_base:{number}:{base}"));
+        }
         if inner.update_proposal_failures.contains(&number) {
             return Err(RemoteError::Api {
                 status: 500,
@@ -534,10 +546,17 @@ impl Provider for MockProvider {
             });
         }
         if let Some(req) = inner.proposal_requests.get_mut(&number) {
+            // Only what the caller supplied is applied: a retarget-only call
+            // leaves the title and body exactly as they stand.
             if let Some(title) = title {
                 req.title = title.to_string();
             }
-            req.body = body.to_string();
+            if let Some(body) = body {
+                req.body = body.to_string();
+            }
+            if let Some(base) = base {
+                req.base_branch = base.to_string();
+            }
         }
         Ok(())
     }

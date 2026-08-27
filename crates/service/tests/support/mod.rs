@@ -619,13 +619,18 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         name: &str,
         commit: &str,
+        force: bool,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.etag_counter += 1;
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
         inner.etags.insert(name.to_string(), etag);
-        inner.calls.push(format!("update_branch:{name}:{commit}"));
+        // Extends the old `update_branch:{name}:{commit}` with the force flag
+        // rather than rewording it, so `starts_with` assertions keep matching.
+        inner
+            .calls
+            .push(format!("update_branch:{name}:{commit}:force={force}"));
         Ok(())
     }
 
@@ -634,7 +639,8 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         number: u64,
         _title: Option<&str>,
-        _body: &str,
+        _body: Option<&str>,
+        _base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("update_proposal:{number}"));

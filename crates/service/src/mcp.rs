@@ -3050,10 +3050,10 @@ fn to_error(e: EngineError) -> ErrorData {
 /// product copy, see `crystalline_remote::error`) is carried verbatim
 /// either way. Genuine input problems - collaboration turned off, no
 /// connection yet, an unreachable repository, a repository or subpath with
-/// no domain, unresolved conflicts blocking a share, or a proposal or
-/// conflict path that does not exist - stay `invalid_params`-shaped. This
-/// match is exhaustive over `RemoteError` so a new variant must be
-/// classified here rather than silently defaulting.
+/// no domain, unresolved conflicts blocking a share, a forge that does not
+/// stack proposals, or a proposal or conflict path that does not exist - stay
+/// `invalid_params`-shaped. This match is exhaustive over `RemoteError` so a
+/// new variant must be classified here rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
     let message = e.to_string();
     match e {
@@ -3073,6 +3073,7 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::ConflictsPending { .. }
         | RemoteError::ProposalNotFound { .. }
         | RemoteError::NoWithdrawTarget { .. }
+        | RemoteError::StacksUnsupported
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }
