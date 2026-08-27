@@ -191,6 +191,14 @@ pub struct ProposeReport {
     /// line of the generated proposal body, when the caller supplies no
     /// description of their own).
     pub summary: String,
+    /// The stack number linking this proposal's chain on the forge. `None`
+    /// off the stacked path, and `None` on a stacked layer whose linking call
+    /// failed (the chain is degraded, which
+    /// [`crate::state::OriginState::stack_link_pending`] carries).
+    pub stack_number: Option<u64>,
+    /// Where this proposal sits in the open chain, as `(position, open
+    /// layers)` with a 1-based position. `None` off the stacked path.
+    pub stack_position: Option<(usize, usize)>,
 }
 
 /// What [`withdraw`] did with a declined or still-open proposal.
@@ -723,6 +731,13 @@ pub struct ShareOptions<'a> {
 /// user saying no before the question is worth asking: it short-circuits
 /// without probing and without consulting or touching the cache, so turning
 /// the setting back on finds the cache exactly as it was.
+///
+/// Only two answers are verdicts worth remembering: the forge served the
+/// listing, or it said it does not serve stacks at all. Any other failure -
+/// offline, a 500, a timeout - is this probe failing rather than the forge
+/// answering, so the share falls back for this run alone and nothing is
+/// cached: the next share asks again. An optional capability is never worth
+/// failing a share over.
 async fn stacks_available(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -739,7 +754,10 @@ async fn stacks_available(
     let verdict = match provider.list_stacks(spec, None).await {
         Ok(_) => true,
         Err(RemoteError::StacksUnsupported) => false,
-        Err(e) => return Err(e),
+        Err(e) => {
+            tracing::debug!("the stacks probe failed; sharing without stacking this time: {e}");
+            return Ok(false);
+        }
     };
     state.stacks_available = Some(verdict);
     state.save(state_dir)?;
@@ -753,7 +771,6 @@ async fn stacks_available(
 /// a stack - a recorded stack number, or a link it still owes the forge. A
 /// multi-open state carrying neither predates stacking, and its shares take
 /// the fallback flows.
-#[allow(dead_code)] // The stacked share path is this helper's only caller.
 fn chain_is_stacked(state: &OriginState) -> bool {
     let open = state
         .proposals
@@ -761,6 +778,87 @@ fn chain_is_stacked(state: &OriginState) -> bool {
         .filter(|p| p.status == ProposalStatus::Open)
         .count();
     open <= 1 || state.stack_number.is_some() || state.stack_link_pending
+}
+
+/// Settles a stack link this machine still owes the forge, best effort.
+///
+/// A layer whose `create_stack` or `extend_stack` call failed leaves the
+/// chain degraded rather than wrong: every pull request exists, they are
+/// simply not grouped. [`crate::state::OriginState::stack_link_pending`]
+/// records that debt, and this pays it off at the start of the next share,
+/// withdrawal or status, before that operation does any work of its own.
+///
+/// Which call settles it follows from what is already known: with no stack
+/// number the whole open chain is grouped in one `create_stack`; with one,
+/// the forge is asked which members it holds and only the missing layers are
+/// added. Fewer than two open layers is not a chain at all, so the flag is
+/// simply cleared. Every failure here is swallowed and logged - the debt
+/// stays recorded and the next operation tries again.
+async fn retry_stack_link(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) {
+    if !state.stack_link_pending {
+        return;
+    }
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    if open.len() < 2 {
+        state.stack_link_pending = false;
+        if let Err(e) = state.save(state_dir) {
+            tracing::debug!("clearing the stale stack-link debt failed: {e}");
+        }
+        return;
+    }
+
+    let linked = match state.stack_number {
+        None => provider
+            .create_stack(spec, &open)
+            .await
+            .map(|info| Some(info.number)),
+        Some(number) => match provider.list_stacks(spec, Some(open[0])).await {
+            Ok(stacks) => {
+                let known: Vec<u64> = stacks
+                    .iter()
+                    .find(|s| s.number == number)
+                    .map(|s| s.members.iter().map(|m| m.number).collect())
+                    .unwrap_or_default();
+                let missing: Vec<u64> = open
+                    .iter()
+                    .copied()
+                    .filter(|n| !known.contains(n))
+                    .collect();
+                if missing.is_empty() {
+                    Ok(Some(number))
+                } else {
+                    provider
+                        .extend_stack(spec, number, &missing)
+                        .await
+                        .map(|_| Some(number))
+                }
+            }
+            Err(e) => Err(e),
+        },
+    };
+
+    match linked {
+        Ok(number) => {
+            state.stack_number = number;
+            state.stack_link_pending = false;
+            if let Err(e) = state.save(state_dir) {
+                tracing::debug!("recording the settled stack link failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::debug!("the owed stack link still fails; the chain stays degraded: {e}");
+        }
+    }
 }
 
 /// Proposes a domain's local changes as a pull request against its origin.
@@ -780,7 +878,17 @@ fn chain_is_stacked(state: &OriginState) -> bool {
 /// `Declined`, its branch best-effort deleted); then either update the one
 /// open proposal in place or create a new one.
 ///
-/// A domain has at most one open proposal at a time. When one is open, this
+/// Two shapes of chain live behind that last step. On a forge that serves
+/// stacks, with `stacks_allowed` on, a share never rewrites what is already
+/// open: it opens a NEW proposal layered on the top open one (its tree built
+/// on that layer's head, its commit carrying exactly one parent, its pull
+/// request targeting that layer's branch) and links it into the forge's
+/// stack, so every share stays reviewable on its own. Everything below is the
+/// fallback that path falls back to, and the flow a chain this machine does
+/// not know as a stack keeps.
+///
+/// On the fallback path a domain has at most one open proposal at a time.
+/// When one is open, this
 /// pushes a fresh commit onto its branch and rewrites its body rather than
 /// opening a second pull request ([`ProposeOutcome::Updated`]), and refuses
 /// with [`ProposeOutcome::ProposalDiverged`] - before any provider write -
@@ -821,9 +929,17 @@ pub async fn propose(
         });
     }
 
+    if options.proposal.is_some() {
+        // Amending a named layer is the next change in this wave; refusing
+        // plainly beats silently sharing something else.
+        return Err(RemoteError::State(
+            "amending a layer lands in the next change".into(),
+        ));
+    }
+
     // Ask the forge once, before any share work: whether this share can stack
     // is a property of the origin, and the answer is cached from here on.
-    let _stacked_path = stacks_available(
+    let stacked_path = stacks_available(
         provider,
         spec,
         &mut state,
@@ -859,7 +975,75 @@ pub async fn propose(
         }
     }
 
-    // 3. An open proposal is updated in place, never paralleled.
+    // 3a. On a stackable chain a share never rewrites what is already open:
+    //     it opens a new layer on top, so each share stays reviewable on its
+    //     own. A chain this machine does not know as a stack (multi-open
+    //     residue from before stacking) falls through to 3b untouched.
+    if stacked_path && chain_is_stacked(&state) {
+        // Any link still owed to the forge is settled first: growing the
+        // chain over an unsettled gap would only widen it.
+        retry_stack_link(provider, spec, &mut state, state_dir).await;
+
+        loop {
+            let top = state
+                .proposals
+                .iter()
+                .rev()
+                .find(|p| p.status == ProposalStatus::Open)
+                .cloned();
+            let Some(top) = top else {
+                // The chain emptied out. Nothing is left to stack onto, so
+                // the create path below opens a fresh bottom layer and the
+                // old chain's stack number goes with the chain.
+                state.stack_number = None;
+                break;
+            };
+            match provider.branch_ref(spec, &top.branch).await? {
+                Some(live_head) => {
+                    if !head_is_ours(&top, &live_head) {
+                        // A reviewer moved the layer this one would sit on;
+                        // refuse before any write, naming the top.
+                        return Ok(ProposeOutcome::ProposalDiverged {
+                            number: top.number,
+                            url: top.url.clone(),
+                            branch: top.branch.clone(),
+                        });
+                    }
+                    return stack_new_layer(
+                        provider,
+                        spec,
+                        domain_root,
+                        domain_name,
+                        state_dir,
+                        state,
+                        top,
+                        live_head,
+                        local,
+                        title,
+                        description,
+                    )
+                    .await;
+                }
+                None => {
+                    // The ref is gone: settle this layer exactly as the
+                    // fallback path settles a gone ref, then read the chain
+                    // again - the layer below becomes the new top.
+                    let refreshed = provider.proposal_state(spec, top.number).await?;
+                    state.proposals.retain(|p| p.number != top.number);
+                    let mut settled = top.clone();
+                    settled.status = match refreshed {
+                        ProposalState::Merged => ProposalStatus::Merged,
+                        ProposalState::Declined | ProposalState::Open => ProposalStatus::Declined,
+                    };
+                    settled.pending_head_commit = None;
+                    state.push_history(settled);
+                    state.save(state_dir)?;
+                }
+            }
+        }
+    }
+
+    // 3b. An open proposal is updated in place, never paralleled.
     let open = state
         .proposals
         .iter()
@@ -989,6 +1173,9 @@ pub async fn propose(
         deleted: collected.deleted,
         skipped_large: local.skipped_large,
         summary,
+        // A bottom layer is not stacked onto anything: the chain starts here.
+        stack_number: None,
+        stack_position: None,
     }))
 }
 
@@ -1010,6 +1197,15 @@ pub struct SharePlan {
 pub enum PlannedAction {
     /// A share would open a new proposal.
     Create,
+    /// A share would stack a new layer on top of this open proposal, leaving
+    /// it and every layer below it exactly as they stand.
+    StackOnTop {
+        /// The top open layer's number, the one the new layer would sit on.
+        top_number: u64,
+        /// The top open layer's title, so a caller can name what is being
+        /// built on without a second lookup.
+        top_title: String,
+    },
     /// A share would update this open proposal in place.
     Update {
         /// The open proposal's number.
@@ -1056,7 +1252,7 @@ pub async fn propose_preview(
 ) -> Result<SharePlan, RemoteError> {
     let title = options.title;
     pull(provider, spec, domain_root, state_dir).await?;
-    let state = OriginState::load(state_dir)?.ok_or_else(|| {
+    let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
@@ -1085,9 +1281,52 @@ pub async fn propose_preview(
         .map(str::to_string)
         .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
 
-    // Classification mirrors propose's, read-only: a declined record would be
-    // superseded (so it reads as Create), an open one is an Update unless a
-    // reviewer amended its branch, and a gone ref would be re-created.
+    // The same capability question a real share asks, and the same cached
+    // answer: a preview that guessed would name an action the share then
+    // would not take.
+    let stacked_path = stacks_available(
+        provider,
+        spec,
+        &mut state,
+        state_dir,
+        options.stacks_allowed,
+    )
+    .await?;
+
+    // Classification mirrors propose's, read-only. On a stackable chain a
+    // share stacks a new layer on the top open one, after the very same
+    // divergence check; a gone ref would be settled and re-created. A share
+    // naming a layer to amend is a different action, and not this one.
+    if stacked_path && chain_is_stacked(&state) && options.proposal.is_none() {
+        let top = state
+            .proposals
+            .iter()
+            .rev()
+            .find(|p| p.status == ProposalStatus::Open);
+        if let Some(top) = top {
+            let action = match provider.branch_ref(spec, &top.branch).await? {
+                Some(live_head) if head_is_ours(top, &live_head) => PlannedAction::StackOnTop {
+                    top_number: top.number,
+                    top_title: top.title.clone(),
+                },
+                Some(_) => PlannedAction::ProposalDiverged {
+                    number: top.number,
+                    url: top.url.clone(),
+                    branch: top.branch.clone(),
+                },
+                None => PlannedAction::Create,
+            };
+            return Ok(SharePlan {
+                action,
+                changes: local,
+                effective_title,
+            });
+        }
+    }
+
+    // The fallback classification: a declined record would be superseded (so
+    // it reads as Create), an open one is an Update unless a reviewer amended
+    // its branch, and a gone ref would be re-created.
     let open = state
         .proposals
         .iter()
@@ -1359,7 +1598,160 @@ async fn update_open_proposal(
         deleted: collected.deleted,
         skipped_large: local.skipped_large,
         summary,
+        // The living-proposal path is the fallback: no chain, no position.
+        stack_number: None,
+        stack_position: None,
     }))
+}
+
+/// Stacks a new layer on top of the open chain: a commit whose single parent
+/// is the top layer's head, a branch of its own and a pull request targeting
+/// the top layer's branch, then linked into the forge's stack.
+///
+/// The tree is built on `top_head` rather than on the trunk, so the layer
+/// carries everything the layers below it carry and the forge's diff shows
+/// only what this share adds. The commit has exactly one parent for the same
+/// reason: a merge commit would drag the trunk into a layer that is meant to
+/// read as one reviewable step.
+///
+/// Linkage comes last and is allowed to fail. The pull request already
+/// exists by then, so a failed `create_stack`/`extend_stack` leaves the chain
+/// degraded (every layer open, none of them grouped) rather than losing the
+/// share: [`crate::state::OriginState::stack_link_pending`] records the debt
+/// and [`retry_stack_link`] pays it off at the start of the next operation.
+#[allow(clippy::too_many_arguments)]
+async fn stack_new_layer(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    top: Proposal,
+    top_head: String,
+    local: crate::changes::LocalChanges,
+    title: Option<&str>,
+    description: Option<&str>,
+) -> Result<ProposeOutcome, RemoteError> {
+    let collected =
+        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+
+    let generated_title = generate_title(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+        domain_name,
+    );
+    let effective_title = title.map(str::to_string).unwrap_or(generated_title);
+    let summary = generate_summary_line(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+    );
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+
+    let tree_sha = provider
+        .create_tree(spec, &top_head, &collected.writes)
+        .await?;
+    let commit_sha = provider
+        .create_commit(
+            spec,
+            &effective_title,
+            &tree_sha,
+            std::slice::from_ref(&top_head),
+        )
+        .await?;
+    let branch = share_branch_name(domain_name);
+    provider.create_branch(spec, &branch, &commit_sha).await?;
+    let handle = provider
+        .create_proposal(
+            spec,
+            &ProposalRequest {
+                title: effective_title.clone(),
+                body,
+                branch: branch.clone(),
+                base_branch: top.branch.clone(),
+            },
+        )
+        .await?;
+
+    // With no stack number yet the chain is exactly the layer below plus this
+    // one: `chain_is_stacked` only lets an unlinked chain here while a single
+    // layer is open, so those two are the whole stack.
+    let linked = match state.stack_number {
+        None => provider
+            .create_stack(spec, &[top.number, handle.number])
+            .await
+            .map(|info| Some(info.number)),
+        Some(number) => provider
+            .extend_stack(spec, number, &[handle.number])
+            .await
+            .map(|_| Some(number)),
+    };
+    match linked {
+        Ok(number) => {
+            state.stack_number = number;
+            state.stack_link_pending = false;
+        }
+        Err(e) => {
+            tracing::debug!(
+                "linking proposal #{} into the stack failed; the chain is degraded until the next share: {e}",
+                handle.number
+            );
+            state.stack_link_pending = true;
+        }
+    }
+
+    state.proposals.push(Proposal {
+        number: handle.number,
+        url: handle.url.clone(),
+        branch: branch.clone(),
+        title: effective_title,
+        created_at: Utc::now(),
+        status: ProposalStatus::Open,
+        files: collected.files,
+        head_commit: Some(commit_sha),
+        pending_head_commit: None,
+        // A layer's base is the layer below it, never the trunk.
+        base_commit: Some(top_head),
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
+    });
+    state.save(state_dir)?;
+
+    Ok(ProposeOutcome::Proposed(ProposeReport {
+        url: handle.url,
+        number: handle.number,
+        branch,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
+        skipped_large: local.skipped_large,
+        summary,
+        stack_number: state.stack_number,
+        stack_position: Some(open_position(&state, handle.number)),
+    }))
+}
+
+/// Where the proposal numbered `number` sits among the open layers, as
+/// `(1-based position, open layers)`. A number that is not open reads as the
+/// top, which is what a freshly pushed layer is anyway.
+fn open_position(state: &OriginState, number: u64) -> (usize, usize) {
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    let position = open
+        .iter()
+        .position(|n| *n == number)
+        .map(|i| i + 1)
+        .unwrap_or(open.len());
+    (position, open.len())
 }
 
 /// Withdraws a share proposal: closes its pull request on the forge (an Open

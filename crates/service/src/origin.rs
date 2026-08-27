@@ -311,8 +311,9 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
 /// Shapes [`ops::propose_preview`]'s plan for `origin_share_preview` and the
 /// REST changes route: always `effective_title` and `changes` (one
 /// `{ path, kind }` entry per detected local change), plus the fields the
-/// planned action itself carries - `number` and `url` for an update, all
-/// three of `number`, `url` and `branch` for a diverged proposal, `count` for
+/// planned action itself carries - `number` and `url` for an update,
+/// `top_number` and `top_title` for a new layer on an open chain, all three
+/// of `number`, `url` and `branch` for a diverged proposal, `count` for
 /// pending conflicts and nothing extra for a create or a no-op.
 pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
     let changes: Vec<Value> = plan
@@ -338,6 +339,14 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
             v["action"] = json!("update");
             v["number"] = json!(number);
             v["url"] = json!(url);
+        }
+        ops::PlannedAction::StackOnTop {
+            top_number,
+            top_title,
+        } => {
+            v["action"] = json!("stack_on_top");
+            v["top_number"] = json!(top_number);
+            v["top_title"] = json!(top_title);
         }
         ops::PlannedAction::NothingToShare => v["action"] = json!("nothing_to_share"),
         ops::PlannedAction::ConflictsPending { count } => {
@@ -746,6 +755,8 @@ mod tests {
             deleted: vec![],
             skipped_large: vec![],
             summary: "Shares 1 new engram.".to_string(),
+            stack_number: None,
+            stack_position: None,
         });
         let v = propose_outcome_json(&outcome);
         assert_eq!(v["outcome"], "proposed");
@@ -765,6 +776,8 @@ mod tests {
             deleted: vec![],
             skipped_large: vec![],
             summary: "Refines 1 engram.".to_string(),
+            stack_number: None,
+            stack_position: None,
         });
         let v = propose_outcome_json(&outcome);
         assert_eq!(v["outcome"], "updated");

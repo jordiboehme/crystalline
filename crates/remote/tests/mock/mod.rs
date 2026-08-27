@@ -23,7 +23,9 @@
 //! head branch, stack numbers come off the same counter as proposals,
 //! closing a member leaves it in the stack, an extend is validated against
 //! the current top member (a closed one included) and a dissolve takes the
-//! stack out of the registry outright.
+//! stack out of the registry outright. [`MockProvider::fail_list_stacks`]
+//! sits beside that switch and models the other kind of no: a probe that
+//! fails rather than one that answers.
 
 #![allow(dead_code)]
 
@@ -134,6 +136,9 @@ struct Inner {
     extend_conflicts: u32,
     /// Whether `create_stack` fails outright, for the link-pending path.
     create_stack_fails: bool,
+    /// Whether `list_stacks` fails with a 500, a transport-shaped failure of
+    /// the capability probe rather than an answer to it.
+    list_stacks_fails: bool,
     /// Trees built by `create_tree`, keyed by a generated tree id: the
     /// parent commit's files with every write applied, ready for
     /// `create_commit` to snapshot into a new [`Commit`].
@@ -445,6 +450,14 @@ impl MockProvider {
     /// link the injected failure lost.
     pub fn heal_create_stack(&self) {
         self.inner.lock().unwrap().create_stack_fails = false;
+    }
+
+    /// Makes every [`Provider::list_stacks`] call fail with a 500, whatever
+    /// `enable_stacks` says. That is the shape a probe failure takes when the
+    /// forge is unreachable or broken rather than simply without the preview:
+    /// no verdict at all, as opposed to [`RemoteError::StacksUnsupported`].
+    pub fn fail_list_stacks(&self) {
+        self.inner.lock().unwrap().list_stacks_fails = true;
     }
 }
 
@@ -861,6 +874,12 @@ impl Provider for MockProvider {
         match pull_request {
             Some(number) => inner.calls.push(format!("list_stacks:{number}")),
             None => inner.calls.push("list_stacks".to_string()),
+        }
+        if inner.list_stacks_fails {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: "injected list_stacks failure".to_string(),
+            });
         }
         if !inner.stacks_enabled {
             return Err(RemoteError::StacksUnsupported);

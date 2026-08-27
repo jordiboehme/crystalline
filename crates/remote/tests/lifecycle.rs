@@ -3868,3 +3868,336 @@ async fn config_off_never_probes() {
         "the config gate leaves the cache untouched"
     );
 }
+
+// The stacked share: while a chain is open, every share opens a NEW proposal
+// layered on top of it rather than rewriting the one below. These scenarios
+// drive `propose` end to end against the stack-serving mock forge.
+
+/// Shares with stacking allowed, the call every stacked scenario makes.
+async fn stacked_share(mock: &MockProvider, sub: &Subscribed) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect("a stacked share should succeed")
+}
+
+/// The report of a share that opened a proposal, or a panic naming what came
+/// back instead.
+fn proposed(outcome: ProposeOutcome) -> crystalline_remote::ops::ProposeReport {
+    match outcome {
+        ProposeOutcome::Proposed(report) => report,
+        other => panic!("expected Proposed, got {other:?}"),
+    }
+}
+
+/// Subscribes a single-file domain against a stack-serving forge and shares
+/// one local edit, the bottom layer every stacked scenario builds on.
+async fn stacked_bottom_layer(
+    mock: &MockProvider,
+) -> (Subscribed, crystalline_remote::ops::ProposeReport) {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let report = proposed(stacked_share(mock, &sub).await);
+    (sub, report)
+}
+
+#[tokio::test]
+async fn a_second_share_stacks_a_new_proposal_on_the_open_one() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // The bottom layer is an ordinary create: there was no chain to stack on.
+    assert_eq!(first.stack_number, None);
+    assert_eq!(first.stack_position, None);
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 1);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    assert_ne!(second.number, first.number, "a new proposal, not an update");
+    let state = load_state(&sub.state_dir);
+    let stack = state.stack_number.expect("the chain is linked");
+    assert_eq!(second.stack_number, Some(stack));
+    assert_eq!(second.stack_position, Some((2, 2)));
+    assert_eq!(state.proposals.len(), 2);
+    assert_eq!(
+        state.stacks_available,
+        Some(true),
+        "the probe's verdict is cached"
+    );
+
+    // The new pull request targets the layer below it, and its commit has
+    // exactly one parent: that layer's head, never a two-parent merge.
+    let request = mock
+        .proposal_request(second.number)
+        .expect("the second layer was opened through the provider");
+    assert_eq!(request.base_branch, first.branch);
+    let top_head = mock.branch_commit(&first.branch).expect("the layer's head");
+    let layer_head = mock.branch_commit(&second.branch).expect("the new head");
+    assert_eq!(mock.commit_parents(&layer_head), Some(vec![top_head]));
+
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!(
+            "create_stack:[{},{}]",
+            first.number, second.number
+        )),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_third_share_extends_the_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let stack = second.stack_number.expect("the chain is linked");
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(&mock, &sub).await);
+
+    assert_eq!(third.stack_number, Some(stack), "the same stack number");
+    assert_eq!(third.stack_position, Some((3, 3)));
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("extend_stack:{stack}:[{}]", third.number)),
+        "{calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals.len(), 3);
+    assert_eq!(state.stack_number, Some(stack));
+    assert!(!state.stack_link_pending);
+}
+
+#[tokio::test]
+async fn a_failed_stack_link_degrades_and_heals_on_the_next_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    // The pull request exists; only the linking call failed.
+    assert_eq!(second.stack_number, None);
+    assert_eq!(second.stack_position, Some((2, 2)));
+    let state = load_state(&sub.state_dir);
+    assert!(state.stack_link_pending, "the chain is degraded, not wrong");
+    assert_eq!(state.stack_number, None);
+    assert_eq!(state.proposals.len(), 2);
+
+    mock.heal_create_stack();
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(&mock, &sub).await);
+
+    let delta = mock.calls().split_off(before);
+    let retried = format!("create_stack:[{},{}]", first.number, second.number);
+    let retry_at = delta
+        .iter()
+        .position(|c| *c == retried)
+        .unwrap_or_else(|| panic!("no retried link in {delta:?}"));
+    let stack = third.stack_number.expect("the retry linked the chain");
+    let extend_at = delta
+        .iter()
+        .position(|c| *c == format!("extend_stack:{stack}:[{}]", third.number))
+        .unwrap_or_else(|| panic!("no extend in {delta:?}"));
+    assert!(
+        retry_at < extend_at,
+        "the owed link is settled before the new layer's own: {delta:?}"
+    );
+    let first_write = delta
+        .iter()
+        .position(|c| c.starts_with("create_blob"))
+        .unwrap_or_else(|| panic!("no share write in {delta:?}"));
+    assert!(
+        retry_at < first_write,
+        "the retry comes before any new share work: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the flag is cleared");
+    assert_eq!(state.stack_number, Some(stack));
+    assert_eq!(state.proposals.len(), 3);
+}
+
+#[tokio::test]
+async fn divergence_on_the_top_layer_refuses_the_stacked_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // A reviewer pushes onto the TOP layer's branch.
+    let foreign = mock.add_commit(commit_files(&[("MANIFEST.md", b"# reviewer")]), None);
+    mock.set_branch(&second.branch, &foreign);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+    match outcome {
+        ProposeOutcome::ProposalDiverged { number, branch, .. } => {
+            assert_eq!(number, second.number, "the TOP layer, not the bottom");
+            assert_ne!(number, first.number);
+            assert_eq!(branch, second.branch);
+        }
+        other => panic!("expected ProposalDiverged, got {other:?}"),
+    }
+    assert_eq!(
+        load_state(&sub.state_dir).proposals.len(),
+        2,
+        "nothing was stacked"
+    );
+}
+
+#[tokio::test]
+async fn preview_names_the_stack_action() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let top_title = load_state(&sub.state_dir).proposals[0].title.clone();
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        plan.action,
+        PlannedAction::StackOnTop {
+            top_number: first.number,
+            top_title,
+        }
+    );
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_multi_open_state_keeps_the_living_proposal_flow() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Two open records with no stack behind them: residue from before
+    // stacking existed, which the living-proposal flow still owns.
+    for number in [41u64, 42] {
+        seed_proposal(&sub.state_dir, number, "notes/a.md", None);
+        let branch = format!("crystalline/share-{number}");
+        mock.register_proposal_branch(number, &branch);
+        mock.set_branch(&branch, &c1);
+        mock.set_proposal_state(number, ProposalState::Open);
+    }
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, None);
+    assert!(!state.stack_link_pending);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let outcome = stacked_share(&mock, &sub).await;
+    match outcome {
+        ProposeOutcome::Updated(report) => {
+            assert_eq!(report.number, 41, "the oldest layer, updated in place");
+            assert_eq!(report.stack_number, None);
+            assert_eq!(report.stack_position, None);
+        }
+        other => panic!("expected Updated, got {other:?}"),
+    }
+    // The capability probe still runs (it is a property of the origin), but
+    // no stack is ever created, extended or dissolved over legacy residue.
+    let calls = mock.calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")),
+        "{calls:?}"
+    );
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 2);
+}
+
+#[tokio::test]
+async fn a_failing_probe_falls_back_without_caching_a_verdict() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_list_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+
+    let outcome = stacked_share(&mock, &sub).await;
+    assert!(
+        matches!(outcome, ProposeOutcome::Proposed(_)),
+        "a broken probe never fails the share: {outcome:?}"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        None,
+        "a transport failure is not a verdict worth remembering"
+    );
+
+    // The next share asks again rather than trusting a cache it never wrote.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    stacked_share(&mock, &sub).await;
+    assert_eq!(
+        mock.calls().iter().filter(|c| *c == "list_stacks").count(),
+        2,
+        "{:?}",
+        mock.calls()
+    );
+}
