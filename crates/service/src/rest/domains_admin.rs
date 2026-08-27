@@ -588,6 +588,163 @@ pub async fn sync_status(
     Ok(Json(Value::Object(report)))
 }
 
+/// `GET /sync` - the instance-wide sync summary: this machine's GitHub
+/// connection and, per team domain, how much unshared work it holds and how
+/// many proposals and conflicts are open.
+///
+/// One call rather than a request per domain, because the caller is a top-bar
+/// share action: it has to know whether ANY team domain has something to share
+/// before it can decide to render itself at all, and then which domains to
+/// offer in its picker.
+///
+/// Counts, not records. [`sync_status`] beside it answers with the full
+/// per-domain report (every open proposal's record, every conflict) because it
+/// draws a card; this feeds a button and a picker, so each entry carries the
+/// same counted shape [`crate::origin::origin_poll_status_json`] gives the
+/// offline `status` overview - minus the poller's `next_due` and `last_result`,
+/// which belong to a schedule view and not to a share decision.
+///
+/// Read-only instances are served (a pure read, exactly like [`sync_status`]),
+/// and a missing GitHub CONNECTION is reported rather than refused, for the
+/// same reason: `connection.connected` false is what lets the button say
+/// "connect GitHub" instead of going quiet. GitHub switched OFF is the one
+/// refusal, and it is the shared 409 rather than the engine's bare 422, so the
+/// caller has a sentence to show.
+///
+/// A domain whose own status read fails does not take the summary down with
+/// it: `origin_status` collects that failure into `errors` and answers with
+/// every domain that did report.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sync",
+    tag = "domains",
+    operation_id = "get_sync_summary",
+    summary = "Where every team domain on this instance stands, in counts.",
+    description = "Admin only. One instance-wide answer to `does anything \
+                   have something to share?`: the GitHub connection plus, per \
+                   team domain, its repository, when it was last checked and \
+                   the counts a share action needs - unshared local changes, \
+                   open and declined proposals, waiting conflicts. A pure \
+                   read, served even on a read-only instance. An instance \
+                   with no GitHub connection is reported, not refused, and an \
+                   instance with no team domain answers an empty list. Use \
+                   `GET /domains/{domain}/sync` for one domain's full report.",
+    responses(
+        (
+            status = 200,
+            description = "The connection block, one counted entry per team \
+                           domain, and the domains whose own status read \
+                           failed. `local_changes` is the unshared-work count \
+                           a share action shows as pending; \
+                           `open_proposals`, `declined_proposals` and \
+                           `conflicts` are counts here rather than the \
+                           records the per-domain route returns. `errors` \
+                           holds one entry per domain that could not be read \
+                           at all, so a single broken domain never blanks the \
+                           summary.",
+            body = Object,
+            example = json!({
+                "connection": { "connected": true, "user": "octo", "token_store": "keychain" },
+                "domains": [{
+                    "domain": "eng",
+                    "mode": "github",
+                    "repo": "acme/knowledge",
+                    "branch": "main",
+                    "last_checked": "2026-08-10T08:00:00Z",
+                    "open_proposals": 1,
+                    "declined_proposals": 0,
+                    "conflicts": 0,
+                    "local_changes": 2
+                }],
+                "errors": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, or the trusted-header \
+                           identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "GitHub is switched off on this instance, so no \
+                           origin can be reached - the detail says where to \
+                           turn it on. A missing connection is NOT refused \
+                           here: the summary comes back with \
+                           `connection.connected` false instead.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn sync_summary(
+    State(state): State<RestState>,
+    identity: Identity,
+) -> Result<Json<Value>, ApiError> {
+    identity.require_admin()?;
+    // No refuse_read_only, and no connection check: see the doc comment, and
+    // [`sync_status`], which makes both calls the same way.
+    if !state.engine.github_enabled() {
+        return Err(github_off_conflict());
+    }
+    let aggregate = state.engine.origin_status(None).await?;
+    let domains: Vec<Value> = aggregate
+        .get("domains")
+        .and_then(Value::as_array)
+        .map(|domains| domains.iter().map(summarize_origin_domain).collect())
+        .unwrap_or_default();
+    Ok(Json(serde_json::json!({
+        "connection": aggregate.get("connection").cloned().unwrap_or(Value::Null),
+        "domains": domains,
+        "errors": aggregate
+            .get("errors")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    })))
+}
+
+/// Condenses one entry of `origin_status`'s aggregate into [`sync_summary`]'s
+/// row: the three record arrays become their lengths and everything a detail
+/// view alone needs (the base commit, the skipped-large list, the probe error)
+/// is dropped, leaving the counted shape plus the `mode` this surface adds the
+/// way [`sync_status`] does.
+///
+/// Reads the aggregate's JSON rather than the `OriginStatusReport` behind it
+/// because that report never leaves the engine: `origin_status` is the one
+/// call that probes, degrades offline and collects per-domain failures, and
+/// re-implementing it here to keep a struct would be a second copy of exactly
+/// the part worth having only once.
+fn summarize_origin_domain(entry: &Value) -> Value {
+    let field = |key: &str| entry.get(key).cloned().unwrap_or(Value::Null);
+    let count = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+    };
+    serde_json::json!({
+        "domain": field("domain"),
+        // This surface's own, like the per-domain route's: a picker has to
+        // know which kind of origin it is offering.
+        "mode": "github",
+        "repo": field("repo"),
+        "branch": field("branch"),
+        "last_checked": field("last_checked"),
+        "open_proposals": count("open_proposals"),
+        "declined_proposals": count("declined_proposals"),
+        "conflicts": count("conflicts"),
+        "local_changes": field("local_changes"),
+    })
+}
+
 /// `POST /domains/{domain}/sync` - pull this domain's origin now, rather than
 /// waiting for the daemon's next poll.
 ///
@@ -1273,12 +1430,21 @@ fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Res
         });
     }
     if !state.engine.github_enabled() {
-        return Err(ApiError::conflict(
-            "GitHub is switched off on this instance, so its origin cannot be \
-             reached: turn it on under Settings > GitHub",
-        ));
+        return Err(github_off_conflict());
     }
     Ok(())
+}
+
+/// The one sentence every sync surface refuses a GitHub-off instance with,
+/// written once so the per-domain routes and the instance-wide summary teach
+/// the same fix. A 409 rather than the 422 `RemoteError::NotEnabled` maps to:
+/// the state is the instance's, not the request's, and the detail names the
+/// screen that changes it.
+fn github_off_conflict() -> ApiError {
+    ApiError::conflict(
+        "GitHub is switched off on this instance, so no origin can be \
+         reached: turn it on under Settings > GitHub",
+    )
 }
 
 #[cfg(test)]

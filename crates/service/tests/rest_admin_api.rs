@@ -919,6 +919,131 @@ async fn a_disabled_github_names_the_fix_on_both_sync_endpoints() {
     }
 }
 
+/// The instance-wide summary behind the top bar's share action: one call that
+/// answers "does any team domain have something to share?" without a request
+/// per domain. Every team domain is listed with counts rather than records -
+/// this feeds a button and a picker, not a detail view - and the instance's
+/// connection travels with it so the button can say why it is disabled.
+///
+/// The admin gate is checked here too: the summary names every team domain on
+/// the instance, so a viewer or an editor must not read it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_summary_counts_what_every_team_domain_has_to_share() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    // Something unshared to count.
+    std::fs::write(
+        kb_root.join("shared.md"),
+        b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Shared\n\nA sharper rule.\n",
+    )
+    .unwrap();
+
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let summary: serde_json::Value = resp.json().await.unwrap();
+
+    assert_eq!(
+        summary["errors"].as_array().map(Vec::len),
+        Some(0),
+        "nothing failed: {summary}"
+    );
+    assert!(
+        summary["connection"]["connected"].is_boolean(),
+        "the button needs the connection to explain itself: {summary}"
+    );
+    let domains = summary["domains"].as_array().expect("a domains array");
+    assert_eq!(domains.len(), 1, "one team domain is registered: {summary}");
+    let kb = &domains[0];
+    assert_eq!(kb["domain"], "kb");
+    assert_eq!(kb["mode"], "github");
+    assert_eq!(kb["repo"], "acme/kb");
+    assert!(kb["branch"].is_string(), "{kb}");
+    assert!(
+        kb["local_changes"].as_u64().unwrap_or(0) >= 1,
+        "the edit above is unshared work: {kb}"
+    );
+    for counted in ["open_proposals", "declined_proposals", "conflicts"] {
+        assert!(
+            kb[counted].is_number(),
+            "{counted} is a count here, not a record list: {kb}"
+        );
+    }
+
+    // Admin only: the summary lists every team domain on the instance.
+    for (name, pw) in [("eddy", "eddypw"), ("vera", "verapw")] {
+        let session = login(fx.addr, name, pw).await;
+        let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &session)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{name} must not read the sync summary");
+    }
+}
+
+/// GitHub switched off: the summary answers the same 409 naming the settings
+/// screen that the per-domain sync endpoints do, rather than the bare 422 the
+/// engine's own NotEnabled would produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_github_names_the_fix_on_the_sync_summary() {
+    let fx = serve(Options {
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 409);
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("settings"),
+        "the refusal points at the fix: {problem}"
+    );
+}
+
+/// GitHub on but no team domain registered: an empty list, not a refusal. The
+/// share action reads that as "nothing to share" and hides itself, which is a
+/// different answer from "this instance cannot share at all".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_summary_is_empty_on_an_instance_with_no_team_domain() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let summary: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        summary["domains"].as_array().map(Vec::len),
+        Some(0),
+        "no domain carries an origin: {summary}"
+    );
+    assert_eq!(summary["errors"].as_array().map(Vec::len), Some(0));
+    assert_eq!(
+        summary["connection"]["connected"], false,
+        "nothing was connected on this fixture: {summary}"
+    );
+}
+
 /// GitHub switched ON but no credential on file: the PULL is refused with a
 /// 409 naming the connection, rather than travelling to the remote where a
 /// missing token comes back as a missing repository. The two failures have

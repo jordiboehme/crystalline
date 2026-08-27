@@ -91,6 +91,7 @@ use crate::engine::Engine;
         domains_admin::remove,
         domains_admin::sync_status,
         domains_admin::sync_now,
+        domains_admin::sync_summary,
         domains_admin::share_changes_preview,
         domains_admin::share_now,
         domains_admin::withdraw_proposal,
@@ -421,6 +422,11 @@ pub fn router(state: RestState) -> Router {
             "/domains/{domain}/sync",
             get(domains_admin::sync_status).post(domains_admin::sync_now),
         )
+        // The instance-wide read behind the top bar's share action: one call
+        // that says whether any team domain has something to share. A pure
+        // read like the per-domain GET above, and served the same way on a
+        // read-only instance.
+        .route("/sync", get(domains_admin::sync_summary))
         // The share half of the same card. The preview is a GET that pulls,
         // so it is refused on a read-only instance like the writes below it;
         // the two conflict routes are offline verbs and need no connection.
