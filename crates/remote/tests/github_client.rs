@@ -4,6 +4,7 @@
 //! touches the real network.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use axum::Json;
@@ -918,4 +919,220 @@ async fn list_open_proposals_pages_until_a_short_page() {
     assert_eq!(open[0].branch, "b1");
     assert_eq!(open[0].head_sha, "s1");
     assert_eq!(open[100].number, 101);
+}
+
+// --- stacks ------------------------------------------------------------------
+
+/// One stack as GitHub's stack endpoints report it, with two members.
+fn stack_json() -> serde_json::Value {
+    serde_json::json!({
+        "number": 42,
+        "open": true,
+        "pull_requests": [
+            {"number": 6, "state": "open", "head": {"ref": "layer-a", "sha": "aaa111"}},
+            {"number": 8, "state": "closed", "head": {"ref": "layer-b", "sha": "bbb222"}},
+        ],
+    })
+}
+
+#[tokio::test]
+async fn list_stacks_maps_members_and_filters_by_pull_request() {
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks",
+        get(|Query(q): Query<HashMap<String, String>>| async move {
+            assert_eq!(
+                q.get("pull_request").map(String::as_str),
+                Some("6"),
+                "a proposal number narrows the listing to that proposal's stack"
+            );
+            Json(serde_json::json!([stack_json()]))
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let stacks = provider.list_stacks(&origin(), Some(6)).await.unwrap();
+    assert_eq!(stacks.len(), 1);
+    assert_eq!(stacks[0].number, 42);
+    assert!(stacks[0].open);
+    assert_eq!(stacks[0].members.len(), 2);
+    assert_eq!(stacks[0].members[0].number, 6);
+    assert_eq!(stacks[0].members[0].state, "open");
+    assert_eq!(stacks[0].members[0].head_sha, "aaa111");
+    assert_eq!(stacks[0].members[1].number, 8);
+    assert_eq!(stacks[0].members[1].state, "closed");
+    assert_eq!(stacks[0].members[1].head_sha, "bbb222");
+}
+
+#[tokio::test]
+async fn list_stacks_404_reads_as_stacks_unsupported() {
+    // A forge with no stack endpoints answers 404 here. That is an answer
+    // about the forge rather than a missing repository, so it must not come
+    // back as RepoNotFound.
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks",
+        get(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"message": "Not Found"})),
+            )
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let err = provider.list_stacks(&origin(), None).await.unwrap_err();
+    assert!(matches!(err, RemoteError::StacksUnsupported), "{err:?}");
+}
+
+#[tokio::test]
+async fn create_stack_posts_bottom_to_top_numbers() {
+    let seen: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+    let state = seen.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks",
+        post(move |body: Json<serde_json::Value>| {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() = Some(body.0);
+                (StatusCode::CREATED, Json(stack_json()))
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let stack = provider.create_stack(&origin(), &[6, 8]).await.unwrap();
+    assert_eq!(stack.number, 42);
+    assert_eq!(stack.members.len(), 2);
+    let body = seen.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        body,
+        serde_json::json!({"pull_requests": [6, 8]}),
+        "the members go up in order, bottom layer first"
+    );
+}
+
+#[tokio::test]
+async fn extend_stack_retries_conflicts_then_succeeds() {
+    // 409 means the stack is being modified concurrently: the first attempt
+    // loses the race, the retry wins.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = calls.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks/42/add",
+        post(move || {
+            let state = state.clone();
+            async move {
+                let previous = state.fetch_add(1, Ordering::SeqCst);
+                if previous == 0 {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({"message": "Stack is being modified"})),
+                    )
+                        .into_response()
+                } else {
+                    (StatusCode::OK, Json(stack_json())).into_response()
+                }
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let stack = provider.extend_stack(&origin(), 42, &[9]).await.unwrap();
+    assert_eq!(stack.number, 42);
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        2,
+        "the conflicted attempt plus the one that succeeded"
+    );
+}
+
+#[tokio::test]
+async fn extend_stack_gives_up_after_three_conflicts() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let state = calls.clone();
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks/42/add",
+        post(move || {
+            let state = state.clone();
+            async move {
+                state.fetch_add(1, Ordering::SeqCst);
+                (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({"message": "Stack is being modified"})),
+                )
+            }
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let err = provider
+        .extend_stack(&origin(), 42, &[9])
+        .await
+        .unwrap_err();
+    match err {
+        RemoteError::Api { status, message } => {
+            assert_eq!(status, 409);
+            assert_eq!(message, "Stack is being modified");
+        }
+        other => panic!("expected an Api 409, got {other:?}"),
+    }
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        3,
+        "three attempts in total, then the conflict is surfaced"
+    );
+}
+
+#[tokio::test]
+async fn dissolve_stack_accepts_200_and_204() {
+    // 204 means every member left the stack; 200 carries whatever remains
+    // when some members are locked. Both are a successful dissolve as far as
+    // this client is concerned.
+    let app = Router::new()
+        .route(
+            "/repos/acme/brand-knowledge/stacks/42/unstack",
+            post(|| async { (StatusCode::OK, Json(stack_json())) }),
+        )
+        .route(
+            "/repos/acme/brand-knowledge/stacks/43/unstack",
+            post(|| async { StatusCode::NO_CONTENT }),
+        );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    provider.dissolve_stack(&origin(), 42).await.unwrap();
+    provider.dissolve_stack(&origin(), 43).await.unwrap();
+}
+
+#[tokio::test]
+async fn create_stack_422_surfaces_githubs_message() {
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks",
+        post(|| async {
+            (
+                StatusCode::UNPROCESSABLE_ENTITY,
+                Json(serde_json::json!({
+                    "message": "Pull requests must form a stack: each base ref must match the head ref below it",
+                })),
+            )
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let err = provider.create_stack(&origin(), &[6, 8]).await.unwrap_err();
+    match err {
+        RemoteError::Api { status, message } => {
+            assert_eq!(status, 422);
+            assert!(
+                message.contains("must form a stack"),
+                "GitHub's own words reach the caller: {message}"
+            );
+        }
+        other => panic!("expected an Api 422, got {other:?}"),
+    }
 }

@@ -216,6 +216,38 @@ pub(super) struct HeadRef {
     pub(super) sha: String,
 }
 
+/// `POST .../stacks` and `POST .../stacks/{number}/add` request body: the
+/// proposals to group, bottom layer first.
+#[derive(Debug, Serialize)]
+pub(super) struct StackWriteRequest {
+    pub(super) pull_requests: Vec<u64>,
+}
+
+/// One stack as `GET .../stacks`, `POST .../stacks` and
+/// `POST .../stacks/{number}/add` all report it. `pull_requests` defaults to
+/// empty rather than being required: a stack whose members have all gone is
+/// still a well-formed answer.
+#[derive(Debug, Deserialize)]
+pub(super) struct StackResponse {
+    pub(super) number: u64,
+    pub(super) open: bool,
+    #[serde(default)]
+    pub(super) pull_requests: Vec<StackMemberResponse>,
+}
+
+/// One member of a stack, in stack order.
+#[derive(Debug, Deserialize)]
+pub(super) struct StackMemberResponse {
+    pub(super) number: u64,
+    pub(super) state: String,
+    pub(super) head: StackMemberHead,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StackMemberHead {
+    pub(super) sha: String,
+}
+
 /// The `message` field GitHub includes on most JSON error bodies.
 #[derive(Debug, Default, Deserialize)]
 pub(super) struct ErrorBody {
