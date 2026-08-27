@@ -956,6 +956,14 @@ async fn retry_stack_link(
 /// any other. Everything below is the fallback that path falls back to, and
 /// the flow a chain this machine does not know as a stack keeps.
 ///
+/// `options.proposal` names a layer to amend instead, the verb a reviewer's
+/// feedback is answered with: the share lands on that layer's own branch and
+/// [`amend_layer`] replays every layer above it onto the amended head, so the
+/// chain heals itself rather than needing a manual re-base. A number that is
+/// not an open layer is refused with the open layers listed. Off the stacked
+/// path the number can only name the one living proposal, and amending it is
+/// exactly the in-place update this function has always done.
+///
 /// On the fallback path a domain has at most one open proposal at a time.
 /// When one is open, this
 /// pushes a fresh commit onto its branch and rewrites its body rather than
@@ -998,14 +1006,6 @@ pub async fn propose(
         });
     }
 
-    if options.proposal.is_some() {
-        // Amending a named layer is the next change in this wave; refusing
-        // plainly beats silently sharing something else.
-        return Err(RemoteError::State(
-            "amending a layer lands in the next change".into(),
-        ));
-    }
-
     // Ask the forge once, before any share work: whether this share can stack
     // is a property of the origin, and the answer is cached from here on.
     let stacked_path = stacks_available(
@@ -1016,6 +1016,29 @@ pub async fn propose(
         options.stacks_allowed,
     )
     .await?;
+
+    // 1b. A share naming a proposal is the amend verb: it lands on that
+    //     layer's own branch instead of opening a new one. On a stackable
+    //     chain that is [`amend_layer`], cascade and all; off it, the number
+    //     can only name the one living proposal, and the amend IS the
+    //     ordinary update below - merge commit and all - so it falls through.
+    if let Some(number) = options.proposal {
+        let index = amend_target_index(&state, number, stacked_path)?;
+        if stacked_path && chain_is_stacked(&state) {
+            return amend_layer(
+                provider,
+                spec,
+                domain_root,
+                domain_name,
+                state_dir,
+                state,
+                index,
+                title,
+                description,
+            )
+            .await;
+        }
+    }
 
     // 2. What this share is measured against, and the layer it would sit on,
     //    are one question on a stackable chain: the base is the chain tip
@@ -1296,6 +1319,17 @@ pub enum PlannedAction {
         /// built on without a second lookup.
         top_title: String,
     },
+    /// A share would amend this open layer in place, leaving the layers below
+    /// it alone and re-basing every layer above it onto the amended head.
+    Amend {
+        /// The amended layer's number.
+        number: u64,
+        /// The web URL a human reviews the layer at.
+        url: String,
+        /// How many open layers sit above it, each one replayed by the
+        /// cascade the amend runs.
+        layers_above: usize,
+    },
     /// A share would update this open proposal in place.
     Update {
         /// The open proposal's number.
@@ -1365,6 +1399,56 @@ pub async fn propose_preview(
     )
     .await?;
 
+    // A share naming a layer is the amend verb, previewed the same way it is
+    // validated: the number must be an open layer (and, off the stacked path,
+    // the one living proposal), and what it would carry is the work standing
+    // against the chain tip - the layer's own recorded files are already
+    // proposed and are not this share's doing.
+    if let Some(number) = options.proposal {
+        let index = amend_target_index(&state, number, stacked_path)?;
+        let stacked = stacked_path && chain_is_stacked(&state);
+        let base = if stacked {
+            effective_tip_files(&state)
+        } else {
+            state.files.clone()
+        };
+        let local = detect_local_changes(domain_root, &base)?;
+        if !state.conflicts.is_empty() {
+            return Ok(SharePlan {
+                action: PlannedAction::ConflictsPending {
+                    count: state.conflicts.len(),
+                },
+                changes: local,
+                effective_title: String::new(),
+            });
+        }
+        if local.changes.is_empty() {
+            return Ok(SharePlan {
+                action: PlannedAction::NothingToShare,
+                changes: local,
+                effective_title: String::new(),
+            });
+        }
+        let (added, updated, deleted) = count_changes(&local);
+        let effective_title = title
+            .map(str::to_string)
+            .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+        let layers_above = state.proposals[index + 1..]
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Open)
+            .count();
+        let layer = &state.proposals[index];
+        return Ok(SharePlan {
+            action: PlannedAction::Amend {
+                number: layer.number,
+                url: layer.url.clone(),
+                layers_above,
+            },
+            changes: local,
+            effective_title,
+        });
+    }
+
     // The stacked walk, read-only: `propose` settles a layer whose branch ref
     // is gone and stacks onto the one below, so a preview walks down the same
     // way and drops each vanished layer out of the tip it detects against. A
@@ -1403,12 +1487,16 @@ pub async fn propose_preview(
         }
     }
 
-    // Detection runs against the chain tip whenever a layer would be stacked
-    // on it, and against the trunk otherwise - the same base the share the
-    // plan describes would use.
-    let base = match &stacked_action {
-        Some(PlannedAction::StackOnTop { .. }) => tip_files_over(&state.files, &surviving),
-        _ => state.files.clone(),
+    // Detection runs against the chain tip whenever the walk above found a
+    // chain, and against the trunk otherwise - the same base the share the
+    // plan describes would use. A diverged top counts as a chain like any
+    // other: that share writes nothing, but the changes it reports are still
+    // the work standing on the chain, never the whole chain re-read against
+    // the trunk.
+    let base = if stacked_action.is_some() {
+        tip_files_over(&state.files, &surviving)
+    } else {
+        state.files.clone()
     };
     let local = detect_local_changes(domain_root, &base)?;
 
@@ -1875,6 +1963,500 @@ fn open_position(state: &OriginState, number: u64) -> (usize, usize) {
         .map(|i| i + 1)
         .unwrap_or(open.len());
     (position, open.len())
+}
+
+/// The index into `state.proposals` of the layer a share named to amend, or
+/// the teaching refusal listing what is actually open.
+///
+/// Two rules, one message. The number must name an OPEN record, and off the
+/// stacked path it must name the only one: the fallback flow has a single
+/// living proposal by construction, and a chain of records left over from
+/// before stacking is exactly the state where naming one of them would mean
+/// something this machine cannot deliver.
+fn amend_target_index(
+    state: &OriginState,
+    number: u64,
+    stacked_path: bool,
+) -> Result<usize, RemoteError> {
+    let open: Vec<(usize, &Proposal)> = state
+        .proposals
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.status == ProposalStatus::Open)
+        .collect();
+    let stacked = stacked_path && chain_is_stacked(state);
+    match open.iter().find(|(_, p)| p.number == number) {
+        Some((index, _)) if stacked || open.len() == 1 => Ok(*index),
+        _ => Err(not_an_open_layer(state, number)),
+    }
+}
+
+/// The refusal a share naming an unamendable proposal gets: what it named and
+/// what is open instead, each layer with its position in the chain, so the
+/// caller can retry against a real number without a second call.
+fn not_an_open_layer(state: &OriginState, number: u64) -> RemoteError {
+    let open: Vec<String> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .enumerate()
+        .map(|(position, p)| format!("#{} (layer {})", p.number, position + 1))
+        .collect();
+    if open.is_empty() {
+        return RemoteError::State(format!(
+            "proposal #{number} is not an open layer of this domain; this domain has no open layers"
+        ));
+    }
+    RemoteError::State(format!(
+        "proposal #{number} is not an open layer of this domain; open layers: {}",
+        open.join(", ")
+    ))
+}
+
+/// The refusal a layer that cannot be replayed earns, named rather than
+/// worked around: rebuilding a layer's tree needs the blob shas its record
+/// carries, and a record written before those existed (pre-0.17.0) has none.
+fn unreplayable_layer(number: u64) -> RemoteError {
+    RemoteError::State(format!(
+        "layer #{number} predates stacked shares and cannot be replayed; withdraw it or merge it first"
+    ))
+}
+
+/// Checks every open layer from `from_index` up for the blob shas a replay
+/// needs, so an amend or a repair refuses BEFORE its first write rather than
+/// halfway up the chain. A deletion needs no blob and is never the reason.
+fn ensure_replayable(state: &OriginState, from_index: usize) -> Result<(), RemoteError> {
+    for layer in state
+        .proposals
+        .iter()
+        .skip(from_index)
+        .filter(|p| p.status == ProposalStatus::Open)
+    {
+        let missing = layer.files.iter().any(|file| {
+            matches!(
+                file.change,
+                ProposedChange::Added | ProposedChange::Modified
+            ) && file.blob_sha.is_none()
+        });
+        if missing {
+            return Err(unreplayable_layer(layer.number));
+        }
+    }
+    Ok(())
+}
+
+/// The chain tip BELOW the layer at `index`: the trunk snapshot with every
+/// open layer beneath it laid over ([`tip_files_over`]), which is both what
+/// that layer's own delta is measured against and the presence walk a replay
+/// asks before writing a deletion - retiring a path nothing below carries is
+/// not a change, it is noise in someone's review.
+fn tip_below_layer(state: &OriginState, index: usize) -> BTreeMap<String, BaseStamp> {
+    let below: Vec<&Proposal> = state.proposals[..index]
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    tip_files_over(&state.files, &below)
+}
+
+/// Amends the open layer at `index`: a fresh commit on ITS branch carrying
+/// its own delta again, then [`cascade_replays`] over every layer above it.
+///
+/// What the layer proposes afterwards is its recorded files with this share's
+/// work merged in, recomputed against the tip below it: a path this share
+/// touched takes the working tree's content, and a path it did not keeps
+/// exactly what the record carries, blob sha and digest included. The working
+/// tree cannot speak for the latter - it holds the chain TIP, so a file a
+/// layer above changed reads there as that layer's content, not this one's -
+/// and re-reading it would quietly move one layer's work into another's.
+/// An entry that is no longer a change against the tip below (a file that
+/// converged with it, a retirement of a path nothing below carries) simply
+/// leaves the layer.
+///
+/// Three properties the shape of this function exists for:
+///
+/// - the commit's parent is ALWAYS the layer's live head alone. A stacked
+///   layer is one reviewable step, and a merge commit would drag the trunk
+///   into it; an advanced trunk arrives through the tree instead, since the
+///   tree is built on the tip below rather than on the layer's own history.
+/// - divergence is checked on this layer's branch only. The layers above are
+///   rewritten from their records either way, so their heads are this amend's
+///   business rather than its precondition.
+/// - not one stack call is made. No base ref moves, so the forge's membership
+///   holds exactly as it stands.
+#[allow(clippy::too_many_arguments)]
+async fn amend_layer(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    index: usize,
+    title: Option<&str>,
+    description: Option<&str>,
+) -> Result<ProposeOutcome, RemoteError> {
+    // Nothing is written until every layer this amend rebuilds is known to be
+    // rebuildable, the amended one included: a chain re-based halfway is
+    // worse than one never touched.
+    ensure_replayable(&state, index)?;
+
+    let layer = state.proposals[index].clone();
+    let live_head = match provider.branch_ref(spec, &layer.branch).await? {
+        Some(live_head) => {
+            if !head_is_ours(&layer, &live_head) {
+                // A reviewer moved the very layer this share would amend;
+                // refuse before any write, exactly as a stacking share does.
+                return Ok(ProposeOutcome::ProposalDiverged {
+                    number: layer.number,
+                    url: layer.url,
+                    branch: layer.branch,
+                });
+            }
+            live_head
+        }
+        None => {
+            // The branch is gone. A stacking share settles such a layer and
+            // carries on, but this share named it: there is nothing to amend.
+            return Err(RemoteError::State(format!(
+                "proposal #{}'s branch {} is gone upstream; withdraw the proposal and share again",
+                layer.number, layer.branch
+            )));
+        }
+    };
+
+    // This share's own work is what stands against the chain tip; the layer's
+    // recorded files are already proposed and are not it.
+    let fresh = detect_local_changes(domain_root, &effective_tip_files(&state))?;
+    if fresh.changes.is_empty() {
+        return Ok(ProposeOutcome::NothingToShare {
+            skipped_large: fresh.skipped_large,
+        });
+    }
+
+    let below = tip_below_layer(&state, index);
+    let collected = collect_amend_changes(
+        provider,
+        spec,
+        domain_root,
+        state_dir,
+        &layer,
+        &below,
+        &fresh,
+        description,
+    )
+    .await?;
+
+    let generated_title = generate_title(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+        domain_name,
+    );
+    let effective_title = title.map(str::to_string).unwrap_or(generated_title);
+    let summary = generate_summary_line(
+        collected.added.len(),
+        collected.updated.len(),
+        collected.deleted.len(),
+    );
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+
+    // The tree is built on the tip below this layer - the layer beneath it,
+    // or the trunk for the bottom one - so the layer's diff stays its own
+    // delta and an advanced trunk costs no merge commit.
+    let below_head = state.proposals[..index]
+        .iter()
+        .rev()
+        .find(|p| p.status == ProposalStatus::Open)
+        .and_then(|p| p.head_commit.clone())
+        .unwrap_or_else(|| state.base_commit.clone());
+
+    let tree_sha = provider
+        .create_tree(spec, &below_head, &collected.writes)
+        .await?;
+    let commit_sha = provider
+        .create_commit(
+            spec,
+            &effective_title,
+            &tree_sha,
+            std::slice::from_ref(&live_head),
+        )
+        .await?;
+
+    // The push is announced before it is made, the same interrupted-update
+    // protocol an ordinary share update follows (see `pending_head_commit`
+    // and `head_is_ours`), and the branch moves fast-forward: this layer's
+    // own history is being extended, not rewritten.
+    state.proposals[index].pending_head_commit = Some(commit_sha.clone());
+    state.save(state_dir)?;
+
+    provider
+        .update_branch(spec, &layer.branch, &commit_sha, false)
+        .await?;
+    provider
+        .update_proposal(spec, layer.number, title, Some(&body), None)
+        .await?;
+
+    {
+        let record = &mut state.proposals[index];
+        record.files = collected.files;
+        record.head_commit = Some(commit_sha.clone());
+        record.pending_head_commit = None;
+        record.base_commit = Some(below_head);
+        record.updated_at = Some(Utc::now());
+        if let Some(t) = title {
+            record.title = t.to_string();
+        }
+    }
+    state.save(state_dir)?;
+
+    // Every layer above now sits on a commit that is no longer this layer's
+    // head, so each is replayed onto the amended one, bottom-up.
+    cascade_replays(provider, spec, &mut state, state_dir, index + 1, commit_sha).await?;
+
+    Ok(ProposeOutcome::Updated(ProposeReport {
+        url: layer.url,
+        number: layer.number,
+        branch: layer.branch,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
+        skipped_large: fresh.skipped_large,
+        summary,
+        stack_number: state.stack_number,
+        stack_position: Some(open_position(&state, layer.number)),
+    }))
+}
+
+/// Collects what an amended layer proposes: its recorded files with `fresh`
+/// merged in, every entry recomputed against `below` (the tip beneath the
+/// layer), and a blob uploaded for each path this share touched.
+///
+/// A recorded entry is kept verbatim - its blob sha is what rebuilds the tree
+/// - unless this share speaks for the same path or the entry stopped being a
+/// change against `below`. A fresh change whose content already matches
+/// `below` takes the path OUT of the layer entirely: the layer has nothing
+/// left to propose there.
+#[allow(clippy::too_many_arguments)]
+async fn collect_amend_changes(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    layer: &Proposal,
+    below: &BTreeMap<String, BaseStamp>,
+    fresh: &crate::changes::LocalChanges,
+    description: Option<&str>,
+) -> Result<CollectedChanges, RemoteError> {
+    let sub = spec.subpath.as_deref();
+    let fresh_paths: BTreeSet<&str> = fresh.changes.iter().map(LocalChange::path).collect();
+
+    let mut merged: BTreeMap<String, ProposedFile> = BTreeMap::new();
+    for file in &layer.files {
+        if fresh_paths.contains(file.path.as_str()) {
+            continue;
+        }
+        let still_a_change = match file.change {
+            ProposedChange::Added | ProposedChange::Modified => true,
+            ProposedChange::Deleted => below.contains_key(&file.path),
+        };
+        if still_a_change {
+            merged.insert(file.path.clone(), file.clone());
+        }
+    }
+
+    for change in &fresh.changes {
+        match change {
+            LocalChange::Added { path, sha256 } | LocalChange::Modified { path, sha256 } => {
+                let beneath = below.get(path);
+                if beneath.map(|stamp| stamp.sha256.as_str()) == Some(sha256.as_str()) {
+                    // The tip below already carries exactly this content.
+                    merged.remove(path);
+                    continue;
+                }
+                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let bytes = std::fs::read(&wt_path)?;
+                let blob_sha = provider.create_blob(spec, &bytes).await?;
+                merged.insert(
+                    path.clone(),
+                    ProposedFile {
+                        path: path.clone(),
+                        change: match beneath {
+                            Some(_) => ProposedChange::Modified,
+                            None => ProposedChange::Added,
+                        },
+                        sha256: Some(sha256.clone()),
+                        blob_sha: Some(blob_sha),
+                        size: Some(bytes.len() as u64),
+                    },
+                );
+            }
+            LocalChange::Deleted { path } => {
+                if !below.contains_key(path) {
+                    // Nothing below carries it, so there is nothing here to
+                    // retire: the layer simply stops proposing the path.
+                    merged.remove(path);
+                    continue;
+                }
+                merged.insert(
+                    path.clone(),
+                    ProposedFile {
+                        path: path.clone(),
+                        change: ProposedChange::Deleted,
+                        sha256: None,
+                        blob_sha: None,
+                        size: None,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut out = CollectedChanges {
+        writes: Vec::new(),
+        files: Vec::new(),
+        added: Vec::new(),
+        updated: Vec::new(),
+        deleted: Vec::new(),
+        entries: ChangeEntries::default(),
+    };
+    for (path, file) in merged {
+        match file.change {
+            ProposedChange::Added | ProposedChange::Modified => {
+                let blob_sha = file
+                    .blob_sha
+                    .clone()
+                    .ok_or_else(|| unreplayable_layer(layer.number))?;
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(&path, sub),
+                    blob_sha: Some(blob_sha),
+                });
+                // Content is only worth reading back for the generated body's
+                // engram titles, and a kept entry's file may not be on disk at
+                // all (a layer above may have retired it since); an unreadable
+                // one simply falls back to its bare path.
+                if description.is_none() {
+                    let wt_path = checked_working_path(state_dir, domain_root, &path)?;
+                    let content = read_optional_file(&wt_path)?.unwrap_or_default();
+                    match file.change {
+                        ProposedChange::Added => out.entries.added.push((path.clone(), content)),
+                        _ => out.entries.updated.push((path.clone(), content)),
+                    }
+                }
+                match file.change {
+                    ProposedChange::Added => out.added.push(path.clone()),
+                    _ => out.updated.push(path.clone()),
+                }
+            }
+            ProposedChange::Deleted => {
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(&path, sub),
+                    blob_sha: None,
+                });
+                if description.is_none() {
+                    let base_content = state::read_base_file(state_dir, &path)?;
+                    out.entries.deleted.push((path.clone(), base_content));
+                }
+                out.deleted.push(path.clone());
+            }
+        }
+        out.files.push(file);
+    }
+
+    Ok(out)
+}
+
+/// Replays every open layer from `from_index` up onto `parent_head`,
+/// bottom-up, rebuilding each one's commit from its OWN recorded files and
+/// forcing its branch onto the result.
+///
+/// This is what makes a mid-chain change self-healing: an amend below (and, in
+/// the withdrawal repair, a hole cut out of the chain) leaves every layer
+/// above sitting on a commit that is no longer the chain, and each one is put
+/// back where it belongs without a human re-basing anything. A layer's content
+/// comes from its record rather than from the working tree, which holds the
+/// chain tip and could not tell one layer's work from another's.
+///
+/// Two rules the replay follows. A deletion is written only when the path is
+/// actually present in the tip below that layer ([`tip_below_layer`]), so a
+/// retirement of something no longer there is dropped rather than replayed as
+/// a phantom change. And each layer's branch move follows the same
+/// interrupted-update protocol a share update does - the sha recorded and
+/// saved BEFORE the ref moves, promoted and cleared after - except the move is
+/// forced: a replayed layer's history is rewritten, not extended.
+async fn cascade_replays(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+    from_index: usize,
+    mut parent_head: String,
+) -> Result<(), RemoteError> {
+    let sub = spec.subpath.as_deref();
+    for index in from_index..state.proposals.len() {
+        if state.proposals[index].status != ProposalStatus::Open {
+            continue;
+        }
+        let layer = state.proposals[index].clone();
+        let below = tip_below_layer(state, index);
+
+        let mut writes = Vec::new();
+        for file in &layer.files {
+            match file.change {
+                ProposedChange::Added | ProposedChange::Modified => {
+                    // Guarded before the first write by `ensure_replayable`;
+                    // refusing here too costs nothing and beats a panic on a
+                    // caller that skipped the check.
+                    let blob_sha = file
+                        .blob_sha
+                        .clone()
+                        .ok_or_else(|| unreplayable_layer(layer.number))?;
+                    writes.push(TreeWrite {
+                        path: to_repo_relative(&file.path, sub),
+                        blob_sha: Some(blob_sha),
+                    });
+                }
+                ProposedChange::Deleted => {
+                    if below.contains_key(&file.path) {
+                        writes.push(TreeWrite {
+                            path: to_repo_relative(&file.path, sub),
+                            blob_sha: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        let tree_sha = provider.create_tree(spec, &parent_head, &writes).await?;
+        let commit_sha = provider
+            .create_commit(
+                spec,
+                &layer.title,
+                &tree_sha,
+                std::slice::from_ref(&parent_head),
+            )
+            .await?;
+
+        state.proposals[index].pending_head_commit = Some(commit_sha.clone());
+        state.save(state_dir)?;
+
+        provider
+            .update_branch(spec, &layer.branch, &commit_sha, true)
+            .await?;
+
+        {
+            let record = &mut state.proposals[index];
+            record.head_commit = Some(commit_sha.clone());
+            record.pending_head_commit = None;
+            record.base_commit = Some(parent_head);
+            record.updated_at = Some(Utc::now());
+        }
+        state.save(state_dir)?;
+
+        parent_head = commit_sha;
+    }
+    Ok(())
 }
 
 /// Withdraws a share proposal: closes its pull request on the forge (an Open

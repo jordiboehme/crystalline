@@ -312,9 +312,10 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
 /// REST changes route: always `effective_title` and `changes` (one
 /// `{ path, kind }` entry per detected local change), plus the fields the
 /// planned action itself carries - `number` and `url` for an update,
-/// `top_number` and `top_title` for a new layer on an open chain, all three
-/// of `number`, `url` and `branch` for a diverged proposal, `count` for
-/// pending conflicts and nothing extra for a create or a no-op.
+/// `top_number` and `top_title` for a new layer on an open chain, `number`,
+/// `url` and `layers_above` for an amend, all three of `number`, `url` and
+/// `branch` for a diverged proposal, `count` for pending conflicts and
+/// nothing extra for a create or a no-op.
 pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
     let changes: Vec<Value> = plan
         .changes
@@ -347,6 +348,16 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
             v["action"] = json!("stack_on_top");
             v["top_number"] = json!(top_number);
             v["top_title"] = json!(top_title);
+        }
+        ops::PlannedAction::Amend {
+            number,
+            url,
+            layers_above,
+        } => {
+            v["action"] = json!("amend");
+            v["number"] = json!(number);
+            v["url"] = json!(url);
+            v["layers_above"] = json!(layers_above);
         }
         ops::PlannedAction::NothingToShare => v["action"] = json!("nothing_to_share"),
         ops::PlannedAction::ConflictsPending { count } => {

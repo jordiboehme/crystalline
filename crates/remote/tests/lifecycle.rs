@@ -4367,3 +4367,418 @@ async fn preview_stacks_on_the_surviving_layer_when_the_top_ref_is_gone() {
         "a preview writes nothing: {delta:?}"
     );
 }
+
+#[tokio::test]
+async fn preview_of_a_diverged_top_still_measures_against_the_tip() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // A reviewer moves the top layer's branch: the share would refuse, but
+    // the change list it reports is still the chain's own delta, not the
+    // whole chain re-read against the trunk.
+    let foreign = mock.add_commit(commit_files(&[("MANIFEST.md", b"# reviewer")]), None);
+    mock.set_branch(&second.branch, &foreign);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { .. }),
+        "{:?}",
+        plan.action
+    );
+    let mut paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["notes/c.md"],
+        "the layers below already carry the rest: {paths:?}"
+    );
+}
+
+// Amending a named layer: the share lands on that layer's own branch instead
+// of opening a new one, and every layer above it is replayed onto the amended
+// head so the chain heals itself.
+
+/// Shares with an explicit layer to amend, the call every amend scenario
+/// makes.
+async fn amend_share(mock: &MockProvider, sub: &Subscribed, number: u64) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(number),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect("an amend should succeed")
+}
+
+/// The report of a share that updated a proposal, or a panic naming what came
+/// back instead.
+fn updated(outcome: ProposeOutcome) -> crystalline_remote::ops::ProposeReport {
+    match outcome {
+        ProposeOutcome::Updated(report) => report,
+        other => panic!("expected Updated, got {other:?}"),
+    }
+}
+
+/// A three-layer chain over one subscribed domain: `notes/a.md` refined by the
+/// bottom layer, `notes/b.md` added by the middle one and `notes/c.md` by the
+/// top one. Returns the layers bottom first.
+async fn stacked_three_layers(
+    mock: &MockProvider,
+) -> (Subscribed, Vec<crystalline_remote::ops::ProposeReport>) {
+    let (sub, first) = stacked_bottom_layer(mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(mock, &sub).await);
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(mock, &sub).await);
+    (sub, vec![first, second, third])
+}
+
+#[tokio::test]
+async fn amending_the_bottom_layer_cascades_force_replays_above() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let (first, second, third) = (&layers[0], &layers[1], &layers[2]);
+    let old_bottom_head = mock.branch_commit(&first.branch).expect("the bottom head");
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    let report = updated(amend_share(&mock, &sub, first.number).await);
+    assert_eq!(report.number, first.number, "the named layer, amended");
+    assert_eq!(
+        report.stack_position,
+        Some((1, 3)),
+        "the amended layer's own position"
+    );
+
+    let delta = mock.calls().split_off(before);
+    let new_bottom = mock.branch_commit(&first.branch).expect("the new head");
+    let new_middle = mock.branch_commit(&second.branch).expect("the new head");
+    let new_top = mock.branch_commit(&third.branch).expect("the new head");
+
+    // The amended layer moves fast-forward; every layer above it is re-based
+    // and forced.
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_bottom}:force=false",
+            first.branch
+        )),
+        "{delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_middle}:force=true",
+            second.branch
+        )),
+        "{delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            third.branch
+        )),
+        "{delta:?}"
+    );
+
+    // The chain stays linear, every layer re-parented onto the one below it.
+    assert_eq!(
+        mock.commit_parents(&new_bottom),
+        Some(vec![old_bottom_head])
+    );
+    assert_eq!(
+        mock.commit_parents(&new_middle),
+        Some(vec![new_bottom.clone()])
+    );
+    assert_eq!(
+        mock.commit_parents(&new_top),
+        Some(vec![new_middle.clone()])
+    );
+
+    // Trees are snapshots, so the top carries every layer's file - with the
+    // amended content - while each layer's own tree carries only its own work.
+    let bottom_tree = mock.commit_tree(&new_bottom).expect("the amended tree");
+    assert_eq!(
+        bottom_tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v3\n".as_slice())
+    );
+    assert!(
+        !bottom_tree.contains_key("notes/b.md") && !bottom_tree.contains_key("notes/c.md"),
+        "the amended layer swallowed the layers above it: {:?}",
+        bottom_tree.keys().collect::<Vec<_>>()
+    );
+    let top_tree = mock.commit_tree(&new_top).expect("the replayed tree");
+    assert_eq!(
+        top_tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v3\n".as_slice())
+    );
+    assert_eq!(
+        top_tree.get("notes/b.md").map(Vec::as_slice),
+        Some(b"beta\n".as_slice())
+    );
+    assert_eq!(
+        top_tree.get("notes/c.md").map(Vec::as_slice),
+        Some(b"gamma\n".as_slice()),
+        "a replayed layer's own content is untouched"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals.len(), 3);
+    for (record, head) in state
+        .proposals
+        .iter()
+        .zip([&new_bottom, &new_middle, &new_top])
+    {
+        assert_eq!(record.status, ProposalStatus::Open);
+        assert_eq!(record.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            record.pending_head_commit, None,
+            "every layer's push finished"
+        );
+    }
+
+    // An amend changes no base ref, so the stack's membership holds and no
+    // stack call is made at all.
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")),
+        "{delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn amending_a_stacked_layer_never_writes_a_merge_commit() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+
+    // The trunk moves on under the open chain.
+    let trunk = load_state(&sub.state_dir).base_commit;
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/upstream.md", b"news\n"),
+        ]),
+        Some(&trunk),
+    );
+    mock.set_branch("main", &c2);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let report = updated(amend_share(&mock, &sub, first.number).await);
+    assert_eq!(report.number, first.number);
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.base_commit, c2, "the amend pulled the trunk in first");
+    let new_bottom = mock.branch_commit(&first.branch).expect("the new head");
+    assert_eq!(
+        mock.commit_parents(&new_bottom).map(|p| p.len()),
+        Some(1),
+        "a stacked layer is always a single-parent commit"
+    );
+    // The advanced trunk arrives through the tree the layer is built on, not
+    // through a merge commit.
+    let tree = mock.commit_tree(&new_bottom).expect("the amended tree");
+    assert!(
+        tree.contains_key("notes/upstream.md"),
+        "{:?}",
+        tree.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v3\n".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn amend_refuses_a_number_that_is_not_an_open_layer() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(999),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect_err("999 is not an open layer");
+    match &err {
+        crystalline_remote::RemoteError::State(message) => {
+            assert!(message.contains("999"), "{message}");
+            assert!(
+                message.contains(&format!("#{} (layer 1)", first.number)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("#{} (layer 2)", second.number)),
+                "{message}"
+            );
+        }
+        other => panic!("expected a State error, got {other:?}"),
+    }
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a refused amend writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn amend_preview_counts_the_layers_above() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let middle = &layers[1];
+
+    // A preview needs work to describe: an amend carrying nothing new is
+    // NothingToShare, exactly as a stacking share is.
+    write(&sub.domain_root.join("notes/b.md"), b"beta v2\n");
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(middle.number),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        plan.action,
+        PlannedAction::Amend {
+            number: middle.number,
+            url: middle.url.clone(),
+            layers_above: 1,
+        }
+    );
+    let paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    assert_eq!(paths, vec!["notes/b.md"], "{paths:?}");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_file_replays_only_where_it_exists_below() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The bottom layer adds a file the trunk never had; the layer above
+    // retires it again.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/x.md"), b"ex\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+    std::fs::remove_file(sub.domain_root.join("notes/x.md")).unwrap();
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // A retirement of a path nothing below ever carried, crafted by hand: the
+    // replay has to drop it rather than write a deletion into the tree.
+    {
+        let mut state = load_state(&sub.state_dir);
+        state.proposals[1].files.push(ProposedFile {
+            path: "notes/ghost.md".to_string(),
+            change: ProposedChange::Deleted,
+            sha256: None,
+            blob_sha: None,
+            size: None,
+        });
+        state.save(&sub.state_dir).unwrap();
+    }
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    updated(amend_share(&mock, &sub, first.number).await);
+    let delta = mock.calls().split_off(before);
+
+    // Two trees: the amended layer's own and the one replay above it.
+    let trees: Vec<&str> = delta
+        .iter()
+        .filter_map(|c| c.strip_prefix("create_tree:"))
+        .collect();
+    assert_eq!(trees.len(), 2, "{delta:?}");
+    let writes = mock.tree_writes(trees[1]).expect("the replayed tree");
+    assert!(
+        writes
+            .iter()
+            .any(|(path, blob)| path == "notes/x.md" && blob.is_none()),
+        "a retirement of a file the layer below still adds is replayed: {writes:?}"
+    );
+    assert!(
+        !writes.iter().any(|(path, _)| path == "notes/ghost.md"),
+        "a retirement of a path nothing below carries is dropped: {writes:?}"
+    );
+
+    // And it lands: the amended layer still adds the file, the layer above
+    // still retires it.
+    let bottom = mock.branch_commit(&first.branch).expect("the new head");
+    let top = mock.branch_commit(&second.branch).expect("the new head");
+    assert!(
+        mock.commit_tree(&bottom)
+            .expect("the amended tree")
+            .contains_key("notes/x.md"),
+        "the amended layer lost the file it adds"
+    );
+    assert!(
+        !mock
+            .commit_tree(&top)
+            .expect("the replayed tree")
+            .contains_key("notes/x.md")
+    );
+}

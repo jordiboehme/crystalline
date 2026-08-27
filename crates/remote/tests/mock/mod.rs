@@ -143,6 +143,9 @@ struct Inner {
     /// parent commit's files with every write applied, ready for
     /// `create_commit` to snapshot into a new [`Commit`].
     trees: HashMap<String, BTreeMap<String, Vec<u8>>>,
+    /// The writes each `create_tree` call carried, keyed by the same tree id,
+    /// as `(path, blob sha)` pairs in call order.
+    tree_writes: HashMap<String, Vec<(String, Option<String>)>>,
     gc: HashSet<String>,
     truncate: bool,
     etag_counter: u64,
@@ -319,6 +322,15 @@ impl MockProvider {
             .commits
             .get(commit)
             .map(|c| c.files.clone())
+    }
+
+    /// The writes `create_tree` was called with for `tree`, as `(path, blob
+    /// sha)` pairs in call order, a deletion carrying `None`. The resulting
+    /// commit tree cannot answer this on its own: deleting a path the parent
+    /// tree never held leaves no trace in the result, so only the call itself
+    /// says whether a replay wrote that deletion or dropped it.
+    pub fn tree_writes(&self, tree: &str) -> Option<Vec<(String, Option<String>)>> {
+        self.inner.lock().unwrap().tree_writes.get(tree).cloned()
     }
 
     /// Marks `commit` as garbage-collected: a [`Provider::compare`] using it
@@ -629,6 +641,11 @@ impl Provider for MockProvider {
         inner.tree_counter += 1;
         let id = format!("tree{}", inner.tree_counter);
         inner.trees.insert(id.clone(), files);
+        let recorded: Vec<(String, Option<String>)> = writes
+            .iter()
+            .map(|write| (write.path.clone(), write.blob_sha.clone()))
+            .collect();
+        inner.tree_writes.insert(id.clone(), recorded);
         inner.calls.push(format!("create_tree:{id}"));
         Ok(id)
     }
