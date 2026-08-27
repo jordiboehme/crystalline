@@ -780,6 +780,71 @@ fn chain_is_stacked(state: &OriginState) -> bool {
     open <= 1 || state.stack_number.is_some() || state.stack_link_pending
 }
 
+/// The chain tip: what the working tree would look like if every open layer
+/// were already merged, as a base snapshot manifest
+/// [`detect_local_changes`] can compare against.
+///
+/// This is the base a stacked share detects against, and it is a base rather
+/// than a filter on purpose. A layer must record ITS delta and nothing else:
+/// with the trunk as the base, every layer re-proposes what the layers below
+/// it already carry, a share with nothing new opens an empty layer instead of
+/// reporting nothing to share, and a delete of a file only a lower layer
+/// holds is invisible, because the trunk never carried that file at all.
+///
+/// The overlay is the trunk snapshot with each OPEN layer's own recorded
+/// files laid over it in `state.proposals` order (bottom to top, which is the
+/// order the layers stack in): an added or modified path takes that layer's
+/// recorded digest and size, a deleted path leaves the map. Tasks 7, 8 and 9
+/// reuse this - an amend recomputes one layer's delta against the tip below
+/// it, a withdrawal excises a layer from the chain, and a pull adopts what a
+/// merged layer brought in.
+fn effective_tip_files(state: &OriginState) -> BTreeMap<String, BaseStamp> {
+    let open: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    tip_files_over(&state.files, &open)
+}
+
+/// [`effective_tip_files`] over an explicit layer list, for a caller that
+/// knows some recorded layer is about to leave the chain (a preview mirroring
+/// the settle a share would perform on a gone branch ref).
+///
+/// A layer entry with no recorded digest is skipped rather than guessed at:
+/// the path keeps its trunk stamp, so the file reads as this share's own work
+/// again. That costs a redundant tree write and never loses a change. Only a
+/// record written before those fields existed can be in that shape, and such
+/// a record cannot sit on a stacked chain, since stacking and the fields
+/// shipped together. A recorded size is used when present and falls back to
+/// the trunk's, which can at worst produce that same redundant write.
+fn tip_files_over(
+    base: &BTreeMap<String, BaseStamp>,
+    layers: &[&Proposal],
+) -> BTreeMap<String, BaseStamp> {
+    let mut tip = base.clone();
+    for layer in layers {
+        for file in &layer.files {
+            match file.change {
+                ProposedChange::Added | ProposedChange::Modified => {
+                    let Some(sha256) = file.sha256.clone() else {
+                        continue;
+                    };
+                    let size = file
+                        .size
+                        .or_else(|| base.get(&file.path).map(|stamp| stamp.size))
+                        .unwrap_or_default();
+                    tip.insert(file.path.clone(), BaseStamp { sha256, size });
+                }
+                ProposedChange::Deleted => {
+                    tip.remove(&file.path);
+                }
+            }
+        }
+    }
+    tip
+}
+
 /// Settles a stack link this machine still owes the forge, best effort.
 ///
 /// A layer whose `create_stack` or `extend_stack` call failed leaves the
@@ -883,9 +948,13 @@ async fn retry_stack_link(
 /// open: it opens a NEW proposal layered on the top open one (its tree built
 /// on that layer's head, its commit carrying exactly one parent, its pull
 /// request targeting that layer's branch) and links it into the forge's
-/// stack, so every share stays reviewable on its own. Everything below is the
-/// fallback that path falls back to, and the flow a chain this machine does
-/// not know as a stack keeps.
+/// stack, so every share stays reviewable on its own. A layer is detected
+/// against the chain TIP rather than the trunk (see [`effective_tip_files`]),
+/// so it records its own delta and nothing the layers below it already carry:
+/// a share with nothing new is [`ProposeOutcome::NothingToShare`] even with a
+/// chain open, and retiring a file only a lower layer holds is a change like
+/// any other. Everything below is the fallback that path falls back to, and
+/// the flow a chain this machine does not know as a stack keeps.
 ///
 /// On the fallback path a domain has at most one open proposal at a time.
 /// When one is open, this
@@ -948,14 +1017,81 @@ pub async fn propose(
     )
     .await?;
 
-    let local = detect_local_changes(domain_root, &state.files)?;
-    if local.changes.is_empty() {
-        return Ok(ProposeOutcome::NothingToShare {
-            skipped_large: local.skipped_large,
-        });
+    // 2. What this share is measured against, and the layer it would sit on,
+    //    are one question on a stackable chain: the base is the chain tip
+    //    (see [`effective_tip_files`]) rather than the trunk, and which
+    //    layers make up that tip depends on which of them are still really
+    //    open - a gone branch ref settles its layer and the tip shrinks with
+    //    it, so the walk down and the detection run together.
+    if stacked_path && chain_is_stacked(&state) {
+        // Any link still owed to the forge is settled first: growing the
+        // chain over an unsettled gap would only widen it.
+        retry_stack_link(provider, spec, &mut state, state_dir).await;
+    }
+    let (local, stack_top) = loop {
+        let top = if stacked_path && chain_is_stacked(&state) {
+            state
+                .proposals
+                .iter()
+                .rev()
+                .find(|p| p.status == ProposalStatus::Open)
+                .cloned()
+        } else {
+            None
+        };
+        // Off the stacked path, and for a chain that emptied out, a share is
+        // measured against the trunk exactly as it always was.
+        let base = match top {
+            Some(_) => effective_tip_files(&state),
+            None => state.files.clone(),
+        };
+        let local = detect_local_changes(domain_root, &base)?;
+        if local.changes.is_empty() {
+            return Ok(ProposeOutcome::NothingToShare {
+                skipped_large: local.skipped_large,
+            });
+        }
+        let Some(top) = top else {
+            break (local, None);
+        };
+        match provider.branch_ref(spec, &top.branch).await? {
+            Some(live_head) => {
+                if !head_is_ours(&top, &live_head) {
+                    // A reviewer moved the layer this one would sit on;
+                    // refuse before any write, naming the top.
+                    return Ok(ProposeOutcome::ProposalDiverged {
+                        number: top.number,
+                        url: top.url.clone(),
+                        branch: top.branch.clone(),
+                    });
+                }
+                break (local, Some((top, live_head)));
+            }
+            None => {
+                // The ref is gone: settle this layer exactly as the fallback
+                // path settles a gone ref, then go round again - the layer
+                // below becomes the new top and leaves the tip as it goes.
+                let refreshed = provider.proposal_state(spec, top.number).await?;
+                state.proposals.retain(|p| p.number != top.number);
+                let mut settled = top.clone();
+                settled.status = match refreshed {
+                    ProposalState::Merged => ProposalStatus::Merged,
+                    ProposalState::Declined | ProposalState::Open => ProposalStatus::Declined,
+                };
+                settled.pending_head_commit = None;
+                state.push_history(settled);
+                state.save(state_dir)?;
+            }
+        }
+    };
+    if stacked_path && stack_top.is_none() {
+        // Nothing is left to stack onto, so the create path below opens a
+        // fresh bottom layer and the old chain's stack number goes with the
+        // chain it named.
+        state.stack_number = None;
     }
 
-    // 2. A declined proposal is superseded by this share: record to history
+    // 3. A declined proposal is superseded by this share: record to history
     //    (keeping Declined), branch best-effort deleted, exactly like the
     //    merged path's cleanup.
     let declined: Vec<Proposal> = state
@@ -975,75 +1111,29 @@ pub async fn propose(
         }
     }
 
-    // 3a. On a stackable chain a share never rewrites what is already open:
-    //     it opens a new layer on top, so each share stays reviewable on its
-    //     own. A chain this machine does not know as a stack (multi-open
-    //     residue from before stacking) falls through to 3b untouched.
-    if stacked_path && chain_is_stacked(&state) {
-        // Any link still owed to the forge is settled first: growing the
-        // chain over an unsettled gap would only widen it.
-        retry_stack_link(provider, spec, &mut state, state_dir).await;
-
-        loop {
-            let top = state
-                .proposals
-                .iter()
-                .rev()
-                .find(|p| p.status == ProposalStatus::Open)
-                .cloned();
-            let Some(top) = top else {
-                // The chain emptied out. Nothing is left to stack onto, so
-                // the create path below opens a fresh bottom layer and the
-                // old chain's stack number goes with the chain.
-                state.stack_number = None;
-                break;
-            };
-            match provider.branch_ref(spec, &top.branch).await? {
-                Some(live_head) => {
-                    if !head_is_ours(&top, &live_head) {
-                        // A reviewer moved the layer this one would sit on;
-                        // refuse before any write, naming the top.
-                        return Ok(ProposeOutcome::ProposalDiverged {
-                            number: top.number,
-                            url: top.url.clone(),
-                            branch: top.branch.clone(),
-                        });
-                    }
-                    return stack_new_layer(
-                        provider,
-                        spec,
-                        domain_root,
-                        domain_name,
-                        state_dir,
-                        state,
-                        top,
-                        live_head,
-                        local,
-                        title,
-                        description,
-                    )
-                    .await;
-                }
-                None => {
-                    // The ref is gone: settle this layer exactly as the
-                    // fallback path settles a gone ref, then read the chain
-                    // again - the layer below becomes the new top.
-                    let refreshed = provider.proposal_state(spec, top.number).await?;
-                    state.proposals.retain(|p| p.number != top.number);
-                    let mut settled = top.clone();
-                    settled.status = match refreshed {
-                        ProposalState::Merged => ProposalStatus::Merged,
-                        ProposalState::Declined | ProposalState::Open => ProposalStatus::Declined,
-                    };
-                    settled.pending_head_commit = None;
-                    state.push_history(settled);
-                    state.save(state_dir)?;
-                }
-            }
-        }
+    // 4a. On a stackable chain a share never rewrites what is already open:
+    //     it opens a new layer on top of the one resolved above, so each
+    //     share stays reviewable on its own. A chain this machine does not
+    //     know as a stack (multi-open residue from before stacking) never
+    //     reaches here and falls through to 4b untouched.
+    if let Some((top, live_head)) = stack_top {
+        return stack_new_layer(
+            provider,
+            spec,
+            domain_root,
+            domain_name,
+            state_dir,
+            state,
+            top,
+            live_head,
+            local,
+            title,
+            description,
+        )
+        .await;
     }
 
-    // 3b. An open proposal is updated in place, never paralleled.
+    // 4b. An open proposal is updated in place, never paralleled.
     let open = state
         .proposals
         .iter()
@@ -1100,7 +1190,7 @@ pub async fn propose(
         }
     }
 
-    // 4. Create, as today, plus head_commit/base_commit on the fresh record.
+    // 5. Create, as today, plus head_commit/base_commit on the fresh record.
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
 
@@ -1238,6 +1328,12 @@ pub enum PlannedAction {
 /// computed against a stale base would name changes a real share would never
 /// make.
 ///
+/// On a stackable chain it walks the open layers down exactly as [`propose`]
+/// does, skipping each layer whose branch ref is gone (a share settles those
+/// and stacks onto the layer below) and dropping it out of the chain tip it
+/// then detects against, so both the named action and the change list match
+/// the share the plan describes.
+///
 /// `domain_name` plays the same role it plays in [`propose`]: it is what the
 /// generated title calls the domain when the caller supplies none. Of
 /// `options` a preview reads the title alone: a description is only ever
@@ -1257,7 +1353,64 @@ pub async fn propose_preview(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
-    let local = detect_local_changes(domain_root, &state.files)?;
+    // The same capability question a real share asks, and the same cached
+    // answer: a preview that guessed would name an action the share then
+    // would not take.
+    let stacked_path = stacks_available(
+        provider,
+        spec,
+        &mut state,
+        state_dir,
+        options.stacks_allowed,
+    )
+    .await?;
+
+    // The stacked walk, read-only: `propose` settles a layer whose branch ref
+    // is gone and stacks onto the one below, so a preview walks down the same
+    // way and drops each vanished layer out of the tip it detects against. A
+    // share naming a layer to amend is a different action, and not this one.
+    let stacked = stacked_path && chain_is_stacked(&state) && options.proposal.is_none();
+    let mut surviving: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    let mut stacked_action = None;
+    if stacked {
+        while let Some(top) = surviving.last().copied() {
+            match provider.branch_ref(spec, &top.branch).await? {
+                Some(live_head) if head_is_ours(top, &live_head) => {
+                    stacked_action = Some(PlannedAction::StackOnTop {
+                        top_number: top.number,
+                        top_title: top.title.clone(),
+                    });
+                    break;
+                }
+                Some(_) => {
+                    stacked_action = Some(PlannedAction::ProposalDiverged {
+                        number: top.number,
+                        url: top.url.clone(),
+                        branch: top.branch.clone(),
+                    });
+                    break;
+                }
+                // Gone: a real share would settle this record, so its files
+                // leave the tip and the layer below becomes the top.
+                None => {
+                    surviving.pop();
+                }
+            }
+        }
+    }
+
+    // Detection runs against the chain tip whenever a layer would be stacked
+    // on it, and against the trunk otherwise - the same base the share the
+    // plan describes would use.
+    let base = match &stacked_action {
+        Some(PlannedAction::StackOnTop { .. }) => tip_files_over(&state.files, &surviving),
+        _ => state.files.clone(),
+    };
+    let local = detect_local_changes(domain_root, &base)?;
 
     if !state.conflicts.is_empty() {
         return Ok(SharePlan {
@@ -1281,47 +1434,12 @@ pub async fn propose_preview(
         .map(str::to_string)
         .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
 
-    // The same capability question a real share asks, and the same cached
-    // answer: a preview that guessed would name an action the share then
-    // would not take.
-    let stacked_path = stacks_available(
-        provider,
-        spec,
-        &mut state,
-        state_dir,
-        options.stacks_allowed,
-    )
-    .await?;
-
-    // Classification mirrors propose's, read-only. On a stackable chain a
-    // share stacks a new layer on the top open one, after the very same
-    // divergence check; a gone ref would be settled and re-created. A share
-    // naming a layer to amend is a different action, and not this one.
-    if stacked_path && chain_is_stacked(&state) && options.proposal.is_none() {
-        let top = state
-            .proposals
-            .iter()
-            .rev()
-            .find(|p| p.status == ProposalStatus::Open);
-        if let Some(top) = top {
-            let action = match provider.branch_ref(spec, &top.branch).await? {
-                Some(live_head) if head_is_ours(top, &live_head) => PlannedAction::StackOnTop {
-                    top_number: top.number,
-                    top_title: top.title.clone(),
-                },
-                Some(_) => PlannedAction::ProposalDiverged {
-                    number: top.number,
-                    url: top.url.clone(),
-                    branch: top.branch.clone(),
-                },
-                None => PlannedAction::Create,
-            };
-            return Ok(SharePlan {
-                action,
-                changes: local,
-                effective_title,
-            });
-        }
+    if let Some(action) = stacked_action {
+        return Ok(SharePlan {
+            action,
+            changes: local,
+            effective_title,
+        });
     }
 
     // The fallback classification: a declined record would be superseded (so
@@ -1412,6 +1530,7 @@ async fn collect_changes(
             LocalChange::Added { path, sha256 } => {
                 let wt_path = checked_working_path(state_dir, domain_root, path)?;
                 let bytes = std::fs::read(&wt_path)?;
+                let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
                     path: to_repo_relative(path, spec.subpath.as_deref()),
@@ -1424,11 +1543,13 @@ async fn collect_changes(
                     change: ProposedChange::Added,
                     sha256: Some(sha256.clone()),
                     blob_sha: Some(blob_sha),
+                    size: Some(size),
                 });
             }
             LocalChange::Modified { path, sha256 } => {
                 let wt_path = checked_working_path(state_dir, domain_root, path)?;
                 let bytes = std::fs::read(&wt_path)?;
+                let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
                     path: to_repo_relative(path, spec.subpath.as_deref()),
@@ -1441,6 +1562,7 @@ async fn collect_changes(
                     change: ProposedChange::Modified,
                     sha256: Some(sha256.clone()),
                     blob_sha: Some(blob_sha),
+                    size: Some(size),
                 });
             }
             LocalChange::Deleted { path } => {
@@ -1461,6 +1583,7 @@ async fn collect_changes(
                     change: ProposedChange::Deleted,
                     sha256: None,
                     blob_sha: None,
+                    size: None,
                 });
             }
         }

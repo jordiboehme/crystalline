@@ -191,6 +191,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
             change: ProposedChange::Added,
             sha256,
             blob_sha: None,
+            size: None,
         }],
         head_commit: None,
         pending_head_commit: None,
@@ -1143,18 +1144,21 @@ async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
                 // The mock provider hands back the content's own sha256 as
                 // its blob sha, so the two match here by construction.
                 blob_sha: Some(sha256_hex(b"brand new\n")),
+                size: Some(b"brand new\n".len() as u64),
             },
             ProposedFile {
                 path: "notes/edit.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"after\n")),
                 blob_sha: Some(sha256_hex(b"after\n")),
+                size: Some(b"after\n".len() as u64),
             },
             ProposedFile {
                 path: "notes/gone.md".to_string(),
                 change: ProposedChange::Deleted,
                 sha256: None,
                 blob_sha: None,
+                size: None,
             },
         ]
     );
@@ -1719,18 +1723,21 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"shared keep v2\n")),
                 blob_sha: None,
+                size: None,
             },
             ProposedFile {
                 path: "notes/diverge.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"shared diverge v2\n")),
                 blob_sha: None,
+                size: None,
             },
             ProposedFile {
                 path: "notes/added.md".to_string(),
                 change: ProposedChange::Added,
                 sha256: Some(sha256_hex(b"newly added\n")),
                 blob_sha: None,
+                size: None,
             },
         ],
         head_commit: None,
@@ -4199,5 +4206,164 @@ async fn a_failing_probe_falls_back_without_caching_a_verdict() {
         2,
         "{:?}",
         mock.calls()
+    );
+}
+
+// A layer records its delta against the chain tip - the trunk snapshot with
+// every open layer's own files laid over it - not against the trunk. Without
+// that, every layer re-proposes what the layers below it already carry, a
+// share with nothing new opens an empty layer, and a delete of a file only a
+// lower layer holds is invisible.
+
+#[tokio::test]
+async fn a_zero_delta_share_on_an_open_chain_is_nothing_to_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    // Nothing was touched since the layer went up: the working tree IS the
+    // chain tip, so there is no second layer to open.
+    let before = mock.calls().len();
+    let outcome = stacked_share(&mock, &sub).await;
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "expected NothingToShare, got {outcome:?}"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).proposals.len(),
+        1,
+        "no empty layer was opened"
+    );
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")
+            || c.starts_with("create_proposal")),
+        "{delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_layer_records_only_its_own_delta_against_the_tip() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // The bottom layer's own change to notes/a.md is part of the tip now, so
+    // it is not this layer's work and never appears in it.
+    assert_eq!(second.added, vec!["notes/b.md".to_string()]);
+    assert!(second.updated.is_empty(), "{:?}", second.updated);
+    assert!(second.deleted.is_empty(), "{:?}", second.deleted);
+
+    let state = load_state(&sub.state_dir);
+    let files = &state.proposals[1].files;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].path, "notes/b.md");
+    assert_eq!(files[0].change, ProposedChange::Added);
+    assert_eq!(
+        files[0].size,
+        Some(b"beta\n".len() as u64),
+        "the size travels with the record so the tip stamp is exact"
+    );
+}
+
+#[tokio::test]
+async fn a_layer_can_delete_a_file_the_layer_below_added() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The bottom layer adds a file the trunk has never seen.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+    let first_head = mock.branch_commit(&first.branch).expect("the layer's head");
+    assert!(
+        mock.commit_tree(&first_head)
+            .unwrap()
+            .contains_key("notes/b.md")
+    );
+
+    // Retiring it again is a change against the tip, invisible against the
+    // trunk: the trunk never carried the file at all.
+    std::fs::remove_file(sub.domain_root.join("notes/b.md")).unwrap();
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    assert_eq!(second.deleted, vec!["notes/b.md".to_string()]);
+    assert!(second.added.is_empty(), "{:?}", second.added);
+    assert!(second.updated.is_empty(), "{:?}", second.updated);
+
+    let state = load_state(&sub.state_dir);
+    let files = &state.proposals[1].files;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].change, ProposedChange::Deleted);
+
+    // The layer's own tree drops the file the layer below it added, so the
+    // diff a reviewer reads is exactly that deletion.
+    let second_head = mock.branch_commit(&second.branch).expect("the new head");
+    assert!(
+        !mock
+            .commit_tree(&second_head)
+            .unwrap()
+            .contains_key("notes/b.md"),
+        "the layer's tree still carries the retired file"
+    );
+    assert_eq!(mock.commit_parents(&second_head), Some(vec![first_head]));
+}
+
+#[tokio::test]
+async fn preview_stacks_on_the_surviving_layer_when_the_top_ref_is_gone() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let top_title = load_state(&sub.state_dir).proposals[0].title.clone();
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // The top layer's branch is gone: a real share settles that record and
+    // stacks onto the layer below, so a preview has to say the same.
+    mock.delete_branch(&spec(), &second.branch).await.unwrap();
+
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        plan.action,
+        PlannedAction::StackOnTop {
+            top_number: first.number,
+            top_title,
+        }
+    );
+    // The settled layer's files leave the tip with it, so its content reads
+    // as this share's work again - the same list a real share would carry.
+    let mut paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["notes/c.md"], "{paths:?}");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
     );
 }

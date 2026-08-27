@@ -247,6 +247,15 @@ pub struct ProposedFile {
     /// [`ProposedChange::Deleted`], which carries no content.
     #[serde(default)]
     pub blob_sha: Option<String>,
+    /// The shared content's size in bytes, recorded at share time so this
+    /// record can stand in for a [`BaseStamp`] when a stacked chain's
+    /// effective tip is assembled (see `crystalline_remote::ops`): a stamp
+    /// needs both halves, and the digest alone would leave the size to be
+    /// guessed. `None` on a record written before this field existed
+    /// (pre-0.17.0) and whenever `change` is [`ProposedChange::Deleted`],
+    /// which carries no content.
+    #[serde(default)]
+    pub size: Option<u64>,
 }
 
 /// How a single file changed within a [`Proposal`].
@@ -1194,12 +1203,14 @@ mod tests {
             change: ProposedChange::Added,
             sha256: Some(sha256_hex(b"content")),
             blob_sha: None,
+            size: Some(b"content".len() as u64),
         };
         let deleted = ProposedFile {
             path: "notes/old.md".to_string(),
             change: ProposedChange::Deleted,
             sha256: None,
             blob_sha: None,
+            size: None,
         };
         assert!(added.sha256.is_some());
         assert!(deleted.sha256.is_none());
@@ -1247,10 +1258,28 @@ mod tests {
             change: ProposedChange::Added,
             sha256: Some("deadbeef".into()),
             blob_sha: Some("b10b".into()),
+            size: None,
         };
         let back: ProposedFile =
             serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
         assert_eq!(back.blob_sha.as_deref(), Some("b10b"));
+    }
+
+    #[test]
+    fn proposed_file_size_defaults_none_and_round_trips() {
+        let json = r#"{"path":"a.md","change":"Added","sha256":"deadbeef"}"#;
+        let pf: ProposedFile = serde_json::from_str(json).unwrap();
+        assert_eq!(pf.size, None, "a record from before the field existed");
+        let with = ProposedFile {
+            path: "a.md".into(),
+            change: ProposedChange::Added,
+            sha256: Some("deadbeef".into()),
+            blob_sha: None,
+            size: Some(7),
+        };
+        let back: ProposedFile =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.size, Some(7));
     }
 
     #[test]
