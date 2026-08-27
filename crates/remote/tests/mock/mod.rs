@@ -14,6 +14,16 @@
 //! and a forced compare truncation) let the tests drive the reconciliation
 //! and recovery paths. Nothing here reaches the network and nothing panics on
 //! an injected fault.
+//!
+//! Stacks are modelled too, but only once a test calls
+//! [`MockProvider::enable_stacks`]: until then the four stack verbs answer
+//! [`RemoteError::StacksUnsupported`], the way a forge without the preview
+//! does. The rules come from the 2026-08-27 live spike: a chain runs bottom
+//! to top with every member's base branch equal to the previous member's
+//! head branch, stack numbers come off the same counter as proposals,
+//! closing a member leaves it in the stack, an extend is validated against
+//! the current top member (a closed one included) and a dissolve takes the
+//! stack out of the registry outright.
 
 #![allow(dead_code)]
 
@@ -24,7 +34,7 @@ use std::sync::Mutex;
 use crystalline_remote::RemoteError;
 use crystalline_remote::provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
-    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
+    ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
 use flate2::Compression;
 use flate2::write::GzEncoder;
@@ -49,6 +59,40 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 struct Commit {
     files: BTreeMap<String, Vec<u8>>,
     parents: Vec<String>,
+}
+
+/// The message GitHub answers a misaligned chain with, taken verbatim from
+/// the spike. Both a bad `POST /stacks` body and an `/add` that does not meet
+/// the current top's head ref come back as this 422.
+const STACK_CHAIN_MESSAGE: &str =
+    "Pull requests must form a stack, where each PR's base ref is the previous PR's head ref";
+
+/// The message GitHub answers a retarget of a stacked proposal with, taken
+/// verbatim from the spike.
+const STACK_RETARGET_MESSAGE: &str =
+    "Cannot change the base branch because the pull request is part of a stack.";
+
+/// The 422 a misaligned chain answers.
+fn chain_mismatch() -> RemoteError {
+    RemoteError::Api {
+        status: 422,
+        message: STACK_CHAIN_MESSAGE.to_string(),
+    }
+}
+
+/// Renders proposal numbers the way the recorded stack calls carry them:
+/// `[6,8]`, bottom member first, no spaces.
+fn number_list(numbers: &[u64]) -> String {
+    let rendered: Vec<String> = numbers.iter().map(u64::to_string).collect();
+    format!("[{}]", rendered.join(","))
+}
+
+/// One stack in the registry. Only the member order is stored: each member's
+/// state and head sha are read live off the proposal and branch registries
+/// when a stack is reported, and whether the stack is open follows from its
+/// members, so a member closing never has to touch this.
+struct StoredStack {
+    members: Vec<u64>,
 }
 
 #[derive(Default)]
@@ -79,6 +123,17 @@ struct Inner {
     update_proposal_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers [`RemoteError::Offline`].
     open_list_fails: bool,
+    /// Whether this forge serves stacks at all. Until
+    /// `MockProvider::enable_stacks` flips it, the four stack verbs answer
+    /// [`RemoteError::StacksUnsupported`].
+    stacks_enabled: bool,
+    /// The stack registry, keyed by stack number, bottom member first.
+    stacks: BTreeMap<u64, StoredStack>,
+    /// How many upcoming `extend_stack` calls answer a 409 before doing any
+    /// work, modelling GitHub's concurrent-modification conflict.
+    extend_conflicts: u32,
+    /// Whether `create_stack` fails outright, for the link-pending path.
+    create_stack_fails: bool,
     /// Trees built by `create_tree`, keyed by a generated tree id: the
     /// parent commit's files with every write applied, ready for
     /// `create_commit` to snapshot into a new [`Commit`].
@@ -90,6 +145,84 @@ struct Inner {
     tree_counter: u64,
     proposal_counter: u64,
     calls: Vec<String>,
+}
+
+impl Inner {
+    /// The branch proposal `number` carries, as `create_proposal` or
+    /// `register_proposal_branch` recorded it.
+    fn head_branch(&self, number: u64) -> Option<&str> {
+        self.proposal_branches.get(&number).map(String::as_str)
+    }
+
+    /// The branch proposal `number` targets, as its opening request or a
+    /// later retarget left it.
+    fn base_branch(&self, number: u64) -> Option<&str> {
+        self.proposal_requests
+            .get(&number)
+            .map(|req| req.base_branch.as_str())
+    }
+
+    /// Checks `numbers` chain bottom to top: each member's base branch is the
+    /// previous member's head branch. `previous_head` seeds the check with
+    /// the head branch a member must already sit on (the current top's, for
+    /// an extend); `None` leaves the bottom member's base unchecked, which is
+    /// what `POST /stacks` does - a stack may sit on any branch.
+    fn validate_chain(
+        &self,
+        numbers: &[u64],
+        previous_head: Option<&str>,
+    ) -> Result<(), RemoteError> {
+        let mut expected = previous_head.map(str::to_string);
+        for number in numbers {
+            if !self.proposals.contains_key(number) {
+                return Err(RemoteError::Api {
+                    status: 404,
+                    message: format!("no proposal {number}"),
+                });
+            }
+            let base = self.base_branch(*number).unwrap_or_default();
+            if let Some(want) = expected.as_deref()
+                && base != want
+            {
+                return Err(chain_mismatch());
+            }
+            expected = self.head_branch(*number).map(str::to_string);
+        }
+        Ok(())
+    }
+
+    /// One stack as the forge reports it: the stored member order, each
+    /// member's state and head sha read live, and `open` true while any
+    /// member is still open (a stack whose members are all closed or merged
+    /// flips shut, exactly as the spike saw).
+    fn stack_info(&self, number: u64, stored: &StoredStack) -> StackInfo {
+        let members: Vec<StackMember> = stored
+            .members
+            .iter()
+            .map(|member| StackMember {
+                number: *member,
+                // Unreachable in practice: a member is only ever recorded
+                // after `validate_chain` found its proposal.
+                state: match self.proposals.get(member) {
+                    Some(ProposalState::Open) => "open",
+                    Some(ProposalState::Merged) => "merged",
+                    Some(ProposalState::Declined) => "closed",
+                    None => "unknown",
+                }
+                .to_string(),
+                head_sha: self
+                    .head_branch(*member)
+                    .and_then(|branch| self.branches.get(branch))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        StackInfo {
+            number,
+            open: members.iter().any(|member| member.state == "open"),
+            members,
+        }
+    }
 }
 
 /// An in-memory forge implementing [`Provider`] for the lifecycle tests.
@@ -265,6 +398,53 @@ impl MockProvider {
             .unwrap()
             .update_proposal_failures
             .remove(&number);
+    }
+
+    /// Turns this forge into one that serves stacks. Until this is called the
+    /// four stack verbs answer [`RemoteError::StacksUnsupported`], so a test
+    /// gets the fallback forge by default and opts into the preview.
+    pub fn enable_stacks(&self) {
+        self.inner.lock().unwrap().stacks_enabled = true;
+    }
+
+    /// Every stack in the registry, lowest number first.
+    pub fn stacks(&self) -> Vec<StackInfo> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .stacks
+            .iter()
+            .map(|(number, stored)| inner.stack_info(*number, stored))
+            .collect()
+    }
+
+    /// One stack by number, or `None` once it was dissolved.
+    pub fn stack(&self, number: u64) -> Option<StackInfo> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .stacks
+            .get(&number)
+            .map(|stored| inner.stack_info(number, stored))
+    }
+
+    /// Makes the next `times` [`Provider::extend_stack`] calls answer a 409,
+    /// GitHub's "the stack is being modified" conflict. The injector fires
+    /// ahead of any validation and is spent one call at a time. The real
+    /// client retries a 409 internally, so a caller driven through this mock
+    /// sees a failure rather than a retry.
+    pub fn fail_extend_stack_with_conflicts(&self, times: u32) {
+        self.inner.lock().unwrap().extend_conflicts = times;
+    }
+
+    /// Makes every [`Provider::create_stack`] call fail with a 500, the hard
+    /// failure that leaves a fresh layer shared but not linked.
+    pub fn fail_create_stack(&self) {
+        self.inner.lock().unwrap().create_stack_fails = true;
+    }
+
+    /// Lets [`Provider::create_stack`] succeed again, so a test can retry the
+    /// link the injected failure lost.
+    pub fn heal_create_stack(&self) {
+        self.inner.lock().unwrap().create_stack_fails = false;
     }
 }
 
@@ -545,6 +725,19 @@ impl Provider for MockProvider {
                 message: format!("injected update failure for {number}"),
             });
         }
+        // A stacked proposal cannot be retargeted: the repair order is
+        // unstack first, then retarget. Title and body edits are unaffected.
+        if base.is_some()
+            && inner
+                .stacks
+                .values()
+                .any(|stack| stack.members.contains(&number))
+        {
+            return Err(RemoteError::Api {
+                status: 422,
+                message: STACK_RETARGET_MESSAGE.to_string(),
+            });
+        }
         if let Some(req) = inner.proposal_requests.get_mut(&number) {
             // Only what the caller supplied is applied: a retarget-only call
             // leaves the title and body exactly as they stand.
@@ -656,6 +849,124 @@ impl Provider for MockProvider {
             .ok_or_else(|| RemoteError::Api {
                 status: 404,
                 message: format!("no proposal {number}"),
+            })
+    }
+
+    async fn list_stacks(
+        &self,
+        _origin: &OriginSpec,
+        pull_request: Option<u64>,
+    ) -> Result<Vec<StackInfo>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        match pull_request {
+            Some(number) => inner.calls.push(format!("list_stacks:{number}")),
+            None => inner.calls.push("list_stacks".to_string()),
+        }
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        Ok(inner
+            .stacks
+            .iter()
+            .filter(|(_, stored)| match pull_request {
+                Some(number) => stored.members.contains(&number),
+                None => true,
+            })
+            .map(|(number, stored)| inner.stack_info(*number, stored))
+            .collect())
+    }
+
+    async fn create_stack(
+        &self,
+        _origin: &OriginSpec,
+        numbers: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .push(format!("create_stack:{}", number_list(numbers)));
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        if inner.create_stack_fails {
+            return Err(RemoteError::Api {
+                status: 500,
+                message: "injected create_stack failure".to_string(),
+            });
+        }
+        inner.validate_chain(numbers, None)?;
+        // Stack numbers come off the issue and pull-request sequence, so a
+        // stack takes the next number the proposals would have taken.
+        inner.proposal_counter += 1;
+        let number = inner.proposal_counter;
+        inner.stacks.insert(
+            number,
+            StoredStack {
+                members: numbers.to_vec(),
+            },
+        );
+        let stored = &inner.stacks[&number];
+        Ok(inner.stack_info(number, stored))
+    }
+
+    async fn extend_stack(
+        &self,
+        _origin: &OriginSpec,
+        stack: u64,
+        numbers: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .push(format!("extend_stack:{stack}:{}", number_list(numbers)));
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        if inner.extend_conflicts > 0 {
+            inner.extend_conflicts -= 1;
+            return Err(RemoteError::Api {
+                status: 409,
+                message: "Stack is being modified".to_string(),
+            });
+        }
+        let top = *inner
+            .stacks
+            .get(&stack)
+            .and_then(|stored| stored.members.last())
+            .ok_or_else(|| RemoteError::Api {
+                status: 404,
+                message: format!("no stack {stack}"),
+            })?;
+        // A closed top blocks the extend, the way the spike saw it: GitHub
+        // answers the same base-ref 422 even for a layer branched off that
+        // closed member's head.
+        if inner.proposals.get(&top) != Some(&ProposalState::Open) {
+            return Err(chain_mismatch());
+        }
+        let top_head = inner.head_branch(top).map(str::to_string);
+        inner.validate_chain(numbers, top_head.as_deref())?;
+        if let Some(stored) = inner.stacks.get_mut(&stack) {
+            stored.members.extend_from_slice(numbers);
+        }
+        let stored = &inner.stacks[&stack];
+        Ok(inner.stack_info(stack, stored))
+    }
+
+    async fn dissolve_stack(&self, _origin: &OriginSpec, stack: u64) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("dissolve_stack:{stack}"));
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        // Dissolving takes the stack out of the registry entirely; the forge
+        // 404s on it afterwards. The member proposals are untouched.
+        inner
+            .stacks
+            .remove(&stack)
+            .map(|_| ())
+            .ok_or_else(|| RemoteError::Api {
+                status: 404,
+                message: format!("no stack {stack}"),
             })
     }
 

@@ -26,7 +26,9 @@ use crystalline_remote::ops::{
     PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, propose,
     propose_preview, pull, resolve, status, subscribe, withdraw,
 };
-use crystalline_remote::provider::{Feedback, OriginSpec, ProposalState, Provider};
+use crystalline_remote::provider::{
+    Feedback, OriginSpec, ProposalRequest, ProposalState, Provider,
+};
 use crystalline_remote::state::{
     BaseStamp, FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange,
     ProposedFile, read_conflict_files,
@@ -3515,4 +3517,214 @@ async fn scenario_37_status_list_failure_degrades_to_local_state() {
     assert!(report.amended_upstream.is_empty());
     let st = load_state(&sub.state_dir);
     assert_eq!(st.proposals[0].status, ProposalStatus::Open, "unchanged");
+}
+
+// The stack rules, as the 2026-08-27 spike found them on a live repository:
+// bottom-to-top chains only, a closed member stays a member, a stacked
+// proposal cannot be retargeted and a dissolve takes the stack away
+// outright. This test drives the mock forge directly rather than an
+// operation, because the mock is what every later stack scenario stands on.
+
+/// Asserts `err` is an API failure carrying `status`, whose message contains
+/// `needle` (empty to check the status alone).
+fn assert_api(err: &crystalline_remote::RemoteError, status: u16, needle: &str) {
+    match err {
+        crystalline_remote::RemoteError::Api {
+            status: got,
+            message,
+        } => {
+            assert_eq!(*got, status, "{err:?}");
+            assert!(
+                message.contains(needle),
+                "{message:?} does not carry {needle:?}"
+            );
+        }
+        other => panic!("expected an Api {status}, got {other:?}"),
+    }
+}
+
+/// Opens one layer through the ordinary create path: a commit on top of
+/// `base_branch`'s head, a branch pointing at it and a proposal targeting
+/// `base_branch`. Returns the new proposal's number.
+async fn stacked_layer(mock: &MockProvider, branch: &str, base_branch: &str) -> u64 {
+    let parent = mock
+        .branch_commit(base_branch)
+        .unwrap_or_else(|| panic!("no branch {base_branch}"));
+    let path = format!("{branch}.md");
+    let commit = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# team"), (path.as_str(), b"layer")]),
+        Some(&parent),
+    );
+    mock.create_branch(&spec(), branch, &commit).await.unwrap();
+    mock.create_proposal(
+        &spec(),
+        &ProposalRequest {
+            title: format!("share {branch}"),
+            body: "one layer".to_string(),
+            branch: branch.to_string(),
+            base_branch: base_branch.to_string(),
+        },
+    )
+    .await
+    .unwrap()
+    .number
+}
+
+#[tokio::test]
+async fn the_mock_forge_models_the_spiked_stack_rules() {
+    let mock = MockProvider::new();
+    // Before `enable_stacks` the mock is a forge without the preview: all
+    // four verbs answer the way the trait defaults do.
+    for err in [
+        mock.list_stacks(&spec(), None).await.unwrap_err(),
+        mock.create_stack(&spec(), &[1, 2]).await.unwrap_err(),
+        mock.extend_stack(&spec(), 1, &[2]).await.unwrap_err(),
+        mock.dissolve_stack(&spec(), 1).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, crystalline_remote::RemoteError::StacksUnsupported),
+            "{err:?}"
+        );
+    }
+    mock.enable_stacks();
+
+    let root = mock.add_commit(commit_files(&[("MANIFEST.md", b"# team")]), None);
+    mock.set_branch("main", &root);
+    let p1 = stacked_layer(&mock, "layer-a", "main").await;
+    let p2 = stacked_layer(&mock, "layer-b", "layer-a").await;
+    assert_eq!((p1, p2), (1, 2));
+
+    // A chain runs bottom to top: reversed, the second member's base ref is
+    // not the first member's head ref.
+    let err = mock.create_stack(&spec(), &[p2, p1]).await.unwrap_err();
+    assert_api(&err, 422, "must form a stack");
+
+    let stack = mock.create_stack(&spec(), &[p1, p2]).await.unwrap();
+    assert_eq!(
+        stack.number, 3,
+        "stack numbers come off the same counter as proposals"
+    );
+    assert!(stack.open);
+    assert_eq!(
+        stack.members.iter().map(|m| m.number).collect::<Vec<_>>(),
+        vec![p1, p2]
+    );
+    assert_eq!(stack.members[0].state, "open");
+    assert_eq!(
+        stack.members[1].head_sha,
+        mock.branch_commit("layer-b").unwrap(),
+        "a member's head is read live off its branch"
+    );
+
+    // A member of a live stack cannot be retargeted: unstack first.
+    let err = mock
+        .update_proposal(&spec(), p2, None, None, Some("main"))
+        .await
+        .unwrap_err();
+    assert_api(&err, 422, "part of a stack");
+
+    // Extending appends on top of the current top member.
+    let p3 = stacked_layer(&mock, "layer-c", "layer-b").await;
+    let stack = mock
+        .extend_stack(&spec(), stack.number, &[p3])
+        .await
+        .unwrap();
+    assert_eq!(stack.members.len(), 3);
+    assert_eq!(stack.members[2].number, p3);
+
+    // A layer branched off trunk does not line up with that top.
+    let stray = stacked_layer(&mock, "stray", "main").await;
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[stray])
+        .await
+        .unwrap_err();
+    assert_api(&err, 422, "must form a stack");
+
+    // The conflict injector answers before any validation, and is spent per
+    // call, so a caller's retry path can be driven without a real race.
+    let p4 = stacked_layer(&mock, "layer-d", "layer-c").await;
+    mock.fail_extend_stack_with_conflicts(1);
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[p4])
+        .await
+        .unwrap_err();
+    assert_api(&err, 409, "");
+    let stack = mock
+        .extend_stack(&spec(), stack.number, &[p4])
+        .await
+        .unwrap();
+    assert_eq!(stack.members.len(), 4, "the second attempt went through");
+
+    // Closing a member never touches the registry: it stays a member,
+    // reported closed, and one open member keeps the stack open.
+    mock.close_proposal(&spec(), p4).await.unwrap();
+    let stack = mock.stack(stack.number).expect("the stack is still there");
+    assert_eq!(stack.members.len(), 4);
+    assert_eq!(stack.members[3].state, "closed");
+    assert!(stack.open);
+
+    // A closed top blocks the extend, even for a layer branched off it.
+    let p5 = stacked_layer(&mock, "layer-e", "layer-d").await;
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[p5])
+        .await
+        .unwrap_err();
+    assert_api(&err, 422, "must form a stack");
+
+    // Listing answers the whole registry, or one proposal's stack.
+    assert_eq!(mock.list_stacks(&spec(), None).await.unwrap().len(), 1);
+    assert_eq!(
+        mock.list_stacks(&spec(), Some(p3)).await.unwrap()[0].number,
+        stack.number
+    );
+    assert!(
+        mock.list_stacks(&spec(), Some(stray))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Dissolve takes the entry away outright, and the retarget the stack
+    // refused a moment ago then goes through.
+    mock.dissolve_stack(&spec(), stack.number).await.unwrap();
+    assert!(mock.stack(stack.number).is_none());
+    assert!(mock.stacks().is_empty());
+    mock.update_proposal(&spec(), p2, None, None, Some("main"))
+        .await
+        .expect("unstack first, then retarget");
+
+    // The hard create injector, and healing it again.
+    mock.update_proposal(&spec(), p2, None, None, Some("layer-a"))
+        .await
+        .unwrap();
+    mock.fail_create_stack();
+    let err = mock.create_stack(&spec(), &[p1, p2]).await.unwrap_err();
+    assert!(
+        matches!(err, crystalline_remote::RemoteError::Api { .. }),
+        "{err:?}"
+    );
+    mock.heal_create_stack();
+    let again = mock.create_stack(&spec(), &[p1, p2]).await.unwrap();
+    assert!(
+        again.number > stack.number,
+        "a fresh number off the shared counter"
+    );
+
+    // Every stack call is recorded, in the colon-separated shape the rest of
+    // the lifecycle assertions read.
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("create_stack:[{p1},{p2}]")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("extend_stack:{}:[{p3}]", stack.number)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("dissolve_stack:{}", stack.number)),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"list_stacks".to_string()), "{calls:?}");
+    assert!(calls.contains(&format!("list_stacks:{p3}")), "{calls:?}");
 }
