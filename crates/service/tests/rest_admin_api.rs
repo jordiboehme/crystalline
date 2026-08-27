@@ -1240,6 +1240,16 @@ async fn read_only_serves_the_status_and_refuses_the_pull() {
         403,
         "read_only refuses the pull before anything else is decided"
     );
+
+    let summary = as_session(ro.addr, reqwest::Method::GET, "/api/v1/sync", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.status(),
+        200,
+        "the instance-wide summary is a pure read and stays served read-only"
+    );
 }
 
 /// Unregister: the registration and index rows go, the files stay, and the
