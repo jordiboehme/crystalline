@@ -51,6 +51,10 @@ export default function SharePickerDialogBody({
     queryKey: SYNC_SUMMARY_KEY,
     queryFn: fetchSyncSummary,
     staleTime: SYNC_SUMMARY_STALE_MS,
+    // Off the app's refetch-on-focus default for the reason the frame's own
+    // observer is: reading this probes every origin at once, and coming back
+    // to the tab is not a reason to do that to draw a list already on screen.
+    refetchOnWindowFocus: false,
   });
   const waiting = (summary.data?.domains ?? []).filter(
     (entry) => entry.localChanges > 0,

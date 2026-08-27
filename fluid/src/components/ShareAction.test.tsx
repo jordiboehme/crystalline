@@ -140,6 +140,11 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/** How many times a route was asked for, exactly. */
+function reads(path: string): number {
+  return requested().filter((asked) => asked === path).length;
+}
+
 /**
  * The top bar, which is the one place this action is drawn.
  *
@@ -397,6 +402,35 @@ describe("the top bar's share action", () => {
     expect(
       await screen.findByRole("dialog", { name: "Share from a domain" }),
     ).toBeVisible();
+  });
+
+  it("asks each of its questions once, however many things read the answer", async () => {
+    serve({
+      "/settings/github": () => githubStatus(),
+      "/sync": () => summaryResponse([summaryEntry("ops", 2)]),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+
+    const user = userEvent.setup();
+    await user.keyboard("{Meta>}k{/Meta}");
+    // Both readers are live now: the button in the top bar, and the palette
+    // row, which is registered by the frame off the same verdict.
+    expect(
+      await screen.findByRole("option", { name: "Share changes" }),
+    ).toBeVisible();
+
+    // Two observers of each query rather than two requests. This is the whole
+    // reason the verdict may be worked out in two places at once, and the
+    // reason it matters here rather than in general: reading either of these
+    // reaches GitHub, the summary once per team domain.
+    expect(reads("/settings/github")).toBe(1);
+    expect(reads("/sync")).toBe(1);
   });
 
   it("registers no palette row for a share that would refuse", async () => {

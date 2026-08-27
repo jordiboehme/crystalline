@@ -32,6 +32,7 @@ import type { ReactElement } from "react";
 import { useId, useState } from "react";
 
 import {
+  SYNC_SUMMARY_KEY,
   fetchShareChanges,
   shareDomain,
   sharePlanKey,
@@ -107,12 +108,18 @@ export default function ShareDialogBody({
       }),
     onSuccess: (result) => {
       setOutcome(describeOutcome(result));
-      // Both of the things a share can have changed: the status the card that
-      // opened this is drawn from, and the listing every sidebar, card and
+      // All three of the things a share can have changed: the status the card
+      // that opened this is drawn from, the listing every sidebar, card and
       // switcher counts engrams in - a share pulls the origin first, and a
-      // pull that applied files moves those counts.
+      // pull that applied files moves those counts - and the instance-wide
+      // summary, which is what the frame's share action reads to decide
+      // whether there is anything left to share and what to fill its picker
+      // with. That one is the reason this list is not two keys: the work just
+      // left this domain, and a button still offering to share it would be
+      // offering a dialog that opens to say there is nothing to do.
       void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
       void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+      void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));

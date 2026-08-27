@@ -201,6 +201,18 @@ const NO_SHARE: ShareAction = {
 };
 
 /**
+ * How long a live origin probe the FRAME fires stays fresh, in milliseconds.
+ *
+ * The same window the summary carries, and deliberately the same number: both
+ * of these reads reach GitHub, both are mounted on every screen because the
+ * frame is, and one freshness policy for the frame's probes is easier to reason
+ * about than two. A screen that wants a fresher answer asks for one - the sync
+ * and proposals cards keep their own options on the same key, which react-query
+ * resolves per observer.
+ */
+const PROBE_STALE_MS = SYNC_SUMMARY_STALE_MS;
+
+/**
  * The three reads behind the share action, and what they add up to.
  *
  * Called from the frame and from the top bar both, which costs one extra
@@ -215,6 +227,13 @@ const NO_SHARE: ShareAction = {
  * GitHub off never reads a status, and the instance-wide summary - which probes
  * every origin at once - is only ever asked when the domain being read cannot
  * answer for itself.
+ *
+ * The two reads that reach GitHub also step out of the app's refetch-on-focus
+ * default. That default is right for content somebody may have edited in
+ * another tab and wrong for a probe: coming back to a tab would fire a live
+ * origin check per team domain, each under that domain's origin lock, to
+ * refresh a button's face. The stale window above IS the freshness policy here,
+ * and focus must not be a way around it.
  */
 function useShareAction(): ShareAction {
   const { capabilities } = useAuth();
@@ -239,13 +258,19 @@ function useShareAction(): ShareAction {
   const match = useMatch("/d/:domain/*");
   const routeDomain = match?.params.domain ?? "";
 
-  // The card's own query, to the letter, so standing on a domain screen costs
-  // nothing extra: same key, same fetcher, same refusal to retry a decided
-  // answer.
+  // The card's own key and fetcher, and the same refusal to retry a decided
+  // answer. On the domain's home screen that costs nothing at all, because the
+  // sync and proposals cards are already asking; on every other screen under
+  // `/d/<domain>` - an engram, the editor, the tree - the frame is the only
+  // one asking, and this is a live origin probe. Hence the window and the
+  // focus rule below: the cards keep their own options on the same key, which
+  // react-query resolves per observer rather than per query.
   const status = useQuery({
     queryKey: syncStatusKey(routeDomain),
     queryFn: () => fetchSyncStatus(routeDomain),
     retry: false,
+    staleTime: PROBE_STALE_MS,
+    refetchOnWindowFocus: false,
     enabled: visible && routeDomain !== "",
   });
   // A domain with no origin answers 404, and that is not a dead end: the
@@ -256,7 +281,8 @@ function useShareAction(): ShareAction {
   const summary = useQuery({
     queryKey: SYNC_SUMMARY_KEY,
     queryFn: fetchSyncSummary,
-    staleTime: SYNC_SUMMARY_STALE_MS,
+    staleTime: PROBE_STALE_MS,
+    refetchOnWindowFocus: false,
     // Not without a credential to read the origins with: the route reports a
     // missing connection rather than refusing over it, so this would be a
     // round trip whose every count is local state alone, to fill in a face

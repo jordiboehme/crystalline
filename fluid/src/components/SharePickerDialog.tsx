@@ -27,7 +27,7 @@ export function SharePickerDialog(props: SharePickerDialogProps): ReactElement {
       fallback={
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/40">
           <p className="rounded border border-slate-200 bg-white px-4 py-2 text-sm text-slate-600 shadow-xl dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300">
-            Opening the share dialog
+            Opening the domain picker
           </p>
         </div>
       }
