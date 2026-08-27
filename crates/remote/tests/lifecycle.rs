@@ -4782,3 +4782,150 @@ async fn a_deleted_file_replays_only_where_it_exists_below() {
             .contains_key("notes/x.md")
     );
 }
+
+// A record written before blob shas were kept (pre-0.17.0) can still be
+// amended: the file it no longer names a blob for is re-read from the working
+// tree and uploaded again, unless a layer above owns that same path - there
+// the working tree holds the layer above's content, and re-reading it would
+// quietly put that content into this layer.
+
+/// Strips the blob sha and size off every file the layer at `index` records,
+/// leaving the record in the pre-0.17.0 shape.
+fn forget_blob_shas(state_dir: &Path, index: usize) {
+    let mut state = load_state(state_dir);
+    for file in state.proposals[index].files.iter_mut() {
+        file.blob_sha = None;
+        file.size = None;
+    }
+    state.save(state_dir).unwrap();
+}
+
+#[tokio::test]
+async fn amending_a_legacy_layer_re_uploads_what_its_record_lost() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    forget_blob_shas(&sub.state_dir, 0);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let report = updated(amend_share(&mock, &sub, first.number).await);
+    assert_eq!(report.number, first.number);
+
+    // The file the record could no longer name a blob for was re-read from
+    // the working tree and uploaded again.
+    let delta = mock.calls().split_off(before);
+    assert!(
+        delta.contains(&format!("create_blob:{}", sha256_hex(b"alpha v2\n"))),
+        "{delta:?}"
+    );
+
+    // And the amend is an ordinary stacked one: one parent, no merge commit,
+    // both files in the tree.
+    let head = mock.branch_commit(&first.branch).expect("the new head");
+    assert_eq!(mock.commit_parents(&head).map(|p| p.len()), Some(1));
+    let tree = mock.commit_tree(&head).expect("the amended tree");
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v2\n".as_slice())
+    );
+    assert_eq!(
+        tree.get("notes/b.md").map(Vec::as_slice),
+        Some(b"beta\n".as_slice())
+    );
+
+    let state = load_state(&sub.state_dir);
+    let kept = state.proposals[0]
+        .files
+        .iter()
+        .find(|f| f.path == "notes/a.md")
+        .expect("the layer still carries its own file");
+    assert!(
+        kept.blob_sha.is_some(),
+        "the record adopted the fresh blob: {kept:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // The layer above refines the very file the bottom layer carries.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+    forget_blob_shas(&sub.state_dir, 0);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(first.number),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect_err("the working tree cannot speak for this layer's copy");
+    match &err {
+        crystalline_remote::RemoteError::State(message) => {
+            assert!(
+                message.contains(&format!("layer #{}", first.number)),
+                "{message}"
+            );
+        }
+        other => panic!("expected a State error, got {other:?}"),
+    }
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a refused amend writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+
+    // A reviewer pushes onto the layer the share would amend.
+    let foreign = mock.add_commit(commit_files(&[("MANIFEST.md", b"# reviewer")]), None);
+    mock.set_branch(&first.branch, &foreign);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(first.number),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+
+    match plan.action {
+        PlannedAction::ProposalDiverged {
+            number, ref branch, ..
+        } => {
+            assert_eq!(number, first.number, "the named layer, not the top");
+            assert_eq!(*branch, first.branch);
+        }
+        ref other => panic!("expected ProposalDiverged, got {other:?}"),
+    }
+}

@@ -1422,7 +1422,19 @@ pub async fn propose_preview(
                 effective_title: String::new(),
             });
         }
-        if local.changes.is_empty() {
+        // The same probe the amend makes, in the same order, so a preview
+        // never promises an amend the share then refuses.
+        let layer = &state.proposals[index];
+        let diverged = match provider.branch_ref(spec, &layer.branch).await? {
+            Some(live_head) if head_is_ours(layer, &live_head) => None,
+            Some(_) => Some(PlannedAction::ProposalDiverged {
+                number: layer.number,
+                url: layer.url.clone(),
+                branch: layer.branch.clone(),
+            }),
+            None => return Err(branch_gone(layer)),
+        };
+        if diverged.is_none() && local.changes.is_empty() {
             return Ok(SharePlan {
                 action: PlannedAction::NothingToShare,
                 changes: local,
@@ -1433,11 +1445,17 @@ pub async fn propose_preview(
         let effective_title = title
             .map(str::to_string)
             .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+        if let Some(action) = diverged {
+            return Ok(SharePlan {
+                action,
+                changes: local,
+                effective_title,
+            });
+        }
         let layers_above = state.proposals[index + 1..]
             .iter()
             .filter(|p| p.status == ProposalStatus::Open)
             .count();
-        let layer = &state.proposals[index];
         return Ok(SharePlan {
             action: PlannedAction::Amend {
                 number: layer.number,
@@ -2013,6 +2031,16 @@ fn not_an_open_layer(state: &OriginState, number: u64) -> RemoteError {
     ))
 }
 
+/// The refusal a share naming a layer whose branch is gone upstream earns:
+/// there is no branch left to amend, and re-creating one behind the same
+/// pull request would be a different operation than the caller asked for.
+fn branch_gone(layer: &Proposal) -> RemoteError {
+    RemoteError::State(format!(
+        "proposal #{}'s branch {} is gone upstream; withdraw the proposal and share again",
+        layer.number, layer.branch
+    ))
+}
+
 /// The refusal a layer that cannot be replayed earns, named rather than
 /// worked around: rebuilding a layer's tree needs the blob shas its record
 /// carries, and a record written before those existed (pre-0.17.0) has none.
@@ -2067,10 +2095,19 @@ fn tip_below_layer(state: &OriginState, index: usize) -> BTreeMap<String, BaseSt
 /// exactly what the record carries, blob sha and digest included. The working
 /// tree cannot speak for the latter - it holds the chain TIP, so a file a
 /// layer above changed reads there as that layer's content, not this one's -
-/// and re-reading it would quietly move one layer's work into another's.
-/// An entry that is no longer a change against the tip below (a file that
-/// converged with it, a retirement of a path nothing below carries) simply
-/// leaves the layer.
+/// and re-reading it would quietly move one layer's work into another's. A
+/// fresh change is dropped from the layer when its content already matches
+/// the tip below (there is nothing left to propose there) and a retirement is
+/// dropped when nothing below carries the path; a KEPT entry is not re-tested
+/// that way, since its own recorded content is what defines the layer.
+///
+/// One consequence to know before reaching for this verb: a fresh edit to a
+/// path an open layer ABOVE owns lands in the amended layer's commit, and
+/// then that layer's replay writes its own recorded content over it, so at
+/// the chain tip the edit is gone and the file reads as an unshared local
+/// change again on the next share. Nothing is lost on disk and no layer is
+/// corrupted, but the edit is not where the caller meant it to be. Amending
+/// the layer that OWNS the path is the way to change it.
 ///
 /// Three properties the shape of this function exists for:
 ///
@@ -2095,10 +2132,12 @@ async fn amend_layer(
     title: Option<&str>,
     description: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
-    // Nothing is written until every layer this amend rebuilds is known to be
-    // rebuildable, the amended one included: a chain re-based halfway is
-    // worse than one never touched.
-    ensure_replayable(&state, index)?;
+    // Nothing is written until every layer this cascade replays is known to be
+    // replayable: a chain re-based halfway is worse than one never touched.
+    // The amended layer itself is not in that set - it is rebuilt from the
+    // working tree rather than replayed from its record, so
+    // [`collect_amend_changes`] decides per file what it can stand on.
+    ensure_replayable(&state, index + 1)?;
 
     let layer = state.proposals[index].clone();
     let live_head = match provider.branch_ref(spec, &layer.branch).await? {
@@ -2114,14 +2153,9 @@ async fn amend_layer(
             }
             live_head
         }
-        None => {
-            // The branch is gone. A stacking share settles such a layer and
-            // carries on, but this share named it: there is nothing to amend.
-            return Err(RemoteError::State(format!(
-                "proposal #{}'s branch {} is gone upstream; withdraw the proposal and share again",
-                layer.number, layer.branch
-            )));
-        }
+        // The branch is gone. A stacking share settles such a layer and
+        // carries on, but this share named it: there is nothing to amend.
+        None => return Err(branch_gone(&layer)),
     };
 
     // This share's own work is what stands against the chain tip; the layer's
@@ -2133,6 +2167,15 @@ async fn amend_layer(
         });
     }
 
+    // Which paths the layers above claim decides whether the working tree may
+    // be read for a file this layer's record can no longer name a blob for:
+    // where a layer above owns the path, the tree holds that layer's content.
+    let owned_above: BTreeSet<String> = state.proposals[index + 1..]
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .flat_map(|p| p.files.iter().map(|file| file.path.clone()))
+        .collect();
+
     let below = tip_below_layer(&state, index);
     let collected = collect_amend_changes(
         provider,
@@ -2141,6 +2184,7 @@ async fn amend_layer(
         state_dir,
         &layer,
         &below,
+        &owned_above,
         &fresh,
         description,
     )
@@ -2238,6 +2282,17 @@ async fn amend_layer(
 /// change against `below`. A fresh change whose content already matches
 /// `below` takes the path OUT of the layer entirely: the layer has nothing
 /// left to propose there.
+///
+/// A kept entry from before blob shas were recorded (pre-0.17.0) has nothing
+/// to rebuild the tree from, and there is exactly one place to get it back:
+/// the working tree. That is sound only where no OPEN layer above owns the
+/// path, since above it the tree holds the upper layer's content rather than
+/// this one's - `owned_above` is that set, and a path in it refuses the whole
+/// amend with the teaching error instead. Where the re-read is allowed it is
+/// still checked rather than trusted: a kept entry is by construction one
+/// that did not change against the chain tip, so the bytes on disk must hash
+/// to the digest the record carries, and content that does not is a refusal
+/// rather than a blob upload of the wrong bytes.
 #[allow(clippy::too_many_arguments)]
 async fn collect_amend_changes(
     provider: &dyn Provider,
@@ -2246,6 +2301,7 @@ async fn collect_amend_changes(
     state_dir: &Path,
     layer: &Proposal,
     below: &BTreeMap<String, BaseStamp>,
+    owned_above: &BTreeSet<String>,
     fresh: &crate::changes::LocalChanges,
     description: Option<&str>,
 ) -> Result<CollectedChanges, RemoteError> {
@@ -2261,9 +2317,37 @@ async fn collect_amend_changes(
             ProposedChange::Added | ProposedChange::Modified => true,
             ProposedChange::Deleted => below.contains_key(&file.path),
         };
-        if still_a_change {
-            merged.insert(file.path.clone(), file.clone());
+        if !still_a_change {
+            continue;
         }
+        let mut kept = file.clone();
+        let needs_blob = matches!(
+            kept.change,
+            ProposedChange::Added | ProposedChange::Modified
+        ) && kept.blob_sha.is_none();
+        if needs_blob {
+            if owned_above.contains(&kept.path) {
+                return Err(unreplayable_layer(layer.number));
+            }
+            let Some(recorded) = kept.sha256.clone() else {
+                // No blob and no digest: nothing to rebuild the file from and
+                // nothing to check a re-read against.
+                return Err(unreplayable_layer(layer.number));
+            };
+            let wt_path = checked_working_path(state_dir, domain_root, &kept.path)?;
+            let Some(bytes) = read_optional_file(&wt_path)? else {
+                return Err(unreplayable_layer(layer.number));
+            };
+            if state::sha256_hex(&bytes) != recorded {
+                return Err(RemoteError::State(format!(
+                    "layer #{} records {} at content the working tree no longer holds; share that change or withdraw the layer",
+                    layer.number, kept.path
+                )));
+            }
+            kept.blob_sha = Some(provider.create_blob(spec, &bytes).await?);
+            kept.size = Some(bytes.len() as u64);
+        }
+        merged.insert(kept.path.clone(), kept);
     }
 
     for change in &fresh.changes {
