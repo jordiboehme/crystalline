@@ -934,7 +934,10 @@ pub async fn share_changes_preview(
         ));
     }
     Ok(Json(
-        state.engine.origin_share_preview(&domain, None).await?,
+        state
+            .engine
+            .origin_share_preview(&domain, None, None)
+            .await?,
     ))
 }
 
@@ -1052,7 +1055,12 @@ pub async fn share_now(
     Ok(Json(
         state
             .engine
-            .origin_share(&domain, body.title.as_deref(), body.description.as_deref())
+            .origin_share(
+                &domain,
+                body.title.as_deref(),
+                body.description.as_deref(),
+                None,
+            )
             .await?,
     ))
 }

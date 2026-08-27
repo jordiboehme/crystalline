@@ -1190,6 +1190,7 @@ pub async fn origin_share(
     domain: &str,
     title: Option<&str>,
     description: Option<&str>,
+    proposal: Option<u64>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -1197,7 +1198,7 @@ pub async fn origin_share(
     if use_daemon(db, config_path)
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "origin_share", "domain": domain,
-            "title": title, "description": description,
+            "title": title, "description": description, "proposal": proposal,
         }))
         .await?
     {
@@ -1206,7 +1207,9 @@ pub async fn origin_share(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_share(domain, title, description).await?)
+    Ok(engine
+        .origin_share(domain, title, description, proposal)
+        .await?)
 }
 
 /// Withdraw a share proposal for one team domain: over the daemon when one

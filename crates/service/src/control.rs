@@ -283,7 +283,12 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let title = req.get("title").and_then(Value::as_str);
             let description = req.get("description").and_then(Value::as_str);
-            match shared.engine.origin_share(domain, title, description).await {
+            let proposal = req.get("proposal").and_then(Value::as_u64);
+            match shared
+                .engine
+                .origin_share(domain, title, description, proposal)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }

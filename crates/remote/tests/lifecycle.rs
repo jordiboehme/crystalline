@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crystalline_remote::ops::{
-    PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, propose,
+    PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions, SubscribeReport, propose,
     propose_preview, pull, resolve, status, subscribe, withdraw,
 };
 use crystalline_remote::provider::{
@@ -156,8 +156,7 @@ async fn shared_once(mock: &MockProvider) -> (Subscribed, crystalline_remote::op
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -775,7 +774,7 @@ async fn scenario_10_declined_proposal_without_movement() {
     assert!(st.history.is_empty());
 
     // Status surfaces it as a declined proposal.
-    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(status_report.declined_proposals.len(), 1);
@@ -841,7 +840,7 @@ async fn scenario_11_missing_base_commit_re_baselines() {
     );
 
     // Subsequent status reports a.md as a local change against the new base.
-    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(status_report.local_changes, 1);
@@ -899,7 +898,7 @@ async fn scenario_13_status_offline_and_online() {
     let (sub, _) = subscribe_at(&mock, &c1).await;
 
     // Offline: no probe, behind is unknown.
-    let offline = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let offline = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(offline.behind, None);
@@ -908,9 +907,15 @@ async fn scenario_13_status_offline_and_online() {
     assert_eq!(offline.base_commit, c1);
 
     // Online, branch unmoved: not behind.
-    let online_unmoved = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let online_unmoved = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(online_unmoved.behind, Some(false));
 
     // Move the branch, then probe again: now behind.
@@ -923,9 +928,15 @@ async fn scenario_13_status_offline_and_online() {
     );
     mock.set_branch("main", &c2);
 
-    let online_moved = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let online_moved = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(online_moved.behind, Some(true));
 
     // A status probe that found the branch moved must not poison the stored
@@ -1054,8 +1065,7 @@ async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
         &sub.domain_root,
         "Brand Team",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1199,8 +1209,7 @@ async fn scenario_16_propose_with_conflicts_pending_refuses_without_provider_wri
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap_err();
@@ -1234,8 +1243,7 @@ async fn scenario_18_propose_with_no_local_changes_is_nothing_to_share() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1282,8 +1290,7 @@ async fn scenario_17_propose_freshness_pulls_first_then_proposes_on_new_base() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1332,8 +1339,7 @@ async fn scenario_19_propose_full_circle_merged_verbatim_is_consumed_by_pull() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1387,8 +1393,7 @@ async fn scenario_20_propose_amended_merge_upstream_wins_silently() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1434,6 +1439,7 @@ async fn scenario_20_withdraw_open_closes_the_pr_and_keeps_files() {
         &sub.domain_root,
         &sub.state_dir,
         None,
+        false,
         false,
     )
     .await
@@ -1481,8 +1487,7 @@ async fn scenario_20_withdraw_revert_restores_undiverged_files() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1503,6 +1508,7 @@ async fn scenario_20_withdraw_revert_restores_undiverged_files() {
         &sub.state_dir,
         Some(report.number),
         true,
+        false,
     )
     .await
     .unwrap();
@@ -1538,6 +1544,7 @@ async fn scenario_20_withdraw_declined_skips_the_close() {
         &sub.state_dir,
         Some(first.number),
         false,
+        false,
     )
     .await
     .unwrap();
@@ -1572,6 +1579,7 @@ async fn scenario_20_withdraw_refuses_a_merged_proposal() {
         &sub.state_dir,
         Some(first.number),
         false,
+        false,
     )
     .await
     .unwrap_err();
@@ -1592,9 +1600,17 @@ async fn scenario_20_withdraw_close_failure_aborts_untouched() {
     let (sub, first) = shared_once(&mock).await;
     mock.fail_close_proposal(first.number);
 
-    let err = withdraw(&mock, &spec(), &sub.domain_root, &sub.state_dir, None, true)
-        .await
-        .unwrap_err();
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        true,
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1629,6 +1645,7 @@ async fn scenario_20_withdraw_targeting_names_candidates() {
         &sub.state_dir,
         None,
         false,
+        false,
     )
     .await
     .unwrap_err();
@@ -1646,6 +1663,7 @@ async fn scenario_20_withdraw_targeting_names_candidates() {
         &sub.domain_root,
         &sub.state_dir,
         Some(99),
+        false,
         false,
     )
     .await
@@ -1737,6 +1755,7 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
         &sub.state_dir,
         Some(9),
         true,
+        false,
     )
     .await
     .unwrap();
@@ -1937,8 +1956,7 @@ async fn scenario_23_generated_title_pluralizes_additions_only() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1969,8 +1987,7 @@ async fn scenario_23_generated_title_singular_modification_only() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2012,8 +2029,7 @@ async fn scenario_23_generated_summary_joins_three_plural_clauses_without_an_oxf
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2048,8 +2064,12 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        Some("My own title"),
-        Some("My own description, written by hand."),
+        ShareOptions {
+            title: Some("My own title"),
+            description: Some("My own description, written by hand."),
+            proposal: None,
+            stacks_allowed: false,
+        },
     )
     .await
     .unwrap();
@@ -2118,7 +2138,7 @@ async fn scenario_24_hidden_upstream_paths_never_extract_status_or_share_clean()
 
     // Status: the hidden paths this domain never tracked cannot show up as
     // local changes, since the base snapshot never claimed them either.
-    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(
@@ -2136,8 +2156,7 @@ async fn scenario_24_hidden_upstream_paths_never_extract_status_or_share_clean()
         &sub.domain_root,
         "team-knowledge",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2643,8 +2662,7 @@ async fn scenario_27_consecutive_shares_update_one_proposal() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2736,8 +2754,7 @@ async fn scenario_28_share_update_after_upstream_advance_makes_a_merge_commit() 
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2789,8 +2806,7 @@ async fn scenario_29_diverged_branch_refuses_with_no_writes() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2843,8 +2859,7 @@ async fn scenario_30_declined_proposal_is_superseded_on_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2884,8 +2899,7 @@ async fn scenario_31_gone_ref_with_open_pr_treats_as_declined_and_creates_new() 
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2919,8 +2933,7 @@ async fn scenario_32_migration_none_head_commit_adopts_live_head() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2953,8 +2966,7 @@ async fn an_interrupted_update_heals_on_the_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap_err();
@@ -2983,7 +2995,7 @@ async fn an_interrupted_update_heals_on_the_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2998,8 +3010,7 @@ async fn an_interrupted_update_heals_on_the_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3035,8 +3046,7 @@ async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap_err();
@@ -3053,7 +3063,7 @@ async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3068,8 +3078,7 @@ async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3116,8 +3125,7 @@ async fn scenario_34_nothing_to_share_leaves_the_open_proposal_untouched() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3132,8 +3140,7 @@ async fn scenario_34_nothing_to_share_leaves_the_open_proposal_untouched() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3164,7 +3171,7 @@ async fn scenario_35_preview_reports_update_for_an_open_proposal_without_writing
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3204,7 +3211,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3219,7 +3226,12 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        Some("My title"),
+        ShareOptions {
+            title: Some("My title"),
+            description: None,
+            proposal: None,
+            stacks_allowed: false,
+        },
     )
     .await
     .unwrap();
@@ -3233,8 +3245,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3251,7 +3262,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3284,7 +3295,7 @@ async fn scenario_35_preview_still_pulls_first() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3331,7 +3342,7 @@ async fn scenario_35_preview_reports_conflicts_pending() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3357,7 +3368,7 @@ async fn scenario_35_preview_of_a_declined_record_creates_without_cleanup() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3455,9 +3466,15 @@ async fn scenario_37_status_flips_a_merged_elsewhere_proposal_without_consuming(
     // Merged on GitHub: gone from the open list, and the single GET says merged.
     mock.set_proposal_state(first.number, ProposalState::Merged);
 
-    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert!(
         report.open_proposals.is_empty(),
         "the merged proposal left the open list"
@@ -3489,9 +3506,15 @@ async fn scenario_37_status_flags_an_amended_branch() {
     let amended = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
     mock.set_branch(&first.branch, &amended);
 
-    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.amended_upstream, vec![first.number]);
     assert_eq!(report.open_proposals.len(), 1, "still open, just amended");
     // Exactly one live list call answers both questions this status asks.
@@ -3510,9 +3533,15 @@ async fn scenario_37_status_list_failure_degrades_to_local_state() {
     let (sub, first) = shared_once(&mock).await;
     mock.fail_open_proposals();
 
-    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .expect("a list failure never fails status");
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .expect("a list failure never fails status");
     assert_eq!(report.open_proposals[0].number, first.number);
     assert!(report.amended_upstream.is_empty());
     let st = load_state(&sub.state_dir);
@@ -3727,4 +3756,115 @@ async fn the_mock_forge_models_the_spiked_stack_rules() {
     );
     assert!(calls.contains(&"list_stacks".to_string()), "{calls:?}");
     assert!(calls.contains(&format!("list_stacks:{p3}")), "{calls:?}");
+}
+
+// The cached stacks probe: whether this origin's forge serves stacks at all is
+// asked once per origin and remembered, and the `github.stacks` config gate
+// short-circuits it before a single call leaves the machine.
+
+#[tokio::test]
+async fn the_probe_runs_once_and_caches_the_verdict() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // A forge without `enable_stacks`: the probe answers StacksUnsupported and
+    // the share takes the ordinary living-proposal path.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::Proposed(_)),
+        "a forge without stacks still shares: {outcome:?}"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        Some(false),
+        "the verdict is cached in origin state"
+    );
+    assert_eq!(
+        mock.calls().iter().filter(|c| *c == "list_stacks").count(),
+        1,
+        "exactly one probe: {:?}",
+        mock.calls()
+    );
+
+    // A second share reads the cache instead of probing again.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mock.calls().iter().filter(|c| *c == "list_stacks").count(),
+        1,
+        "still one probe after a second share: {:?}",
+        mock.calls()
+    );
+}
+
+#[tokio::test]
+async fn config_off_never_probes() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: false,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("list_stacks")),
+        "github.stacks off never asks the forge: {:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        None,
+        "the config gate leaves the cache untouched"
+    );
 }

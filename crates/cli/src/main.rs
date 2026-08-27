@@ -1682,6 +1682,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
                 &domain,
                 title.as_deref(),
                 message.as_deref(),
+                None,
                 db.as_deref(),
                 config.as_deref(),
             )

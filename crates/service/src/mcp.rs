@@ -1561,7 +1561,7 @@ impl McpServer {
                 None => {
                     let preview = self
                         .engine
-                        .origin_share_preview(&p.domain, p.title.as_deref())
+                        .origin_share_preview(&p.domain, p.title.as_deref(), None)
                         .await
                         .map_err(to_error)?;
                     // Only a share that would publish gets a question;
@@ -1586,7 +1586,12 @@ impl McpServer {
             }
         }
         self.engine
-            .origin_share(&p.domain, p.title.as_deref(), p.description.as_deref())
+            .origin_share(
+                &p.domain,
+                p.title.as_deref(),
+                p.description.as_deref(),
+                None,
+            )
             .await
             .map_err(to_error)
             .and_then(ok)

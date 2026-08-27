@@ -200,7 +200,10 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     )
     .await;
 
-    let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
+    let share_err = eng
+        .origin_share("brand", None, None, None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(share_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{share_err}"
@@ -212,7 +215,10 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
         "{withdraw_err}"
     );
 
-    let preview_err = eng.origin_share_preview("brand", None).await.unwrap_err();
+    let preview_err = eng
+        .origin_share_preview("brand", None, None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(preview_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{preview_err}"
@@ -243,7 +249,10 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
 
     // None of these need a registered domain: read-only refuses before the
     // domain is even resolved, exactly like `origin_add` above.
-    let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
+    let share_err = eng
+        .origin_share("brand", None, None, None)
+        .await
+        .unwrap_err();
     assert!(matches!(share_err, EngineError::ReadOnly), "{share_err}");
 
     let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
@@ -252,7 +261,10 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
         "{withdraw_err}"
     );
 
-    let preview_err = eng.origin_share_preview("brand", None).await.unwrap_err();
+    let preview_err = eng
+        .origin_share_preview("brand", None, None)
+        .await
+        .unwrap_err();
     assert!(
         matches!(preview_err, EngineError::ReadOnly),
         "{preview_err}"
@@ -1469,7 +1481,7 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
     )
     .unwrap();
 
-    let result = eng.origin_share("brand", None, None).await.unwrap();
+    let result = eng.origin_share("brand", None, None, None).await.unwrap();
     assert_eq!(result["outcome"], "proposed");
     assert_eq!(result["added"][0], "notes/new.md");
     assert!(
@@ -1533,7 +1545,7 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     mock.set_branch("main", &c2);
     eng.origin_update(Some("brand")).await.unwrap();
 
-    let result = eng.origin_share("brand", None, None).await.unwrap();
+    let result = eng.origin_share("brand", None, None, None).await.unwrap();
     assert_eq!(result["outcome"], "conflicts_pending");
     assert_eq!(result["count"], 1);
     let conflicts = result["conflicts"].as_array().unwrap();
@@ -1591,7 +1603,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     ]));
     mock.set_branch("main", &c2);
 
-    let plan = eng.origin_share_preview("brand", None).await.unwrap();
+    let plan = eng.origin_share_preview("brand", None, None).await.unwrap();
     assert_eq!(plan["action"], "nothing_to_share", "{plan}");
     assert!(root.join("notes/upstream-one.md").exists());
     assert_eq!(
@@ -1621,7 +1633,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     )
     .unwrap();
 
-    let result = eng.origin_share("brand", None, None).await.unwrap();
+    let result = eng.origin_share("brand", None, None, None).await.unwrap();
     assert_eq!(result["outcome"], "proposed", "{result}");
     assert_eq!(
         found("second upstream arrival").await,
@@ -1667,7 +1679,7 @@ async fn shared_team_engine(
         engram("Alpha", "notes/a", "alpha v2"),
     )
     .unwrap();
-    let shared = eng.origin_share("kb", None, None).await.unwrap();
+    let shared = eng.origin_share("kb", None, None, None).await.unwrap();
     assert_eq!(shared["outcome"], "proposed", "{shared}");
     let number = shared["number"].as_u64().unwrap();
     (eng, mock, root, number)
@@ -1709,7 +1721,7 @@ async fn origin_share_maps_updated_and_diverged() {
     let (eng, mock, root, number) = shared_team_engine(&tmp).await;
 
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
-    let second = eng.origin_share("kb", None, None).await.unwrap();
+    let second = eng.origin_share("kb", None, None, None).await.unwrap();
     assert_eq!(second["outcome"], "updated");
     assert_eq!(second["proposal"]["number"], number);
 
@@ -1718,7 +1730,7 @@ async fn origin_share_maps_updated_and_diverged() {
     let amended = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
     mock.set_branch(&branch, &amended);
     std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
-    let third = eng.origin_share("kb", None, None).await.unwrap();
+    let third = eng.origin_share("kb", None, None, None).await.unwrap();
     assert_eq!(third["outcome"], "proposal_diverged");
     assert_eq!(third["proposal"]["number"], number);
     assert!(
@@ -1732,7 +1744,7 @@ async fn origin_share_preview_names_the_action_and_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
-    let v = eng.origin_share_preview("kb", None).await.unwrap();
+    let v = eng.origin_share_preview("kb", None, None).await.unwrap();
     assert_eq!(v["action"], "update");
     assert_eq!(v["number"].as_u64(), Some(number));
     let changes = v["changes"].as_array().unwrap();

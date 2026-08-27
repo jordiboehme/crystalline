@@ -8191,7 +8191,8 @@ impl Engine {
         // A probe is best-effort: no connection, or a provider that fails to
         // build, must never turn a status call into a hard failure.
         let probe = self.resolve_origin_provider().ok();
-        match ops::status(&spec, &root, &state_dir, probe.as_deref()).await {
+        let stacks_allowed = self.config.read().unwrap().github_stacks();
+        match ops::status(&spec, &root, &state_dir, probe.as_deref(), stacks_allowed).await {
             Ok(report) => Ok(origin::status_report_json(name, &report, None)),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
@@ -8200,7 +8201,7 @@ impl Engine {
                 // credential here too; the retry below runs probe-free, so
                 // status still comes back offline.
                 self.drop_github_credential_on_auth(&e);
-                let report = ops::status(&spec, &root, &state_dir, None).await?;
+                let report = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await?;
                 Ok(origin::status_report_json(
                     name,
                     &report,
@@ -8393,13 +8394,15 @@ impl Engine {
         let (connected, token_store) = self.origin_connection_offline();
         let rate_limit_wait_until = self.origin_poller.rate_limited_until();
         let targets = self.origin_targets(None).unwrap_or_default();
+        let stacks_allowed = self.config.read().unwrap().github_stacks();
 
         let mut domains = Vec::new();
         for (name, entry) in targets {
             let Ok((spec, root, state_dir)) = self.origin_spec_for(&name, &entry) else {
                 continue;
             };
-            let Ok(report) = ops::status(&spec, &root, &state_dir, None).await else {
+            let Ok(report) = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await
+            else {
                 continue;
             };
             let next_due = self.origin_poller.next_due_at(&name);
@@ -8437,15 +8440,23 @@ impl Engine {
     /// the pull it opens with does, so it ends with the same sync and embed
     /// tail `origin_update_one` runs (see
     /// `Engine::index_what_the_share_pull_applied`).
+    ///
+    /// `proposal` names an open layer to amend instead of letting the share
+    /// pick its own target; `None` is the ordinary call.
     pub async fn origin_share(
         &self,
         domain: &str,
         title: Option<&str>,
         description: Option<&str>,
+        proposal: Option<u64>,
     ) -> Result<Value> {
-        if !self.config.read().unwrap().github_enabled() {
-            return Err(RemoteError::NotEnabled.into());
-        }
+        let stacks_allowed = {
+            let config = self.config.read().unwrap();
+            if !config.github_enabled() {
+                return Err(RemoteError::NotEnabled.into());
+            }
+            config.github_stacks()
+        };
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -8459,8 +8470,12 @@ impl Engine {
             &root,
             domain,
             &state_dir,
-            title,
-            description,
+            ops::ShareOptions {
+                title,
+                description,
+                proposal,
+                stacks_allowed,
+            },
         )
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))
@@ -8528,10 +8543,19 @@ impl Engine {
     /// writes the working tree and is refused on a read-only instance exactly
     /// as a share is - and, for the same reason, it ends with the same sync and
     /// embed tail (see `Engine::index_what_the_share_pull_applied`).
-    pub async fn origin_share_preview(&self, domain: &str, title: Option<&str>) -> Result<Value> {
-        if !self.config.read().unwrap().github_enabled() {
-            return Err(RemoteError::NotEnabled.into());
-        }
+    pub async fn origin_share_preview(
+        &self,
+        domain: &str,
+        title: Option<&str>,
+        proposal: Option<u64>,
+    ) -> Result<Value> {
+        let stacks_allowed = {
+            let config = self.config.read().unwrap();
+            if !config.github_enabled() {
+                return Err(RemoteError::NotEnabled.into());
+            }
+            config.github_stacks()
+        };
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -8539,9 +8563,21 @@ impl Engine {
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let provider = self.resolve_origin_provider()?;
-        let plan = ops::propose_preview(provider.as_ref(), &spec, &root, domain, &state_dir, title)
-            .await
-            .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        let plan = ops::propose_preview(
+            provider.as_ref(),
+            &spec,
+            &root,
+            domain,
+            &state_dir,
+            ops::ShareOptions {
+                title,
+                description: None,
+                proposal,
+                stacks_allowed,
+            },
+        )
+        .await
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
         self.index_what_the_share_pull_applied(domain, "previewing a share")
             .await;
         Ok(origin::share_plan_json(&plan))
@@ -8558,9 +8594,13 @@ impl Engine {
         proposal: Option<u64>,
         revert: bool,
     ) -> Result<Value> {
-        if !self.config.read().unwrap().github_enabled() {
-            return Err(RemoteError::NotEnabled.into());
-        }
+        let stacks_allowed = {
+            let config = self.config.read().unwrap();
+            if !config.github_enabled() {
+                return Err(RemoteError::NotEnabled.into());
+            }
+            config.github_stacks()
+        };
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
@@ -8575,6 +8615,7 @@ impl Engine {
             &state_dir,
             proposal,
             revert,
+            stacks_allowed,
         )
         .await
         .inspect_err(|e| self.drop_github_credential_on_auth(e))?;

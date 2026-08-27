@@ -563,12 +563,17 @@ pub async fn pull(
 /// history stays [`pull`]'s job. The list call is best-effort: a failure logs
 /// and degrades to the offline picture (local statuses unchanged, no amended
 /// flags), never failing the status.
+///
+/// `stacks_allowed` carries `github.stacks` through to the stack-link retry a
+/// status is allowed to make; nothing in the report itself depends on it.
 pub async fn status(
     spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
     probe: Option<&dyn Provider>,
+    stacks_allowed: bool,
 ) -> Result<OriginStatusReport, RemoteError> {
+    let _ = stacks_allowed;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
@@ -697,6 +702,67 @@ pub async fn status(
     })
 }
 
+/// Everything a share call carries besides the domain itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShareOptions<'a> {
+    /// The proposal's title (a new layer) or commit message (an amend).
+    pub title: Option<&'a str>,
+    /// The proposal's description body.
+    pub description: Option<&'a str>,
+    /// Amend this open layer instead of stacking a new proposal.
+    pub proposal: Option<u64>,
+    /// Whether stacked proposals may be used at all (github.stacks config).
+    pub stacks_allowed: bool,
+}
+
+/// The cached stacks verdict for this origin, probing once when unknown.
+///
+/// A forge either serves stacks or it does not, and that answer does not
+/// change between two shares, so it is asked once per origin and kept in
+/// origin state. `stacks_allowed = false` (the `github.stacks` config) is the
+/// user saying no before the question is worth asking: it short-circuits
+/// without probing and without consulting or touching the cache, so turning
+/// the setting back on finds the cache exactly as it was.
+async fn stacks_available(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+    stacks_allowed: bool,
+) -> Result<bool, RemoteError> {
+    if !stacks_allowed {
+        return Ok(false);
+    }
+    if let Some(cached) = state.stacks_available {
+        return Ok(cached);
+    }
+    let verdict = match provider.list_stacks(spec, None).await {
+        Ok(_) => true,
+        Err(RemoteError::StacksUnsupported) => false,
+        Err(e) => return Err(e),
+    };
+    state.stacks_available = Some(verdict);
+    state.save(state_dir)?;
+    Ok(verdict)
+}
+
+/// Whether this origin's open chain is one more layers may be stacked onto.
+///
+/// Zero or one open proposal is trivially compatible: there is no chain to be
+/// inconsistent with. Beyond that the chain must be one this machine knows as
+/// a stack - a recorded stack number, or a link it still owes the forge. A
+/// multi-open state carrying neither predates stacking, and its shares take
+/// the fallback flows.
+#[allow(dead_code)] // The stacked share path is this helper's only caller.
+fn chain_is_stacked(state: &OriginState) -> bool {
+    let open = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .count();
+    open <= 1 || state.stack_number.is_some() || state.stack_link_pending
+}
+
 /// Proposes a domain's local changes as a pull request against its origin.
 ///
 /// `domain_name` is the domain's registered name, the contract's sole
@@ -737,9 +803,11 @@ pub async fn propose(
     domain_root: &Path,
     domain_name: &str,
     state_dir: &Path,
-    title: Option<&str>,
-    description: Option<&str>,
+    options: ShareOptions<'_>,
 ) -> Result<ProposeOutcome, RemoteError> {
+    let ShareOptions {
+        title, description, ..
+    } = options;
     // Freshness first: every proposal must be mergeable at creation.
     pull(provider, spec, domain_root, state_dir).await?;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
@@ -752,6 +820,17 @@ pub async fn propose(
             count: state.conflicts.len(),
         });
     }
+
+    // Ask the forge once, before any share work: whether this share can stack
+    // is a property of the origin, and the answer is cached from here on.
+    let _stacked_path = stacks_available(
+        provider,
+        spec,
+        &mut state,
+        state_dir,
+        options.stacks_allowed,
+    )
+    .await?;
 
     let local = detect_local_changes(domain_root, &state.files)?;
     if local.changes.is_empty() {
@@ -964,15 +1043,18 @@ pub enum PlannedAction {
 /// make.
 ///
 /// `domain_name` plays the same role it plays in [`propose`]: it is what the
-/// generated title calls the domain when the caller supplies none.
+/// generated title calls the domain when the caller supplies none. Of
+/// `options` a preview reads the title alone: a description is only ever
+/// written by a real share, and previewing writes nothing.
 pub async fn propose_preview(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
     domain_name: &str,
     state_dir: &Path,
-    title: Option<&str>,
+    options: ShareOptions<'_>,
 ) -> Result<SharePlan, RemoteError> {
+    let title = options.title;
     pull(provider, spec, domain_root, state_dir).await?;
     let state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
@@ -1301,6 +1383,9 @@ async fn update_open_proposal(
 /// needing repair - the next [`status`] or [`pull`] classifies the closed
 /// pull request and flips the record to Declined, and a retried withdraw then
 /// takes the Declined path (no second close, the remaining files reverted).
+///
+/// `stacks_allowed` carries `github.stacks` through to the stack repair a
+/// withdrawal of a stacked layer needs; a fallback withdrawal ignores it.
 pub async fn withdraw(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -1308,7 +1393,9 @@ pub async fn withdraw(
     state_dir: &Path,
     proposal_number: Option<u64>,
     revert: bool,
+    stacks_allowed: bool,
 ) -> Result<WithdrawReport, RemoteError> {
+    let _ = stacks_allowed;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
