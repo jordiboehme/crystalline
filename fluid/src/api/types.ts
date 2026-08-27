@@ -863,6 +863,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where every team domain on this instance stands, in counts.
+         * @description Admin only. One instance-wide answer to `does anything have something to share?`: the GitHub connection plus, per team domain, its repository, when it was last checked and the counts a share action needs - unshared local changes, open and declined proposals, waiting conflicts. A pure read, served even on a read-only instance. An instance with no GitHub connection is reported, not refused, and an instance with no team domain answers an empty list. Use `GET /domains/{domain}/sync` for one domain's full report.
+         */
+        get: operations["get_sync_summary"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/users": {
         parameters: {
             query?: never;
@@ -5383,6 +5403,76 @@ export interface operations {
             };
             /** @description The body is JSON but not a token, the token is empty, GitHub refused it, or this machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN` and no token may be stored here. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_sync_summary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending; `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "connection": {
+                     *         "connected": true,
+                     *         "token_store": "keychain",
+                     *         "user": "octo"
+                     *       },
+                     *       "domains": [
+                     *         {
+                     *           "branch": "main",
+                     *           "conflicts": 0,
+                     *           "declined_proposals": 0,
+                     *           "domain": "eng",
+                     *           "last_checked": "2026-08-10T08:00:00Z",
+                     *           "local_changes": 2,
+                     *           "mode": "github",
+                     *           "open_proposals": 1,
+                     *           "repo": "acme/knowledge"
+                     *         }
+                     *       ],
+                     *       "errors": []
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on. A missing connection is NOT refused here: the summary comes back with `connection.connected` false instead. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

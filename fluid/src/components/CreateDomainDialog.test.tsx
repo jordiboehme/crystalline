@@ -434,15 +434,20 @@ describe("registering a domain", () => {
     serveAs("admin", { "/settings/github": () => githubStatus(true) });
     renderApp("/users");
 
+    // Counted from where the dialog opens rather than from zero: the frame
+    // asks the same question once for every admin session, to decide whether
+    // to offer its share action, and this is about the dialog adding a probe
+    // of its own.
     const dialog = await openFromSidebar();
+    const before = settingsCalls().length;
     // Local, and then the other mode that has no repository either: the probe
     // belongs to team mode alone, and an instance's GitHub connection is not
-    // something to go asking about because a dialog opened.
+    // something to go asking about again because a dialog opened.
     await userEvent.type(within(dialog).getByLabelText("Name"), "scratch");
     await userEvent.click(
       within(dialog).getByRole("radio", { name: "Virtual" }),
     );
 
-    expect(settingsCalls()).toHaveLength(0);
+    expect(settingsCalls()).toHaveLength(before);
   });
 });

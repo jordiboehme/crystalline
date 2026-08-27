@@ -306,6 +306,9 @@ describe("the layout", () => {
       "/auth/me": () => meResponse({ user: userFixture({ role: "admin" }) }),
       "/domains": domainsResponse,
       "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+      // GitHub is off on this instance, which is what keeps the share action
+      // out of the row below; `ShareAction.test.tsx` is where it is drawn.
+      "/settings/github": () => ({ enabled: false, connected: false }),
     });
 
     renderApp("/");
@@ -320,6 +323,8 @@ describe("the layout", () => {
     // GitHub settings are reached through the identity menu's Settings item;
     // the top bar carries no separate door to the same screen.
     expect(screen.queryByRole("link", { name: "GitHub" })).toBeNull();
+    // And nothing to share on an instance with no origins to share to.
+    expect(screen.queryByRole("button", { name: "Share changes" })).toBeNull();
     expect(screen.getByRole("button", { name: /^Theme:/ })).toBeVisible();
     expect(screen.getByRole("link", { name: "Fluid" })).toHaveAttribute(
       "href",

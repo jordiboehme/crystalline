@@ -11,6 +11,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  SYNC_SUMMARY_KEY,
   archiveDownloadUrl,
   createDomain,
   disconnectGithub,
@@ -18,6 +19,7 @@ import {
   fetchGithubStatus,
   fetchShareChanges,
   fetchSyncStatus,
+  fetchSyncSummary,
   importArchive,
   previewArchive,
   readGithubStatus,
@@ -453,6 +455,82 @@ describe("the admin client layer", () => {
     ]);
     // The counts still count everything, including what the lists dropped.
     expect(status.conflicts).toBe(2);
+  });
+
+  it("reads the instance-wide summary, and files it outside the domain family", async () => {
+    apiMock.mockResolvedValueOnce({
+      connection: { connected: true, user: "octo", token_store: "keychain" },
+      domains: [
+        {
+          domain: "eng",
+          mode: "github",
+          repo: "acme/kb",
+          branch: "main",
+          last_checked: "2026-08-10T08:00:00Z",
+          local_changes: 2,
+          open_proposals: 1,
+          declined_proposals: 0,
+          conflicts: 0,
+        },
+        // No name is no domain to share into, so it never becomes a row: the
+        // name is the handle every screen reading this addresses a share by.
+        { local_changes: 5 },
+      ],
+      errors: [],
+    });
+    const summary = await fetchSyncSummary();
+
+    expect(apiMock).toHaveBeenLastCalledWith("/sync");
+    // Only what a share action needs. The entry carries a repository, a branch
+    // and a last-checked instant too, and none of them is read here: the card
+    // that draws those reads the per-domain report.
+    expect(summary).toEqual({
+      connected: true,
+      domains: [
+        {
+          domain: "eng",
+          localChanges: 2,
+          openProposals: 1,
+          declinedProposals: 0,
+          conflicts: 0,
+        },
+      ],
+    });
+    // And the key it is cached under, deliberately outside the `["domains"]`
+    // family: reading this route probes GitHub, so a bulk domain invalidation
+    // must never reach it.
+    expect(SYNC_SUMMARY_KEY).toEqual(["sync-summary"]);
+    expect(SYNC_SUMMARY_KEY[0]).not.toBe(syncStatusKey("eng")[0]);
+  });
+
+  it("reads a summary that counted nothing as zero, and no block as no answer", async () => {
+    apiMock.mockResolvedValueOnce({ domains: [{ domain: "eng" }] });
+    const summary = await fetchSyncSummary();
+
+    // A count the report left out is none rather than a hole, and a report
+    // with no connection block says nothing about the credential rather than
+    // telling somebody to connect what is already connected.
+    expect(summary.connected).toBeNull();
+    expect(summary.domains).toEqual([
+      {
+        domain: "eng",
+        localChanges: 0,
+        openProposals: 0,
+        declinedProposals: 0,
+        conflicts: 0,
+      },
+    ]);
+  });
+
+  it("reads an instance with no credential on file as not connected", async () => {
+    // The summary reports a missing connection rather than refusing over it,
+    // so `false` is an answer a share action has to be able to act on.
+    apiMock.mockResolvedValueOnce({
+      connection: { connected: false },
+      domains: [],
+    });
+
+    expect((await fetchSyncSummary()).connected).toBe(false);
   });
 
   it("reads what a share would do, defaults included", async () => {

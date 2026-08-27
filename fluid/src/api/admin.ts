@@ -329,6 +329,60 @@ export function sharePlanKey(domain: string): readonly unknown[] {
 }
 
 /**
+ * One team domain's standing, as the instance-wide summary counts it.
+ *
+ * Counts and a name, and nothing else. The entry carries its repository, its
+ * branch and when it was last checked as well, and none of them is read here on
+ * purpose: this is what a share action needs to decide whether to offer itself
+ * and what to fill a picker with, while the card that draws a repository reads
+ * the per-domain report {@link SyncStatus} is made of.
+ */
+export interface SyncSummaryEntry {
+  domain: string;
+  /** Unshared local work, as a count. */
+  localChanges: number;
+  openProposals: number;
+  declinedProposals: number;
+  conflicts: number;
+}
+
+/** Where every team domain on this instance stands, in one read. */
+export interface SyncSummary {
+  /**
+   * Whether this instance has a GitHub credential on file, or null when the
+   * report carried no connection block at all. The three states are three
+   * different sentences, for the reason {@link SyncStatus.connected} spells
+   * out.
+   */
+  connected: boolean | null;
+  /** One entry per team domain; empty on an instance that has none. */
+  domains: SyncSummaryEntry[];
+}
+
+/**
+ * The cache key of the instance-wide sync summary, and the second key in this
+ * app that deliberately sits outside the `["domains", ...]` family.
+ *
+ * Reading the summary probes GitHub for every team domain at once, so it is not
+ * a cache of domain content: react-query invalidates by prefix, and a summary
+ * filed under `["domains"]` would be refetched - which is to say, would probe -
+ * by every bulk domain invalidation in the app, including the ones a share and
+ * an import fire on their way out. {@link sharePlanKey} carries the same
+ * reasoning for the same reason.
+ */
+export const SYNC_SUMMARY_KEY = ["sync-summary"] as const;
+
+/**
+ * How long a summary stays fresh, in milliseconds.
+ *
+ * Here rather than at one use site because there are two - the frame's share
+ * action and the picker it opens - and a picker that considered the frame's
+ * answer stale would probe every origin again in the act of being opened,
+ * which is a round trip to GitHub per domain to draw a list already in hand.
+ */
+export const SYNC_SUMMARY_STALE_MS = 30_000;
+
+/**
  * A count that may arrive as a number or as the list it counts.
  *
  * The engine's status report embeds the proposals and the conflicts themselves
@@ -444,6 +498,48 @@ export async function fetchSyncStatus(domain: string): Promise<SyncStatus> {
   return readSyncStatus(
     await api<unknown>(`/domains/${encodeSegment(domain)}/sync`),
   );
+}
+
+/**
+ * One summary entry.
+ *
+ * The name or nothing: it is the handle a share is addressed by, so an entry
+ * without one is dropped rather than offered as a row that would open a dialog
+ * pointing at no domain.
+ */
+function readSummaryEntry(value: unknown): SyncSummaryEntry | null {
+  const record = asObject(value);
+  const domain = asString(record?.domain);
+  if (domain === null) {
+    return null;
+  }
+  return {
+    domain,
+    localChanges: asCount(record?.local_changes),
+    openProposals: asCount(record?.open_proposals),
+    declinedProposals: asCount(record?.declined_proposals),
+    conflicts: asCount(record?.conflicts),
+  };
+}
+
+/**
+ * Where every team domain stands, in counts. Admin only.
+ *
+ * An instance with GitHub switched off refuses this with a 409, and an instance
+ * with no credential on file is reported rather than refused - `connected` is
+ * false and the entries are local state alone.
+ */
+export async function fetchSyncSummary(): Promise<SyncSummary> {
+  const record = asObject(await api<unknown>("/sync"));
+  const connected = asObject(record?.connection)?.connected;
+  return {
+    // Only a literal boolean is an answer, the way the per-domain report reads
+    // the same block: anything else is "this report does not say".
+    connected: typeof connected === "boolean" ? connected : null,
+    domains: asArray(record?.domains)
+      .map(readSummaryEntry)
+      .filter((entry): entry is SyncSummaryEntry => entry !== null),
+  };
 }
 
 /** Pull this team domain's origin now. */
