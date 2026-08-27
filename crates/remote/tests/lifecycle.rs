@@ -189,6 +189,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
             path: path.to_string(),
             change: ProposedChange::Added,
             sha256,
+            blob_sha: None,
         }],
         head_commit: None,
         pending_head_commit: None,
@@ -1127,16 +1128,21 @@ async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
                 path: "notes/added.md".to_string(),
                 change: ProposedChange::Added,
                 sha256: Some(sha256_hex(b"brand new\n")),
+                // The mock provider hands back the content's own sha256 as
+                // its blob sha, so the two match here by construction.
+                blob_sha: Some(sha256_hex(b"brand new\n")),
             },
             ProposedFile {
                 path: "notes/edit.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"after\n")),
+                blob_sha: Some(sha256_hex(b"after\n")),
             },
             ProposedFile {
                 path: "notes/gone.md".to_string(),
                 change: ProposedChange::Deleted,
                 sha256: None,
+                blob_sha: None,
             },
         ]
     );
@@ -1692,16 +1698,19 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
                 path: "notes/keep.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"shared keep v2\n")),
+                blob_sha: None,
             },
             ProposedFile {
                 path: "notes/diverge.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"shared diverge v2\n")),
+                blob_sha: None,
             },
             ProposedFile {
                 path: "notes/added.md".to_string(),
                 change: ProposedChange::Added,
                 sha256: Some(sha256_hex(b"newly added\n")),
+                blob_sha: None,
             },
         ],
         head_commit: None,

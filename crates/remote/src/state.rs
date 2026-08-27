@@ -88,6 +88,29 @@ pub struct OriginState {
     pub history: Vec<Proposal>,
     /// Conflicts from a previous pull still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
+    /// The GitHub stack number linking the open proposals, once two or more
+    /// layers exist. `None` while zero or one proposal is open, and always
+    /// `None` on the fallback (no-stacks) path. A recreate after a withdraw
+    /// repair allocates a NEW number - stack numbers come from the same
+    /// sequence as issue and pull request numbers.
+    #[serde(default)]
+    pub stack_number: Option<u64>,
+    /// The cached probe verdict: does this origin's forge serve the stacked
+    /// pull request endpoints? `None` = never probed (the next stacked-path
+    /// operation probes and records). A fresh subscribe starts at `None`, so
+    /// re-subscribing re-probes.
+    #[serde(default)]
+    pub stacks_available: Option<bool>,
+    /// True from just before a withdraw repair dissolves the stack until the
+    /// repair's recreate completes, so an interrupted repair is visible and
+    /// the next share or withdraw finishes it before doing its own work.
+    #[serde(default)]
+    pub repair_pending: bool,
+    /// True when a proposal was opened but its stack create/extend call
+    /// failed after retries: the chain is degraded (a PR outside the stack),
+    /// not wrong. Retried at the start of share, withdraw and status.
+    #[serde(default)]
+    pub stack_link_pending: bool,
 }
 
 /// The recorded shape of a file in the base snapshot: enough to tell, without
@@ -217,6 +240,13 @@ pub struct ProposedFile {
     /// The SHA-256 hex digest of the file's new content, absent when
     /// `change` is [`ProposedChange::Deleted`].
     pub sha256: Option<String>,
+    /// The git blob sha of the shared content, recorded at share time so a
+    /// cascade replay can rebuild the layer's tree without re-reading the
+    /// local file, which may have changed since. `None` on a record written
+    /// before this field existed (pre-0.17.0) and whenever `change` is
+    /// [`ProposedChange::Deleted`], which carries no content.
+    #[serde(default)]
+    pub blob_sha: Option<String>,
 }
 
 /// How a single file changed within a [`Proposal`].
@@ -266,6 +296,10 @@ impl OriginState {
             proposals: Vec::new(),
             history: Vec::new(),
             conflicts: Vec::new(),
+            stack_number: None,
+            stacks_available: None,
+            repair_pending: false,
+            stack_link_pending: false,
         }
     }
 
@@ -1159,14 +1193,64 @@ mod tests {
             path: "notes/new.md".to_string(),
             change: ProposedChange::Added,
             sha256: Some(sha256_hex(b"content")),
+            blob_sha: None,
         };
         let deleted = ProposedFile {
             path: "notes/old.md".to_string(),
             change: ProposedChange::Deleted,
             sha256: None,
+            blob_sha: None,
         };
         assert!(added.sha256.is_some());
         assert!(deleted.sha256.is_none());
+    }
+
+    #[test]
+    fn origin_state_stack_fields_default_and_round_trip() {
+        let mut state = OriginState::new("team/knowledge", "main");
+        assert_eq!(state.stack_number, None);
+        assert_eq!(state.stacks_available, None);
+        assert!(!state.repair_pending);
+        assert!(!state.stack_link_pending);
+        state.stack_number = Some(42);
+        state.stacks_available = Some(true);
+        state.repair_pending = true;
+        state.stack_link_pending = true;
+        let json = serde_json::to_string(&state).unwrap();
+        let back: OriginState = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.stack_number, Some(42));
+        assert_eq!(back.stacks_available, Some(true));
+        assert!(back.repair_pending);
+        assert!(back.stack_link_pending);
+    }
+
+    #[test]
+    fn a_pre_stacks_state_json_loads_with_absent_stack_fields() {
+        // A 0.16.0-shaped record: none of the four stack fields present.
+        let json = r#"{"version":1,"repo":"team/knowledge","branch":"main",
+            "base_commit":"abc","ref_etag":null,"last_checked":null,
+            "files":{},"proposals":[],"history":[],"conflicts":[]}"#;
+        let state: OriginState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.stack_number, None);
+        assert_eq!(state.stacks_available, None);
+        assert!(!state.repair_pending);
+        assert!(!state.stack_link_pending);
+    }
+
+    #[test]
+    fn proposed_file_blob_sha_defaults_none_and_round_trips() {
+        let json = r#"{"path":"a.md","change":"Added","sha256":"deadbeef"}"#;
+        let pf: ProposedFile = serde_json::from_str(json).unwrap();
+        assert_eq!(pf.blob_sha, None);
+        let with = ProposedFile {
+            path: "a.md".into(),
+            change: ProposedChange::Added,
+            sha256: Some("deadbeef".into()),
+            blob_sha: Some("b10b".into()),
+        };
+        let back: ProposedFile =
+            serde_json::from_str(&serde_json::to_string(&with).unwrap()).unwrap();
+        assert_eq!(back.blob_sha.as_deref(), Some("b10b"));
     }
 
     #[test]

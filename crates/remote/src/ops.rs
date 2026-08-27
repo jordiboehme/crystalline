@@ -1094,7 +1094,7 @@ async fn collect_changes(
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
                     path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: Some(blob_sha),
+                    blob_sha: Some(blob_sha.clone()),
                 });
                 out.entries.added.push((path.clone(), bytes));
                 out.added.push(path.clone());
@@ -1102,6 +1102,7 @@ async fn collect_changes(
                     path: path.clone(),
                     change: ProposedChange::Added,
                     sha256: Some(sha256.clone()),
+                    blob_sha: Some(blob_sha),
                 });
             }
             LocalChange::Modified { path, sha256 } => {
@@ -1110,7 +1111,7 @@ async fn collect_changes(
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
                     path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: Some(blob_sha),
+                    blob_sha: Some(blob_sha.clone()),
                 });
                 out.entries.updated.push((path.clone(), bytes));
                 out.updated.push(path.clone());
@@ -1118,6 +1119,7 @@ async fn collect_changes(
                     path: path.clone(),
                     change: ProposedChange::Modified,
                     sha256: Some(sha256.clone()),
+                    blob_sha: Some(blob_sha),
                 });
             }
             LocalChange::Deleted { path } => {
@@ -1137,6 +1139,7 @@ async fn collect_changes(
                     path: path.clone(),
                     change: ProposedChange::Deleted,
                     sha256: None,
+                    blob_sha: None,
                 });
             }
         }

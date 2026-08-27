@@ -162,6 +162,14 @@ impl GlobalConfig {
             .unwrap_or(false)
     }
 
+    /// Whether shares may stack their proposals, from `github.stacks`. Absent
+    /// config or an absent key means yes (true): where the forge serves the
+    /// stacked pull request endpoints a share adds a layer, and setting the
+    /// key to `false` forces the single living proposal behavior everywhere.
+    pub fn github_stacks(&self) -> bool {
+        self.github.as_ref().and_then(|g| g.stacks).unwrap_or(true)
+    }
+
     /// The configured salience-prior weight, or `None` to use the store default.
     pub fn salience_weight(&self) -> Option<f64> {
         self.search.as_ref().and_then(|s| s.salience_weight)
@@ -412,6 +420,11 @@ pub struct GitHubConfig {
     /// Absent means 300.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_secs: Option<u64>,
+    /// Whether shares may use GitHub's stacked pull requests where the forge
+    /// serves them. Absent means yes; `false` forces the single living
+    /// proposal behavior everywhere. See the `configure` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacks: Option<bool>,
     /// The GitHub API base URL, for a GitHub Enterprise Server instance.
     /// Absent means `https://api.github.com`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1012,6 +1025,25 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_stacks_defaults_true_and_reads_the_key() {
+        let mut config = GlobalConfig::default();
+        assert!(
+            config.github_stacks(),
+            "absent github block means stacks allowed"
+        );
+        config.github = Some(GitHubConfig {
+            stacks: Some(false),
+            ..Default::default()
+        });
+        assert!(!config.github_stacks());
+        config.github = Some(GitHubConfig {
+            stacks: Some(true),
+            ..Default::default()
+        });
+        assert!(config.github_stacks());
+    }
 
     /// The tri-state parses from every spelling it can arrive in, and the two
     /// booleans survive a round trip as booleans, so an existing config that
