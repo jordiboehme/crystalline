@@ -4,10 +4,20 @@
  *
  * The plan is the reason this is a dialog rather than a button. The server's
  * own word for the action decides everything the dialog says and whether it
- * offers to act at all: only `create` and `update` are shareable, and the other
- * three - nothing to share, conflicts waiting, a proposal a reviewer moved -
- * are states where a share would do nothing or something surprising. Each of
- * them says so in a sentence instead of leaving a live button that fails.
+ * offers to act at all: `create`, `update`, `stack` and `amend` are shareable,
+ * and the other three - nothing to share, conflicts waiting, a proposal a
+ * reviewer moved - are states where a share would do nothing or something
+ * surprising. Each of them says so in a sentence instead of leaving a live
+ * button that fails.
+ *
+ * Where a chain is open, which layer the share lands on is a choice rather than
+ * a verdict, and it is the one choice this dialog adds. Stacking a new layer on
+ * top is the default because that is what the engine would do unasked and what
+ * keeps each review focused; naming an open layer amends it instead, which is
+ * how somebody acts on that layer's review feedback. The layers themselves come
+ * off the status the proposals card already read, under the same key: opening
+ * this dialog from the card costs nothing, and opening it from the top bar's
+ * picker costs one read of a domain the reader is not standing in.
  *
  * An untouched title is not sent. The field is prefilled with the title the
  * server would generate anyway, so echoing it back as an explicit title would
@@ -31,9 +41,12 @@ import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 import { useId, useState } from "react";
 
+import type { SharePlan } from "../api/admin";
 import {
   SYNC_SUMMARY_KEY,
   fetchShareChanges,
+  fetchSyncStatus,
+  readStackPlacement,
   shareDomain,
   sharePlanKey,
   syncStatusKey,
@@ -59,6 +72,10 @@ export default function ShareDialogBody({
   const queryClient = useQueryClient();
   const titleField = useId();
   const descriptionField = useId();
+  const proposalField = useId();
+  // "" is "stack a new layer on top", which is what the engine does unasked;
+  // a number is the open layer somebody chose to amend instead.
+  const [target, setTarget] = useState("");
   // `null` is "nobody has typed here", which is what keeps the prefill out of
   // the request; an empty string is a title somebody deliberately cleared.
   const [title, setTitle] = useState<string | null>(null);
@@ -93,6 +110,32 @@ export default function ShareDialogBody({
     enabled: outcome === null,
   });
 
+  // The open layers, off the status the proposals card is drawn from: same
+  // key, same fetcher, so mounting this over that card is a cache read. Held
+  // rather than refetched while the dialog is open - re-reading it pulls the
+  // origin, and nothing about a list of open layers changes because a field
+  // was typed in - and never retried, since the refusals it can carry (a
+  // domain with no origin, GitHub off) are immediate and final. A domain this
+  // read cannot answer for simply offers no layer to amend.
+  const status = useQuery({
+    queryKey: syncStatusKey(domain),
+    queryFn: () => fetchSyncStatus(domain),
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+  const openLayers = (status.data?.proposals ?? []).filter(
+    (proposal) => proposal.status === "open",
+  );
+  const amending = target === "" ? null : Number(target);
+  // How many layers the chosen amend would rebuild, counted off the same
+  // bottom-first order the chain is reviewed in.
+  const chosenIndex = openLayers.findIndex(
+    (proposal) => proposal.number === amending,
+  );
+  const chosenLayersAbove =
+    chosenIndex < 0 ? null : openLayers.length - 1 - chosenIndex;
+
   const effectiveTitle = plan.data?.effectiveTitle ?? "";
   const typed = title?.trim() ?? "";
   /** A title of the author's own, as opposed to the prefill handed back. */
@@ -105,6 +148,10 @@ export default function ShareDialogBody({
         ...(description.trim() !== ""
           ? { description: description.trim() }
           : {}),
+        // Only when somebody chose a layer: the engine picks its own target
+        // otherwise, and sending the one it would have picked would turn a
+        // stack into an amend of the layer under it.
+        ...(amending === null ? {} : { proposal: amending }),
       }),
     onSuccess: (result) => {
       setOutcome(describeOutcome(result));
@@ -127,7 +174,11 @@ export default function ShareDialogBody({
   });
 
   const action = plan.data?.action ?? null;
-  const shareable = action === "create" || action === "update";
+  const shareable =
+    action === "create" ||
+    action === "update" ||
+    action === "stack" ||
+    action === "amend";
   const planProblem = plan.error === null ? null : problemDetail(plan.error);
   const changes = plan.data?.changes ?? [];
 
@@ -162,11 +213,13 @@ export default function ShareDialogBody({
             {outcome !== null
               ? "Done."
               : planProblem === null
-                ? actionLine(
-                    action,
-                    plan.data?.number ?? null,
-                    plan.data?.count ?? null,
-                  )
+                ? // A chosen layer is the plan now: the server planned the
+                  // target it would have picked, and saying that line over a
+                  // choice somebody just made would describe a different
+                  // share from the one the button would send.
+                  amending === null
+                  ? actionLine(plan.data ?? null)
+                  : amendLine(amending, chosenLayersAbove)
                 : "This share could not be planned."}
           </Dialog.Description>
           {outcome === null ? (
@@ -200,6 +253,39 @@ export default function ShareDialogBody({
                     </li>
                   ))}
                 </ul>
+              )}
+              {openLayers.length > 0 && (
+                <Field id={proposalField} label="Proposal">
+                  <select
+                    id={proposalField}
+                    className={FIELD_CLASSES}
+                    value={target}
+                    onChange={(event) => {
+                      setTarget(event.target.value);
+                    }}
+                  >
+                    {/* The engine's own default, first and selected: each
+                        share gets its own focused review, and reviewers land
+                        the chain by merging the top. */}
+                    <option value="">New proposal (stack on top)</option>
+                    {openLayers.map((layer) => (
+                      <option key={layer.number} value={String(layer.number)}>
+                        Amend #{String(layer.number)} - {layer.title}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+              )}
+              {amending !== null && (
+                // The one thing somebody amending a layer has to know, and it
+                // is general rather than a list of paths: the engine knows
+                // which files the layers above claim, and a change to one of
+                // them belongs in the layer that claimed it - put lower, it
+                // is simply overwritten by the layer above.
+                <p className="text-caption text-slate-500 dark:text-slate-400">
+                  Changes to files a higher layer already touched belong in that
+                  layer instead.
+                </p>
               )}
               <Field
                 id={titleField}
@@ -285,6 +371,22 @@ export default function ShareDialogBody({
 }
 
 /**
+ * What amending a named layer would do, in the same voice the plan speaks in.
+ *
+ * Written here rather than left to the plan, because the plan is about the
+ * target the server picked and this is about the one somebody chose instead.
+ * The layers above are named when there are any: amending under them rebuilds
+ * work that is already in front of reviewers, which is the whole difference
+ * between amending the top layer and amending one below it.
+ */
+function amendLine(number: number, layersAbove: number | null): string {
+  const named = `proposal #${String(number)}`;
+  return layersAbove === null || layersAbove === 0
+    ? `Sharing amends ${named}.`
+    : `Sharing amends ${named} and re-bases ${plural(layersAbove, "layer", "layers")} above it.`;
+}
+
+/**
  * The one sentence the plan earns: what pressing Share would do, or why there
  * is nothing for it to do.
  *
@@ -294,11 +396,14 @@ export default function ShareDialogBody({
  * shared. A plan that was refused never reaches here - the caller says so in
  * the server's own words instead.
  */
-function actionLine(
-  action: string | null,
-  number: number | null,
-  count: number | null,
-): string {
+function actionLine(plan: SharePlan | null): string {
+  const {
+    action = null,
+    number = null,
+    count = null,
+    topNumber = null,
+    layersAbove = null,
+  } = plan ?? {};
   const named =
     number === null ? "the proposal" : `proposal #${String(number)}`;
   switch (action) {
@@ -306,6 +411,16 @@ function actionLine(
       return `Sharing updates ${named}.`;
     case "create":
       return "Sharing opens a new proposal.";
+    case "stack":
+      // The layer it lands on is the whole difference between a stack and a
+      // lone proposal, so it is named rather than implied.
+      return topNumber === null
+        ? "Will stack a new proposal on top of the open one."
+        : `Will stack a new proposal on top of #${String(topNumber)}.`;
+    case "amend":
+      return number === null
+        ? "Sharing amends the open proposal."
+        : amendLine(number, layersAbove);
     case "nothing_to_share":
       return "Nothing to share: the team already has all of this.";
     case "conflicts_pending":
@@ -322,6 +437,32 @@ function actionLine(
 }
 
 /**
+ * Where the proposal that just landed sits in its chain, as a clause to hang
+ * off its name, or the empty string when there is no chain worth naming.
+ *
+ * Two rules, and they are the CLI's own to the letter. The position is what
+ * decides whether this is a layer at all, never the stack number: on the
+ * stacked path a chain whose linking call has not landed carries real
+ * positions with no number, and "stack #null" would be worse than saying
+ * nothing about the number. And a chain of one open layer is not a chain a
+ * reader needs told about, so a lone proposal reads exactly as it always did.
+ */
+function placementLine(payload: unknown): string {
+  const { stackNumber, stackPosition } = readStackPlacement(payload);
+  if (stackPosition === null) {
+    return "";
+  }
+  const [layer, open] = stackPosition;
+  if (open < 2) {
+    return "";
+  }
+  const where = `, layer ${String(layer)} of ${String(open)}`;
+  return stackNumber === null
+    ? `${where} (stack link pending)`
+    : `${where} on stack #${String(stackNumber)}`;
+}
+
+/**
  * The one sentence the outcome earns.
  *
  * Read off the engine's own report rather than through a parsed shape, because
@@ -329,19 +470,27 @@ function actionLine(
  * the top level on a create and inside `proposal` on the two that already have
  * one. Read with the same primitives every `api/` reader uses, so a report
  * that arrives without a number says so in words instead of printing a gap.
+ *
+ * The two answers that landed also say where in the chain they landed, and the
+ * two rules for saying it are the ones {@link readStackPlacement} carries: the
+ * position is the gate, and a chain of one open layer is not a chain anybody
+ * needs told about.
  */
 function describeOutcome(result: unknown): string {
   const record = asObject(result);
   const outcome = asString(record?.outcome) ?? "";
-  const number =
-    asNumber(record?.number) ?? asNumber(asObject(record?.proposal)?.number);
+  // A `proposed` report carries its placement at the top level and an
+  // `updated` one inside `proposal`, the same split the number follows.
+  const proposal = asObject(record?.proposal);
+  const number = asNumber(record?.number) ?? asNumber(proposal?.number);
   const named =
     number === null ? "the proposal" : `proposal #${String(number)}`;
+  const placed = `${named}${placementLine(proposal ?? record)}`;
   switch (outcome) {
     case "updated":
-      return `Updated ${named}.`;
+      return `Updated ${placed}.`;
     case "proposed":
-      return `Opened ${named}.`;
+      return `Opened ${placed}.`;
     case "nothing_to_share":
       return "Nothing to share: the team already has all of this.";
     case "conflicts_pending":

@@ -16,7 +16,14 @@
  */
 
 import { API_BASE, api, encodeSegment } from "./client";
-import { asArray, asNumber, asObject, asString, asStrings } from "./json";
+import {
+  asArray,
+  asNumber,
+  asNumbers,
+  asObject,
+  asString,
+  asStrings,
+} from "./json";
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
@@ -306,6 +313,28 @@ export interface SyncStatus {
    * a conflict by.
    */
   conflictList: SyncConflict[];
+  /**
+   * The chain's own number on the forge, or null when nothing is stacked.
+   *
+   * Never the gate on whether there is a chain to draw: on the stacked path
+   * this is null for as long as the call that groups the layers on the forge
+   * has not landed, and a screen that keyed off it would print "stack #null"
+   * over a chain that is perfectly real. {@link SyncStatus.stackLinkPending}
+   * is what that state says out loud.
+   */
+  stackNumber: number | null;
+  /**
+   * The declined layers still carrying open layers above them, by number.
+   *
+   * Empty when the chain is sound, and the one stack fact a screen must not
+   * hide: a wedged chain cannot grow until one of these is withdrawn or the
+   * chain is repaired, and the number is what either verb is addressed by.
+   */
+  stackWedged: number[];
+  /** A rebuild left half-done, which the next share or withdraw finishes. */
+  repairPending: boolean;
+  /** Every layer exists, but they are not grouped on the forge yet. */
+  stackLinkPending: boolean;
 }
 
 /** The cache key of one domain's sync status. */
@@ -344,6 +373,20 @@ export interface SyncSummaryEntry {
   openProposals: number;
   declinedProposals: number;
   conflicts: number;
+  /**
+   * The declined layers still carrying open layers above them, by number.
+   *
+   * The one stack fact a picker must not hide, which is why it rides along
+   * with a row that otherwise carries only counts: a wedged chain cannot
+   * grow, so a domain offered without it is a domain somebody picks and then
+   * finds out about from a refusal. Where the domain sits IN its chain is
+   * detail rather than a decision, and stays on the per-domain report.
+   */
+  stackWedged: number[];
+  /** A rebuild left half-done, which the next share or withdraw finishes. */
+  repairPending: boolean;
+  /** Every layer exists, but they are not grouped on the forge yet. */
+  stackLinkPending: boolean;
 }
 
 /** Where every team domain on this instance stands, in one read. */
@@ -490,6 +533,13 @@ function readSyncStatus(payload: unknown): SyncStatus {
     conflictList: asArray(record?.conflicts)
       .map(readConflict)
       .filter((conflict): conflict is SyncConflict => conflict !== null),
+    // The four chain keys, which the route always sends and an older report
+    // never did: quiet defaults rather than holes, so one reader handles the
+    // stacked path and the unstacked one.
+    stackNumber: asNumber(record?.stack_number),
+    stackWedged: asNumbers(record?.stack_wedged),
+    repairPending: record?.repair_pending === true,
+    stackLinkPending: record?.stack_link_pending === true,
   };
 }
 
@@ -519,6 +569,9 @@ function readSummaryEntry(value: unknown): SyncSummaryEntry | null {
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
     conflicts: asCount(record?.conflicts),
+    stackWedged: asNumbers(record?.stack_wedged),
+    repairPending: record?.repair_pending === true,
+    stackLinkPending: record?.stack_link_pending === true,
   };
 }
 
@@ -552,9 +605,10 @@ export async function syncDomain(domain: string): Promise<unknown> {
 /** What a share would do, before anybody commits to doing it. */
 export interface SharePlan {
   /**
-   * `create`, `update`, `nothing_to_share`, `conflicts_pending` or
-   * `proposal_diverged` - the server's own word for what the button would do,
-   * which is also what decides whether there is a button at all.
+   * `create`, `update`, `stack`, `amend`, `nothing_to_share`,
+   * `conflicts_pending` or `proposal_diverged` - the server's own word for
+   * what the button would do, which is also what decides whether there is a
+   * button at all.
    */
   action: string;
   /** The title the proposal would carry, the server's own if none was given. */
@@ -571,6 +625,51 @@ export interface SharePlan {
    * reader can size the work from before opening the screen that settles them.
    */
   count: number | null;
+  /**
+   * The open layer a `stack` would sit on, and its title; null on every other
+   * action. The whole difference between stacking and opening a lone proposal
+   * is what it lands on, so the plan names it.
+   */
+  topNumber: number | null;
+  topTitle: string | null;
+  /**
+   * How many layers an `amend` would rebuild; null on every other action.
+   *
+   * The difference between amending the top layer and amending one under it:
+   * the second re-bases work that is already in front of reviewers.
+   */
+  layersAbove: number | null;
+}
+
+/**
+ * Where a shared proposal sits in its chain, as the share outcome reports it.
+ *
+ * Two fields with one rule between them, which is why they are read together
+ * rather than field by field at a use site: `stackPosition` is `[layer, open
+ * layers]` with a 1-based layer and is the gate on whether there is a chain at
+ * all, while `stackNumber` is named only when there is one. On the stacked
+ * path the position is always set and the number is null until the call that
+ * groups the chain on the forge lands, so a renderer that keyed off the number
+ * would print "stack #null" over a chain that is perfectly real.
+ */
+export interface StackPlacement {
+  stackNumber: number | null;
+  /** `[layer, open layers]`, 1-based, or null off the stacked path. */
+  stackPosition: [number, number] | null;
+}
+
+/** Read a placement off whatever the share outcome carried. */
+export function readStackPlacement(payload: unknown): StackPlacement {
+  const record = asObject(payload);
+  const position = asArray(record?.stack_position);
+  const layer = asNumber(position[0]);
+  const open = asNumber(position[1]);
+  return {
+    stackNumber: asNumber(record?.stack_number),
+    // Both halves or nothing: half a position says neither which layer this
+    // is nor how many there are, and either alone is unprintable.
+    stackPosition: layer === null || open === null ? null : [layer, open],
+  };
 }
 
 /**
@@ -601,20 +700,26 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
     number: asNumber(record?.number),
     url: asString(record?.url),
     count: asNumber(record?.count),
+    topNumber: asNumber(record?.top_number),
+    topTitle: asString(record?.top_title),
+    layersAbove: asNumber(record?.layers_above),
   };
 }
 
 /**
- * Share this domain's local changes as a proposal, or into the open one.
+ * Share this domain's local changes as a proposal, as a new layer on the chain
+ * already open, or into an open layer named by number.
  *
  * The outcome comes back as the engine's own report rather than as a shape read
  * here: it is five different answers (`proposed`, `updated`,
  * `nothing_to_share`, `conflicts_pending`, `proposal_diverged`) and the screen
  * that asked is the one that knows which of them it is looking for.
+ * {@link readStackPlacement} is how the two that landed say where in the chain
+ * they landed.
  */
 export async function shareDomain(
   domain: string,
-  body: { title?: string; description?: string },
+  body: { title?: string; description?: string; proposal?: number },
 ): Promise<unknown> {
   return api<unknown>(`/domains/${encodeSegment(domain)}/sync/share`, {
     method: "POST",
@@ -641,6 +746,24 @@ export interface WithdrawReceipt {
   deleted: string[];
   /** Files a reviewer amended on the branch, which a revert leaves alone. */
   skippedDiverged: string[];
+  /**
+   * Files whose pre-share content is nowhere to be had, so no revert could put
+   * them back. A different reason from {@link WithdrawReceipt.skippedDiverged}
+   * and worth its own sentence: nobody moved on from these, they simply cannot
+   * be restored, and somebody has to know which ones.
+   */
+  skippedReverts: string[];
+  /** Whether the chain around the withdrawn layer was rebuilt. */
+  repaired: boolean;
+  /**
+   * The NEW stack number that rebuild allocated, or null.
+   *
+   * Null covers both "no repair happened" and "the survivors no longer make a
+   * chain", so it is read together with {@link WithdrawReceipt.repaired}
+   * rather than alone. Stack numbers come off the same sequence as proposal
+   * numbers, so the old one never comes back.
+   */
+  restacked: number | null;
 }
 
 /** Close a proposal on the forge; `revert` also restores the shared files. */
@@ -663,6 +786,9 @@ export async function withdrawProposal(
     restored: asStrings(record?.restored),
     deleted: asStrings(record?.deleted),
     skippedDiverged: asStrings(record?.skipped_diverged),
+    skippedReverts: asStrings(record?.skipped_reverts),
+    repaired: record?.repaired === true,
+    restacked: asNumber(record?.restacked),
   };
 }
 

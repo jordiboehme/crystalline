@@ -79,7 +79,11 @@ function summaryResponse(domains: Record<string, unknown>[]) {
 }
 
 /** One counted summary entry, zero everywhere but where it is told otherwise. */
-function summaryEntry(domain: string, localChanges: number) {
+function summaryEntry(
+  domain: string,
+  localChanges: number,
+  overrides: Record<string, unknown> = {},
+) {
   return {
     domain,
     mode: "github",
@@ -90,6 +94,10 @@ function summaryEntry(domain: string, localChanges: number) {
     open_proposals: 0,
     declined_proposals: 0,
     conflicts: 0,
+    stack_wedged: [],
+    repair_pending: false,
+    stack_link_pending: false,
+    ...overrides,
   };
 }
 
@@ -335,6 +343,39 @@ describe("the top bar's share action", () => {
     expect(
       screen.queryByRole("dialog", { name: "Share from a domain" }),
     ).toBeNull();
+  });
+
+  it("badges a domain whose chain is wedged before anybody picks it", async () => {
+    serve({
+      "/settings/github": () => githubStatus(),
+      "/sync": () =>
+        summaryResponse([
+          summaryEntry("eng", 2, { stack_wedged: [3] }),
+          summaryEntry("ops", 1, { repair_pending: true }),
+        ]),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+    await userEvent.click(action);
+
+    const picker = await screen.findByRole("dialog", {
+      name: "Share from a domain",
+    });
+    // A wedged chain cannot grow, so the row says so before somebody picks it
+    // and finds out from a refusal.
+    expect(within(picker).getByText("stack wedged")).toBeVisible();
+    expect(within(picker).getByText("repair pending")).toBeVisible();
+    // And the badge reaches a reader who hears the row rather than sees it.
+    expect(
+      within(picker).getByRole("button", {
+        name: "eng - 2 pending changes, stack wedged",
+      }),
+    ).toBeVisible();
   });
 
   it("has nothing to offer when no domain anywhere is holding work", async () => {

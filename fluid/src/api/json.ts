@@ -37,6 +37,13 @@ export function asStrings(value: unknown): string[] {
   );
 }
 
+/** The finite numbers in an array, dropping everything else. */
+export function asNumbers(value: unknown): number[] {
+  return asArray(value).filter(
+    (item): item is number => typeof item === "number" && Number.isFinite(item),
+  );
+}
+
 /** The value as a finite number, or null. */
 export function asNumber(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) ? value : null;

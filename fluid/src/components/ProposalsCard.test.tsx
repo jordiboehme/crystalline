@@ -76,8 +76,34 @@ function syncResponse(overrides: Record<string, unknown> = {}) {
     ],
     declined_proposals: [],
     conflicts: [],
+    stack_number: null,
+    stack_wedged: [],
+    repair_pending: false,
+    stack_link_pending: false,
     ...overrides,
   };
+}
+
+/** One open layer, in chain order wherever it is put in the list. */
+function openProposal(number: number, title: string) {
+  return {
+    number,
+    url: `https://github.com/acme/knowledge/pull/${String(number)}`,
+    title,
+    status: "Open",
+    review_state: null,
+    amended_upstream: false,
+    feedback: [],
+    updated_at: null,
+  };
+}
+
+/** Two open layers, bottom first, the way the report orders a chain. */
+function stackedProposals() {
+  return [
+    openProposal(4, "Refine 2 engrams in eng"),
+    openProposal(7, "One more pass on the routing"),
+  ];
 }
 
 function serve(routes: Record<string, Answer> = {}) {
@@ -285,6 +311,175 @@ describe("the proposals card", () => {
     // one more open piece of work.
     expect(within(card).getByText("declined")).toBeVisible();
     expect(within(card).getByText("open")).toBeVisible();
+  });
+
+  it("says where each open layer sits, and which stack they are on", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // Bottom-up, the way the chain is reviewed and the way the report orders
+    // it: the first row is the layer everything else sits on.
+    const rows = within(card).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent("Refine 2 engrams in eng");
+    expect(rows[0]).toHaveTextContent("layer 1 of 2");
+    expect(rows[1]).toHaveTextContent("One more pass on the routing");
+    expect(rows[1]).toHaveTextContent("layer 2 of 2");
+    // And the chain itself, named once rather than per row.
+    expect(within(card).getByText("stack #42")).toBeVisible();
+  });
+
+  it("says nothing about layers when only one proposal is open", async () => {
+    serve({ "/domains/eng/sync": () => syncResponse({ stack_number: 42 }) });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // A lone proposal stands in no chain a reader needs told about: no
+    // "layer 1 of 1" noise, and no stack to name either.
+    expect(within(card).queryByText(/layer 1 of 1/i)).toBeNull();
+    expect(within(card).queryByText(/^stack #/)).toBeNull();
+  });
+
+  it("says the link is pending rather than naming a stack it has no number for", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          // Every layer exists; the call that groups them on the forge has
+          // not landed yet.
+          stack_number: null,
+          stack_link_pending: true,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The positions are real, so they are drawn.
+    expect(within(card).getByText("layer 2 of 2")).toBeVisible();
+    // The number is not, so nothing anywhere says "stack #".
+    expect(within(card).queryByText(/stack #/)).toBeNull();
+    expect(within(card).getByText(/stack link pending/i)).toBeVisible();
+  });
+
+  it("names the declined layer a wedged chain is stuck behind", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+          stack_wedged: [3],
+          repair_pending: true,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The number is what a reader acts on, and the sentence says which two
+    // verbs act on it: a wedged chain cannot grow until one of them runs.
+    expect(
+      within(card).getByText(
+        "Stack wedged by #3 - withdraw it or share again to repair the chain.",
+      ),
+    ).toBeVisible();
+    // And the debt the next write settles by itself.
+    expect(
+      within(card).getByText(
+        "Repair pending - the next share or withdraw finishes it.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("warns before withdrawing a layer that is carrying others", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The bottom layer: closing it rebuilds everything above it, which is
+    // work already in front of reviewers.
+    await userEvent.click(
+      within(card).getAllByRole("button", {
+        name: "Withdraw",
+      })[0] as HTMLElement,
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+    expect(
+      within(dialog).getByText("Closes #4 and re-bases 1 layer above it."),
+    ).toBeVisible();
+  });
+
+  it("says nothing about re-basing when the top layer is the one going", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    const buttons = within(card).getAllByRole("button", { name: "Withdraw" });
+    await userEvent.click(buttons[buttons.length - 1] as HTMLElement);
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+    // Nothing sits on the top layer, so nothing is re-based and nothing is
+    // warned about.
+    expect(within(dialog).queryByText(/re-bases/i)).toBeNull();
+  });
+
+  it("says which files a revert could not put back", async () => {
+    serve({
+      "/domains/eng/sync/proposals/4/withdraw": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              number: 4,
+              closed: true,
+              status: "withdrawn",
+              restored: ["notes/a.md"],
+              deleted: [],
+              skipped_diverged: [],
+              // No reachable copy of what this looked like before the share.
+              skipped_reverts: ["notes/c.md"],
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+    await userEvent.click(
+      within(dialog).getByLabelText("Restore shared files"),
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Withdraw proposal" }),
+    );
+
+    // The dialog closes on a withdraw that landed, so what it could not do
+    // lands on the row rather than under a panel nothing can read.
+    expect(await within(card).findByRole("status")).toHaveTextContent(
+      "Could not restore: notes/c.md",
+    );
   });
 
   it("withdraws through the confirm dialog, with the revert checkbox", async () => {

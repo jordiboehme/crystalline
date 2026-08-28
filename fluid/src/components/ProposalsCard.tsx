@@ -24,6 +24,15 @@
  * this card never loads a dialog's worth of code: this file draws rows, and
  * `WithdrawProposalDialog` and `ShareDialog` are what mount once somebody
  * presses Withdraw or Share changes.
+ *
+ * A chain of stacked proposals is drawn as what it is: the open layers come in
+ * chain order, bottom first, each wearing where it sits, and the chain itself
+ * is named once above them. Two rules decide that, and they are the same two
+ * the CLI's own renderer follows. One: a lone proposal stands in no chain a
+ * reader needs told about, so nothing says "layer 1 of 1". Two: the position is
+ * the gate and the stack number is named only when there is one - a chain whose
+ * linking call has not landed carries real positions with no number, and
+ * "stack #null" would be worse than saying nothing about the number at all.
  */
 
 import { useQuery } from "@tanstack/react-query";
@@ -64,6 +73,16 @@ export function ProposalsCard({
     return null;
   }
   const proposals = answered.proposals;
+  // The open layers in chain order, bottom first, which is the order the
+  // report sends them in and the order reviewers merge them in.
+  const open = proposals.filter((proposal) => proposal.status === "open");
+  const chained = open.length > 1;
+  // The number is named only when there is one. On the stacked path it is null
+  // for as long as the call that groups the layers on the forge has not
+  // landed, and the debt below says so instead.
+  const stacked = chained && answered.stackNumber !== null;
+  const linkPending =
+    answered.stackLinkPending || (chained && answered.stackNumber === null);
 
   return (
     <section
@@ -71,9 +90,16 @@ export function ProposalsCard({
       className="flex flex-col gap-3 rounded border border-slate-200 p-4 dark:border-slate-800"
     >
       <div className="flex flex-wrap items-baseline justify-between gap-3">
-        <h2 id="domain-proposals" className="text-section">
-          Proposals
-        </h2>
+        <div className="flex flex-wrap items-baseline gap-2">
+          <h2 id="domain-proposals" className="text-section">
+            Proposals
+          </h2>
+          {/* The chain named once, beside its own heading, rather than
+              repeated on every row that belongs to it. */}
+          {stacked && (
+            <Chip variant="accent">stack #{String(answered.stackNumber)}</Chip>
+          )}
+        </div>
         {/* Primary, and in the header rather than beside a row: sharing is
             what somebody opens this card to do, and it is about the domain
             rather than about any one proposal already on it. */}
@@ -87,19 +113,38 @@ export function ProposalsCard({
           Share changes
         </button>
       </div>
+      <ChainNotices
+        wedged={answered.stackWedged}
+        repairPending={answered.repairPending}
+        linkPending={linkPending}
+      />
       {proposals.length === 0 ? (
         <p className="text-sm text-slate-500 dark:text-slate-400">
           No open proposals.
         </p>
       ) : (
         <ul className="flex flex-col gap-3">
-          {proposals.map((proposal) => (
-            <ProposalRow
-              key={proposal.number}
-              domain={domain}
-              proposal={proposal}
-            />
-          ))}
+          {proposals.map((proposal) => {
+            // Where this one sits, worked out once from the open list rather
+            // than carried per row: the report orders the chain and says how
+            // it stands, and a row is a position in that order.
+            const layer = open.indexOf(proposal);
+            return (
+              <ProposalRow
+                key={proposal.number}
+                domain={domain}
+                proposal={proposal}
+                position={
+                  chained && layer >= 0 ? [layer + 1, open.length] : null
+                }
+                // How much a withdraw would rebuild. Only the open layers
+                // above this one, and only for a layer that is itself open: a
+                // declined layer's place in the chain is not something this
+                // report says, so nothing is claimed about it.
+                layersAbove={layer >= 0 ? open.length - 1 - layer : 0}
+              />
+            );
+          })}
         </ul>
       )}
       {sharing && (
@@ -111,6 +156,52 @@ export function ProposalsCard({
         />
       )}
     </section>
+  );
+}
+
+/**
+ * What the chain itself is owed, said in the words of the verbs that settle it.
+ *
+ * Three lines, none of which prints while the chain is sound. A wedged layer is
+ * named by number, one line each, because that number is what a reader
+ * withdraws or shares against and a chain cannot grow until one of them does.
+ * The two debts below it are not blockages at all: they are work the next write
+ * finishes by itself, so they read as notes rather than as warnings.
+ */
+function ChainNotices({
+  wedged,
+  repairPending,
+  linkPending,
+}: {
+  wedged: number[];
+  repairPending: boolean;
+  linkPending: boolean;
+}): ReactElement | null {
+  if (wedged.length === 0 && !repairPending && !linkPending) {
+    return null;
+  }
+  return (
+    <div className="flex flex-col gap-1 text-sm">
+      {wedged.map((number) => (
+        <p
+          key={number}
+          className="rounded bg-amber-50 px-3 py-2 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+        >
+          Stack wedged by #{String(number)} - withdraw it or share again to
+          repair the chain.
+        </p>
+      ))}
+      {repairPending && (
+        <p className="text-caption text-slate-500 dark:text-slate-400">
+          Repair pending - the next share or withdraw finishes it.
+        </p>
+      )}
+      {linkPending && (
+        <p className="text-caption text-slate-500 dark:text-slate-400">
+          Stack link pending - the next share or status check finishes it.
+        </p>
+      )}
+    </div>
   );
 }
 
@@ -162,17 +253,31 @@ function reviewVariant(state: string): ChipVariant {
 function ProposalRow({
   domain,
   proposal,
+  position,
+  layersAbove,
 }: {
   domain: string;
   proposal: SyncProposal;
+  /** `[layer, open layers]`, 1-based, or null when there is no chain to name. */
+  position: [number, number] | null;
+  /** How many open layers a withdraw here would re-base. */
+  layersAbove: number;
 }): ReactElement {
   const [confirming, setConfirming] = useState(false);
   const [expanded, setExpanded] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   return (
     <li className="flex flex-col gap-1 text-sm">
       <div className="flex flex-wrap items-center gap-2">
+        {/* Where this layer sits, before what it is called: the chain is read
+            bottom-up, and the position is what makes the order legible. */}
+        {position !== null && (
+          <Chip>
+            layer {String(position[0])} of {String(position[1])}
+          </Chip>
+        )}
         {isWebAddress(proposal.url) ? (
           <a
             href={proposal.url}
@@ -207,6 +312,7 @@ function ProposalRow({
           type="button"
           onClick={() => {
             setProblem(null);
+            setNotice(null);
             setConfirming(true);
           }}
           className={BUTTON.secondary}
@@ -263,13 +369,28 @@ function ProposalRow({
         </p>
       )}
 
+      {/* What a withdraw that landed could not do. Not a refusal - the
+          proposal is closed - so it is announced politely rather than as an
+          alert, and it lands here for the same reason a refusal does: the
+          dialog is gone by the time there is anything to say. */}
+      {notice !== null && (
+        <p
+          role="status"
+          className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+        >
+          {notice}
+        </p>
+      )}
+
       {confirming && (
         <WithdrawProposalDialog
           domain={domain}
           proposal={proposal}
+          layersAbove={layersAbove}
           onClose={() => {
             setConfirming(false);
           }}
+          onNotice={setNotice}
           onProblem={(detail) => {
             // The dialog closes with the refusal, so the message lands on the
             // row: an open dialog `aria-hidden`s the page behind it, and an

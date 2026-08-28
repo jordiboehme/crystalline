@@ -295,6 +295,206 @@ describe("the share dialog", () => {
     });
   });
 
+  it("names the layer a new proposal would stack on", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A stack is a proposal of its own, so the share is offered rather than
+    // refused, and the line says what it would sit on.
+    expect(
+      await within(dialog).findByText(
+        "Will stack a new proposal on top of #4.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+  });
+
+  it("offers the open layers to amend, and names the one that was chosen", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "updated",
+      proposal: { number: 4, url: "https://github.com/acme/knowledge/pull/4" },
+    }));
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "https://github.com/acme/knowledge/pull/4",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: "changes_requested",
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+            {
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              title: "One more pass on the routing",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+          stack_number: 42,
+        }),
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 7,
+        top_title: "One more pass on the routing",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Stacking on top is the default: acting on a layer's review feedback is
+    // the deliberate choice, and it is made by naming the layer.
+    const select = await within(dialog).findByLabelText("Proposal");
+    expect(select).toHaveValue("");
+    await userEvent.selectOptions(select, "4");
+
+    // The one thing somebody amending a lower layer has to know, because the
+    // layer above it would simply overwrite the change.
+    expect(
+      within(dialog).getByText(
+        "Changes to files a higher layer already touched belong in that layer instead.",
+      ),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // The chosen layer is the whole of what the choice sends: the prefilled
+    // title still stays behind.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      proposal: 4,
+    });
+  });
+
+  it("says where the proposal it just opened sits in the chain", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              stack_number: 42,
+              stack_position: [2, 2],
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    expect(
+      await within(dialog).findByText(
+        "Opened proposal #7, layer 2 of 2 on stack #42.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("names no stack number for a chain that is not linked yet", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              // The layers all exist; the call that groups them has not
+              // landed, so there is no number to name.
+              stack_number: null,
+              stack_position: [2, 2],
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    expect(
+      await within(dialog).findByText(
+        "Opened proposal #7, layer 2 of 2 (stack link pending).",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no layer to amend when nothing is open", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ open_proposals: [] }),
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await within(dialog).findByText(/opens a new proposal/i);
+    // A choice between one thing is not a choice, and there is no layer to
+    // amend at all here.
+    expect(within(dialog).queryByLabelText("Proposal")).toBeNull();
+  });
+
   it("disables the share with the reason when there is nothing to confirm", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({

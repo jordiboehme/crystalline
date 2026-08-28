@@ -13,6 +13,11 @@
  * count every sidebar and card draws. A withdraw that only closed a pull
  * request leaves all of that alone, which is why the receipt is read rather
  * than the request's own flag trusted.
+ *
+ * A layer with open layers on top of it is the one case where withdrawing does
+ * something to work other than its own: the chain is rebuilt around the hole,
+ * which re-bases every layer above. That is said before the press rather than
+ * discovered from the review threads afterwards.
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -25,13 +30,16 @@ import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
+import { plural } from "../format";
 import { BUTTON } from "./primitives";
 import type { WithdrawProposalDialogProps } from "./WithdrawProposalDialog";
 
 export default function WithdrawProposalDialogBody({
   domain,
   proposal,
+  layersAbove,
   onClose,
+  onNotice,
   onProblem,
 }: WithdrawProposalDialogProps): ReactElement {
   const queryClient = useQueryClient();
@@ -41,6 +49,12 @@ export default function WithdrawProposalDialogBody({
     mutationFn: () => withdrawProposal(domain, proposal.number, revert),
     onSuccess: (receipt) => {
       onClose();
+      // The one thing a withdraw can fail at while succeeding: a file whose
+      // pre-share content is nowhere to be had cannot be put back, and
+      // somebody has to be told which ones rather than finding a gap later.
+      if (receipt.skippedReverts.length > 0) {
+        onNotice(`Could not restore: ${receipt.skippedReverts.join(", ")}`);
+      }
       // Always: this proposal is not open any more, and the card that lists it
       // and the card that counts it both read this one status.
       void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
@@ -84,6 +98,12 @@ export default function WithdrawProposalDialogBody({
             Closes the proposal on the origin and records it as withdrawn. The
             review stays readable there.
           </Dialog.Description>
+          {layersAbove > 0 && (
+            <p className="mt-2 rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+              Closes #{String(proposal.number)} and re-bases{" "}
+              {plural(layersAbove, "layer", "layers")} above it.
+            </p>
+          )}
           <label className="mt-3 flex items-center gap-2 text-sm">
             <input
               type="checkbox"

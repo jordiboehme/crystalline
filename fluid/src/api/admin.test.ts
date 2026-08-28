@@ -23,6 +23,7 @@ import {
   importArchive,
   previewArchive,
   readGithubStatus,
+  readStackPlacement,
   resolveConflict,
   shareDomain,
   sharePlanKey,
@@ -276,8 +277,55 @@ describe("the admin client layer", () => {
         },
       ],
       conflictList: [],
+      // The four chain keys the route always sends, read out of a report that
+      // sent none of them: nothing is stacked, nothing is wedged and neither
+      // debt is outstanding. Quiet defaults rather than holes, because every
+      // one of them is drawn as a badge or a banner when it is set.
+      stackNumber: null,
+      stackWedged: [],
+      repairPending: false,
+      stackLinkPending: false,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("reads where the domain's chain of stacked proposals stands", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [{ number: 7 }, { number: 9 }],
+      stack_number: 42,
+      // A declined layer still carrying open layers above it, by number: that
+      // number is what a reader withdraws or shares against.
+      stack_wedged: [3, "nonsense"],
+      repair_pending: true,
+      stack_link_pending: true,
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.stackNumber).toBe(42);
+    // Only the numbers: a wedged entry that is not one is nothing a screen can
+    // address a proposal by.
+    expect(status.stackWedged).toEqual([3]);
+    expect(status.repairPending).toBe(true);
+    expect(status.stackLinkPending).toBe(true);
+  });
+
+  it("reads a chain whose linking call has not landed as pending, not as stack null", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [{ number: 7 }, { number: 9 }],
+      // Every layer exists; they are simply not grouped on the forge yet.
+      stack_number: null,
+      stack_wedged: [],
+      repair_pending: false,
+      stack_link_pending: true,
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.stackNumber).toBeNull();
+    expect(status.stackLinkPending).toBe(true);
   });
 
   it("reads the mode and the connection the sync report carries", async () => {
@@ -493,6 +541,12 @@ describe("the admin client layer", () => {
           openProposals: 1,
           declinedProposals: 0,
           conflicts: 0,
+          // Chain health rides along with the row, because a picker has to
+          // know which domains it can actually offer; where a domain sits IN
+          // its chain stays on the per-domain report.
+          stackWedged: [],
+          repairPending: false,
+          stackLinkPending: false,
         },
       ],
     });
@@ -518,8 +572,30 @@ describe("the admin client layer", () => {
         openProposals: 0,
         declinedProposals: 0,
         conflicts: 0,
+        stackWedged: [],
+        repairPending: false,
+        stackLinkPending: false,
       },
     ]);
+  });
+
+  it("reads a summary row's chain health, so a picker can badge it", async () => {
+    apiMock.mockResolvedValueOnce({
+      domains: [
+        {
+          domain: "eng",
+          local_changes: 2,
+          stack_wedged: [3],
+          repair_pending: true,
+          stack_link_pending: false,
+        },
+      ],
+    });
+    const summary = await fetchSyncSummary();
+
+    expect(summary.domains[0]?.stackWedged).toEqual([3]);
+    expect(summary.domains[0]?.repairPending).toBe(true);
+    expect(summary.domains[0]?.stackLinkPending).toBe(false);
   });
 
   it("reads an instance with no credential on file as not connected", async () => {
@@ -556,6 +632,10 @@ describe("the admin client layer", () => {
       url: "https://github.example/acme/kb/pull/4",
       // An update carries no conflict count, and none is invented for it.
       count: null,
+      // Nor any of the three fields the two stacked plans carry.
+      topNumber: null,
+      topTitle: null,
+      layersAbove: null,
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:
@@ -580,6 +660,36 @@ describe("the admin client layer", () => {
     expect(plan.action).toBe("conflicts_pending");
   });
 
+  it("reads the layer a stack would sit on, and the layers an amend rebuilds", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "stack",
+      effective_title: "Refine 1 engram in kb",
+      changes: [],
+      top_number: 4,
+      top_title: "Refine 2 engrams in kb",
+    });
+    const stack = await fetchShareChanges("eng");
+
+    expect(stack.action).toBe("stack");
+    expect(stack.topNumber).toBe(4);
+    expect(stack.topTitle).toBe("Refine 2 engrams in kb");
+
+    apiMock.mockResolvedValueOnce({
+      action: "amend",
+      effective_title: "Refine 1 engram in kb",
+      changes: [],
+      number: 4,
+      url: "https://github.example/acme/kb/pull/4",
+      layers_above: 2,
+    });
+    const amend = await fetchShareChanges("eng");
+
+    // How much work the amend would rebuild, which is the whole difference
+    // between amending the top layer and amending one under it.
+    expect(amend.number).toBe(4);
+    expect(amend.layersAbove).toBe(2);
+  });
+
   it("shares a domain with the title and description it was given", async () => {
     apiMock.mockResolvedValueOnce({ outcome: "proposed", number: 4 });
     await shareDomain("team eng", { title: "From the UI" });
@@ -593,6 +703,45 @@ describe("the admin client layer", () => {
     );
   });
 
+  it("names the open layer to amend on the share body", async () => {
+    apiMock.mockResolvedValueOnce({
+      outcome: "updated",
+      proposal: { number: 4 },
+    });
+    await shareDomain("eng", { proposal: 4 });
+
+    // The one field that turns a share from "stack a new layer" into "amend
+    // this one", and it travels only when somebody chose a layer.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/sync/share",
+      expect.objectContaining({ body: JSON.stringify({ proposal: 4 }) }),
+    );
+  });
+
+  it("reads where a shared proposal sits in its chain, position first", () => {
+    // The position is the gate and the number is named only when there is one:
+    // a chain whose linking call failed carries real positions with a null
+    // number, and "stack #null" would be worse than saying nothing.
+    expect(
+      readStackPlacement({ stack_number: 42, stack_position: [2, 3] }),
+    ).toEqual({ stackNumber: 42, stackPosition: [2, 3] });
+    expect(
+      readStackPlacement({ stack_number: null, stack_position: [2, 3] }),
+    ).toEqual({ stackNumber: null, stackPosition: [2, 3] });
+    // Off the stacked path both are null rather than absent, and a position
+    // that is not a pair of numbers is no position at all.
+    expect(
+      readStackPlacement({ stack_number: null, stack_position: null }),
+    ).toEqual({ stackNumber: null, stackPosition: null });
+    expect(
+      readStackPlacement({ stack_position: [2] }).stackPosition,
+    ).toBeNull();
+    expect(readStackPlacement("nonsense")).toEqual({
+      stackNumber: null,
+      stackPosition: null,
+    });
+  });
+
   it("withdraws a proposal by number, with the revert flag on the body", async () => {
     apiMock.mockResolvedValueOnce({
       number: 4,
@@ -601,6 +750,12 @@ describe("the admin client layer", () => {
       restored: ["notes/a.md"],
       deleted: [],
       skipped_diverged: ["notes/b.md"],
+      // The second reason a revert leaves a file alone: no reachable copy of
+      // what it looked like before the share.
+      skipped_reverts: ["notes/c.md"],
+      repaired: true,
+      // The rebuild allocated a new number; the old one never comes back.
+      restacked: 43,
     });
     const receipt = await withdrawProposal("eng", 4, true);
 
@@ -621,7 +776,26 @@ describe("the admin client layer", () => {
       restored: ["notes/a.md"],
       deleted: [],
       skippedDiverged: ["notes/b.md"],
+      skippedReverts: ["notes/c.md"],
+      repaired: true,
+      restacked: 43,
     });
+  });
+
+  it("reads a repair that found too few survivors to be a stack", async () => {
+    apiMock.mockResolvedValueOnce({
+      number: 4,
+      closed: true,
+      repaired: true,
+      // Null covers both "no repair happened" and "the survivors no longer
+      // make a chain", so it is read together with `repaired` rather than
+      // alone.
+      restacked: null,
+    });
+    const receipt = await withdrawProposal("eng", 4, false);
+
+    expect(receipt.repaired).toBe(true);
+    expect(receipt.restacked).toBeNull();
   });
 
   it("reads a withdraw that moved nothing as having moved nothing", async () => {
@@ -637,6 +811,9 @@ describe("the admin client layer", () => {
       restored: [],
       deleted: [],
       skippedDiverged: [],
+      skippedReverts: [],
+      repaired: false,
+      restacked: null,
     });
   });
 

@@ -21,6 +21,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
 
+import type { SyncSummaryEntry } from "../api/admin";
 import {
   SYNC_SUMMARY_KEY,
   SYNC_SUMMARY_STALE_MS,
@@ -28,7 +29,7 @@ import {
 } from "../api/admin";
 import { plural } from "../format";
 import type { SharePickerDialogProps } from "./SharePickerDialog";
-import { BUTTON, FOCUS_RING } from "./primitives";
+import { BUTTON, Chip, FOCUS_RING } from "./primitives";
 
 /** One row: the name, and how much is waiting in it. */
 const ROW_CLASSES = `flex w-full items-baseline justify-between gap-3 rounded border border-slate-300 px-2 py-1.5 text-left text-sm hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800 ${FOCUS_RING}`;
@@ -38,9 +39,32 @@ function pendingChanges(count: number): string {
   return plural(count, "pending change", "pending changes");
 }
 
+/**
+ * What is wrong with this domain's chain of stacked proposals, or null when
+ * nothing is.
+ *
+ * One badge rather than three, and wedged wins: a wedged chain cannot grow
+ * until a declined layer is withdrawn or the chain is repaired, so it is the
+ * one fact that changes what happens when this row is picked. The two debts
+ * behind it are settled by the very share this picker leads to, so they are a
+ * note rather than a warning - and the domain is still offered either way,
+ * because the picker's job is to say which domain, not to refuse for a route
+ * that can refuse for itself.
+ */
+function chainBadge(entry: SyncSummaryEntry): string | null {
+  if (entry.stackWedged.length > 0) {
+    return "stack wedged";
+  }
+  if (entry.repairPending) {
+    return "repair pending";
+  }
+  return entry.stackLinkPending ? "stack link pending" : null;
+}
+
 /** The whole row said as one line, which is what a row is called. */
-function rowLabel(domain: string, count: number): string {
-  return `${domain} - ${pendingChanges(count)}`;
+function rowLabel(domain: string, count: number, badge: string | null): string {
+  const chain = badge === null ? "" : `, ${badge}`;
+  return `${domain} - ${pendingChanges(count)}${chain}`;
 }
 
 export default function SharePickerDialogBody({
@@ -84,31 +108,47 @@ export default function SharePickerDialogBody({
             </p>
           ) : (
             <ul className="mt-3 flex flex-col gap-1">
-              {waiting.map((entry) => (
-                <li key={entry.domain}>
-                  {/*
-                    Named as the whole row rather than left to be assembled
-                    out of the two ends of it. The name and the count sit at
-                    opposite edges the way the sidebar's own domain rows do,
-                    and a name computed from that is the two halves run
-                    together; spelling it out is what makes the row read as
-                    "eng - 2 pending changes" to anything listening.
-                  */}
-                  <button
-                    type="button"
-                    aria-label={rowLabel(entry.domain, entry.localChanges)}
-                    onClick={() => {
-                      onPick(entry.domain);
-                    }}
-                    className={ROW_CLASSES}
-                  >
-                    <span className="truncate font-medium">{entry.domain}</span>
-                    <span className="text-caption shrink-0 text-slate-500 dark:text-slate-400">
-                      {pendingChanges(entry.localChanges)}
-                    </span>
-                  </button>
-                </li>
-              ))}
+              {waiting.map((entry) => {
+                const badge = chainBadge(entry);
+                return (
+                  <li key={entry.domain}>
+                    {/*
+                      Named as the whole row rather than left to be assembled
+                      out of the two ends of it. The name and the count sit at
+                      opposite edges the way the sidebar's own domain rows do,
+                      and a name computed from that is the two halves run
+                      together; spelling it out is what makes the row read as
+                      "eng - 2 pending changes" to anything listening - and it
+                      is what carries the chain badge to a reader who hears
+                      the row rather than sees it.
+                    */}
+                    <button
+                      type="button"
+                      aria-label={rowLabel(
+                        entry.domain,
+                        entry.localChanges,
+                        badge,
+                      )}
+                      onClick={() => {
+                        onPick(entry.domain);
+                      }}
+                      className={ROW_CLASSES}
+                    >
+                      <span className="flex min-w-0 items-baseline gap-2">
+                        <span className="truncate font-medium">
+                          {entry.domain}
+                        </span>
+                        {badge !== null && (
+                          <Chip variant="caution">{badge}</Chip>
+                        )}
+                      </span>
+                      <span className="text-caption shrink-0 text-slate-500 dark:text-slate-400">
+                        {pendingChanges(entry.localChanges)}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
             </ul>
           )}
           <div className="mt-3 flex justify-end">
