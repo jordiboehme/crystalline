@@ -1588,10 +1588,16 @@ async fn scenario_20_withdraw_refuses_a_merged_proposal() {
     .await
     .unwrap_err();
     match err {
-        crystalline_remote::RemoteError::State(msg) => {
+        // A refusal, not a corrupt state: the proposal is exactly where the
+        // record says it is, the caller simply cannot withdraw it any more.
+        crystalline_remote::RemoteError::Refused(msg) => {
             assert!(msg.contains("already merged"), "{msg}");
+            assert!(
+                msg.starts_with(&format!("proposal #{}", first.number)),
+                "the refusal reaches the caller unprefixed: {msg}"
+            );
         }
-        other => panic!("expected State, got {other:?}"),
+        other => panic!("expected Refused, got {other:?}"),
     }
     let st = load_state(&sub.state_dir);
     assert_eq!(st.proposals.len(), 1, "the record is untouched");

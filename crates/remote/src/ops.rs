@@ -402,7 +402,7 @@ pub async fn pull(
     state_dir: &Path,
 ) -> Result<PullReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -773,7 +773,7 @@ pub async fn status(
     stacks_allowed: bool,
 ) -> Result<OriginStatusReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -1235,7 +1235,7 @@ pub async fn propose(
     // Freshness first: every proposal must be mergeable at creation.
     pull(provider, spec, domain_root, state_dir).await?;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -1627,7 +1627,7 @@ pub async fn propose_preview(
     let title = options.title;
     pull(provider, spec, domain_root, state_dir).await?;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -2583,7 +2583,7 @@ async fn collect_amend_changes(
                 return Err(unreplayable_layer(layer.number));
             };
             if state::sha256_hex(&bytes) != recorded {
-                return Err(RemoteError::State(format!(
+                return Err(RemoteError::Refused(format!(
                     "layer #{} records {} at content the working tree no longer holds; share that change or withdraw the layer",
                     layer.number, kept.path
                 )));
@@ -3175,7 +3175,7 @@ pub async fn withdraw(
     stacks_allowed: bool,
 ) -> Result<WithdrawReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -3239,7 +3239,7 @@ pub async fn withdraw(
         // A Merged record can genuinely stand here: `status` flips one to
         // Merged without consuming it, and only the next pull moves it to
         // history. Withdrawing a merged proposal is refused outright.
-        return Err(RemoteError::State(format!(
+        return Err(RemoteError::Refused(format!(
             "proposal #{} has already merged and cannot be withdrawn",
             proposal.number
         )));
@@ -3486,7 +3486,7 @@ pub fn resolve(
     resolution: Resolution<'_>,
 ) -> Result<ResolveReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
