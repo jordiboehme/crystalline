@@ -5386,3 +5386,195 @@ async fn a_repaired_chain_is_not_repaired_again_on_the_next_share() {
     );
     assert_eq!(fourth.stack_number, Some(stack));
 }
+
+#[tokio::test]
+async fn a_merged_layer_mid_chain_refuses_the_repair_until_it_is_pulled() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A status poll flips the middle layer to Merged without advancing the
+    // base commit: its content is on the trunk, and nothing local knows it
+    // yet. Replaying the top onto the bottom here would rebuild it without
+    // the merged files, which reads as a deletion on the forge.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[1].status = ProposalStatus::Merged;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(layers[2].number),
+        false,
+        true,
+    )
+    .await
+    .expect_err("a chain with a merged layer cannot be repaired yet");
+    let delta = mock.calls().split_off(before);
+
+    match err {
+        crystalline_remote::RemoteError::State(message) => {
+            assert!(
+                message.contains(&format!("#{}", layers[1].number)),
+                "the refusal names the merged layer: {message}"
+            );
+            assert!(
+                message.contains("pull"),
+                "the refusal names the way out: {message}"
+            );
+        }
+        other => panic!("expected a State error, got {other:?}"),
+    }
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)
+            || c.starts_with("dissolve_stack")
+            || c.starts_with("create_stack")),
+        "a refused withdrawal writes nothing: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert_eq!(state.proposals.len(), 3, "the chain is left as it stands");
+}
+
+#[tokio::test]
+async fn a_declined_bottom_layer_heals_the_chain_on_the_next_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+    let trunk = load_state(&sub.state_dir).base_commit;
+
+    // A reviewer closes the BOTTOM layer. Everything above it now sits on a
+    // branch that is going nowhere, and the stack holds a closed member.
+    mock.set_proposal_state(layers[0].number, ProposalState::Declined);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    // The survivors were replayed onto the trunk, so the closed layer's own
+    // work is excised from every tree above it.
+    let new_middle = mock
+        .branch_commit(&layers[1].branch)
+        .expect("the replayed head");
+    assert_eq!(mock.commit_parents(&new_middle), Some(vec![trunk]));
+    let tree = mock.commit_tree(&new_middle).expect("the replayed tree");
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha\n".as_slice()),
+        "the declined layer's refinement is gone"
+    );
+    assert_eq!(
+        tree.get("notes/b.md").map(Vec::as_slice),
+        Some(b"beta\n".as_slice())
+    );
+
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "{delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("update_proposal_base:{}:main", layers[1].number)),
+        "the new bottom targets the trunk: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{}]",
+            layers[1].number, layers[2].number
+        )),
+        "{delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert!(!state.stack_link_pending);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[1].number, layers[2].number, fourth.number]
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[0].number),
+        "the closed layer left the chain: {:?}",
+        state.history
+    );
+}
+
+#[tokio::test]
+async fn legacy_multi_open_withdraw_still_names_its_candidates() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Two open records with no stack behind them: residue from before
+    // stacking, where naming the top would mean something this machine
+    // cannot deliver.
+    for number in [41u64, 42] {
+        seed_proposal(&sub.state_dir, number, "notes/a.md", None);
+        let branch = format!("crystalline/share-{number}");
+        mock.register_proposal_branch(number, &branch);
+        mock.set_branch(&branch, &c1);
+        mock.set_proposal_state(number, ProposalState::Open);
+    }
+
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+        true,
+    )
+    .await
+    .expect_err("a legacy multi-open state has no default target");
+    match err {
+        crystalline_remote::RemoteError::NoWithdrawTarget { open, declined } => {
+            assert_eq!(open, vec![41, 42]);
+            assert!(declined.is_empty(), "{declined:?}");
+        }
+        other => panic!("expected NoWithdrawTarget, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn withdraw_settles_an_owed_stack_link_before_closing() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "the chain is degraded to begin with"
+    );
+
+    mock.heal_create_stack();
+    let before = mock.calls().len();
+    stacked_withdraw(&mock, &sub, Some(second.number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    let link_at = call_at(
+        &delta,
+        &format!("create_stack:[{},{}]", first.number, second.number),
+    );
+    let close_at = call_at(&delta, &format!("close_proposal:{}", second.number));
+    assert!(
+        link_at < close_at,
+        "the owed link is settled before the withdrawal's own work: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the debt is cleared");
+    assert_eq!(state.stack_number, None, "one survivor is no chain");
+    assert_eq!(open_numbers(&sub.state_dir), vec![first.number]);
+}

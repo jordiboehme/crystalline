@@ -2593,12 +2593,15 @@ struct RepairOutcome {
 /// each one reads false again once [`repair_chain`] has done its work - a
 /// repaired chain must not re-repair itself on every later operation.
 ///
-/// A Merged record is deliberately not a hole here. A merged layer's content
-/// lives on the trunk and only the next [`pull`] advances the base commit onto
-/// it, so replaying the survivors before then would rebuild them without it.
-/// Reconciling a merged layer stays a pull concern.
+/// A chain carrying a Merged record answers false whatever its shape: such a
+/// chain is not repairable at all until the merge is pulled in
+/// ([`merged_layer_blocking_repair`]), so the honest answer is "not for this
+/// function to fix" rather than "fine".
 fn stack_shape_broken(state: &OriginState) -> bool {
     if state.stack_number.is_none() {
+        return false;
+    }
+    if merged_layer_blocking_repair(state).is_some() {
         return false;
     }
     let open: Vec<&Proposal> = state
@@ -2628,6 +2631,37 @@ fn stack_shape_broken(state: &OriginState) -> bool {
         .any(|pair| pair[1].base_commit != pair[0].head_commit)
 }
 
+/// The merged layer that makes this chain unrepairable, if it carries one.
+///
+/// A repair rebuilds every layer above a hole from the layers below it, and a
+/// merged layer's content is in neither place yet: it lives on the trunk, and
+/// only the next [`pull`] advances `base_commit` and the base snapshot onto
+/// it. Replaying over that would rebuild the survivors WITHOUT the merged
+/// files, which on the forge reads as those files being deleted - a corrupt
+/// review rather than a repaired chain. So any Merged record in the chain
+/// stops a repair, and the way out is the pull that consumes it.
+///
+/// Deliberately broader than the shapes that are provably lossy (a merged
+/// layer below the first replayed survivor): a repair is a rare operation, the
+/// pull that clears this is one call away, and refusing the whole class costs
+/// nothing next to getting one of its members wrong. Once pull adopts merged
+/// layers into the chain this can narrow.
+fn merged_layer_blocking_repair(state: &OriginState) -> Option<u64> {
+    state
+        .proposals
+        .iter()
+        .find(|p| p.status == ProposalStatus::Merged)
+        .map(|p| p.number)
+}
+
+/// The refusal a chain carrying a merged layer earns, with the way out named:
+/// the merge has to be pulled in before the chain around it can be rebuilt.
+fn merged_layer_blocks_repair(number: u64) -> RemoteError {
+    RemoteError::State(format!(
+        "proposal #{number} has merged and this domain has not pulled it in yet, so the layers around it cannot be rebuilt without losing what it brought; pull this domain first, then try again"
+    ))
+}
+
 /// Repairs the open chain around every hole it records, in the one order the
 /// forge accepts: dissolve, replay, retarget, recreate.
 ///
@@ -2639,6 +2673,10 @@ fn stack_shape_broken(state: &OriginState) -> bool {
 /// up from there. Each survivor that directly follows a hole then has its pull
 /// request retargeted at the branch below it, since the branch it pointed at
 /// is going away.
+///
+/// A Merged record is a hole this cannot fill: the refusal
+/// ([`merged_layer_blocks_repair`]) comes before the first call, and the pull
+/// that consumes the merge is what unblocks it.
 ///
 /// Why the order is not negotiable: a stacked proposal cannot be retargeted at
 /// all (the forge answers 422), so the stack has to be dissolved before the
@@ -2659,6 +2697,12 @@ async fn repair_chain(
     state: &mut OriginState,
     state_dir: &Path,
 ) -> Result<RepairOutcome, RemoteError> {
+    // A merged layer is not a hole this can close: refuse before anything is
+    // dissolved, replayed or retargeted.
+    if let Some(number) = merged_layer_blocking_repair(state) {
+        return Err(merged_layer_blocks_repair(number));
+    }
+
     // The plan is read off the recorded chain before a single call is made:
     // where the replay starts, what it starts from, and which survivors have
     // to be pointed at a new base branch.
@@ -2798,7 +2842,15 @@ async fn repair_chain(
 /// A layer the forge reports closed while a repair is pending is recorded as
 /// [`ProposalStatus::Withdrawn`] rather than Declined: this machine closed it,
 /// in the withdrawal that never finished. A layer that merged in the meantime
-/// keeps its Merged status and stays for [`pull`] to consume.
+/// keeps its Merged status and stays for [`pull`] to consume - and blocks the
+/// repair until it has been ([`merged_layer_blocking_repair`]).
+///
+/// One consequence of where this is called from: both call sites sit behind
+/// the stacked path, so turning `github.stacks` off strands a pending repair
+/// exactly as it stands until the setting is turned back on. That is the
+/// intended trade - a repair is stack work, and a machine that has been told
+/// not to use stacks should not be making stack calls - but a chain left
+/// mid-repair stays mid-repair meanwhile.
 async fn finish_pending_repair(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -2908,6 +2960,10 @@ pub async fn withdraw(
         let entry = finish_pending_repair(provider, spec, &mut state, state_dir).await?;
         report.repaired = entry.repaired;
         report.restacked = entry.restacked;
+        // A link still owed to the forge is settled here too (spec 9.2 names
+        // share, withdraw and status): the repair below dissolves and
+        // recreates, and it can only do that over a chain the forge holds.
+        retry_stack_link(provider, spec, &mut state, state_dir).await;
     }
 
     let proposal = match proposal_number {
@@ -2986,8 +3042,14 @@ pub async fn withdraw(
 
     if let (true, Some(index)) = (repair_owed, index) {
         // Nothing is written until every layer above this one can be replayed:
-        // a chain left half re-based is worse than one never touched.
+        // a chain left half re-based is worse than one never touched. A merged
+        // layer this domain has not pulled in is the other refusal, and it
+        // belongs here rather than inside the repair, so the pull request is
+        // never closed for a repair that then cannot run.
         ensure_replayable(&state, index + 1)?;
+        if let Some(number) = merged_layer_blocking_repair(&state) {
+            return Err(merged_layer_blocks_repair(number));
+        }
         provider.close_proposal(spec, proposal.number).await?;
         report.closed = true;
         // From here the chain is knowingly inconsistent, and the flag says so
