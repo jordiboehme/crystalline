@@ -138,6 +138,22 @@ pub struct OriginStatusReport {
     /// live list was not consulted (offline, no probe, or the list call
     /// failed and status degraded to local state).
     pub amended_upstream: Vec<u64>,
+    /// The stack number linking this domain's open chain on the forge, `None`
+    /// when nothing is stacked (zero or one open layer, the fallback path, or
+    /// a chain whose link is still owed).
+    pub stack_number: Option<u64>,
+    /// Numbers of Declined layers that still carry open layers above them: the
+    /// chain is wedged on them, and the next share or withdrawal repairs it
+    /// (see [`crate::state::OriginState::proposals`] for the bottom-to-top
+    /// order this walks).
+    pub stack_wedged: Vec<u64>,
+    /// Whether a chain repair was interrupted and is still owed. The next
+    /// stacked share or withdrawal finishes it before its own work.
+    pub repair_pending: bool,
+    /// Whether a stack link this machine owes the forge is still unpaid: every
+    /// pull request exists, they are simply not grouped. A status with a probe
+    /// tries to settle it first, so this reads false once the retry lands.
+    pub stack_link_pending: bool,
 }
 
 /// What [`propose`] did with a domain's local changes.
@@ -373,6 +389,12 @@ pub async fn subscribe(
 /// merge each change into the working tree, record conflicts, advance the base
 /// snapshot over every processed path (conflicted ones included) and consume
 /// any merged proposals.
+///
+/// Consuming a merged layer is also what puts a stacked chain back together
+/// after the forge moved it: merging one layer rebases every layer above it,
+/// so once the merge is in history [`adopt_rebased_layers`] takes each
+/// survivor's new head where the move carried none of that layer's own work.
+/// Without that a plain merge would leave the whole chain looking amended.
 pub async fn pull(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -541,20 +563,24 @@ pub async fn pull(
     state.ref_etag = new_etag;
     state.last_checked = Some(Utc::now());
 
-    // Consume merged proposals in memory, then persist base advance,
+    // Consume merged proposals in memory, adopt the rebase the forge performed
+    // on whatever still stands above them, then persist base advance,
     // conflicts and history together in one atomic save so a crash cannot
     // leave a merged proposal half-consumed.
-    for prop in &merged_to_consume {
-        state.proposals.retain(|p| p.number != prop.number);
-        let mut consumed = prop.clone();
-        consumed.status = ProposalStatus::Merged;
-        state.push_history(consumed);
+    let consumed = consume_merged(&mut state);
+    if !consumed.is_empty()
+        && state
+            .proposals
+            .iter()
+            .any(|p| p.status == ProposalStatus::Open)
+    {
+        adopt_rebased_layers(provider, spec, &mut state).await;
     }
     state.save(state_dir)?;
 
     // Best-effort branch cleanup, after the state is durable; errors are
     // ignored entirely (the branch lingering upstream harms nothing).
-    for prop in &merged_to_consume {
+    for prop in &consumed {
         let _ = provider.delete_branch(spec, &prop.branch).await;
     }
 
@@ -567,6 +593,143 @@ pub async fn pull(
         skipped_large,
         re_baselined: false,
     })
+}
+
+/// Moves every Merged record out of the chain and into history, returning
+/// them so the caller can delete their branches once its state is durable.
+///
+/// The one rule beyond the move: when the last open layer leaves this way, the
+/// stack number goes with it. A number naming a chain with nothing open in it
+/// names nothing, and leaving it behind would have the next share dissolve a
+/// stack that is already finished.
+fn consume_merged(state: &mut OriginState) -> Vec<Proposal> {
+    let merged: Vec<Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Merged)
+        .cloned()
+        .collect();
+    if merged.is_empty() {
+        return merged;
+    }
+    state
+        .proposals
+        .retain(|p| p.status != ProposalStatus::Merged);
+    for prop in &merged {
+        state.push_history(prop.clone());
+    }
+    if !state
+        .proposals
+        .iter()
+        .any(|p| p.status == ProposalStatus::Open)
+    {
+        state.stack_number = None;
+    }
+    merged
+}
+
+/// Adopts the rebase the forge performs on a chain when a layer below it
+/// merges, so a surviving layer is not reported as amended for work nobody
+/// did.
+///
+/// Merging one layer of a stack moves every layer above it: GitHub rebases
+/// each survivor onto the new trunk, which gives it a new head sha carrying
+/// the same content. Left alone, that reads exactly like a reviewer's
+/// amendment ([`status`]'s `amended_upstream`), and a share would refuse with
+/// [`ProposeOutcome::ProposalDiverged`] over a move this domain asked for.
+///
+/// Telling the two apart is one comparison per moved layer: a rebase changes
+/// what the layer's commit stands on and nothing the layer itself proposes, so
+/// a compare from the recorded head to the live one that touches NONE of the
+/// layer's own files is a rebase, and the record simply takes the new head.
+/// The spec's blob-by-blob check is the same statement over the verbs this
+/// provider actually has. Anything else leaves the record exactly as it
+/// stands: a compare that touches an own path is a real amendment and must
+/// stay visible, a truncated compare is no answer at all (the next poll asks
+/// again), and a gone branch ref is the settling paths' business rather than
+/// this one's.
+///
+/// Only ever called after a merge was consumed, and best effort throughout: a
+/// failure here leaves the layer looking amended, which is the safe reading
+/// and one the user can act on, so it never fails the pull that healed
+/// everything else.
+async fn adopt_rebased_layers(provider: &dyn Provider, spec: &OriginSpec, state: &mut OriginState) {
+    let sub = spec.subpath.as_deref();
+    // What each layer stands on, walked bottom to top: the freshly advanced
+    // trunk for the bottom layer, the layer below for every other. Recording
+    // it keeps the chain's recorded shape intact, which is what
+    // `stack_shape_broken` reads to decide a repair is owed.
+    let mut parent_head = state.base_commit.clone();
+    for index in 0..state.proposals.len() {
+        if state.proposals[index].status != ProposalStatus::Open {
+            continue;
+        }
+        let layer = state.proposals[index].clone();
+        match rebased_head(provider, spec, &layer, sub).await {
+            Some(live) => {
+                let record = &mut state.proposals[index];
+                record.head_commit = Some(live.clone());
+                record.base_commit = Some(parent_head);
+                parent_head = live;
+            }
+            None => {
+                if let Some(head) = layer.head_commit {
+                    parent_head = head;
+                }
+            }
+        }
+    }
+}
+
+/// The live head of `layer`'s branch when a rebase is the only thing that
+/// moved it, `None` in every other case (see [`adopt_rebased_layers`] for what
+/// those cases are and why each one is left alone).
+async fn rebased_head(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    layer: &Proposal,
+    sub: Option<&str>,
+) -> Option<String> {
+    let recorded = layer.head_commit.as_deref()?;
+    let live = match provider.branch_ref(spec, &layer.branch).await {
+        Ok(Some(live)) => live,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(
+                "reading proposal #{}'s branch failed; leaving its recorded head alone: {e}",
+                layer.number
+            );
+            return None;
+        }
+    };
+    // A head this machine put there - settled or half-pushed - is nothing to
+    // adopt: the share paths own both.
+    if head_is_ours(layer, &live) {
+        return None;
+    }
+    let cmp = match provider.compare(spec, recorded, &live).await {
+        Ok(cmp) => cmp,
+        Err(e) => {
+            tracing::debug!(
+                "comparing proposal #{}'s heads failed; leaving its recorded head alone: {e}",
+                layer.number
+            );
+            return None;
+        }
+    };
+    if cmp.truncated {
+        return None;
+    }
+    let own: BTreeSet<String> = layer
+        .files
+        .iter()
+        .map(|file| to_repo_relative(&file.path, sub))
+        .collect();
+    let touches_own = cmp.files.iter().any(|change| {
+        own.contains(&change.path)
+            || matches!(&change.kind, ChangeKind::Renamed { previous } if own.contains(previous))
+    });
+    if touches_own { None } else { Some(live) }
 }
 
 /// Reports where a domain stands relative to its origin.
@@ -587,8 +750,14 @@ pub async fn pull(
 /// and degrades to the offline picture (local statuses unchanged, no amended
 /// flags), never failing the status.
 ///
-/// `stacks_allowed` carries `github.stacks` through to the stack-link retry a
-/// status is allowed to make; nothing in the report itself depends on it.
+/// The four stack fields are read off local state, with one exception: an
+/// owed stack link is settled before they are read ([`retry_stack_link`]), so
+/// a status that could pay the debt reports the healed truth rather than the
+/// debt. That needs a provider and `github.stacks` on, and it costs nothing
+/// when nothing is owed - the flag is tested before the capability is.
+///
+/// `stacks_allowed` carries `github.stacks` through to that retry; nothing
+/// else in the report depends on it.
 pub async fn status(
     spec: &OriginSpec,
     domain_root: &Path,
@@ -596,7 +765,6 @@ pub async fn status(
     probe: Option<&dyn Provider>,
     stacks_allowed: bool,
 ) -> Result<OriginStatusReport, RemoteError> {
-    let _ = stacks_allowed;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
@@ -627,6 +795,17 @@ pub async fn status(
                 state.save(state_dir)?;
             }
         }
+    }
+
+    // A link this machine owes the forge is settled before anything is
+    // reported, so a status names the chain as it really stands rather than as
+    // the last failed call left it. The debt is tested first: an origin that
+    // owes nothing never asks whether the forge serves stacks at all.
+    if let Some(provider) = probe
+        && state.stack_link_pending
+        && stacks_available(provider, spec, &mut state, state_dir, stacks_allowed).await?
+    {
+        retry_stack_link(provider, spec, &mut state, state_dir).await;
     }
 
     // One live list call, made only when there is an open record for it to
@@ -722,7 +901,36 @@ pub async fn status(
         conflicts: state.conflicts.clone(),
         last_checked: state.last_checked,
         amended_upstream,
+        stack_number: state.stack_number,
+        stack_wedged: under_an_open_layer(&state)
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Declined)
+            .map(|p| p.number)
+            .collect(),
+        repair_pending: state.repair_pending,
+        stack_link_pending: state.stack_link_pending,
     })
+}
+
+/// The recorded layers that still carry an OPEN layer above them, in chain
+/// order.
+///
+/// One walk answers both questions this crate asks about a closed layer left
+/// inside a chain, because they are the same question: is there still open
+/// work standing on it? A Declined one there is a wedge a repair has to close
+/// ([`OriginStatusReport::stack_wedged`]); a Merged one there is content a
+/// replay would rebuild without ([`merged_layer_blocking_repair`]). Above the
+/// topmost open layer neither is true: nothing is stacked on it, so nothing is
+/// replayed over it.
+fn under_an_open_layer(state: &OriginState) -> &[Proposal] {
+    match state
+        .proposals
+        .iter()
+        .rposition(|p| p.status == ProposalStatus::Open)
+    {
+        Some(top) => &state.proposals[..top],
+        None => &[],
+    }
 }
 
 /// Everything a share call carries besides the domain itself.
@@ -2593,10 +2801,10 @@ struct RepairOutcome {
 /// each one reads false again once [`repair_chain`] has done its work - a
 /// repaired chain must not re-repair itself on every later operation.
 ///
-/// A chain carrying a Merged record answers false whatever its shape: such a
-/// chain is not repairable at all until the merge is pulled in
-/// ([`merged_layer_blocking_repair`]), so the honest answer is "not for this
-/// function to fix" rather than "fine".
+/// A chain carrying a merged layer with open work above it answers false
+/// whatever its shape: such a chain is not repairable at all until the merge
+/// is pulled in ([`merged_layer_blocking_repair`]), so the honest answer is
+/// "not for this function to fix" rather than "fine".
 fn stack_shape_broken(state: &OriginState) -> bool {
     if state.stack_number.is_none() {
         return false;
@@ -2638,17 +2846,20 @@ fn stack_shape_broken(state: &OriginState) -> bool {
 /// only the next [`pull`] advances `base_commit` and the base snapshot onto
 /// it. Replaying over that would rebuild the survivors WITHOUT the merged
 /// files, which on the forge reads as those files being deleted - a corrupt
-/// review rather than a repaired chain. So any Merged record in the chain
-/// stops a repair, and the way out is the pull that consumes it.
+/// review rather than a repaired chain. The way out is the pull that consumes
+/// it, which both arms of [`pull`] now perform.
 ///
-/// Deliberately broader than the shapes that are provably lossy (a merged
-/// layer below the first replayed survivor): a repair is a rare operation, the
-/// pull that clears this is one call away, and refusing the whole class costs
-/// nothing next to getting one of its members wrong. Once pull adopts merged
-/// layers into the chain this can narrow.
+/// What blocks is exactly the merged record with an OPEN layer still above it
+/// ([`under_an_open_layer`]), which is the whole lossy class and nothing more.
+/// Such a record is either below where the replay starts - the survivors are
+/// then rebuilt on a parent that predates the merge - or inside the range
+/// [`cascade_replays`] walks, where it is skipped as not-open and the layer
+/// above it is rebuilt without it. A merged record ABOVE every open layer is
+/// neither: no tree is rebuilt over it, because the walk finds no survivor
+/// after it to replay, so a withdrawal below it repairs the chain without
+/// touching what merged.
 fn merged_layer_blocking_repair(state: &OriginState) -> Option<u64> {
-    state
-        .proposals
+    under_an_open_layer(state)
         .iter()
         .find(|p| p.status == ProposalStatus::Merged)
         .map(|p| p.number)
@@ -3292,7 +3503,14 @@ pub fn resolve(
 
 /// Handles the "nothing new upstream" outcome of a pull: refresh open
 /// proposals (a proposal can still be declined without the branch moving),
-/// persist any resulting change, and report up to date.
+/// consume any merged record, persist the result and report up to date.
+///
+/// The consumption is not an optimization. A merged record still sitting in
+/// the chain blocks every repair around it ([`merged_layer_blocking_repair`]),
+/// and the refusal's way out is "pull this domain first" - so a pull that
+/// finds nothing new upstream has to finish that record off too, or the advice
+/// names an operation that cannot clear it. No rebase is adopted here: the
+/// trunk never moved, so nothing above the merge was rebased onto it.
 ///
 /// `new_etag` is `Some` when this was reached from a moved branch that
 /// happened to equal the base commit (carrying a possibly-new etag to store)
@@ -3306,7 +3524,8 @@ async fn settle_up_to_date(
     new_etag: Option<Option<String>>,
 ) -> Result<PullReport, RemoteError> {
     let (transitions, touched) = refresh_proposals(provider, spec, &mut state).await?;
-    let mut dirty = touched;
+    let consumed = consume_merged(&mut state);
+    let mut dirty = touched || !consumed.is_empty();
     if let Some(etag) = new_etag
         && state.ref_etag != etag
     {
@@ -3316,6 +3535,11 @@ async fn settle_up_to_date(
     if dirty {
         state.last_checked = Some(Utc::now());
         state.save(state_dir)?;
+    }
+    // Best-effort branch cleanup once the state is durable, exactly as the
+    // moved-trunk arm does it.
+    for prop in &consumed {
+        let _ = provider.delete_branch(spec, &prop.branch).await;
     }
     Ok(PullReport {
         up_to_date: true,

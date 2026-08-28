@@ -23,8 +23,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crystalline_remote::ops::{
-    PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions, SubscribeReport, propose,
-    propose_preview, pull, resolve, status, subscribe, withdraw,
+    OriginStatusReport, PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions,
+    SubscribeReport, propose, propose_preview, pull, resolve, status, subscribe, withdraw,
 };
 use crystalline_remote::provider::{
     Feedback, OriginSpec, ProposalRequest, ProposalState, Provider,
@@ -5577,4 +5577,345 @@ async fn withdraw_settles_an_owed_stack_link_before_closing() {
     assert!(!state.stack_link_pending, "the debt is cleared");
     assert_eq!(state.stack_number, None, "one survivor is no chain");
     assert_eq!(open_numbers(&sub.state_dir), vec![first.number]);
+}
+
+// A merge upstream is the one event that moves a whole chain without anyone
+// asking this machine: GitHub rebases every layer above the merged one onto
+// the new trunk. These scenarios drive the pull that adopts that rebase, the
+// amendment it must NOT swallow, and the four stack fields a status carries.
+
+/// A status against the stack-serving mock: online, with stacking allowed.
+async fn stacked_status(mock: &MockProvider, sub: &Subscribed) -> OriginStatusReport {
+    status(&spec(), &sub.domain_root, &sub.state_dir, Some(mock), true)
+        .await
+        .expect("a status should succeed")
+}
+
+/// Marks `layer` merged on the mock forge, moves the trunk onto a commit
+/// carrying its file and returns the new trunk commit: the shape GitHub leaves
+/// behind when it merges the bottom of a two-layer chain.
+async fn merge_the_bottom(mock: &MockProvider, sub: &Subscribed, number: u64) -> String {
+    let trunk = load_state(&sub.state_dir).base_commit;
+    mock.set_proposal_state(number, ProposalState::Merged);
+    let merged = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v2\n"),
+        ]),
+        Some(&trunk),
+    );
+    mock.set_branch("main", &merged);
+    merged
+}
+
+#[tokio::test]
+async fn merging_the_bottom_adopts_githubs_rebase_of_the_layer_above() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_top = mock.branch_commit(&second.branch).expect("the top head");
+
+    // The forge merges the bottom layer and rebases the one above onto the new
+    // trunk: a fresh commit with the very same tree and a new parent.
+    let merged = merge_the_bottom(&mock, &sub, first.number).await;
+    let same_tree = mock.commit_tree(&old_top).expect("the top layer's tree");
+    let rebased = mock.add_commit(same_tree, Some(&merged));
+    mock.set_branch(&second.branch, &rebased);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.history.iter().any(|p| p.number == first.number),
+        "the merged layer was consumed: {:?}",
+        state.history
+    );
+    let top = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the layer above is still open");
+    assert_eq!(
+        top.head_commit.as_deref(),
+        Some(rebased.as_str()),
+        "the rebase was adopted rather than read as an amendment"
+    );
+    assert_eq!(
+        top.base_commit.as_deref(),
+        Some(merged.as_str()),
+        "the survivor stands on the new trunk"
+    );
+
+    let report = stacked_status(&mock, &sub).await;
+    assert!(
+        report.amended_upstream.is_empty(),
+        "nobody amended anything: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_real_amendment_during_rebase_is_still_flagged() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_top = mock.branch_commit(&second.branch).expect("the top head");
+
+    // Same shape, except the new head also changes the layer's OWN file: that
+    // is a reviewer's amendment riding along, not a rebase.
+    let merged = merge_the_bottom(&mock, &sub, first.number).await;
+    let mut tree = mock.commit_tree(&old_top).expect("the top layer's tree");
+    tree.insert("notes/b.md".to_string(), b"beta, reviewed\n".to_vec());
+    let amended = mock.add_commit(tree, Some(&merged));
+    mock.set_branch(&second.branch, &amended);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    let top = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the layer above is still open");
+    assert_eq!(
+        top.head_commit.as_deref(),
+        Some(old_top.as_str()),
+        "a head that touches the layer's own file is never adopted"
+    );
+
+    let report = stacked_status(&mock, &sub).await;
+    assert_eq!(report.amended_upstream, vec![second.number]);
+}
+
+#[tokio::test]
+async fn a_reviewer_decline_mid_chain_reads_as_wedged() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer closes the MIDDLE layer: the top is stacked on a branch that
+    // is going nowhere, which is what wedged names.
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let report = stacked_status(&mock, &sub).await;
+    assert_eq!(report.stack_wedged, vec![layers[1].number]);
+    assert_eq!(report.stack_number, Some(old_stack));
+    assert!(!report.repair_pending);
+    assert!(!report.stack_link_pending);
+    assert_eq!(report.declined_proposals.len(), 1);
+    assert_eq!(report.open_proposals.len(), 2);
+
+    // The next share repairs the chain before it stacks anything onto it.
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    let dissolve_at = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let retarget_at = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    let branch_at = delta
+        .iter()
+        .position(|c| c.starts_with(&format!("create_branch:{}:", fourth.branch)))
+        .unwrap_or_else(|| panic!("no branch for the new layer in {delta:?}"));
+    assert!(dissolve_at < retarget_at, "{delta:?}");
+    assert!(
+        dissolve_at < branch_at,
+        "the repair runs before the new layer is built: {delta:?}"
+    );
+
+    let healed = stacked_status(&mock, &sub).await;
+    assert!(healed.stack_wedged.is_empty(), "{healed:?}");
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number, fourth.number]
+    );
+    assert!(
+        load_state(&sub.state_dir)
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number),
+        "the declined layer left the chain"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_link_pending_and_heals_it_with_a_probe() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "the chain is degraded to begin with"
+    );
+
+    // Offline the debt can only be reported, never settled.
+    let offline = status(&spec(), &sub.domain_root, &sub.state_dir, None, true)
+        .await
+        .unwrap();
+    assert!(offline.stack_link_pending);
+    assert_eq!(offline.stack_number, None);
+
+    mock.heal_create_stack();
+    let report = stacked_status(&mock, &sub).await;
+    assert!(
+        !report.stack_link_pending,
+        "the probe settled the owed link: {report:?}"
+    );
+    let stack = report.stack_number.expect("the chain is linked now");
+    assert!(
+        mock.calls().contains(&format!(
+            "create_stack:[{},{}]",
+            first.number, second.number
+        )),
+        "{:?}",
+        mock.calls()
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, Some(stack));
+    assert!(!state.stack_link_pending);
+}
+
+#[tokio::test]
+async fn merging_the_top_consumes_the_whole_chain_in_one_pull() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    for layer in &layers {
+        mock.set_proposal_state(layer.number, ProposalState::Merged);
+    }
+    // Merging the top merges everything under it, so the trunk lands on the
+    // top layer's own head, carrying all three files.
+    let top_head = mock.branch_commit(&layers[2].branch).expect("the top head");
+    mock.set_branch("main", &top_head);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.proposals.is_empty(),
+        "every layer was consumed: {:?}",
+        state.proposals
+    );
+    for layer in &layers {
+        assert!(
+            state.history.iter().any(|p| p.number == layer.number),
+            "layer #{} reached history: {:?}",
+            layer.number,
+            state.history
+        );
+    }
+    assert_eq!(
+        state.stack_number, None,
+        "the last open layer left the chain"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+    assert_eq!(read(&sub.domain_root.join("notes/b.md")), b"beta\n");
+    assert_eq!(read(&sub.domain_root.join("notes/c.md")), b"gamma\n");
+}
+
+#[tokio::test]
+async fn a_merged_top_no_longer_blocks_repairing_the_chain_below_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A status poll flipped the TOP layer to Merged without consuming it.
+    // Nothing sits above it, so no survivor is replayed and no tree can lose
+    // what the merge brought: the withdrawal below it goes through.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[2].status = ProposalStatus::Merged;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    assert!(report.closed);
+    assert!(report.repaired);
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "{delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_tree")),
+        "no layer above the hole is replayed: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(open_numbers(&sub.state_dir), vec![layers[0].number]);
+    assert!(
+        state
+            .proposals
+            .iter()
+            .any(|p| p.number == layers[2].number && p.status == ProposalStatus::Merged),
+        "the merged layer stays for the next pull to consume: {:?}",
+        state.proposals
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[1].number),
+        "the withdrawn layer reached history"
+    );
+    assert!(!state.repair_pending);
+}
+
+#[tokio::test]
+async fn an_up_to_date_pull_still_consumes_a_merged_layer() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A status poll flipped the top layer to Merged. The trunk has not moved,
+    // so the pull the merged-layer refusal advises takes the up-to-date arm -
+    // and it has to consume the record there too, or the advice never clears.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[2].status = ProposalStatus::Merged;
+    state.save(&sub.state_dir).unwrap();
+    mock.set_proposal_state(layers[2].number, ProposalState::Merged);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(report.up_to_date, "the trunk never moved");
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.proposals.iter().all(|p| p.number != layers[2].number),
+        "the merged layer was consumed: {:?}",
+        state.proposals
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[2].number),
+        "it reached history"
+    );
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number]
+    );
 }

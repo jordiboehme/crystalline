@@ -640,6 +640,10 @@ mod tests {
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
         };
         let v = status_report_json("eng", &report, None);
         assert_eq!(v["domain"], "eng");
@@ -663,6 +667,10 @@ mod tests {
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
         };
         let message = RemoteError::Offline.to_string();
         let v = status_report_json("eng", &report, Some(message.clone()));
@@ -686,6 +694,10 @@ mod tests {
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
         }
     }
 
@@ -916,6 +928,10 @@ mod tests {
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![2],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
         };
         let v = status_report_json("eng", &report, None);
         assert_eq!(v["open_proposals"][0]["number"], 1);
