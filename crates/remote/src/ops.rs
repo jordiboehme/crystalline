@@ -2265,11 +2265,11 @@ fn not_an_open_layer(state: &OriginState, number: u64) -> RemoteError {
         .map(|(position, p)| format!("#{} (layer {})", p.number, position + 1))
         .collect();
     if open.is_empty() {
-        return RemoteError::State(format!(
+        return RemoteError::Refused(format!(
             "proposal #{number} is not an open layer of this domain; this domain has no open layers"
         ));
     }
-    RemoteError::State(format!(
+    RemoteError::Refused(format!(
         "proposal #{number} is not an open layer of this domain; open layers: {}",
         open.join(", ")
     ))
@@ -2279,7 +2279,7 @@ fn not_an_open_layer(state: &OriginState, number: u64) -> RemoteError {
 /// there is no branch left to amend, and re-creating one behind the same
 /// pull request would be a different operation than the caller asked for.
 fn branch_gone(layer: &Proposal) -> RemoteError {
-    RemoteError::State(format!(
+    RemoteError::Refused(format!(
         "proposal #{}'s branch {} is gone upstream; withdraw the proposal and share again",
         layer.number, layer.branch
     ))
@@ -2289,7 +2289,7 @@ fn branch_gone(layer: &Proposal) -> RemoteError {
 /// worked around: rebuilding a layer's tree needs the blob shas its record
 /// carries, and a record written before those existed (pre-0.17.0) has none.
 fn unreplayable_layer(number: u64) -> RemoteError {
-    RemoteError::State(format!(
+    RemoteError::Refused(format!(
         "layer #{number} predates stacked shares and cannot be replayed; withdraw it or merge it first"
     ))
 }
@@ -2891,7 +2891,7 @@ fn merged_layer_blocking_repair(state: &OriginState) -> Option<u64> {
 /// The refusal a chain carrying a merged layer earns, with the way out named:
 /// the merge has to be pulled in before the chain around it can be rebuilt.
 fn merged_layer_blocks_repair(number: u64) -> RemoteError {
-    RemoteError::State(format!(
+    RemoteError::Refused(format!(
         "proposal #{number} has merged and this domain has not pulled it in yet, so the layers around it cannot be rebuilt without losing what it brought; pull this domain first, then try again"
     ))
 }

@@ -290,11 +290,20 @@ fn poll_outcome_json(outcome: &DomainPollOutcome) -> Value {
 /// `stack_position` is `[layer, open layers]` with a 1-based layer, so a
 /// caller can say "layer 2 of 2 on stack #42" without a second call. Both are
 /// `null` off the stacked path - an unstacked forge, a lone proposal - rather
-/// than absent, so one shape reads either way. The
-/// further outcome a caller may see, `conflicts_pending`, is not shaped here:
-/// `Engine::origin_share` builds it directly from the reloaded conflict list
-/// when `ops::propose` itself refuses, since `RemoteError::ConflictsPending`
-/// alone carries only a count.
+/// than absent, so one shape reads either way.
+///
+/// The two are not null together on the stacked path: `stack_position` is
+/// always set there, while `stack_number` is `null` when the call that links
+/// the chain on the forge failed - every layer exists, they are simply not
+/// grouped yet, and `stack_link_pending` in the status surfaces carries that
+/// debt until a share or a probing status settles it. So a renderer keys off
+/// `stack_position` to decide whether it is looking at a layer at all, and
+/// names the stack number only when it has one.
+///
+/// The further outcome a caller may see, `conflicts_pending`, is not shaped
+/// here: `Engine::origin_share` builds it directly from the reloaded conflict
+/// list when `ops::propose` itself refuses, since
+/// `RemoteError::ConflictsPending` alone carries only a count.
 pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
     match outcome {
         ProposeOutcome::Proposed(report) => json!({

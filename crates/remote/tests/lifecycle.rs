@@ -4646,7 +4646,7 @@ async fn amend_refuses_a_number_that_is_not_an_open_layer() {
     .await
     .expect_err("999 is not an open layer");
     match &err {
-        crystalline_remote::RemoteError::State(message) => {
+        crystalline_remote::RemoteError::Refused(message) => {
             assert!(message.contains("999"), "{message}");
             assert!(
                 message.contains(&format!("#{} (layer 1)", first.number)),
@@ -4657,7 +4657,7 @@ async fn amend_refuses_a_number_that_is_not_an_open_layer() {
                 "{message}"
             );
         }
-        other => panic!("expected a State error, got {other:?}"),
+        other => panic!("expected a Refused error, got {other:?}"),
     }
     let delta = mock.calls().split_off(before);
     assert!(
@@ -4875,13 +4875,15 @@ async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
     .await
     .expect_err("the working tree cannot speak for this layer's copy");
     match &err {
-        crystalline_remote::RemoteError::State(message) => {
+        // A refusal, not a State error: the caller asked for something this
+        // chain cannot honor, and the message names the way out.
+        crystalline_remote::RemoteError::Refused(message) => {
             assert!(
                 message.contains(&format!("layer #{}", first.number)),
                 "{message}"
             );
         }
-        other => panic!("expected a State error, got {other:?}"),
+        other => panic!("expected a Refused error, got {other:?}"),
     }
     let delta = mock.calls().split_off(before);
     assert!(
@@ -5416,7 +5418,7 @@ async fn a_merged_layer_mid_chain_refuses_the_repair_until_it_is_pulled() {
     let delta = mock.calls().split_off(before);
 
     match err {
-        crystalline_remote::RemoteError::State(message) => {
+        crystalline_remote::RemoteError::Refused(message) => {
             assert!(
                 message.contains(&format!("#{}", layers[1].number)),
                 "the refusal names the merged layer: {message}"
@@ -5426,7 +5428,7 @@ async fn a_merged_layer_mid_chain_refuses_the_repair_until_it_is_pulled() {
                 "the refusal names the way out: {message}"
             );
         }
-        other => panic!("expected a State error, got {other:?}"),
+        other => panic!("expected a Refused error, got {other:?}"),
     }
     assert!(
         !delta.iter().any(|c| is_write_call(c)

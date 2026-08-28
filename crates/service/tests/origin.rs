@@ -1763,7 +1763,10 @@ async fn origin_share_amend_param_reaches_ops() {
 /// refusal, and that text has to reach a control or MCP client word for word:
 /// it names what was asked for and lists the layers that are actually open, so
 /// the caller retries against a real number without a second round trip. The
-/// engine boundary must not summarize it away.
+/// engine boundary must not summarize it away - and nothing may be prepended
+/// to it either: a framing clause in front of the guidance blames the machine
+/// for what the request asked for, so the rendered error starts with the
+/// teaching text itself.
 #[tokio::test]
 async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1775,13 +1778,12 @@ async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
         .await
         .unwrap_err()
         .to_string();
-    assert!(
-        err.contains("proposal #9999 is not an open layer of this domain"),
-        "{err}"
-    );
-    assert!(
-        err.contains(&format!("open layers: #{number} (layer 1)")),
-        "{err}"
+    assert_eq!(
+        err,
+        format!(
+            "proposal #9999 is not an open layer of this domain; open layers: #{number} (layer 1)"
+        ),
+        "the refusal reaches a control or MCP client whole and unprefixed"
     );
 }
 
