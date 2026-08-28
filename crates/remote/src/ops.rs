@@ -2334,7 +2334,13 @@ async fn stack_new_layer(
             // The stack this machine records is no longer the open chain -
             // a member settled out from under it, or somebody dissolved it -
             // and every later extend would be refused the same way. Rebuild
-            // it once rather than wedging the chain forever.
+            // it once rather than wedging the chain forever. One 404 arrives
+            // here wearing the same clothes and is not that at all: a
+            // repository deleted or made invisible answers every stack path
+            // the same way, so the rebuild fails too and the chain simply
+            // records `stack_link_pending` instead of reporting the missing
+            // repository - the proposals all exist and the next operation
+            // against the repository is what names the real problem.
             Err(e) if stack_no_longer_matches(&e) => {
                 rebuild_stack(provider, spec, number, &open).await
             }
@@ -2560,11 +2566,18 @@ fn first_misaligned_layer(state: &OriginState) -> Option<(usize, String)> {
             continue;
         }
         if let Some(layer) = below {
-            // A layer below with no recorded head says nothing about where
-            // the one above it belongs, so there is no re-base to plan.
-            let parent = layer.head_commit.clone()?;
-            if prop.base_commit.as_deref() != Some(parent.as_str()) {
-                return Some((index, parent));
+            // A layer below with no recorded head says nothing about where the
+            // one above it belongs, so there is no re-base to plan for THIS
+            // pair - and only for this pair. Abandoning the whole walk on one
+            // such layer would let a record written before head commits
+            // existed, or one an interrupted push left blank, silence the scan
+            // for every pair above it too, and the chain would sit wedged on a
+            // misalignment nothing was looking for any more.
+            match layer.head_commit.as_deref() {
+                Some(parent) if prop.base_commit.as_deref() != Some(parent) => {
+                    return Some((index, parent.to_string()));
+                }
+                _ => {}
             }
         }
         below = Some(prop);

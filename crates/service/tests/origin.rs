@@ -1607,11 +1607,16 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     // Nothing this domain knows is unshared. What the plan does carry is the
     // folder listings the generator wrote when the domain was subscribed: an
     // origin that has never seen them is genuinely behind on them, and they
-    // ride along with a share rather than being one.
+    // ride along with a share rather than being one - so the action is a
+    // create, and every path in it is a listing.
+    assert_eq!(plan["action"], "create", "{plan}");
+    let changes = plan["changes"].as_array().unwrap();
     assert!(
-        plan["changes"]
-            .as_array()
-            .unwrap()
+        !changes.is_empty(),
+        "the listings are what makes this a create: {plan}"
+    );
+    assert!(
+        changes
             .iter()
             .all(|c| c["path"].as_str().unwrap_or_default().ends_with("index.md")),
         "{plan}"

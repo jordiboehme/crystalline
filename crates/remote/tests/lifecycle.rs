@@ -7080,3 +7080,115 @@ async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
     assert_eq!(plan.changes.substantive_count(), 1);
     assert_eq!(plan.changes.index_count(), 2);
 }
+
+#[tokio::test]
+async fn a_generated_index_replays_with_its_layer_like_any_other_file() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // The top layer carries an engram and the folder listing that came with
+    // it, so its record holds an index entry a replay has to rebuild from.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        second.added.contains(&"notes/index.md".to_string()),
+        "{:?}",
+        second.added
+    );
+
+    // Amending the layer below replays the one above from its own record,
+    // which is where an index entry has to survive: the working tree cannot
+    // speak for one layer's copy of a file, and a listing rebuilt from nothing
+    // would read on the forge as the layer deleting it.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    updated(amend_share(&mock, &sub, first.number).await);
+
+    let state = load_state(&sub.state_dir);
+    let replayed = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the top layer is still in the chain");
+    let entry = replayed
+        .files
+        .iter()
+        .find(|f| f.path == "notes/index.md")
+        .expect("the listing is still a recorded file on the replayed layer");
+    assert_eq!(entry.change, ProposedChange::Added);
+    assert_eq!(entry.blob_sha, Some(sha256_hex(b"# Contents\n")));
+    assert_eq!(entry.size, Some(b"# Contents\n".len() as u64));
+
+    // And the rebuilt commit really carries it, beside the engram it lists.
+    let head = mock
+        .branch_commit(&second.branch)
+        .expect("the replayed layer's head");
+    let tree = mock.commit_tree(&head).expect("the replayed tree");
+    assert_eq!(
+        tree.get("notes/index.md"),
+        Some(&b"# Contents\n".to_vec()),
+        "the listing rides the replay"
+    );
+    assert_eq!(tree.get("notes/b.md"), Some(&b"beta\n".to_vec()));
+    assert_eq!(
+        tree.get("notes/a.md"),
+        Some(&b"alpha v3\n".to_vec()),
+        "on top of the amended layer below it"
+    );
+}
+
+#[tokio::test]
+async fn a_layer_with_no_recorded_head_does_not_silence_the_repair_above_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let layers = [
+        layers[0].clone(),
+        layers[1].clone(),
+        layers[2].clone(),
+        fourth,
+    ];
+
+    // Two things are wrong with the recorded chain, and only one of them is
+    // fixable. The second layer carries no head commit at all - a record
+    // written before the field existed, or one an interrupted push left blank -
+    // so nothing can say where the layer above it belongs. Higher up, a cascade
+    // died half-way and left the top layer standing on a commit that is no
+    // longer its parent's head. The unreadable pair must not hide the fixable
+    // one: the walk skips what it cannot read and keeps going.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[1].head_commit = None;
+    state.proposals[3].base_commit = Some("a commit nothing points at".to_string());
+    state.save(&sub.state_dir).unwrap();
+    let third_head = state.proposals[2]
+        .head_commit
+        .clone()
+        .expect("the third layer's head");
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/e.md"), b"epsilon\n");
+    stacked_share(&mock, &sub).await;
+    let delta = mock.calls().split_off(before);
+
+    // The top layer was re-based onto the layer below it, forced the way every
+    // replay is.
+    let top = &layers[3];
+    let new_top = mock.branch_commit(&top.branch).expect("the replayed head");
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            top.branch
+        )),
+        "the misaligned layer above the unreadable one was replayed: {delta:?}"
+    );
+    let healed = load_state(&sub.state_dir);
+    assert_eq!(
+        healed.proposals[3].base_commit,
+        Some(third_head),
+        "and its record now stands on the layer below it"
+    );
+    assert!(!healed.repair_pending, "the repair finished");
+}
