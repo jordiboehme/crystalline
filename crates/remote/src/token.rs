@@ -28,8 +28,29 @@ use crate::error::RemoteError;
 /// The keyring service name every Crystalline credential is stored under.
 const KEYRING_SERVICE: &str = "crystalline";
 
-/// The file name the file-backed store writes within its state directory.
+/// The file name the file-backed store writes within its state directory for
+/// the instance credential. Byte-identical to what every existing install
+/// already carries: a personal token gets its own name beside it rather than
+/// changing this one.
 const TOKEN_FILE_NAME: &str = "github-token.json";
+
+/// The longest personal identity name a credential is addressed by. Account
+/// names come from the auth layer already trimmed and lowercased, so this is a
+/// sanity ceiling rather than a policy: a keyring account name and a file name
+/// both stay comfortably short.
+const MAX_IDENTITY_NAME_BYTES: usize = 128;
+
+/// Which credential a store addresses: the instance-wide token, or one
+/// person's personal token.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenIdentity {
+    /// The machine-wide credential `crystalline connect github` manages.
+    Instance,
+    /// A personal credential bound to a crystalline account name (already
+    /// trimmed and lowercased by the account layer) - or the fixed local
+    /// name `owner` for the CLI/stdio machine owner.
+    Personal(String),
+}
 
 /// A saved GitHub access token, together with who it belongs to and where.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,6 +123,13 @@ pub enum TokenStore {
     /// Never produced by [`TokenStore::resolve_and_load`] or
     /// [`TokenStore::save_resolving`]; built directly with [`TokenStore::env`]
     /// by a caller that already holds the value (see the module docs).
+    ///
+    /// Instance-only, always: the environment supplies the machine's own
+    /// credential and never a personal one. One process serves everybody who
+    /// reaches it, so a single environment variable cannot mean "alice's
+    /// token" for one request and "bob's" for the next -
+    /// [`TokenIdentity::Personal`] is resolved through the keyring or the
+    /// file store and never through here.
     Env {
         /// The token value, exactly as `CRYSTALLINE_GITHUB_TOKEN` carries it.
         token: String,
@@ -152,7 +180,23 @@ impl TokenStore {
         host: Option<&str>,
         fallback_dir: &Path,
     ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
-        let account = account_for(host);
+        TokenStore::resolve_and_load_for(&TokenIdentity::Instance, host, fallback_dir)
+    }
+
+    /// [`TokenStore::resolve_and_load`] for one identity: the same single
+    /// keychain read, against the account [`account_for_identity`] names and
+    /// with the file fallback [`file_fallback_for`] names, so the instance
+    /// credential and every personal one are separate credentials rather than
+    /// one credential several callers overwrite in turn.
+    ///
+    /// A personal name that could escape the fallback directory is refused
+    /// here, before any backend is touched.
+    pub fn resolve_and_load_for(
+        identity: &TokenIdentity,
+        host: Option<&str>,
+        fallback_dir: &Path,
+    ) -> Result<(TokenStore, Option<StoredToken>), RemoteError> {
+        let account = account_for_identity_checked(identity, host)?;
         let read = keyring::Entry::new(KEYRING_SERVICE, &account)
             .ok()
             .map(|entry| entry.get_password());
@@ -160,7 +204,7 @@ impl TokenStore {
             Some(Ok(json)) => Ok((TokenStore::Keyring { account }, Some(from_json(&json)?))),
             Some(Err(keyring::Error::NoEntry)) => Ok((TokenStore::Keyring { account }, None)),
             _ => {
-                let store = file_fallback(fallback_dir);
+                let store = file_fallback_for(identity, fallback_dir)?;
                 let token = store.load()?;
                 Ok((store, token))
             }
@@ -185,14 +229,30 @@ impl TokenStore {
         fallback_dir: &Path,
         token: &StoredToken,
     ) -> Result<TokenStore, RemoteError> {
-        let account = account_for(host);
+        TokenStore::save_resolving_for(&TokenIdentity::Instance, host, fallback_dir, token)
+    }
+
+    /// [`TokenStore::save_resolving`] for one identity: the same keychain-first
+    /// write, against the per-identity account and file names, so saving
+    /// alice's personal token never disturbs the instance credential or bob's.
+    ///
+    /// A personal name that could escape the fallback directory is refused
+    /// here, before any backend is touched: the refusal names the account and
+    /// nothing is written.
+    pub fn save_resolving_for(
+        identity: &TokenIdentity,
+        host: Option<&str>,
+        fallback_dir: &Path,
+        token: &StoredToken,
+    ) -> Result<TokenStore, RemoteError> {
+        let account = account_for_identity_checked(identity, host)?;
         if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, &account)
             && let Ok(json) = to_json(token)
             && entry.set_password(&json).is_ok()
         {
             return Ok(TokenStore::Keyring { account });
         }
-        let store = file_fallback(fallback_dir);
+        let store = file_fallback_for(identity, fallback_dir)?;
         store.save(token)?;
         Ok(store)
     }
@@ -273,12 +333,63 @@ impl TokenStore {
     }
 }
 
-/// The keyring account name for `host`: `"github"` for GitHub.com,
-/// `"github:<host>"` for a GitHub Enterprise Server host.
-fn account_for(host: Option<&str>) -> String {
-    match host {
-        Some(host) => format!("github:{host}"),
-        None => "github".to_string(),
+/// The keyring account name for `identity` at `host`, the single site the
+/// account naming scheme lives:
+///
+/// - the instance credential keeps exactly the names it has always had,
+///   `"github"` for GitHub.com and `"github:<host>"` for a GitHub Enterprise
+///   Server host, so an install that connected before personal tokens existed
+///   still resolves its token;
+/// - a personal credential is namespaced away from those,
+///   `"github-personal:<name>"` and `"github-personal:<name>:<host>"`.
+///
+/// Callers that may be handed an unvalidated name go through
+/// [`account_for_identity_checked`] instead; this function assumes the name is
+/// already sound.
+fn account_for_identity(identity: &TokenIdentity, host: Option<&str>) -> String {
+    match (identity, host) {
+        (TokenIdentity::Instance, None) => "github".to_string(),
+        (TokenIdentity::Instance, Some(host)) => format!("github:{host}"),
+        (TokenIdentity::Personal(name), None) => format!("github-personal:{name}"),
+        (TokenIdentity::Personal(name), Some(host)) => format!("github-personal:{name}:{host}"),
+    }
+}
+
+/// [`account_for_identity`] with the name checked first, for the two resolving
+/// constructors: they take an identity from a caller and must refuse a bad one
+/// before a keychain entry is opened or a path is joined.
+fn account_for_identity_checked(
+    identity: &TokenIdentity,
+    host: Option<&str>,
+) -> Result<String, RemoteError> {
+    check_identity(identity)?;
+    Ok(account_for_identity(identity, host))
+}
+
+/// Whether `name` is safe to address a credential by. Account names reach here
+/// already lowercased and `[a-z0-9._-]`-safe from the auth layer, so this is
+/// the belt to that layer's braces: a name that is empty, over-long or carries
+/// a path separator or a NUL would otherwise decide where a token file lands.
+fn valid_identity_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= MAX_IDENTITY_NAME_BYTES
+        && !name.contains('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+}
+
+/// Refuses an identity whose name could address something other than its own
+/// credential. [`RemoteError::Refused`] rather than a credential error: the
+/// caller's own request is at fault, and the message names the account it
+/// asked for so the caller can see which one. The token itself is never part
+/// of this - or of any other - message.
+fn check_identity(identity: &TokenIdentity) -> Result<(), RemoteError> {
+    match identity {
+        TokenIdentity::Instance => Ok(()),
+        TokenIdentity::Personal(name) if valid_identity_name(name) => Ok(()),
+        TokenIdentity::Personal(name) => Err(RemoteError::Refused(format!(
+            "\"{name}\" is not a usable account name for a personal GitHub token; use the account name Crystalline knows this person by."
+        ))),
     }
 }
 
@@ -288,14 +399,30 @@ fn keyring_entry(account: &str) -> Result<keyring::Entry, RemoteError> {
     keyring::Entry::new(KEYRING_SERVICE, account).map_err(|e| credential_error("open", e))
 }
 
-/// The file-backed store under `fallback_dir`, the single place the token
-/// file's location is derived so [`TokenStore::resolve_and_load`] and
-/// [`TokenStore::save_resolving`] never disagree about where the fallback
-/// lives.
-fn file_fallback(fallback_dir: &Path) -> TokenStore {
-    TokenStore::File {
-        path: fallback_dir.join(TOKEN_FILE_NAME),
-    }
+/// The file-backed store for `identity` under `fallback_dir`, the single place
+/// a token file's location is derived so [`TokenStore::resolve_and_load_for`]
+/// and [`TokenStore::save_resolving_for`] never disagree about where the
+/// fallback lives. The instance file keeps its long-standing
+/// `github-token.json`; a personal one is `github-token-personal-<name>.json`
+/// beside it.
+///
+/// Public because a host process that redirects the token directory - the
+/// service engine's store override - maps identities through here rather than
+/// rebuilding the naming scheme. It returns a `Result` for the same reason:
+/// this is where a name becomes a path, so this is where a name that could
+/// escape `fallback_dir` is refused.
+pub fn file_fallback_for(
+    identity: &TokenIdentity,
+    fallback_dir: &Path,
+) -> Result<TokenStore, RemoteError> {
+    check_identity(identity)?;
+    let name = match identity {
+        TokenIdentity::Instance => TOKEN_FILE_NAME.to_string(),
+        TokenIdentity::Personal(name) => format!("github-token-personal-{name}.json"),
+    };
+    Ok(TokenStore::File {
+        path: fallback_dir.join(name),
+    })
 }
 
 /// Builds a [`RemoteError::Credential`] naming the attempted `operation`.
@@ -395,9 +522,90 @@ mod tests {
     // backend.
 
     #[test]
+    fn personal_and_instance_tokens_live_in_separate_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance = file_fallback_for(&TokenIdentity::Instance, dir.path()).unwrap();
+        let alice =
+            file_fallback_for(&TokenIdentity::Personal("alice".to_string()), dir.path()).unwrap();
+
+        // The instance file name is the one existing installs already carry;
+        // a personal token gets its own file beside it.
+        match (&instance, &alice) {
+            (TokenStore::File { path: instance }, TokenStore::File { path: alice }) => {
+                assert_eq!(instance, &dir.path().join("github-token.json"));
+                assert_eq!(
+                    alice,
+                    &dir.path().join("github-token-personal-alice.json"),
+                    "a personal token lands in its own file"
+                );
+            }
+            other => panic!("expected two file stores, got {other:?}"),
+        }
+
+        // Saving one leaves the other untouched: the two are separate
+        // credentials, not two views of one.
+        alice.save(&sample_token()).unwrap();
+        assert_eq!(alice.load().unwrap(), Some(sample_token()));
+        assert_eq!(
+            instance.load().unwrap(),
+            None,
+            "the instance token is not what alice just saved"
+        );
+    }
+
+    #[test]
+    fn account_names_are_identity_and_host_scoped() {
+        assert_eq!(
+            account_for_identity(&TokenIdentity::Instance, None),
+            "github"
+        );
+        assert_eq!(
+            account_for_identity(&TokenIdentity::Instance, Some("ghes.example")),
+            "github:ghes.example"
+        );
+        assert_eq!(
+            account_for_identity(&TokenIdentity::Personal("alice".to_string()), None),
+            "github-personal:alice"
+        );
+        assert_eq!(
+            account_for_identity(
+                &TokenIdentity::Personal("alice".to_string()),
+                Some("ghes.example")
+            ),
+            "github-personal:alice:ghes.example"
+        );
+    }
+
+    #[test]
+    fn a_path_escaping_identity_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = TokenStore::save_resolving_for(
+            &TokenIdentity::Personal("../x".to_string()),
+            None,
+            dir.path(),
+            &sample_token(),
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(matches!(err, RemoteError::Refused(_)), "{err:?}");
+        assert!(msg.contains("../x"), "the refusal names the account: {msg}");
+        assert!(
+            !msg.contains("gho_"),
+            "a refusal never carries the token: {msg}"
+        );
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(entries.is_empty(), "nothing was written: {entries:?}");
+    }
+
+    #[test]
     fn file_fallback_store_round_trips_under_the_fallback_dir() {
         let dir = tempfile::tempdir().unwrap();
-        let store = file_fallback(dir.path());
+        let store = file_fallback_for(&TokenIdentity::Instance, dir.path()).unwrap();
         assert_eq!(store.kind(), "file");
         // The fallback lands at the documented file name under the given dir,
         // so a save here is found again by a later resolve on the same machine.
