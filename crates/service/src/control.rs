@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::daemon::Shared;
-use crate::engine::ConfigureAction;
+use crate::engine::{ConfigureAction, ShareActor};
 
 /// The protocol version carried on every ctl envelope.
 pub const CTL_VERSION: u64 = 1;
@@ -278,7 +278,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         // Propose one domain's local changes as a pull request against its
-        // origin.
+        // origin. The control socket is the machine owner's own channel - a
+        // CLI process that already holds this machine's state directory - so
+        // it acts as `ShareActor::Owner`, here and in the two write verbs
+        // below. That is the final answer for this transport, not a
+        // placeholder waiting for a session.
         "origin_share" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let title = req.get("title").and_then(Value::as_str);
@@ -289,7 +293,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             };
             match shared
                 .engine
-                .origin_share(domain, title, description, proposal)
+                .origin_share(domain, title, description, proposal, ShareActor::Owner)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -307,7 +311,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let revert = req.get("revert").and_then(Value::as_bool).unwrap_or(false);
             match shared
                 .engine
-                .origin_withdraw(domain, proposal, revert)
+                .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -330,7 +334,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             };
             match shared
                 .engine
-                .origin_resolve(domain, path, keep, content.as_deref())
+                .origin_resolve(domain, path, keep, content.as_deref(), ShareActor::Owner)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

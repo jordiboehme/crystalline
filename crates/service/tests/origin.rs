@@ -24,7 +24,7 @@ use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
     FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
-use crystalline_service::engine::EngineError;
+use crystalline_service::engine::{EngineError, ShareActor};
 use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::{Engine, EnvOverlay};
 use support::{CountingEmbedder, MockProvider, sha256_hex};
@@ -201,7 +201,7 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     .await;
 
     let share_err = eng
-        .origin_share("brand", None, None, None)
+        .origin_share("brand", None, None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -209,14 +209,17 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
         "{share_err}"
     );
 
-    let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
+    let withdraw_err = eng
+        .origin_withdraw("brand", None, false, ShareActor::Owner)
+        .await
+        .unwrap_err();
     assert!(
         matches!(withdraw_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{withdraw_err}"
     );
 
     let preview_err = eng
-        .origin_share_preview("brand", None, None)
+        .origin_share_preview("brand", None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -225,7 +228,7 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     );
 
     let resolve_err = eng
-        .origin_resolve("brand", "notes/a.md", Some("mine"), None)
+        .origin_resolve("brand", "notes/a.md", Some("mine"), None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -250,19 +253,22 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     // None of these need a registered domain: read-only refuses before the
     // domain is even resolved, exactly like `origin_add` above.
     let share_err = eng
-        .origin_share("brand", None, None, None)
+        .origin_share("brand", None, None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(matches!(share_err, EngineError::ReadOnly), "{share_err}");
 
-    let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
+    let withdraw_err = eng
+        .origin_withdraw("brand", None, false, ShareActor::Owner)
+        .await
+        .unwrap_err();
     assert!(
         matches!(withdraw_err, EngineError::ReadOnly),
         "{withdraw_err}"
     );
 
     let preview_err = eng
-        .origin_share_preview("brand", None, None)
+        .origin_share_preview("brand", None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -271,7 +277,7 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     );
 
     let resolve_err = eng
-        .origin_resolve("brand", "notes/a.md", Some("mine"), None)
+        .origin_resolve("brand", "notes/a.md", Some("mine"), None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -1481,7 +1487,10 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
     )
     .unwrap();
 
-    let result = eng.origin_share("brand", None, None, None).await.unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["outcome"], "proposed");
     assert_eq!(result["added"][0], "notes/new.md");
     assert!(
@@ -1545,7 +1554,10 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     mock.set_branch("main", &c2);
     eng.origin_update(Some("brand")).await.unwrap();
 
-    let result = eng.origin_share("brand", None, None, None).await.unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["outcome"], "conflicts_pending");
     assert_eq!(result["count"], 1);
     let conflicts = result["conflicts"].as_array().unwrap();
@@ -1603,7 +1615,10 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     ]));
     mock.set_branch("main", &c2);
 
-    let plan = eng.origin_share_preview("brand", None, None).await.unwrap();
+    let plan = eng
+        .origin_share_preview("brand", None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     // Nothing this domain knows is unshared. What the plan does carry is the
     // folder listings the generator wrote when the domain was subscribed: an
     // origin that has never seen them is genuinely behind on them, and they
@@ -1649,7 +1664,10 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     )
     .unwrap();
 
-    let result = eng.origin_share("brand", None, None, None).await.unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["outcome"], "proposed", "{result}");
     assert_eq!(
         found("second upstream arrival").await,
@@ -1695,17 +1713,54 @@ async fn shared_team_engine(
         engram("Alpha", "notes/a", "alpha v2"),
     )
     .unwrap();
-    let shared = eng.origin_share("kb", None, None, None).await.unwrap();
+    let shared = eng
+        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(shared["outcome"], "proposed", "{shared}");
     let number = shared["number"].as_u64().unwrap();
     (eng, mock, root, number)
+}
+
+/// The injected test provider short-circuits BOTH share-identity modes, which
+/// is what keeps every origin test in this file (and every other one that
+/// injects a mock) free of a credential: an engine sharing personally, with no
+/// token of any kind on disk, still shares through the mock and never reaches
+/// the token store. Personal mode's refusals are engine unit tests, where a
+/// real credential resolution actually runs.
+#[tokio::test]
+async fn an_injected_provider_short_circuits_personal_mode_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, _number) = shared_team_engine(&tmp).await;
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "personal".to_string(),
+    })
+    .await
+    .unwrap();
+
+    std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
+    let shared = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "updated", "{shared}");
 }
 
 #[tokio::test]
 async fn origin_withdraw_closes_the_pr_and_records_withdrawn() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, mock, root, _number) = shared_team_engine(&tmp).await;
-    let v = eng.origin_withdraw("kb", None, false).await.unwrap();
+    let v = eng
+        .origin_withdraw("kb", None, false, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(v["status"], "withdrawn");
     assert_eq!(v["closed"], true);
     assert!(v["restored"].as_array().unwrap().is_empty());
@@ -1725,7 +1780,10 @@ async fn origin_withdraw_closes_the_pr_and_records_withdrawn() {
 async fn origin_withdraw_with_revert_restores_files() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
-    let v = eng.origin_withdraw("kb", Some(number), true).await.unwrap();
+    let v = eng
+        .origin_withdraw("kb", Some(number), true, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(v["restored"][0], "notes/a.md");
     let text = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
     assert!(!text.contains("alpha v2"), "restored to base: {text}");
@@ -1737,7 +1795,10 @@ async fn origin_share_maps_updated_and_diverged() {
     let (eng, mock, root, number) = shared_team_engine(&tmp).await;
 
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
-    let second = eng.origin_share("kb", None, None, None).await.unwrap();
+    let second = eng
+        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(second["outcome"], "updated");
     assert_eq!(second["proposal"]["number"], number);
 
@@ -1746,7 +1807,10 @@ async fn origin_share_maps_updated_and_diverged() {
     let amended = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
     mock.set_branch(&branch, &amended);
     std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
-    let third = eng.origin_share("kb", None, None, None).await.unwrap();
+    let third = eng
+        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(third["outcome"], "proposal_diverged");
     assert_eq!(third["proposal"]["number"], number);
     assert!(
@@ -1766,7 +1830,7 @@ async fn origin_share_amend_param_reaches_ops() {
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
 
     let v = eng
-        .origin_share("kb", None, None, Some(number))
+        .origin_share("kb", None, None, Some(number), ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(v["outcome"], "updated", "{v}");
@@ -1790,7 +1854,7 @@ async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
 
     let err = eng
-        .origin_share("kb", None, None, Some(9999))
+        .origin_share("kb", None, None, Some(9999), ShareActor::Owner)
         .await
         .unwrap_err()
         .to_string();
@@ -1827,7 +1891,10 @@ async fn origin_share_preview_names_the_action_and_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
-    let v = eng.origin_share_preview("kb", None, None).await.unwrap();
+    let v = eng
+        .origin_share_preview("kb", None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(v["action"], "update");
     assert_eq!(v["number"].as_u64(), Some(number));
     let changes = v["changes"].as_array().unwrap();
@@ -1890,7 +1957,9 @@ async fn origin_status_flags_an_amended_open_proposal() {
 async fn conflicted_team_engine(tmp: &tempfile::TempDir) -> (Engine, std::path::PathBuf, String) {
     let (eng, mock, root, _number) = shared_team_engine(tmp).await;
     // Clear the open proposal so the conflict setup is the only moving part.
-    eng.origin_withdraw("kb", None, false).await.unwrap();
+    eng.origin_withdraw("kb", None, false, ShareActor::Owner)
+        .await
+        .unwrap();
     // Local and upstream edit the same engram differently, then pull.
     std::fs::write(
         root.join("notes/a.md"),
@@ -2025,7 +2094,10 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
     });
     state.save(&state_dir).unwrap();
 
-    let result = eng.origin_withdraw("brand", Some(5), true).await.unwrap();
+    let result = eng
+        .origin_withdraw("brand", Some(5), true, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["restored"][0], "notes/keep.md");
     assert_eq!(
         result["closed"], false,
@@ -2111,7 +2183,9 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
     });
     state.save(&state_dir).unwrap();
 
-    eng.origin_withdraw("brand", Some(5), true).await.unwrap();
+    eng.origin_withdraw("brand", Some(5), true, ShareActor::Owner)
+        .await
+        .unwrap();
     assert!(
         rx.try_recv().is_ok(),
         "origin_withdraw must schedule a background embed instead of embedding inline"
@@ -2165,7 +2239,13 @@ async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
     );
 
     let result = eng
-        .origin_resolve("brand", "notes/a.md", Some("theirs"), None)
+        .origin_resolve(
+            "brand",
+            "notes/a.md",
+            Some("theirs"),
+            None,
+            ShareActor::Owner,
+        )
         .await
         .unwrap();
     assert_eq!(result["remaining"], 0);
@@ -2213,7 +2293,13 @@ async fn origin_resolve_unknown_path_errors_without_writing() {
     .unwrap();
 
     let err = eng
-        .origin_resolve("brand", "notes/missing.md", Some("mine"), None)
+        .origin_resolve(
+            "brand",
+            "notes/missing.md",
+            Some("mine"),
+            None,
+            ShareActor::Owner,
+        )
         .await
         .unwrap_err();
     assert!(

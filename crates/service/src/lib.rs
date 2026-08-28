@@ -48,7 +48,7 @@ pub use client::{
     scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
-pub use engine::{Engine, EngineError};
+pub use engine::{Engine, EngineError, ShareActor};
 pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };

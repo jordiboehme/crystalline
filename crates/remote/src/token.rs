@@ -38,7 +38,12 @@ const TOKEN_FILE_NAME: &str = "github-token.json";
 /// names come from the auth layer already trimmed and lowercased, so this is a
 /// sanity ceiling rather than a policy: a keyring account name and a file name
 /// both stay comfortably short.
-const MAX_IDENTITY_NAME_BYTES: usize = 128;
+///
+/// Public because the settings layer validates `github.agent_identity` - a
+/// name that has to address a credential here - against
+/// [`valid_identity_name`], and its refusal message names this ceiling. One
+/// predicate, one limit, one place to change them.
+pub const MAX_IDENTITY_NAME_BYTES: usize = 128;
 
 /// Which credential a store addresses: the instance-wide token, or one
 /// person's personal token.
@@ -404,7 +409,14 @@ fn account_for_identity_checked(
 /// `Personal("alice")` at `ghes.example`) and the NTFS alternate-data-stream
 /// separator, and a NUL truncates a path at the syscall boundary. An
 /// allowlist answers all three and whatever the next one turns out to be.
-fn valid_identity_name(name: &str) -> bool {
+///
+/// Public so the one caller outside this crate that decides an identity name
+/// before a credential exists - the `github.agent_identity` setting, which
+/// names the account an HTTP-MCP share runs as - asks this predicate rather
+/// than mirroring its character class and its ceiling. A mirror would drift,
+/// and the drift would show up as a setting that saves and then cannot be
+/// resolved.
+pub fn valid_identity_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= MAX_IDENTITY_NAME_BYTES
         && name

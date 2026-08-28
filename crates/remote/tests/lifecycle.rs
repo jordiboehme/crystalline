@@ -7629,3 +7629,20 @@ async fn a_layer_with_no_recorded_head_does_not_silence_the_repair_above_it() {
     );
     assert!(!healed.repair_pending, "the repair finished");
 }
+
+/// The boundary this whole crate is on the right side of: `ops` orchestrates a
+/// share, a withdrawal and a pull without ever learning WHO is doing it. The
+/// acting identity is resolved one layer up, in the service engine, which hands
+/// `ops` a provider already built from the right credential; nothing here takes
+/// an actor, an account or a token identity.
+///
+/// A source scan rather than a type-level proof, and blunt on purpose: the
+/// boundary is the point, so a rename that slips past this string list is a
+/// deliberate act someone will have to review.
+#[test]
+fn ops_signatures_carry_no_identity_types() {
+    let ops = include_str!("../src/ops.rs");
+    for name in ["ShareActor", "TokenIdentity", "Caller"] {
+        assert!(!ops.contains(name), "{name} leaked into ops.rs");
+    }
+}

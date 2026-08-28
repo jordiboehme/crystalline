@@ -15,6 +15,7 @@ use crystalline_core::config::{
     SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
+use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
 
 use crate::overlay::EnvOverlay;
 
@@ -607,30 +608,25 @@ fn share_identity_effective(config: &GlobalConfig) -> (String, bool) {
 
 // --- github.agent_identity ----------------------------------------------------
 
-/// The longest accepted `github.agent_identity`, bytes. Mirrors the token
-/// store's own limit on an identity name.
-const MAX_AGENT_IDENTITY_BYTES: usize = 128;
-
 /// The value names a Crystalline account whose credential the token store
-/// addresses by name, so it is held to that store's allowlist - `[a-z0-9._-]`
-/// - rather than to "anything without whitespace". An empty value clears the
-/// setting instead of storing a name nothing can resolve: the REST admin API
-/// sets without an unset verb, so the empty string has to be the way back
-/// there (`configure` also carries Unset; `set_allowed_hosts` is the same
-/// trade).
+/// addresses by name, so it is held to that store's own predicate -
+/// [`valid_identity_name`], the allowlist `[a-z0-9._-]` up to
+/// [`MAX_IDENTITY_NAME_BYTES`] - rather than to "anything without whitespace",
+/// and by CALLING it rather than mirroring it: a mirror would drift, and the
+/// drift would show up as a setting that saves and then cannot be resolved. An
+/// empty value clears the setting instead of storing a name nothing can
+/// resolve: the REST admin API sets without an unset verb, so the empty string
+/// has to be the way back there (`configure` also carries Unset;
+/// `set_allowed_hosts` is the same trade).
 fn set_agent_identity(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         clear_agent_identity(config);
         return Ok(());
     }
-    let well_formed = trimmed.len() <= MAX_AGENT_IDENTITY_BYTES
-        && trimmed
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
-    if !well_formed {
+    if !valid_identity_name(trimmed) {
         return Err(SettingsError(format!(
-            "github.agent_identity must be a crystalline account name of at most {MAX_AGENT_IDENTITY_BYTES} bytes, drawn from lowercase letters, digits, '.', '_' and '-'"
+            "github.agent_identity must be a crystalline account name of at most {MAX_IDENTITY_NAME_BYTES} bytes, drawn from lowercase letters, digits, '.', '_' and '-'"
         )));
     }
     config
@@ -1731,7 +1727,7 @@ mod tests {
             "team/bot",
             "bot:ghes.example",
             "bot\\name",
-            &"b".repeat(MAX_AGENT_IDENTITY_BYTES + 1),
+            &"b".repeat(MAX_IDENTITY_NAME_BYTES + 1),
         ] {
             let mut cfg = GlobalConfig::default();
             let err = apply(&mut cfg, "github.agent_identity", bad).unwrap_err();
@@ -1740,6 +1736,40 @@ mod tests {
                 "{bad}: {err}"
             );
             assert!(cfg.github.is_none(), "a rejected value must not be written");
+        }
+    }
+
+    /// The cross-crate agreement this setting rests on: `github.agent_identity`
+    /// names an account the token store will have to address, so the setting
+    /// accepts a value if and only if
+    /// [`crystalline_remote::valid_identity_name`] does. One predicate decides
+    /// the character class AND the ceiling; a value that saves here and then
+    /// cannot be resolved there is the failure this pins shut.
+    #[test]
+    fn the_agent_identity_class_is_the_token_stores_own_predicate() {
+        let names = [
+            "bot",
+            "share-bot",
+            "share_bot.2",
+            "Share-Bot",
+            "share bot",
+            "team/bot",
+            "bot:ghes.example",
+            "bot\\name",
+            "bot\u{1f}name",
+            "",
+            "   ",
+            &"b".repeat(MAX_IDENTITY_NAME_BYTES),
+            &"b".repeat(MAX_IDENTITY_NAME_BYTES + 1),
+        ];
+        for name in names {
+            let mut cfg = GlobalConfig::default();
+            let accepted = apply(&mut cfg, "github.agent_identity", name).is_ok();
+            // The empty value is the documented way to clear the setting, so it
+            // is accepted here while the predicate rejects it; every other value
+            // must agree exactly.
+            let expected = valid_identity_name(name.trim()) || name.trim().is_empty();
+            assert_eq!(accepted, expected, "{name:?}");
         }
     }
 

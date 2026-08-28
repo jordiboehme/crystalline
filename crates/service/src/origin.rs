@@ -1274,7 +1274,7 @@ mod tests {
                         &format!("https://github.test/pull/{n}"),
                         &format!("Layer {n}"),
                     );
-                    p.status = status.clone();
+                    p.status = status;
                     p
                 })
                 .collect::<Vec<_>>()

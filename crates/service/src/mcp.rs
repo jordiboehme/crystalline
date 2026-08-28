@@ -917,7 +917,7 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
-use crate::engine::{AckIntent, ConfigureAction, Engine, EngineError, ProvisionAction};
+use crate::engine::{AckIntent, ConfigureAction, Engine, EngineError, ProvisionAction, ShareActor};
 use crate::params::*;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
@@ -1569,7 +1569,14 @@ impl McpServer {
                 None => {
                     let preview = self
                         .engine
-                        .origin_share_preview(&p.domain, p.title.as_deref(), p.proposal)
+                        .origin_share_preview(
+                            &p.domain,
+                            p.title.as_deref(),
+                            p.proposal,
+                            // Task 6 wires the transport: stdio MCP is the
+                            // machine owner, HTTP MCP is the agent identity.
+                            ShareActor::Owner,
+                        )
                         .await
                         .map_err(to_error)?;
                     if share_plan_needs_confirmation(preview["action"].as_str()) {
@@ -1588,6 +1595,8 @@ impl McpServer {
                 p.title.as_deref(),
                 p.description.as_deref(),
                 p.proposal,
+                // Task 6 wires the transport.
+                ShareActor::Owner,
             )
             .await
             .map_err(to_error)
@@ -1707,7 +1716,8 @@ impl McpServer {
             }
         };
         self.engine
-            .origin_resolve(&p.domain, &p.path, keep, content)
+            // Task 6 wires the transport.
+            .origin_resolve(&p.domain, &p.path, keep, content, ShareActor::Owner)
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1745,7 +1755,8 @@ impl McpServer {
                     // about a proposal that does not exist.
                     let preview = self
                         .engine
-                        .origin_withdraw_preview(&p.domain, p.proposal, revert)
+                        // Task 6 wires the transport.
+                        .origin_withdraw_preview(&p.domain, p.proposal, revert, ShareActor::Owner)
                         .await
                         .map_err(to_error)?;
                     return Ok(confirm_question(withdraw_question(&preview)).into());
@@ -1757,7 +1768,8 @@ impl McpServer {
             }
         }
         self.engine
-            .origin_withdraw(&p.domain, p.proposal, revert)
+            // Task 6 wires the transport.
+            .origin_withdraw(&p.domain, p.proposal, revert, ShareActor::Owner)
             .await
             .map_err(to_error)
             .and_then(ok)

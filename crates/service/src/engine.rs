@@ -22,7 +22,7 @@ use std::time::Instant;
 use chrono::{DateTime, Duration, FixedOffset, NaiveDate, Utc};
 use crystalline_core::config::{
     DomainConfig, DomainEntry, DomainKind as CoreDomainKind, GlobalConfig, OriginConfig,
-    ResponseFormat, VerifyConfig,
+    ResponseFormat, ShareIdentityMode, VerifyConfig,
 };
 use crystalline_core::emit::{
     append_body, insert_after_section, insert_before_section, prepend_body,
@@ -45,7 +45,7 @@ use crystalline_index::{
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
-    GitHubProvider, OriginSpec, Provider, RemoteError, StoredToken, TokenStore,
+    GitHubProvider, OriginSpec, Provider, RemoteError, StoredToken, TokenIdentity, TokenStore,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -649,8 +649,9 @@ pub struct Engine {
     // and `save_resolving`, cached per process in `github_tokens`.
     token_store_dir_override: Option<PathBuf>,
     // A process-lifetime cache of the resolved GitHub token store and the
-    // token it holds, keyed by token host ("" for GitHub.com, the bare host
-    // for a GitHub Enterprise Server). The point is that one machine reads its
+    // token it holds, keyed by credential identity and token host (see
+    // `credential_cache_key`: the instance credential and every personal one
+    // get their own slot per host). The point is that one machine reads its
     // OS keychain at most once per process: the first `github_credential`
     // touch for a host performs the single keychain read and every later one
     // is served from here, so a daemon polling N team domains prompts the
@@ -692,15 +693,94 @@ pub struct Engine {
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
 }
 
-/// One host's cached GitHub credential: the resolved store and the token it
-/// held at the single keychain read this process ever does for that host. The
-/// token is non-optional - only a present-token outcome is ever cached, so an
-/// entry existing in [`Engine::github_tokens`] means a token exists - and the
-/// type carries no `Debug` impl, so a cached secret cannot reach a log line or
-/// panic message through the engine's own `Debug`.
+/// One identity's cached GitHub credential for one host: the resolved store
+/// and the token it held at the single keychain read this process ever does for
+/// that pair. The token is non-optional - only a present-token outcome is ever
+/// cached, so an entry existing in [`Engine::github_tokens`] means a token
+/// exists - and the type carries no `Debug` impl, so a cached secret cannot
+/// reach a log line or panic message through the engine's own `Debug`.
 struct CachedGithub {
     store: TokenStore,
     token: StoredToken,
+}
+
+/// Who a write verb acts as, resolved by each surface before it calls the
+/// engine. Read verbs never carry one: pulls, polls and probes stay on the one
+/// instance credential whatever `github.share_identity` says, so a person with
+/// no GitHub connection of their own still sees everything the instance sees.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShareActor {
+    /// The machine owner: the CLI, control-socket clients and stdio MCP.
+    Owner,
+    /// An authenticated account: Fluid and the REST API.
+    Account(String),
+    /// An agent over HTTP MCP, a transport with no user auth of its own:
+    /// resolved through the `github.agent_identity` setting.
+    HttpAgent,
+}
+
+/// The fixed identity name the machine owner's personal credential is stored
+/// under - the CLI and stdio MCP have no account to be, so they share one local
+/// name rather than inventing one per machine. `crystalline connect github
+/// --personal` with no `--as` writes exactly this slot.
+pub const OWNER_IDENTITY_NAME: &str = "owner";
+
+/// The refusal a write verb answers with in personal mode when the acting
+/// identity has connected no GitHub account of its own (spec section 6, and the
+/// locked decision behind it: no silent fallback to the instance token, ever).
+/// Surface-neutral on purpose - it names both ways back - because the engine
+/// serves Fluid, the REST API, MCP and the CLI from this one string; a surface
+/// that can say something sharper says it in its own layer.
+const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again.";
+
+/// The refusal an HTTP-MCP write gets when this instance shares personally and
+/// no agent identity is configured. HTTP MCP carries no user auth, so there is
+/// nobody to resolve a credential for until an admin names the account those
+/// shares run as - which is what this message teaches, rather than reporting a
+/// missing token for an identity the caller never chose.
+const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
+
+/// The [`Engine::github_tokens`] cache key for one credential on one host.
+///
+/// A unit separator joins the parts because an identity name can never contain
+/// one: [`crystalline_remote::valid_identity_name`] is an allowlist of
+/// `[a-z0-9._-]`, so no name can impersonate another identity or swallow the
+/// host boundary. The instance credential keeps a slot of its own, which is
+/// what stops a personal write from ever being served the machine's token out
+/// of the cache.
+fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String {
+    let host = host.unwrap_or("");
+    match identity {
+        TokenIdentity::Instance => format!("i\u{1f}{host}"),
+        TokenIdentity::Personal(name) => format!("p\u{1f}{name}\u{1f}{host}"),
+    }
+}
+
+/// Turns a write failure on a PERSONAL credential into the teaching error that
+/// failure actually needs (spec section 8). `login` is `None` for an
+/// instance-credential write, which keeps today's texts untouched.
+///
+/// Two failures are personal mode's own, and both are unreadable in their raw
+/// form: a 403 means the account authenticated fine and simply cannot push to
+/// this repository (stacks are same-repo and forks are unsupported, so
+/// collaborator access is a hard requirement, not a suggestion), and an expired
+/// token means THIS person's connection lapsed, not the instance's - so the
+/// instruction is to reconnect their own identity rather than to run the
+/// machine-wide connect. Every other error passes through: an offline machine
+/// or a rate limit is the same event whoever was acting.
+fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteError {
+    let Some(login) = login else {
+        return e;
+    };
+    match e {
+        RemoteError::Api { status: 403, .. } => RemoteError::Refused(format!(
+            "your GitHub account @{login} needs write access to {repo} - ask a maintainer to add you as a collaborator."
+        )),
+        RemoteError::AuthExpired => RemoteError::Refused(format!(
+            "the GitHub connection for @{login} has expired or was revoked - reconnect your GitHub identity (Fluid profile, or 'crystalline connect github --personal')."
+        )),
+        other => other,
+    }
 }
 
 /// The engine's observable activity: what is running now and what finished
@@ -8443,12 +8523,17 @@ impl Engine {
     ///
     /// `proposal` names an open layer to amend instead of letting the share
     /// pick its own target; `None` is the ordinary call.
+    ///
+    /// `actor` is who the share runs as, which decides the credential the
+    /// forge writes go out on (see [`Engine::resolve_share_provider`]); it is
+    /// inert while `github.share_identity` is `instance`, the default.
     pub async fn origin_share(
         &self,
         domain: &str,
         title: Option<&str>,
         description: Option<&str>,
         proposal: Option<u64>,
+        actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
@@ -8463,7 +8548,8 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let provider = self.resolve_origin_provider()?;
+        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let acting = self.personal_write_login(login.as_deref());
         match ops::propose(
             provider.as_ref(),
             &spec,
@@ -8503,7 +8589,7 @@ impl Engine {
                     "conflicts": conflicts,
                 }))
             }
-            Err(e) => Err(e.into()),
+            Err(e) => Err(enrich_write_error(e, acting.as_deref(), &spec.repo).into()),
         }
     }
 
@@ -8543,11 +8629,16 @@ impl Engine {
     /// writes the working tree and is refused on a read-only instance exactly
     /// as a share is - and, for the same reason, it ends with the same sync and
     /// embed tail (see `Engine::index_what_the_share_pull_applied`).
+    ///
+    /// It carries the share's own credential resolution too, `actor` and all:
+    /// a preview that resolved a different identity than the share would could
+    /// promise a plan this instance then refuses to perform.
     pub async fn origin_share_preview(
         &self,
         domain: &str,
         title: Option<&str>,
         proposal: Option<u64>,
+        actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
@@ -8562,7 +8653,8 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let provider = self.resolve_origin_provider()?;
+        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let acting = self.personal_write_login(login.as_deref());
         let plan = ops::propose_preview(
             provider.as_ref(),
             &spec,
@@ -8577,7 +8669,8 @@ impl Engine {
             },
         )
         .await
-        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))
+        .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
         self.index_what_the_share_pull_applied(domain, "previewing a share")
             .await;
         Ok(origin::share_plan_json(&plan))
@@ -8602,11 +8695,16 @@ impl Engine {
     /// with no credential on file has to fail in round one, where the failure
     /// is still the answer to the call, rather than after the user has said
     /// yes to a question.
+    ///
+    /// The provider it resolves and drops is the withdrawal's own, `actor`
+    /// included, so an instance that shares personally refuses here - before
+    /// the question - when the acting identity has no connection of its own.
     pub async fn origin_withdraw_preview(
         &self,
         domain: &str,
         proposal: Option<u64>,
         revert: bool,
+        actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
@@ -8621,7 +8719,7 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let _provider = self.resolve_origin_provider()?;
+        let (_provider, _login) = self.resolve_share_provider(&actor)?;
         let report = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await?;
         Ok(origin::withdraw_plan_json(
             &report,
@@ -8636,11 +8734,15 @@ impl Engine {
     /// shared files (`revert`) and records it as withdrawn. Under the
     /// domain's origin lock; syncs and embeds afterward only when files
     /// moved. Refuses when collaboration is off and on a read-only instance.
+    ///
+    /// `actor` decides the credential the close and the branch delete go out
+    /// on, exactly as it does for a share.
     pub async fn origin_withdraw(
         &self,
         domain: &str,
         proposal: Option<u64>,
         revert: bool,
+        actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
@@ -8655,7 +8757,8 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let provider = self.resolve_origin_provider()?;
+        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let acting = self.personal_write_login(login.as_deref());
         let report = ops::withdraw(
             provider.as_ref(),
             &spec,
@@ -8666,7 +8769,8 @@ impl Engine {
             stacks_allowed,
         )
         .await
-        .inspect_err(|e| self.drop_github_credential_on_auth(e))?;
+        .inspect_err(|e| self.drop_github_credential_on_auth(e))
+        .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
 
         if !report.restored.is_empty() || !report.deleted.is_empty() {
             self.sync(Some(domain)).await?;
@@ -8758,12 +8862,20 @@ impl Engine {
     /// must be supplied (see [`origin::resolution_from`]). Refuses with
     /// `github.enabled`'s message when collaboration is off, and with
     /// `EngineError::ReadOnly` on a read-only instance.
+    ///
+    /// `_actor` completes the write-verb signature every surface passes an
+    /// actor to, and is deliberately unused: resolving writes this machine's
+    /// working tree and its origin state and makes no provider call at all, so
+    /// there is no credential to resolve and nothing for an identity to change.
+    /// The resolved content reaches the forge later, on the next share, under
+    /// whoever performs that.
     pub async fn origin_resolve(
         &self,
         domain: &str,
         path: &str,
         keep: Option<&str>,
         content: Option<&[u8]>,
+        _actor: ShareActor,
     ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
@@ -8996,6 +9108,133 @@ impl Engine {
         )))
     }
 
+    /// Resolves the provider a WRITE verb runs its GitHub calls through, plus
+    /// the login it acts as (the acting `StoredToken.user`, for a proposal's
+    /// recorded author).
+    ///
+    /// The read side is [`Engine::resolve_origin_provider`] and never moves.
+    /// This one splits by `github.share_identity`, read LIVE on every call
+    /// rather than snapshotted at start: the setting is `startup_effective:
+    /// false`, so a mode flipped through `configure` is honoured by the very
+    /// next share with no restart.
+    ///
+    /// - `instance` (the default): byte for byte what the read side does, the
+    ///   one instance credential, whoever the actor is.
+    /// - `personal`: the actor's own credential -
+    ///   [`ShareActor::Owner`] the fixed `owner` slot, [`ShareActor::Account`]
+    ///   that account's, [`ShareActor::HttpAgent`] the account
+    ///   `github.agent_identity` names. No personal token on file refuses with
+    ///   a teaching text; there is no fallback to the instance credential, by
+    ///   design (spec section 6).
+    ///
+    /// The test provider override short-circuits BOTH modes, with no login: an
+    /// injected mock has no credential behind it to name.
+    fn resolve_share_provider(
+        &self,
+        actor: &ShareActor,
+    ) -> Result<(Arc<dyn Provider>, Option<String>)> {
+        if let Some(p) = &self.origin_provider_override {
+            return Ok((p.clone(), None));
+        }
+        let (api_url, token) = self.resolve_share_credential(actor)?;
+        let login = token.user_display().map(str::to_string);
+        Ok((
+            Arc::new(GitHubProvider::new(api_url, Some(token.access_token))),
+            login,
+        ))
+    }
+
+    /// The credential half of [`Engine::resolve_share_provider`]: the api url
+    /// and the token a write goes out on, before an HTTP client exists.
+    ///
+    /// Split out because this is where every decision lives - the mode, the
+    /// actor mapping, the two refusals - while building the client is
+    /// mechanical, and because a `reqwest` client build loads the platform
+    /// trust store, which is slow enough to be worth keeping out of the tests
+    /// that exercise this matrix.
+    fn resolve_share_credential(
+        &self,
+        actor: &ShareActor,
+    ) -> Result<(Option<String>, StoredToken)> {
+        let (api_url, mode, agent_identity) = {
+            let config = self.config.read().unwrap();
+            (
+                config.github.as_ref().and_then(|g| g.api_url.clone()),
+                config.github_share_identity(),
+                config.github_agent_identity().map(str::to_string),
+            )
+        };
+        let identity = match mode {
+            ShareIdentityMode::Instance => TokenIdentity::Instance,
+            ShareIdentityMode::Personal => {
+                TokenIdentity::Personal(self.acting_identity_name(actor, agent_identity)?)
+            }
+        };
+        let host = origin::token_host(api_url.as_deref());
+        let (_store, token) = self.github_credential_for(&identity, host.as_deref())?;
+        let token = match token {
+            Some(token) => token,
+            // The two absences are different failures and read differently: an
+            // instance with no credential at all is simply not connected, while
+            // an instance that shares personally and holds no token for THIS
+            // identity is connected and still refusing, which is the case that
+            // needs teaching.
+            None if identity == TokenIdentity::Instance => {
+                return Err(RemoteError::NotConnected.into());
+            }
+            None => return Err(RemoteError::Refused(PERSONAL_TOKEN_MISSING.to_string()).into()),
+        };
+        Ok((api_url, token))
+    }
+
+    /// The login a write failure is enriched in the name of: the acting login
+    /// when this instance shares personally, `None` otherwise.
+    ///
+    /// Instance-token failures keep today's texts (spec section 8), so the
+    /// teaching in [`enrich_write_error`] must not fire for them - and the mode
+    /// is read live here for the same reason it is read live in
+    /// [`Engine::resolve_share_provider`], one call after it, so the two agree
+    /// about which credential the call in flight actually used.
+    fn personal_write_login(&self, login: Option<&str>) -> Option<String> {
+        match self.config.read().unwrap().github_share_identity() {
+            ShareIdentityMode::Personal => login.map(str::to_string),
+            ShareIdentityMode::Instance => None,
+        }
+    }
+
+    /// The personal identity name a write runs under, in personal mode.
+    ///
+    /// The machine owner has no account to be, so it gets the one fixed local
+    /// name; an account is itself; an HTTP-MCP agent is whoever
+    /// `github.agent_identity` names, or a refusal that says which setting to
+    /// write.
+    fn acting_identity_name(
+        &self,
+        actor: &ShareActor,
+        agent_identity: Option<String>,
+    ) -> Result<String> {
+        let name = match actor {
+            ShareActor::Owner => OWNER_IDENTITY_NAME.to_string(),
+            ShareActor::Account(name) => name.clone(),
+            ShareActor::HttpAgent => agent_identity.ok_or_else(|| {
+                EngineError::Remote(RemoteError::Refused(AGENT_IDENTITY_UNSET.to_string()))
+            })?,
+        };
+        // Normalization belongs to the layer that mints these names - the auth
+        // store (`crate::rest::auth_store`) trims and lowercases an account name
+        // before it is ever stored, and the settings layer holds
+        // `github.agent_identity` to the same shape - so the engine asserts the
+        // invariant rather than quietly re-normalizing and hiding a surface that
+        // stopped honouring it. The token store refuses a malformed name anyway;
+        // this is the earlier, louder signal in a debug build.
+        debug_assert_eq!(
+            name,
+            name.trim().to_lowercase(),
+            "account names reach the engine already trimmed and lowercased"
+        );
+        Ok(name)
+    }
+
     /// This machine's GitHub connection, for `origin_status`: `{ connected,
     /// user, token_store }`. With an injected test provider, reflects the
     /// mock's own identity instead of the real token store, so origin tests
@@ -9024,8 +9263,11 @@ impl Engine {
         }))
     }
 
-    /// The GitHub token store for `host` and the token it holds, reading the
-    /// OS keychain at most once per process. The environment token wins first
+    /// The INSTANCE GitHub token store for `host` and the token it holds -
+    /// [`Engine::github_credential_for`] with the instance identity - reading
+    /// the OS keychain at most once per process. Every read verb and every
+    /// connection-status surface goes through here; only a write in personal
+    /// mode addresses another identity. The environment token wins first
     /// (`CRYSTALLINE_GITHUB_TOKEN`, via `self.overlay`; keyring-free and never
     /// cached, so unsetting it is picked up live); then a cached present-token
     /// for this host; then the resolved store - the test file override (see
@@ -9042,12 +9284,31 @@ impl Engine {
     /// test can prove the env token is actually what gets used even when a
     /// token directory is also wired up.
     fn github_credential(&self, host: Option<&str>) -> Result<(TokenStore, Option<StoredToken>)> {
-        if let Some(token) = self.overlay.github_token() {
+        self.github_credential_for(&TokenIdentity::Instance, host)
+    }
+
+    /// [`Engine::github_credential`] for any identity: the instance credential
+    /// or one person's personal one, cached per identity and host so two
+    /// identities can never be served the same client.
+    ///
+    /// The environment token is instance-only and stays that way. One process
+    /// serves everybody who reaches it, so a single `CRYSTALLINE_GITHUB_TOKEN`
+    /// cannot mean alice's token for one request and bob's for the next; a
+    /// personal identity resolves through the keyring or the file store, even on
+    /// a machine that sets the variable.
+    fn github_credential_for(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<(TokenStore, Option<StoredToken>)> {
+        if *identity == TokenIdentity::Instance
+            && let Some(token) = self.overlay.github_token()
+        {
             let store = TokenStore::env(token, host);
             let stored = store.load()?;
             return Ok((store, stored));
         }
-        let key = host.unwrap_or("").to_string();
+        let key = credential_cache_key(identity, host);
         // The std mutex is held across the keychain read on a cache miss on
         // purpose: the critical section never awaits, and single-flighting the
         // first touch under the lock collapses N concurrent first reads (a
@@ -9060,15 +9321,13 @@ impl Engine {
         }
         let (store, token) = match &self.token_store_dir_override {
             Some(dir) => {
-                let store = TokenStore::File {
-                    path: dir.join("github-token.json"),
-                };
+                let store = TokenStore::file_fallback_for(identity, dir)?;
                 let token = store.load()?;
                 (store, token)
             }
             None => {
                 let base = self.origins_base_dir()?;
-                TokenStore::resolve_and_load(host, &base)?
+                TokenStore::resolve_and_load_for(identity, host, &base)?
             }
         };
         if let Some(token) = &token {
@@ -9664,7 +9923,7 @@ impl TokenSavePlan {
                 TokenStore::save_resolving(self.host.as_deref(), fallback_dir, token)?
             }
         };
-        let key = self.host.clone().unwrap_or_default();
+        let key = credential_cache_key(&TokenIdentity::Instance, self.host.as_deref());
         self.cache.lock().unwrap().insert(
             key,
             CachedGithub {
@@ -11939,5 +12198,306 @@ mod receipt_permalink_tests {
                 "a receipt lookup must never fail the write it describes"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod share_actor_tests {
+    use super::*;
+    use crystalline_core::config::GitHubConfig;
+    use crystalline_index::TursoStore;
+    use crystalline_remote::TokenIdentity;
+
+    /// An engine whose credentials live in a tempdir file store, never the
+    /// developer's real keychain, with no injected provider: the point of these
+    /// tests is the credential resolution the override would short-circuit.
+    async fn credential_engine(tmp: &tempfile::TempDir, mode: Option<&str>) -> Engine {
+        let store = TursoStore::open_in_memory().await.unwrap();
+        let tokens = tmp.path().join("tokens");
+        std::fs::create_dir_all(&tokens).unwrap();
+        let config = GlobalConfig {
+            github: Some(GitHubConfig {
+                enabled: Some(true),
+                share_identity: mode.map(str::to_string),
+                ..GitHubConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            config,
+            None,
+            Some(tmp.path().join("config.yaml")),
+        )
+        .with_token_store_dir(tokens)
+    }
+
+    /// Writes a token for `identity` exactly where the file-backed store reads
+    /// it from, standing in for a `connect` that landed.
+    fn write_token(dir: &std::path::Path, identity: &TokenIdentity, user: &str) {
+        TokenStore::file_fallback_for(identity, dir)
+            .unwrap()
+            .save(&StoredToken {
+                access_token: format!("{user}-secret"),
+                host: "github.com".to_string(),
+                user: user.to_string(),
+                created_at: Utc::now(),
+            })
+            .unwrap();
+    }
+
+    fn personal(name: &str) -> TokenIdentity {
+        TokenIdentity::Personal(name.to_string())
+    }
+
+    /// The default mode is unchanged behaviour: one instance credential does
+    /// every write, whoever the actor is, and it reports the login the token
+    /// was connected as.
+    #[tokio::test]
+    async fn instance_mode_shares_run_on_the_instance_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, None).await;
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Owner)
+            .expect("the instance credential resolves");
+        assert_eq!(token.user_display(), Some("instance-gh"));
+
+        // And an account actor reaches the same one: the mode, not the actor,
+        // decides which credential a write runs on.
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect("the instance credential resolves for any actor");
+        assert_eq!(token.user_display(), Some("instance-gh"));
+    }
+
+    /// Strictness, locked: no personal token means a teaching refusal, never a
+    /// silent fall back to the instance credential.
+    #[tokio::test]
+    async fn personal_mode_without_a_token_refuses_with_the_teaching_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal")).await;
+        // The instance token is present and must not be reached for.
+        write_token(&tmp.path().join("tokens"), &TokenIdentity::Instance, "inst");
+
+        let err = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect_err("no personal token for alice");
+        assert_eq!(
+            err.to_string(),
+            "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again."
+        );
+    }
+
+    /// Each actor writes as itself: the account's own credential, the machine
+    /// owner's under the fixed `owner` name, and the instance token never read.
+    #[tokio::test]
+    async fn personal_mode_uses_the_actors_own_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal")).await;
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &personal("alice"), "alice-gh");
+        write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
+
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect("alice's own credential");
+        assert_eq!(token.user_display(), Some("alice-gh"));
+
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Owner)
+            .expect("the machine owner's credential");
+        assert_eq!(token.user_display(), Some("owner-gh"));
+
+        // Two identities never share a cached client: one entry each, and the
+        // instance slot was never touched.
+        let cache = engine.github_tokens.lock().unwrap();
+        assert_eq!(cache.len(), 2, "one cache entry per identity");
+        assert!(
+            !cache.contains_key(&credential_cache_key(&TokenIdentity::Instance, None)),
+            "a personal write must not read the instance credential"
+        );
+    }
+
+    /// An agent over HTTP MCP has no session to be, so an unconfigured instance
+    /// is told which setting names one.
+    #[tokio::test]
+    async fn http_agent_without_agent_identity_refuses_naming_the_setting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal")).await;
+
+        let err = engine
+            .resolve_share_credential(&ShareActor::HttpAgent)
+            .expect_err("no agent identity is configured");
+        assert_eq!(
+            err.to_string(),
+            "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI."
+        );
+        assert!(err.to_string().contains("github.agent_identity"), "{err}");
+    }
+
+    /// With one configured, the agent writes as that account's connected
+    /// identity.
+    #[tokio::test]
+    async fn http_agent_resolves_through_the_configured_account() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal")).await;
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.agent_identity".to_string(),
+                value: "bot".to_string(),
+            })
+            .await
+            .unwrap();
+        write_token(&tmp.path().join("tokens"), &personal("bot"), "bot-gh");
+
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::HttpAgent)
+            .expect("the bot's credential");
+        assert_eq!(token.user_display(), Some("bot-gh"));
+    }
+
+    /// Reads never move: pulls, polls and probes stay on the one instance
+    /// credential in personal mode, so a person with no GitHub connection of
+    /// their own still sees everything the instance can see.
+    #[tokio::test]
+    async fn reads_stay_on_the_instance_token_in_personal_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal")).await;
+        write_token(
+            &tmp.path().join("tokens"),
+            &TokenIdentity::Instance,
+            "instance-gh",
+        );
+
+        let (store, token) = engine
+            .github_credential(None)
+            .expect("the read side reads the instance credential");
+        assert_eq!(
+            token.expect("a token").user_display(),
+            Some("instance-gh"),
+            "{}",
+            store.kind()
+        );
+        // ... while a write in the same mode, with no personal token, refuses.
+        assert!(
+            engine.resolve_share_credential(&ShareActor::Owner).is_err(),
+            "the write side must not borrow the instance credential"
+        );
+    }
+
+    /// Neither setting is a start-time snapshot: a mode flipped through the
+    /// settings path is honoured by the very next resolution, in both
+    /// directions, with no restart.
+    #[tokio::test]
+    async fn a_live_mode_flip_is_honoured_by_the_next_resolution() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, None).await;
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+        write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
+
+        let (_api_url, token) = engine.resolve_share_credential(&ShareActor::Owner).unwrap();
+        assert_eq!(token.user_display(), Some("instance-gh"));
+
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.share_identity".to_string(),
+                value: "personal".to_string(),
+            })
+            .await
+            .unwrap();
+        let (_api_url, token) = engine.resolve_share_credential(&ShareActor::Owner).unwrap();
+        assert_eq!(
+            token.user_display(),
+            Some("owner-gh"),
+            "the flip to personal is live"
+        );
+
+        engine
+            .configure(&ConfigureAction::Unset {
+                key: "github.share_identity".to_string(),
+            })
+            .await
+            .unwrap();
+        let (_api_url, token) = engine.resolve_share_credential(&ShareActor::Owner).unwrap();
+        assert_eq!(
+            token.user_display(),
+            Some("instance-gh"),
+            "and the flip back is live too"
+        );
+    }
+
+    /// The cache key separates every identity from every other one and from the
+    /// instance, per host: a name can never be read as a host or as another
+    /// identity, because the allowlist keeps the separator out of a name.
+    #[test]
+    fn cache_keys_never_collide_across_identities_and_hosts() {
+        let keys = [
+            credential_cache_key(&TokenIdentity::Instance, None),
+            credential_cache_key(&TokenIdentity::Instance, Some("ghes.example")),
+            credential_cache_key(&personal("alice"), None),
+            credential_cache_key(&personal("alice"), Some("ghes.example")),
+            credential_cache_key(&personal("alice.ghes"), None),
+            credential_cache_key(&personal("bob"), None),
+        ];
+        let unique: HashSet<&String> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len(), "{keys:?}");
+    }
+
+    /// A personal token that cannot write the repository is the one failure
+    /// this mode adds, and the message says what to ask for rather than
+    /// reporting a bare 403.
+    #[test]
+    fn a_personal_403_teaches_the_collaborator_requirement() {
+        let err = enrich_write_error(
+            RemoteError::Api {
+                status: 403,
+                message: "Resource not accessible by personal access token".to_string(),
+            },
+            Some("alice"),
+            "team/knowledge",
+        );
+        assert_eq!(
+            err.to_string(),
+            "your GitHub account @alice needs write access to team/knowledge - ask a maintainer to add you as a collaborator."
+        );
+    }
+
+    /// An expired personal token names the reconnect flow: the instance-level
+    /// "use configure to sign in again" is the wrong instruction for a person
+    /// whose own connection lapsed.
+    #[test]
+    fn an_expired_personal_token_names_the_reconnect_flow() {
+        let err = enrich_write_error(RemoteError::AuthExpired, Some("alice"), "team/knowledge");
+        assert!(
+            err.to_string().contains("reconnect your GitHub identity"),
+            "{err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("crystalline connect github --personal"),
+            "{err}"
+        );
+    }
+
+    /// Instance-token failures keep today's texts (spec section 8), and any
+    /// other failure passes through whoever was acting.
+    #[test]
+    fn instance_failures_and_other_errors_pass_through_untouched() {
+        let untouched = enrich_write_error(
+            RemoteError::Api {
+                status: 403,
+                message: "nope".to_string(),
+            },
+            None,
+            "team/knowledge",
+        );
+        assert!(untouched.to_string().contains("403"), "{untouched}");
+
+        let offline = enrich_write_error(RemoteError::Offline, Some("alice"), "team/knowledge");
+        assert_eq!(offline.to_string(), RemoteError::Offline.to_string());
     }
 }

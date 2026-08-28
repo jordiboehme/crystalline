@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 
 use super::auth::Identity;
 use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
-use crate::engine::EngineError;
+use crate::engine::{EngineError, ShareActor};
 
 /// What `POST /domains` takes: a mode and whatever that mode needs.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -1017,7 +1017,7 @@ pub async fn share_changes_preview(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     if !state.engine.github_ready().await {
@@ -1029,7 +1029,12 @@ pub async fn share_changes_preview(
     Ok(Json(
         state
             .engine
-            .origin_share_preview(&domain, None, None)
+            .origin_share_preview(
+                &domain,
+                None,
+                None,
+                ShareActor::Account(caller.name().to_string()),
+            )
             .await?,
     ))
 }
@@ -1177,7 +1182,7 @@ pub async fn share_now(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<ShareBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
@@ -1194,6 +1199,7 @@ pub async fn share_now(
                 body.title.as_deref(),
                 body.description.as_deref(),
                 body.proposal,
+                ShareActor::Account(caller.name().to_string()),
             )
             .await?,
     ))
@@ -1307,7 +1313,7 @@ pub async fn withdraw_proposal(
     ApiPath((domain, number)): ApiPath<(String, u64)>,
     ApiJson(body): ApiJson<WithdrawBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
@@ -1319,7 +1325,12 @@ pub async fn withdraw_proposal(
     Ok(Json(
         state
             .engine
-            .origin_withdraw(&domain, Some(number), body.revert.unwrap_or(false))
+            .origin_withdraw(
+                &domain,
+                Some(number),
+                body.revert.unwrap_or(false),
+                ShareActor::Account(caller.name().to_string()),
+            )
             .await?,
     ))
 }
@@ -1508,7 +1519,7 @@ pub async fn resolve_conflict(
     ApiPath((domain, id)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     // Resolve BY ID: look the path up first, then run the path-based verb.
@@ -1540,7 +1551,13 @@ pub async fn resolve_conflict(
     Ok(Json(
         state
             .engine
-            .origin_resolve(&domain, &path, keep, content.as_deref())
+            .origin_resolve(
+                &domain,
+                &path,
+                keep,
+                content.as_deref(),
+                ShareActor::Account(caller.name().to_string()),
+            )
             .await?,
     ))
 }
