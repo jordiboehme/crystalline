@@ -646,6 +646,17 @@ async fn the_share_routes_walk_the_loop() {
     assert!(prop["feedback"].is_array(), "{status}");
     assert_eq!(prop["amended_upstream"], false);
 
+    // The chain keys ride along even off the stacked path, quiet rather than
+    // absent, so one client reads either path. This forge does not answer the
+    // stack probe, so the quiet values are exactly what a reader sees here.
+    assert!(
+        status["stack_number"].is_null(),
+        "nothing is stacked on this forge: {status}"
+    );
+    assert_eq!(status["stack_wedged"], serde_json::json!([]), "{status}");
+    assert_eq!(status["repair_pending"], false, "{status}");
+    assert_eq!(status["stack_link_pending"], false, "{status}");
+
     // A second share updates in place.
     std::fs::write(
         kb_root.join("second.md"),
@@ -666,6 +677,29 @@ async fn the_share_routes_walk_the_loop() {
     let again: serde_json::Value = again.json().await.unwrap();
     assert_eq!(again["outcome"], "updated", "{again}");
     assert_eq!(again["proposal"]["number"], number);
+
+    // A share naming a proposal is the amend verb, and the number has to reach
+    // the engine to be judged: #12 is not open here, so the engine's own
+    // teaching refusal comes back naming both what was asked for and what is
+    // open instead. A body whose `proposal` was dropped on the way in would
+    // have shared successfully rather than refused.
+    let amend = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({"proposal": 12}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(amend.status(), 422, "a teaching refusal, not a failure");
+    let amend: serde_json::Value = amend.json().await.unwrap();
+    let detail = amend["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("#12") && detail.contains(&format!("#{number}")),
+        "the refusal names the target and the open layers: {amend}"
+    );
 
     // Withdraw it.
     let withdrawn = as_session(
@@ -972,6 +1006,19 @@ async fn the_sync_summary_counts_what_every_team_domain_has_to_share() {
         assert!(
             kb[counted].is_number(),
             "{counted} is a count here, not a record list: {kb}"
+        );
+    }
+    // Chain health travels with the picker's row: a wedged chain is the one
+    // stack fact a picker must not hide, and the two debts say whether the
+    // chain is mid-repair. Where a domain sits IN its chain is detail the
+    // per-domain route carries, so it stays out of here.
+    assert_eq!(kb["stack_wedged"], serde_json::json!([]), "{kb}");
+    assert_eq!(kb["repair_pending"], false, "{kb}");
+    assert_eq!(kb["stack_link_pending"], false, "{kb}");
+    for detail in ["stack_number", "stack_position"] {
+        assert!(
+            kb.get(detail).is_none(),
+            "{detail} is per-domain detail, not a summary row: {kb}"
         );
     }
 

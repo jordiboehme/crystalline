@@ -543,7 +543,7 @@ export interface paths {
         };
         /**
          * Preview what sharing this team domain would do.
-         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
+         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
          */
         get: operations["get_domain_share_changes"];
         put?: never;
@@ -625,7 +625,7 @@ export interface paths {
         put?: never;
         /**
          * Share a team domain's local changes as a proposal.
-         * @description Admin only. Opens a pull request against the domain's origin, or updates the one already open in place. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
+         * @description Admin only. Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
          */
         post: operations["share_domain"];
         delete?: never;
@@ -872,7 +872,7 @@ export interface paths {
         };
         /**
          * Where every team domain on this instance stands, in counts.
-         * @description Admin only. One instance-wide answer to `does anything have something to share?`: the GitHub connection plus, per team domain, its repository, when it was last checked and the counts a share action needs - unshared local changes, open and declined proposals, waiting conflicts. A pure read, served even on a read-only instance. An instance with no GitHub connection is reported, not refused, and an instance with no team domain answers an empty list. Use `GET /domains/{domain}/sync` for one domain's full report.
+         * @description Admin only. One instance-wide answer to `does anything have something to share?`: the GitHub connection plus, per team domain, its repository, when it was last checked and the counts a share action needs - unshared local changes, open and declined proposals, waiting conflicts - and whether its chain of stacked proposals is healthy. A pure read, served even on a read-only instance. An instance with no GitHub connection is reported, not refused, and an instance with no team domain answers an empty list. Use `GET /domains/{domain}/sync` for one domain's full report.
          */
         get: operations["get_sync_summary"];
         put?: never;
@@ -1565,13 +1565,21 @@ export interface components {
              */
             token?: string | null;
         };
-        /** @description The proposal's title and description. Both optional: with neither, the share carries a title the engine generates from the changes themselves. */
+        /** @description The proposal's title and description, and optionally the open proposal to amend instead of stacking a new layer. All optional: with none of them, the share carries a title the engine generates from the changes themselves and targets the layer it picks itself. */
         ShareBody: {
             /**
              * @description A longer description of what changed and why.
              * @example Sharper wording on the routing rules.
              */
             description?: string | null;
+            /**
+             * Format: int64
+             * @description An open proposal to amend, rather than letting the share pick its own
+             *     target. Absent is the ordinary share: a new layer on the chain, or an
+             *     update of the one living proposal off the stacked path.
+             * @example 4
+             */
+            proposal?: number | null;
             /**
              * @description The pull request title. Defaults to a generated summary.
              * @example Refine 2 engrams in kb
@@ -4109,7 +4117,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. */
+            /**
+             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing.
+             *
+             *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4133,7 +4145,11 @@ export interface operations {
                      *       "mode": "github",
                      *       "open_proposals": [],
                      *       "probe_error": null,
-                     *       "repo": "acme/knowledge"
+                     *       "repair_pending": false,
+                     *       "repo": "acme/knowledge",
+                     *       "stack_link_pending": false,
+                     *       "stack_number": 42,
+                     *       "stack_wedged": []
                      *     }
                      */
                     "application/json": Record<string, never>;
@@ -4262,7 +4278,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. */
+            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url` and `layers_above` for an `amend` (how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4503,7 +4519,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own withdraw report: the number, whether a live pull request was closed, the `withdrawn` status the record now carries and the working-tree lists a revert produced. */
+            /** @description The engine's own withdraw report: the number, whether a live pull request was closed, the `withdrawn` status the record now carries and the working-tree lists a revert produced. `skipped_diverged` holds the paths whose local file moved on, `skipped_reverts` the paths whose pre-share content is nowhere to be had - two different reasons a revert left a file alone. `repaired` says the chain around the withdrawn layer was rebuilt, and `restacked` names the NEW stack number that rebuild allocated: null covers both `no repair happened` and `the survivors no longer make a chain`, so a client reads it together with `repaired` rather than alone. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4514,10 +4530,13 @@ export interface operations {
                      *       "closed": true,
                      *       "deleted": [],
                      *       "number": 4,
+                     *       "repaired": true,
+                     *       "restacked": 43,
                      *       "restored": [
                      *         "notes/a.md"
                      *       ],
                      *       "skipped_diverged": [],
+                     *       "skipped_reverts": [],
                      *       "status": "withdrawn"
                      *     }
                      */
@@ -4587,7 +4606,11 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance. */
+            /**
+             * @description The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance.
+             *
+             *     A `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4603,6 +4626,11 @@ export interface operations {
                      *       "number": 4,
                      *       "outcome": "proposed",
                      *       "skipped_large": [],
+                     *       "stack_number": 42,
+                     *       "stack_position": [
+                     *         2,
+                     *         2
+                     *       ],
                      *       "summary": "Refine 2 engrams in kb",
                      *       "updated": [
                      *         "notes/a.md"
@@ -4651,6 +4679,15 @@ export interface operations {
             };
             /** @description The body is not `application/json`. */
             415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The `proposal` named is not an open layer of this domain. The detail names the open layers with their positions in the chain, so a client can retry against a real number without a second call. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5421,7 +5458,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending; `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary. */
+            /**
+             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending; `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+             *
+             *     Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5444,7 +5485,10 @@ export interface operations {
                      *           "local_changes": 2,
                      *           "mode": "github",
                      *           "open_proposals": 1,
-                     *           "repo": "acme/knowledge"
+                     *           "repair_pending": false,
+                     *           "repo": "acme/knowledge",
+                     *           "stack_link_pending": false,
+                     *           "stack_wedged": []
                      *         }
                      *       ],
                      *       "errors": []

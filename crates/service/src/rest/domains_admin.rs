@@ -511,7 +511,22 @@ fn single_domain(
                            local state alone; `connection.connected` is false \
                            when no credential is on file, which is why a \
                            disconnected instance still answers here instead \
-                           of refusing.",
+                           of refusing.\n\nFour keys say where the domain's \
+                           chain of stacked proposals stands. `stack_number` \
+                           is the chain's number on the forge, null when \
+                           nothing is stacked. `stack_wedged` lists the \
+                           declined layers still carrying open layers above \
+                           them, empty when the chain is sound - a client \
+                           surfaces those numbers, because a wedged chain \
+                           cannot grow until one of them is withdrawn or \
+                           reopened. `repair_pending` and \
+                           `stack_link_pending` are the two debts a caller \
+                           settles by sharing or by checking status again: a \
+                           rebuild left half-done, and a chain whose layers \
+                           all exist but are not grouped on the forge yet. \
+                           All four are always present, quiet rather than \
+                           absent off the stacked path, so one reader handles \
+                           either path.",
             body = Object,
             example = json!({
                 "domain": "eng",
@@ -526,6 +541,10 @@ fn single_domain(
                 "conflicts": [],
                 "last_checked": "2026-08-10T08:00:00Z",
                 "probe_error": null,
+                "stack_number": 42,
+                "stack_wedged": [],
+                "repair_pending": false,
+                "stack_link_pending": false,
                 "connection": { "connected": true, "user": "octo", "token_store": "keychain" }
             }),
         ),
@@ -624,7 +643,8 @@ pub async fn sync_status(
                    have something to share?`: the GitHub connection plus, per \
                    team domain, its repository, when it was last checked and \
                    the counts a share action needs - unshared local changes, \
-                   open and declined proposals, waiting conflicts. A pure \
+                   open and declined proposals, waiting conflicts - and \
+                   whether its chain of stacked proposals is healthy. A pure \
                    read, served even on a read-only instance. An instance \
                    with no GitHub connection is reported, not refused, and an \
                    instance with no team domain answers an empty list. Use \
@@ -641,7 +661,19 @@ pub async fn sync_status(
                            records the per-domain route returns. `errors` \
                            holds one entry per domain that could not be read \
                            at all, so a single broken domain never blanks the \
-                           summary.",
+                           summary.\n\nThree chain-health keys ride along, \
+                           because a picker has to know which domains it can \
+                           actually offer: `stack_wedged` names the declined \
+                           layers still carrying open layers above them (empty \
+                           when the chain is sound, and the one stack fact a \
+                           picker must not hide, since a wedged chain cannot \
+                           grow), and `repair_pending` and \
+                           `stack_link_pending` say whether the chain is \
+                           mid-repair or not yet grouped on the forge. Where a \
+                           domain sits IN its chain - `stack_number` and \
+                           `stack_position` - is detail rather than a \
+                           decision, so it stays on `GET \
+                           /domains/{domain}/sync` and out of this row.",
             body = Object,
             example = json!({
                 "connection": { "connected": true, "user": "octo", "token_store": "keychain" },
@@ -654,7 +686,10 @@ pub async fn sync_status(
                     "open_proposals": 1,
                     "declined_proposals": 0,
                     "conflicts": 0,
-                    "local_changes": 2
+                    "local_changes": 2,
+                    "stack_wedged": [],
+                    "repair_pending": false,
+                    "stack_link_pending": false
                 }],
                 "errors": []
             }),
@@ -716,6 +751,17 @@ pub async fn sync_summary(
 /// is dropped, leaving the counted shape plus the `mode` this surface adds the
 /// way [`sync_status`] does.
 ///
+/// Three of the four chain keys survive the condensing, and the line drawn is
+/// "can the caller act on it here?". `stack_wedged` decides whether the picker
+/// can offer the domain at all - a chain held by a declined layer cannot grow,
+/// and the numbers it lists are what a caller withdraws or reopens - while
+/// `repair_pending` and `stack_link_pending` are debts the next share settles,
+/// so a row that hid them would let a client call a mid-repair chain healthy.
+/// `stack_number` and `stack_position` are dropped with the rest of the
+/// detail: where a domain sits in its chain says nothing about whether to
+/// offer it, and the per-domain route is one request away for the client that
+/// wants to draw it.
+///
 /// Reads the aggregate's JSON rather than the `OriginStatusReport` behind it
 /// because that report never leaves the engine: `origin_status` is the one
 /// call that probes, degrades offline and collects per-domain failures, and
@@ -742,6 +788,12 @@ fn summarize_origin_domain(entry: &Value) -> Value {
         "declined_proposals": count("declined_proposals"),
         "conflicts": count("conflicts"),
         "local_changes": field("local_changes"),
+        // Whole lists rather than counts, exactly as the engine reports them:
+        // a wedged layer is named by number because that number is what the
+        // caller withdraws or reopens.
+        "stack_wedged": field("stack_wedged"),
+        "repair_pending": field("repair_pending"),
+        "stack_link_pending": field("stack_link_pending"),
     })
 }
 
@@ -868,18 +920,27 @@ pub async fn sync_now(
     summary = "Preview what sharing this team domain would do.",
     description = "Admin only. Pulls the origin first, then reports the \
                    action a share would take (`create`, `update` with the \
-                   proposal number and url, `nothing_to_share`, \
-                   `conflicts_pending`, `proposal_diverged`), the effective \
-                   title and the changed files. Writes nothing to the origin; \
-                   refused on a read-only instance because the freshness pull \
-                   writes the working tree.",
+                   proposal number and url, `stack` with the layer it would \
+                   sit on, `amend` with the layer it would land on, \
+                   `nothing_to_share`, `conflicts_pending`, \
+                   `proposal_diverged`), the effective title and the changed \
+                   files. Writes nothing to the origin; refused on a \
+                   read-only instance because the freshness pull writes the \
+                   working tree.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     responses(
         (
             status = 200,
             description = "The share plan: the action it would take, the \
                            title it would carry and one entry per changed \
-                           file.",
+                           file. Each action carries its own fields - \
+                           `number` and `url` for an `update`, `top_number` \
+                           and `top_title` for a `stack` (the open layer the \
+                           new one would sit on), `number`, `url` and \
+                           `layers_above` for an `amend` (how many layers the \
+                           amend would rebuild), `count` for \
+                           `conflicts_pending`, and nothing extra for a \
+                           `create` or a `nothing_to_share`.",
             body = Object,
             example = json!({
                 "action": "update",
@@ -941,12 +1002,15 @@ pub async fn share_changes_preview(
     ))
 }
 
-/// What `POST /domains/{domain}/sync/share` takes: both fields optional, since
-/// the engine writes a summary of its own when neither is given.
+/// What `POST /domains/{domain}/sync/share` takes: every field optional, since
+/// the engine writes a summary of its own when no title is given and picks the
+/// share's own target when no proposal is named.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-#[schema(description = "The proposal's title and description. Both optional: \
-                        with neither, the share carries a title the engine \
-                        generates from the changes themselves.")]
+#[schema(description = "The proposal's title and description, and optionally \
+                        the open proposal to amend instead of stacking a new \
+                        layer. All optional: with none of them, the share \
+                        carries a title the engine generates from the changes \
+                        themselves and targets the layer it picks itself.")]
 pub struct ShareBody {
     /// The pull request title. Defaults to a generated summary.
     #[serde(default)]
@@ -956,6 +1020,12 @@ pub struct ShareBody {
     #[serde(default)]
     #[schema(example = "Sharper wording on the routing rules.")]
     pub description: Option<String>,
+    /// An open proposal to amend, rather than letting the share pick its own
+    /// target. Absent is the ordinary share: a new layer on the chain, or an
+    /// update of the one living proposal off the stacked path.
+    #[serde(default)]
+    #[schema(example = 4)]
+    pub proposal: Option<u64>,
 }
 
 /// `POST /domains/{domain}/sync/share` - propose this domain's local changes
@@ -964,6 +1034,11 @@ pub struct ShareBody {
 /// A write against the origin, so a read-only instance refuses it, and it
 /// needs a GitHub connection for the same reason the pull does: with no
 /// credential it has nothing to publish with.
+///
+/// `proposal` in the body is the amend verb: it names the open layer to land
+/// on instead of letting the share pick its own target. A number that is not
+/// an open layer is a teaching refusal (422) naming what IS open, rather than
+/// a silent share against the wrong target.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/sync/share",
@@ -971,12 +1046,15 @@ pub struct ShareBody {
     operation_id = "share_domain",
     summary = "Share a team domain's local changes as a proposal.",
     description = "Admin only. Opens a pull request against the domain's \
-                   origin, or updates the one already open in place. Answers \
-                   `nothing_to_share` when the team already has everything, \
-                   `conflicts_pending` with the conflicts that need resolving \
-                   first, and `proposal_diverged` when a reviewer moved the \
-                   proposal branch and nothing was written. Refused on a \
-                   read-only instance.",
+                   origin, stacks a new layer on the chain already open, or \
+                   updates the one living proposal in place. With `proposal` \
+                   in the body it amends that open layer instead, rebuilding \
+                   the layers above it. Answers `nothing_to_share` when the \
+                   team already has everything, `conflicts_pending` with the \
+                   conflicts that need resolving first, and \
+                   `proposal_diverged` when a reviewer moved the proposal \
+                   branch and nothing was written. Refused on a read-only \
+                   instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,
     responses(
@@ -986,7 +1064,20 @@ pub struct ShareBody {
                            new proposal's number and url, `updated` carrying \
                            the proposal it refreshed, `nothing_to_share`, \
                            `conflicts_pending` with the conflicts, or \
-                           `proposal_diverged` with guidance.",
+                           `proposal_diverged` with guidance.\n\nA `proposed` \
+                           or `updated` outcome also names where the proposal \
+                           sits in its chain: `stack_number` is the chain's \
+                           number on the forge and `stack_position` is \
+                           `[layer, open layers]` with a 1-based layer. Both \
+                           are null off the stacked path - an unstacked forge, \
+                           a lone proposal - rather than absent, so one reader \
+                           handles either path. On the stacked path \
+                           `stack_position` is always set while `stack_number` \
+                           is null when the call that groups the chain on the \
+                           forge has not landed yet, so a client keys off \
+                           `stack_position` to decide whether it is looking at \
+                           a layer at all and names the stack number only when \
+                           it has one.",
             body = Object,
             example = json!({
                 "outcome": "proposed",
@@ -997,7 +1088,9 @@ pub struct ShareBody {
                 "updated": ["notes/a.md"],
                 "deleted": [],
                 "skipped_large": [],
-                "summary": "Refine 2 engrams in kb"
+                "summary": "Refine 2 engrams in kb",
+                "stack_number": 42,
+                "stack_position": [2, 2]
             }),
         ),
         (
@@ -1035,6 +1128,15 @@ pub struct ShareBody {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 422,
+            description = "The `proposal` named is not an open layer of this \
+                           domain. The detail names the open layers with their \
+                           positions in the chain, so a client can retry \
+                           against a real number without a second call.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn share_now(
@@ -1059,7 +1161,7 @@ pub async fn share_now(
                 &domain,
                 body.title.as_deref(),
                 body.description.as_deref(),
-                None,
+                body.proposal,
             )
             .await?,
     ))
@@ -1106,7 +1208,17 @@ pub struct WithdrawBody {
             description = "The engine's own withdraw report: the number, \
                            whether a live pull request was closed, the \
                            `withdrawn` status the record now carries and the \
-                           working-tree lists a revert produced.",
+                           working-tree lists a revert produced. \
+                           `skipped_diverged` holds the paths whose local file \
+                           moved on, `skipped_reverts` the paths whose \
+                           pre-share content is nowhere to be had - two \
+                           different reasons a revert left a file alone. \
+                           `repaired` says the chain around the withdrawn \
+                           layer was rebuilt, and `restacked` names the NEW \
+                           stack number that rebuild allocated: null covers \
+                           both `no repair happened` and `the survivors no \
+                           longer make a chain`, so a client reads it together \
+                           with `repaired` rather than alone.",
             body = Object,
             example = json!({
                 "number": 4,
@@ -1114,7 +1226,10 @@ pub struct WithdrawBody {
                 "status": "withdrawn",
                 "restored": ["notes/a.md"],
                 "deleted": [],
-                "skipped_diverged": []
+                "skipped_diverged": [],
+                "skipped_reverts": [],
+                "repaired": true,
+                "restacked": 43
             }),
         ),
         (
