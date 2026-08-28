@@ -1564,26 +1564,7 @@ impl McpServer {
                         .origin_share_preview(&p.domain, p.title.as_deref(), p.proposal)
                         .await
                         .map_err(to_error)?;
-                    // Only a share that would publish gets a question;
-                    // nothing_to_share, conflicts_pending and
-                    // proposal_diverged answer in round one, because
-                    // executing the share produces exactly those canonical
-                    // shapes with no publishing write - no commit, no branch
-                    // update, no proposal opened or patched. Stated that way
-                    // rather than as "no provider write": the pull the share
-                    // runs first can reconcile a proposal the forge already
-                    // closed, so a diverged answer may be preceded by
-                    // bookkeeping calls. Those record what the forge already
-                    // decided; they never publish this domain's changes.
-                    //
-                    // The two stacked plans belong on the asking side for the
-                    // same reason the other two do: a stack opens a pull
-                    // request the team can see, and an amend moves a layer
-                    // they are already reviewing.
-                    if matches!(
-                        preview["action"].as_str(),
-                        Some("create") | Some("update") | Some("stack") | Some("amend")
-                    ) {
+                    if share_plan_needs_confirmation(preview["action"].as_str()) {
                         return Ok(confirm_question(share_question(&preview)).into());
                     }
                 }
@@ -1634,7 +1615,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means the layers exist but the forge has not grouped them yet. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -2758,6 +2739,31 @@ fn delete_question(preview: &Value) -> String {
     format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
 }
 
+/// Whether a share plan has to be confirmed before it runs, given the plan's
+/// `action` word.
+///
+/// **This is a deny-list on purpose, and the direction is the whole point.**
+/// Exactly three plans answer in round one without asking - `nothing_to_share`,
+/// `conflicts_pending` and `proposal_diverged` - because executing the share
+/// produces exactly those canonical shapes with no publishing write: no
+/// commit, no branch update, no proposal opened or patched. Stated that way
+/// rather than as "no provider write": the pull the share runs first can
+/// reconcile a proposal the forge already closed, so a diverged answer may be
+/// preceded by bookkeeping calls. Those record what the forge already decided;
+/// they never publish this domain's changes.
+///
+/// Everything else asks, an unknown or absent word included. An allow-list
+/// would fail the wrong way: a new `PlannedAction` variant nobody wired in
+/// here would publish to the team without asking, which is the one mistake
+/// this gate exists to prevent. Failing safe costs at worst a question in
+/// front of a plan that had nothing to publish.
+fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
+    !matches!(
+        action,
+        Some("nothing_to_share") | Some("conflicts_pending") | Some("proposal_diverged")
+    )
+}
+
 /// The sentence `share_changes` asks before it publishes, rendered from
 /// [`crate::engine::Engine::origin_share_preview`]'s plan: the action (update
 /// keeps the proposal's number and URL in front of the user), the effective
@@ -2857,9 +2863,11 @@ fn share_question(preview: &Value) -> String {
 /// while this one is a context budget. A `stack_number` of null, an empty
 /// `stack_wedged` and either debt flag false say nothing a caller can act on,
 /// so they say nothing at all. A null `stack_number` beside real positions is
-/// the degraded chain rather than an unstacked domain - the layers exist and
-/// are simply not grouped on the forge yet - and `stack_link_pending` is the
-/// key that survives to carry that debt.
+/// read off `stack_link_pending`: with the debt still owed it is the degraded
+/// chain - the layers exist and are simply not grouped on the forge yet - and
+/// with no debt it is a domain whose open records were never a chain at all,
+/// the unstacked forge or `github.stacks` turned off over leftover open
+/// proposals.
 fn lean_origin_status(mut value: Value) -> Value {
     if let Some(domains) = value.get_mut("domains").and_then(Value::as_array_mut) {
         for domain in domains {
@@ -3624,6 +3632,38 @@ mod tests {
         );
         assert!(create.contains("and 2 more"), "{create}");
         assert!(!create.contains("notes/f10.md"), "capped at ten: {create}");
+    }
+
+    /// The confirm gate's direction, stated as the property rather than as a
+    /// list: the three non-publishing plans answer straight away, and
+    /// everything else asks - a word this build has never heard of included.
+    ///
+    /// That last case is the one worth a test. A future `PlannedAction`
+    /// variant reaches this function as a string nobody here matched on, and
+    /// an allow-list would let it publish to the team unasked. The unknown
+    /// words below stand in for it.
+    #[test]
+    fn the_share_confirm_gate_asks_about_anything_it_does_not_recognize() {
+        for quiet in ["nothing_to_share", "conflicts_pending", "proposal_diverged"] {
+            assert!(
+                !share_plan_needs_confirmation(Some(quiet)),
+                "{quiet} publishes nothing, so it answers in round one"
+            );
+        }
+        for asks in ["create", "update", "stack", "amend"] {
+            assert!(share_plan_needs_confirmation(Some(asks)), "{asks}");
+        }
+        // The fail-safe: a plan word from a later version, and no word at all.
+        for unknown in ["reparent", "split_layer", ""] {
+            assert!(
+                share_plan_needs_confirmation(Some(unknown)),
+                "an unrecognized plan must ask rather than publish: {unknown}"
+            );
+        }
+        assert!(
+            share_plan_needs_confirmation(None),
+            "and so must a plan carrying no action at all"
+        );
     }
 
     /// The two stacked plans the same question renders, in the same framing

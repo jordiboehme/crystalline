@@ -2542,6 +2542,55 @@ async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
     );
 }
 
+/// The same round one on a forge that stacks: the question names the layer
+/// the new proposal would land on, and the forge is still untouched.
+///
+/// This is the stacked model's own version of the assertion above, and it is
+/// worth its own test because the two differ in what the user is agreeing to.
+/// An update moves a proposal reviewers are already looking at; a stack opens
+/// a second one on top of it. A gate that let the stacked plan through
+/// unasked would publish a pull request the user never saw a word about,
+/// which is precisely what `share_plan_needs_confirmation` fails safe on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_share_on_a_stacking_forge_is_asked_before_the_layer_is_opened() {
+    let (h, mock) = Harness::team().await;
+    // On before the first share, so the capability answer this domain caches
+    // is the stacked one from the start.
+    mock.enable_stacks();
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+
+    // Everything the forge was told while the first proposal was legitimately
+    // opened, so the silence asserted below is about this round alone.
+    let before = mock.calls().len();
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "a stacked share is confirmed too, not waved through: {asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Stacks a new proposal on top of #{number}")),
+        "the question names the layer it lands on: {message}"
+    );
+    assert!(
+        message.contains("notes/b.md"),
+        "and the file it carries: {message}"
+    );
+
+    assert!(
+        !mock.calls()[before..]
+            .iter()
+            .any(|c| c.starts_with("create_")),
+        "round one opens no layer: {:?}",
+        &mock.calls()[before..]
+    );
+}
+
 /// Round two with a yes on an *update* lands on the open proposal rather than
 /// opening a second one.
 ///

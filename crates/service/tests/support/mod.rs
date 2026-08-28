@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use crystalline_index::EmbeddingProvider;
 use crystalline_remote::provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
-    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
+    ProposalRequest, ProposalState, Provider, StackInfo, TreeWrite, UpstreamChange,
 };
 use crystalline_remote::{DeviceFlowStart, RemoteError};
 use crystalline_service::engine::ConnectAuth;
@@ -184,6 +184,10 @@ struct Inner {
     close_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers `RemoteError::Offline`.
     open_list_fails: bool,
+    /// Whether this forge answers the stack probe at all. Off by default, so
+    /// every test that does not ask for stacking keeps the single living
+    /// proposal this mock has always modelled.
+    stacks_enabled: bool,
     /// Every provider call made so far, in order, for tests asserting on the
     /// exact sequence a share-update or withdraw drives.
     calls: Vec<String>,
@@ -364,6 +368,21 @@ impl MockProvider {
     /// Makes `proposal_feedback` fail with a 500 for `number`.
     pub fn fail_feedback(&self, number: u64) {
         self.inner.lock().unwrap().feedback_failures.insert(number);
+    }
+
+    /// Makes this forge answer the stack probe, so a share takes the stacked
+    /// path instead of updating one living proposal.
+    ///
+    /// Only [`Provider::list_stacks`] is modelled, which is exactly what the
+    /// capability probe and a stacked *preview* need: the plan reads off the
+    /// recorded chain and the live branch refs, never off a stack record.
+    /// Grouping a chain (`create_stack`, `extend_stack`) keeps the trait's
+    /// unsupported default, so a test that lets a stacked share actually
+    /// publish a second layer would need those written first - the full forge
+    /// model lives in `crates/remote/tests/mock`, where the stacked lifecycle
+    /// is exercised end to end.
+    pub fn enable_stacks(&self) {
+        self.inner.lock().unwrap().stacks_enabled = true;
     }
 }
 
@@ -757,6 +776,28 @@ impl Provider for MockProvider {
 
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok(self.inner.lock().unwrap().current_user.clone())
+    }
+
+    /// The capability probe, and the only stack verb this mock answers. An
+    /// enabled forge reports no stacks yet, which is what a repository that
+    /// serves the endpoints and has grouped nothing looks like; a disabled
+    /// one refuses exactly as the trait default does, so the fallback path
+    /// stays the default here.
+    async fn list_stacks(
+        &self,
+        _origin: &OriginSpec,
+        pull_request: Option<u64>,
+    ) -> Result<Vec<StackInfo>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        match pull_request {
+            Some(number) => inner.calls.push(format!("list_stacks:{number}")),
+            None => inner.calls.push("list_stacks".to_string()),
+        }
+        if inner.stacks_enabled {
+            Ok(Vec::new())
+        } else {
+            Err(RemoteError::StacksUnsupported)
+        }
     }
 }
 
