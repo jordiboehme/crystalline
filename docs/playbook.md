@@ -693,17 +693,40 @@ person at command reads it and merges on GitHub; the agent never merges its own
 work, it only relays the link. If two edits collide, ask the agent to resolve the
 conflict, keeping your side or theirs.
 
+You do not have to wait for that review before the next piece of work goes out.
+Share again while the first proposal is still open and the new work stacks on top
+of it as a proposal of its own - the clamp findings on layer 1, the coolant
+lesson on layer 2 - so each one is a small, focused thing to read rather than one
+sprawling review that grows all week. Command merges the chain from the bottom
+up, and merging the top one lands everything under it in a single step; the
+layers still open are re-based for you, and the next pull takes those re-bases in.
+Ask where the domain stands and the agent reads the chain back in order.
+
 Review is a conversation, not a verdict. When command asks for changes:
 
 ```text
 What did the review say about my fleet-ops proposal?
 ```
 
-*The agent pulls the domain, relays the reviewers' comments, and after you refine
-the engrams, sharing again updates the same proposal - same number, same review
-URL - so the conversation stays in one place.* A declined proposal is normal;
-ask the agent to withdraw it, which closes it on GitHub and tidies the record,
-optionally restoring the shared files. Hard-won knowledge is worth the review.
+*The agent pulls the domain and relays the reviewers' comments.* After you refine
+the engrams, the agent shares again naming the layer the feedback was on, which
+amends that proposal - same number, same review URL - and re-bases the layers
+stacked above it automatically, so the conversation stays in one place and the
+work above it survives:
+
+```text
+The reviewer wants the clamp threshold spelled out - fix that and update proposal 1.
+```
+
+A layer that no longer earns its place is withdrawn, even from the middle of the
+chain: that closes it on GitHub, lifts its content out of the layers above,
+repairs the chain and tidies the record, optionally restoring the files it shared.
+A declined layer with work stacked on it is normal too and needs nothing from you -
+the next share or withdrawal on that domain repairs the chain as it goes. Where
+the forge does not serve stacked pull requests, a domain keeps one living proposal
+instead and sharing again updates it in place, same number and same URL; the
+conversation you have with the agent is the same either way. Hard-won knowledge is
+worth the review.
 
 ## Appendix
 
@@ -724,6 +747,7 @@ optionally restoring the shared files. Hard-won knowledge is worth the review.
 | Tidy vocabulary | "Have our hyperdrive tags drifted?" |
 | Ask what needs work | "Sweep ship-ops and tell me what the archive needs." |
 | Share with the team | "Share the clamp findings as a proposal for review." |
+| Answer a review | "Spell out the clamp threshold and update proposal 1." |
 | Withdraw a proposal | "Withdraw the fleet-ops proposal and keep my local edits." |
 
 ### Reference blocks
@@ -765,6 +789,7 @@ crystalline install claude-code                     # wire up a harness (Setup)
 crystalline import ./old-notes --domain ship-ops    # convert a legacy markdown tree
 crystalline tags rename <old> <new>                 # rename a tag everywhere
 crystalline tags merge <old> <into>                 # fold one tag into another
+crystalline origin share fleet-ops --proposal 4     # amend that layer after review
 crystalline origin withdraw fleet-ops --proposal 4  # close and clear a proposal
 crystalline verify                                  # static check: frontmatter, links, schema
 crystalline doctor                                  # diagnose index and service; add --fix to repair
