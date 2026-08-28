@@ -48,7 +48,8 @@ pub use engram::{
 };
 pub use harness::{HarnessKind, HarnessPaths, artifact_base, harness_paths};
 pub use index::{
-    INDEX_FILE, IndexEntry, LOG_FILE, OKF_VERSION, is_reserved_file, is_reserved_path, render_index,
+    INDEX_FILE, IndexEntry, LOG_FILE, OKF_VERSION, is_index_file, is_index_path, is_reserved_file,
+    is_reserved_path, render_index,
 };
 pub use manifest::{
     ArtifactType, Manifest, ProblemKind, ProvisioningDecl, ProvisioningProblem,

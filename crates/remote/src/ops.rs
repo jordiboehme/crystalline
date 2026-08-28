@@ -80,7 +80,10 @@ pub struct SubscribeReport {
     pub adopted: bool,
     /// How many local files differ from the new base snapshot right after
     /// subscribing: kept local edits plus local-only files, all shareable or
-    /// updatable through the ordinary flows. Always 0 for a fresh download.
+    /// updatable through the ordinary flows. Counted the way
+    /// [`OriginStatusReport::local_changes`] is, real work only, so a directory
+    /// index the local generator will rewrite anyway is not reported as kept
+    /// work. Always 0 for a fresh download.
     pub local_changes: usize,
 }
 
@@ -120,7 +123,10 @@ pub struct OriginStatusReport {
     /// Whether the branch has moved ahead of the base commit, or `None` when
     /// the origin was not probed (offline mode).
     pub behind: Option<bool>,
-    /// How many local working-tree changes stand against the base snapshot.
+    /// How many local working-tree changes stand against the base snapshot,
+    /// counting only real work: a refreshed directory index is derived from the
+    /// files beside it, so it never on its own makes a domain look like it has
+    /// something to say.
     pub local_changes: usize,
     /// Working-tree files skipped for exceeding [`MAX_SHARED_FILE_BYTES`],
     /// each with its size in bytes.
@@ -368,7 +374,7 @@ pub async fn subscribe(
 
     let engrams = extracted.keys().filter(|p| p.ends_with(".md")).count();
     let local_changes = if adopted {
-        detect_local_changes(domain_root, &files)?.changes.len()
+        detect_local_changes(domain_root, &files)?.substantive_count()
     } else {
         0
     };
@@ -400,6 +406,14 @@ pub async fn subscribe(
 /// merge each change into the working tree, record conflicts, advance the base
 /// snapshot over every processed path (conflicted ones included) and consume
 /// any merged proposals.
+///
+/// One kind of upstream change is deliberately not merged: a generated
+/// directory index (`index.md`). Its stamp is advanced like any other file's,
+/// so a share can carry the local generator's listing upstream and the
+/// repository converges, but the file on disk is left exactly as the generator
+/// wrote it. So an index whose local content differs from its recorded stamp is
+/// the expected steady state here rather than drift, it never appears in
+/// [`PullReport::applied`], and it can never raise a conflict.
 ///
 /// Consuming a merged layer is also what puts a stacked chain back together
 /// after the forge moved it: merging one layer rebases every layer above it,
@@ -497,6 +511,18 @@ pub async fn pull(
 
     for edit in &edits {
         let rel = &edit.path;
+        // A generated directory index rides along with a share so the team
+        // repository stays browsable, but the local generator is the single
+        // authority on its content: the origin's copy is recorded in the base
+        // snapshot below - so the next share carries the delta and the
+        // repository converges on this machine's listing - and is never
+        // written over the file on disk. Skipping the whole merge here is also
+        // what keeps a diverged index structurally incapable of raising a
+        // conflict: a derived file is nothing to ask a person to choose sides
+        // over.
+        if crystalline_core::is_index_path(rel) {
+            continue;
+        }
         let base = state::read_base_file(state_dir, rel)?;
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
         let local = read_optional_file(&wt_path)?;
@@ -929,7 +955,7 @@ pub async fn status(
         branch: state.branch.clone(),
         base_commit: state.base_commit.clone(),
         behind,
-        local_changes: local.changes.len(),
+        local_changes: local.substantive_count(),
         skipped_large: local.skipped_large,
         open_proposals,
         declined_proposals,
@@ -1552,18 +1578,10 @@ pub async fn propose(
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
 
-    let generated_title = generate_title(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-        domain_name,
-    );
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-    );
+    let summary = generate_summary_line(added, updated, deleted, indexes);
     let body = description
         .map(str::to_string)
         .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
@@ -1633,7 +1651,11 @@ pub struct SharePlan {
     /// What a share run right now would do with the detected changes.
     pub action: PlannedAction,
     /// The local changes a share would carry, exactly as [`propose`] would
-    /// detect them against the freshly pulled base.
+    /// detect them against the freshly pulled base - refreshed directory
+    /// indexes included, since the share really does carry them. A surface
+    /// that lists this splits it with
+    /// [`crate::changes::LocalChange::is_generated_index`] and draws the
+    /// indexes as one line rather than among the engrams.
     pub changes: crate::changes::LocalChanges,
     /// The caller's title, or the generated one for this change mix. Empty
     /// when there is nothing to title (nothing to share, conflicts pending).
@@ -1786,10 +1808,10 @@ pub async fn propose_preview(
                 effective_title: String::new(),
             });
         }
-        let (added, updated, deleted) = count_changes(&local);
+        let (added, updated, deleted, indexes) = count_changes(&local);
         let effective_title = title
             .map(str::to_string)
-            .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+            .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
         if let Some(action) = diverged {
             return Ok(SharePlan {
                 action,
@@ -1881,10 +1903,10 @@ pub async fn propose_preview(
         });
     }
 
-    let (added, updated, deleted) = count_changes(&local);
+    let (added, updated, deleted, indexes) = count_changes(&local);
     let effective_title = title
         .map(str::to_string)
-        .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+        .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
 
     if let Some(action) = stacked_action {
         return Ok(SharePlan {
@@ -1932,10 +1954,21 @@ pub async fn propose_preview(
     })
 }
 
-/// The (added, updated, deleted) counts of a detected change set.
-fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize) {
-    let mut counts = (0usize, 0usize, 0usize);
+/// The (added, updated, deleted) counts of the real work in a detected change
+/// set, with the generated directory indexes counted separately as a fourth
+/// number.
+///
+/// The split is what keeps a generated title honest. A share carries its
+/// folder listings so the team repository stays browsable, but calling two
+/// refreshed listings "2 new engrams" on the pull request would be a plain
+/// falsehood, and it is the first thing a reviewer reads.
+fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize, 0usize);
     for change in &local.changes {
+        if change.is_generated_index() {
+            counts.3 += 1;
+            continue;
+        }
         match change {
             LocalChange::Added { .. } => counts.0 += 1,
             LocalChange::Modified { .. } => counts.1 += 1,
@@ -1943,6 +1976,25 @@ fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize) 
         }
     }
     counts
+}
+
+/// The same split over the path lists a collected share carries: how many of
+/// each kind are real work, and how many generated directory indexes ride along
+/// across all three.
+fn count_collected(collected: &CollectedChanges) -> (usize, usize, usize, usize) {
+    let work = |paths: &[String]| {
+        paths
+            .iter()
+            .filter(|p| !crystalline_core::is_index_path(p))
+            .count()
+    };
+    let indexes = |paths: &[String]| paths.len() - work(paths);
+    (
+        work(&collected.added),
+        work(&collected.updated),
+        work(&collected.deleted),
+        indexes(&collected.added) + indexes(&collected.updated) + indexes(&collected.deleted),
+    )
 }
 
 /// Everything a share commit is built from, collected in one pass over the
@@ -2091,18 +2143,10 @@ async fn update_open_proposal(
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
 
-    let generated_title = generate_title(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-        domain_name,
-    );
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-    );
+    let summary = generate_summary_line(added, updated, deleted, indexes);
     let body = description
         .map(str::to_string)
         .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
@@ -2218,18 +2262,10 @@ async fn stack_new_layer(
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
 
-    let generated_title = generate_title(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-        domain_name,
-    );
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-    );
+    let summary = generate_summary_line(added, updated, deleted, indexes);
     let body = description
         .map(str::to_string)
         .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
@@ -2663,18 +2699,10 @@ async fn amend_layer(
     )
     .await?;
 
-    let generated_title = generate_title(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-        domain_name,
-    );
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-    );
+    let summary = generate_summary_line(added, updated, deleted, indexes);
     let body = description
         .map(str::to_string)
         .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
@@ -4186,7 +4214,7 @@ fn stamp(content: &[u8]) -> BaseStamp {
 /// the prefix stripping [`crate::archive::extract_tarball`] applies, so the
 /// compare and tarball paths agree on which files belong to the domain, and
 /// applies the same [`crate::changes::is_excluded_path`] rule that function
-/// does: a hidden or reserved upstream change is dropped here, before the caller ever
+/// does: a hidden or logged upstream change is dropped here, before the caller ever
 /// fetches a blob for it or stamps it into
 /// [`crate::state::OriginState::files`], so a compare-driven pull can never
 /// disagree with a tarball-driven one about which files are hidden.
@@ -4466,17 +4494,30 @@ fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
 
-/// Generates a proposal title from the change mix, by three simple,
+/// Generates a proposal title from the change mix, by four simple,
 /// deterministic rules:
 ///
 /// - only additions -> `"Share N new engram(s) from <domain>"`
 /// - only modifications -> `"Refine N engram(s) in <domain>"`
+/// - no real work at all, only refreshed listings ->
+///   `"Refresh N folder index(es) in <domain>"`
 /// - anything else (deletions alone, or any mix of two or three kinds) ->
 ///   `"Share updates from <domain>"`
 ///
+/// The counts are of real work; `indexes` is the generated directory listings
+/// riding along, and it only ever decides the title when there is nothing else
+/// to name. A share of two refreshed listings called "2 new engrams" would be
+/// the first thing a reviewer reads and a plain falsehood.
+///
 /// Used as the proposal title, and (unless the caller supplies their own
 /// title) the commit message too.
-fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &str) -> String {
+fn generate_title(
+    added: usize,
+    updated: usize,
+    deleted: usize,
+    indexes: usize,
+    domain_name: &str,
+) -> String {
     match (added > 0, updated > 0, deleted > 0) {
         (true, false, false) => format!(
             "Share {added} new {} from {domain_name}",
@@ -4485,6 +4526,10 @@ fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &st
         (false, true, false) => format!(
             "Refine {updated} {} in {domain_name}",
             pluralize(updated, "engram", "engrams")
+        ),
+        (false, false, false) if indexes > 0 => format!(
+            "Refresh {indexes} folder {} in {domain_name}",
+            pluralize(indexes, "index", "indexes")
         ),
         _ => format!("Share updates from {domain_name}"),
     }
@@ -4495,7 +4540,18 @@ fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &st
 /// with a zero-count clause omitted entirely, singular or plural chosen per
 /// count, and no Oxford comma before the final "and" (see
 /// [`join_clauses`]).
-fn generate_summary_line(added: usize, updated: usize, deleted: usize) -> String {
+///
+/// The counts are of real work, like [`generate_title`]'s. A share whose only
+/// content is refreshed folder listings says exactly that instead of summing to
+/// an empty sentence; a share that has real work in it lets the work speak and
+/// leaves the listings to the file sections below.
+fn generate_summary_line(added: usize, updated: usize, deleted: usize, indexes: usize) -> String {
+    if added == 0 && updated == 0 && deleted == 0 && indexes > 0 {
+        return format!(
+            "Refreshes {indexes} folder {}.",
+            pluralize(indexes, "index", "indexes")
+        );
+    }
     let mut clauses = Vec::new();
     if added > 0 {
         clauses.push(format!(

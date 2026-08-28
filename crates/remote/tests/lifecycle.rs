@@ -6765,3 +6765,318 @@ async fn an_owed_link_to_a_dissolved_stack_recreates_it() {
         "and the new layer joins the rebuilt stack: {delta:?}"
     );
 }
+
+// --- generated folder indexes ------------------------------------------------
+//
+// A generated `index.md` travels with a domain so a team repository stays
+// browsable on the forge, and the local generator stays the single authority on
+// what it says. The five tests below pin both halves of that: an index is
+// detected, shared and stamped like any other file, and a pull records the
+// origin's copy without ever writing it over the local one - which is also what
+// makes an index structurally incapable of raising a conflict.
+
+#[tokio::test]
+async fn a_generated_index_is_detected_and_shared_like_any_other_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    let report = proposed(outcome);
+
+    let mut added = report.added.clone();
+    added.sort();
+    assert_eq!(
+        added,
+        vec![
+            "index.md".to_string(),
+            "notes/added.md".to_string(),
+            "notes/index.md".to_string(),
+        ],
+        "both listings ride along with the engram"
+    );
+
+    // The commit really carries them, under the domain's subpath.
+    let branch_commit = mock.branch_commit(&report.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(
+        tree.get("knowledge/index.md"),
+        Some(&b"# Contents\n".to_vec())
+    );
+    assert_eq!(
+        tree.get("knowledge/notes/index.md"),
+        Some(&b"# Contents\n".to_vec())
+    );
+
+    // And each one is recorded as an ordinary layer entry, blob and size and
+    // all, so a withdrawal can excise it like anything else.
+    let st = load_state(&sub.state_dir);
+    let recorded = st.proposals[0]
+        .files
+        .iter()
+        .find(|f| f.path == "notes/index.md")
+        .expect("the nested listing is a recorded file");
+    assert_eq!(recorded.change, ProposedChange::Added);
+    assert_eq!(recorded.blob_sha, Some(sha256_hex(b"# Contents\n")));
+    assert_eq!(recorded.size, Some(b"# Contents\n".len() as u64));
+}
+
+#[tokio::test]
+async fn a_pull_stamps_the_origins_index_without_writing_it_to_disk() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n\n* [A](notes/a.md)\n"),
+            ("notes/a.md", b"alpha\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The local generator rewrote the listing; upstream someone else's
+    // generator wrote a different one.
+    let locally_generated = b"# Contents\n\n* [A](notes/a.md)\n* [B](notes/b.md)\n";
+    write(&sub.domain_root.join("index.md"), locally_generated);
+    let upstream_index = b"# Contents\n\n* [A](notes/a.md)\n* [C](notes/c.md)\n";
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", upstream_index),
+            ("notes/a.md", b"alpha revised\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.applied,
+        vec!["notes/a.md".to_string()],
+        "the engram is applied and the listing is not"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("index.md")),
+        locally_generated,
+        "the local generator stays the authority on disk"
+    );
+
+    // The stamp advances all the same, so the next share carries the delta.
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.files.get("index.md").map(|s| s.sha256.clone()),
+        Some(sha256_hex(upstream_index)),
+        "the origin's copy is what the base snapshot records"
+    );
+    assert_eq!(
+        crystalline_remote::state::read_base_file(&sub.state_dir, "index.md").unwrap(),
+        Some(upstream_index.to_vec())
+    );
+
+    // Which is exactly what makes the listing the next thing to share.
+    let after = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.local_changes, 0,
+        "a listing on its own is not work to share"
+    );
+}
+
+#[tokio::test]
+async fn a_diverging_origin_index_never_records_a_conflict() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n\n* [A](a.md)\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Both sides rewrote the very same line, which for any ordinary file is
+    // the textbook same-line conflict.
+    write(
+        &sub.domain_root.join("index.md"),
+        b"# Contents\n\n* [A](a.md) - local\n",
+    );
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n\n* [A](a.md) - upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert!(
+        report.conflicts.is_empty(),
+        "a derived file is nothing to choose sides over: {:?}",
+        report.conflicts
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+    assert_eq!(
+        read(&sub.domain_root.join("index.md")),
+        b"# Contents\n\n* [A](a.md) - local\n"
+    );
+}
+
+#[tokio::test]
+async fn an_index_only_share_still_opens_a_proposal() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+
+    // Nothing a status would call work to share, and an explicit share still
+    // proceeds: somebody asked for the repository to be browsable.
+    let standing = status(&spec, &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(standing.local_changes, 0);
+
+    let plan = propose_preview(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::Create);
+    assert_eq!(plan.changes.substantive_count(), 0);
+    assert_eq!(plan.changes.index_count(), 1);
+    // The generated title says what the share is, never "1 new engram".
+    assert_eq!(plan.effective_title, "Refresh 1 folder index in Brand Team");
+
+    let report = proposed(
+        propose(
+            &mock,
+            &spec,
+            &sub.domain_root,
+            "Brand Team",
+            &sub.state_dir,
+            ShareOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(report.added, vec!["index.md".to_string()]);
+    assert_eq!(report.summary, "Refreshes 1 folder index.");
+    assert_eq!(
+        mock.proposal_request(1).unwrap().title,
+        "Refresh 1 folder index in Brand Team"
+    );
+}
+
+#[tokio::test]
+async fn a_shares_title_names_the_engrams_and_never_the_listings_beside_them() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+
+    let report = proposed(
+        propose(
+            &mock,
+            &spec,
+            &sub.domain_root,
+            "Brand Team",
+            &sub.state_dir,
+            ShareOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    // One engram travelled, and three files did. The title and the summary are
+    // about the engram; the listings are in the commit and in the body's file
+    // sections, where completeness is what a reviewer wants.
+    assert_eq!(report.added.len(), 3);
+    assert_eq!(report.summary, "Shares 1 new engram.");
+    assert_eq!(
+        mock.proposal_request(1).unwrap().title,
+        "Share 1 new engram from Brand Team"
+    );
+    assert!(
+        mock.proposal_request(1).unwrap().body.contains("index.md"),
+        "the body still records every file the commit carries"
+    );
+}
+
+#[tokio::test]
+async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.local_changes, 1,
+        "one engram is the work; two listings are not"
+    );
+
+    // The share plan still names all three, so nothing is hidden from the
+    // person deciding.
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.changes.changes.len(), 3);
+    assert_eq!(plan.changes.substantive_count(), 1);
+    assert_eq!(plan.changes.index_count(), 2);
+}

@@ -59,6 +59,19 @@ impl LocalChange {
             LocalChange::Deleted { path } => path,
         }
     }
+
+    /// Whether this change is a generated directory index rather than
+    /// knowledge somebody wrote.
+    ///
+    /// An index refresh rides along with a share so the team repository stays
+    /// browsable, but it is derived from the files beside it and says nothing
+    /// on its own. Every surface that counts unshared work to decide whether
+    /// to offer sharing at all leaves these out, and every surface that lists
+    /// what a share carries draws them as one quiet line rather than among the
+    /// engrams.
+    pub fn is_generated_index(&self) -> bool {
+        crystalline_core::is_index_path(self.path())
+    }
 }
 
 /// The result of comparing a domain's working tree against its base
@@ -73,6 +86,32 @@ pub struct LocalChanges {
     pub skipped_large: Vec<(String, u64)>,
 }
 
+impl LocalChanges {
+    /// How many changes are knowledge somebody wrote: everything except a
+    /// generated directory index.
+    ///
+    /// This is the number that decides whether a domain has anything to say -
+    /// the count `status` reports, the one a share button and a picker badge
+    /// read. A domain whose only difference from its origin is a handful of
+    /// refreshed listings has nothing to say, and offering to share it would be
+    /// offering churn.
+    pub fn substantive_count(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|c| !c.is_generated_index())
+            .count()
+    }
+
+    /// How many changes are generated directory indexes, the other half of
+    /// [`Self::substantive_count`]. What the surfaces render as one line.
+    pub fn index_count(&self) -> usize {
+        self.changes
+            .iter()
+            .filter(|c| c.is_generated_index())
+            .count()
+    }
+}
+
 /// Detects local changes in `domain_root` relative to `base`, the base
 /// snapshot manifest from [`crate::state::OriginState::files`].
 ///
@@ -80,9 +119,10 @@ pub struct LocalChanges {
 ///
 /// - dot-files and dot-directories are skipped at any depth; the domain root
 ///   itself is never pruned, even if its own name starts with a dot.
-/// - the OKF reserved filenames (`index.md`, `log.md`) are skipped at any
-///   depth: the directory index is generated locally by whoever holds the
-///   files, so it is never shared.
+/// - `log.md` is skipped at any depth: an append-only activity log is written
+///   rather than derived, and sharing one would collide on every line.
+///   `index.md` is NOT skipped - the generated directory index travels with the
+///   domain so the team repository stays browsable (see [`is_excluded_path`]).
 /// - every non-hidden file is included regardless of extension.
 /// - a file larger than [`MAX_SHARED_FILE_BYTES`] is reported in
 ///   `skipped_large` instead of being hashed or classified as a change.
@@ -115,7 +155,7 @@ pub fn detect_local_changes(
             continue;
         }
         let fname = entry.file_name().to_string_lossy();
-        if is_hidden(&fname) || crystalline_core::is_reserved_file(&fname) {
+        if is_excluded_name(&fname) {
             continue;
         }
 
@@ -237,17 +277,37 @@ pub(crate) fn is_hidden_path(rel_path: &str) -> bool {
     rel_path.split('/').any(is_hidden)
 }
 
-/// The full "never travels with a domain" rule: a hidden path, or one of the
-/// OKF reserved filenames (`index.md`, `log.md`).
+/// The full "never travels with a domain" rule: a hidden path, or the OKF
+/// reserved log file (`log.md`).
 ///
-/// The reserved names are derived, not knowledge: Crystalline regenerates the
-/// directory index on every side that holds the files, so sharing one would
-/// put pure churn in a proposal and let a member whose working tree is a
-/// commit behind overwrite a listing that is already correct upstream. Both
-/// the walk here and every ingestion boundary apply this same rule, so a
-/// reserved file never lands in a base snapshot the walk cannot see again.
+/// The two reserved names part company here. `log.md` is an append-only
+/// activity log, written rather than derived, and two members appending to
+/// their own copies would collide on every line, so it never travels.
+/// `index.md` is generated from the files it lists, and a team repository whose
+/// folders carry no index is not browsable on the forge at all - so it does
+/// travel, as an ordinary entry in snapshots, share trees and layer records.
+/// What keeps that convergent rather than a tug of war is that the local
+/// generator stays the single authority on its content: a pull records the
+/// origin's copy in the base snapshot and never writes it to disk (see
+/// [`crate::ops::pull`]), so the next share simply carries the locally
+/// generated listing upstream.
+///
+/// Both the walk here (through [`is_excluded_name`], which must agree with
+/// this) and every ingestion boundary apply this same rule, so an excluded
+/// file never lands in a base snapshot the walk cannot see again.
 pub(crate) fn is_excluded_path(rel_path: &str) -> bool {
-    is_hidden_path(rel_path) || crystalline_core::is_reserved_path(rel_path)
+    is_hidden_path(rel_path)
+        || (crystalline_core::is_reserved_path(rel_path)
+            && !crystalline_core::is_index_path(rel_path))
+}
+
+/// [`is_excluded_path`]'s rule stated over a bare filename, for the walk, which
+/// meets each name on its own rather than as a whole path. The two must always
+/// agree: a name this admits and that path rule rejects would be stamped into a
+/// base snapshot the walk can never see again.
+fn is_excluded_name(name: &str) -> bool {
+    is_hidden(name)
+        || (crystalline_core::is_reserved_file(name) && !crystalline_core::is_index_file(name))
 }
 
 /// The forward-slash relative path of `path` under `root`.
@@ -439,15 +499,67 @@ mod tests {
     }
 
     #[test]
-    fn is_excluded_path_covers_hidden_paths_and_the_okf_reserved_names() {
-        // A generated directory index never travels with a domain, at the root
-        // or anywhere below it; an ordinary engram beside it still does.
-        assert!(is_excluded_path("index.md"));
-        assert!(is_excluded_path("runbooks/index.md"));
+    fn is_excluded_path_covers_hidden_paths_and_the_activity_log_but_not_the_index() {
+        // The generated directory index travels with a domain, at the root and
+        // anywhere below it, so the team repository stays browsable; the
+        // activity log never does, and neither does anything hidden.
+        assert!(!is_excluded_path("index.md"));
+        assert!(!is_excluded_path("runbooks/index.md"));
+        assert!(is_excluded_path("log.md"));
         assert!(is_excluded_path("runbooks/log.md"));
         assert!(is_excluded_path(".github/workflows/ci.yml"));
         assert!(!is_excluded_path("runbooks/restart.md"));
         assert!(!is_excluded_path(".crystalline.yaml"));
+    }
+
+    #[test]
+    fn the_walks_name_rule_agrees_with_the_path_rule() {
+        assert!(!is_excluded_name("index.md"));
+        assert!(is_excluded_name("log.md"));
+        assert!(is_excluded_name(".gitignore"));
+        assert!(!is_excluded_name("restart.md"));
+        assert!(!is_excluded_name(".crystalline.yaml"));
+    }
+
+    #[test]
+    fn generated_indexes_are_walked_like_any_other_file_and_logs_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", b"# Contents");
+        write(dir.path(), "runbooks/index.md", b"# Contents");
+        write(dir.path(), "runbooks/log.md", b"* something happened");
+        write(dir.path(), "runbooks/restart.md", b"restart it");
+
+        let result = detect_local_changes(dir.path(), &BTreeMap::new()).unwrap();
+        let mut paths: Vec<&str> = result.changes.iter().map(|c| c.path()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["index.md", "runbooks/index.md", "runbooks/restart.md"]
+        );
+    }
+
+    #[test]
+    fn a_change_set_splits_into_real_work_and_index_refreshes() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", b"# Contents");
+        write(dir.path(), "runbooks/index.md", b"# Contents");
+        write(dir.path(), "runbooks/restart.md", b"restart it");
+
+        let result = detect_local_changes(dir.path(), &BTreeMap::new()).unwrap();
+        assert_eq!(result.changes.len(), 3);
+        assert_eq!(result.substantive_count(), 1);
+        assert_eq!(result.index_count(), 2);
+    }
+
+    #[test]
+    fn an_index_only_change_set_counts_as_no_real_work() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "index.md", b"# Contents");
+
+        let result = detect_local_changes(dir.path(), &BTreeMap::new()).unwrap();
+        assert_eq!(result.substantive_count(), 0);
+        assert_eq!(result.index_count(), 1);
+        assert!(result.changes[0].is_generated_index());
     }
 
     #[test]
