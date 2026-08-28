@@ -127,6 +127,15 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: enabled_effective,
         },
         SettingSpec {
+            key: "github.stacks",
+            doc: "Stack a new proposal on the open one when sharing again, where the forge serves stacked pull requests (default true); false keeps a single proposal per domain, updated in place",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            apply: set_stacks,
+            clear: clear_stacks,
+            effective: stacks_effective,
+        },
+        SettingSpec {
             key: "github.poll_secs",
             doc: "How often the daemon polls GitHub for changes, in seconds (minimum 60)",
             kind: SettingKind::U64,
@@ -504,6 +513,35 @@ fn clear_enabled(config: &mut GlobalConfig) {
 fn enabled_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.github.as_ref().and_then(|g| g.enabled).is_none();
     (config.github_enabled().to_string(), is_default)
+}
+
+// --- github.stacks ------------------------------------------------------------
+
+fn set_stacks(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "github.stacks must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .github
+        .get_or_insert_with(GitHubConfig::default)
+        .stacks = Some(parsed);
+    Ok(())
+}
+
+fn clear_stacks(config: &mut GlobalConfig) {
+    if let Some(g) = config.github.as_mut() {
+        g.stacks = None;
+    }
+    drop_github_if_empty(config);
+}
+
+/// Unlike every other GitHub toggle this one defaults ON, so the effective
+/// value an unset key shows is `true`.
+fn stacks_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.github.as_ref().and_then(|g| g.stacks).is_none();
+    (config.github_stacks().to_string(), is_default)
 }
 
 // --- github.poll_secs ----------------------------------------------------------
@@ -1188,12 +1226,13 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_twenty_one_keys_in_order() {
+    fn registry_lists_exactly_the_twenty_two_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
                 "domains_root",
                 "github.enabled",
+                "github.stacks",
                 "github.poll_secs",
                 "github.api_url",
                 "github.oauth_client_id",
@@ -1226,6 +1265,7 @@ mod tests {
             vec![
                 ("domains_root", "CRYSTALLINE_DOMAINS_ROOT".to_string()),
                 ("github.enabled", "CRYSTALLINE_GITHUB_ENABLED".to_string()),
+                ("github.stacks", "CRYSTALLINE_GITHUB_STACKS".to_string()),
                 (
                     "github.poll_secs",
                     "CRYSTALLINE_GITHUB_POLL_SECS".to_string()
@@ -1463,6 +1503,36 @@ mod tests {
         assert!(err.to_string().contains("yes"));
     }
 
+    /// `github.stacks` is the one collaboration toggle that defaults ON, so
+    /// the round trip a test has to pin is the way back: setting it false has
+    /// to survive, and clearing it has to land back on true rather than on
+    /// the bool default.
+    #[test]
+    fn apply_github_stacks_round_trips_and_defaults_on() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.github_stacks(), "stacking is the default");
+
+        apply(&mut cfg, "github.stacks", "false").unwrap();
+        assert!(!cfg.github_stacks());
+        assert_eq!(cfg.github.as_ref().unwrap().stacks, Some(false));
+
+        apply(&mut cfg, "github.stacks", "true").unwrap();
+        assert!(cfg.github_stacks());
+
+        unset(&mut cfg, "github.stacks").unwrap();
+        assert!(cfg.github_stacks(), "back to the on default");
+        assert!(cfg.github.is_none(), "and the emptied block goes with it");
+    }
+
+    #[test]
+    fn apply_github_stacks_rejects_non_bool() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "github.stacks", "sometimes").unwrap_err();
+        assert!(err.to_string().contains("github.stacks"), "{err}");
+        assert!(err.to_string().contains("sometimes"), "{err}");
+        assert!(cfg.github.is_none(), "a rejected value must not be written");
+    }
+
     #[test]
     fn apply_github_poll_secs_happy_path() {
         let mut cfg = GlobalConfig::default();
@@ -1601,12 +1671,13 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 21);
+        assert_eq!(views.len(), 22);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
                 "domains_root",
                 "github.enabled",
+                "github.stacks",
                 "github.poll_secs",
                 "github.api_url",
                 "github.oauth_client_id",
@@ -1642,79 +1713,84 @@ mod tests {
         assert_eq!(enabled.source, SettingSource::Config);
         assert!(!enabled.doc.is_empty());
 
-        let poll_secs = &views[2];
+        // The one GitHub setting whose unset default is on.
+        let stacks = &views[2];
+        assert_eq!(stacks.value, "true");
+        assert_eq!(stacks.source, SettingSource::Default);
+
+        let poll_secs = &views[3];
         assert_eq!(poll_secs.value, "300");
         assert_eq!(poll_secs.source, SettingSource::Default);
 
-        let api_url = &views[3];
+        let api_url = &views[4];
         assert_eq!(api_url.value, "https://api.github.com");
         assert_eq!(api_url.source, SettingSource::Default);
 
-        let oauth = &views[4];
+        let oauth = &views[5];
         assert_eq!(oauth.value, crystalline_remote::GITHUB_CLIENT_ID);
         assert_eq!(oauth.source, SettingSource::Default);
 
-        let read_only = &views[5];
+        let read_only = &views[6];
         assert_eq!(read_only.value, "false");
         assert_eq!(read_only.source, SettingSource::Default);
 
         // The endpoint is on by default, so the effective value nobody set is the
         // loopback address the daemon will actually bind.
-        let http = &views[6];
+        let http = &views[7];
         assert_eq!(http.value, "127.0.0.1:7411");
         assert_eq!(http.source, SettingSource::Default);
 
         // Both HTTP-surface toggles default to on, so an unconfigured install
         // gets the web UI and the JSON API on that endpoint.
-        let ui = &views[7];
+        let ui = &views[8];
         assert_eq!(ui.value, "true");
         assert_eq!(ui.source, SettingSource::Default);
 
-        let api = &views[8];
+        let api = &views[9];
         assert_eq!(api.value, "true");
         assert_eq!(api.source, SettingSource::Default);
 
-        let allowed_hosts = &views[9];
+        let allowed_hosts = &views[10];
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let response_format = &views[10];
+        let response_format = &views[11];
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let skills_serve = &views[11];
+        let skills_serve = &views[12];
         assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
-        let backend = &views[12];
+        let backend = &views[13];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[13];
+        let url = &views[14];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[14];
+        let salience_weight = &views[15];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[15];
+        let retired_weight = &views[16];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[16];
+        let index_files = &views[17];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let identity_actor = &views[17];
+        let identity_actor = &views[18];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[18];
+        let trusted_header = &views[19];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[19];
+        let anonymous = &views[20];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }

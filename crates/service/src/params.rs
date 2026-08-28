@@ -484,6 +484,10 @@ pub struct ShareChangesParams {
     /// A longer description of what changed and why.
     #[serde(default)]
     pub description: Option<String>,
+    /// Amend this open proposal (layer) instead of stacking a new one - the
+    /// way to answer its review feedback.
+    #[serde(default)]
+    pub proposal: Option<u64>,
 }
 
 /// Parameters for `update_domain`.

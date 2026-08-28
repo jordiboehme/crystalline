@@ -289,6 +289,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 | `CRYSTALLINE_DATABASE_BACKEND` | `database.backend` | `turso` or `postgres` |
 | `CRYSTALLINE_DATABASE_URL` | `database.url` | |
 | `CRYSTALLINE_GITHUB_ENABLED` and the other `github.*` keys | `github.enabled`, `github.poll_secs`, `github.api_url`, `github.oauth_client_id` | |
+| `CRYSTALLINE_GITHUB_STACKS` | `github.stacks` | `true` (default) lets a share stack a new proposal on the domain's open one where the forge serves stacked pull requests, so each share gets its own focused review and reviewers merge the chain bottom-up; `false` keeps one proposal per domain, updated in place |
 | `CRYSTALLINE_SEARCH_SALIENCE_WEIGHT` | `search.salience_weight` | 0.0 to 1.0 (default 0.15); how strongly a salient engram is lifted in hybrid ranking |
 | `CRYSTALLINE_SEARCH_RETIRED_WEIGHT` | `search.retired_weight` | 0.0 to 1.0 (default 0.6, 1.0 disables); the ranking multiplier for deprecated, superseded, archived or legacy engrams |
 | `CRYSTALLINE_IDENTITY_ACTOR` | `identity.actor` | who is recorded as the writer of an engram (`generated.by`), for example `team-bot/1.0` or `human:jordi`; unset means the connected MCP client identifies itself |

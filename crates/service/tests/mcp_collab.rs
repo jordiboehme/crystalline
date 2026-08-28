@@ -472,8 +472,9 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let settings = out["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 21, "{settings:?}");
+    assert_eq!(settings.len(), 22, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
+    assert!(settings.iter().any(|s| s["key"] == "github.stacks"));
     assert!(settings.iter().any(|s| s["key"] == "domains_root"));
     // github.enabled is off here, so the github block states enablement and
     // says nothing about a credential the call deliberately never read.
@@ -1478,6 +1479,56 @@ async fn share_changes_tool_wires_through_to_origin_share() {
     assert_eq!(out["outcome"], json!("proposed"));
     assert_eq!(out["added"][0], json!("notes/new.md"));
     assert!(out["url"].as_str().unwrap().starts_with("https://"));
+}
+
+/// The `proposal` argument reaches the engine rather than being decoration on
+/// the schema.
+///
+/// A number that names no open layer is the cheapest proof there is: the
+/// refusal it earns can only be produced by code that read the argument, and
+/// it is the teaching refusal itself - a caller's mistake, so `invalid_params`
+/// with the way out in the text, never a server error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_forwards_the_proposal_number_to_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let err = call(
+        peer,
+        "share_changes",
+        json!({ "domain": "brand", "proposal": 999 }),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("#999"), "the number the caller named: {err}");
+    assert!(
+        err.contains("no open layers"),
+        "and what is open instead: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

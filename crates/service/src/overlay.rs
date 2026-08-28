@@ -599,6 +599,7 @@ mod tests {
                 "https://ghe.example.com/api/v3",
             ),
             ("CRYSTALLINE_GITHUB_OAUTH_CLIENT_ID", "client-xyz"),
+            ("CRYSTALLINE_GITHUB_STACKS", "false"),
             ("CRYSTALLINE_SERVICE_READ_ONLY", "true"),
             ("CRYSTALLINE_SERVICE_HTTP", "0.0.0.0:7411"),
             ("CRYSTALLINE_SERVICE_UI", "false"),
@@ -618,6 +619,7 @@ mod tests {
             "github.poll_secs",
             "github.api_url",
             "github.oauth_client_id",
+            "github.stacks",
             "service.read_only",
             "service.http",
             "service.ui",
@@ -635,6 +637,9 @@ mod tests {
             "/srv/knowledge"
         );
         assert!(effective.github_enabled());
+        // The one setting whose default is on, so the env has to be able to
+        // turn it off rather than only to restate it.
+        assert!(!effective.github_stacks());
         assert!(effective.read_only());
         assert!(!effective.ui_enabled());
         assert!(!effective.api_enabled());

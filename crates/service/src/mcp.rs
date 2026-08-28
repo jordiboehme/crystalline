@@ -1539,7 +1539,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. While a proposal is already open for the domain, calling this again UPDATES it in place - same proposal number, same URL, a fresh commit reviewers are notified about - it never opens a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, edit the engrams, share again to the same proposal. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (update proposal #N or open a new one), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1561,7 +1561,7 @@ impl McpServer {
                 None => {
                     let preview = self
                         .engine
-                        .origin_share_preview(&p.domain, p.title.as_deref(), None)
+                        .origin_share_preview(&p.domain, p.title.as_deref(), p.proposal)
                         .await
                         .map_err(to_error)?;
                     // Only a share that would publish gets a question;
@@ -1575,7 +1575,15 @@ impl McpServer {
                     // closed, so a diverged answer may be preceded by
                     // bookkeeping calls. Those record what the forge already
                     // decided; they never publish this domain's changes.
-                    if matches!(preview["action"].as_str(), Some("create") | Some("update")) {
+                    //
+                    // The two stacked plans belong on the asking side for the
+                    // same reason the other two do: a stack opens a pull
+                    // request the team can see, and an amend moves a layer
+                    // they are already reviewing.
+                    if matches!(
+                        preview["action"].as_str(),
+                        Some("create") | Some("update") | Some("stack") | Some("amend")
+                    ) {
                         return Ok(confirm_question(share_question(&preview)).into());
                     }
                 }
@@ -1590,7 +1598,7 @@ impl McpServer {
                 &p.domain,
                 p.title.as_deref(),
                 p.description.as_deref(),
-                None,
+                p.proposal,
             )
             .await
             .map_err(to_error)
@@ -1626,7 +1634,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means the layers exist but the forge has not grouped them yet. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -1720,7 +1728,7 @@ impl McpServer {
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2765,6 +2773,15 @@ fn delete_question(preview: &Value) -> String {
 /// same value is both the commit message and the retitling PATCH the update
 /// sends. Labelling it `Title` would promise a retitle in the first case,
 /// which is the one a caller lands on by default.
+///
+/// **The two stacked plans split the same way.** A `stack` opens a pull
+/// request of its own, so it is titled and labelled `Title` like a create,
+/// and it names the layer it lands on because that is the whole difference
+/// between it and a lone proposal. An `amend` puts a fresh commit on a
+/// proposal that already exists, so it labels the value `Commit message` like
+/// an update, and it says how many layers above it will be re-based: the user
+/// is being asked about work they already put in front of reviewers, not only
+/// about the layer they named.
 fn share_question(preview: &Value) -> String {
     // `label` rides along with the action for exactly the reason above.
     let (action, label) = match preview["action"].as_str().unwrap_or_default() {
@@ -2773,6 +2790,22 @@ fn share_question(preview: &Value) -> String {
                 "Update open proposal #{} ({})",
                 preview["number"].as_u64().unwrap_or_default(),
                 preview["url"].as_str().unwrap_or_default()
+            ),
+            "Commit message",
+        ),
+        "stack" => (
+            format!(
+                "Stacks a new proposal on top of #{} ({})",
+                preview["top_number"].as_u64().unwrap_or_default(),
+                preview["top_title"].as_str().unwrap_or_default()
+            ),
+            "Title",
+        ),
+        "amend" => (
+            format!(
+                "Amends proposal #{}; {} layer(s) above will be re-based",
+                preview["number"].as_u64().unwrap_or_default(),
+                preview["layers_above"].as_u64().unwrap_or_default()
             ),
             "Commit message",
         ),
@@ -2808,15 +2841,32 @@ fn share_question(preview: &Value) -> String {
 
 /// Trims `origin_status`'s per-domain proposal records to what a status
 /// glance needs: number, url, title, status, review_state, amended_upstream,
-/// feedback_count, updated_at. The bodies stay out on purpose - update_domain
-/// and the REST payload carry them - so status never bloats a session with
-/// comment text the agent did not ask for.
+/// feedback_count, updated_at, position. The bodies stay out on purpose -
+/// update_domain and the REST payload carry them - so status never bloats a
+/// session with comment text the agent did not ask for.
+///
+/// `position` is the layer's place in the open chain, 1-based from the bottom,
+/// read off the open list's own order (the engine builds it in chain order).
+/// It is what a reader keys off to know it is looking at a layer at all, so it
+/// is present on both arrays for one shape, and null on a declined proposal,
+/// which stands in no chain.
+///
+/// **The four domain-level stack keys are dropped while they are quiet**, and
+/// that is deliberately not what [`crate::origin::status_report_json`] does:
+/// the JSON surface emits all four always so one reader handles either path,
+/// while this one is a context budget. A `stack_number` of null, an empty
+/// `stack_wedged` and either debt flag false say nothing a caller can act on,
+/// so they say nothing at all. A null `stack_number` beside real positions is
+/// the degraded chain rather than an unstacked domain - the layers exist and
+/// are simply not grouped on the forge yet - and `stack_link_pending` is the
+/// key that survives to carry that debt.
 fn lean_origin_status(mut value: Value) -> Value {
     if let Some(domains) = value.get_mut("domains").and_then(Value::as_array_mut) {
         for domain in domains {
             for key in ["open_proposals", "declined_proposals"] {
+                let in_the_chain = key == "open_proposals";
                 if let Some(entries) = domain.get_mut(key).and_then(Value::as_array_mut) {
-                    for entry in entries.iter_mut() {
+                    for (index, entry) in entries.iter_mut().enumerate() {
                         *entry = json!({
                             "number": entry["number"],
                             "url": entry["url"],
@@ -2832,13 +2882,45 @@ fn lean_origin_status(mut value: Value) -> Value {
                                 .map(Vec::len)
                                 .unwrap_or(0),
                             "updated_at": entry["updated_at"],
+                            "position": if in_the_chain {
+                                json!(index + 1)
+                            } else {
+                                Value::Null
+                            },
                         });
                     }
                 }
             }
+            drop_quiet_stack_keys(domain);
         }
     }
     value
+}
+
+/// Removes the stack keys that carry no fact from one lean domain entry: a
+/// null `stack_number`, an empty `stack_wedged`, and `repair_pending` or
+/// `stack_link_pending` set false. Anything else stays, including a
+/// `stack_wedged` list, because a wedged layer is named by the number a
+/// caller withdraws or shares against.
+fn drop_quiet_stack_keys(domain: &mut Value) {
+    let Some(object) = domain.as_object_mut() else {
+        return;
+    };
+    if object.get("stack_number").is_some_and(Value::is_null) {
+        object.remove("stack_number");
+    }
+    if object
+        .get("stack_wedged")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        object.remove("stack_wedged");
+    }
+    for key in ["repair_pending", "stack_link_pending"] {
+        if object.get(key) == Some(&json!(false)) {
+            object.remove(key);
+        }
+    }
 }
 
 /// What an unconfirmed share tells the model, naming what did not happen.
@@ -3544,6 +3626,54 @@ mod tests {
         assert!(!create.contains("notes/f10.md"), "capped at ten: {create}");
     }
 
+    /// The two stacked plans the same question renders, in the same framing
+    /// the create and update legs use.
+    ///
+    /// A stack names the layer it lands on, because "on top of what" is the
+    /// only thing that distinguishes it from opening a lone proposal; an
+    /// amend names the cascade, because saying yes to it moves work the user
+    /// already put in front of reviewers.
+    #[test]
+    fn share_question_names_the_stack_and_amend_actions() {
+        let stacked = share_question(&json!({
+            "action": "stack", "top_number": 6, "top_title": "Refine alpha",
+            "effective_title": "Share 1 new engram from kb",
+            "changes": [{ "path": "notes/b.md", "kind": "added" }],
+        }));
+        assert!(
+            stacked.contains("Stacks a new proposal on top of #6 (Refine alpha)"),
+            "{stacked}"
+        );
+        // A new layer really is titled on the forge, so it labels the value
+        // Title exactly as a create does.
+        assert!(
+            stacked.contains("Title: 'Share 1 new engram from kb'"),
+            "{stacked}"
+        );
+        assert!(
+            stacked.contains("1 added, 0 modified, 0 deleted: notes/b.md"),
+            "{stacked}"
+        );
+
+        let amended = share_question(&json!({
+            "action": "amend", "number": 9, "url": "https://github.test/pulls/9",
+            "layers_above": 1,
+            "effective_title": "Answer the review on layer 2",
+            "changes": [{ "path": "notes/a.md", "kind": "modified" }],
+        }));
+        assert!(
+            amended.contains("Amends proposal #9; 1 layer(s) above will be re-based"),
+            "{amended}"
+        );
+        // An amend is a fresh commit on an existing proposal, so the label is
+        // the update leg's, never a promise to retitle.
+        assert!(
+            amended.contains("Commit message: 'Answer the review on layer 2'"),
+            "{amended}"
+        );
+        assert!(!amended.contains("Title: '"), "{amended}");
+    }
+
     #[test]
     fn transient_remote_errors_map_to_the_internal_error_class() {
         let cases = [
@@ -3712,8 +3842,8 @@ mod tests {
     /// to supply the missing key rather than leave the two arrays different
     /// shapes.
     #[test]
-    fn lean_origin_status_trims_both_proposal_arrays_to_the_eight_keys() {
-        const LEAN_KEYS: [&str; 8] = [
+    fn lean_origin_status_trims_both_proposal_arrays_to_the_nine_keys() {
+        const LEAN_KEYS: [&str; 9] = [
             "number",
             "url",
             "title",
@@ -3722,12 +3852,17 @@ mod tests {
             "amended_upstream",
             "feedback_count",
             "updated_at",
+            "position",
         ];
 
         let leaned = lean_origin_status(json!({
             "domains": [{
                 "domain": "kb",
                 "repo": "team/knowledge",
+                "stack_number": Value::Null,
+                "stack_wedged": [],
+                "repair_pending": false,
+                "stack_link_pending": false,
                 "open_proposals": [{
                     "number": 7,
                     "url": "https://example.invalid/pull/7",
@@ -3797,6 +3932,86 @@ mod tests {
             json!(false),
             "a declined proposal the engine never decorated defaults to false"
         );
+
+        // The chain position is the open list's own order, 1-based from the
+        // bottom, so a caller reads "which layer is this" without a second
+        // call. A declined proposal stands in no chain, so it carries the key
+        // (one shape for both arrays) with nothing in it.
+        assert_eq!(open["position"], json!(1));
+        assert_eq!(declined["position"], Value::Null);
+
+        // A domain with nothing stacked says nothing about stacks: the four
+        // keys the engine always emits are dropped when they are quiet, which
+        // is where this trim differs from `origin::status_report_json` on
+        // purpose.
+        let domain = domain.as_object().unwrap();
+        for key in [
+            "stack_number",
+            "stack_wedged",
+            "repair_pending",
+            "stack_link_pending",
+        ] {
+            assert!(
+                !domain.contains_key(key),
+                "{key} is dropped while it is quiet: {domain:?}"
+            );
+        }
+    }
+
+    /// The other half of the stack trim: a domain that really is stacked
+    /// keeps every key that carries a fact, and every open layer numbers
+    /// itself bottom-up.
+    ///
+    /// `stack_number` null beside a real position is the degraded chain, not
+    /// an unstacked domain - the layers exist and are simply not grouped yet -
+    /// so it drops out here while `stack_link_pending` stays to carry the
+    /// debt. A reader keys off `position`, never off a stack number it may
+    /// not have.
+    #[test]
+    fn lean_origin_status_keeps_the_stack_keys_that_carry_a_fact() {
+        let leaned = lean_origin_status(json!({
+            "domains": [{
+                "domain": "kb",
+                "stack_number": 42,
+                "stack_wedged": [4],
+                "repair_pending": true,
+                "stack_link_pending": false,
+                "open_proposals": [
+                    { "number": 7, "feedback": [], "status": "Open" },
+                    { "number": 8, "feedback": [], "status": "Open" },
+                ],
+            }, {
+                "domain": "degraded",
+                "stack_number": Value::Null,
+                "stack_wedged": [],
+                "repair_pending": false,
+                "stack_link_pending": true,
+                "open_proposals": [{ "number": 11, "feedback": [], "status": "Open" }],
+            }],
+        }));
+
+        let stacked = &leaned["domains"][0];
+        assert_eq!(stacked["stack_number"], json!(42));
+        assert_eq!(stacked["stack_wedged"], json!([4]));
+        assert_eq!(stacked["repair_pending"], json!(true));
+        assert!(
+            stacked
+                .as_object()
+                .unwrap()
+                .get("stack_link_pending")
+                .is_none(),
+            "a paid link says nothing: {stacked}"
+        );
+        assert_eq!(stacked["open_proposals"][0]["position"], json!(1));
+        assert_eq!(stacked["open_proposals"][1]["position"], json!(2));
+
+        let degraded = &leaned["domains"][1];
+        assert!(
+            degraded.as_object().unwrap().get("stack_number").is_none(),
+            "an unlinked chain names no stack number: {degraded}"
+        );
+        assert_eq!(degraded["stack_link_pending"], json!(true));
+        assert_eq!(degraded["open_proposals"][0]["position"], json!(1));
     }
 
     /// A payload with no `domains` array, and one whose entries carry no
