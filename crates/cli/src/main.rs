@@ -996,7 +996,9 @@ enum OriginCommand {
         config: Option<PathBuf>,
     },
     /// Propose a team domain's local changes as a pull request against its
-    /// origin.
+    /// origin. Where the forge stacks proposals, sharing while one is open
+    /// stacks a new layer on top of it; --proposal amends a named layer
+    /// instead.
     Share {
         /// The team domain to share local changes from.
         domain: String,
@@ -1007,6 +1009,10 @@ enum OriginCommand {
         /// The proposal's description. Defaults to a generated summary.
         #[arg(long)]
         message: Option<String>,
+        /// Amend this open proposal (layer) instead of stacking a new one;
+        /// the layers above it are re-based automatically.
+        #[arg(long)]
+        proposal: Option<u64>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1676,13 +1682,14 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             domain,
             title,
             message,
+            proposal,
             config,
         } => {
             let data = crystalline_service::origin_share(
                 &domain,
                 title.as_deref(),
                 message.as_deref(),
-                None,
+                proposal,
                 db.as_deref(),
                 config.as_deref(),
             )
@@ -1805,9 +1812,16 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
 /// a note when the live probe itself failed (offline, rate limited, an
 /// expired connection) rather than the whole domain, open and declined
 /// proposals with their urls (an open one also carrying its review standing,
-/// whether a reviewer amended its branch and how much feedback it has),
-/// unresolved conflicts and when it was last checked, then one line per
-/// domain that genuinely failed to report.
+/// whether a reviewer amended its branch and how much feedback it has), the
+/// chain's own standing (see below), unresolved conflicts and when it was
+/// last checked, then one line per domain that genuinely failed to report.
+///
+/// Open proposals arrive in chain order, bottom layer first, and are labelled
+/// `layer k:` only while more than one is open: a lone proposal stands in no
+/// chain, so it renders exactly as it always did. The three chain lines below
+/// them each name something a caller can act on - a declined layer still
+/// carrying open work above it, a link the forge never got, a repair the next
+/// share or withdraw finishes - and stay silent otherwise.
 fn print_origin_status(data: &serde_json::Value, json: bool) {
     if json {
         print_value(data, true);
@@ -1853,9 +1867,16 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         if let Some(probe_error) = d["probe_error"].as_str() {
             println!("  probe failed, reporting from local state only: {probe_error}");
         }
-        for p in d["open_proposals"].as_array().unwrap_or(&empty) {
+        let open = d["open_proposals"].as_array().unwrap_or(&empty);
+        let stacked = open.len() > 1;
+        for (index, p) in open.iter().enumerate() {
+            let layer = if stacked {
+                format!("layer {}: ", index + 1)
+            } else {
+                String::new()
+            };
             println!(
-                "  open proposal #{}: {} - {}",
+                "  {layer}open proposal #{}: {} - {}",
                 p["number"].as_u64().unwrap_or(0),
                 p["title"].as_str().unwrap_or(""),
                 p["url"].as_str().unwrap_or("")
@@ -1889,6 +1910,21 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
                 p["title"].as_str().unwrap_or(""),
                 p["url"].as_str().unwrap_or("")
             );
+        }
+        // The chain's own standing, after the layers it is about. Each line
+        // is a debt or a blockage a caller settles with a verb they already
+        // have; nothing prints while the chain is sound.
+        for w in d["stack_wedged"].as_array().unwrap_or(&empty) {
+            println!(
+                "  stack wedged by #{} - withdraw it or share to repair",
+                w.as_u64().unwrap_or(0)
+            );
+        }
+        if d["stack_link_pending"].as_bool().unwrap_or(false) {
+            println!("  share link pending - a share or status with connection retries it");
+        }
+        if d["repair_pending"].as_bool().unwrap_or(false) {
+            println!("  repair pending - the next share or withdraw finishes it");
         }
         for c in d["conflicts"].as_array().unwrap_or(&empty) {
             println!(

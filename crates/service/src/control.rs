@@ -283,7 +283,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let title = req.get("title").and_then(Value::as_str);
             let description = req.get("description").and_then(Value::as_str);
-            let proposal = req.get("proposal").and_then(Value::as_u64);
+            let proposal = match optional_number(req, "proposal") {
+                Ok(proposal) => proposal,
+                Err(message) => return (envelope_err(message), false),
+            };
             match shared
                 .engine
                 .origin_share(domain, title, description, proposal)
@@ -406,10 +409,66 @@ async fn maybe_embed(shared: &Arc<Shared>, embed: bool, data: &mut Value) {
     }
 }
 
+/// An optional proposal number from the envelope: absent or null is `None`,
+/// a whole non-negative number is that number, and anything else is a
+/// refusal naming the key.
+///
+/// Deliberately not `and_then(Value::as_u64)`, which reads a negative, a
+/// fraction or a string as absence. For `origin_share` that silent downgrade
+/// would turn "amend layer #6" into "stack a new layer", which opens a
+/// proposal the caller never asked for; a refusal the caller can read is the
+/// only safe answer to a value we cannot interpret.
+fn optional_number(req: &Value, key: &str) -> Result<Option<u64>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("invalid {key}: expected a proposal number, got {value}")),
+    }
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
 
 fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `origin_share`'s amend target is the parameter this guards: absent
+    /// means "stack a new layer", a number means "amend that layer", and a
+    /// value that is neither must refuse rather than quietly become the
+    /// first of those and open a proposal nobody asked for.
+    #[test]
+    fn an_optional_number_refuses_a_present_but_unreadable_value() {
+        assert_eq!(optional_number(&json!({}), "proposal"), Ok(None));
+        assert_eq!(
+            optional_number(&json!({ "proposal": Value::Null }), "proposal"),
+            Ok(None)
+        );
+        assert_eq!(
+            optional_number(&json!({ "proposal": 6 }), "proposal"),
+            Ok(Some(6))
+        );
+
+        for bad in [json!(-1), json!(1.5), json!("6"), json!([6]), json!(true)] {
+            let refused = optional_number(&json!({ "proposal": bad }), "proposal")
+                .expect_err("a value that is not a proposal number is refused");
+            assert!(refused.starts_with("invalid proposal:"), "{refused}");
+            let envelope = envelope_err(refused);
+            assert_eq!(envelope["ok"], false);
+            assert!(
+                envelope["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected a proposal number"),
+                "{envelope}"
+            );
+        }
+    }
 }

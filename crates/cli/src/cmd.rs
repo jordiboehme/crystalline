@@ -443,7 +443,8 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// "nothing to share" line when the team already has everything the domain
 /// knows, the refusal when a reviewer amended the proposal's branch, or
 /// (when conflicts are still pending) every conflicting path plus a pointer
-/// at `origin resolve`.
+/// at `origin resolve`. A proposal that stands in a chain of two or more open
+/// layers also says where it sits, through [`stack_line`].
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -460,6 +461,9 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             let updated = data["updated"].as_array().map(Vec::len).unwrap_or(0);
             let deleted = data["deleted"].as_array().map(Vec::len).unwrap_or(0);
             println!("  {added} added, {updated} updated, {deleted} deleted");
+            if let Some(line) = stack_line(data) {
+                println!("  {line}");
+            }
             print_skipped_large(&data["skipped_large"]);
         }
         "updated" => {
@@ -476,6 +480,9 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             let updated = prop["updated"].as_array().map(Vec::len).unwrap_or(0);
             let deleted = prop["deleted"].as_array().map(Vec::len).unwrap_or(0);
             println!("  {added} added, {updated} updated, {deleted} deleted");
+            if let Some(line) = stack_line(prop) {
+                println!("  {line}");
+            }
             print_skipped_large(&prop["skipped_large"]);
         }
         "proposal_diverged" => {
@@ -507,6 +514,32 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
     }
 }
 
+/// Where a shared proposal sits in its chain, or `None` when there is no
+/// chain worth naming.
+///
+/// `stack_position` is what decides that, never `stack_number`: a chain whose
+/// linking call failed carries real positions with a null number, and saying
+/// "stack #null" would be worse than saying nothing about the number at all.
+/// So the position is the gate and the number is named only when there is
+/// one, with `(stack link pending)` standing in otherwise - the same debt
+/// `origin status` reports until a share or a probing status settles it.
+///
+/// A chain of one open layer is not a chain a reader needs told about, so a
+/// lone proposal renders exactly as it always did: no "layer 1 of 1" noise.
+fn stack_line(proposal: &serde_json::Value) -> Option<String> {
+    let number = proposal["number"].as_u64()?;
+    let position = proposal["stack_position"].as_array()?;
+    let layer = position.first()?.as_u64()?;
+    let open = position.get(1)?.as_u64()?;
+    if open < 2 {
+        return None;
+    }
+    Some(match proposal["stack_number"].as_u64() {
+        Some(stack) => format!("proposal #{number}, layer {layer} of {open} on stack #{stack}"),
+        None => format!("proposal #{number}, layer {layer} of {open} (stack link pending)"),
+    })
+}
+
 fn print_skipped_large(skipped_large: &serde_json::Value) {
     let empty = Vec::new();
     for s in skipped_large.as_array().unwrap_or(&empty) {
@@ -518,8 +551,11 @@ fn print_skipped_large(skipped_large: &serde_json::Value) {
     }
 }
 
-/// Print `origin withdraw`'s result: what was closed, what was restored and
-/// what was left alone because it diverged since sharing.
+/// Print `origin withdraw`'s result: what was closed, what was restored,
+/// what was left alone because it diverged since sharing, what no revert
+/// could bring back, and what became of the chain the withdrawn layer stood
+/// in - repaired under a new stack number, or dissolved when too few layers
+/// survived to be a stack at all.
 pub(crate) fn print_origin_withdraw(data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -543,6 +579,21 @@ pub(crate) fn print_origin_withdraw(data: &serde_json::Value, json: bool) {
             "left alone (diverged since sharing): {}",
             p.as_str().unwrap_or("")
         );
+    }
+    for p in data["skipped_reverts"].as_array().unwrap_or(&empty) {
+        println!(
+            "could not restore (no reachable copy): {}",
+            p.as_str().unwrap_or("")
+        );
+    }
+    // A repair either recreated the stack under a new number (stack numbers
+    // come off the same sequence as pull request numbers, so the old one
+    // never comes back) or found too few survivors to be a stack at all.
+    if data["repaired"].as_bool().unwrap_or(false) {
+        match data["restacked"].as_u64() {
+            Some(stack) => println!("stack repaired; now stack #{stack}"),
+            None => println!("stack dissolved"),
+        }
     }
 }
 
