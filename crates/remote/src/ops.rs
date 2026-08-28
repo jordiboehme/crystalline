@@ -673,6 +673,13 @@ async fn adopt_rebased_layers(provider: &dyn Provider, spec: &OriginSpec, state:
                 parent_head = live;
             }
             None => {
+                // A layer left alone keeps its recorded head, so the layer
+                // above it records a base that is stale upstream. That is the
+                // consistent reading rather than a guess: the chain stays
+                // self-consistent (`stack_shape_broken` sees each base still
+                // matching the head below it, so no repair is ordered) and the
+                // divergence surfaces where it belongs, as `amended_upstream`
+                // on the layer that really moved.
                 if let Some(head) = layer.head_commit {
                     parent_head = head;
                 }
@@ -801,11 +808,20 @@ pub async fn status(
     // reported, so a status names the chain as it really stands rather than as
     // the last failed call left it. The debt is tested first: an origin that
     // owes nothing never asks whether the forge serves stacks at all.
+    //
+    // Nothing on this path may fail the status, the capability check included:
+    // its one error is the save that caches a fresh verdict, and a status that
+    // could not write that cache still has every answer it came for.
     if let Some(provider) = probe
         && state.stack_link_pending
-        && stacks_available(provider, spec, &mut state, state_dir, stacks_allowed).await?
     {
-        retry_stack_link(provider, spec, &mut state, state_dir).await;
+        match stacks_available(provider, spec, &mut state, state_dir, stacks_allowed).await {
+            Ok(true) => retry_stack_link(provider, spec, &mut state, state_dir).await,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!("the stacks probe failed; reporting the owed link as it is: {e}");
+            }
+        }
     }
 
     // One live list call, made only when there is an open record for it to
@@ -2854,10 +2870,17 @@ fn stack_shape_broken(state: &OriginState) -> bool {
 /// Such a record is either below where the replay starts - the survivors are
 /// then rebuilt on a parent that predates the merge - or inside the range
 /// [`cascade_replays`] walks, where it is skipped as not-open and the layer
-/// above it is rebuilt without it. A merged record ABOVE every open layer is
-/// neither: no tree is rebuilt over it, because the walk finds no survivor
-/// after it to replay, so a withdrawal below it repairs the chain without
-/// touching what merged.
+/// above it is rebuilt without it.
+///
+/// A merged record with NO open layer above it is neither, and the invariant
+/// that says so is about the records a repair touches rather than about how
+/// far its walk runs (the walk may well run past such a record, in a chain
+/// like open, declined, open, merged): a replay only ever rebuilds OPEN
+/// records, and only ever onto the record below the one it is rebuilding, so
+/// a merged record with nothing open above it has no tree rebuilt on top of
+/// it. Retargets name only open records too, so it is never pointed anywhere
+/// either. A withdrawal below it repairs the chain without touching what
+/// merged.
 fn merged_layer_blocking_repair(state: &OriginState) -> Option<u64> {
     under_an_open_layer(state)
         .iter()

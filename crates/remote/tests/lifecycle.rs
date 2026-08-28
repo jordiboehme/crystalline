@@ -5695,6 +5695,70 @@ async fn a_real_amendment_during_rebase_is_still_flagged() {
 }
 
 #[tokio::test]
+async fn a_rebase_that_moves_only_unowned_files_is_still_adopted() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_top = mock.branch_commit(&second.branch).expect("the top head");
+
+    // The reviewer merged the bottom layer with a wording change of their own,
+    // so the rebase really does move the top layer's tree - in the BOTTOM
+    // layer's file, which the top layer does not own. Adoption turns on whose
+    // files moved, never on whether anything moved at all.
+    let trunk = load_state(&sub.state_dir).base_commit;
+    mock.set_proposal_state(first.number, ProposalState::Merged);
+    let merged = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v3\n"),
+        ]),
+        Some(&trunk),
+    );
+    mock.set_branch("main", &merged);
+    let mut tree = mock.commit_tree(&old_top).expect("the top layer's tree");
+    tree.insert("notes/a.md".to_string(), b"alpha v3\n".to_vec());
+    let rebased = mock.add_commit(tree, Some(&merged));
+    mock.set_branch(&second.branch, &rebased);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let moved = Provider::compare(&mock, &spec(), &old_top, &rebased)
+        .await
+        .unwrap();
+    assert_eq!(
+        moved
+            .files
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["notes/a.md"],
+        "the two heads really do differ, in a file the top layer never touched"
+    );
+
+    let state = load_state(&sub.state_dir);
+    let top = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the layer above is still open");
+    assert_eq!(
+        top.head_commit.as_deref(),
+        Some(rebased.as_str()),
+        "a non-empty diff over unowned paths is still a rebase"
+    );
+
+    let report = stacked_status(&mock, &sub).await;
+    assert!(
+        report.amended_upstream.is_empty(),
+        "nobody amended anything: {report:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_reviewer_decline_mid_chain_reads_as_wedged() {
     let mock = MockProvider::new();
     mock.enable_stacks();
