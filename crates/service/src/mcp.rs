@@ -2821,6 +2821,14 @@ fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
 /// an update, and it says how many layers above it will be re-based: the user
 /// is being asked about work they already put in front of reviewers, not only
 /// about the layer they named.
+///
+/// **All four read as one instruction rather than four narrations.** Every
+/// leg opens with the imperative the create and update legs always used -
+/// "Open a new proposal", "Update open proposal #N", "Stack a new proposal on
+/// top of #N", "Amend proposal #N" - so the question a user is answering is
+/// the action they are authorizing, in the same voice each time. And both
+/// legs that name an existing proposal name it by title as well as by number:
+/// a bare "#9" is not something a person can recognize their own work in.
 fn share_question(preview: &Value) -> String {
     // `label` rides along with the action for exactly the reason above.
     let (action, label) = match preview["action"].as_str().unwrap_or_default() {
@@ -2834,7 +2842,7 @@ fn share_question(preview: &Value) -> String {
         ),
         "stack" => (
             format!(
-                "Stacks a new proposal on top of #{} ({})",
+                "Stack a new proposal on top of #{} ({})",
                 preview["top_number"].as_u64().unwrap_or_default(),
                 preview["top_title"].as_str().unwrap_or_default()
             ),
@@ -2842,8 +2850,9 @@ fn share_question(preview: &Value) -> String {
         ),
         "amend" => (
             format!(
-                "Amends proposal #{}; {} layer(s) above will be re-based",
+                "Amend proposal #{} ({}); {} layer(s) above will be re-based",
                 preview["number"].as_u64().unwrap_or_default(),
+                preview["title"].as_str().unwrap_or_default(),
                 preview["layers_above"].as_u64().unwrap_or_default()
             ),
             "Commit message",
@@ -3760,7 +3769,7 @@ mod tests {
             "changes": [{ "path": "notes/b.md", "kind": "added" }],
         }));
         assert!(
-            stacked.contains("Stacks a new proposal on top of #6 (Refine alpha)"),
+            stacked.contains("Stack a new proposal on top of #6 (Refine alpha)"),
             "{stacked}"
         );
         // A new layer really is titled on the forge, so it labels the value
@@ -3776,12 +3785,12 @@ mod tests {
 
         let amended = share_question(&json!({
             "action": "amend", "number": 9, "url": "https://github.test/pulls/9",
-            "layers_above": 1,
+            "title": "Refine beta", "layers_above": 1,
             "effective_title": "Answer the review on layer 2",
             "changes": [{ "path": "notes/a.md", "kind": "modified" }],
         }));
         assert!(
-            amended.contains("Amends proposal #9; 1 layer(s) above will be re-based"),
+            amended.contains("Amend proposal #9 (Refine beta); 1 layer(s) above will be re-based"),
             "{amended}"
         );
         // An amend is a fresh commit on an existing proposal, so the label is

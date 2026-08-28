@@ -1145,3 +1145,54 @@ async fn create_stack_422_surfaces_githubs_message() {
         other => panic!("expected an Api 422, got {other:?}"),
     }
 }
+
+#[tokio::test]
+async fn extend_stack_404_names_the_missing_stack() {
+    // A path carrying a concrete stack number 404s when THAT stack is gone -
+    // somebody dissolved it on the website - which says nothing about
+    // whether the forge serves stacks at all. Reading it as
+    // StacksUnsupported would strand the caller on the fallback path; the
+    // caller wants the status, so it can rebuild the stack.
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks/42/add",
+        post(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"message": "Not Found"})),
+            )
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let err = provider
+        .extend_stack(&origin(), 42, &[9])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, RemoteError::Api { status: 404, .. }),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn dissolve_stack_404_names_the_missing_stack() {
+    // Same reading, and the caller treats it as "already dissolved".
+    let app = Router::new().route(
+        "/repos/acme/brand-knowledge/stacks/42/unstack",
+        post(|| async {
+            (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"message": "Not Found"})),
+            )
+        }),
+    );
+    let base = spawn(app).await;
+    let provider = GitHubProvider::new(Some(base), None);
+
+    let err = provider.dissolve_stack(&origin(), 42).await.unwrap_err();
+    assert!(
+        matches!(err, RemoteError::Api { status: 404, .. }),
+        "{err:?}"
+    );
+}

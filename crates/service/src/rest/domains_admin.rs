@@ -941,9 +941,10 @@ pub async fn sync_now(
                            file. Each action carries its own fields - \
                            `number` and `url` for an `update`, `top_number` \
                            and `top_title` for a `stack` (the open layer the \
-                           new one would sit on), `number`, `url` and \
-                           `layers_above` for an `amend` (how many layers the \
-                           amend would rebuild), `count` for \
+                           new one would sit on), `number`, `url`, `title` \
+                           and `layers_above` for an `amend` (the layer it \
+                           lands on and how many layers the amend would \
+                           rebuild), `count` for \
                            `conflicts_pending`, and nothing extra for a \
                            `create` or a `nothing_to_share`.",
             body = Object,

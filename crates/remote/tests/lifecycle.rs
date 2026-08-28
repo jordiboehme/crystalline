@@ -4723,6 +4723,7 @@ async fn amend_preview_counts_the_layers_above() {
         PlannedAction::Amend {
             number: middle.number,
             url: middle.url.clone(),
+            title: load_state(&sub.state_dir).proposals[1].title.clone(),
             layers_above: 1,
         }
     );
@@ -6457,4 +6458,310 @@ async fn stacks_available_cache_survives_and_subscribe_forgets_it() {
         mock.calls()
     );
     assert_eq!(probe_count(&mock), 2, "the yes is cached too");
+}
+
+// Interruption and safety around the cascade: a chain whose re-base died
+// half-way heals without churning the stack, a stack the forge no longer
+// matches is rebuilt rather than retried forever, and no replay ever runs
+// over commits a reviewer put on an upper branch.
+
+/// Breaks the chain the way a cascade that died half-way does: the bottom
+/// layer's branch and record move to a fresh commit and nothing above it
+/// follows, so the middle layer's recorded base is no longer the head below
+/// it. Returns the new bottom head.
+async fn half_cascaded_chain(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    layers: &[crystalline_remote::ops::ProposeReport],
+) -> String {
+    let old_bottom = mock
+        .branch_commit(&layers[0].branch)
+        .expect("the bottom head");
+    let amended = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v3\n"),
+        ]),
+        Some(&old_bottom),
+    );
+    mock.set_branch(&layers[0].branch, &amended);
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[0].head_commit = Some(amended.clone());
+    state.save(&sub.state_dir).unwrap();
+    amended
+}
+
+#[tokio::test]
+async fn a_half_cascaded_chain_re_bases_without_churning_the_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+    let amended = half_cascaded_chain(&mock, &sub, &layers).await;
+
+    // The next share finds the chain broken and re-bases it before adding to
+    // it. Membership never changed, so nothing is dissolved or recreated.
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    let new_middle = mock.branch_commit(&layers[1].branch).expect("the new head");
+    let new_top = mock.branch_commit(&layers[2].branch).expect("the new head");
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_middle}:force=true",
+            layers[1].branch
+        )),
+        "the stale layer is re-based: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            layers[2].branch
+        )),
+        "and the chain above it follows: {delta:?}"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_middle),
+        Some(vec![amended.clone()]),
+        "the re-based layer sits on the amended head"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_top),
+        Some(vec![new_middle.clone()])
+    );
+
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("dissolve_stack") || c.starts_with("create_stack")),
+        "an intact membership is never dissolved and recreated: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("extend_stack:{stack}:[{}]", fourth.number)),
+        "the new layer joins the stack that was already there: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, Some(stack), "the same stack, no churn");
+    assert_eq!(state.proposals[1].base_commit.as_deref(), Some(&*amended));
+    assert_eq!(
+        state.proposals[2].base_commit,
+        state.proposals[1].head_commit
+    );
+    assert_eq!(
+        state.proposals[3].base_commit,
+        state.proposals[2].head_commit
+    );
+
+    // And the healed chain stays healed: a second share re-bases nothing.
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/e.md"), b"epsilon\n");
+    let _fifth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.contains(":force=true")),
+        "a repaired chain does not re-repair itself: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_commit_above_refuses_the_amend_before_any_write() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A reviewer pushes onto the TOP layer's branch. Amending the bottom
+    // layer would replay over that commit and lose it.
+    let top_head = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the top layer's head");
+    let foreign = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v2\n"),
+            ("notes/b.md", b"beta\n"),
+            ("notes/c.md", b"gamma reviewed\n"),
+        ]),
+        Some(&top_head),
+    );
+    mock.set_branch(&layers[2].branch, &foreign);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let outcome = amend_share(&mock, &sub, layers[0].number).await;
+    let delta = mock.calls().split_off(before);
+
+    match outcome {
+        ProposeOutcome::ProposalDiverged { number, .. } => assert_eq!(
+            number, layers[2].number,
+            "the refusal names the layer a reviewer touched"
+        ),
+        other => panic!("expected the upper layer to refuse the amend, got {other:?}"),
+    }
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "nothing was written before the refusal: {delta:?}"
+    );
+    assert_eq!(
+        mock.branch_commit(&layers[2].branch).as_deref(),
+        Some(&*foreign),
+        "the reviewer's commit still stands"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_commit_above_refuses_the_repair_too() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    half_cascaded_chain(&mock, &sub, &layers).await;
+
+    let top_head = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the top layer's head");
+    let foreign = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v2\n"),
+            ("notes/b.md", b"beta\n"),
+            ("notes/c.md", b"gamma reviewed\n"),
+        ]),
+        Some(&top_head),
+    );
+    mock.set_branch(&layers[2].branch, &foreign);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect_err("the repair must refuse rather than overwrite a reviewer");
+    let delta = mock.calls().split_off(before);
+
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("#{}", layers[2].number)),
+        "the refusal names the layer a reviewer touched: {message}"
+    );
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "nothing was written before the refusal: {delta:?}"
+    );
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("dissolve_stack") || c.starts_with("create_stack")),
+        "and the stack was left alone: {delta:?}"
+    );
+    assert_eq!(
+        mock.branch_commit(&layers[2].branch).as_deref(),
+        Some(&*foreign),
+        "the reviewer's commit still stands"
+    );
+}
+
+#[tokio::test]
+async fn a_settled_top_member_rebuilds_the_stack_instead_of_wedging_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer declines the TOP layer and a pull records that. The stack
+    // still holds it as its top member, which the forge refuses to extend
+    // for as long as it stands.
+    mock.set_proposal_state(layers[2].number, ProposalState::Declined);
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[2].status = ProposalStatus::Declined;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!("extend_stack:{old_stack}:[{}]", fourth.number)),
+        "the extend is tried once: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "the stack the forge no longer matches is dissolved: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{},{}]",
+            layers[0].number, layers[1].number, fourth.number
+        )),
+        "and recreated over the open chain: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "no owed link is left behind");
+    let stack = state.stack_number.expect("the rebuilt chain is linked");
+    assert_ne!(stack, old_stack);
+    assert_eq!(fourth.stack_number, Some(stack));
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number, fourth.number],
+        "the new layer landed"
+    );
+}
+
+#[tokio::test]
+async fn an_owed_link_to_a_dissolved_stack_recreates_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // Somebody dissolved the stack on the website, and this machine still
+    // owes it a member: the extend can only ever 404 from here.
+    Provider::dissolve_stack(&mock, &spec(), old_stack)
+        .await
+        .unwrap();
+    let mut state = load_state(&sub.state_dir);
+    state.stack_link_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{},{}]",
+            layers[0].number, layers[1].number, layers[2].number
+        )),
+        "the owed link rebuilds the stack it can no longer extend: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the debt is settled");
+    let stack = state.stack_number.expect("the rebuilt chain is linked");
+    assert_ne!(stack, old_stack);
+    assert_eq!(fourth.stack_number, Some(stack));
+    assert!(
+        delta.contains(&format!("extend_stack:{stack}:[{}]", fourth.number)),
+        "and the new layer joins the rebuilt stack: {delta:?}"
+    );
 }

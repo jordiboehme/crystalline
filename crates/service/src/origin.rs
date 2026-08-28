@@ -366,7 +366,7 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
 /// `{ path, kind }` entry per detected local change), plus the fields the
 /// planned action itself carries - `number` and `url` for an update,
 /// `top_number` and `top_title` for a `stack` (a new layer on an open chain),
-/// `number`, `url` and `layers_above` for an `amend`, all three of `number`,
+/// `number`, `url`, `title` and `layers_above` for an `amend`, all three of `number`,
 /// `url` and `branch` for a diverged proposal, `count` for pending conflicts
 /// and nothing extra for a create or a no-op.
 pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
@@ -405,11 +405,13 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
         ops::PlannedAction::Amend {
             number,
             url,
+            title,
             layers_above,
         } => {
             v["action"] = json!("amend");
             v["number"] = json!(number);
             v["url"] = json!(url);
+            v["title"] = json!(title);
             v["layers_above"] = json!(layers_above);
         }
         ops::PlannedAction::NothingToShare => v["action"] = json!("nothing_to_share"),
@@ -1247,11 +1249,16 @@ mod tests {
         let amend = share_plan_json(&plan(ops::PlannedAction::Amend {
             number: 9,
             url: "https://github.test/pull/9".to_string(),
+            title: "Refine the glossary".to_string(),
             layers_above: 1,
         }));
         assert_eq!(amend["action"], "amend");
         assert_eq!(amend["number"], 9);
         assert_eq!(amend["url"], "https://github.test/pull/9");
+        assert_eq!(
+            amend["title"], "Refine the glossary",
+            "the amended layer names itself, so the confirm question can too"
+        );
         assert_eq!(amend["layers_above"], 1);
     }
 

@@ -1104,6 +1104,66 @@ fn tip_files_over(
     tip
 }
 
+/// Whether a stack write failed because the stack this machine records is no
+/// longer the open chain, rather than because the write itself went wrong.
+///
+/// Two answers say it, and neither is retryable - the identical call would
+/// fail identically forever, which is exactly the wedge this exists to end:
+///
+/// - the forge's base-ref 422 ("pull requests must form a stack..."), which
+///   an `extend_stack` earns whenever the recorded stack's TOP member is not
+///   the layer the new one was branched from. A member closed out from under
+///   the chain is the everyday reason, since closing a member neither removes
+///   it from the stack nor retargets anything;
+/// - a 404 on a path naming a concrete stack number, which is that stack
+///   being gone outright - dissolved on the website by somebody who did not
+///   tell this machine. (The GitHub client keeps that distinct from
+///   [`RemoteError::StacksUnsupported`] precisely so this can read it.)
+///
+/// [`rebuild_stack`] is what settles both.
+fn stack_no_longer_matches(e: &RemoteError) -> bool {
+    match e {
+        RemoteError::Api { status: 404, .. } => true,
+        RemoteError::Api {
+            status: 422,
+            message,
+        } => message.to_lowercase().contains("form a stack"),
+        _ => false,
+    }
+}
+
+/// Dissolves the stack this machine records and creates a fresh one over the
+/// whole open chain: the one move that settles a stack the forge no longer
+/// matches, and the only thing that unwedges an `extend_stack` the forge
+/// refuses on the chain rule.
+///
+/// Bounded on purpose: one dissolve, one create, no loop and no second
+/// attempt. A dissolve of a stack that is already gone is a 404 and means the
+/// work is done; a create that fails leaves the caller to record the debt as
+/// [`crate::state::OriginState::stack_link_pending`], and the next operation
+/// comes back through here rather than around again.
+async fn rebuild_stack(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    stack: u64,
+    open: &[u64],
+) -> Result<u64, RemoteError> {
+    match provider.dissolve_stack(spec, stack).await {
+        Ok(()) => {}
+        Err(RemoteError::Api { status: 404, .. }) => {
+            tracing::debug!("stack {stack} was already gone");
+        }
+        Err(RemoteError::StacksUnsupported) => {
+            tracing::debug!("this forge no longer serves stacks; nothing to dissolve");
+        }
+        Err(e) => return Err(e),
+    }
+    provider
+        .create_stack(spec, open)
+        .await
+        .map(|info| info.number)
+}
+
 /// Settles a stack link this machine still owes the forge, best effort.
 ///
 /// A layer whose `create_stack` or `extend_stack` call failed leaves the
@@ -1118,6 +1178,12 @@ fn tip_files_over(
 /// added. Fewer than two open layers is not a chain at all, so the flag is
 /// simply cleared. Every failure here is swallowed and logged - the debt
 /// stays recorded and the next operation tries again.
+///
+/// With one exception, because retrying is exactly what must not happen
+/// there: an extend the forge refuses because the recorded stack is no longer
+/// the open chain ([`stack_no_longer_matches`]) would be retried forever and
+/// heal nothing, so it is rebuilt instead ([`rebuild_stack`]) - once, in this
+/// call, over the whole open chain.
 async fn retry_stack_link(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -1161,10 +1227,15 @@ async fn retry_stack_link(
                 if missing.is_empty() {
                     Ok(Some(number))
                 } else {
-                    provider
-                        .extend_stack(spec, number, &missing)
-                        .await
-                        .map(|_| Some(number))
+                    match provider.extend_stack(spec, number, &missing).await {
+                        Ok(_) => Ok(Some(number)),
+                        // The recorded stack is not the open chain any more,
+                        // so no number of retries adds anything to it.
+                        Err(e) if stack_no_longer_matches(&e) => {
+                            rebuild_stack(provider, spec, number, &open).await.map(Some)
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
             }
             Err(e) => Err(e),
@@ -1590,6 +1661,10 @@ pub enum PlannedAction {
         number: u64,
         /// The web URL a human reviews the layer at.
         url: String,
+        /// The layer's own title, so a caller can name the proposal it is
+        /// about to move without a second lookup - the same reason
+        /// [`PlannedAction::StackOnTop`] carries `top_title`.
+        title: String,
         /// How many open layers sit above it, each one replayed by the
         /// cascade the amend runs.
         layers_above: usize,
@@ -1730,6 +1805,7 @@ pub async fn propose_preview(
             action: PlannedAction::Amend {
                 number: layer.number,
                 url: layer.url.clone(),
+                title: layer.title.clone(),
                 layers_above,
             },
             changes: local,
@@ -2118,6 +2194,13 @@ async fn update_open_proposal(
 /// degraded (every layer open, none of them grouped) rather than losing the
 /// share: [`crate::state::OriginState::stack_link_pending`] records the debt
 /// and [`retry_stack_link`] pays it off at the start of the next operation.
+///
+/// One failure is not a debt but a mismatch, and retrying it would wedge the
+/// chain forever: an extend the forge refuses because the recorded stack is
+/// no longer the open chain ([`stack_no_longer_matches`] - a member closed
+/// out from under it, or the stack dissolved on the website). That one is
+/// settled here and now, by rebuilding the stack over the open chain with
+/// this layer in it ([`rebuild_stack`]).
 #[allow(clippy::too_many_arguments)]
 async fn stack_new_layer(
     provider: &dyn Provider,
@@ -2176,33 +2259,9 @@ async fn stack_new_layer(
         )
         .await?;
 
-    // With no stack number yet the chain is exactly the layer below plus this
-    // one: `chain_is_stacked` only lets an unlinked chain here while a single
-    // layer is open, so those two are the whole stack.
-    let linked = match state.stack_number {
-        None => provider
-            .create_stack(spec, &[top.number, handle.number])
-            .await
-            .map(|info| Some(info.number)),
-        Some(number) => provider
-            .extend_stack(spec, number, &[handle.number])
-            .await
-            .map(|_| Some(number)),
-    };
-    match linked {
-        Ok(number) => {
-            state.stack_number = number;
-            state.stack_link_pending = false;
-        }
-        Err(e) => {
-            tracing::debug!(
-                "linking proposal #{} into the stack failed; the chain is degraded until the next share: {e}",
-                handle.number
-            );
-            state.stack_link_pending = true;
-        }
-    }
-
+    // The record joins the chain before the linkage is attempted, so the
+    // rebuild below has the whole open chain - this layer included - to
+    // recreate the stack over.
     state.proposals.push(Proposal {
         number: handle.number,
         url: handle.url.clone(),
@@ -2219,6 +2278,46 @@ async fn stack_new_layer(
         feedback: Vec::new(),
         updated_at: None,
     });
+
+    // With no stack number yet the chain is exactly the layer below plus this
+    // one: `chain_is_stacked` only lets an unlinked chain here while a single
+    // layer is open, so those two are the whole stack.
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    let linked = match state.stack_number {
+        None => provider
+            .create_stack(spec, &[top.number, handle.number])
+            .await
+            .map(|info| info.number),
+        Some(number) => match provider.extend_stack(spec, number, &[handle.number]).await {
+            Ok(_) => Ok(number),
+            // The stack this machine records is no longer the open chain -
+            // a member settled out from under it, or somebody dissolved it -
+            // and every later extend would be refused the same way. Rebuild
+            // it once rather than wedging the chain forever.
+            Err(e) if stack_no_longer_matches(&e) => {
+                rebuild_stack(provider, spec, number, &open).await
+            }
+            Err(e) => Err(e),
+        },
+    };
+    match linked {
+        Ok(number) => {
+            state.stack_number = Some(number);
+            state.stack_link_pending = false;
+        }
+        Err(e) => {
+            tracing::debug!(
+                "linking proposal #{} into the stack failed; the chain is degraded until the next share: {e}",
+                handle.number
+            );
+            state.stack_link_pending = true;
+        }
+    }
     state.save(state_dir)?;
 
     Ok(ProposeOutcome::Proposed(ProposeReport {
@@ -2343,6 +2442,100 @@ fn ensure_replayable(state: &OriginState, from_index: usize) -> Result<(), Remot
     Ok(())
 }
 
+/// The refusal a cascade earns when a layer it would replay is carrying
+/// commits this machine did not make.
+///
+/// A replay force-updates a branch, so running it over a reviewer's work
+/// would destroy that work with nothing to recover it from. The whole
+/// operation stops instead, naming the layer that is holding it up and the
+/// two ways forward: take the commits in, or leave that layer alone until its
+/// review is done.
+fn upper_layer_diverged(layer: &Proposal) -> RemoteError {
+    RemoteError::Refused(format!(
+        "proposal #{} carries commits this machine did not make, and re-basing the chain would overwrite them; pull this domain to take in what was pushed onto {}, or let that layer's review finish before changing the chain below it",
+        layer.number, layer.branch
+    ))
+}
+
+/// The upfront pass every cascade makes before its first write: each open
+/// layer from `from_index` up has to be replayable from its own record
+/// ([`ensure_replayable`]) AND still standing where this machine left it.
+///
+/// The second half is the safety rule that gives the cascade the protection
+/// every other write path here already has. A replay is a forced ref move, so
+/// a reviewer's commits on a layer ABOVE the one being changed would be
+/// obliterated by an amend or a repair that never looked at them. So every
+/// layer the cascade would replay is probed with `branch_ref` first, and a
+/// live head that is neither the recorded head nor a half-finished push of
+/// this machine's ([`head_is_ours`]) stops the WHOLE operation - not that one
+/// layer, the operation - before anything at all is written. Which is why
+/// this is one pass and one call site per operation rather than a check
+/// inside [`cascade_replays`]: a refusal halfway up would leave a chain worse
+/// than it found it.
+///
+/// The diverged layer is RETURNED rather than raised, because the two callers
+/// owe their callers different answers for it: a share reports
+/// [`ProposeOutcome::ProposalDiverged`] naming that layer, a repair raises
+/// [`upper_layer_diverged`].
+///
+/// A branch that is simply gone is neither replayable-nor-ours nor a
+/// divergence, and is not refused here: the settle paths a share and a repair
+/// already carry are what speak for those.
+async fn ensure_cascade_ready(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &OriginState,
+    from_index: usize,
+) -> Result<Option<Proposal>, RemoteError> {
+    ensure_replayable(state, from_index)?;
+    for layer in state
+        .proposals
+        .iter()
+        .skip(from_index)
+        .filter(|p| p.status == ProposalStatus::Open)
+    {
+        if let Some(live_head) = provider.branch_ref(spec, &layer.branch).await?
+            && !head_is_ours(layer, &live_head)
+        {
+            return Ok(Some(layer.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The lowest OPEN layer standing on a commit that is no longer the head of
+/// the layer below it, together with the head it should be standing on.
+///
+/// This is what a cascade that died half-way leaves behind, and it is a
+/// different shape from a hole: nothing left the chain, every member is still
+/// a member, and one branch simply never made it onto its new parent. The
+/// repair it needs is therefore only a re-base - dissolving and recreating an
+/// intact membership would churn the stack number for nothing.
+///
+/// The bottom layer is deliberately not measured against the trunk here. An
+/// advanced trunk under an intact chain is ordinary (an amend re-bases a
+/// layer onto it; a repair does not), and [`stack_shape_broken`] only reads
+/// that comparison where a hole opened beneath the bottom survivor - which is
+/// the other repair's business.
+fn first_misaligned_layer(state: &OriginState) -> Option<(usize, String)> {
+    let mut below: Option<&Proposal> = None;
+    for (index, prop) in state.proposals.iter().enumerate() {
+        if prop.status != ProposalStatus::Open {
+            continue;
+        }
+        if let Some(layer) = below {
+            // A layer below with no recorded head says nothing about where
+            // the one above it belongs, so there is no re-base to plan.
+            let parent = layer.head_commit.clone()?;
+            if prop.base_commit.as_deref() != Some(parent.as_str()) {
+                return Some((index, parent));
+            }
+        }
+        below = Some(prop);
+    }
+    None
+}
+
 /// The chain tip BELOW the layer at `index`: the trunk snapshot with every
 /// open layer beneath it laid over ([`tip_files_over`]), which is both what
 /// that layer's own delta is measured against and the presence walk a replay
@@ -2385,9 +2578,11 @@ fn tip_below_layer(state: &OriginState, index: usize) -> BTreeMap<String, BaseSt
 ///   layer is one reviewable step, and a merge commit would drag the trunk
 ///   into it; an advanced trunk arrives through the tree instead, since the
 ///   tree is built on the tip below rather than on the layer's own history.
-/// - divergence is checked on this layer's branch only. The layers above are
-///   rewritten from their records either way, so their heads are this amend's
-///   business rather than its precondition.
+/// - divergence is checked on every layer this touches, this one and each one
+///   above it, and all of it before the first write. The layers above are
+///   rewritten from their records by a forced ref move, so a reviewer's
+///   commits sitting on one of them refuse the whole amend
+///   ([`ensure_cascade_ready`]) rather than being silently replaced.
 /// - not one stack call is made. No base ref moves, so the forge's membership
 ///   holds exactly as it stands.
 #[allow(clippy::too_many_arguments)]
@@ -2403,11 +2598,19 @@ async fn amend_layer(
     description: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
     // Nothing is written until every layer this cascade replays is known to be
-    // replayable: a chain re-based halfway is worse than one never touched.
-    // The amended layer itself is not in that set - it is rebuilt from the
-    // working tree rather than replayed from its record, so
-    // [`collect_amend_changes`] decides per file what it can stand on.
-    ensure_replayable(&state, index + 1)?;
+    // replayable AND known to be ours: a chain re-based halfway is worse than
+    // one never touched, and a reviewer's commits above are not this share's
+    // to overwrite. The amended layer itself is not in that set - it is
+    // rebuilt from the working tree rather than replayed from its record, so
+    // [`collect_amend_changes`] decides per file what it can stand on, and
+    // its own divergence is checked just below.
+    if let Some(above) = ensure_cascade_ready(provider, spec, &state, index + 1).await? {
+        return Ok(ProposeOutcome::ProposalDiverged {
+            number: above.number,
+            url: above.url,
+            branch: above.branch,
+        });
+    }
 
     let layer = state.proposals[index].clone();
     let live_head = match provider.branch_ref(spec, &layer.branch).await? {
@@ -2748,6 +2951,13 @@ async fn collect_amend_changes(
 /// comes from its record rather than from the working tree, which holds the
 /// chain tip and could not tell one layer's work from another's.
 ///
+/// The heads of the layers it replays ARE its precondition, and one it does
+/// not check itself: [`ensure_cascade_ready`] probes every one of them in the
+/// caller's single upfront pass, so that a layer carrying a reviewer's
+/// commits refuses the whole operation before any write rather than being
+/// force-updated away halfway up. Calling this without that pass would
+/// overwrite work nothing can recover.
+///
 /// Two rules the replay follows. A deletion is written only when the path is
 /// actually present in the tip below that layer ([`tip_below_layer`]), so a
 /// retirement of something no longer there is dropped rather than replayed as
@@ -2842,16 +3052,20 @@ struct RepairOutcome {
 /// Whether the recorded chain and the stack this machine believes in have
 /// come apart, without asking the forge anything.
 ///
-/// Three shapes say so, and all of them are the residue of a layer leaving
-/// the chain outside a withdrawal - a settled gone branch ref, or a reviewer
-/// closing one layer of several. A stack whose members are no longer a chain
-/// wedges every later `extend_stack` with the base-ref 422 and cannot be
-/// unwedged without dissolving first, so finding these cheaply matters:
+/// Three shapes say so. Two are the residue of a layer leaving the chain
+/// outside a withdrawal - a settled gone branch ref, or a reviewer closing one
+/// layer of several - and a stack whose members are no longer a chain wedges
+/// every later `extend_stack` with the base-ref 422 and cannot be unwedged
+/// without dissolving first, so finding those cheaply matters. The third is a
+/// re-base that never finished, which needs no stack call at all:
 ///
 /// - a stack number with fewer than two open layers under it, which is a
 ///   number naming something that is not a chain any more;
 /// - an open layer whose recorded base is not the head of the open layer below
-///   it, which is a hole in between the two;
+///   it: a hole in between the two, or - where nothing left the chain at all -
+///   a cascade that died half-way and left that branch behind
+///   ([`first_misaligned_layer`], which is what [`repair_chain`] tells the two
+///   apart with);
 /// - a hole below the bottom open layer, which shows as that layer not yet
 ///   standing on the trunk it now has to target.
 ///
@@ -2954,6 +3168,15 @@ fn merged_layer_blocks_repair(number: u64) -> RemoteError {
 /// ([`merged_layer_blocks_repair`]) comes before the first call, and the pull
 /// that consumes the merge is what unblocks it.
 ///
+/// A chain with NO hole in it takes a shorter path, and taking it matters as
+/// much as the long one. Every member is still a member there; what came
+/// apart is only where a branch stands, which is what a cascade that died
+/// half-way leaves ([`first_misaligned_layer`]). The membership is intact, so
+/// there is nothing to dissolve and nothing to recreate: the layers from the
+/// break up are re-based and that is the repair. Run through the long path
+/// instead, such a chain would churn the stack number on every share it ever
+/// sees and never once move the branch that is actually stale.
+///
 /// Why the order is not negotiable: a stacked proposal cannot be retargeted at
 /// all (the forge answers 422), so the stack has to be dissolved before the
 /// first `update_proposal` base call; and a recreate can only succeed once
@@ -2977,6 +3200,29 @@ async fn repair_chain(
     // dissolved, replayed or retargeted.
     if let Some(number) = merged_layer_blocking_repair(state) {
         return Err(merged_layer_blocks_repair(number));
+    }
+
+    // A chain with no hole in it has nothing to dissolve and nothing to
+    // recreate: every member is still a member, and what came apart is only
+    // where the branches stand. That is a cascade that died half-way, and the
+    // whole repair is to re-base the layers above the break onto the head
+    // below it. Dissolving an intact membership would churn the stack number
+    // on every later share and still leave the stale branch where it was.
+    let intact = state
+        .proposals
+        .iter()
+        .all(|p| p.status == ProposalStatus::Open);
+    if intact && let Some((index, parent)) = first_misaligned_layer(state) {
+        if let Some(above) = ensure_cascade_ready(provider, spec, state, index).await? {
+            return Err(upper_layer_diverged(&above));
+        }
+        cascade_replays(provider, spec, state, state_dir, index, parent).await?;
+        state.repair_pending = false;
+        state.save(state_dir)?;
+        return Ok(RepairOutcome {
+            repaired: true,
+            restacked: None,
+        });
     }
 
     // The plan is read off the recorded chain before a single call is made:
@@ -3011,10 +3257,13 @@ async fn repair_chain(
     }
 
     // Nothing is written until every layer the cascade replays is known to be
-    // replayable, so a chain that cannot be healed is refused before the
+    // replayable and known to be ours, so a chain that cannot be healed - or
+    // one carrying a reviewer's commits above the hole - is refused before the
     // dissolve rather than halfway up.
     if let Some(index) = first_survivor {
-        ensure_replayable(state, index)?;
+        if let Some(above) = ensure_cascade_ready(provider, spec, state, index).await? {
+            return Err(upper_layer_diverged(&above));
+        }
     }
 
     let mut outcome = RepairOutcome::default();

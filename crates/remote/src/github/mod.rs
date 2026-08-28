@@ -214,18 +214,27 @@ impl GitHubProvider {
     /// reads the stack it answers with.
     ///
     /// Two answers are read before [`check`](GitHubProvider::check) sees
-    /// them. A 404 is the forge saying it has no stack endpoints at all
-    /// rather than a missing repository, so it becomes
-    /// [`RemoteError::StacksUnsupported`]. A 409 is GitHub reporting that the
-    /// stack is being modified concurrently: the write is retried up to
-    /// [`STACK_WRITE_ATTEMPTS`] times with [`STACK_WRITE_BACKOFF`] between
-    /// the tries, and only a conflict that survives all of them is surfaced,
-    /// as an ordinary [`RemoteError::Api`] carrying GitHub's message.
+    /// them. A 409 is GitHub reporting that the stack is being modified
+    /// concurrently: the write is retried up to [`STACK_WRITE_ATTEMPTS`]
+    /// times with [`STACK_WRITE_BACKOFF`] between the tries, and only a
+    /// conflict that survives all of them is surfaced, as an ordinary
+    /// [`RemoteError::Api`] carrying GitHub's message.
+    ///
+    /// A 404 depends on what `path` names, which is what `numbered` says. On
+    /// the collection path (`POST /stacks`, creating a stack) it is the forge
+    /// saying it has no stack endpoints at all, so it becomes
+    /// [`RemoteError::StacksUnsupported`]. On a path carrying a concrete
+    /// stack number it means THAT stack is gone - somebody dissolved it on
+    /// the website - which says nothing about the forge, so it comes back as
+    /// a plain `Api { status: 404 }` for the caller to rebuild from. Reading
+    /// the second as the first would stand a whole origin down to the
+    /// fallback path over one dissolved stack.
     async fn stack_write(
         &self,
         repo: &str,
         path: &str,
         pull_requests: &[u64],
+        numbered: bool,
     ) -> Result<StackInfo, RemoteError> {
         let body = StackWriteRequest {
             pull_requests: pull_requests.to_vec(),
@@ -235,7 +244,7 @@ impl GitHubProvider {
             let response = self
                 .send(self.request(Method::POST, path).json(&body))
                 .await?;
-            if response.status() == StatusCode::NOT_FOUND {
+            if !numbered && response.status() == StatusCode::NOT_FOUND {
                 return Err(RemoteError::StacksUnsupported);
             }
             if response.status() == StatusCode::CONFLICT && attempt < STACK_WRITE_ATTEMPTS {
@@ -243,7 +252,10 @@ impl GitHubProvider {
                 attempt += 1;
                 continue;
             }
-            let response = self.check(response, Some(repo)).await?;
+            // A numbered path passes no repository to `check`, so its 404
+            // stays a 404 rather than becoming `RepoNotFound`.
+            let repo = (!numbered).then_some(repo);
+            let response = self.check(response, repo).await?;
             let stack: StackResponse = parse_json(response).await?;
             return Ok(map_stack(stack));
         }
@@ -648,7 +660,8 @@ impl Provider for GitHubProvider {
     ) -> Result<StackInfo, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/stacks");
-        self.stack_write(&origin.repo, &path, pull_requests).await
+        self.stack_write(&origin.repo, &path, pull_requests, false)
+            .await
     }
 
     async fn extend_stack(
@@ -659,7 +672,8 @@ impl Provider for GitHubProvider {
     ) -> Result<StackInfo, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/stacks/{stack_number}/add");
-        self.stack_write(&origin.repo, &path, pull_requests).await
+        self.stack_write(&origin.repo, &path, pull_requests, true)
+            .await
     }
 
     async fn dissolve_stack(
@@ -670,17 +684,18 @@ impl Provider for GitHubProvider {
         let (owner, repo_name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{repo_name}/stacks/{stack_number}/unstack");
         let response = self.send(self.request(Method::POST, &path)).await?;
-        if response.status() == StatusCode::NOT_FOUND {
-            // Same reading as list_stacks: no stack endpoints, not a missing
-            // repository.
-            return Err(RemoteError::StacksUnsupported);
-        }
         // GitHub answers 204 when every member left the stack and 200 with
         // whatever remains when some member could not be released (a queued
         // merge holds it). Both mean the request was carried out, and this
         // client has nothing to do with the remainder, so the body is
         // deliberately not read.
-        self.check(response, Some(&origin.repo)).await?;
+        //
+        // The path names a concrete stack, so a 404 means that stack is gone
+        // rather than that the forge has no stacks - and a dissolve of
+        // something already dissolved is a dissolve that is done. Passing no
+        // repository to `check` keeps it a 404 instead of `RepoNotFound`, and
+        // every caller reads it as done.
+        self.check(response, None).await?;
         Ok(())
     }
 }

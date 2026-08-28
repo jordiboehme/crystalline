@@ -2574,7 +2574,7 @@ async fn an_eliciting_share_on_a_stacking_forge_is_asked_before_the_layer_is_ope
         .as_str()
         .unwrap_or_default();
     assert!(
-        message.contains(&format!("Stacks a new proposal on top of #{number}")),
+        message.contains(&format!("Stack a new proposal on top of #{number}")),
         "the question names the layer it lands on: {message}"
     );
     assert!(
