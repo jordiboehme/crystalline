@@ -577,7 +577,7 @@ pub fn load_file(path: &Path) -> anyhow::Result<GlobalConfig> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crystalline_core::config::DatabaseBackend;
+    use crystalline_core::config::{DatabaseBackend, ShareIdentityMode};
 
     fn overlay(pairs: &[(&str, &str)]) -> Result<EnvOverlay, OverlayError> {
         EnvOverlay::from_vars(
@@ -600,6 +600,8 @@ mod tests {
             ),
             ("CRYSTALLINE_GITHUB_OAUTH_CLIENT_ID", "client-xyz"),
             ("CRYSTALLINE_GITHUB_STACKS", "false"),
+            ("CRYSTALLINE_GITHUB_SHARE_IDENTITY", "personal"),
+            ("CRYSTALLINE_GITHUB_AGENT_IDENTITY", "share-bot"),
             ("CRYSTALLINE_SERVICE_READ_ONLY", "true"),
             ("CRYSTALLINE_SERVICE_HTTP", "0.0.0.0:7411"),
             ("CRYSTALLINE_SERVICE_UI", "false"),
@@ -620,6 +622,8 @@ mod tests {
             "github.api_url",
             "github.oauth_client_id",
             "github.stacks",
+            "github.share_identity",
+            "github.agent_identity",
             "service.read_only",
             "service.http",
             "service.ui",
@@ -640,6 +644,13 @@ mod tests {
         // The one setting whose default is on, so the env has to be able to
         // turn it off rather than only to restate it.
         assert!(!effective.github_stacks());
+        // A headless node configures personal mode and its bot account purely
+        // from the environment, with no config file to edit.
+        assert_eq!(
+            effective.github_share_identity(),
+            ShareIdentityMode::Personal
+        );
+        assert_eq!(effective.github_agent_identity(), Some("share-bot"));
         assert!(effective.read_only());
         assert!(!effective.ui_enabled());
         assert!(!effective.api_enabled());
