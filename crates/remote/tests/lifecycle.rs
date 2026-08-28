@@ -3731,6 +3731,15 @@ async fn the_mock_forge_models_the_spiked_stack_rules() {
     mock.dissolve_stack(&spec(), stack.number).await.unwrap();
     assert!(mock.stack(stack.number).is_none());
     assert!(mock.stacks().is_empty());
+
+    // Extending what is no longer in the registry is a 404, not a chain
+    // complaint: there is no stack left to line a layer up against.
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[p3])
+        .await
+        .unwrap_err();
+    assert_api(&err, 404, "no stack");
+
     mock.update_proposal(&spec(), p2, None, None, Some("main"))
         .await
         .expect("unstack first, then retarget");
@@ -3751,6 +3760,16 @@ async fn the_mock_forge_models_the_spiked_stack_rules() {
         again.number > stack.number,
         "a fresh number off the shared counter"
     );
+
+    // One open member keeps a stack open; with the last one closed the stack
+    // itself reads shut, while the registry entry stays put.
+    mock.close_proposal(&spec(), p1).await.unwrap();
+    let half = mock.stack(again.number).expect("still registered");
+    assert!(half.open, "p2 is still open, so the stack is");
+    mock.close_proposal(&spec(), p2).await.unwrap();
+    let shut = mock.stack(again.number).expect("still registered");
+    assert_eq!(shut.members.len(), 2, "closing never unstacks a member");
+    assert!(!shut.open, "no open member left, so the stack reads closed");
 
     // Every stack call is recorded, in the colon-separated shape the rest of
     // the lifecycle assertions read.
@@ -4899,6 +4918,88 @@ async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
 }
 
 #[tokio::test]
+async fn a_refusal_on_a_later_kept_entry_leaves_no_orphan_blob_behind() {
+    // Two legacy entries: the first has everything it needs to be re-read and
+    // uploaded, the second is owned by the layer above and refuses. Every
+    // kept entry is judged before the first upload, so the refusal costs the
+    // repository nothing - no blob for the first entry goes up and is then
+    // stranded by the second entry's refusal.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/z.md", b"zeta\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/z.md"), b"zeta v2\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+
+    // The layer above takes over one of the two paths, which is what makes
+    // that entry unrebuildable from the working tree.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+
+    // Only the blob sha is dropped: an entry that also lost its size reads as
+    // a fresh change again and never reaches the kept-entry path at all.
+    // The record's file order decides which entry that path reaches first, and
+    // the point here is a refusal on a LATER entry, so the owned path is
+    // pinned to the end rather than left to detection order.
+    let mut state = load_state(&sub.state_dir);
+    for file in state.proposals[0].files.iter_mut() {
+        file.blob_sha = None;
+    }
+    state.proposals[0]
+        .files
+        .sort_by_key(|f| f.path == "notes/a.md");
+    state.save(&sub.state_dir).unwrap();
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0]
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>(),
+        vec!["notes/z.md".to_string(), "notes/a.md".to_string()]
+    );
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(first.number),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect_err("the layer above owns notes/a.md");
+    assert!(
+        matches!(err, crystalline_remote::RemoteError::Refused(_)),
+        "{err:?}"
+    );
+
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_blob")),
+        "notes/z.md's blob must not go up ahead of notes/a.md's refusal: {delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a refused amend writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
 async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend() {
     let mock = MockProvider::new();
     mock.enable_stacks();
@@ -4936,6 +5037,61 @@ async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend()
         }
         ref other => panic!("expected ProposalDiverged, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn amend_preview_refuses_over_an_unreplayable_layer_above() {
+    // The cascade an amend runs replays every layer above it, and a layer
+    // whose record predates blob shas cannot be replayed. The share refuses
+    // over that before its first write, so the preview refuses in the same
+    // words rather than promising an Amend that would then be turned down.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    forget_blob_shas(&sub.state_dir, 1);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let options = || ShareOptions {
+        title: None,
+        description: None,
+        proposal: Some(first.number),
+        stacks_allowed: true,
+    };
+    let err = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .expect_err("the layer above cannot be replayed");
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(
+                message.contains(&format!("layer #{}", second.number)),
+                "{message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+
+    // And the share raises the very same refusal, which is the point: the
+    // preview's answer is the share's answer.
+    let shared = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .expect_err("the share refuses too");
+    assert_eq!(format!("{shared}"), format!("{err}"));
 }
 
 // The stacked withdrawal: taking one layer out of an open chain closes its
@@ -5511,6 +5667,54 @@ async fn a_declined_bottom_layer_heals_the_chain_on_the_next_share() {
         "the closed layer left the chain: {:?}",
         state.history
     );
+}
+
+#[tokio::test]
+async fn a_repair_settles_a_declined_layer_the_way_it_settles_a_withdrawn_one() {
+    // A share supersedes a declined proposal on its way past it, but a
+    // withdrawal never goes through that step: the repair is what closes the
+    // chain around both holes, so it moves both records to history rather than
+    // leaving the declined one behind for the next repair to walk again.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A reviewer closes the middle layer, and this machine withdraws the
+    // bottom one: two holes at once, of two different kinds.
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 3);
+
+    stacked_withdraw(&mock, &sub, Some(layers[0].number), false).await;
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(open_numbers(&sub.state_dir), vec![layers[2].number]);
+    assert!(
+        state
+            .proposals
+            .iter()
+            .all(|p| p.status == ProposalStatus::Open),
+        "the repair left no settled record in the chain: {:?}",
+        state.proposals
+    );
+    let declined = state
+        .history
+        .iter()
+        .find(|p| p.number == layers[1].number)
+        .expect("the declined layer went to history");
+    assert_eq!(
+        declined.status,
+        ProposalStatus::Declined,
+        "it keeps the status it settled with"
+    );
+    let withdrawn = state
+        .history
+        .iter()
+        .find(|p| p.number == layers[0].number)
+        .expect("the withdrawn layer went to history");
+    assert_eq!(withdrawn.status, ProposalStatus::Withdrawn);
 }
 
 #[tokio::test]

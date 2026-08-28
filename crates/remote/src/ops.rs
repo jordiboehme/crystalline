@@ -1666,6 +1666,12 @@ pub async fn propose_preview(
                 effective_title: String::new(),
             });
         }
+        // Read-only, and the same question the amend asks before its first
+        // write: a layer above that cannot be replayed refuses the share, so
+        // the preview must refuse too rather than promise an Amend. The share
+        // raises this exact error, so the preview raises it rather than
+        // inventing a plan classification for it.
+        ensure_replayable(&state, index + 1)?;
         // The same probe the amend makes, in the same order, so a preview
         // never promises an amend the share then refuses.
         let layer = &state.proposals[index];
@@ -2553,6 +2559,12 @@ async fn collect_amend_changes(
     let fresh_paths: BTreeSet<&str> = fresh.changes.iter().map(LocalChange::path).collect();
 
     let mut merged: BTreeMap<String, ProposedFile> = BTreeMap::new();
+    // Every kept entry is judged before a single blob goes up. A refusal on
+    // the third entry used to land after the first two had already been
+    // uploaded, leaving orphan blobs behind on a share that refused, so the
+    // re-read and its checks run as a pre-pass and the uploads follow only
+    // once the whole set has passed.
+    let mut rebuild: Vec<(String, Vec<u8>)> = Vec::new();
     for file in &layer.files {
         if fresh_paths.contains(file.path.as_str()) {
             continue;
@@ -2564,7 +2576,7 @@ async fn collect_amend_changes(
         if !still_a_change {
             continue;
         }
-        let mut kept = file.clone();
+        let kept = file.clone();
         let needs_blob = matches!(
             kept.change,
             ProposedChange::Added | ProposedChange::Modified
@@ -2588,10 +2600,16 @@ async fn collect_amend_changes(
                     layer.number, kept.path
                 )));
             }
-            kept.blob_sha = Some(provider.create_blob(spec, &bytes).await?);
-            kept.size = Some(bytes.len() as u64);
+            rebuild.push((kept.path.clone(), bytes));
         }
         merged.insert(kept.path.clone(), kept);
+    }
+    for (path, bytes) in rebuild {
+        let blob_sha = provider.create_blob(spec, &bytes).await?;
+        if let Some(entry) = merged.get_mut(&path) {
+            entry.blob_sha = Some(blob_sha);
+            entry.size = Some(bytes.len() as u64);
+        }
     }
 
     for change in &fresh.changes {
@@ -3008,19 +3026,31 @@ async fn repair_chain(
         outcome.repaired = true;
     }
 
-    // A layer this machine withdrew leaves the chain for history here, once
-    // the survivors above it stand on their own again.
-    let withdrawn: Vec<Proposal> = state
+    // A layer this machine withdrew, and one the forge declined out from under
+    // it, both leave the chain for history here, once the survivors above them
+    // stand on their own again. Each keeps the status it settled with, the way
+    // a share's supersede step records a declined proposal: the chain is what
+    // is being repaired, and a hole that stayed behind in `proposals` would
+    // have the next repair walk it all over again.
+    let settled: Vec<Proposal> = state
         .proposals
         .iter()
-        .filter(|p| p.status == ProposalStatus::Withdrawn)
+        .filter(|p| {
+            matches!(
+                p.status,
+                ProposalStatus::Withdrawn | ProposalStatus::Declined
+            )
+        })
         .cloned()
         .collect();
-    if !withdrawn.is_empty() {
-        state
-            .proposals
-            .retain(|p| p.status != ProposalStatus::Withdrawn);
-        for record in withdrawn {
+    if !settled.is_empty() {
+        state.proposals.retain(|p| {
+            !matches!(
+                p.status,
+                ProposalStatus::Withdrawn | ProposalStatus::Declined
+            )
+        });
+        for record in settled {
             state.push_history(record);
         }
     }

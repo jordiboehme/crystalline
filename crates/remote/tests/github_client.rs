@@ -937,21 +937,30 @@ fn stack_json() -> serde_json::Value {
 
 #[tokio::test]
 async fn list_stacks_maps_members_and_filters_by_pull_request() {
+    // The query is captured rather than asserted inside the handler: an
+    // assert that fires in there unwinds the connection, and the client
+    // reads a dropped socket instead of the message that says what broke.
+    let seen: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let state = seen.clone();
     let app = Router::new().route(
         "/repos/acme/brand-knowledge/stacks",
-        get(|Query(q): Query<HashMap<String, String>>| async move {
-            assert_eq!(
-                q.get("pull_request").map(String::as_str),
-                Some("6"),
-                "a proposal number narrows the listing to that proposal's stack"
-            );
-            Json(serde_json::json!([stack_json()]))
+        get(move |Query(q): Query<HashMap<String, String>>| {
+            let state = state.clone();
+            async move {
+                *state.lock().unwrap() = q.get("pull_request").cloned();
+                Json(serde_json::json!([stack_json()]))
+            }
         }),
     );
     let base = spawn(app).await;
     let provider = GitHubProvider::new(Some(base), None);
 
     let stacks = provider.list_stacks(&origin(), Some(6)).await.unwrap();
+    assert_eq!(
+        seen.lock().unwrap().as_deref(),
+        Some("6"),
+        "a proposal number narrows the listing to that proposal's stack"
+    );
     assert_eq!(stacks.len(), 1);
     assert_eq!(stacks[0].number, 42);
     assert!(stacks[0].open);

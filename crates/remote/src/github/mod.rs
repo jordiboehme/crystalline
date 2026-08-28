@@ -625,10 +625,10 @@ impl Provider for GitHubProvider {
         pull_request: Option<u64>,
     ) -> Result<Vec<StackInfo>, RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
-        let mut path = format!("/repos/{owner}/{name}/stacks");
-        if let Some(number) = pull_request {
-            path.push_str(&format!("?pull_request={number}"));
-        }
+        let path = match pull_request {
+            Some(number) => format!("/repos/{owner}/{name}/stacks?pull_request={number}"),
+            None => format!("/repos/{owner}/{name}/stacks"),
+        };
         let response = self.send(self.request(Method::GET, &path)).await?;
         if response.status() == StatusCode::NOT_FOUND {
             // A forge that does not serve stacks answers 404 on this path:
