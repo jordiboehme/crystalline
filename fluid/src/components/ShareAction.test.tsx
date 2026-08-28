@@ -345,6 +345,68 @@ describe("the top bar's share action", () => {
     ).toBeNull();
   });
 
+  it("stops reading the picked domain's status once the share has landed", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "proposed",
+      number: 7,
+      url: "https://github.com/acme/ops/pull/7",
+    }));
+    serve({
+      "/settings/github": () => githubStatus(),
+      "/sync": () => summaryResponse([summaryEntry("ops", 2)]),
+      // The dialog reads this for the open layers it offers to amend. Nothing
+      // on this screen is drawn from it - the proposals card lives on the
+      // domain screen - so this observer is the only one there is.
+      "/domains/ops/sync": () => syncResponse({ domain: "ops" }),
+      "/domains/ops/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 new engrams from ops",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+      "/domains/ops/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+    await userEvent.click(action);
+    const picker = await screen.findByRole("dialog", {
+      name: "Share from a domain",
+    });
+    await userEvent.click(
+      within(picker).getByRole("button", { name: "ops - 2 pending changes" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", { name: "Share changes" });
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    const statusReads = reads("/domains/ops/sync");
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    await within(dialog).findByText(/opened proposal #7/i);
+    // The share's own success handler invalidates the status key along with
+    // the two listings, and reading that key pulls the origin. Waiting for
+    // the summary - invalidated in the same tick, and read by the action
+    // behind this dialog - is what makes the count below a settled answer
+    // rather than a race.
+    await waitFor(() => {
+      expect(reads("/sync")).toBeGreaterThan(1);
+    });
+    // The form is gone, the select with it, and nothing left on screen is
+    // drawn from this domain's status: a second origin-pulling read here
+    // would be a probe to redraw something nobody is looking at.
+    expect(reads("/domains/ops/sync")).toBe(statusReads);
+  });
+
   it("badges a domain whose chain is wedged before anybody picks it", async () => {
     serve({
       "/settings/github": () => githubStatus(),

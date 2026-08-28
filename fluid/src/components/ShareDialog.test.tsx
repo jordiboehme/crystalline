@@ -323,6 +323,62 @@ describe("the share dialog", () => {
     });
   });
 
+  it("offers the share on an amend plan, and says what it rebuilds", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "updated",
+      proposal: {
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        stack_number: 42,
+        stack_position: [1, 2],
+      },
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "amend",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        layers_above: 1,
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // An amend puts a fresh commit on a proposal that already exists, so it is
+    // shareable like an update - and it says how much work above it would be
+    // rebuilt, which is the whole difference from amending the top layer.
+    expect(
+      await within(dialog).findByText(
+        "Sharing amends proposal #4 and re-bases 1 layer above it.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // The server already planned this target, so nothing names it again: the
+    // number travels only when somebody picked a layer of their own.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({});
+    expect(
+      await within(dialog).findByText(
+        "Updated proposal #4, layer 1 of 2 on stack #42.",
+      ),
+    ).toBeInTheDocument();
+  });
+
   it("offers the open layers to amend, and names the one that was chosen", async () => {
     const shared = vi.fn(() => ({
       outcome: "updated",

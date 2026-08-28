@@ -39,7 +39,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
-import { useId, useState } from "react";
+import { useEffect, useId, useState } from "react";
 
 import type { SharePlan } from "../api/admin";
 import {
@@ -97,11 +97,12 @@ export default function ShareDialogBody({
   // other read of a domain is filed under, which is the one place this app
   // breaks that pattern. `DOMAINS_QUERY_KEY` is the bare `["domains"]` prefix
   // and TanStack invalidates by prefix, so a plan filed in there would be
-  // refetched by every bulk domain invalidation in the app - including this
-  // component's own success handler, which fires it in the same tick as the
-  // state above and so beats `enabled` to the punch. This is not a cache of
-  // domain content: reading it pulls the origin, and re-reading it as a side
-  // effect of somebody else's write is a write nobody asked for.
+  // refetched by every bulk domain invalidation in the app - this component's
+  // own included, and `enabled` alone would not save it, since an invalidation
+  // fired in the same tick as the state above reaches an observer React has
+  // not re-rendered yet. This is not a cache of domain content: reading it
+  // pulls the origin, and re-reading it as a side effect of somebody else's
+  // write is a write nobody asked for.
   const plan = useQuery({
     queryKey: sharePlanKey(domain),
     queryFn: () => fetchShareChanges(domain),
@@ -117,12 +118,23 @@ export default function ShareDialogBody({
   // was typed in - and never retried, since the refusals it can carry (a
   // domain with no origin, GitHub off) are immediate and final. A domain this
   // read cannot answer for simply offers no layer to amend.
+  //
+  // Switched off the moment a share lands, for the reason the plan above is
+  // and one of its own. This component invalidates the status key and the
+  // `["domains"]` prefix that also covers it, and an observer still live would
+  // answer that by pulling the origin again to redraw a select that is no
+  // longer on screen - the outcome pane has replaced the form by then. The
+  // card behind the dialog is the reader that wants the fresh status, and it
+  // gets it: what is switched off here is this dialog's second copy of it.
+  // This flag only holds because those invalidations are fired from an effect
+  // rather than from the mutation's handler; the note on them says why.
   const status = useQuery({
     queryKey: syncStatusKey(domain),
     queryFn: () => fetchSyncStatus(domain),
     staleTime: Infinity,
     refetchOnWindowFocus: false,
     retry: false,
+    enabled: outcome === null,
   });
   const openLayers = (status.data?.proposals ?? []).filter(
     (proposal) => proposal.status === "open",
@@ -155,23 +167,41 @@ export default function ShareDialogBody({
       }),
     onSuccess: (result) => {
       setOutcome(describeOutcome(result));
-      // All three of the things a share can have changed: the status the card
-      // that opened this is drawn from, the listing every sidebar, card and
-      // switcher counts engrams in - a share pulls the origin first, and a
-      // pull that applied files moves those counts - and the instance-wide
-      // summary, which is what the frame's share action reads to decide
-      // whether there is anything left to share and what to fill its picker
-      // with. That one is the reason this list is not two keys: the work just
-      // left this domain, and a button still offering to share it would be
-      // offering a dialog that opens to say there is nothing to do.
-      void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
-      void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
-      void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
     },
     onError: (error: Error) => {
       setProblem(problemDetail(error));
     },
   });
+
+  // All three of the things a share can have changed: the status the card that
+  // opened this is drawn from, the listing every sidebar, card and switcher
+  // counts engrams in - a share pulls the origin first, and a pull that applied
+  // files moves those counts - and the instance-wide summary, which is what the
+  // frame's share action reads to decide whether there is anything left to
+  // share and what to fill its picker with. That one is the reason this list is
+  // not two keys: the work just left this domain, and a button still offering
+  // to share it would be offering a dialog that opens to say there is nothing
+  // to do.
+  //
+  // Fired from an effect keyed on the outcome rather than from the mutation's
+  // own success handler, and that is load bearing rather than tidy. The status
+  // query above is one of the keys being invalidated - `syncStatusKey` sits
+  // under the `["domains"]` prefix, so both of the first two reach it - and
+  // firing them inside `onSuccess` would reach an observer that is still
+  // enabled, because React has not re-rendered with the outcome yet. The dialog
+  // would answer its own invalidation by pulling the origin again to redraw a
+  // select that the outcome pane has already replaced. By the time this runs
+  // the component has re-rendered, this observer is off, and the reader that
+  // actually wants the fresh status - the proposals card behind the dialog -
+  // is the one left to answer.
+  useEffect(() => {
+    if (outcome === null) {
+      return;
+    }
+    void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
+    void queryClient.invalidateQueries({ queryKey: DOMAINS_QUERY_KEY });
+    void queryClient.invalidateQueries({ queryKey: SYNC_SUMMARY_KEY });
+  }, [outcome, domain, queryClient]);
 
   const action = plan.data?.action ?? null;
   const shareable =
