@@ -176,6 +176,21 @@ function sentBody(path: string, method: string): unknown {
   return JSON.parse(body) as unknown;
 }
 
+/**
+ * The face a row's rail node wears, as its classes.
+ *
+ * The rail is decorative to the letter - `aria-hidden`, no text - so there is
+ * nothing to query it by except its shape: the node is the middle of the three
+ * spans that make up one row's piece of it.
+ */
+function railNode(row: HTMLElement): string {
+  const node = row.querySelector('[aria-hidden="true"] > span:nth-child(2)');
+  if (node === null) {
+    throw new Error("the row drew no rail node");
+  }
+  return node.className;
+}
+
 /** The card itself, once the status behind it has landed. */
 async function proposalsCard(): Promise<HTMLElement> {
   return screen.findByRole("region", { name: "Proposals" });
@@ -337,6 +352,13 @@ describe("the proposals card", () => {
     // And what the whole chain stands on, at the foot of the rail: the
     // tracked branch, which is where merging the top of it lands.
     expect(rows[2]).toHaveTextContent("main");
+    // The foot is not a layer and does not wear a layer's face: an open layer
+    // is filled in the accent, the trunk is the hollow node. Drawn apart
+    // rather than only named apart, so the rail reads as a chain standing on
+    // a branch instead of three of the same thing.
+    expect(railNode(rows[0] as HTMLElement)).toContain("bg-accent-600");
+    expect(railNode(rows[2] as HTMLElement)).not.toContain("bg-accent-600");
+    expect(railNode(rows[2] as HTMLElement)).toContain("border-slate-400");
     // The chain itself, named once rather than per row.
     expect(within(card).getByText("stack #42")).toBeVisible();
   });

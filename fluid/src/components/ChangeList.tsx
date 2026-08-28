@@ -25,6 +25,8 @@
 import type { ReactElement } from "react";
 import { useState } from "react";
 
+import { CHIP_VARIANTS } from "./primitives";
+
 /**
  * How many paths a group draws before it starts counting the rest.
  *
@@ -41,38 +43,31 @@ export interface Change {
 }
 
 /**
+ * The one face the chips have no name for: a rename is neither good news nor a
+ * caution, and blue is what source control has drawn it in for years. Written
+ * in the shape the chip faces are written in - the same two steps, the same
+ * inversion in the dark scheme - so it sits beside them without reading as a
+ * second vocabulary. blue-800 on blue-100 is 8.15:1 and blue-300 on blue-950 is
+ * 10.44:1, both clear of the 4.5:1 floor for text this size.
+ */
+const RENAMED_FACE =
+  "bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300";
+
+/**
  * The letter, the word and the face each kind the engine writes wears.
  *
- * The four color pairs are the chip palette's own - emerald, amber and red are
- * `positive`, `caution` and `danger` to the shade, and blue is the same shape
- * for the one kind the chips have no face for - so a badge sits beside a chip
- * without introducing a second vocabulary of color into the app. Every pair
- * clears 4.5:1 in both schemes, the way the chips do.
+ * The faces are the chip table's own rather than a copy of its strings, so a
+ * palette retune reaches the badges and the chips together: added is
+ * `positive`, modified is `caution`, deleted is `danger` and anything this side
+ * has not been taught is `neutral`. Only the rename has a face of its own,
+ * above.
  */
 const KINDS: Record<string, { letter: string; word: string; classes: string }> =
   {
-    added: {
-      letter: "A",
-      word: "Added",
-      classes:
-        "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",
-    },
-    modified: {
-      letter: "M",
-      word: "Modified",
-      classes:
-        "bg-amber-100 text-amber-800 dark:bg-amber-950 dark:text-amber-300",
-    },
-    deleted: {
-      letter: "D",
-      word: "Deleted",
-      classes: "bg-red-100 text-red-800 dark:bg-red-950 dark:text-red-200",
-    },
-    renamed: {
-      letter: "R",
-      word: "Renamed",
-      classes: "bg-blue-100 text-blue-800 dark:bg-blue-950 dark:text-blue-300",
-    },
+    added: { letter: "A", word: "Added", classes: CHIP_VARIANTS.positive },
+    modified: { letter: "M", word: "Modified", classes: CHIP_VARIANTS.caution },
+    deleted: { letter: "D", word: "Deleted", classes: CHIP_VARIANTS.danger },
+    renamed: { letter: "R", word: "Renamed", classes: RENAMED_FACE },
   };
 
 /** The order the taught kinds are read in; anything else follows, as it came. */
@@ -96,8 +91,7 @@ function faceFor(kind: string): {
   if (known) {
     return known;
   }
-  const neutral =
-    "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300";
+  const neutral = CHIP_VARIANTS.neutral;
   return kind === ""
     ? { letter: "?", word: "Changed", classes: neutral }
     : { letter: kind.slice(0, 1).toUpperCase(), word: kind, classes: neutral };
@@ -175,6 +169,16 @@ function ChangeGroup({
         <button
           type="button"
           aria-expanded={expanded}
+          // Which group this opens, for anything reading the buttons rather
+          // than the headings above them: three over-cap groups would
+          // otherwise be three controls all called "and 2 more". The visible
+          // text stays short, because beside its own heading it is not
+          // ambiguous at all.
+          aria-label={
+            expanded
+              ? `Show fewer ${face.word.toLowerCase()}`
+              : `Show ${String(rest)} more ${face.word.toLowerCase()}`
+          }
           onClick={() => {
             setExpanded((open) => !open);
           }}

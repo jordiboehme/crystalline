@@ -553,7 +553,13 @@ describe("the share dialog", () => {
     expect(within(dialog).getByText("notes/mod-4.md")).toBeVisible();
     expect(within(dialog).queryByText("notes/mod-5.md")).toBeNull();
 
-    const more = within(dialog).getByRole("button", { name: "and 2 more" });
+    // The toggle names its own group. Beside its heading the short words are
+    // unambiguous, but a dialog with three over-cap groups would otherwise
+    // offer three controls all called "and 2 more".
+    const more = within(dialog).getByRole("button", {
+      name: "Show 2 more modified",
+    });
+    expect(more).toHaveTextContent("and 2 more");
     expect(more).toHaveAttribute("aria-expanded", "false");
     await userEvent.click(more);
 
@@ -562,9 +568,52 @@ describe("the share dialog", () => {
     expect(within(dialog).getByText("notes/mod-5.md")).toBeVisible();
     expect(within(dialog).getByText("notes/mod-6.md")).toBeVisible();
     await userEvent.click(
-      within(dialog).getByRole("button", { name: "Show fewer" }),
+      within(dialog).getByRole("button", { name: "Show fewer modified" }),
     );
     expect(within(dialog).queryByText("notes/mod-5.md")).toBeNull();
+  });
+
+  it("offers nothing to expand on a group that is exactly full", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 5 new engrams from eng",
+        changes: changesOf("added", 5, "new"),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The cap is what a group draws, not what it draws before hiding one: a
+    // group that fits exactly is whole, and a toggle over it would open onto
+    // nothing.
+    expect(await within(dialog).findByText("Added 5")).toBeVisible();
+    expect(within(dialog).getByText("notes/new-4.md")).toBeVisible();
+    expect(within(dialog).queryByText(/more$/)).toBeNull();
+  });
+
+  it("counts the single file over the cap as one", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 6 new engrams from eng",
+        changes: changesOf("added", 6, "new"),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // One over the cap is the first press worth offering, and it says one
+    // rather than rounding up into a plural.
+    const more = await within(dialog).findByRole("button", {
+      name: "Show 1 more added",
+    });
+    expect(more).toHaveTextContent("and 1 more");
+    expect(within(dialog).queryByText("notes/new-5.md")).toBeNull();
+    await userEvent.click(more);
+    expect(within(dialog).getByText("notes/new-5.md")).toBeVisible();
   });
 
   it("badges each change with its kind letter and the word behind it", async () => {

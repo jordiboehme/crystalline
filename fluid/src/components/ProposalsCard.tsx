@@ -164,7 +164,7 @@ export function ProposalsCard({
               merging the top of the chain lands, and a report that did not
               name one still has an origin the work goes to. */}
           <li className="flex items-center gap-3 py-1 text-sm">
-            <Rail last />
+            <Rail last node="trunk" />
             <Chip mono>
               <span className="sr-only">{"Trunk branch "}</span>
               {answered.branch ?? "origin"}
