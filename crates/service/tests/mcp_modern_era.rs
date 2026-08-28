@@ -2591,6 +2591,77 @@ async fn an_eliciting_share_on_a_stacking_forge_is_asked_before_the_layer_is_ope
     );
 }
 
+/// And the yes that follows: round two on a stacking forge publishes the
+/// layer, opened against the branch below it and grouped into a stack.
+///
+/// The round-one test above proves the question is asked; this proves what
+/// the answer buys, over the wire rather than in the remote crate's own
+/// harness - a second pull request, based on the layer below it rather than
+/// on the trunk, and a `create_stack` linking the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_stacked_share_opens_the_layer_on_the_one_below_it() {
+    let (h, mock) = Harness::team().await;
+    mock.enable_stacks();
+    let (mut wire, first, first_branch) = first_shared_proposal(&h).await;
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let done = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            share_kb(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body["outcome"], "proposed",
+        "a second proposal, not an update: {body}"
+    );
+    let second = body["number"].as_u64().unwrap();
+    assert_ne!(second, first, "the layer below is left alone");
+    assert_eq!(
+        body["stack_position"],
+        json!([2, 2]),
+        "layer 2 of 2: {body}"
+    );
+
+    // The layer targets the branch below it, not the trunk, and the two were
+    // grouped on the forge.
+    assert_eq!(
+        mock.proposal_base(second).as_deref(),
+        Some(first_branch.as_str()),
+        "the new layer is based on the one below it"
+    );
+    assert!(
+        mock.calls()
+            .contains(&format!("create_stack:[{first},{second}]")),
+        "the chain is linked bottom first: {:?}",
+        mock.calls()
+    );
+    let stack = body["stack_number"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the chain is linked: {body}"));
+    let members: Vec<u64> = mock
+        .stack(stack)
+        .expect("the stack is in the registry")
+        .members
+        .iter()
+        .map(|member| member.number)
+        .collect();
+    assert_eq!(members, vec![first, second]);
+}
+
 /// Round two with a yes on an *update* lands on the open proposal rather than
 /// opening a second one.
 ///

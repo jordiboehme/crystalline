@@ -29,7 +29,7 @@ A proposal the team no longer wants - declined, stalled or superseded by better 
 
 ## Forges that do not stack
 
-Stacking needs a forge that serves stacked pull requests - github.com does, GitHub Enterprise Server does not - and Crystalline works out which one it is talking to on its own. Where stacks are not served, and wherever someone turned the `github.stacks` setting off deliberately (`configure` with `set: { "github.stacks": "false" }`, or `crystalline config set github.stacks false`), a domain keeps one living proposal instead: sharing again updates that proposal in place, same number and same review URL, and `origin_status` shows no layer positions. Nothing else about the loop changes - share, read the feedback, refine, share again - so teach the person the proposal number they are looking at rather than assuming which model is in play.
+Stacking needs a forge that serves stacked pull requests - github.com does, and GitHub Enterprise Server generally does not yet - and Crystalline works out which one it is talking to on its own, so never predict the answer for a given host. Where stacks are not served, and wherever someone turned the `github.stacks` setting off deliberately (`configure` with `set: { "github.stacks": "false" }`, or `crystalline config set github.stacks false`), a domain keeps one living proposal instead: sharing again updates that proposal in place, same number and same review URL, and `origin_status` shows no layer positions. Nothing else about the loop changes - share, read the feedback, refine, share again - so teach the person the proposal number they are looking at rather than assuming which model is in play.
 
 ## Conflict etiquette
 

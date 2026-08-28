@@ -300,7 +300,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // optionally restore the shared files, record it withdrawn.
         "origin_withdraw" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
-            let proposal = req.get("proposal").and_then(Value::as_u64);
+            let proposal = match optional_number(req, "proposal") {
+                Ok(proposal) => proposal,
+                Err(message) => return (envelope_err(message), false),
+            };
             let revert = req.get("revert").and_then(Value::as_bool).unwrap_or(false);
             match shared
                 .engine
@@ -416,8 +419,10 @@ async fn maybe_embed(shared: &Arc<Shared>, embed: bool, data: &mut Value) {
 /// Deliberately not `and_then(Value::as_u64)`, which reads a negative, a
 /// fraction or a string as absence. For `origin_share` that silent downgrade
 /// would turn "amend layer #6" into "stack a new layer", which opens a
-/// proposal the caller never asked for; a refusal the caller can read is the
-/// only safe answer to a value we cannot interpret.
+/// proposal the caller never asked for; for `origin_withdraw` it turns
+/// "withdraw layer #6" into "withdraw the top layer", which closes a proposal
+/// the caller never named. A refusal the caller can read is the only safe
+/// answer to a value we cannot interpret.
 fn optional_number(req: &Value, key: &str) -> Result<Option<u64>, String> {
     match req.get(key) {
         None | Some(Value::Null) => Ok(None),
@@ -443,7 +448,9 @@ mod tests {
     /// `origin_share`'s amend target is the parameter this guards: absent
     /// means "stack a new layer", a number means "amend that layer", and a
     /// value that is neither must refuse rather than quietly become the
-    /// first of those and open a proposal nobody asked for.
+    /// first of those and open a proposal nobody asked for. `origin_withdraw`
+    /// reads the same key with the same stakes: absent means "the top layer",
+    /// so an unreadable value there would close a layer nobody named.
     #[test]
     fn an_optional_number_refuses_a_present_but_unreadable_value() {
         assert_eq!(optional_number(&json!({}), "proposal"), Ok(None));
@@ -468,6 +475,29 @@ mod tests {
                     .unwrap()
                     .contains("expected a proposal number"),
                 "{envelope}"
+            );
+        }
+    }
+
+    /// Both origin arms that carry an amend or withdraw target read it
+    /// through the guard rather than through `as_u64`, so neither can
+    /// silently downgrade an unreadable value to "no target given".
+    #[test]
+    fn both_origin_arms_read_their_proposal_through_the_guard() {
+        let source = include_str!("control.rs");
+        for arm in ["\"origin_share\" =>", "\"origin_withdraw\" =>"] {
+            let start = source.find(arm).unwrap_or_else(|| panic!("no {arm} arm"));
+            let rest = &source[start + arm.len()..];
+            // Up to the next arm at the same indentation, which is where this
+            // one's body ends.
+            let body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
+            assert!(
+                body.contains("optional_number(req, \"proposal\")"),
+                "{arm} must read its proposal through optional_number"
+            );
+            assert!(
+                !body.contains("get(\"proposal\").and_then(Value::as_u64)"),
+                "{arm} must not read its proposal as a bare as_u64"
             );
         }
     }

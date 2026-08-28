@@ -723,6 +723,91 @@ async fn the_share_routes_walk_the_loop() {
     assert_eq!(withdrawn["closed"], true);
 }
 
+/// One engram into the registered domain's working tree, so there is
+/// something for the next share to carry.
+fn write_kb_engram(kb_root: &std::path::Path, file: &str, title: &str, permalink: &str) {
+    std::fs::write(
+        kb_root.join(file),
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# {title}\n\nSomething to share.\n"
+        ),
+    )
+    .unwrap();
+}
+
+/// Shares whatever is unshared in `kb` and returns the answer as JSON.
+async fn share_kb(fx: &Fixture, admin: &(String, String)) -> serde_json::Value {
+    let shared = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        admin,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(shared.status(), 200, "{}", shared.text().await.unwrap());
+    shared.json().await.unwrap()
+}
+
+/// The stacked half of the share route. `the_share_routes_walk_the_loop`
+/// pins the quiet chain values an unstacked forge produces; this pins the
+/// populated ones, which is the half a client actually renders a layer from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stacked_share_answers_with_the_layer_it_opened() {
+    let (fx, mock) = serve_team_with_mock().await;
+    // On before the first share, so the capability answer this domain caches
+    // is the stacked one from the start.
+    mock.enable_stacks();
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    write_kb_engram(&kb_root, "first.md", "First", "first");
+    let first = share_kb(&fx, &admin).await;
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    assert!(
+        first["stack_position"].is_null(),
+        "one proposal is not a chain yet: {first}"
+    );
+    let first_number = first["number"].as_u64().unwrap();
+
+    // A second share stacks rather than updating, and says where the layer
+    // sits without a second call.
+    write_kb_engram(&kb_root, "second.md", "Second", "second");
+    let second = share_kb(&fx, &admin).await;
+    assert_eq!(second["outcome"], "proposed", "a layer, not an update");
+    assert_ne!(second["number"], first["number"], "{second}");
+    assert_eq!(
+        second["stack_position"],
+        serde_json::json!([2, 2]),
+        "layer 2 of 2: {second}"
+    );
+    let stack = second["stack_number"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the chain is linked on the forge: {second}"));
+
+    // And the per-domain status names the same chain.
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let status: serde_json::Value = status.json().await.unwrap();
+    assert_eq!(status["stack_number"], serde_json::json!(stack), "{status}");
+    assert_eq!(status["stack_wedged"], serde_json::json!([]), "{status}");
+    assert_eq!(
+        status["open_proposals"][0]["number"],
+        serde_json::json!(first_number),
+        "the chain reads bottom up: {status}"
+    );
+}
+
 /// The conflict half: a pull that collides records a conflict the status
 /// lists by id, the detail route serves both sides, and the resolve route
 /// addresses it by that same id rather than by path.
@@ -1031,6 +1116,66 @@ async fn the_sync_summary_counts_what_every_team_domain_has_to_share() {
             .unwrap();
         assert_eq!(resp.status(), 403, "{name} must not read the sync summary");
     }
+}
+
+/// The summary row's chain health, against a chain that really is wedged.
+///
+/// The test above pins the quiet values a sound chain produces, which cannot
+/// tell a working detector from one that always answers "empty". Here a
+/// reviewer closes the bottom layer while work is still stacked on it - the
+/// one stack fact a picker must not hide - and the row has to name it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_summary_names_a_wedged_chain() {
+    let (fx, mock) = serve_team_with_mock().await;
+    mock.enable_stacks();
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    write_kb_engram(&kb_root, "first.md", "First", "first");
+    let first = share_kb(&fx, &admin).await;
+    let first_number = first["number"].as_u64().unwrap();
+    write_kb_engram(&kb_root, "second.md", "Second", "second");
+    let second = share_kb(&fx, &admin).await;
+    assert_eq!(
+        second["stack_position"],
+        serde_json::json!([2, 2]),
+        "two layers to wedge: {second}"
+    );
+
+    // A reviewer closes the bottom layer. The layer above it is now stacked
+    // on a branch that is going nowhere, and the pull records the decline.
+    mock.set_proposal_state(
+        first_number,
+        crystalline_remote::provider::ProposalState::Declined,
+    );
+    let pulled = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(pulled.status(), 200, "{}", pulled.text().await.unwrap());
+
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &admin)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+    let summary: serde_json::Value = resp.json().await.unwrap();
+    let kb = &summary["domains"][0];
+    assert_eq!(
+        kb["stack_wedged"],
+        serde_json::json!([first_number]),
+        "the closed layer under open work is named: {kb}"
+    );
+    assert_eq!(
+        kb["declined_proposals"], 1,
+        "and it is counted as declined: {kb}"
+    );
 }
 
 /// GitHub switched off: the summary answers the same 409 naming the settings

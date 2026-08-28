@@ -3194,17 +3194,37 @@
                 "schema": {
                   "type": "object"
                 },
-                "example": {
-                  "action": "update",
-                  "changes": [
-                    {
-                      "kind": "modified",
-                      "path": "notes/a.md"
+                "examples": {
+                  "stack": {
+                    "summary": "A new layer would be stacked on the open one.",
+                    "value": {
+                      "action": "stack",
+                      "changes": [
+                        {
+                          "kind": "added",
+                          "path": "notes/b.md"
+                        }
+                      ],
+                      "effective_title": "Share 1 new engram in kb",
+                      "top_number": 4,
+                      "top_title": "Refine 2 engrams in kb"
                     }
-                  ],
-                  "effective_title": "Refine 2 engrams in kb",
-                  "number": 4,
-                  "url": "https://github.com/acme/knowledge/pull/4"
+                  },
+                  "update": {
+                    "summary": "The one open proposal would be updated in place.",
+                    "value": {
+                      "action": "update",
+                      "changes": [
+                        {
+                          "kind": "modified",
+                          "path": "notes/a.md"
+                        }
+                      ],
+                      "effective_title": "Refine 2 engrams in kb",
+                      "number": 4,
+                      "url": "https://github.com/acme/knowledge/pull/4"
+                    }
+                  }
                 }
               }
             }

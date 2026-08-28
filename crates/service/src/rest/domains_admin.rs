@@ -942,13 +942,28 @@ pub async fn sync_now(
                            `conflicts_pending`, and nothing extra for a \
                            `create` or a `nothing_to_share`.",
             body = Object,
-            example = json!({
-                "action": "update",
-                "number": 4,
-                "url": "https://github.com/acme/knowledge/pull/4",
-                "effective_title": "Refine 2 engrams in kb",
-                "changes": [{ "path": "notes/a.md", "kind": "modified" }]
-            }),
+            examples(
+                ("update" = (
+                    summary = "The one open proposal would be updated in place.",
+                    value = json!({
+                        "action": "update",
+                        "number": 4,
+                        "url": "https://github.com/acme/knowledge/pull/4",
+                        "effective_title": "Refine 2 engrams in kb",
+                        "changes": [{ "path": "notes/a.md", "kind": "modified" }]
+                    })
+                )),
+                ("stack" = (
+                    summary = "A new layer would be stacked on the open one.",
+                    value = json!({
+                        "action": "stack",
+                        "top_number": 4,
+                        "top_title": "Refine 2 engrams in kb",
+                        "effective_title": "Share 1 new engram in kb",
+                        "changes": [{ "path": "notes/b.md", "kind": "added" }]
+                    })
+                )),
+            ),
         ),
         (
             status = 401,

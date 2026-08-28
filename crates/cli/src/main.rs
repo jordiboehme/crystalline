@@ -1869,6 +1869,12 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         }
         let open = d["open_proposals"].as_array().unwrap_or(&empty);
         let stacked = open.len() > 1;
+        // The chain is named once, above the layers it groups. A chain the
+        // forge holds no stack for says nothing here; so does a lone proposal,
+        // which is not a chain to begin with.
+        if stacked && let Some(stack) = d["stack_number"].as_u64() {
+            println!("  stack #{stack}: {} layers", open.len());
+        }
         for (index, p) in open.iter().enumerate() {
             let layer = if stacked {
                 format!("layer {}: ", index + 1)
@@ -1921,7 +1927,7 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
             );
         }
         if d["stack_link_pending"].as_bool().unwrap_or(false) {
-            println!("  share link pending - a share or status with connection retries it");
+            println!("  stack link pending - a share or status with connection retries it");
         }
         if d["repair_pending"].as_bool().unwrap_or(false) {
             println!("  repair pending - the next share or withdraw finishes it");

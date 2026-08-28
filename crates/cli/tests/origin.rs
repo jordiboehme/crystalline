@@ -613,6 +613,7 @@ mod chain {
             ),
         );
         let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("stack #42: 3 layers"), "{out}");
         assert!(out.contains("layer 1: open proposal #3"), "{out}");
         assert!(out.contains("layer 3: open proposal #9"), "{out}");
         assert!(
@@ -624,9 +625,27 @@ mod chain {
             "{out}"
         );
         assert!(
-            out.contains("share link pending - a share or status with connection retries it"),
+            out.contains("stack link pending - a share or status with connection retries it"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn status_names_no_stack_for_a_chain_the_forge_holds_none_of() {
+        let mut payload = status_payload(
+            vec![
+                open_proposal(3, "Bottom layer"),
+                open_proposal(8, "Top layer"),
+            ],
+            vec![],
+            false,
+            true,
+        );
+        payload["domains"][0]["stack_number"] = Value::Null;
+        let daemon = Daemon::answering("status-unlinked", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("layer 2: open proposal #8"), "{out}");
+        assert!(!out.contains("stack #"), "{out}");
     }
 
     #[test]
