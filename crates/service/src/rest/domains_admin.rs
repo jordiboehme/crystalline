@@ -511,7 +511,11 @@ fn single_domain(
                            local state alone; `connection.connected` is false \
                            when no credential is on file, which is why a \
                            disconnected instance still answers here instead \
-                           of refusing.\n\nFour keys say where the domain's \
+                           of refusing. `merged_unconsumed` names, by number, \
+                           the proposals a live check found merged upstream \
+                           that this domain has not pulled in yet: they stand \
+                           in neither proposal list, and the next sync \
+                           consumes them.\n\nFour keys say where the domain's \
                            chain of stacked proposals stands. `stack_number` \
                            is the chain's number on the forge, null when \
                            nothing is stacked. `stack_wedged` lists the \
@@ -538,6 +542,7 @@ fn single_domain(
                 "local_changes": 2,
                 "open_proposals": [],
                 "declined_proposals": [],
+                "merged_unconsumed": [],
                 "conflicts": [],
                 "last_checked": "2026-08-10T08:00:00Z",
                 "probe_error": null,

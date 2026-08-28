@@ -150,8 +150,8 @@ pub(crate) fn proposal_transitions_json(
 /// Shapes one domain's [`OriginStatusReport`] into `origin_status`'s
 /// per-domain entry: `{ domain, repo, branch, base_commit, behind,
 /// local_changes, skipped_large, open_proposals, declined_proposals,
-/// conflicts, last_checked, probe_error, stack_number, stack_wedged,
-/// repair_pending, stack_link_pending }`. `probe_error` carries the live
+/// merged_unconsumed, conflicts, last_checked, probe_error, stack_number,
+/// stack_wedged, repair_pending, stack_link_pending }`. `probe_error` carries the live
 /// probe's own error message, verbatim, when the probe failed for a
 /// transport reason (offline, rate limited, an expired connection) and the
 /// report was produced by retrying with no probe at all; `null` when the
@@ -162,6 +162,12 @@ pub(crate) fn proposal_transitions_json(
 /// longer matches the recorded one, so the caller can say a reviewer moved
 /// the branch without a second round trip. It is false for every proposal
 /// when the live list was not consulted at all (offline, or a failed list).
+///
+/// `merged_unconsumed` names, by number, the proposals a probe found merged
+/// upstream that this domain has not pulled in yet. They stand in neither
+/// list - a merged record is no longer open and was never declined - and the
+/// key is emitted always, an empty list rather than an absent one, so a reader
+/// never has to tell "nothing merged" from "this build does not report it".
 ///
 /// The four stack keys name where the domain's chain stands: `stack_number`
 /// (the chain's number on the forge, `null` when nothing is stacked),
@@ -194,6 +200,7 @@ pub(crate) fn status_report_json(
         "skipped_large": report.skipped_large,
         "open_proposals": open,
         "declined_proposals": report.declined_proposals,
+        "merged_unconsumed": report.merged_unconsumed,
         "conflicts": report.conflicts,
         "last_checked": report.last_checked,
         "probe_error": probe_error,
@@ -222,12 +229,15 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
 /// Shapes one domain's offline [`OriginStatusReport`] together with the
 /// poller's own schedule and last result into `status_report`'s `origins`
 /// block entry: `{ domain, repo, branch, last_checked, last_result,
-/// next_due, open_proposals, declined_proposals, conflicts, local_changes,
-/// stack_number, stack_wedged, repair_pending, stack_link_pending }`. The
+/// next_due, open_proposals, declined_proposals, merged_unconsumed, conflicts,
+/// local_changes, stack_number, stack_wedged, repair_pending,
+/// stack_link_pending }`. The
 /// four stack keys carry the same meaning they do in [`status_report_json`],
-/// and are the one place the glance keeps whole lists rather than counts:
-/// a wedged layer is named by number because that number is what a caller
-/// withdraws or shares against. `next_due` and `last_result` are `null` for
+/// and are one of the two places the glance keeps whole lists rather than
+/// counts: a wedged layer is named by number because that number is what a
+/// caller withdraws or shares against. `merged_unconsumed` is the other, for
+/// the same reason - the number is what explains a refused withdrawal and what
+/// the next pull consumes. `next_due` and `last_result` are `null` for
 /// a domain the poller has not scheduled or completed a tick for yet: a
 /// freshly enabled or freshly added domain, or any domain when no daemon runs
 /// the poller at all.
@@ -250,6 +260,7 @@ pub(crate) fn origin_poll_status_json(
         "next_due": next_due,
         "open_proposals": report.open_proposals.len(),
         "declined_proposals": report.declined_proposals.len(),
+        "merged_unconsumed": report.merged_unconsumed,
         "conflicts": report.conflicts.len(),
         "local_changes": report.local_changes,
         "stack_number": report.stack_number,
@@ -421,36 +432,51 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
 }
 
 /// Resolves the layer a withdrawal would take out and shapes it for
-/// `origin_withdraw_preview`: `{ number, title, url, layers_above,
+/// `origin_withdraw_preview`: `{ number, title, url, declined, layers_above,
 /// only_layer, reverting }`.
 ///
 /// **Target resolution mirrors [`ops::withdraw`]'s, read off one offline
 /// [`OriginStatusReport`] instead of origin state.** A named number is looked
 /// for among the open layers and then the declined records - a declined
-/// proposal can be withdrawn too, which tidies its record away - and a number
-/// that is neither is [`RemoteError::ProposalNotFound`]. With no number the
-/// target is the single open proposal, or, on a chain this machine knows as a
-/// stack, the TOP open layer: the one nothing is built on. Anything else - no
-/// open proposal, or the legacy multi-open shape from before stacking - is
-/// [`RemoteError::NoWithdrawTarget`] carrying both candidate lists, exactly
-/// the teaching error the withdrawal itself would raise a moment later.
+/// proposal can be withdrawn too, which tidies its record away - then among
+/// the merged-but-unconsumed numbers, which answer the withdrawal's own
+/// refusal ("already merged") rather than pretending the number is unknown. A
+/// number that is none of the three is [`RemoteError::ProposalNotFound`]. With
+/// no number the target is the single open proposal, or, on a chain this
+/// machine knows as a stack, the TOP open layer: the one nothing is built on.
+/// Anything else - no open proposal, or the legacy multi-open shape from
+/// before stacking - is [`RemoteError::NoWithdrawTarget`] carrying both
+/// candidate lists, exactly the teaching error the withdrawal itself would
+/// raise a moment later.
 ///
-/// The one deliberate difference is the stacks question. `ops::withdraw` asks
-/// the forge (through the cached `stacks_available` verdict) whether this
-/// origin serves stacks at all; a preview may not touch the forge, so it takes
-/// `stacks_allowed` (the `github.stacks` setting) together with the two chain
-/// facts the report already carries. Those can only disagree for a chain that
-/// records a stack number no forge ever served, and the cost of the
-/// disagreement is a question naming the top layer in front of a withdrawal
-/// that then refuses - never a withdrawal of some layer the user was not
-/// shown.
+/// **Two things the forge knows and this report does not, and what each
+/// costs.** `ops::withdraw` asks the forge (through the cached
+/// `stacks_available` verdict) whether this origin serves stacks at all; a
+/// preview may not touch the forge, so it takes `stacks_allowed` (the
+/// `github.stacks` setting) together with the two chain facts the report
+/// carries. Those can only disagree for a chain that records a stack number no
+/// forge ever served, and the disagreement costs a question naming the top
+/// layer in front of a withdrawal that then refuses.
 ///
-/// `layers_above` counts the OPEN layers standing above the target in chain
-/// order (zero for the top one, and for a declined record, which stands in no
-/// chain), because those are the layers a withdrawal re-bases. `only_layer`
-/// says the target is the domain's one open proposal. `reverting` carries the
-/// call's own `revert` flag through, so the question can name the working-tree
-/// half of what it is about to do.
+/// The second is `repair_pending`, and it is the one that could otherwise
+/// name the wrong layer. `ops::withdraw` finishes a half-done repair BEFORE it
+/// resolves its target, and that repair can settle layers out of the chain, so
+/// a preview reading the pre-repair state can name the top layer as it stands
+/// now while the withdrawal - resolving after the repair - takes out the one
+/// below it. So an implicit target is refused outright while the chain is
+/// mid-repair, in words that say how to get past it: name the number, or run a
+/// share or a status first and let the repair finish. A named number needs no
+/// such guard, since it resolves to the same record either side of a repair.
+///
+/// `declined` says the target is a closed record rather than a live proposal,
+/// so a question can say what a withdrawal of it actually does (nothing is
+/// closed on the forge; the record is cleared). `layers_above` counts the OPEN
+/// layers standing above the target in chain order (zero for the top one, and
+/// for a declined record, which stands in no chain), because those are the
+/// layers a withdrawal re-bases. `only_layer` says the target is the domain's
+/// one open proposal. `reverting` carries the call's own `revert` flag
+/// through, so the question can name the working-tree half of what it is about
+/// to do.
 pub(crate) fn withdraw_plan_json(
     report: &OriginStatusReport,
     proposal: Option<u64>,
@@ -463,8 +489,17 @@ pub(crate) fn withdraw_plan_json(
             .iter()
             .chain(report.declined_proposals.iter())
             .find(|p| p.number == number)
-            .ok_or(RemoteError::ProposalNotFound { number })?,
+            .ok_or_else(|| {
+                if report.merged_unconsumed.contains(&number) {
+                    merged_cannot_be_withdrawn(number)
+                } else {
+                    RemoteError::ProposalNotFound { number }
+                }
+            })?,
         None => {
+            if report.repair_pending {
+                return Err(RemoteError::Refused(MID_REPAIR_NEEDS_A_NUMBER.to_string()));
+            }
             // `ops::chain_is_stacked`'s test, over the same three facts: a
             // chain of one is trivially stackable, and beyond that this
             // machine must know the chain as a stack (a recorded number, or a
@@ -491,11 +526,26 @@ pub(crate) fn withdraw_plan_json(
         "number": target.number,
         "title": target.title,
         "url": target.url,
+        "declined": target.status == ProposalStatus::Declined,
         "layers_above": layers_above,
         "only_layer": open.len() == 1 && open[0].number == target.number,
         "reverting": revert,
     }))
 }
+
+/// The withdrawal's own refusal for a proposal that has already merged, worded
+/// exactly as [`ops::withdraw`] words it so the preview and the act it
+/// previews teach the same sentence.
+fn merged_cannot_be_withdrawn(number: u64) -> RemoteError {
+    RemoteError::Refused(format!(
+        "proposal #{number} has already merged and cannot be withdrawn"
+    ))
+}
+
+/// What a withdrawal with no proposal number is told while the chain is
+/// mid-repair: the two ways forward, since the repair itself is what decides
+/// which layer is the top one.
+const MID_REPAIR_NEEDS_A_NUMBER: &str = "this domain's chain is mid-repair, so which layer stands on top is not settled yet; withdraw with an explicit proposal number, or share or check origin status first to finish the repair.";
 
 /// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
 /// proposal number, whether a live pull request was closed on the forge, the
@@ -768,6 +818,7 @@ mod tests {
             skipped_large: vec![],
             open_proposals: vec![],
             declined_proposals: vec![],
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
@@ -782,6 +833,26 @@ mod tests {
         assert_eq!(v["behind"], true);
         assert_eq!(v["local_changes"], 2);
         assert!(v["probe_error"].is_null());
+        // Emitted always, empty rather than absent, so a reader never has to
+        // tell "nothing merged" from "this build does not report it".
+        assert_eq!(v["merged_unconsumed"], json!([]));
+    }
+
+    /// The merged-but-unpulled numbers ride both status shapes, because both
+    /// are read by a caller deciding what to do next: one explains a refused
+    /// withdrawal, the other says a pull is owed.
+    #[test]
+    fn both_status_shapers_name_the_merged_proposals_no_pull_has_consumed() {
+        let mut report = poll_status_fixture();
+        report.merged_unconsumed = vec![4, 9];
+        assert_eq!(
+            status_report_json("eng", &report, None)["merged_unconsumed"],
+            json!([4, 9])
+        );
+        assert_eq!(
+            origin_poll_status_json("eng", &report, None, None)["merged_unconsumed"],
+            json!([4, 9])
+        );
     }
 
     #[test]
@@ -795,6 +866,7 @@ mod tests {
             skipped_large: vec![],
             open_proposals: vec![],
             declined_proposals: vec![],
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
@@ -821,6 +893,7 @@ mod tests {
             skipped_large: vec![],
             open_proposals: vec![],
             declined_proposals: vec![],
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
@@ -847,6 +920,7 @@ mod tests {
             skipped_large: vec![],
             open_proposals: vec![],
             declined_proposals: vec![],
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
@@ -874,6 +948,7 @@ mod tests {
                 "Share glossary edits",
             )],
             declined_proposals: vec![],
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
@@ -1206,6 +1281,7 @@ mod tests {
             skipped_large: vec![],
             open_proposals: proposals(open, ProposalStatus::Open),
             declined_proposals: proposals(declined, ProposalStatus::Declined),
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![],
@@ -1275,15 +1351,63 @@ mod tests {
     }
 
     /// A declined proposal can be withdrawn - it tidies the record away - so
-    /// naming its number previews rather than refusing. Nothing stands above a
-    /// record that stands in no chain, so the cascade count is zero.
+    /// naming its number previews rather than refusing, and says which kind of
+    /// record it found. Nothing stands above a record that stands in no chain,
+    /// so the cascade count is zero.
     #[test]
     fn withdraw_plan_json_previews_a_declined_proposal_named_by_number() {
         let report = chain_fixture(&[5], &[3], false);
         let v = withdraw_plan_json(&report, Some(3), false, false).unwrap();
         assert_eq!(v["number"], 3);
+        assert_eq!(v["declined"], true);
         assert_eq!(v["layers_above"], 0);
         assert_eq!(v["only_layer"], false);
+
+        // An open target is not declined, and says so rather than leaving the
+        // key out: one reader, either shape.
+        let open = withdraw_plan_json(&report, Some(5), false, false).unwrap();
+        assert_eq!(open["declined"], false);
+    }
+
+    /// A number that merged upstream and has not been pulled in yet gets the
+    /// withdrawal's own refusal, not a not-found: the record exists, it simply
+    /// cannot be withdrawn, and only one of those two sentences tells the
+    /// caller what to do next.
+    #[test]
+    fn withdraw_plan_json_answers_the_merged_refusal_for_an_unconsumed_merge() {
+        let mut report = chain_fixture(&[5], &[], false);
+        report.merged_unconsumed = vec![4];
+        let err = withdraw_plan_json(&report, Some(4), false, false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "proposal #4 has already merged and cannot be withdrawn"
+        );
+        // And a number that is nowhere at all still says exactly that.
+        let err = withdraw_plan_json(&report, Some(99), false, false).unwrap_err();
+        assert!(matches!(err, RemoteError::ProposalNotFound { number: 99 }));
+    }
+
+    /// Mid-repair, an implicit target is refused rather than guessed.
+    ///
+    /// `ops::withdraw` finishes the repair before it resolves, and the repair
+    /// can settle a layer out of the chain, so the top layer this report names
+    /// is not necessarily the top layer the withdrawal would find. A named
+    /// number resolves to the same record either side of the repair, so it is
+    /// previewed as usual.
+    #[test]
+    fn withdraw_plan_json_refuses_an_implicit_target_while_the_chain_is_mid_repair() {
+        let mut report = chain_fixture(&[5, 6], &[], true);
+        report.repair_pending = true;
+        let err = withdraw_plan_json(&report, None, false, true).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("mid-repair"), "{message}");
+        assert!(
+            message.contains("explicit proposal number"),
+            "the refusal names the way out: {message}"
+        );
+
+        let v = withdraw_plan_json(&report, Some(5), false, true).unwrap();
+        assert_eq!(v["number"], 5);
     }
 
     #[test]
@@ -1345,6 +1469,7 @@ mod tests {
                 proposal_fixture(2, "https://github.test/pull/2", "Two"),
             ],
             declined_proposals: vec![],
+            merged_unconsumed: vec![],
             conflicts: vec![],
             last_checked: None,
             amended_upstream: vec![2],

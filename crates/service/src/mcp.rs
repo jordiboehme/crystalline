@@ -2989,12 +2989,18 @@ const WITHDRAW_REFUSAL: &str = "The withdrawal was not confirmed, so the proposa
 /// that is not the top one re-bases every open layer above it, so saying yes
 /// moves work the user already put in front of reviewers, not only the
 /// proposal they named.
+///
+/// A declined target gets its own first sentence, because the ordinary one
+/// would be false: the forge closed that pull request already, and what the
+/// withdrawal does is clear the record this domain still keeps of it.
 fn withdraw_question(preview: &Value) -> String {
-    let mut question = format!(
-        "Withdraws proposal #{} ({}) and closes its pull request on GitHub.",
-        preview["number"].as_u64().unwrap_or_default(),
-        preview["title"].as_str().unwrap_or_default()
-    );
+    let number = preview["number"].as_u64().unwrap_or_default();
+    let title = preview["title"].as_str().unwrap_or_default();
+    let mut question = if preview["declined"] == json!(true) {
+        format!("Withdraws proposal #{number} ({title}) and clears its declined record.")
+    } else {
+        format!("Withdraws proposal #{number} ({title}) and closes its pull request on GitHub.")
+    };
     let layers_above = preview["layers_above"].as_u64().unwrap_or_default();
     if layers_above > 0 {
         question.push_str(&format!(
@@ -3833,6 +3839,37 @@ mod tests {
         assert!(
             !reverting.contains("layer(s) above"),
             "nothing stands above it: {reverting}"
+        );
+    }
+
+    /// A declined target is asked about in its own words: nothing is closed on
+    /// the forge, because the forge closed it already - what goes away is the
+    /// record this domain still keeps.
+    #[test]
+    fn the_withdraw_question_says_what_a_declined_record_actually_costs() {
+        let declined = withdraw_question(&json!({
+            "number": 3, "title": "Share the glossary",
+            "url": "https://github.test/pulls/3",
+            "declined": true,
+            "layers_above": 0, "only_layer": false, "reverting": false,
+        }));
+        assert_eq!(
+            declined,
+            "Withdraws proposal #3 (Share the glossary) and clears its declined record."
+        );
+        assert!(
+            !declined.contains("closes its pull request"),
+            "the forge closed it already: {declined}"
+        );
+
+        // A revert still restores files, whichever kind of record it is.
+        let reverting = withdraw_question(&json!({
+            "number": 3, "title": "Share the glossary", "declined": true,
+            "layers_above": 0, "only_layer": false, "reverting": true,
+        }));
+        assert!(
+            reverting.contains("The shared files are restored locally where a copy is reachable."),
+            "{reverting}"
         );
     }
 

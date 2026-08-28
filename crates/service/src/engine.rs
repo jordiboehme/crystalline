@@ -8594,10 +8594,14 @@ impl Engine {
     /// and no provider call is made, which is what lets an eliciting client
     /// ask its user before a pull request is closed.
     ///
-    /// It still carries the withdrawal's own gates - collaboration off,
-    /// read-only, an unregistered domain - rather than only the read's, so a
-    /// user is never asked to confirm a withdrawal this instance would refuse
-    /// to perform.
+    /// It still carries the withdrawal's own gates, all of them and in the
+    /// same order - collaboration off, read-only, an unregistered domain, and
+    /// a provider this instance cannot build - rather than only the read's, so
+    /// a user is never asked to confirm a withdrawal this instance would
+    /// refuse to perform. The provider is resolved and dropped: an instance
+    /// with no credential on file has to fail in round one, where the failure
+    /// is still the answer to the call, rather than after the user has said
+    /// yes to a question.
     pub async fn origin_withdraw_preview(
         &self,
         domain: &str,
@@ -8617,6 +8621,7 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let _provider = self.resolve_origin_provider()?;
         let report = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await?;
         Ok(origin::withdraw_plan_json(
             &report,

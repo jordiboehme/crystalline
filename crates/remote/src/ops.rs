@@ -129,6 +129,17 @@ pub struct OriginStatusReport {
     pub open_proposals: Vec<Proposal>,
     /// Share proposals closed without merging.
     pub declined_proposals: Vec<Proposal>,
+    /// Numbers of proposals this domain knows have merged but has not pulled
+    /// in yet.
+    ///
+    /// A [`status`] with a probe flips a record to [`ProposalStatus::Merged`]
+    /// without consuming it - consumption stays [`pull`]'s job - so the record
+    /// sits in state, in neither list above, until the next pull moves it to
+    /// history. Reported by number rather than as records because the one
+    /// thing a caller does with it is recognize a number: a merged proposal
+    /// cannot be withdrawn, and [`withdraw`] says so in those words rather
+    /// than claiming the number does not exist.
+    pub merged_unconsumed: Vec<u64>,
     /// Conflicts still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
     /// When the branch was last checked for new upstream commits.
@@ -904,6 +915,14 @@ pub async fn status(
         .filter(|p| p.status == ProposalStatus::Declined)
         .cloned()
         .collect();
+    // Every Merged record still standing in `state.proposals` is one this
+    // domain has not pulled in: a consumed one has already moved to history.
+    let merged_unconsumed = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Merged)
+        .map(|p| p.number)
+        .collect();
 
     Ok(OriginStatusReport {
         repo: state.repo.clone(),
@@ -914,6 +933,7 @@ pub async fn status(
         skipped_large: local.skipped_large,
         open_proposals,
         declined_proposals,
+        merged_unconsumed,
         conflicts: state.conflicts.clone(),
         last_checked: state.last_checked,
         amended_upstream,
