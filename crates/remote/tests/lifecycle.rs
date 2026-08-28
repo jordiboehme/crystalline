@@ -5983,3 +5983,234 @@ async fn an_up_to_date_pull_still_consumes_a_merged_layer() {
         vec![layers[0].number, layers[1].number]
     );
 }
+
+// The fallback pin: stacking is an optional capability, so the two ways of
+// not having it - a forge that answers the probe with a 404, and an install
+// with `github.stacks` off - must land on the 0.16.0 living-proposal
+// lifecycle exactly as it was: one proposal updated in place, the merge-commit
+// rule intact, `withdraw` with no target resolving the single open one. The
+// only cost stacking is allowed to add on those paths is the one probe the
+// capability question itself costs, and on the config-off path not even that.
+
+/// Shares with `github.stacks` set to `allowed` and no title overrides, the
+/// call both fallback scenarios make.
+async fn share_with_stacks(mock: &MockProvider, sub: &Subscribed, allowed: bool) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: allowed,
+        },
+    )
+    .await
+    .expect("a share should succeed whether or not the forge serves stacks")
+}
+
+/// Every stack verb the mock recorded: the probe and the three linking calls.
+fn stack_calls(mock: &MockProvider) -> Vec<String> {
+    mock.calls()
+        .into_iter()
+        .filter(|c| {
+            c.starts_with("list_stacks")
+                || c.starts_with("create_stack")
+                || c.starts_with("extend_stack")
+                || c.starts_with("dissolve_stack")
+        })
+        .collect()
+}
+
+/// How many capability probes left the machine: `list_stacks` with no
+/// argument, the bare listing `stacks_available` asks for.
+fn probe_count(mock: &MockProvider) -> usize {
+    mock.calls().iter().filter(|c| *c == "list_stacks").count()
+}
+
+/// The whole 0.16.0 share lifecycle over one domain: a first share opens a
+/// proposal, upstream advances, a second share updates that same proposal in
+/// place with a two-parent merge commit, and an untargeted `withdraw` closes
+/// it. Asserts the shape; the caller adds the call-level expectations that
+/// tell its scenario apart.
+async fn assert_living_proposal_lifecycle(mock: &MockProvider, allowed: bool) -> Subscribed {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(share_with_stacks(mock, &sub, allowed).await);
+    assert_eq!(first.stack_number, None, "nothing was stacked");
+    assert_eq!(first.stack_position, None);
+    let head_after_create = mock.branch_commit(&first.branch).expect("the branch head");
+
+    // Upstream advances between the shares, so the update commit owes two
+    // parents: the merge-base rule the living proposal has always followed.
+    let old_base = load_state(&sub.state_dir).base_commit.clone();
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/upstream.md", b"from the team\n"),
+        ]),
+        Some(&old_base),
+    );
+    mock.set_branch("main", &c2);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let updated = match share_with_stacks(mock, &sub, allowed).await {
+        ProposeOutcome::Updated(report) => report,
+        other => panic!("a second share must update the open proposal, got {other:?}"),
+    };
+    assert_eq!(updated.number, first.number, "the same proposal");
+    assert_eq!(updated.url, first.url);
+    assert_eq!(updated.branch, first.branch);
+    assert_eq!(updated.stack_number, None);
+
+    let head_after_update = mock.branch_commit(&first.branch).expect("the new head");
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        mock.commit_parents(&head_after_update).unwrap(),
+        vec![head_after_create, state.base_commit.clone()],
+        "branch head first, then the advanced base"
+    );
+    assert_eq!(
+        state.proposals.len(),
+        1,
+        "one living proposal, never a chain"
+    );
+    assert_eq!(state.stack_number, None);
+    assert!(!state.stack_link_pending);
+    assert!(!state.repair_pending);
+
+    // No target: the single open proposal is the only thing it could mean.
+    let report = withdraw(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+        allowed,
+    )
+    .await
+    .expect("withdrawing the one open proposal");
+    assert_eq!(report.number, first.number);
+    assert!(report.closed);
+    assert!(!report.repaired, "there is no stack to repair");
+    assert_eq!(report.restacked, None);
+
+    let state = load_state(&sub.state_dir);
+    assert!(state.proposals.is_empty(), "{:?}", state.proposals);
+    assert_eq!(state.history[0].number, first.number);
+    assert_eq!(state.history[0].status, ProposalStatus::Withdrawn);
+    sub
+}
+
+#[tokio::test]
+async fn a_404_probing_forge_keeps_the_living_proposal_lifecycle() {
+    // A forge with no stacks endpoint, with `github.stacks` on throughout:
+    // the capability answer is no, and every share and the withdrawal take
+    // the flows they took before stacking existed.
+    let mock = MockProvider::new();
+    let sub = assert_living_proposal_lifecycle(&mock, true).await;
+
+    assert_eq!(
+        stack_calls(&mock),
+        vec!["list_stacks".to_string()],
+        "one probe and no other stack verb, ever: {:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        Some(false),
+        "the no answer is cached, so the probe is never repeated"
+    );
+}
+
+#[tokio::test]
+async fn config_off_is_byte_for_byte_the_old_flow_even_where_stacks_exist() {
+    // The same lifecycle against a forge that does serve stacks, with the
+    // config off: the question is never asked, so the answer cannot matter.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = assert_living_proposal_lifecycle(&mock, false).await;
+
+    assert!(
+        stack_calls(&mock).is_empty(),
+        "github.stacks off spends no stack call at all: {:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        None,
+        "the config gate leaves the cache unwritten, so turning it on later still asks"
+    );
+}
+
+#[tokio::test]
+async fn stacks_available_cache_survives_and_subscribe_forgets_it() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // A first share against a forge without stacks caches the no.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(share_with_stacks(&mock, &sub, true).await);
+    assert_eq!(load_state(&sub.state_dir).stacks_available, Some(false));
+    assert_eq!(probe_count(&mock), 1);
+
+    // The forge grows stacks afterwards. The cached verdict wins: an origin
+    // is asked once, and this share is still a fallback update in place.
+    mock.enable_stacks();
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    match share_with_stacks(&mock, &sub, true).await {
+        ProposeOutcome::Updated(report) => assert_eq!(report.number, first.number),
+        other => panic!("the cached no must keep the fallback flow, got {other:?}"),
+    }
+    assert_eq!(probe_count(&mock), 1, "no second probe: {:?}", mock.calls());
+    assert_eq!(load_state(&sub.state_dir).stacks_available, Some(false));
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("create_stack")),
+        "nothing was stacked: {:?}",
+        mock.calls()
+    );
+
+    // Subscribing the domain again is a fresh origin state, and a fresh state
+    // remembers nothing: the next share asks the forge and finds stacks.
+    let (fresh, _) = subscribe_at(&mock, &c1).await;
+    write(&fresh.domain_root.join("notes/a.md"), b"alpha rewritten\n");
+    let bottom = proposed(share_with_stacks(&mock, &fresh, true).await);
+    assert_eq!(
+        load_state(&fresh.state_dir).stacks_available,
+        Some(true),
+        "the fresh subscription probed for itself"
+    );
+    assert_eq!(probe_count(&mock), 2, "exactly one probe per origin state");
+
+    // And with a yes recorded, the next share stacks a layer instead of
+    // rewriting the one below it.
+    write(&fresh.domain_root.join("notes/c.md"), b"gamma\n");
+    let layer = proposed(share_with_stacks(&mock, &fresh, true).await);
+    assert_ne!(layer.number, bottom.number, "a new layer, not an update");
+    assert_eq!(layer.stack_position, Some((2, 2)));
+    assert!(
+        mock.calls().iter().any(|c| {
+            c.starts_with(&format!(
+                "create_stack:[{},{}]",
+                bottom.number, layer.number
+            ))
+        }),
+        "{:?}",
+        mock.calls()
+    );
+    assert_eq!(probe_count(&mock), 2, "the yes is cached too");
+}

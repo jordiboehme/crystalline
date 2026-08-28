@@ -2521,11 +2521,11 @@ async fn amend_layer(
 /// merged in, every entry recomputed against `below` (the tip beneath the
 /// layer), and a blob uploaded for each path this share touched.
 ///
-/// A recorded entry is kept verbatim - its blob sha is what rebuilds the tree
-/// - unless this share speaks for the same path or the entry stopped being a
-/// change against `below`. A fresh change whose content already matches
-/// `below` takes the path OUT of the layer entirely: the layer has nothing
-/// left to propose there.
+/// A recorded entry is kept verbatim - its blob sha is what rebuilds the
+/// tree - unless this share speaks for the same path or the entry stopped
+/// being a change against `below`. A fresh change whose content already
+/// matches `below` takes the path OUT of the layer entirely: the layer has
+/// nothing left to propose there.
 ///
 /// A kept entry from before blob shas were recorded (pre-0.17.0) has nothing
 /// to rebuild the tree from, and there is exactly one place to get it back:
@@ -3354,16 +3354,16 @@ pub async fn withdraw(
 ///
 /// A file that diverged since sharing is never touched: the recorded digest is
 /// what says whether the local copy is still the one that was proposed, and
-/// anything else is newer work. What a restore reads from is the base snapshot
-/// - except where the trunk never carried the file at all, which is the shape
-/// a stacked chain makes possible: a layer below added the path and this layer
-/// modified or retired it, so the pre-share content is that lower layer's, and
-/// the only copy of it is the blob its record names. That blob is fetched by
-/// sha and CHECKED against the lower record's digest before it is written; a
-/// record with no blob sha, a fetch that fails and content that does not hash
-/// to what was recorded all leave the path exactly as it stands and name it in
-/// [`WithdrawReport::skipped_reverts`]. A withdrawal is never failed over a
-/// file that cannot be put back.
+/// anything else is newer work. What a restore reads from is the base
+/// snapshot - except where the trunk never carried the file at all, which is
+/// the shape a stacked chain makes possible: a layer below added the path and
+/// this layer modified or retired it, so the pre-share content is that lower
+/// layer's, and the only copy of it is the blob its record names. That blob is
+/// fetched by sha and CHECKED against the lower record's digest before it is
+/// written; a record with no blob sha, a fetch that fails and content that
+/// does not hash to what was recorded all leave the path exactly as it stands
+/// and name it in [`WithdrawReport::skipped_reverts`]. A withdrawal is never
+/// failed over a file that cannot be put back.
 async fn revert_layer_files(
     provider: &dyn Provider,
     spec: &OriginSpec,

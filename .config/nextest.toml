@@ -1,3 +1,26 @@
+# The root cause behind the two timeout overrides below, addressed rather than
+# survived: every suite in this group builds a reqwest client, and on macOS
+# each new client asks the system trust store for the root certificates. Under
+# full-workspace parallelism dozens of those land at once, the trust store
+# serializes them and the contention is not marginal - measured on 2026-08-26,
+# tests that run in milliseconds per-crate ran 100 to 10000 times slower under
+# full parallel load, close enough to the terminate-after ceiling to be killed
+# as hangs. Capping the group at four concurrent tests keeps the contention off
+# the critical path; everything else in the workspace runs at default
+# parallelism.
+[test-groups.forge-wire]
+max-threads = 4
+
+[[profile.default.overrides]]
+filter = '''
+    package(crystalline-remote) & (binary(github_client) | binary(github_auth))
+    | package(crystalline-service) & (binary(collab_ws) | binary(rest_admin_api)
+        | binary(rest_api) | binary(rest_evolve) | binary(rest_files)
+        | binary(rest_setup_api) | binary(rest_write_api) | binary(ui_serving))
+    | package(crystalline) & binary(service)
+'''
+test-group = 'forge-wire'
+
 # Keeps a hung test from wedging the whole run: the sandboxed environments
 # this repo is developed in can stall the loopback-binding suites
 # (crates/remote/tests/github_client.rs and github_auth.rs bind
