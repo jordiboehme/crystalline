@@ -6568,6 +6568,443 @@ async fn a_half_cascaded_chain_re_bases_without_churning_the_stack() {
     );
 }
 
+/// Runs an amend of the bottom layer whose cascade died before it moved a
+/// single layer above it: the amended layer is committed, pushed and RECORDED,
+/// and every layer over it still stands exactly where it stood. Returns the
+/// amended bottom head.
+///
+/// The forge and the upper records are rolled back afterwards rather than the
+/// cascade being failed mid-flight, which is the same shape with one fewer
+/// moving part. What makes this state hard to leave is not where the branches
+/// are, it is that the amended content is already recorded: re-detecting the
+/// very same edit yields no delta at all.
+async fn amend_with_the_cascade_interrupted(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    layers: &[crystalline_remote::ops::ProposeReport],
+) -> String {
+    let before = load_state(&sub.state_dir);
+    updated(amend_share(mock, sub, layers[0].number).await);
+
+    let mut state = load_state(&sub.state_dir);
+    for index in 1..state.proposals.len() {
+        state.proposals[index] = before.proposals[index].clone();
+        let head = state.proposals[index]
+            .head_commit
+            .clone()
+            .expect("every layer was pushed when it was opened");
+        mock.set_branch(&state.proposals[index].branch, &head);
+    }
+    state.save(&sub.state_dir).unwrap();
+    mock.branch_commit(&layers[0].branch)
+        .expect("the amended bottom head")
+}
+
+#[tokio::test]
+async fn retrying_an_interrupted_amend_heals_the_chain_before_it_answers() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let amended = amend_with_the_cascade_interrupted(&mock, &sub, &layers).await;
+
+    // The retry: the same verb, the same number, the same working tree. The
+    // amended content is recorded already, so there is nothing new to share -
+    // and the chain above is still where the dead cascade left it. The heal
+    // runs before the named layer is even resolved, so the retry is what puts
+    // the chain back together rather than reporting over a broken one.
+    let before = mock.calls().len();
+    let outcome = amend_share(&mock, &sub, layers[0].number).await;
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "the amended content is recorded, so nothing to share is the honest answer: {outcome:?}"
+    );
+
+    let new_middle = mock
+        .branch_commit(&layers[1].branch)
+        .expect("the re-based head");
+    let new_top = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the re-based head");
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_middle}:force=true",
+            layers[1].branch
+        )),
+        "the stale layer was re-based: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            layers[2].branch
+        )),
+        "and the chain above it followed: {delta:?}"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_middle),
+        Some(vec![amended.clone()]),
+        "the re-based layer sits on the amended head"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_top),
+        Some(vec![new_middle.clone()])
+    );
+    assert_eq!(
+        mock.branch_commit(&layers[0].branch).as_deref(),
+        Some(&*amended),
+        "the amended layer itself was not written again"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[1].base_commit.as_deref(), Some(&*amended));
+    assert_eq!(
+        state.proposals[2].base_commit,
+        state.proposals[1].head_commit
+    );
+    assert_eq!(
+        state.stack_number,
+        Some(stack),
+        "an intact membership is never churned"
+    );
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("dissolve_stack") || c.starts_with("create_stack")),
+        "nothing left the chain, so nothing is dissolved or recreated: {delta:?}"
+    );
+
+    // And the healed chain stays healed: a third try re-bases nothing.
+    let before = mock.calls().len();
+    let outcome = amend_share(&mock, &sub, layers[0].number).await;
+    let delta = mock.calls().split_off(before);
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a healed chain does not heal itself again: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_amend_over_a_hole_repairs_the_chain_before_its_own_writes() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer closes the MIDDLE layer: a hole with open work above it, the
+    // other shape a repair exists for.
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    let report = updated(amend_share(&mock, &sub, layers[0].number).await);
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(report.number, layers[0].number, "the named layer, amended");
+    assert_eq!(
+        report.stack_position,
+        Some((1, 2)),
+        "the hole left the chain before the amend counted it"
+    );
+
+    // The repair ran whole, in its own order, and all of it before the amend's
+    // own push.
+    let amended_head = mock
+        .branch_commit(&layers[0].branch)
+        .expect("the amended head");
+    let amend_push = call_at(
+        &delta,
+        &format!(
+            "update_branch:{}:{amended_head}:force=false",
+            layers[0].branch
+        ),
+    );
+    let dissolve = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let retarget = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    let restack = call_at(
+        &delta,
+        &format!("create_stack:[{},{}]", layers[0].number, layers[2].number),
+    );
+    assert!(
+        dissolve < retarget && retarget < restack,
+        "the repair keeps the one order the forge accepts: {delta:?}"
+    );
+    assert!(
+        restack < amend_push,
+        "and the whole repair precedes the amend's own writes: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number]
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[1].number),
+        "the closed layer left the chain: {:?}",
+        state.history
+    );
+    assert!(!state.repair_pending);
+    assert_eq!(
+        state.proposals[1].base_commit, state.proposals[0].head_commit,
+        "the survivor stands on the amended layer"
+    );
+}
+
+#[tokio::test]
+async fn an_amend_over_a_hole_names_the_layer_the_repair_left() {
+    // The hazard healing first creates: a repair settles what left the chain
+    // into history, so an index resolved BEFORE it names a different record
+    // after it. Amending the top layer over a hole is where that shows - it is
+    // the third record in the chain the share was handed and the second in the
+    // one the repair leaves - and reading the stale index would name the wrong
+    // layer or run off the end of the vec.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma v2\n");
+    let report = updated(amend_share(&mock, &sub, layers[2].number).await);
+
+    assert_eq!(
+        report.number, layers[2].number,
+        "the layer the number names"
+    );
+    assert_eq!(report.stack_position, Some((2, 2)));
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number]
+    );
+
+    let head = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the amended head");
+    let tree = mock.commit_tree(&head).expect("the amended tree");
+    assert_eq!(
+        tree.get("notes/c.md").map(Vec::as_slice),
+        Some(b"gamma v2\n".as_slice()),
+        "the amend landed on the top layer's own work"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        state.proposals[0].head_commit, state.proposals[1].base_commit,
+        "and the layer below it was left where the repair put it"
+    );
+}
+
+#[tokio::test]
+async fn an_amend_refusal_lists_the_layers_the_repair_left_open() {
+    // A number that names nothing is refused with what IS open - and after the
+    // heal, that list is the chain the repair left rather than the one the
+    // share was handed. Which also means a refused amend is no longer
+    // write-free where a repair was owed: the heal is the chain's, not this
+    // share's, and it stands whether or not the number turns out to be real.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(999),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect_err("999 is not an open layer");
+    let delta = mock.calls().split_off(before);
+
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(message.contains("999"), "{message}");
+            assert!(
+                message.contains(&format!("#{} (layer 1)", layers[0].number)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("#{} (layer 2)", layers[2].number)),
+                "the survivor took the position the hole vacated: {message}"
+            );
+            assert!(
+                !message.contains(&format!("#{}", layers[1].number)),
+                "the settled layer is no layer of this chain: {message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    assert!(
+        delta.iter().any(|c| c.starts_with("dissolve_stack")),
+        "the chain was healed even though the number was not real: {delta:?}"
+    );
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number]
+    );
+    assert!(!load_state(&sub.state_dir).repair_pending);
+}
+
+#[tokio::test]
+async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // The middle layer merged and this domain has not taken it in: its content
+    // sits on the trunk and nowhere the chain can see, so rebuilding the
+    // survivors around it would read as deleting what it brought. Every pull
+    // consumes such a record except the re-baselining arm, which is what leaves
+    // one standing for a share to meet.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[1].status = ProposalStatus::Merged;
+    // A repair a withdrawal never finished: what makes this share enter the
+    // repair at all, since a merge-wedged chain reads as shape-fine by design.
+    state.repair_pending = true;
+    state.base_commit = "ghost-commit".to_string();
+    state.save(&sub.state_dir).unwrap();
+    mock.gc_commit("ghost-commit");
+    let moved = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    mock.set_branch("main", &moved);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(layers[0].number),
+            stacks_allowed: true,
+        },
+    )
+    .await
+    .expect_err("the merge has to be pulled in before this chain is rebuilt");
+    let delta = mock.calls().split_off(before);
+
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(
+                message.contains(&format!("#{}", layers[1].number)),
+                "the refusal names the merged layer: {message}"
+            );
+            assert!(
+                message.contains("pull"),
+                "the refusal names the way out: {message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)
+            || c.starts_with("dissolve_stack")
+            || c.starts_with("create_stack")),
+        "the pull-first refusal wins before a single repair call: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.repair_pending,
+        "and the repair stays owed until the pull clears the way"
+    );
+    assert_eq!(state.proposals.len(), 3, "the chain is left as it stands");
+}
+
+#[tokio::test]
+async fn a_fallback_amend_runs_no_repair_machinery() {
+    // Off the stacked path the number can only name the one living proposal,
+    // and the amend IS the ordinary in-place update. No repair entry sits on
+    // that path at all, so a repair recorded pending is left exactly where it
+    // stands - the same trade both stacked call sites make.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(share_with_stacks(&mock, &sub, false).await);
+
+    let mut state = load_state(&sub.state_dir);
+    state.repair_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let report = updated(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions {
+                title: None,
+                description: None,
+                proposal: Some(first.number),
+                stacks_allowed: false,
+            },
+        )
+        .await
+        .expect("a fallback amend is the ordinary update"),
+    );
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(
+        report.number, first.number,
+        "the one living proposal, updated in place"
+    );
+    assert_eq!(report.stack_number, None);
+    assert_eq!(report.stack_position, None);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("list_stacks")
+            || c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")),
+        "a fallback amend spends no stack call at all: {delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| c.contains(":force=true")),
+        "and re-bases nothing: {delta:?}"
+    );
+    assert!(
+        load_state(&sub.state_dir).repair_pending,
+        "the pending repair is stranded rather than run off the stacked path"
+    );
+}
+
 #[tokio::test]
 async fn a_reviewer_commit_above_refuses_the_amend_before_any_write() {
     let mock = MockProvider::new();

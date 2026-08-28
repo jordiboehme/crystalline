@@ -1320,6 +1320,15 @@ async fn retry_stack_link(
 /// path the number can only name the one living proposal, and amending it is
 /// exactly the in-place update this function has always done.
 ///
+/// An amend whose cascade dies half-way is answered by retrying the same
+/// amend, so the repair a stacking share runs happens on this path too, and it
+/// happens BEFORE the named layer is resolved: the amended content is recorded
+/// before the cascade starts, so the retry has nothing new to share, and a
+/// target resolved first would carry that answer back over a chain still
+/// broken. Healing first also means the layer the number names, and the layers
+/// a refusal lists, are read off the records the repair left rather than the
+/// ones it was handed. Off the stacked path no repair machinery runs at all.
+///
 /// On the fallback path a domain has at most one open proposal at a time.
 /// When one is open, this
 /// pushes a fresh commit onto its branch and rewrites its body rather than
@@ -1379,6 +1388,20 @@ pub async fn propose(
     //     can only name the one living proposal, and the amend IS the
     //     ordinary update below - merge commit and all - so it falls through.
     if let Some(number) = options.proposal {
+        // A repair a previous operation left half-done is finished BEFORE the
+        // named layer is resolved - the same entry the new-layer arm below
+        // makes, and here for a sharper reason. Retrying the SAME amend is how
+        // a person answers an amend whose cascade died half-way, and by then
+        // the amended content is already recorded: resolve the target first
+        // and the retry detects nothing new, answers NothingToShare and leaves
+        // the chain exactly as broken as it found it.
+        if stacked_path && chain_is_stacked(&state) {
+            finish_pending_repair(provider, spec, &mut state, state_dir).await?;
+        }
+        // Everything below reads the POST-repair records. A repair settles what
+        // left the chain into history, so the vec the number is looked up in
+        // shrinks and re-indexes under it, and the refusal that lists what is
+        // open owes the same post-repair truth.
         let index = amend_target_index(&state, number, stacked_path)?;
         if stacked_path && chain_is_stacked(&state) {
             return amend_layer(
