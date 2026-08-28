@@ -4929,3 +4929,460 @@ async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend()
         ref other => panic!("expected ProposalDiverged, got {other:?}"),
     }
 }
+
+// The stacked withdrawal: taking one layer out of an open chain closes its
+// pull request, repairs the stack around the hole it leaves (dissolve, replay,
+// retarget, recreate) and excises its content from every layer above it. The
+// repair is interruption-safe: `repair_pending` marks it from the first
+// forge-visible step, and the next withdraw or share finishes what a dying
+// process left behind.
+
+/// Withdraws with stacking allowed, the call every repair scenario makes.
+async fn stacked_withdraw(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    number: Option<u64>,
+    revert: bool,
+) -> crystalline_remote::ops::WithdrawReport {
+    withdraw(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        number,
+        revert,
+        true,
+    )
+    .await
+    .expect("a stacked withdraw should succeed")
+}
+
+/// The numbers of the open layers in saved state, bottom first.
+fn open_numbers(state_dir: &Path) -> Vec<u64> {
+    load_state(state_dir)
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect()
+}
+
+/// The index of `call` in a recorded delta, or a panic naming the delta.
+fn call_at(delta: &[String], call: &str) -> usize {
+    delta
+        .iter()
+        .position(|c| c == call)
+        .unwrap_or_else(|| panic!("no {call} in {delta:?}"))
+}
+
+#[tokio::test]
+async fn withdrawing_the_top_layer_repairs_the_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(report.number, layers[2].number);
+    assert!(report.closed);
+    let close_at = call_at(&delta, &format!("close_proposal:{}", layers[2].number));
+    let dissolve_at = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let create_at = call_at(
+        &delta,
+        &format!("create_stack:[{},{}]", layers[0].number, layers[1].number),
+    );
+    let delete_at = call_at(&delta, &format!("delete_branch:{}", layers[2].branch));
+    assert!(close_at < dissolve_at, "{delta:?}");
+    assert!(dissolve_at < create_at, "{delta:?}");
+    assert!(
+        create_at < delete_at,
+        "the withdrawn branch goes last: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    let new_stack = state.stack_number.expect("the survivors are re-linked");
+    assert_ne!(new_stack, old_stack, "a recreate allocates a fresh number");
+    assert!(report.repaired);
+    assert_eq!(report.restacked, Some(new_stack));
+    assert!(!state.repair_pending);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number]
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_a_middle_layer_excises_its_content() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+    let bottom_head = mock
+        .branch_commit(&layers[0].branch)
+        .expect("the bottom head");
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    let delta = mock.calls().split_off(before);
+    assert!(report.repaired);
+
+    // The top layer was replayed onto the layer below the hole, so its tree
+    // carries the bottom layer's work and its own, and nothing of the layer
+    // that left.
+    let new_top = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the replayed head");
+    assert_eq!(mock.commit_parents(&new_top), Some(vec![bottom_head]));
+    let tree = mock.commit_tree(&new_top).expect("the replayed tree");
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v2\n".as_slice())
+    );
+    assert_eq!(
+        tree.get("notes/c.md").map(Vec::as_slice),
+        Some(b"gamma\n".as_slice())
+    );
+    assert!(
+        !tree.contains_key("notes/b.md"),
+        "the withdrawn layer's file rode along: {:?}",
+        tree.keys().collect::<Vec<_>>()
+    );
+
+    // The survivor above the hole now targets the branch below it, and the
+    // retarget waits for the dissolve: a stacked proposal cannot be retargeted.
+    let dissolve_at = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let retarget_at = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    assert!(dissolve_at < retarget_at, "{delta:?}");
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{}]",
+            layers[0].number, layers[2].number
+        )),
+        "{delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert_eq!(
+        state
+            .proposals
+            .iter()
+            .map(|p| p.number)
+            .collect::<Vec<u64>>(),
+        vec![layers[0].number, layers[2].number]
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_the_bottom_layer_retargets_onto_the_trunk() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let base = load_state(&sub.state_dir).base_commit;
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(first.number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    // The survivor is replayed straight onto the trunk and targets it too.
+    let new_head = mock
+        .branch_commit(&second.branch)
+        .expect("the replayed head");
+    assert_eq!(mock.commit_parents(&new_head), Some(vec![base]));
+    assert!(
+        delta.contains(&format!("update_proposal_base:{}:main", second.number)),
+        "{delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")),
+        "one survivor is no stack: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, None);
+    assert_eq!(report.restacked, None);
+    assert!(report.repaired);
+    assert!(!state.repair_pending);
+    assert_eq!(open_numbers(&sub.state_dir), vec![second.number]);
+}
+
+#[tokio::test]
+async fn an_interrupted_repair_resumes_on_the_next_withdraw() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A withdrawal of the middle layer died right after the dissolve: the pull
+    // request is closed and the stack is gone upstream, while local state
+    // still records the layer as open and the repair as pending.
+    Provider::close_proposal(&mock, &spec(), layers[1].number)
+        .await
+        .unwrap();
+    Provider::dissolve_stack(&mock, &spec(), old_stack)
+        .await
+        .unwrap();
+    let mut state = load_state(&sub.state_dir);
+    state.repair_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+    let delta = mock.calls().split_off(before);
+    assert_eq!(report.number, layers[2].number);
+
+    // The interrupted repair finished before the new withdrawal's own close.
+    let retarget_at = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    let close_at = call_at(&delta, &format!("close_proposal:{}", layers[2].number));
+    assert!(retarget_at < close_at, "{delta:?}");
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert_eq!(open_numbers(&sub.state_dir), vec![layers[0].number]);
+    assert_eq!(state.stack_number, None);
+    assert!(
+        state.history.iter().any(|p| p.number == layers[1].number
+            && matches!(
+                p.status,
+                ProposalStatus::Withdrawn | ProposalStatus::Declined
+            )),
+        "the layer the repair settled: {:?}",
+        state.history
+    );
+}
+
+#[tokio::test]
+async fn stacked_withdraw_with_no_number_takes_the_top() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, None, false).await;
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(
+        report.number, second.number,
+        "the top layer, not the bottom"
+    );
+    assert!(delta.contains(&format!("close_proposal:{}", second.number)));
+    assert!(
+        !delta.contains(&format!("close_proposal:{}", first.number)),
+        "{delta:?}"
+    );
+    assert_eq!(open_numbers(&sub.state_dir), vec![first.number]);
+}
+
+#[tokio::test]
+async fn withdraw_revert_still_only_touches_the_withdrawn_layers_files() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    let report = stacked_withdraw(&mock, &sub, Some(second.number), true).await;
+
+    assert_eq!(report.deleted, vec!["notes/b.md".to_string()]);
+    assert!(report.restored.is_empty(), "{:?}", report.restored);
+    assert!(
+        !sub.domain_root.join("notes/b.md").exists(),
+        "the withdrawn layer's own file is gone"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha v2\n",
+        "the layer below keeps its work"
+    );
+}
+
+#[tokio::test]
+async fn a_settled_top_layer_leaves_no_wedged_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer closes the top layer and deletes its branch. The share below
+    // settles that record, and the stack it leaves behind holds a closed
+    // member, which the forge refuses to extend forever.
+    Provider::delete_branch(&mock, &spec(), &second.branch)
+        .await
+        .unwrap();
+    mock.set_proposal_state(second.number, ProposalState::Declined);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "the wedged stack is dissolved: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("create_stack:[{},{}]", first.number, third.number)),
+        "{delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "no owed link is left behind");
+    assert!(!state.repair_pending);
+    let stack = state.stack_number.expect("the healed chain is linked");
+    assert_ne!(stack, old_stack);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![first.number, third.number]
+    );
+}
+
+#[tokio::test]
+async fn an_owed_stack_link_extends_the_stack_that_already_exists() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A repair got as far as recreating the stack over the two bottom layers
+    // and then died: the top layer's membership is still owed.
+    Provider::dissolve_stack(&mock, &spec(), old_stack)
+        .await
+        .unwrap();
+    let recreated = Provider::create_stack(&mock, &spec(), &[layers[0].number, layers[1].number])
+        .await
+        .unwrap();
+    let mut state = load_state(&sub.state_dir);
+    state.stack_number = Some(recreated.number);
+    state.stack_link_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let _fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!(
+            "extend_stack:{}:[{}]",
+            recreated.number, layers[2].number
+        )),
+        "the owed member is added to the existing stack: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending);
+    assert_eq!(state.stack_number, Some(recreated.number));
+}
+
+/// A two-layer chain whose bottom layer adds a file the trunk never carried
+/// and whose top layer retires it again, the shape a revert can only undo from
+/// the lower layer's recorded blob.
+async fn chain_retiring_a_lower_file(
+    mock: &MockProvider,
+) -> (Subscribed, Vec<crystalline_remote::ops::ProposeReport>) {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/new.md"), b"fresh\n");
+    let first = proposed(stacked_share(mock, &sub).await);
+    std::fs::remove_file(sub.domain_root.join("notes/new.md")).unwrap();
+    let second = proposed(stacked_share(mock, &sub).await);
+    (sub, vec![first, second])
+}
+
+#[tokio::test]
+async fn a_revert_restores_a_file_only_the_layer_below_ever_carried() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = chain_retiring_a_lower_file(&mock).await;
+
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), true).await;
+
+    assert_eq!(report.restored, vec!["notes/new.md".to_string()]);
+    assert!(
+        report.skipped_reverts.is_empty(),
+        "{:?}",
+        report.skipped_reverts
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/new.md")),
+        b"fresh\n",
+        "restored from the lower layer's recorded blob"
+    );
+}
+
+#[tokio::test]
+async fn a_revert_skips_a_file_no_recorded_blob_can_restore() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = chain_retiring_a_lower_file(&mock).await;
+    // The lower layer's record predates blob shas, so there is nothing left to
+    // fetch the retired file's content from.
+    forget_blob_shas(&sub.state_dir, 0);
+
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), true).await;
+
+    assert_eq!(report.skipped_reverts, vec!["notes/new.md".to_string()]);
+    assert!(report.restored.is_empty(), "{:?}", report.restored);
+    assert!(
+        !sub.domain_root.join("notes/new.md").exists(),
+        "nothing was invented for the file"
+    );
+}
+
+#[tokio::test]
+async fn a_repaired_chain_is_not_repaired_again_on_the_next_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    let stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the survivors were re-linked");
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        !delta.iter().any(|c| c.starts_with("dissolve_stack")),
+        "a healthy chain is left alone: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("extend_stack:{stack}:[{}]", fourth.number)),
+        "{delta:?}"
+    );
+    assert_eq!(fourth.stack_number, Some(stack));
+}

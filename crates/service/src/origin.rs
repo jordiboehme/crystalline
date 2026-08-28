@@ -888,6 +888,7 @@ mod tests {
             restored: vec!["notes/a.md".to_string()],
             deleted: vec!["notes/b.md".to_string()],
             skipped_diverged: vec!["notes/c.md".to_string()],
+            ..Default::default()
         };
         let v = withdraw_report_json(&report);
         assert_eq!(v["number"], 7);

@@ -219,6 +219,21 @@ pub struct WithdrawReport {
     /// Paths left untouched because the local file diverged since sharing:
     /// newer work is never destroyed.
     pub skipped_diverged: Vec<String>,
+    /// Paths a revert could not restore because their pre-share content is
+    /// nowhere to be had: the trunk snapshot never carried the file (a layer
+    /// below the withdrawn one added it) and that layer's record names no blob
+    /// to fetch it back from, or the fetch itself failed. The path is left
+    /// exactly as it stands rather than failing the withdrawal.
+    pub skipped_reverts: Vec<String>,
+    /// True when the chain around the withdrawn layer was repaired: the stack
+    /// was dissolved and, where two layers survived, recreated, with every
+    /// layer above the hole replayed onto the one below it.
+    pub repaired: bool,
+    /// The NEW stack number a repair's recreate allocated, `None` when no
+    /// stack was recreated (fewer than two survivors, or no repair at all).
+    /// A dissolve plus recreate never keeps the old number: stack numbers come
+    /// off the same sequence as issue and pull request numbers.
+    pub restacked: Option<u64>,
 }
 
 /// How to settle one recorded conflict, passed to [`resolve`].
@@ -1047,7 +1062,12 @@ pub async fn propose(
     //    open - a gone branch ref settles its layer and the tip shrinks with
     //    it, so the walk down and the detection run together.
     if stacked_path && chain_is_stacked(&state) {
-        // Any link still owed to the forge is settled first: growing the
+        // A repair a previous operation left half-done - and a chain that came
+        // apart without one, which is what a settled gone-top ref leaves - is
+        // finished before anything is stacked onto it: growing a chain whose
+        // stack still holds a closed member wedges every later link call.
+        finish_pending_repair(provider, spec, &mut state, state_dir).await?;
+        // Any link still owed to the forge is settled next: growing the
         // chain over an unsettled gap would only widen it.
         retry_stack_link(provider, spec, &mut state, state_dir).await;
     }
@@ -2543,20 +2563,312 @@ async fn cascade_replays(
     Ok(())
 }
 
+/// What a chain repair did, carried back to the caller's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RepairOutcome {
+    /// Whether the repair touched the forge at all (a dissolve, a replay or a
+    /// recreate).
+    repaired: bool,
+    /// The NEW stack number a recreate allocated, when one ran.
+    restacked: Option<u64>,
+}
+
+/// Whether the recorded chain and the stack this machine believes in have
+/// come apart, without asking the forge anything.
+///
+/// Three shapes say so, and all of them are the residue of a layer leaving
+/// the chain outside a withdrawal - a settled gone branch ref, or a reviewer
+/// closing one layer of several. A stack whose members are no longer a chain
+/// wedges every later `extend_stack` with the base-ref 422 and cannot be
+/// unwedged without dissolving first, so finding these cheaply matters:
+///
+/// - a stack number with fewer than two open layers under it, which is a
+///   number naming something that is not a chain any more;
+/// - an open layer whose recorded base is not the head of the open layer below
+///   it, which is a hole in between the two;
+/// - a hole below the bottom open layer, which shows as that layer not yet
+///   standing on the trunk it now has to target.
+///
+/// Every test is a comparison of recorded fields, so this costs no call, and
+/// each one reads false again once [`repair_chain`] has done its work - a
+/// repaired chain must not re-repair itself on every later operation.
+///
+/// A Merged record is deliberately not a hole here. A merged layer's content
+/// lives on the trunk and only the next [`pull`] advances the base commit onto
+/// it, so replaying the survivors before then would rebuild them without it.
+/// Reconciling a merged layer stays a pull concern.
+fn stack_shape_broken(state: &OriginState) -> bool {
+    if state.stack_number.is_none() {
+        return false;
+    }
+    let open: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    let Some(bottom) = open.first() else {
+        return true;
+    };
+    if open.len() < 2 {
+        return true;
+    }
+    // A hole under the bottom survivor: only a repair puts that layer onto the
+    // trunk, so a recorded base still naming the vanished layer's head says
+    // the repair has not run. The trunk moving on under an intact chain is not
+    // this shape - there is no hole beneath the bottom layer then.
+    let hole_below = state
+        .proposals
+        .iter()
+        .take_while(|p| p.number != bottom.number)
+        .any(|p| p.status != ProposalStatus::Open);
+    if hole_below && bottom.base_commit.as_deref() != Some(state.base_commit.as_str()) {
+        return true;
+    }
+    open.windows(2)
+        .any(|pair| pair[1].base_commit != pair[0].head_commit)
+}
+
+/// Repairs the open chain around every hole it records, in the one order the
+/// forge accepts: dissolve, replay, retarget, recreate.
+///
+/// A hole is a recorded layer that is no longer open - the layer a withdrawal
+/// just closed, or one settled out from under this machine. Every layer above
+/// a hole sits on a commit that is no longer the chain, so the first survivor
+/// above the LOWEST hole is replayed onto the layer below it (the trunk, for a
+/// hole at the bottom) and [`cascade_replays`] carries the rest of the chain
+/// up from there. Each survivor that directly follows a hole then has its pull
+/// request retargeted at the branch below it, since the branch it pointed at
+/// is going away.
+///
+/// Why the order is not negotiable: a stacked proposal cannot be retargeted at
+/// all (the forge answers 422), so the stack has to be dissolved before the
+/// first `update_proposal` base call; and a recreate can only succeed once
+/// every member's base ref points where the new chain says it does, so it
+/// comes after the retargets. A dissolve of a stack that is already gone is a
+/// 404 and means the work is done, not that it failed.
+///
+/// Every step is idempotent, because this runs again from the top whenever a
+/// previous attempt died halfway: re-dissolving 404s, a retarget that is
+/// already applied is a no-op, and a recreate over the survivors produces the
+/// same chain whatever a previous run got through. The caller clears
+/// [`crate::state::OriginState::repair_pending`] by letting this finish; a
+/// failure leaves it set and the next withdraw or share resumes.
+async fn repair_chain(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) -> Result<RepairOutcome, RemoteError> {
+    // The plan is read off the recorded chain before a single call is made:
+    // where the replay starts, what it starts from, and which survivors have
+    // to be pointed at a new base branch.
+    let mut first_survivor: Option<usize> = None;
+    let mut parent_head: Option<String> = None;
+    let mut retargets: Vec<(u64, String)> = Vec::new();
+    {
+        let mut below: Option<&Proposal> = None;
+        let mut after_hole = false;
+        for (index, prop) in state.proposals.iter().enumerate() {
+            if prop.status != ProposalStatus::Open {
+                after_hole = true;
+                continue;
+            }
+            if after_hole {
+                if first_survivor.is_none() {
+                    first_survivor = Some(index);
+                    parent_head = below.and_then(|p| p.head_commit.clone());
+                }
+                retargets.push((
+                    prop.number,
+                    below
+                        .map(|p| p.branch.clone())
+                        .unwrap_or_else(|| spec.branch.clone()),
+                ));
+                after_hole = false;
+            }
+            below = Some(prop);
+        }
+    }
+
+    // Nothing is written until every layer the cascade replays is known to be
+    // replayable, so a chain that cannot be healed is refused before the
+    // dissolve rather than halfway up.
+    if let Some(index) = first_survivor {
+        ensure_replayable(state, index)?;
+    }
+
+    let mut outcome = RepairOutcome::default();
+
+    if let Some(stack) = state.stack_number {
+        match provider.dissolve_stack(spec, stack).await {
+            Ok(()) => {}
+            // Already gone: an earlier attempt at this repair got this far, or
+            // the forge dropped the stack itself. Either way it is done.
+            Err(RemoteError::Api { status: 404, .. }) => {
+                tracing::debug!("stack {stack} was already dissolved");
+            }
+            Err(RemoteError::StacksUnsupported) => {
+                tracing::debug!("this forge no longer serves stacks; nothing to dissolve");
+            }
+            Err(e) => return Err(e),
+        }
+        state.stack_number = None;
+        outcome.repaired = true;
+        state.save(state_dir)?;
+    }
+
+    if let Some(index) = first_survivor {
+        let parent = parent_head.unwrap_or_else(|| state.base_commit.clone());
+        cascade_replays(provider, spec, state, state_dir, index, parent).await?;
+        outcome.repaired = true;
+    }
+
+    for (number, base) in &retargets {
+        provider
+            .update_proposal(spec, *number, None, None, Some(base))
+            .await?;
+        outcome.repaired = true;
+    }
+
+    // A layer this machine withdrew leaves the chain for history here, once
+    // the survivors above it stand on their own again.
+    let withdrawn: Vec<Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Withdrawn)
+        .cloned()
+        .collect();
+    if !withdrawn.is_empty() {
+        state
+            .proposals
+            .retain(|p| p.status != ProposalStatus::Withdrawn);
+        for record in withdrawn {
+            state.push_history(record);
+        }
+    }
+
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    if open.len() >= 2 {
+        match provider.create_stack(spec, &open).await {
+            Ok(info) => {
+                state.stack_number = Some(info.number);
+                state.stack_link_pending = false;
+                outcome.restacked = Some(info.number);
+                outcome.repaired = true;
+            }
+            Err(e) => {
+                // The pull requests are all there and correctly based; only
+                // the grouping is missing, which is the degraded chain
+                // `stack_link_pending` records and the next operation retries.
+                tracing::debug!(
+                    "re-linking the repaired chain failed; it stays degraded until the next operation: {e}"
+                );
+                state.stack_number = None;
+                state.stack_link_pending = true;
+            }
+        }
+    } else {
+        // One layer is not a chain, so there is no stack to name.
+        state.stack_number = None;
+        state.stack_link_pending = false;
+    }
+
+    state.repair_pending = false;
+    state.save(state_dir)?;
+    Ok(outcome)
+}
+
+/// Finishes a repair a previous operation left half-done, and heals a chain
+/// that came apart without one, before the caller does any work of its own.
+///
+/// Two entry conditions, both cheap to test. [`OriginState::repair_pending`]
+/// says a withdrawal died between its dissolve and its recreate; the recorded
+/// chain is then re-read against the forge, since a layer this machine closed
+/// before dying is still recorded Open here, and one `proposal_state` per open
+/// layer settles that. [`stack_shape_broken`] says the chain and the stack
+/// disagree with no repair ever having been marked - the residue of a layer
+/// settled out of the chain by a share, which leaves a stack the forge will
+/// refuse to extend for as long as it stands.
+///
+/// A layer the forge reports closed while a repair is pending is recorded as
+/// [`ProposalStatus::Withdrawn`] rather than Declined: this machine closed it,
+/// in the withdrawal that never finished. A layer that merged in the meantime
+/// keeps its Merged status and stays for [`pull`] to consume.
+async fn finish_pending_repair(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) -> Result<RepairOutcome, RemoteError> {
+    if !state.repair_pending && !stack_shape_broken(state) {
+        return Ok(RepairOutcome::default());
+    }
+
+    if state.repair_pending {
+        let open: Vec<u64> = state
+            .proposals
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Open)
+            .map(|p| p.number)
+            .collect();
+        let mut dirty = false;
+        for number in open {
+            let live = provider.proposal_state(spec, number).await?;
+            let status = match live {
+                ProposalState::Open => continue,
+                ProposalState::Merged => ProposalStatus::Merged,
+                ProposalState::Declined => ProposalStatus::Withdrawn,
+            };
+            if let Some(record) = state.proposals.iter_mut().find(|p| p.number == number) {
+                record.status = status;
+                record.pending_head_commit = None;
+                dirty = true;
+            }
+        }
+        if dirty {
+            state.save(state_dir)?;
+        }
+    }
+
+    repair_chain(provider, spec, state, state_dir).await
+}
+
 /// Withdraws a share proposal: closes its pull request on the forge (an Open
 /// one), best-effort deletes its branch, optionally restores the shared files
 /// to their pre-share content, and moves the record to history as
 /// [`ProposalStatus::Withdrawn`].
 ///
-/// Target: `proposal_number`, or the single Open proposal when `None`;
-/// no open proposal (or more than one, possible only in pre-living-proposal
-/// state) is [`RemoteError::NoWithdrawTarget`] listing every candidate, and a
-/// named number that is not among the open or declined records is
+/// Target: `proposal_number`, or the single Open proposal when `None`; on a
+/// stacked chain with no number the target is the TOP open layer, since that
+/// is the layer nothing is built on. No open proposal, or a multi-open chain
+/// this machine does not know as a stack (residue from before stacking), is
+/// [`RemoteError::NoWithdrawTarget`] listing every candidate, and a named
+/// number that is not among the open or declined records is
 /// [`RemoteError::ProposalNotFound`]. A close failure aborts the whole
 /// withdraw with the error and nothing else changed. Without `revert` the
 /// working tree is untouched; with it, files still matching what was proposed
 /// are restored (base-tree content for Modified/Deleted, deletion for Added)
-/// and diverged ones are skipped - newer work is never destroyed.
+/// and diverged ones are skipped - newer work is never destroyed. On a chain
+/// the pre-share content of a path a LOWER layer added is that layer's rather
+/// than the trunk's, so it is fetched back from the blob that layer's record
+/// names; a path nothing can speak for is named in
+/// [`WithdrawReport::skipped_reverts`] and left exactly as it stands.
+///
+/// Taking a layer out of a stacked chain is more than a close: the layers
+/// above it sit on a commit that is about to be nothing, and the forge refuses
+/// to retarget a proposal while it is stacked. So the chain is repaired around
+/// the hole, in [`repair_chain`]'s order - dissolve, replay the survivors onto
+/// the layer below the hole, retarget the first of them, recreate the stack
+/// when two or more layers survive - with
+/// [`crate::state::OriginState::repair_pending`] set from before the dissolve
+/// until after the recreate, so a process that dies mid-repair is finished by
+/// the next withdraw or share rather than leaving a wedged chain. The
+/// withdrawn layer's own branch is deleted LAST, once the repair is durable.
 ///
 /// Only the close is atomic: a failure later, inside the revert loop, leaves
 /// the pull request closed on the forge while the record is still locally
@@ -2576,12 +2888,27 @@ pub async fn withdraw(
     revert: bool,
     stacks_allowed: bool,
 ) -> Result<WithdrawReport, RemoteError> {
-    let _ = stacks_allowed;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::State(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
+
+    // The same capability question a share asks, and the same cached answer:
+    // whether this origin's chains are stacks at all decides both how a target
+    // is resolved and whether a repair is owed.
+    let stacked_path =
+        stacks_available(provider, spec, &mut state, state_dir, stacks_allowed).await?;
+
+    // A repair a previous operation left half-done, or a chain that came apart
+    // without one, is finished before this withdrawal picks its own target:
+    // the target set itself changes when a settled layer leaves the chain.
+    let mut report = WithdrawReport::default();
+    if stacked_path {
+        let entry = finish_pending_repair(provider, spec, &mut state, state_dir).await?;
+        report.repaired = entry.repaired;
+        report.restacked = entry.restacked;
+    }
 
     let proposal = match proposal_number {
         Some(number) => state
@@ -2596,8 +2923,14 @@ pub async fn withdraw(
                 .iter()
                 .filter(|p| p.status == ProposalStatus::Open)
                 .collect();
+            let stacked_chain = stacked_path && chain_is_stacked(&state);
             match open.as_slice() {
                 [single] => (*single).clone(),
+                // On a stacked chain the default target is the TOP layer: it
+                // is the one nothing is built on, so withdrawing it costs no
+                // replay. A multi-open chain this machine does not know as a
+                // stack is the legacy shape, and there the caller has to say.
+                [.., top] if stacked_chain => (*top).clone(),
                 _ => {
                     return Err(RemoteError::NoWithdrawTarget {
                         open: open.iter().map(|p| p.number).collect(),
@@ -2622,57 +2955,93 @@ pub async fn withdraw(
         )));
     }
 
+    report.number = proposal.number;
+
+    // Where this layer sits, and what stands below it: both are read before a
+    // single call, because the repair moves the record out of the chain and
+    // the revert still needs the layers underneath it to restore from.
+    let index = state
+        .proposals
+        .iter()
+        .position(|p| p.number == proposal.number);
+    let below: Vec<Proposal> = match index {
+        Some(index) => state.proposals[..index]
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Open)
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    let open_layers = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .count();
+    // A repair is owed when this layer really is part of a chain: a stack the
+    // forge holds, or a second open layer that would be left dangling.
+    let repair_owed = stacked_path
+        && proposal.status == ProposalStatus::Open
+        && chain_is_stacked(&state)
+        && (state.stack_number.is_some() || open_layers >= 2);
+
+    if let (true, Some(index)) = (repair_owed, index) {
+        // Nothing is written until every layer above this one can be replayed:
+        // a chain left half re-based is worse than one never touched.
+        ensure_replayable(&state, index + 1)?;
+        provider.close_proposal(spec, proposal.number).await?;
+        report.closed = true;
+        // From here the chain is knowingly inconsistent, and the flag says so
+        // until the recreate lands. The withdrawn record stays in the chain,
+        // marked, so the repair can see where the hole is; `repair_chain`
+        // settles it to history once the survivors stand on their own.
+        state.proposals[index].status = ProposalStatus::Withdrawn;
+        state.repair_pending = true;
+        state.save(state_dir)?;
+
+        let outcome = repair_chain(provider, spec, &mut state, state_dir).await?;
+        report.repaired |= outcome.repaired;
+        report.restacked = outcome.restacked.or(report.restacked);
+
+        if revert {
+            revert_layer_files(
+                provider,
+                spec,
+                domain_root,
+                state_dir,
+                &proposal,
+                &below,
+                &mut report,
+            )
+            .await?;
+        }
+
+        // The branch goes last, once the repaired chain is durable: a survivor
+        // replayed onto a branch that is already gone would have nothing to
+        // sit on if this ran earlier and the repair then failed.
+        let _ = provider.delete_branch(spec, &proposal.branch).await;
+        return Ok(report);
+    }
+
     // Close first: a failure here aborts with nothing else changed. A
     // Declined proposal is already closed on the forge, so only the branch
     // cleanup applies to it.
-    let closed = if proposal.status == ProposalStatus::Open {
+    if proposal.status == ProposalStatus::Open {
         provider.close_proposal(spec, proposal.number).await?;
-        true
-    } else {
-        false
-    };
+        report.closed = true;
+    }
     let _ = provider.delete_branch(spec, &proposal.branch).await;
 
-    let mut restored = Vec::new();
-    let mut deleted = Vec::new();
-    let mut skipped_diverged = Vec::new();
     if revert {
-        for pf in &proposal.files {
-            let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
-            let current = read_optional_file(&wt_path)?;
-            let current_sha = current.as_deref().map(state::sha256_hex);
-
-            let diverged = match pf.change {
-                ProposedChange::Added | ProposedChange::Modified => {
-                    current_sha.as_deref() != pf.sha256.as_deref()
-                }
-                ProposedChange::Deleted => current.is_some(),
-            };
-            if diverged {
-                skipped_diverged.push(pf.path.clone());
-                continue;
-            }
-
-            match pf.change {
-                ProposedChange::Added => {
-                    remove_working_file(&wt_path)?;
-                    deleted.push(pf.path.clone());
-                }
-                ProposedChange::Modified | ProposedChange::Deleted => {
-                    match state::read_base_file(state_dir, &pf.path)? {
-                        Some(bytes) => {
-                            write_working_file(&wt_path, &bytes)?;
-                            restored.push(pf.path.clone());
-                        }
-                        // No base copy to restore from (should not happen: a
-                        // Modified or Deleted change always had a base entry);
-                        // never destroy the local file over it, so this is left
-                        // alone like a genuine divergence.
-                        None => skipped_diverged.push(pf.path.clone()),
-                    }
-                }
-            }
-        }
+        revert_layer_files(
+            provider,
+            spec,
+            domain_root,
+            state_dir,
+            &proposal,
+            &below,
+            &mut report,
+        )
+        .await?;
     }
 
     state.proposals.retain(|p| p.number != proposal.number);
@@ -2681,13 +3050,131 @@ pub async fn withdraw(
     state.push_history(record);
     state.save(state_dir)?;
 
-    Ok(WithdrawReport {
-        number: proposal.number,
-        closed,
-        restored,
-        deleted,
-        skipped_diverged,
-    })
+    Ok(report)
+}
+
+/// Puts the working tree back the way it stood before `proposal` was shared,
+/// for every file the proposal itself changed and no other.
+///
+/// A file that diverged since sharing is never touched: the recorded digest is
+/// what says whether the local copy is still the one that was proposed, and
+/// anything else is newer work. What a restore reads from is the base snapshot
+/// - except where the trunk never carried the file at all, which is the shape
+/// a stacked chain makes possible: a layer below added the path and this layer
+/// modified or retired it, so the pre-share content is that lower layer's, and
+/// the only copy of it is the blob its record names. That blob is fetched by
+/// sha and CHECKED against the lower record's digest before it is written; a
+/// record with no blob sha, a fetch that fails and content that does not hash
+/// to what was recorded all leave the path exactly as it stands and name it in
+/// [`WithdrawReport::skipped_reverts`]. A withdrawal is never failed over a
+/// file that cannot be put back.
+async fn revert_layer_files(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    proposal: &Proposal,
+    below: &[Proposal],
+    report: &mut WithdrawReport,
+) -> Result<(), RemoteError> {
+    for pf in &proposal.files {
+        let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
+        let current = read_optional_file(&wt_path)?;
+        let current_sha = current.as_deref().map(state::sha256_hex);
+
+        let diverged = match pf.change {
+            ProposedChange::Added | ProposedChange::Modified => {
+                current_sha.as_deref() != pf.sha256.as_deref()
+            }
+            ProposedChange::Deleted => current.is_some(),
+        };
+        if diverged {
+            report.skipped_diverged.push(pf.path.clone());
+            continue;
+        }
+
+        match pf.change {
+            ProposedChange::Added => {
+                remove_working_file(&wt_path)?;
+                report.deleted.push(pf.path.clone());
+            }
+            ProposedChange::Modified | ProposedChange::Deleted => {
+                match state::read_base_file(state_dir, &pf.path)? {
+                    Some(bytes) => {
+                        write_working_file(&wt_path, &bytes)?;
+                        report.restored.push(pf.path.clone());
+                    }
+                    // The trunk has no copy. On a chain that means a layer
+                    // below owns the path, and its recorded blob is the
+                    // pre-share content; anywhere else there is simply nothing
+                    // to restore from and the file is left alone.
+                    None => match layer_below_content(provider, spec, below, &pf.path).await {
+                        Some(bytes) => {
+                            write_working_file(&wt_path, &bytes)?;
+                            report.restored.push(pf.path.clone());
+                        }
+                        None => report.skipped_reverts.push(pf.path.clone()),
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The content the nearest layer below carries at `path`, fetched by blob sha
+/// and verified against that layer's recorded digest, or `None` when no layer
+/// below can speak for the path with content this function is willing to
+/// write.
+///
+/// Nearest first, since a higher layer's version is the one that stood
+/// directly beneath the withdrawn layer. Every way this can go wrong answers
+/// `None` rather than an error: a record from before blob shas existed, a
+/// record with no digest to check against, a blob the forge no longer has, and
+/// content that does not hash to what was recorded. The caller reports the
+/// path as unrestored, which is the honest outcome.
+async fn layer_below_content(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    below: &[Proposal],
+    path: &str,
+) -> Option<Vec<u8>> {
+    for layer in below.iter().rev() {
+        let Some(file) = layer.files.iter().find(|f| f.path == path) else {
+            continue;
+        };
+        match file.change {
+            ProposedChange::Added | ProposedChange::Modified => {}
+            // This layer retired the path too, so it is not what stood below.
+            ProposedChange::Deleted => return None,
+        }
+        let (Some(blob_sha), Some(recorded)) = (file.blob_sha.as_deref(), file.sha256.as_deref())
+        else {
+            tracing::debug!(
+                "layer #{} records {path} without a blob to restore it from",
+                layer.number
+            );
+            return None;
+        };
+        match provider.blob(spec, blob_sha).await {
+            Ok(bytes) if state::sha256_hex(&bytes) == recorded => return Some(bytes),
+            Ok(_) => {
+                tracing::debug!(
+                    "the blob layer #{} records for {path} does not hash to its recorded digest",
+                    layer.number
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "fetching layer #{}'s copy of {path} failed: {e}",
+                    layer.number
+                );
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Resolves one recorded conflict at `path`: settles it per `resolution`,
