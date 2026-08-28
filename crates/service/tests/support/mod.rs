@@ -640,10 +640,20 @@ impl Provider for MockProvider {
         number: u64,
         _title: Option<&str>,
         _body: Option<&str>,
-        _base: Option<&str>,
+        base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("update_proposal:{number}"));
+        // A retarget is recorded as its own line, mirroring the remote crate's
+        // mock: an amend re-bases the layers above it, and the only evidence
+        // that reached this double is the base each `update_proposal` carried.
+        // Recorded beside the plain line rather than instead of it, so
+        // existing `update_proposal:{number}` assertions keep matching.
+        if let Some(base) = base {
+            inner
+                .calls
+                .push(format!("update_proposal_base:{number}:{base}"));
+        }
         Ok(())
     }
 

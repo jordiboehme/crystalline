@@ -150,7 +150,8 @@ pub(crate) fn proposal_transitions_json(
 /// Shapes one domain's [`OriginStatusReport`] into `origin_status`'s
 /// per-domain entry: `{ domain, repo, branch, base_commit, behind,
 /// local_changes, skipped_large, open_proposals, declined_proposals,
-/// conflicts, last_checked, probe_error }`. `probe_error` carries the live
+/// conflicts, last_checked, probe_error, stack_number, stack_wedged,
+/// repair_pending, stack_link_pending }`. `probe_error` carries the live
 /// probe's own error message, verbatim, when the probe failed for a
 /// transport reason (offline, rate limited, an expired connection) and the
 /// report was produced by retrying with no probe at all; `null` when the
@@ -161,6 +162,14 @@ pub(crate) fn proposal_transitions_json(
 /// longer matches the recorded one, so the caller can say a reviewer moved
 /// the branch without a second round trip. It is false for every proposal
 /// when the live list was not consulted at all (offline, or a failed list).
+///
+/// The four stack keys name where the domain's chain stands: `stack_number`
+/// (the chain's number on the forge, `null` when nothing is stacked),
+/// `stack_wedged` (Declined layers still carrying open layers above them, an
+/// empty list when the chain is sound), and the two debts a caller can act on
+/// by sharing or checking status again, `repair_pending` and
+/// `stack_link_pending`. All four are always present, quiet rather than
+/// absent off the stacked path, so one reader handles either path.
 pub(crate) fn status_report_json(
     domain: &str,
     report: &OriginStatusReport,
@@ -188,6 +197,10 @@ pub(crate) fn status_report_json(
         "conflicts": report.conflicts,
         "last_checked": report.last_checked,
         "probe_error": probe_error,
+        "stack_number": report.stack_number,
+        "stack_wedged": report.stack_wedged,
+        "repair_pending": report.repair_pending,
+        "stack_link_pending": report.stack_link_pending,
     })
 }
 
@@ -209,10 +222,15 @@ pub(crate) fn is_probe_transport_error(err: &RemoteError) -> bool {
 /// Shapes one domain's offline [`OriginStatusReport`] together with the
 /// poller's own schedule and last result into `status_report`'s `origins`
 /// block entry: `{ domain, repo, branch, last_checked, last_result,
-/// next_due, open_proposals, declined_proposals, conflicts, local_changes
-/// }`. `next_due` and `last_result` are `null` for a domain the poller has
-/// not scheduled or completed a tick for yet: a freshly enabled or freshly
-/// added domain, or any domain when no daemon runs the poller at all.
+/// next_due, open_proposals, declined_proposals, conflicts, local_changes,
+/// stack_number, stack_wedged, repair_pending, stack_link_pending }`. The
+/// four stack keys carry the same meaning they do in [`status_report_json`],
+/// and are the one place the glance keeps whole lists rather than counts:
+/// a wedged layer is named by number because that number is what a caller
+/// withdraws or shares against. `next_due` and `last_result` are `null` for
+/// a domain the poller has not scheduled or completed a tick for yet: a
+/// freshly enabled or freshly added domain, or any domain when no daemon runs
+/// the poller at all.
 /// Unlike [`status_report_json`] (which embeds the full open and declined
 /// proposal records for `origin_status`'s detailed view), this counts them:
 /// the status overview stays a glance rather than a second copy of
@@ -234,6 +252,10 @@ pub(crate) fn origin_poll_status_json(
         "declined_proposals": report.declined_proposals.len(),
         "conflicts": report.conflicts.len(),
         "local_changes": report.local_changes,
+        "stack_number": report.stack_number,
+        "stack_wedged": report.stack_wedged,
+        "repair_pending": report.repair_pending,
+        "stack_link_pending": report.stack_link_pending,
     })
 }
 
@@ -257,11 +279,18 @@ fn poll_outcome_json(outcome: &DomainPollOutcome) -> Value {
 
 /// Shapes [`ops::propose`]'s outcome into `origin_share`'s JSON: `{ outcome:
 /// "proposed", url, number, branch, added, updated, deleted, skipped_large,
-/// summary }` when a pull request was opened, `{ outcome: "updated", proposal
-/// }` when the one open proposal was updated in place, `{ outcome:
-/// "nothing_to_share", skipped_large }` when the team already has everything
-/// the domain knows, or `{ outcome: "proposal_diverged", proposal, guidance }`
-/// when a reviewer moved the proposal branch and nothing was written. The
+/// summary, stack_number, stack_position }` when a pull request was opened
+/// (a new layer on a chain included), `{ outcome: "updated", proposal }` when
+/// an open proposal was amended in place, `{ outcome: "nothing_to_share",
+/// skipped_large }` when the team already has everything the domain knows, or
+/// `{ outcome: "proposal_diverged", proposal, guidance }` when a reviewer
+/// moved the proposal branch and nothing was written.
+///
+/// `stack_number` names the chain this proposal belongs to on the forge and
+/// `stack_position` is `[layer, open layers]` with a 1-based layer, so a
+/// caller can say "layer 2 of 2 on stack #42" without a second call. Both are
+/// `null` off the stacked path - an unstacked forge, a lone proposal - rather
+/// than absent, so one shape reads either way. The
 /// further outcome a caller may see, `conflicts_pending`, is not shaped here:
 /// `Engine::origin_share` builds it directly from the reloaded conflict list
 /// when `ops::propose` itself refuses, since `RemoteError::ConflictsPending`
@@ -278,6 +307,8 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
             "deleted": report.deleted,
             "skipped_large": report.skipped_large,
             "summary": report.summary,
+            "stack_number": report.stack_number,
+            "stack_position": report.stack_position,
         }),
         ProposeOutcome::Updated(report) => json!({
             "outcome": "updated",
@@ -290,6 +321,8 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
                 "deleted": report.deleted,
                 "skipped_large": report.skipped_large,
                 "summary": report.summary,
+                "stack_number": report.stack_number,
+                "stack_position": report.stack_position,
             },
         }),
         ProposeOutcome::NothingToShare { skipped_large } => json!({
@@ -312,10 +345,10 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
 /// REST changes route: always `effective_title` and `changes` (one
 /// `{ path, kind }` entry per detected local change), plus the fields the
 /// planned action itself carries - `number` and `url` for an update,
-/// `top_number` and `top_title` for a new layer on an open chain, `number`,
-/// `url` and `layers_above` for an amend, all three of `number`, `url` and
-/// `branch` for a diverged proposal, `count` for pending conflicts and
-/// nothing extra for a create or a no-op.
+/// `top_number` and `top_title` for a `stack` (a new layer on an open chain),
+/// `number`, `url` and `layers_above` for an `amend`, all three of `number`,
+/// `url` and `branch` for a diverged proposal, `count` for pending conflicts
+/// and nothing extra for a create or a no-op.
 pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
     let changes: Vec<Value> = plan
         .changes
@@ -345,7 +378,7 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
             top_number,
             top_title,
         } => {
-            v["action"] = json!("stack_on_top");
+            v["action"] = json!("stack");
             v["top_number"] = json!(top_number);
             v["top_title"] = json!(top_title);
         }
@@ -380,8 +413,17 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
 
 /// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
 /// proposal number, whether a live pull request was closed on the forge, the
-/// fixed `"withdrawn"` status the record now carries, and the three
+/// fixed `"withdrawn"` status the record now carries, and the four
 /// working-tree lists a revert produces (all empty without one).
+/// `skipped_reverts` is the fourth: paths a revert left alone because their
+/// pre-share content is nowhere to be had, distinct from `skipped_diverged`,
+/// where the local file simply moved on.
+///
+/// `repaired` says the chain around the withdrawn layer was rebuilt, and
+/// `restacked` names the NEW stack number that rebuild allocated - `null`
+/// when no stack was recreated, which is both "no repair happened" and "the
+/// survivors no longer make a chain", so a caller reads it together with
+/// `repaired` rather than alone.
 pub(crate) fn withdraw_report_json(report: &ops::WithdrawReport) -> Value {
     json!({
         "number": report.number,
@@ -390,6 +432,9 @@ pub(crate) fn withdraw_report_json(report: &ops::WithdrawReport) -> Value {
         "restored": report.restored,
         "deleted": report.deleted,
         "skipped_diverged": report.skipped_diverged,
+        "skipped_reverts": report.skipped_reverts,
+        "repaired": report.repaired,
+        "restacked": report.restacked,
     })
 }
 
@@ -654,6 +699,58 @@ mod tests {
     }
 
     #[test]
+    fn status_report_json_names_the_stack_and_its_debts() {
+        let report = OriginStatusReport {
+            repo: "acme/brand-knowledge".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: Some(false),
+            local_changes: 0,
+            skipped_large: vec![],
+            open_proposals: vec![],
+            declined_proposals: vec![],
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![],
+            stack_number: Some(42),
+            stack_wedged: vec![7],
+            repair_pending: true,
+            stack_link_pending: true,
+        };
+        let v = status_report_json("eng", &report, None);
+        assert_eq!(v["stack_number"], 42);
+        assert_eq!(v["stack_wedged"], json!([7]));
+        assert_eq!(v["repair_pending"], true);
+        assert_eq!(v["stack_link_pending"], true);
+    }
+
+    #[test]
+    fn status_report_json_keeps_the_stack_fields_present_when_nothing_is_stacked() {
+        let report = OriginStatusReport {
+            repo: "acme/brand-knowledge".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: Some(false),
+            local_changes: 0,
+            skipped_large: vec![],
+            open_proposals: vec![],
+            declined_proposals: vec![],
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
+        };
+        let v = status_report_json("eng", &report, None);
+        assert!(v["stack_number"].is_null(), "{v}");
+        assert_eq!(v["stack_wedged"], json!([]));
+        assert_eq!(v["repair_pending"], false);
+        assert_eq!(v["stack_link_pending"], false);
+    }
+
+    #[test]
     fn status_report_json_carries_a_probe_error_verbatim() {
         let report = OriginStatusReport {
             repo: "acme/brand-knowledge".to_string(),
@@ -720,6 +817,28 @@ mod tests {
         assert_eq!(v["next_due"], serde_json::to_value(next_due).unwrap());
         assert_eq!(v["last_result"]["outcome"], "applied");
         assert_eq!(v["last_result"]["applied"], 2);
+    }
+
+    #[test]
+    fn origin_poll_status_json_names_the_stack_and_its_debts() {
+        let mut report = poll_status_fixture();
+        report.stack_number = Some(42);
+        report.stack_wedged = vec![7, 9];
+        report.repair_pending = true;
+        report.stack_link_pending = true;
+        let v = origin_poll_status_json("eng", &report, None, None);
+        assert_eq!(v["stack_number"], 42);
+        assert_eq!(v["stack_wedged"], json!([7, 9]));
+        assert_eq!(v["repair_pending"], true);
+        assert_eq!(v["stack_link_pending"], true);
+
+        // Present and quiet rather than absent when nothing is stacked: the
+        // overview reads the same shape whichever path the domain is on.
+        let plain = origin_poll_status_json("eng", &poll_status_fixture(), None, None);
+        assert!(plain["stack_number"].is_null(), "{plain}");
+        assert_eq!(plain["stack_wedged"], json!([]));
+        assert_eq!(plain["repair_pending"], false);
+        assert_eq!(plain["stack_link_pending"], false);
     }
 
     #[test]
@@ -810,6 +929,63 @@ mod tests {
     }
 
     #[test]
+    fn propose_outcome_json_carries_the_stack_number_and_position() {
+        let outcome = ProposeOutcome::Proposed(ops::ProposeReport {
+            url: "https://github.com/acme/brand-knowledge/pull/8".to_string(),
+            number: 8,
+            branch: "crystalline/share-brand-240101120000".to_string(),
+            added: vec![],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Shares 1 new engram.".to_string(),
+            stack_number: Some(42),
+            stack_position: Some((2, 2)),
+        });
+        let v = propose_outcome_json(&outcome);
+        assert_eq!(v["stack_number"], 42);
+        assert_eq!(v["stack_position"], json!([2, 2]));
+    }
+
+    #[test]
+    fn propose_outcome_json_carries_the_stack_fields_on_an_amended_layer_too() {
+        let outcome = ProposeOutcome::Updated(ops::ProposeReport {
+            url: "https://github.com/acme/brand-knowledge/pull/8".to_string(),
+            number: 8,
+            branch: "crystalline/share-brand-240101120000".to_string(),
+            added: vec![],
+            updated: vec!["notes/a.md".to_string()],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Refines 1 engram.".to_string(),
+            stack_number: Some(42),
+            stack_position: Some((1, 3)),
+        });
+        let v = propose_outcome_json(&outcome);
+        assert_eq!(v["proposal"]["stack_number"], 42);
+        assert_eq!(v["proposal"]["stack_position"], json!([1, 3]));
+    }
+
+    #[test]
+    fn propose_outcome_json_leaves_the_stack_fields_null_off_the_stacked_path() {
+        let outcome = ProposeOutcome::Proposed(ops::ProposeReport {
+            url: "https://github.com/acme/brand-knowledge/pull/3".to_string(),
+            number: 3,
+            branch: "crystalline/share-brand-240101120000".to_string(),
+            added: vec![],
+            updated: vec![],
+            deleted: vec![],
+            skipped_large: vec![],
+            summary: "Shares 1 new engram.".to_string(),
+            stack_number: None,
+            stack_position: None,
+        });
+        let v = propose_outcome_json(&outcome);
+        assert!(v["stack_number"].is_null(), "{v}");
+        assert!(v["stack_position"].is_null(), "{v}");
+    }
+
+    #[test]
     fn propose_outcome_json_shapes_a_proposal_diverged_outcome_with_guidance() {
         let outcome = ProposeOutcome::ProposalDiverged {
             number: 3,
@@ -890,6 +1066,58 @@ mod tests {
         assert_eq!(diverged["action"], "proposal_diverged");
         assert_eq!(diverged["number"], 9);
         assert_eq!(diverged["branch"], "crystalline/share-brand");
+    }
+
+    #[test]
+    fn share_plan_json_names_the_stack_and_amend_actions() {
+        use crystalline_remote::changes::LocalChanges;
+        let plan = |action| ops::SharePlan {
+            action,
+            changes: LocalChanges::default(),
+            effective_title: String::new(),
+        };
+        let stack = share_plan_json(&plan(ops::PlannedAction::StackOnTop {
+            top_number: 6,
+            top_title: "Share glossary edits".to_string(),
+        }));
+        assert_eq!(stack["action"], "stack");
+        assert_eq!(stack["top_number"], 6);
+        assert_eq!(stack["top_title"], "Share glossary edits");
+        let amend = share_plan_json(&plan(ops::PlannedAction::Amend {
+            number: 9,
+            url: "https://github.test/pull/9".to_string(),
+            layers_above: 1,
+        }));
+        assert_eq!(amend["action"], "amend");
+        assert_eq!(amend["number"], 9);
+        assert_eq!(amend["url"], "https://github.test/pull/9");
+        assert_eq!(amend["layers_above"], 1);
+    }
+
+    #[test]
+    fn withdraw_report_json_carries_the_repair_and_the_unrevertable_paths() {
+        let report = ops::WithdrawReport {
+            number: 7,
+            closed: true,
+            skipped_reverts: vec!["notes/d.md".to_string()],
+            repaired: true,
+            restacked: Some(43),
+            ..Default::default()
+        };
+        let v = withdraw_report_json(&report);
+        assert_eq!(v["repaired"], true);
+        assert_eq!(v["restacked"], 43);
+        assert_eq!(v["skipped_reverts"], json!(["notes/d.md"]));
+
+        // A withdrawal off the stacked path says so rather than staying
+        // silent: false, null and an empty list, never absent keys.
+        let plain = withdraw_report_json(&ops::WithdrawReport {
+            number: 7,
+            ..Default::default()
+        });
+        assert_eq!(plain["repaired"], false);
+        assert!(plain["restacked"].is_null(), "{plain}");
+        assert_eq!(plain["skipped_reverts"], json!([]));
     }
 
     #[test]

@@ -1739,6 +1739,71 @@ async fn origin_share_maps_updated_and_diverged() {
     );
 }
 
+/// The `proposal` argument reaches `ops::propose` rather than being dropped
+/// on the way: naming the one open layer amends exactly it, and the response
+/// carries the stack fields (null here, since the mock forge serves no stacks
+/// and the share takes the single-proposal fallback).
+#[tokio::test]
+async fn origin_share_amend_param_reaches_ops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+
+    let v = eng
+        .origin_share("kb", None, None, Some(number))
+        .await
+        .unwrap();
+    assert_eq!(v["outcome"], "updated", "{v}");
+    assert_eq!(v["proposal"]["number"].as_u64(), Some(number), "{v}");
+    assert!(v["proposal"]["stack_number"].is_null(), "{v}");
+    assert!(v["proposal"]["stack_position"].is_null(), "{v}");
+}
+
+/// A share naming a proposal that is not an open layer earns `ops`'s teaching
+/// refusal, and that text has to reach a control or MCP client word for word:
+/// it names what was asked for and lists the layers that are actually open, so
+/// the caller retries against a real number without a second round trip. The
+/// engine boundary must not summarize it away.
+#[tokio::test]
+async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+
+    let err = eng
+        .origin_share("kb", None, None, Some(9999))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("proposal #9999 is not an open layer of this domain"),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!("open layers: #{number} (layer 1)")),
+        "{err}"
+    );
+}
+
+/// `origin_status`'s per-domain entry names the stack and every debt around
+/// it, even when there is nothing stacked: a caller reads the same four keys
+/// whichever path the domain is on.
+#[tokio::test]
+async fn origin_status_json_names_wedge_and_pending_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, _root, _number) = shared_team_engine(&tmp).await;
+    let v = eng.origin_status(Some("kb")).await.unwrap();
+    let domain = &v["domains"][0];
+    assert!(domain["stack_number"].is_null(), "{v}");
+    assert_eq!(
+        domain["stack_wedged"].as_array().map(Vec::len),
+        Some(0),
+        "{v}"
+    );
+    assert_eq!(domain["repair_pending"], false, "{v}");
+    assert_eq!(domain["stack_link_pending"], false, "{v}");
+}
+
 #[tokio::test]
 async fn origin_share_preview_names_the_action_and_changes() {
     let tmp = tempfile::tempdir().unwrap();
