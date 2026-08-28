@@ -505,7 +505,11 @@ fn single_domain(
             description = "The engine's own status report for this one \
                            domain, plus the mode it is synced in and this \
                            instance's GitHub connection. `local_changes` is \
-                           the unshared-work count a client shows as pending; \
+                           the unshared-work count a client shows as pending, \
+                           counting real work only: a refreshed folder listing \
+                           (`index.md`) is derived from the engrams beside it \
+                           and rides along with a share without ever being the \
+                           reason for one; \
                            `probe_error` is set when the live check could not \
                            reach GitHub and the rest of the report came from \
                            local state alone; `connection.connected` is false \
@@ -660,7 +664,9 @@ pub async fn sync_status(
             description = "The connection block, one counted entry per team \
                            domain, and the domains whose own status read \
                            failed. `local_changes` is the unshared-work count \
-                           a share action shows as pending; \
+                           a share action shows as pending, real work only: a \
+                           refreshed folder listing (`index.md`) rides along \
+                           with a share and never makes one worth offering; \
                            `open_proposals`, `declined_proposals` and \
                            `conflicts` are counts here rather than the \
                            records the per-domain route returns. `errors` \
@@ -929,7 +935,12 @@ pub async fn sync_now(
                    sit on, `amend` with the layer it would land on, \
                    `nothing_to_share`, `conflicts_pending`, \
                    `proposal_diverged`), the effective title and the changed \
-                   files. Writes nothing to the origin; refused on a \
+                   files. A generated folder listing (`index.md`) is a change \
+                   like any other here, because a share really carries it, but \
+                   it is derived rather than written and is left out of the \
+                   domain's `local_changes` count: a renderer counts these \
+                   into one line rather than listing them beside the engrams. \
+                   Writes nothing to the origin; refused on a \
                    read-only instance because the freshness pull writes the \
                    working tree.",
     params(("domain" = String, Path, description = "The registered team domain.")),

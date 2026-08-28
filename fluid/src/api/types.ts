@@ -543,7 +543,7 @@ export interface paths {
         };
         /**
          * Preview what sharing this team domain would do.
-         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
+         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
          */
         get: operations["get_domain_share_changes"];
         put?: never;
@@ -4118,7 +4118,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them.
+             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and rides along with a share without ever being the reason for one; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them.
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
              */
@@ -4279,7 +4279,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url` and `layers_above` for an `amend` (how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. */
+            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -5446,7 +5446,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending; `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) rides along with a share and never makes one worth offering; `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
              *
              *     Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
              */

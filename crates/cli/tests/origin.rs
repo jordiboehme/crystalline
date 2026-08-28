@@ -515,6 +515,53 @@ mod chain {
     }
 
     #[test]
+    fn refreshed_folder_indexes_get_one_line_and_stay_out_of_the_counts() {
+        let daemon = Daemon::answering(
+            "indexes",
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/9",
+                "number": 9,
+                "branch": "crystalline/brand-9",
+                "summary": "Shares 1 new engram.",
+                "added": ["notes/b.md", "index.md"],
+                "updated": ["notes/index.md"],
+                "deleted": [],
+                "skipped_large": [],
+                "stack_number": Value::Null,
+                "stack_position": Value::Null,
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        // The counts are about the engram; the listings that rode along with
+        // it say so once, underneath, and never inflate the numbers a reader
+        // recognizes their own work in.
+        assert!(out.contains("1 added, 0 updated, 0 deleted"), "{out}");
+        assert!(out.contains("also refreshes 2 folder indexes"), "{out}");
+    }
+
+    #[test]
+    fn a_share_with_no_refreshed_indexes_says_nothing_about_them() {
+        let daemon = Daemon::answering(
+            "plain",
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/9",
+                "number": 9,
+                "branch": "crystalline/brand-9",
+                "summary": "Shares 1 new engram.",
+                "added": ["notes/b.md"], "updated": [], "deleted": [],
+                "skipped_large": [],
+                "stack_number": Value::Null,
+                "stack_position": Value::Null,
+            }),
+        );
+        let out = daemon.run(&["origin", "share", "brand"]);
+        assert!(out.contains("1 added, 0 updated, 0 deleted"), "{out}");
+        assert!(!out.contains("folder index"), "{out}");
+    }
+
+    #[test]
     fn withdraw_names_the_repaired_chain_and_what_it_could_not_restore() {
         let daemon = Daemon::answering(
             "repaired",

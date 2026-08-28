@@ -444,7 +444,9 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// knows, the refusal when a reviewer amended the proposal's branch, or
 /// (when conflicts are still pending) every conflicting path plus a pointer
 /// at `origin resolve`. A proposal that stands in a chain of two or more open
-/// layers also says where it sits, through [`stack_line`].
+/// layers also says where it sits, through [`stack_line`]; a share that also
+/// carried refreshed folder listings says so in one line of its own, through
+/// [`print_change_counts`].
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -457,10 +459,7 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             if let Some(summary) = data["summary"].as_str() {
                 println!("  {summary}");
             }
-            let added = data["added"].as_array().map(Vec::len).unwrap_or(0);
-            let updated = data["updated"].as_array().map(Vec::len).unwrap_or(0);
-            let deleted = data["deleted"].as_array().map(Vec::len).unwrap_or(0);
-            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_change_counts(data);
             if let Some(line) = stack_line(data) {
                 println!("  {line}");
             }
@@ -476,10 +475,7 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             if let Some(summary) = prop["summary"].as_str() {
                 println!("  {summary}");
             }
-            let added = prop["added"].as_array().map(Vec::len).unwrap_or(0);
-            let updated = prop["updated"].as_array().map(Vec::len).unwrap_or(0);
-            let deleted = prop["deleted"].as_array().map(Vec::len).unwrap_or(0);
-            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_change_counts(prop);
             if let Some(line) = stack_line(prop) {
                 println!("  {line}");
             }
@@ -538,6 +534,42 @@ fn stack_line(proposal: &serde_json::Value) -> Option<String> {
         Some(stack) => format!("proposal #{number}, layer {layer} of {open} on stack #{stack}"),
         None => format!("proposal #{number}, layer {layer} of {open} (stack link pending)"),
     })
+}
+
+/// Print a shared proposal's change mix: one line of counts for the work
+/// somebody wrote, and one quiet line for the folder listings that rode along
+/// with it.
+///
+/// The listings are `index.md` files, generated from the engrams beside them so
+/// the team repository stays browsable on the forge. They travel with a share
+/// and they say nothing on their own, so counting them among the engrams would
+/// inflate every number a reader uses to recognize their own work. The second
+/// line is skipped entirely when there are none, which is most shares.
+fn print_change_counts(proposal: &serde_json::Value) {
+    let (added, added_indexes) = split_indexes(&proposal["added"]);
+    let (updated, updated_indexes) = split_indexes(&proposal["updated"]);
+    let (deleted, deleted_indexes) = split_indexes(&proposal["deleted"]);
+    println!("  {added} added, {updated} updated, {deleted} deleted");
+    let indexes = added_indexes + updated_indexes + deleted_indexes;
+    if indexes > 0 {
+        let noun = if indexes == 1 { "index" } else { "indexes" };
+        println!("  also refreshes {indexes} folder {noun}");
+    }
+}
+
+/// How many of a path list are real work and how many are generated folder
+/// listings, classified by filename since that is what a listing is.
+fn split_indexes(paths: &serde_json::Value) -> (usize, usize) {
+    let empty = Vec::new();
+    let mut work = 0usize;
+    let mut indexes = 0usize;
+    for path in paths.as_array().unwrap_or(&empty) {
+        match path.as_str() {
+            Some(path) if crystalline_core::is_index_path(path) => indexes += 1,
+            _ => work += 1,
+        }
+    }
+    (work, indexes)
 }
 
 fn print_skipped_large(skipped_large: &serde_json::Value) {

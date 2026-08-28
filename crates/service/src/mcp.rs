@@ -2822,6 +2822,14 @@ fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
 /// is being asked about work they already put in front of reviewers, not only
 /// about the layer they named.
 ///
+/// **Generated folder listings get one line at the end and no place in the
+/// list.** `index.md` files ride along with a share so the team repository
+/// stays browsable on the forge, and they are derived from the engrams beside
+/// them: counted among the changes they would crowd the real work out of the
+/// ten-file cap and say nothing in return. So they are summarized - "Also
+/// refreshes 3 folder indexes." - and a share carrying nothing else says that
+/// plainly instead of reading as a share of nothing.
+///
 /// **All four read as one instruction rather than four narrations.** Every
 /// leg opens with the imperative the create and update legs always used -
 /// "Open a new proposal", "Update open proposal #N", "Stack a new proposal on
@@ -2861,9 +2869,15 @@ fn share_question(preview: &Value) -> String {
     };
     let title = preview["effective_title"].as_str().unwrap_or_default();
     let empty = Vec::new();
-    let changes = preview["changes"].as_array().unwrap_or(&empty);
+    let all = preview["changes"].as_array().unwrap_or(&empty);
+    // The generated folder listings are counted, never listed. They travel with
+    // the share so the team repository stays browsable, and a person deciding
+    // whether to publish is deciding about the engrams: ten paths of derived
+    // churn ahead of them would push the real work off the end of the cap.
+    let indexes = all.iter().filter(|c| is_index_change(c)).count();
+    let changes: Vec<&Value> = all.iter().filter(|c| !is_index_change(c)).collect();
     let (mut added, mut updated, mut deleted) = (0usize, 0usize, 0usize);
-    for c in changes {
+    for c in &changes {
         match c["kind"].as_str() {
             Some("added") => added += 1,
             Some("modified") => updated += 1,
@@ -2882,9 +2896,38 @@ fn share_question(preview: &Value) -> String {
     } else {
         names.join(", ")
     };
-    format!(
-        "{action}? {label}: '{title}'. {added} added, {updated} modified, {deleted} deleted: {listed}. Reviewers see the result on GitHub."
-    )
+    let mut question = format!("{action}? {label}: '{title}'.");
+    if !changes.is_empty() {
+        question.push_str(&format!(
+            " {added} added, {updated} modified, {deleted} deleted: {listed}."
+        ));
+    }
+    if indexes > 0 {
+        let noun = if indexes == 1 { "index" } else { "indexes" };
+        // A share with nothing but listings in it is a real share somebody
+        // asked for, so the question says plainly what it would publish
+        // rather than reading as a share of nothing.
+        question.push_str(&if changes.is_empty() {
+            format!(" It refreshes {indexes} folder {noun} and nothing else.")
+        } else {
+            format!(" Also refreshes {indexes} folder {noun}.")
+        });
+    }
+    question.push_str(" Reviewers see the result on GitHub.");
+    question
+}
+
+/// Whether one entry of a share plan's `changes` array is a generated folder
+/// index rather than knowledge somebody wrote.
+///
+/// Read off the path's own filename, which is all the classification this
+/// needs: the plan carries no flag for it, and inventing one would put a
+/// presentation distinction into a wire schema that every other reader would
+/// then have to know about.
+fn is_index_change(change: &Value) -> bool {
+    change["path"]
+        .as_str()
+        .is_some_and(crystalline_core::is_index_path)
 }
 
 /// Trims `origin_status`'s per-domain proposal records to what a status
@@ -3800,6 +3843,73 @@ mod tests {
             "{amended}"
         );
         assert!(!amended.contains("Title: '"), "{amended}");
+    }
+
+    /// The generated folder listings, in the three shapes the question can
+    /// meet them: none at all, some beside real work, and a share that is
+    /// nothing but listings.
+    ///
+    /// The middle one is the whole point of the split. The listings are
+    /// counted and never named, so a sweep that refreshed forty of them still
+    /// shows the person the engrams they are actually publishing.
+    #[test]
+    fn the_share_question_gives_folder_listings_one_line_and_no_place_in_the_list() {
+        let none = share_question(&json!({
+            "action": "create", "effective_title": "Share 1 new engram from kb",
+            "changes": [{ "path": "notes/a.md", "kind": "added" }],
+        }));
+        assert!(
+            !none.contains("folder index"),
+            "nothing to say, so nothing said: {none}"
+        );
+        assert!(none.contains("1 added, 0 modified, 0 deleted: notes/a.md"));
+
+        let mixed = share_question(&json!({
+            "action": "create", "effective_title": "Share 1 new engram from kb",
+            "changes": [
+                { "path": "index.md", "kind": "modified" },
+                { "path": "notes/a.md", "kind": "added" },
+                { "path": "notes/index.md", "kind": "modified" },
+            ],
+        }));
+        assert!(
+            mixed.contains("1 added, 0 modified, 0 deleted: notes/a.md"),
+            "the listings are counted out of the mix: {mixed}"
+        );
+        assert!(!mixed.contains("notes/index.md"), "{mixed}");
+        assert!(
+            mixed.contains("Also refreshes 2 folder indexes."),
+            "{mixed}"
+        );
+
+        let one = share_question(&json!({
+            "action": "create", "effective_title": "Share 1 new engram from kb",
+            "changes": [
+                { "path": "notes/a.md", "kind": "added" },
+                { "path": "index.md", "kind": "modified" },
+            ],
+        }));
+        assert!(one.contains("Also refreshes 1 folder index."), "{one}");
+
+        let only = share_question(&json!({
+            "action": "create", "effective_title": "Refresh the listings in kb",
+            "changes": [
+                { "path": "index.md", "kind": "modified" },
+                { "path": "notes/index.md", "kind": "modified" },
+            ],
+        }));
+        assert!(
+            only.contains("It refreshes 2 folder indexes and nothing else."),
+            "an index-only share says what it does: {only}"
+        );
+        assert!(
+            !only.contains("0 added, 0 modified, 0 deleted"),
+            "and never as a share of nothing: {only}"
+        );
+        assert!(
+            only.contains("Reviewers see the result on GitHub."),
+            "{only}"
+        );
     }
 
     /// The withdrawal question, in its three shapes: the plain top layer, a

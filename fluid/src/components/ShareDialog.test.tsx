@@ -616,6 +616,92 @@ describe("the share dialog", () => {
     expect(within(dialog).getByText("notes/new-5.md")).toBeVisible();
   });
 
+  it("says nothing about folder listings when a share carries none", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(await within(dialog).findByText("Added 1")).toBeVisible();
+    expect(within(dialog).queryByText(/folder index/)).toBeNull();
+  });
+
+  it("counts refreshed folder listings in one line instead of listing them", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "index.md", kind: "modified" },
+          ...changesOf("added", 2, "new"),
+          { path: "notes/index.md", kind: "modified" },
+          { path: "runbooks/index.md", kind: "added" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The engrams are the share; the listings are what the share does to keep
+    // the repository browsable, and they never crowd the engrams out.
+    expect(await within(dialog).findByText("Added 2")).toBeVisible();
+    expect(within(dialog).queryByText("Modified 2")).toBeNull();
+    expect(within(dialog).queryByText("notes/index.md")).toBeNull();
+    expect(
+      within(dialog).getByText("Also refreshes 3 folder indexes"),
+    ).toBeVisible();
+  });
+
+  it("names a single refreshed listing in the singular", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [
+          { path: "notes/a.md", kind: "added" },
+          { path: "index.md", kind: "modified" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(
+      await within(dialog).findByText("Also refreshes 1 folder index"),
+    ).toBeVisible();
+  });
+
+  it("still shows the line when the listings are all a share carries", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Refresh the listings in eng",
+        changes: [
+          { path: "index.md", kind: "modified" },
+          { path: "notes/index.md", kind: "modified" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Nothing to group, and still something to say: somebody who opened this
+    // dialog is owed the reason the Share button is live.
+    expect(
+      await within(dialog).findByText("Also refreshes 2 folder indexes"),
+    ).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Share" })).toBeEnabled();
+  });
+
   it("badges each change with its kind letter and the word behind it", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({

@@ -20,6 +20,14 @@
  * A and an M. The badge sits on every row rather than once on the heading: the
  * box scrolls, and a row that has been scrolled away from its heading still has
  * to say what it is.
+ *
+ * Generated folder listings are the one thing kept out of the groups. An
+ * `index.md` is rebuilt from the engrams beside it so a team repository stays
+ * browsable on the forge, and it travels with a share for that reason alone: a
+ * sweep that touched forty folders would put forty derived paths in front of a
+ * reader looking for the three engrams they wrote. So they are counted rather
+ * than listed, in one muted line under the groups, and the line is absent
+ * entirely when there are none.
  */
 
 import type { ReactElement } from "react";
@@ -192,16 +200,27 @@ function ChangeGroup({
 }
 
 /**
+ * Whether a path is a generated folder listing rather than something somebody
+ * wrote, read off its filename the way the engine reads it.
+ */
+export function isFolderIndex(path: string): boolean {
+  return path === "index.md" || path.endsWith("/index.md");
+}
+
+/**
  * Every file a share would carry, by kind, inside a box that cannot grow past
- * the dialog it sits in.
+ * the dialog it sits in, with the folder listings counted beneath them.
  */
 export function ChangeList({
   changes,
 }: {
   changes: Change[];
 }): ReactElement | null {
-  const groups = groupChanges(changes);
-  if (groups.length === 0) {
+  const indexes = changes.filter((change) => isFolderIndex(change.path)).length;
+  const groups = groupChanges(
+    changes.filter((change) => !isFolderIndex(change.path)),
+  );
+  if (groups.length === 0 && indexes === 0) {
     return null;
   }
   return (
@@ -212,6 +231,14 @@ export function ChangeList({
       {groups.map((group) => (
         <ChangeGroup key={group.kind} kind={group.kind} paths={group.paths} />
       ))}
+      {indexes > 0 && (
+        // Under the groups and quieter than them, because that is exactly the
+        // weight it carries: something the share does, not something the
+        // reader has to decide about.
+        <p className="text-caption text-slate-500 dark:text-slate-400">
+          {`Also refreshes ${String(indexes)} folder ${indexes === 1 ? "index" : "indexes"}`}
+        </p>
+      )}
     </div>
   );
 }

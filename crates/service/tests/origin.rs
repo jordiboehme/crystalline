@@ -1604,7 +1604,18 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     mock.set_branch("main", &c2);
 
     let plan = eng.origin_share_preview("brand", None, None).await.unwrap();
-    assert_eq!(plan["action"], "nothing_to_share", "{plan}");
+    // Nothing this domain knows is unshared. What the plan does carry is the
+    // folder listings the generator wrote when the domain was subscribed: an
+    // origin that has never seen them is genuinely behind on them, and they
+    // ride along with a share rather than being one.
+    assert!(
+        plan["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["path"].as_str().unwrap_or_default().ends_with("index.md")),
+        "{plan}"
+    );
     assert!(root.join("notes/upstream-one.md").exists());
     assert_eq!(
         found("first upstream arrival").await,

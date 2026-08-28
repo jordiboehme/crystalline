@@ -59,6 +59,38 @@ const ERA: &str = "2026-07-28";
 /// `initialize` handshake.
 const LEGACY: &str = "2025-11-25";
 
+/// Every generated folder index under `root`, as domain-relative paths.
+///
+/// The engine writes one per directory it holds, and they travel with a share
+/// like any other file, so a fixture that wants a tree matching its origin has
+/// to put them in the origin too.
+fn generated_indexes(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.path().is_dir() {
+                stack.push((entry.path(), rel));
+            } else if crystalline_core::is_index_file(&name) {
+                found.push(rel);
+            }
+        }
+    }
+    found
+}
+
 // --- the engine, and the two wires ------------------------------------------
 
 struct Harness {
@@ -132,14 +164,13 @@ impl Harness {
         std::fs::create_dir_all(&token_store).unwrap();
 
         let mock = Arc::new(MockProvider::new());
-        let c1 = mock.add_commit(
-            [
+        let mut origin_tree: std::collections::BTreeMap<String, Vec<u8>> = [
                 ("MANIFEST.md".to_string(), b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n".to_vec()),
                 ("notes/a.md".to_string(), b"---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha\n".to_vec()),
             ]
             .into_iter()
-            .collect(),
-        );
+            .collect();
+        let c1 = mock.add_commit(origin_tree.clone());
         mock.set_branch("main", &c1);
 
         let store = TursoStore::open_in_memory().await.unwrap();
@@ -160,6 +191,20 @@ impl Harness {
             )
             .await
             .unwrap();
+        // Subscribing generates a folder index per directory, and those travel
+        // with a share now: left as they are, this domain would stand one
+        // refresh ahead of an origin that has never seen them, and "the tree
+        // matches the origin" would not be true of it. So the listings the
+        // generator just wrote are seeded into the origin and pulled back,
+        // which is exactly what the first share after an upgrade does. From
+        // here the tree really does match.
+        for rel in generated_indexes(&domain_root) {
+            let bytes = std::fs::read(domain_root.join(&rel)).unwrap();
+            origin_tree.insert(rel, bytes);
+        }
+        let c2 = mock.add_commit(origin_tree);
+        mock.set_branch("main", &c2);
+        engine.origin_update(Some("kb")).await.unwrap();
         (
             Harness {
                 _tmp: tmp,

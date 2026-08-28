@@ -27,6 +27,9 @@
  * The files are grouped by kind rather than listed flat, in {@link ChangeList}:
  * an evolve pass or an ingest shares hundreds at once, and the shape of that -
  * three added, a hundred and twenty-one modified - is what a reader decides on.
+ * The generated folder listings a share carries alongside them are counted into
+ * one line there rather than grouped, for the same reason: they are what keeps
+ * the team repository browsable, never what somebody is deciding about.
  *
  * An untouched title is not sent. The field is prefilled with the title the
  * server would generate anyway, so echoing it back as an explicit title would
