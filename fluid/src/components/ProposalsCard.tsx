@@ -25,14 +25,27 @@
  * `WithdrawProposalDialog` and `ShareDialog` are what mount once somebody
  * presses Withdraw or Share changes.
  *
- * A chain of stacked proposals is drawn as what it is: the open layers come in
- * chain order, bottom first, each wearing where it sits, and the chain itself
- * is named once above them. Two rules decide that, and they are the same two
- * the CLI's own renderer follows. One: a lone proposal stands in no chain a
- * reader needs told about, so nothing says "layer 1 of 1". Two: the position is
- * the gate and the stack number is named only when there is one - a chain whose
+ * A chain of stacked proposals is drawn as what it is: a rail with a node per
+ * layer, newest at the top, the layers that are no longer open below them and
+ * the branch the whole thing lands on at the foot. The order is the reverse of
+ * the report's, which sends a chain bottom first, and it is deliberate - a
+ * stack is drawn top down everywhere somebody has seen one before, the newest
+ * layer is the one just shared and the one the next share sits on, and the
+ * trunk at the bottom is what the chain is standing on. The positions are still
+ * named, so the report's own order is never lost.
+ *
+ * Two rules decide what is said about the chain, and they are the same two the
+ * CLI's own renderer follows. One: a lone proposal stands in no chain a reader
+ * needs told about, so nothing says "layer 1 of 1". Two: the position is the
+ * gate and the stack number is named only when there is one - a chain whose
  * linking call has not landed carries real positions with no number, and
  * "stack #null" would be worse than saying nothing about the number at all.
+ *
+ * What is wrong with the chain is said where it can be acted on. A wedged layer
+ * wears a badge on its own row, so a reader looking at the rail sees which node
+ * is holding it up rather than matching a number in a sentence against a list;
+ * the sentence itself stays once above the rail, because what it carries - the
+ * two verbs that settle it - is not something a badge can say.
  */
 
 import { useQuery } from "@tanstack/react-query";
@@ -123,8 +136,8 @@ export function ProposalsCard({
           No open proposals.
         </p>
       ) : (
-        <ul className="flex flex-col gap-3">
-          {proposals.map((proposal) => {
+        <ul className="flex flex-col">
+          {railOrder(proposals, open).map((proposal, index) => {
             // Where this one sits, worked out once from the open list rather
             // than carried per row: the report orders the chain and says how
             // it stands, and a row is a position in that order.
@@ -134,6 +147,8 @@ export function ProposalsCard({
                 key={proposal.number}
                 domain={domain}
                 proposal={proposal}
+                first={index === 0}
+                wedged={answered.stackWedged.includes(proposal.number)}
                 position={
                   chained && layer >= 0 ? [layer + 1, open.length] : null
                 }
@@ -145,6 +160,16 @@ export function ProposalsCard({
               />
             );
           })}
+          {/* What the whole rail stands on. The tracked branch is where
+              merging the top of the chain lands, and a report that did not
+              name one still has an origin the work goes to. */}
+          <li className="flex items-center gap-3 py-1 text-sm">
+            <Rail last />
+            <Chip mono>
+              <span className="sr-only">{"Trunk branch "}</span>
+              {answered.branch ?? "origin"}
+            </Chip>
+          </li>
         </ul>
       )}
       {sharing && (
@@ -160,13 +185,76 @@ export function ProposalsCard({
 }
 
 /**
+ * The order the rail is read in: the open layers newest first, then whatever is
+ * no longer open, in the order the report sent it.
+ *
+ * The reversal is the whole of it. A closed layer has no place in the chain the
+ * report will vouch for, so nothing is invented for it - it follows the chain
+ * rather than being threaded into it.
+ */
+function railOrder(
+  proposals: SyncProposal[],
+  open: SyncProposal[],
+): SyncProposal[] {
+  return [
+    ...[...open].reverse(),
+    ...proposals.filter((proposal) => !open.includes(proposal)),
+  ];
+}
+
+/** The rail's own ink, and the three faces a node on it wears. */
+const RAIL_INK = "bg-slate-200 dark:bg-slate-700";
+
+const RAIL_NODE = {
+  // Filled and accent: an open layer is live work.
+  open: "bg-accent-600 dark:bg-accent-400",
+  // Hollow: a layer that is no longer part of the chain.
+  closed:
+    "border border-slate-300 bg-white dark:border-slate-600 dark:bg-slate-950",
+  trunk:
+    "border border-slate-400 bg-white dark:border-slate-500 dark:bg-slate-950",
+} as const;
+
+/**
+ * One row's piece of the rail: the line above the node, the node, the line
+ * below it.
+ *
+ * Decorative to the letter - `aria-hidden`, no text - because everything it
+ * draws is already said in words on the row beside it. The first row has no
+ * line above its node and the trunk none below, so the rail begins and ends at
+ * a node rather than trailing off the ends of the list.
+ */
+function Rail({
+  first = false,
+  last = false,
+  node = "open",
+}: {
+  first?: boolean;
+  last?: boolean;
+  node?: keyof typeof RAIL_NODE;
+}): ReactElement {
+  return (
+    <span
+      aria-hidden="true"
+      className="flex w-3 shrink-0 flex-col items-center self-stretch"
+    >
+      <span className={`h-2.5 w-px ${first ? "" : RAIL_INK}`} />
+      <span className={`h-2 w-2 shrink-0 rounded-full ${RAIL_NODE[node]}`} />
+      <span className={`w-px flex-1 ${last ? "" : RAIL_INK}`} />
+    </span>
+  );
+}
+
+/**
  * What the chain itself is owed, said in the words of the verbs that settle it.
  *
- * Three lines, none of which prints while the chain is sound. A wedged layer is
- * named by number, one line each, because that number is what a reader
- * withdraws or shares against and a chain cannot grow until one of them does.
- * The two debts below it are not blockages at all: they are work the next write
- * finishes by itself, so they read as notes rather than as warnings.
+ * Three notes, none of which prints while the chain is sound. The wedged layers
+ * are named by number in one line rather than one line each: the number is what
+ * a reader withdraws or shares against, the row it belongs to wears a badge of
+ * its own, and a banner per number would push the rail off the card on a chain
+ * that is stuck in several places. The two debts below it are not blockages at
+ * all: they are work the next write finishes by itself, so they read as notes
+ * rather than as warnings.
  */
 function ChainNotices({
   wedged,
@@ -182,15 +270,15 @@ function ChainNotices({
   }
   return (
     <div className="flex flex-col gap-1 text-sm">
-      {wedged.map((number) => (
-        <p
-          key={number}
-          className="rounded bg-amber-50 px-3 py-2 text-amber-900 dark:bg-amber-950 dark:text-amber-200"
-        >
-          Stack wedged by #{String(number)} - withdraw it or share again to
-          repair the chain.
+      {wedged.length > 0 && (
+        <p className="rounded bg-amber-50 px-3 py-2 text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+          {`Stack wedged by ${wedged
+            .map((number) => `#${String(number)}`)
+            .join(", ")} - withdraw ${
+            wedged.length === 1 ? "it" : "them"
+          } or share again to repair the chain.`}
         </p>
-      ))}
+      )}
       {repairPending && (
         <p className="text-caption text-slate-500 dark:text-slate-400">
           Repair pending - the next share or withdraw finishes it.
@@ -253,11 +341,17 @@ function reviewVariant(state: string): ChipVariant {
 function ProposalRow({
   domain,
   proposal,
+  first,
+  wedged,
   position,
   layersAbove,
 }: {
   domain: string;
   proposal: SyncProposal;
+  /** Whether this is the head of the rail, which has no line above its node. */
+  first: boolean;
+  /** Whether the chain is stuck behind this one. */
+  wedged: boolean;
   /** `[layer, open layers]`, 1-based, or null when there is no chain to name. */
   position: [number, number] | null;
   /** How many open layers a withdraw here would re-base. */
@@ -269,137 +363,155 @@ function ProposalRow({
   const [notice, setNotice] = useState<string | null>(null);
 
   return (
-    <li className="flex flex-col gap-1 text-sm">
-      <div className="flex flex-wrap items-center gap-2">
-        {/* Where this layer sits, before what it is called: the chain is read
-            bottom-up, and the position is what makes the order legible. */}
-        {position !== null && (
-          <Chip>
-            layer {String(position[0])} of {String(position[1])}
-          </Chip>
-        )}
-        {isWebAddress(proposal.url) ? (
-          <a
-            href={proposal.url}
-            target="_blank"
-            rel="noreferrer"
-            className="font-medium underline underline-offset-2 hover:no-underline"
-          >
-            {proposal.title}
-          </a>
-        ) : (
-          // The title is still worth reading; the link is not worth having.
-          <span className="font-medium">{proposal.title}</span>
-        )}
-        <Chip variant={proposalStatusVariant(proposal.status)}>
-          {proposal.status}
-        </Chip>
-        {proposal.reviewState !== null && (
-          <Chip variant={reviewVariant(proposal.reviewState)}>
-            {/* The wire's underscores are a key, not a word somebody reads. */}
-            {proposal.reviewState.replaceAll("_", " ")}
-          </Chip>
-        )}
-        {/* Only on the open list, and only when a reviewer actually moved the
-            branch: it is the one fact that has to reach somebody before they
-            share into this proposal again. */}
-        {proposal.amendedUpstream && (
-          <Chip variant="caution">amended upstream</Chip>
-        )}
-        {/* Secondary: withdrawing is the exception, and the row's own subject
-            is the proposal rather than the button. */}
-        <button
-          type="button"
-          onClick={() => {
-            setProblem(null);
-            setNotice(null);
-            setConfirming(true);
-          }}
-          className={BUTTON.secondary}
-        >
-          Withdraw
-        </button>
-      </div>
+    <li className="flex gap-3 py-1 text-sm">
+      <Rail
+        first={first}
+        node={proposal.status === "open" ? "open" : "closed"}
+      />
+      <div className="flex min-w-0 flex-1 flex-col gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* The number first, the way a proposal is referred to everywhere
+              else: it is what a share, a withdraw and a review thread are all
+              addressed by. */}
+          <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
+            #{String(proposal.number)}
+          </span>
+          {isWebAddress(proposal.url) ? (
+            <a
+              href={proposal.url}
+              target="_blank"
+              rel="noreferrer"
+              className="font-medium underline underline-offset-2 hover:no-underline"
+            >
+              {proposal.title}
+            </a>
+          ) : (
+            // The title is still worth reading; the link is not worth having.
+            <span className="font-medium">{proposal.title}</span>
+          )}
+          {/* Where this one stands, pushed to the far end of the row: the rail
+              says the order, and this side says the standing. */}
+          <span className="ml-auto flex flex-wrap items-center gap-2">
+            {position !== null && (
+              <span className="text-caption text-slate-500 dark:text-slate-400">
+                layer {String(position[0])} of {String(position[1])}
+              </span>
+            )}
+            {/* The chain is stuck behind this one, said on the row it is
+                about rather than only in the banner above the rail. */}
+            {wedged && <Chip variant="caution">wedged</Chip>}
+            <Chip variant={proposalStatusVariant(proposal.status)}>
+              {proposal.status}
+            </Chip>
+            {proposal.reviewState !== null && (
+              <Chip variant={reviewVariant(proposal.reviewState)}>
+                {/* The wire's underscores are a key, not a word somebody
+                    reads. */}
+                {proposal.reviewState.replaceAll("_", " ")}
+              </Chip>
+            )}
+            {/* Only on the open list, and only when a reviewer actually moved
+                the branch: it is the one fact that has to reach somebody
+                before they share into this proposal again. */}
+            {proposal.amendedUpstream && (
+              <Chip variant="caution">amended upstream</Chip>
+            )}
+            {/* Secondary: withdrawing is the exception, and the row's own
+                subject is the proposal rather than the button. */}
+            <button
+              type="button"
+              onClick={() => {
+                setProblem(null);
+                setNotice(null);
+                setConfirming(true);
+              }}
+              className={BUTTON.secondary}
+            >
+              Withdraw
+            </button>
+          </span>
+        </div>
 
-      {proposal.feedback.length > 0 && (
-        <button
-          type="button"
-          aria-expanded={expanded}
-          onClick={() => {
-            setExpanded((open) => !open);
-          }}
-          className="self-start text-caption text-slate-500 underline underline-offset-2 hover:no-underline dark:text-slate-400"
-        >
-          {expanded
-            ? "Hide feedback"
-            : `Show feedback (${String(proposal.feedback.length)})`}
-        </button>
-      )}
-      {expanded && (
-        <ul className="flex flex-col gap-2 border-l-2 border-slate-200 pl-3 dark:border-slate-700">
-          {proposal.feedback.map((item, index) => (
-            // Keyed by position as well as instant: two comments can share a
-            // timestamp, and the list arrives whole and is never reordered.
-            <li key={`${String(index)}-${item.submittedAt ?? ""}`}>
-              <p className="flex flex-wrap items-baseline gap-2">
-                <span className="font-medium">{item.author}</span>
-                {item.path !== null && (
-                  <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
-                    {item.line === null
-                      ? item.path
-                      : `${item.path}:${String(item.line)}`}
-                  </span>
-                )}
-              </p>
-              {/* Verbatim, wrapping preserved: a review body is somebody's
+        {proposal.feedback.length > 0 && (
+          <button
+            type="button"
+            aria-expanded={expanded}
+            onClick={() => {
+              setExpanded((open) => !open);
+            }}
+            className="self-start text-caption text-slate-500 underline underline-offset-2 hover:no-underline dark:text-slate-400"
+          >
+            {expanded
+              ? "Hide feedback"
+              : `Show feedback (${String(proposal.feedback.length)})`}
+          </button>
+        )}
+        {expanded && (
+          <ul className="flex flex-col gap-2 border-l-2 border-slate-200 pl-3 dark:border-slate-700">
+            {proposal.feedback.map((item, index) => (
+              // Keyed by position as well as instant: two comments can share a
+              // timestamp, and the list arrives whole and is never reordered.
+              <li key={`${String(index)}-${item.submittedAt ?? ""}`}>
+                <p className="flex flex-wrap items-baseline gap-2">
+                  <span className="font-medium">{item.author}</span>
+                  {item.path !== null && (
+                    <span className="font-mono text-caption text-slate-500 dark:text-slate-400">
+                      {item.line === null
+                        ? item.path
+                        : `${item.path}:${String(item.line)}`}
+                    </span>
+                  )}
+                </p>
+                {/* Verbatim, wrapping preserved: a review body is somebody's
                   own paragraphs, and reflowing them loses the code and the
                   lists people write reviews in. */}
-              <p className="whitespace-pre-wrap">{item.body}</p>
-            </li>
-          ))}
-        </ul>
-      )}
+                <p className="whitespace-pre-wrap">{item.body}</p>
+              </li>
+            ))}
+          </ul>
+        )}
 
-      {problem !== null && (
-        <p
-          role="alert"
-          className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
-        >
-          {problem}
-        </p>
-      )}
+        {problem !== null && (
+          <p
+            role="alert"
+            className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+          >
+            {problem}
+          </p>
+        )}
 
-      {/* What a withdraw that landed could not do. Not a refusal - the
+        {/* What a withdraw that landed could not do. Not a refusal - the
           proposal is closed - so it is announced politely rather than as an
           alert, and it lands here for the same reason a refusal does: the
           dialog is gone by the time there is anything to say. */}
-      {notice !== null && (
-        <p
-          role="status"
-          className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200"
-        >
-          {notice}
-        </p>
-      )}
+        {notice !== null && (
+          <p
+            role="status"
+            className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200"
+          >
+            {notice}
+          </p>
+        )}
 
-      {confirming && (
-        <WithdrawProposalDialog
-          domain={domain}
-          proposal={proposal}
-          layersAbove={layersAbove}
-          onClose={() => {
-            setConfirming(false);
-          }}
-          onNotice={setNotice}
-          onProblem={(detail) => {
-            // The dialog closes with the refusal, so the message lands on the
-            // row: an open dialog `aria-hidden`s the page behind it, and an
-            // alert under one reaches nothing that reads the screen.
-            setConfirming(false);
-            setProblem(detail);
-          }}
-        />
-      )}
+        {confirming && (
+          <WithdrawProposalDialog
+            domain={domain}
+            proposal={proposal}
+            layersAbove={layersAbove}
+            onClose={() => {
+              setConfirming(false);
+            }}
+            onNotice={setNotice}
+            onProblem={(detail) => {
+              // The dialog closes with the refusal, so the message lands on the
+              // row: an open dialog `aria-hidden`s the page behind it, and an
+              // alert under one reaches nothing that reads the screen.
+              setConfirming(false);
+              setProblem(detail);
+            }}
+          />
+        )}
+      </div>
     </li>
   );
 }

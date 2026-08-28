@@ -107,6 +107,23 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/** Whether one element is drawn before another, in document order. */
+function precedes(before: Element, after: Element): boolean {
+  return (
+    (before.compareDocumentPosition(after) &
+      Node.DOCUMENT_POSITION_FOLLOWING) !==
+    0
+  );
+}
+
+/** `count` changes of one kind, named apart so each is findable. */
+function changesOf(kind: string, count: number, prefix: string) {
+  return Array.from({ length: count }, (_unused, index) => ({
+    path: `notes/${prefix}-${String(index)}.md`,
+    kind,
+  }));
+}
+
 /** How many times a route was asked for, exactly. */
 function reads(path: string): number {
   return requested().filter((asked) => asked === path).length;
@@ -450,6 +467,208 @@ describe("the share dialog", () => {
     expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
       proposal: 4,
     });
+  });
+
+  it("offers the newest layer first, under the default that stacks", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "https://github.com/acme/knowledge/pull/4",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+            {
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              title: "One more pass on the routing",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+        }),
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 7,
+        top_title: "One more pass on the routing",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    const select = await within(dialog).findByLabelText("Proposal");
+
+    // The report orders a chain bottom first, and a picker that repeated that
+    // order would put the layer somebody just shared - the one their review
+    // feedback is about - at the far end of the list. The layer that is
+    // stacked on is the layer most likely to be amended, so it comes first,
+    // under the default that stacks a new one over the top of it.
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([
+      "New proposal (stack on top)",
+      "Amend #7 - One more pass on the routing",
+      "Amend #4 - Refine 2 engrams in eng",
+    ]);
+  });
+
+  it("groups a long change list by kind and keeps the rest one press away", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 11 engrams from eng",
+        changes: [
+          ...changesOf("added", 3, "new"),
+          ...changesOf("modified", 7, "mod"),
+          { path: "notes/gone.md", kind: "deleted" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A sweep shares dozens to hundreds of files at once. The count per kind
+    // is the shape of the share; the paths are the detail behind it.
+    expect(await within(dialog).findByText("Added 3")).toBeVisible();
+    expect(within(dialog).getByText("Modified 7")).toBeVisible();
+    expect(within(dialog).getByText("Deleted 1")).toBeVisible();
+
+    // A group under the cap is whole, so nothing offers to expand it.
+    expect(within(dialog).getByText("notes/new-2.md")).toBeVisible();
+    // The one over it shows its first few and counts the rest.
+    expect(within(dialog).getByText("notes/mod-4.md")).toBeVisible();
+    expect(within(dialog).queryByText("notes/mod-5.md")).toBeNull();
+
+    const more = within(dialog).getByRole("button", { name: "and 2 more" });
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(more);
+
+    // Nothing is lost: the whole group is one press away, inside the same
+    // scrolling box rather than growing the dialog past the screen.
+    expect(within(dialog).getByText("notes/mod-5.md")).toBeVisible();
+    expect(within(dialog).getByText("notes/mod-6.md")).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Show fewer" }),
+    );
+    expect(within(dialog).queryByText("notes/mod-5.md")).toBeNull();
+  });
+
+  it("badges each change with its kind letter and the word behind it", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 3 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "added" },
+          { path: "notes/b.md", kind: "modified" },
+          { path: "notes/c.md", kind: "deleted" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The source-control idiom: one letter per row, color behind it rather
+    // than under it, and the word itself for anything that reads the page -
+    // color is never the only thing carrying the meaning.
+    const added = await within(dialog).findByRole("img", { name: "Added" });
+    expect(added).toHaveTextContent("A");
+    expect(
+      within(dialog).getByRole("img", { name: "Modified" }),
+    ).toHaveTextContent("M");
+    expect(
+      within(dialog).getByRole("img", { name: "Deleted" }),
+    ).toHaveTextContent("D");
+  });
+
+  it("keeps a kind it has not been taught, as the word it arrived as", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "vaporized" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A word this side has not been taught is somebody else's vocabulary
+    // rather than a malformed one: it gets the neutral face and its own
+    // initial, and the group still says what it is and how much of it there
+    // is.
+    expect(await within(dialog).findByText("vaporized 1")).toBeVisible();
+    expect(
+      within(dialog).getByRole("img", { name: "vaporized" }),
+    ).toHaveTextContent("V");
+  });
+
+  it("asks which layer first, then says what the share would do", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "https://github.com/acme/knowledge/pull/4",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+        }),
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The order the decision is actually made in: which layer this lands on
+    // decides what the sentence under it says, the changes are what is being
+    // landed, and the two fields are the wording somebody writes last.
+    const select = await within(dialog).findByLabelText("Proposal");
+    const line = within(dialog).getByText(
+      "Will stack a new proposal on top of #4.",
+    );
+    const changes = within(dialog).getByText("Modified 1");
+    const title = within(dialog).getByLabelText("Title");
+    const description = within(dialog).getByLabelText("Description");
+
+    expect(precedes(select, line)).toBe(true);
+    expect(precedes(line, changes)).toBe(true);
+    expect(precedes(changes, title)).toBe(true);
+    expect(precedes(title, description)).toBe(true);
+
+    // And the choice still rewrites the sentence rather than leaving the
+    // server's own plan standing over a target somebody just changed.
+    await userEvent.selectOptions(select, "4");
+    expect(
+      within(dialog).getByText("Sharing amends proposal #4."),
+    ).toBeVisible();
   });
 
   it("says where the proposal it just opened sits in the chain", async () => {

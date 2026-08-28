@@ -19,6 +19,15 @@
  * this dialog from the card costs nothing, and opening it from the top bar's
  * picker costs one read of a domain the reader is not standing in.
  *
+ * The form is ordered the way the decision is actually made: which layer the
+ * share lands on, then the sentence saying what landing there would do, then
+ * the files that would travel, and last the wording somebody writes for them.
+ * The picker comes first because it is what rewrites that sentence - asked
+ * after it, it would leave a line describing a share nobody is making any more.
+ * The files are grouped by kind rather than listed flat, in {@link ChangeList}:
+ * an evolve pass or an ingest shares hundreds at once, and the shape of that -
+ * three added, a hundred and twenty-one modified - is what a reader decides on.
+ *
  * An untouched title is not sent. The field is prefilled with the title the
  * server would generate anyway, so echoing it back as an explicit title would
  * change nothing on a create and would rename an open proposal on an update -
@@ -55,6 +64,7 @@ import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { asNumber, asObject, asString } from "../api/json";
 import { plural } from "../format";
+import { ChangeList } from "./ChangeList";
 import type { ShareDialogProps } from "./ShareDialog";
 import { BUTTON, Field } from "./primitives";
 
@@ -230,28 +240,26 @@ export default function ShareDialogBody({
           <Dialog.Title className="text-lg font-semibold">
             Share changes
           </Dialog.Title>
-          <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
-            {/*
-              Once there is an outcome the header says nothing of its own. The
-              plan's line is written in the future tense - "Sharing updates
-              proposal #4." - and left standing it would sit directly above a
-              sentence saying that share already happened, which reads as the
-              dialog contradicting itself about the one thing it is for. The
-              outcome below is the whole answer, so this steps out of its way
-              rather than paraphrasing it in a second voice.
-            */}
-            {outcome !== null
-              ? "Done."
-              : planProblem === null
-                ? // A chosen layer is the plan now: the server planned the
-                  // target it would have picked, and saying that line over a
-                  // choice somebody just made would describe a different
-                  // share from the one the button would send.
-                  amending === null
-                  ? actionLine(plan.data ?? null)
-                  : amendLine(amending, chosenLayersAbove)
-                : "This share could not be planned."}
-          </Dialog.Description>
+          {/*
+            Once there is an outcome the header says nothing of its own. The
+            plan's line is written in the future tense - "Sharing updates
+            proposal #4." - and left standing it would sit directly above a
+            sentence saying that share already happened, which reads as the
+            dialog contradicting itself about the one thing it is for. The
+            outcome below is the whole answer, so this steps out of its way
+            rather than paraphrasing it in a second voice.
+
+            While the form is up the description lives inside it instead, under
+            the layer picker: which layer the share lands on is what decides
+            what the sentence says, so the choice is asked before the sentence
+            that answers it. Exactly one of the two is ever mounted, so the
+            dialog is described once either way.
+          */}
+          {outcome !== null && (
+            <Dialog.Description className="mt-1 text-sm text-slate-500 dark:text-slate-400">
+              Done.
+            </Dialog.Description>
+          )}
           {outcome === null ? (
             <form
               className="mt-3 flex flex-col gap-3"
@@ -268,22 +276,6 @@ export default function ShareDialogBody({
                   {problem ?? planProblem}
                 </p>
               )}
-              {changes.length > 0 && (
-                <ul className="max-h-40 overflow-y-auto text-sm">
-                  {changes.map((change) => (
-                    <li key={change.path} className="flex items-baseline gap-2">
-                      {/* The verb in a fixed column so the paths line up: a
-                          list of files is read down the names, not across. */}
-                      <span className="w-16 shrink-0 text-caption text-slate-500 dark:text-slate-400">
-                        {change.kind}
-                      </span>
-                      <span className="font-mono text-xs break-all">
-                        {change.path}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
               {openLayers.length > 0 && (
                 <Field id={proposalField} label="Proposal">
                   <select
@@ -298,7 +290,14 @@ export default function ShareDialogBody({
                         share gets its own focused review, and reviewers land
                         the chain by merging the top. */}
                     <option value="">New proposal (stack on top)</option>
-                    {openLayers.map((layer) => (
+                    {/* Newest layer first, which is the reverse of the order
+                        the report sends and the same order the card draws.
+                        The chain is reviewed bottom up, but the layer somebody
+                        is most likely to amend is the one they last shared -
+                        the one at the top - and a picker that buried it at the
+                        far end of a long chain would put the likely choice
+                        furthest from the default. */}
+                    {[...openLayers].reverse().map((layer) => (
                       <option key={layer.number} value={String(layer.number)}>
                         Amend #{String(layer.number)} - {layer.title}
                       </option>
@@ -306,6 +305,17 @@ export default function ShareDialogBody({
                   </select>
                 </Field>
               )}
+              {/* The sentence the picker above decides: a chosen layer is the
+                  plan now, and saying the server's line over a choice somebody
+                  just made would describe a different share from the one the
+                  button would send. */}
+              <Dialog.Description className="text-sm text-slate-500 dark:text-slate-400">
+                {planProblem === null
+                  ? amending === null
+                    ? actionLine(plan.data ?? null)
+                    : amendLine(amending, chosenLayersAbove)
+                  : "This share could not be planned."}
+              </Dialog.Description>
               {amending !== null && (
                 // The one thing somebody amending a layer has to know, and it
                 // is general rather than a list of paths: the engine knows
@@ -317,6 +327,9 @@ export default function ShareDialogBody({
                   layer instead.
                 </p>
               )}
+              {/* What would travel, after what it would travel into: the
+                  grouping is what keeps a sweep's worth of files readable. */}
+              <ChangeList changes={changes} />
               <Field
                 id={titleField}
                 label="Title"

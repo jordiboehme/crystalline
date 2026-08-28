@@ -313,7 +313,7 @@ describe("the proposals card", () => {
     expect(within(card).getByText("open")).toBeVisible();
   });
 
-  it("says where each open layer sits, and which stack they are on", async () => {
+  it("draws the chain top down, with the trunk at the foot of the rail", async () => {
     serve({
       "/domains/eng/sync": () =>
         syncResponse({
@@ -325,15 +325,65 @@ describe("the proposals card", () => {
     renderApp("/d/eng");
     const card = await proposalsCard();
 
-    // Bottom-up, the way the chain is reviewed and the way the report orders
-    // it: the first row is the layer everything else sits on.
+    // Top down, the way a stack is drawn everywhere else: the newest layer is
+    // the one somebody just shared and the one their next share sits on, and
+    // it reads first. The report still orders the chain bottom first, and the
+    // positions say which is which either way.
     const rows = within(card).getAllByRole("listitem");
-    expect(rows[0]).toHaveTextContent("Refine 2 engrams in eng");
-    expect(rows[0]).toHaveTextContent("layer 1 of 2");
-    expect(rows[1]).toHaveTextContent("One more pass on the routing");
-    expect(rows[1]).toHaveTextContent("layer 2 of 2");
-    // And the chain itself, named once rather than per row.
+    expect(rows[0]).toHaveTextContent("One more pass on the routing");
+    expect(rows[0]).toHaveTextContent("layer 2 of 2");
+    expect(rows[1]).toHaveTextContent("Refine 2 engrams in eng");
+    expect(rows[1]).toHaveTextContent("layer 1 of 2");
+    // And what the whole chain stands on, at the foot of the rail: the
+    // tracked branch, which is where merging the top of it lands.
+    expect(rows[2]).toHaveTextContent("main");
+    // The chain itself, named once rather than per row.
     expect(within(card).getByText("stack #42")).toBeVisible();
+  });
+
+  it("names the trunk origin when the report did not say which branch", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ open_proposals: stackedProposals(), branch: null }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The foot of the rail is where the chain lands, and it is worth drawing
+    // even when the report carried no branch name to put on it.
+    const rows = within(card).getAllByRole("listitem");
+    expect(rows[rows.length - 1]).toHaveTextContent("origin");
+  });
+
+  it("marks the wedged layer on its own row, under one banner", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+          // The bottom layer is the one the chain is stuck behind.
+          stack_wedged: [4],
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The badge goes on the row it is about, so a reader looking at the chain
+    // sees which layer is holding it up rather than matching a number in a
+    // sentence against a list.
+    const rows = within(card).getAllByRole("listitem");
+    expect(rows[1]).toHaveTextContent("Refine 2 engrams in eng");
+    expect(within(rows[1] as HTMLElement).getByText("wedged")).toBeVisible();
+    expect(within(rows[0] as HTMLElement).queryByText("wedged")).toBeNull();
+    // And the guidance stays once, above the rail: it says which two verbs
+    // settle it, which is not something a badge can carry.
+    expect(
+      within(card).getByText(
+        "Stack wedged by #4 - withdraw it or share again to repair the chain.",
+      ),
+    ).toBeVisible();
   });
 
   it("says nothing about layers when only one proposal is open", async () => {
@@ -411,13 +461,10 @@ describe("the proposals card", () => {
     renderApp("/d/eng");
     const card = await proposalsCard();
 
-    // The bottom layer: closing it rebuilds everything above it, which is
-    // work already in front of reviewers.
-    await userEvent.click(
-      within(card).getAllByRole("button", {
-        name: "Withdraw",
-      })[0] as HTMLElement,
-    );
+    // The bottom layer, at the foot of the rail: closing it rebuilds
+    // everything above it, which is work already in front of reviewers.
+    const buttons = within(card).getAllByRole("button", { name: "Withdraw" });
+    await userEvent.click(buttons[buttons.length - 1] as HTMLElement);
     const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
     expect(
       within(dialog).getByText("Closes #4 and re-bases 1 layer above it."),
@@ -436,8 +483,9 @@ describe("the proposals card", () => {
     renderApp("/d/eng");
     const card = await proposalsCard();
 
+    // The top layer, at the head of the rail.
     const buttons = within(card).getAllByRole("button", { name: "Withdraw" });
-    await userEvent.click(buttons[buttons.length - 1] as HTMLElement);
+    await userEvent.click(buttons[0] as HTMLElement);
     const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
     // Nothing sits on the top layer, so nothing is re-based and nothing is
     // warned about.
