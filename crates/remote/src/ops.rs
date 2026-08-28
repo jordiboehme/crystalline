@@ -2606,10 +2606,14 @@ async fn collect_amend_changes(
     }
     for (path, bytes) in rebuild {
         let blob_sha = provider.create_blob(spec, &bytes).await?;
-        if let Some(entry) = merged.get_mut(&path) {
-            entry.blob_sha = Some(blob_sha);
-            entry.size = Some(bytes.len() as u64);
-        }
+        // Every rebuilt path was inserted into `merged` by the pass above, in
+        // the same iteration that queued it here, and nothing removes from
+        // `merged` in between: a miss would mean the two passes disagree.
+        let entry = merged
+            .get_mut(&path)
+            .expect("a rebuilt path is one the pre-pass kept");
+        entry.blob_sha = Some(blob_sha);
+        entry.size = Some(bytes.len() as u64);
     }
 
     for change in &fresh.changes {

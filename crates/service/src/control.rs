@@ -489,7 +489,13 @@ mod tests {
             let start = source.find(arm).unwrap_or_else(|| panic!("no {arm} arm"));
             let rest = &source[start + arm.len()..];
             // Up to the next arm at the same indentation, which is where this
-            // one's body ends.
+            // one's body ends. That eight-space prefix is the assumption this
+            // slice rests on: these arms sit two levels in, inside `match`
+            // inside `handle`. Reindent them (another nesting level, a helper
+            // function around them) and the slice runs past the arm into its
+            // neighbours, where a stray `optional_number` would keep this
+            // test green over an arm that no longer calls it - so move this
+            // pattern with the code rather than leaving it to match by luck.
             let body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
             assert!(
                 body.contains("optional_number(req, \"proposal\")"),

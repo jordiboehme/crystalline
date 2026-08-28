@@ -4813,6 +4813,11 @@ async fn a_deleted_file_replays_only_where_it_exists_below() {
 // tree and uploaded again, unless a layer above owns that same path - there
 // the working tree holds the layer above's content, and re-reading it would
 // quietly put that content into this layer.
+//
+// Which of the two helpers below a test uses decides which path it drives,
+// and the distinction is easy to lose: a record stripped of its size reads as
+// this share's own fresh work and takes the ordinary create path, so only
+// `forget_blob_shas_keeping_size` reaches the kept-entry re-read.
 
 /// Strips the blob sha and size off every file the layer at `index` records,
 /// leaving the record in the pre-0.17.0 shape.
@@ -4825,12 +4830,30 @@ fn forget_blob_shas(state_dir: &Path, index: usize) {
     state.save(state_dir).unwrap();
 }
 
+/// [`forget_blob_shas`] with the recorded size left alone, which is what it
+/// takes to reach the kept-entry re-read at all.
+///
+/// A record that loses its size too stops matching the chain tip it is
+/// measured against - the tip falls back to the trunk's size, and
+/// `detect_local_changes` calls a size mismatch a change before it ever
+/// hashes - so the path reads as this share's own FRESH work and the
+/// kept-entry branch is never entered. Keeping the size is therefore not a
+/// convenience here; it is the difference between testing the re-read and
+/// testing the ordinary create.
+fn forget_blob_shas_keeping_size(state_dir: &Path, index: usize) {
+    let mut state = load_state(state_dir);
+    for file in state.proposals[index].files.iter_mut() {
+        file.blob_sha = None;
+    }
+    state.save(state_dir).unwrap();
+}
+
 #[tokio::test]
 async fn amending_a_legacy_layer_re_uploads_what_its_record_lost() {
     let mock = MockProvider::new();
     mock.enable_stacks();
     let (sub, first) = stacked_bottom_layer(&mock).await;
-    forget_blob_shas(&sub.state_dir, 0);
+    forget_blob_shas_keeping_size(&sub.state_dir, 0);
 
     write(&sub.domain_root.join("notes/b.md"), b"beta\n");
     let before = mock.calls().len();
@@ -4838,7 +4861,10 @@ async fn amending_a_legacy_layer_re_uploads_what_its_record_lost() {
     assert_eq!(report.number, first.number);
 
     // The file the record could no longer name a blob for was re-read from
-    // the working tree and uploaded again.
+    // the working tree and uploaded again. This is the kept-entry branch,
+    // not the fresh-change one: notes/a.md still matches the stamp its own
+    // layer records, so this share detects nothing there and the blob can
+    // only have come from the re-read.
     let delta = mock.calls().split_off(before);
     assert!(
         delta.contains(&format!("create_blob:{}", sha256_hex(b"alpha v2\n"))),
@@ -4865,9 +4891,15 @@ async fn amending_a_legacy_layer_re_uploads_what_its_record_lost() {
         .iter()
         .find(|f| f.path == "notes/a.md")
         .expect("the layer still carries its own file");
-    assert!(
-        kept.blob_sha.is_some(),
-        "the record adopted the fresh blob: {kept:?}"
+    assert_eq!(
+        kept.blob_sha.as_deref(),
+        Some(sha256_hex(b"alpha v2\n").as_str()),
+        "the record adopted the blob the re-read uploaded: {kept:?}"
+    );
+    assert_eq!(
+        kept.size,
+        Some(b"alpha v2\n".len() as u64),
+        "and the size the rebuild pass wrote back: {kept:?}"
     );
 }
 
