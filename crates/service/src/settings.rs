@@ -614,9 +614,10 @@ const MAX_AGENT_IDENTITY_BYTES: usize = 128;
 /// The value names a Crystalline account whose credential the token store
 /// addresses by name, so it is held to that store's allowlist - `[a-z0-9._-]`
 /// - rather than to "anything without whitespace". An empty value clears the
-/// setting instead of storing a name nothing can resolve: `configure` and the
-/// REST admin API both set without an unset verb, so the empty string has to
-/// be the way back.
+/// setting instead of storing a name nothing can resolve: the REST admin API
+/// sets without an unset verb, so the empty string has to be the way back
+/// there (`configure` also carries Unset; `set_allowed_hosts` is the same
+/// trade).
 fn set_agent_identity(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
