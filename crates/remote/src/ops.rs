@@ -3324,10 +3324,10 @@ async fn repair_chain(
     // replayable and known to be ours, so a chain that cannot be healed - or
     // one carrying a reviewer's commits above the hole - is refused before the
     // dissolve rather than halfway up.
-    if let Some(index) = first_survivor {
-        if let Some(above) = ensure_cascade_ready(provider, spec, state, index).await? {
-            return Err(upper_layer_diverged(&above));
-        }
+    if let Some(index) = first_survivor
+        && let Some(above) = ensure_cascade_ready(provider, spec, state, index).await?
+    {
+        return Err(upper_layer_diverged(&above));
     }
 
     let mut outcome = RepairOutcome::default();
