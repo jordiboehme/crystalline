@@ -3098,8 +3098,32 @@ async fn a_conflicted_share_answers_round_one_with_the_pending_count() {
     assert_eq!(body["count"], json!(1), "{body}");
 }
 
-// --- withdraw_proposal -------------------------------------------------------
+// --- withdraw_proposal, and its own confirmation round -----------------------
+//
+// Withdrawing closes a pull request the team is looking at, and a `revert`
+// rewrites the working tree besides, so the eliciting peer is asked the same
+// way `share_changes` asks. The gate is the same two-sided one: a peer that
+// declared no elicitation capability is served exactly one round, unchanged.
 
+/// A withdraw call's params, optionally naming a layer and carrying a round 2
+/// answer.
+fn withdraw_kb(proposal: Option<u64>, responses: Option<Value>) -> Value {
+    let mut arguments = json!({ "domain": "kb" });
+    if let Some(number) = proposal {
+        arguments["proposal"] = json!(number);
+    }
+    let mut params = json!({
+        "name": "withdraw_proposal",
+        "arguments": arguments,
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The peer that cannot be asked keeps today's behaviour: one round, and the
+/// proposal is closed on the forge by the time it answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn withdraw_proposal_closes_the_open_proposal_single_round() {
     let (h, mock) = Harness::team().await;
@@ -3108,21 +3132,13 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
     let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
     assert!(shared["error"].is_null(), "{shared}");
 
-    // Single round even for an eliciting peer: no MRTR on withdraw (spec).
     let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            json!({
-                "name": "withdraw_proposal",
-                "arguments": { "domain": "kb" },
-            }),
-        ))
+        .call(modern(2, "tools/call", withdraw_kb(None, None)))
         .await;
     assert_ne!(
         done["result"]["resultType"],
         json!("input_required"),
-        "{done}"
+        "a peer that declared no elicitation is never asked: {done}"
     );
     assert!(done["result"]["isError"] != json!(true), "{done}");
     let body: Value =
@@ -3134,6 +3150,108 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
             .iter()
             .any(|c| c.starts_with("close_proposal:")),
         "{:?}",
+        mock.calls()
+    );
+}
+
+/// Round one names the proposal and closes nothing; round two closes it.
+///
+/// The negative half is the point, as it is for the share and delete rounds:
+/// an `input_required` answered after the pull request was already closed
+/// would be a confirmation of something the team can already see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_withdrawal_is_asked_before_the_proposal_is_closed() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    let body: Value =
+        serde_json::from_str(shared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let number = body["number"].as_u64().unwrap();
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", withdraw_kb(None, None)))
+        .await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Withdraws proposal #{number}")),
+        "the question names the layer it would close: {message}"
+    );
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "round one closes nothing: {:?}",
+        mock.calls()
+    );
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            withdraw_kb(None, Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["number"], json!(number));
+    assert_eq!(body["status"], "withdrawn");
+    assert_eq!(body["closed"], true);
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "and round two does close it: {:?}",
+        mock.calls()
+    );
+}
+
+/// A withdrawal that cannot resolve a target is reported, not negotiated: the
+/// teaching text arrives verbatim as an `invalid_params` error rather than as
+/// a question about a proposal that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_withdrawal_of_an_unknown_number_is_refused_rather_than_asked() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert!(shared["error"].is_null(), "{shared}");
+
+    let refused = wire
+        .call(eliciting(2, "tools/call", withdraw_kb(Some(99), None)))
+        .await;
+    assert!(
+        refused["result"]["resultType"] != json!("input_required"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["code"],
+        json!(-32602),
+        "an unresolvable target is the caller's mistake: {refused}"
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        json!("no open or declined proposal #99 found for this domain"),
+        "{refused}"
+    );
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "and nothing was closed: {:?}",
         mock.calls()
     );
 }

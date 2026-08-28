@@ -420,6 +420,83 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
     v
 }
 
+/// Resolves the layer a withdrawal would take out and shapes it for
+/// `origin_withdraw_preview`: `{ number, title, url, layers_above,
+/// only_layer, reverting }`.
+///
+/// **Target resolution mirrors [`ops::withdraw`]'s, read off one offline
+/// [`OriginStatusReport`] instead of origin state.** A named number is looked
+/// for among the open layers and then the declined records - a declined
+/// proposal can be withdrawn too, which tidies its record away - and a number
+/// that is neither is [`RemoteError::ProposalNotFound`]. With no number the
+/// target is the single open proposal, or, on a chain this machine knows as a
+/// stack, the TOP open layer: the one nothing is built on. Anything else - no
+/// open proposal, or the legacy multi-open shape from before stacking - is
+/// [`RemoteError::NoWithdrawTarget`] carrying both candidate lists, exactly
+/// the teaching error the withdrawal itself would raise a moment later.
+///
+/// The one deliberate difference is the stacks question. `ops::withdraw` asks
+/// the forge (through the cached `stacks_available` verdict) whether this
+/// origin serves stacks at all; a preview may not touch the forge, so it takes
+/// `stacks_allowed` (the `github.stacks` setting) together with the two chain
+/// facts the report already carries. Those can only disagree for a chain that
+/// records a stack number no forge ever served, and the cost of the
+/// disagreement is a question naming the top layer in front of a withdrawal
+/// that then refuses - never a withdrawal of some layer the user was not
+/// shown.
+///
+/// `layers_above` counts the OPEN layers standing above the target in chain
+/// order (zero for the top one, and for a declined record, which stands in no
+/// chain), because those are the layers a withdrawal re-bases. `only_layer`
+/// says the target is the domain's one open proposal. `reverting` carries the
+/// call's own `revert` flag through, so the question can name the working-tree
+/// half of what it is about to do.
+pub(crate) fn withdraw_plan_json(
+    report: &OriginStatusReport,
+    proposal: Option<u64>,
+    revert: bool,
+    stacks_allowed: bool,
+) -> Result<Value, RemoteError> {
+    let open = &report.open_proposals;
+    let target = match proposal {
+        Some(number) => open
+            .iter()
+            .chain(report.declined_proposals.iter())
+            .find(|p| p.number == number)
+            .ok_or(RemoteError::ProposalNotFound { number })?,
+        None => {
+            // `ops::chain_is_stacked`'s test, over the same three facts: a
+            // chain of one is trivially stackable, and beyond that this
+            // machine must know the chain as a stack (a recorded number, or a
+            // link it still owes the forge).
+            let stacked_chain = stacks_allowed
+                && (open.len() <= 1 || report.stack_number.is_some() || report.stack_link_pending);
+            match open.as_slice() {
+                [single] => single,
+                [.., top] if stacked_chain => top,
+                _ => {
+                    return Err(RemoteError::NoWithdrawTarget {
+                        open: open.iter().map(|p| p.number).collect(),
+                        declined: report.declined_proposals.iter().map(|p| p.number).collect(),
+                    });
+                }
+            }
+        }
+    };
+    let layers_above = open
+        .iter()
+        .position(|p| p.number == target.number)
+        .map_or(0, |index| open.len() - index - 1);
+    Ok(json!({
+        "number": target.number,
+        "title": target.title,
+        "url": target.url,
+        "layers_above": layers_above,
+        "only_layer": open.len() == 1 && open[0].number == target.number,
+        "reverting": revert,
+    }))
+}
+
 /// Shapes [`ops::withdraw`]'s report into `origin_withdraw`'s JSON: the
 /// proposal number, whether a live pull request was closed on the forge, the
 /// fixed `"withdrawn"` status the record now carries, and the four
@@ -1101,6 +1178,112 @@ mod tests {
         assert_eq!(amend["number"], 9);
         assert_eq!(amend["url"], "https://github.test/pull/9");
         assert_eq!(amend["layers_above"], 1);
+    }
+
+    /// A chain fixture for the withdrawal preview: `open` layers bottom-first,
+    /// the way origin state and [`OriginStatusReport`] both order them.
+    fn chain_fixture(open: &[u64], declined: &[u64], stacked: bool) -> OriginStatusReport {
+        let proposals = |numbers: &[u64], status: ProposalStatus| {
+            numbers
+                .iter()
+                .map(|n| {
+                    let mut p = proposal_fixture(
+                        *n,
+                        &format!("https://github.test/pull/{n}"),
+                        &format!("Layer {n}"),
+                    );
+                    p.status = status.clone();
+                    p
+                })
+                .collect::<Vec<_>>()
+        };
+        OriginStatusReport {
+            repo: "acme/brand-knowledge".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: None,
+            local_changes: 0,
+            skipped_large: vec![],
+            open_proposals: proposals(open, ProposalStatus::Open),
+            declined_proposals: proposals(declined, ProposalStatus::Declined),
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![],
+            stack_number: stacked.then_some(42),
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
+        }
+    }
+
+    #[test]
+    fn withdraw_plan_json_defaults_to_the_top_open_layer_and_counts_what_stands_above() {
+        // No number on a stacked chain: the top layer, the one nothing is
+        // built on, exactly as `ops::withdraw` resolves it.
+        let report = chain_fixture(&[5, 6, 7], &[], true);
+        let v = withdraw_plan_json(&report, None, false, true).unwrap();
+        assert_eq!(v["number"], 7);
+        assert_eq!(v["title"], "Layer 7");
+        assert_eq!(v["url"], "https://github.test/pull/7");
+        assert_eq!(v["layers_above"], 0);
+        assert_eq!(v["only_layer"], false);
+        assert_eq!(v["reverting"], false);
+
+        // A named layer lower down carries the cascade count with it.
+        let v = withdraw_plan_json(&report, Some(5), true, true).unwrap();
+        assert_eq!(v["number"], 5);
+        assert_eq!(v["layers_above"], 2);
+        assert_eq!(v["reverting"], true);
+    }
+
+    #[test]
+    fn withdraw_plan_json_names_the_lone_open_proposal() {
+        let report = chain_fixture(&[4], &[], false);
+        let v = withdraw_plan_json(&report, None, false, false).unwrap();
+        assert_eq!(v["number"], 4);
+        assert_eq!(v["layers_above"], 0);
+        assert_eq!(v["only_layer"], true);
+    }
+
+    /// The two refusals travel verbatim, because they are the teaching text
+    /// the caller acts on: an unknown number, and the legacy multi-open shape
+    /// this machine does not know as a stack.
+    #[test]
+    fn withdraw_plan_json_refuses_an_unknown_number_and_the_legacy_multi_open_shape() {
+        let report = chain_fixture(&[5, 6], &[3], true);
+        let err = withdraw_plan_json(&report, Some(99), false, true).unwrap_err();
+        assert!(matches!(err, RemoteError::ProposalNotFound { number: 99 }));
+
+        // Two open layers and no stack this machine knows: the caller has to
+        // say which one, and both candidate lists ride along.
+        let legacy = chain_fixture(&[5, 6], &[3], false);
+        let err = withdraw_plan_json(&legacy, None, false, true).unwrap_err();
+        match err {
+            RemoteError::NoWithdrawTarget { open, declined } => {
+                assert_eq!(open, vec![5, 6]);
+                assert_eq!(declined, vec![3]);
+            }
+            other => panic!("{other}"),
+        }
+
+        // And nothing open at all is the same refusal.
+        let empty = chain_fixture(&[], &[], false);
+        assert!(matches!(
+            withdraw_plan_json(&empty, None, false, true),
+            Err(RemoteError::NoWithdrawTarget { .. })
+        ));
+    }
+
+    /// A declined proposal can be withdrawn - it tidies the record away - so
+    /// naming its number previews rather than refusing. Nothing stands above a
+    /// record that stands in no chain, so the cascade count is zero.
+    #[test]
+    fn withdraw_plan_json_previews_a_declined_proposal_named_by_number() {
+        let report = chain_fixture(&[5], &[3], false);
+        let v = withdraw_plan_json(&report, Some(3), false, false).unwrap();
+        assert_eq!(v["number"], 3);
+        assert_eq!(v["layers_above"], 0);
+        assert_eq!(v["only_layer"], false);
     }
 
     #[test]

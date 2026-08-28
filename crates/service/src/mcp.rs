@@ -192,14 +192,22 @@
 //! [`resolved_overwrite`]) and a third condition beside the gate: a call that
 //! already passed `overwrite` answered the question before it was put.
 //!
-//! **A question is only put about a call that can run.** Both rounds that take
-//! an identifier resolve it before they ask - `delete_engram` through
+//! **The collaboration tools carry rounds of their own**, on the same three
+//! helpers: `share_changes` asks what it would publish before it publishes it,
+//! `withdraw_proposal` asks which proposal it would close, and
+//! `resolve_conflict` asks a mine-or-theirs question of its own shape when the
+//! caller named no resolution.
+//!
+//! **A question is only put about a call that can run.** Every round that takes
+//! a target resolves it before it asks - `delete_engram` through
 //! [`crate::engine::Engine::delete_preview`], the `evolve_ack` round through
-//! [`crate::engine::Engine::ack_preview`] - so a read-only server, a domain
-//! nobody registered and an identifier nobody has each fail in round one, and
-//! the question names what resolution found rather than what was typed. The
-//! collision round needs no such step: the write itself is what discovers the
-//! collision, and the question is built from the failure.
+//! [`crate::engine::Engine::ack_preview`], `share_changes` through
+//! [`crate::engine::Engine::origin_share_preview`] and `withdraw_proposal`
+//! through [`crate::engine::Engine::origin_withdraw_preview`] - so a read-only
+//! server, a domain nobody registered and a target nobody has each fail in
+//! round one, and the question names what resolution found rather than what was
+//! typed. The collision round needs no such step: the write itself is what
+//! discovers the collision, and the question is built from the failure.
 //!
 //! **An answer is not bound to the arguments it was asked about.** The client
 //! re-sends the original arguments beside the answer and nothing on this side
@@ -1709,7 +1717,7 @@ impl McpServer {
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1720,15 +1728,40 @@ impl McpServer {
     async fn withdraw_proposal(
         &self,
         Parameters(p): Parameters<WithdrawProposalParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
-            return refuse(RemoteError::NotEnabled.to_string());
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
+        }
+        let revert = p.revert.unwrap_or(false);
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    // The preview resolves the target the withdrawal itself
+                    // would, off local state and without a single provider
+                    // call, so a target that cannot be named is reported here
+                    // as the error it is rather than turned into a question
+                    // about a proposal that does not exist.
+                    let preview = self
+                        .engine
+                        .origin_withdraw_preview(&p.domain, p.proposal, revert)
+                        .await
+                        .map_err(to_error)?;
+                    return Ok(confirm_question(withdraw_question(&preview)).into());
+                }
+                Some(false) => {
+                    return refuse(WITHDRAW_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
         }
         self.engine
-            .origin_withdraw(&p.domain, p.proposal, p.revert.unwrap_or(false))
+            .origin_withdraw(&p.domain, p.proposal, revert)
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -2934,6 +2967,46 @@ fn drop_quiet_stack_keys(domain: &mut Value) {
 /// What an unconfirmed share tells the model, naming what did not happen.
 const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared. Call share_changes again if the user asks for it.";
 
+/// What an unconfirmed withdrawal tells the model, naming what is still true
+/// rather than what failed.
+const WITHDRAW_REFUSAL: &str = "The withdrawal was not confirmed, so the proposal is still open. Call withdraw_proposal again if the user asks for it.";
+
+/// The sentence `withdraw_proposal` asks before it closes anything, rendered
+/// from [`crate::engine::Engine::origin_withdraw_preview`]'s plan: the layer
+/// it would take out, the layers that move because of it, and the working-tree
+/// half of a `revert`.
+///
+/// **There is no deny-list beside this, and the difference from
+/// [`share_plan_needs_confirmation`] is the reason.** A share has three plans
+/// that publish nothing, so it has something to wave through; every withdrawal
+/// that resolves a target closes a proposal the team can see, and one that
+/// cannot resolve a target never reaches this renderer - it is the preview's
+/// error. So the gate here is the renderer itself: a plan shape this build
+/// does not recognize degrades to the thinner sentence it can render, and the
+/// round is still asked.
+///
+/// The cascade sentence is the one that earns its words. Withdrawing a layer
+/// that is not the top one re-bases every open layer above it, so saying yes
+/// moves work the user already put in front of reviewers, not only the
+/// proposal they named.
+fn withdraw_question(preview: &Value) -> String {
+    let mut question = format!(
+        "Withdraws proposal #{} ({}) and closes its pull request on GitHub.",
+        preview["number"].as_u64().unwrap_or_default(),
+        preview["title"].as_str().unwrap_or_default()
+    );
+    let layers_above = preview["layers_above"].as_u64().unwrap_or_default();
+    if layers_above > 0 {
+        question.push_str(&format!(
+            " {layers_above} layer(s) above it will be re-based."
+        ));
+    }
+    if preview["reverting"] == json!(true) {
+        question.push_str(" The shared files are restored locally where a copy is reachable.");
+    }
+    question
+}
+
 /// The sentence a conflict asks when the caller named no resolution: the
 /// conflict's path and kind, then a bounded preview of both sides.
 ///
@@ -3712,6 +3785,72 @@ mod tests {
             "{amended}"
         );
         assert!(!amended.contains("Title: '"), "{amended}");
+    }
+
+    /// The withdrawal question, in its three shapes: the plain top layer, a
+    /// layer carrying open work above it, and a withdrawal that also restores
+    /// the shared files locally.
+    ///
+    /// The cascade sentence is the one worth pinning. Saying yes to a
+    /// non-top layer moves every layer above it onto a new base, so the user
+    /// is agreeing to more than the proposal they named, and the question has
+    /// to say so before they do.
+    #[test]
+    fn the_withdraw_question_names_the_proposal_the_cascade_and_the_revert() {
+        let top = withdraw_question(&json!({
+            "number": 7, "title": "Refine alpha",
+            "url": "https://github.test/pulls/7",
+            "layers_above": 0, "only_layer": true, "reverting": false,
+        }));
+        assert_eq!(
+            top,
+            "Withdraws proposal #7 (Refine alpha) and closes its pull request on GitHub."
+        );
+
+        let middle = withdraw_question(&json!({
+            "number": 5, "title": "Share the glossary",
+            "url": "https://github.test/pulls/5",
+            "layers_above": 2, "only_layer": false, "reverting": false,
+        }));
+        assert!(
+            middle.contains("Withdraws proposal #5 (Share the glossary)"),
+            "{middle}"
+        );
+        assert!(
+            middle.contains("2 layer(s) above it will be re-based."),
+            "a withdrawal that moves other layers says so: {middle}"
+        );
+
+        let reverting = withdraw_question(&json!({
+            "number": 5, "title": "Share the glossary",
+            "url": "https://github.test/pulls/5",
+            "layers_above": 0, "only_layer": true, "reverting": true,
+        }));
+        assert!(
+            reverting.contains("The shared files are restored locally where a copy is reachable."),
+            "a revert changes the working tree, so it is named: {reverting}"
+        );
+        assert!(
+            !reverting.contains("layer(s) above"),
+            "nothing stands above it: {reverting}"
+        );
+    }
+
+    /// The fail-safe half: a preview shape this build does not recognize is
+    /// still rendered into a question rather than waved through.
+    ///
+    /// Unlike `share_changes` there is no quiet plan to let past - every
+    /// resolvable withdrawal closes something on the forge - so the gate is
+    /// the renderer itself: missing fields degrade to a thinner sentence, and
+    /// the round is still asked.
+    #[test]
+    fn the_withdraw_question_degrades_rather_than_skipping_the_round() {
+        let bare = withdraw_question(&json!({}));
+        assert!(bare.starts_with("Withdraws proposal #"), "{bare}");
+        assert!(
+            bare.contains("closes its pull request on GitHub."),
+            "{bare}"
+        );
     }
 
     #[test]

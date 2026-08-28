@@ -8583,6 +8583,49 @@ impl Engine {
         Ok(origin::share_plan_json(&plan))
     }
 
+    /// Previews which proposal a withdrawal would take out, without touching
+    /// the forge at all.
+    ///
+    /// A pure local read: the offline status path ([`ops::status`] with no
+    /// probe) reports this domain's open and declined proposals off origin
+    /// state, and [`origin::withdraw_plan_json`] resolves the target out of
+    /// that exactly as [`ops::withdraw`] would, refusing with the same
+    /// teaching errors when no single target can be named. Nothing is written
+    /// and no provider call is made, which is what lets an eliciting client
+    /// ask its user before a pull request is closed.
+    ///
+    /// It still carries the withdrawal's own gates - collaboration off,
+    /// read-only, an unregistered domain - rather than only the read's, so a
+    /// user is never asked to confirm a withdrawal this instance would refuse
+    /// to perform.
+    pub async fn origin_withdraw_preview(
+        &self,
+        domain: &str,
+        proposal: Option<u64>,
+        revert: bool,
+    ) -> Result<Value> {
+        let stacks_allowed = {
+            let config = self.config.read().unwrap();
+            if !config.github_enabled() {
+                return Err(RemoteError::NotEnabled.into());
+            }
+            config.github_stacks()
+        };
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let lock = self.origin_lock_registered(domain)?;
+        let _guard = lock.lock().await;
+        let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
+        let report = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await?;
+        Ok(origin::withdraw_plan_json(
+            &report,
+            proposal,
+            revert,
+            stacks_allowed,
+        )?)
+    }
+
     /// Withdraws a share proposal for one domain: closes its pull request on
     /// the forge, best-effort deletes its branch, optionally restores the
     /// shared files (`revert`) and records it as withdrawn. Under the
