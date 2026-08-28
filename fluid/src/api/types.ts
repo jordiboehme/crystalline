@@ -4284,20 +4284,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    /**
-                     * @example {
-                     *       "action": "update",
-                     *       "changes": [
-                     *         {
-                     *           "kind": "modified",
-                     *           "path": "notes/a.md"
-                     *         }
-                     *       ],
-                     *       "effective_title": "Refine 2 engrams in kb",
-                     *       "number": 4,
-                     *       "url": "https://github.com/acme/knowledge/pull/4"
-                     *     }
-                     */
                     "application/json": Record<string, never>;
                 };
             };
