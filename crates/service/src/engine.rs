@@ -9356,13 +9356,25 @@ impl Engine {
     /// Only `origin_status` is enriched, not [`Engine::origin_connection_json`]
     /// itself: the settings screen and the `configure` snapshot report the
     /// instance connection, and the personal identities they care about are the
-    /// SESSION's, served by `/me/github-identity`. The owner slot is the one a
-    /// CLI or stdio-MCP share resolves ([`Engine::acting_identity_name`]), which
-    /// is exactly who reads `origin status`.
+    /// SESSION's, served by `/me/github-identity`.
+    ///
+    /// The slot reported is the machine OWNER's, which is what a CLI or stdio-MCP
+    /// share resolves ([`Engine::acting_identity_name`]) - not what every reader
+    /// of this status resolves. An HTTP-MCP peer calls the same status tool and
+    /// its own shares run as `github.agent_identity`, so `owner_identity` is
+    /// under-reporting for that caller rather than wrong about it; naming the
+    /// agent slot beside this one is Task 13's call, not a claim this doc gets
+    /// to make.
     ///
     /// A credential that cannot be resolved reports as not connected rather
     /// than failing the whole status read: this is a report, and every other
     /// line of it survives an unreadable credential store.
+    ///
+    /// The cost, stated rather than hidden: only a PRESENT token is cached
+    /// ([`Engine::github_credential_for`]), so an instance in personal mode
+    /// whose owner has connected nothing pays one credential-store read per
+    /// `origin status` - deliberate, since it is also what lets a standalone
+    /// `crystalline connect github --personal` be seen without a restart.
     async fn origin_status_connection(&self) -> Result<Value> {
         let mut connection = self.origin_connection_json().await?;
         let mode = self.config.read().unwrap().github_share_identity();
@@ -9371,10 +9383,15 @@ impl Engine {
             let (connected, user) = if self.origin_provider_override.is_some() {
                 // An injected provider IS the credential (see
                 // `origin_connection_json`); reading a token store here would
-                // reach the machine's real keychain from a test.
+                // reach the machine's real keychain from a test. The login is
+                // deliberately null rather than the mock's: that login belongs
+                // to the injected INSTANCE provider, and reporting it here would
+                // invent a personal connection nobody made - the one thing this
+                // block must never do, since the whole point of the field is to
+                // say whether a share can go out at all.
                 (
                     connection["connected"].as_bool().unwrap_or(false),
-                    connection["user"].clone(),
+                    Value::Null,
                 )
             } else {
                 let identity = TokenIdentity::Personal(OWNER_IDENTITY_NAME.to_string());

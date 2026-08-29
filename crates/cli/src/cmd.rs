@@ -1509,7 +1509,14 @@ pub(crate) fn connect_identity(
 /// machine's, since that variable fixes the MACHINE's identity and an instance
 /// that sets it is exactly the kind that shares personally.
 ///
-/// `disconnect` forgets the addressed credential instead of connecting one.
+/// `disconnect` forgets the addressed credential instead of connecting one,
+/// and is allowed even while `CRYSTALLINE_GITHUB_TOKEN` is set: that variable
+/// fixes which identity this machine ACTS as, while a disconnect deletes what
+/// is stored, and deleting a stored credential the environment is currently
+/// shadowing is a perfectly meaningful thing to want (it is how a machine stops
+/// holding a token it no longer uses). The environment is untouched either way;
+/// unsetting the variable is what changes who this machine is.
+///
 /// A daemon that already resolved that credential keeps it cached for the rest
 /// of its process life (it re-reads on an expired token, never on a deleted
 /// one), so a running daemon sees a disconnect on its next restart - stated
@@ -1524,7 +1531,7 @@ pub async fn connect_github(
 ) -> Result<()> {
     let instance = *identity == crystalline_remote::TokenIdentity::Instance;
     let loaded = load(config_override)?;
-    if instance && loaded.overlay.github_token().is_some() {
+    if instance && !disconnect && loaded.overlay.github_token().is_some() {
         bail!(
             "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
         );
