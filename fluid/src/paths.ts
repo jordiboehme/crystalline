@@ -122,6 +122,17 @@ export function githubSettingsRoute(): string {
   return "/settings/github";
 }
 
+/**
+ * Your own profile: who this session is, and the GitHub identity it shares as.
+ *
+ * Not under `/settings/`, which is where this instance's own settings live and
+ * where only an admin goes. This screen is about the person rather than about
+ * the machine, and everybody who can share has one.
+ */
+export function profileRoute(): string {
+  return "/profile";
+}
+
 /** Where the topbar's search box sends a query. */
 export function searchRoute(query: string): string {
   return `/search?q=${encodeURIComponent(query)}`;

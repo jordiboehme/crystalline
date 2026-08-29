@@ -27,6 +27,7 @@ import {
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
+  GithubIdentityResponse,
   GithubStatusResponse,
 } from "./model";
 
@@ -146,6 +147,130 @@ export async function submitGithubToken(token: string): Promise<GithubStatus> {
 export async function disconnectGithub(): Promise<GithubStatus> {
   return readGithubStatus(
     await api<GithubStatusResponse>("/settings/github", { method: "DELETE" }),
+  );
+}
+
+/**
+ * One account's own GitHub identity, as the profile card renders and polls it.
+ *
+ * The instance connection's personal counterpart, and the same promise holds:
+ * no token material, ever. Only whose identity it is, whether a credential is
+ * on file, the login it authenticated as, since when and where it lives.
+ */
+export interface GithubIdentity {
+  /** The account it belongs to, which is always the caller's own. */
+  account: string;
+  /** Whether a personal credential is on file for that account. */
+  connected: boolean;
+  /** The GitHub login it authenticated as, when connected. */
+  login: string | null;
+  /** When the credential was stored, RFC 3339; null when disconnected. */
+  connectedAt: string | null;
+  /**
+   * `keyring` or `file`; null when disconnected. Never `environment`: the
+   * environment supplies the machine's credential and never a personal one.
+   */
+  tokenStore: string | null;
+  /** This account's device flow waiting for the browser side, or null. */
+  pending: GithubPending | null;
+  /**
+   * This account's finished flow's failure, in the server's words. Reported on
+   * exactly one read after the flow ends, then cleared.
+   */
+  error: string | null;
+}
+
+/**
+ * The cache key of the caller's own GitHub identity, and the third key in this
+ * app that sits outside the `["domains", ...]` family.
+ *
+ * A personal credential is not domain content: react-query invalidates by
+ * prefix, and an identity filed under `["domains"]` would be re-read by every
+ * bulk domain invalidation in the app - including the ones a share fires on its
+ * way out, which is precisely when this card is being watched. It is not the
+ * instance connection's key either: the two are different credentials with
+ * different lifetimes, and a disconnect on one must not blank the other's card.
+ */
+export const MY_GITHUB_IDENTITY_KEY = ["me-github-identity"] as const;
+
+/**
+ * Read an identity payload, whatever arrived.
+ *
+ * Defensive rather than cast, for the reason {@link readGithubStatus} is: this
+ * one is also the device flow's poll, read on a timer while a background flow
+ * finishes, and a field that is briefly missing should leave the card saying
+ * "not connected" rather than throwing inside a render.
+ */
+export function readMyGithubIdentity(payload: unknown): GithubIdentity {
+  const record = asObject(payload);
+  return {
+    account: asString(record?.account) ?? "",
+    connected: record?.connected === true,
+    login: asString(record?.login),
+    connectedAt: asString(record?.connected_at),
+    tokenStore: asString(record?.token_store),
+    pending: readPending(record?.pending),
+    error: asString(record?.error),
+  };
+}
+
+/**
+ * The caller's own identity as it stands. Also the device flow's poll: the
+ * flow finishes in another window, so there is no event to wait for.
+ *
+ * No account in the path, because the session already names one: this surface
+ * manages the caller's own credential and no one else's.
+ */
+export async function fetchMyGithubIdentity(): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity"),
+  );
+}
+
+/**
+ * Start a device-code sign-in for the caller's own identity.
+ *
+ * A second call from the same account reports the code already outstanding, so
+ * a double press is safe; one made while ANOTHER identity's sign-in is in
+ * flight is refused 409, which is the server's sentence to show as it stands.
+ */
+export async function startMyGithubIdentityDevice(): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity/connect", {
+      method: "POST",
+    }),
+  );
+}
+
+/**
+ * Connect the caller's own identity with a personal access token.
+ *
+ * `PUT`, unlike the instance surface's `POST`: this replaces the caller's one
+ * identity rather than adding to a collection, so re-pasting a token is the
+ * same request twice with the same result. The token goes out in this one body
+ * and is held nowhere - the answer is the same token-material-free identity
+ * every other verb here returns.
+ */
+export async function connectMyGithubIdentityToken(
+  token: string,
+): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity/token", {
+      method: "PUT",
+      body: JSON.stringify({ token }),
+    }),
+  );
+}
+
+/**
+ * Forget the caller's own credential. Idempotent, and the instance connection
+ * is untouched: each credential lives in its own store entry.
+ */
+export async function disconnectMyGithubIdentity(): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity", {
+      method: "DELETE",
+    }),
   );
 }
 

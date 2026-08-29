@@ -68,6 +68,7 @@ import {
   domainRoute,
   githubSettingsRoute,
   maintenanceRoute,
+  profileRoute,
   searchRoute,
   usersRoute,
 } from "../paths";
@@ -864,6 +865,16 @@ function UserMenu() {
                 {user.name} ({capabilities.role})
               </DropdownMenu.Label>
               <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+              {/*
+                Ungated, unlike the two rows under it: this one is about the
+                account in the line above rather than about the instance, so
+                every signed-in session has one to open. A viewer's says why
+                there is no identity to connect there, which is an answer
+                rather than a door that will not open.
+              */}
+              <DropdownMenu.Item className={ITEM_CLASSES} asChild>
+                <Link to={profileRoute()}>Profile</Link>
+              </DropdownMenu.Item>
               {capabilities.canAdminister && (
                 <>
                   <DropdownMenu.Item className={ITEM_CLASSES} asChild>

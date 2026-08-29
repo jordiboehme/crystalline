@@ -66,6 +66,12 @@ const EngramPage = lazy(() => import("./screens/EngramPage"));
 const GithubSettings = lazy(() => import("./screens/GithubSettings"));
 const UsersAdmin = lazy(() => import("./screens/UsersAdmin"));
 
+/**
+ * And the profile, lazy for the third of those reasons: it is a screen a reader
+ * opens once, to connect the identity they share as, and never again.
+ */
+const Profile = lazy(() => import("./screens/Profile"));
+
 const EDITOR_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">
     Loading the editor
@@ -78,6 +84,12 @@ const SETTINGS_FALLBACK = (
 
 const USERS_FALLBACK = (
   <p className="text-sm text-slate-500 dark:text-slate-400">Loading accounts</p>
+);
+
+const PROFILE_FALLBACK = (
+  <p className="text-sm text-slate-500 dark:text-slate-400">
+    Loading your profile
+  </p>
 );
 
 /**
@@ -172,6 +184,19 @@ export function AppRoutes() {
             element={
               <Suspense fallback={SETTINGS_FALLBACK}>
                 <GithubSettings />
+              </Suspense>
+            }
+          />
+          {/*
+            Routed for everybody and rendered for an account: an anonymous
+            session has no profile, and the screen says so with the not-found
+            screen the way the two admin ones do.
+          */}
+          <Route
+            path="/profile"
+            element={
+              <Suspense fallback={PROFILE_FALLBACK}>
+                <Profile />
               </Suspense>
             }
           />

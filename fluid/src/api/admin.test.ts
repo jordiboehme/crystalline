@@ -11,23 +11,29 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  MY_GITHUB_IDENTITY_KEY,
   SYNC_SUMMARY_KEY,
   archiveDownloadUrl,
+  connectMyGithubIdentityToken,
   createDomain,
   disconnectGithub,
+  disconnectMyGithubIdentity,
   fetchConflict,
   fetchGithubStatus,
+  fetchMyGithubIdentity,
   fetchShareChanges,
   fetchSyncStatus,
   fetchSyncSummary,
   importArchive,
   previewArchive,
   readGithubStatus,
+  readMyGithubIdentity,
   readStackPlacement,
   resolveConflict,
   shareDomain,
   sharePlanKey,
   startGithubConnect,
+  startMyGithubIdentityDevice,
   submitGithubToken,
   syncDomain,
   syncStatusKey,
@@ -180,6 +186,138 @@ describe("the admin client layer", () => {
       pending: null,
       error: null,
     });
+  });
+
+  it("reads my own GitHub identity out of its wire spelling", async () => {
+    apiMock.mockResolvedValueOnce({
+      account: "ada",
+      connected: false,
+      login: null,
+      connected_at: null,
+      token_store: null,
+      pending: {
+        user_code: "ABCD-1234",
+        verification_url: "https://github.example/device",
+        expires_in_secs: 900,
+      },
+      error: null,
+    });
+    const identity = await fetchMyGithubIdentity();
+
+    // The caller's own, so no path segment names it: the session does.
+    expect(apiMock).toHaveBeenLastCalledWith("/me/github-identity");
+    expect(identity).toEqual({
+      account: "ada",
+      connected: false,
+      login: null,
+      connectedAt: null,
+      tokenStore: null,
+      pending: {
+        userCode: "ABCD-1234",
+        verificationUrl: "https://github.example/device",
+        expiresInSecs: 900,
+      },
+      error: null,
+    });
+  });
+
+  it("reads a connected identity, and a report that left fields out", () => {
+    expect(
+      readMyGithubIdentity({
+        account: "ada",
+        connected: true,
+        login: "octo",
+        connected_at: "2026-08-29T09:12:44Z",
+        token_store: "keyring",
+        pending: null,
+        error: "the code expired before it was confirmed",
+      }),
+    ).toEqual({
+      account: "ada",
+      connected: true,
+      login: "octo",
+      connectedAt: "2026-08-29T09:12:44Z",
+      tokenStore: "keyring",
+      pending: null,
+      error: "the code expired before it was confirmed",
+    });
+
+    // This one is the card's poll as well as its read, so a field that is
+    // briefly missing leaves the card saying "not connected" rather than
+    // throwing inside a render. Nonsense reads the same way.
+    const bare = {
+      account: "",
+      connected: false,
+      login: null,
+      connectedAt: null,
+      tokenStore: null,
+      pending: null,
+      error: null,
+    };
+    expect(readMyGithubIdentity({})).toEqual(bare);
+    expect(readMyGithubIdentity("nonsense")).toEqual(bare);
+    // A code with nowhere to type it is not something to put in front of
+    // somebody, so half a pending block is no pending block.
+    expect(
+      readMyGithubIdentity({ pending: { user_code: "ABCD-1234" } }).pending,
+    ).toBeNull();
+  });
+
+  it("starts my own device flow on its own route, and files it outside the domain family", async () => {
+    apiMock.mockResolvedValueOnce({
+      account: "ada",
+      connected: false,
+      pending: {
+        user_code: "ABCD-1234",
+        verification_url: "https://github.example/device",
+        expires_in_secs: 900,
+      },
+    });
+    const identity = await startMyGithubIdentityDevice();
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/me/github-identity/connect",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(identity.pending?.userCode).toBe("ABCD-1234");
+    // A personal identity is nobody's domain content, so no bulk domain
+    // invalidation reaches it.
+    expect(MY_GITHUB_IDENTITY_KEY).toEqual(["me-github-identity"]);
+    expect(MY_GITHUB_IDENTITY_KEY[0]).not.toBe(syncStatusKey("eng")[0]);
+  });
+
+  it("puts my token and keeps no copy of it", async () => {
+    apiMock.mockResolvedValueOnce({
+      account: "ada",
+      connected: true,
+      login: "octo",
+      connected_at: "2026-08-29T09:12:44Z",
+      token_store: "keyring",
+    });
+    const identity = await connectMyGithubIdentityToken("ghp_secret");
+
+    // PUT rather than POST: this replaces the caller's one identity, so
+    // re-pasting a token is the same request twice with the same result.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/me/github-identity/token",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ token: "ghp_secret" }),
+      }),
+    );
+    expect(JSON.stringify(identity)).not.toContain("ghp_secret");
+  });
+
+  it("forgets my own credential with a DELETE", async () => {
+    apiMock.mockResolvedValueOnce({ account: "ada", connected: false });
+    const identity = await disconnectMyGithubIdentity();
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/me/github-identity",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(identity.connected).toBe(false);
+    expect(identity.login).toBeNull();
   });
 
   it("registers a domain and reads where it landed", async () => {

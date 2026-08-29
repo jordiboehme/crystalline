@@ -203,7 +203,7 @@ function ChangeGroup({
  * Whether a path is a generated folder listing rather than something somebody
  * wrote, read off its filename the way the engine reads it.
  */
-export function isFolderIndex(path: string): boolean {
+function isFolderIndex(path: string): boolean {
   return path === "index.md" || path.endsWith("/index.md");
 }
 
