@@ -78,9 +78,10 @@ export interface paths {
         /**
          * The capability probe a client calls before anything else: who it is, whether
          *     it is being served anonymously, whether this instance refuses content
-         *     mutations, whether it has any accounts at all, and which server version it
-         *     is talking to, so a mismatched UI can say so instead of failing later.
-         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
+         *     mutations, whether it has any accounts at all, whether this session may
+         *     drive the share surfaces, and which server version it is talking to, so a
+         *     mismatched UI can say so instead of failing later.
+         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
          */
         get: operations["get_me"];
         put?: never;
@@ -519,7 +520,7 @@ export interface paths {
         };
         /**
          * Where a team domain stands relative to its GitHub origin.
-         * @description Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`. An instance with no GitHub connection is reported, not refused: the report comes back from local state with `connection.connected` false.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`): this is the report every share surface is drawn from, so it is gated with the share verbs rather than with the plain admin reads. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`. An instance with no GitHub connection is reported, not refused: the report comes back from local state with `connection.connected` false.
          */
         get: operations["get_domain_sync_status"];
         put?: never;
@@ -1447,6 +1448,25 @@ export interface components {
         MeResponse: {
             /** @description Whether the request is being served as the anonymous viewer. */
             anonymous: boolean;
+            /**
+             * @description Whether this session may drive the share surfaces: the sync status of a
+             *     team domain, the share preview, the share, a withdrawal and a conflict.
+             *
+             *     Computed here rather than derived by a client from the role, because
+             *     the answer is not a property of the role alone: it is the role read
+             *     against `github.share_identity`, which is instance configuration a
+             *     browser cannot see. An admin may always; an editor may when this
+             *     instance shares as the acting person rather than as the machine; a
+             *     viewer and the anonymous reader never may.
+             *
+             *     It is a rendering signal, never the gate. Every share route still
+             *     refuses on its own, off this same predicate, so a stale or forged
+             *     `true` costs a 403 rather than access. What it
+             *     buys is a client that does not have to ask a domain's origin whether it
+             *     is allowed to ask: an editor on an instance-mode install draws no share
+             *     card and issues no request behind it.
+             */
+            can_share: boolean;
             /**
              * @description The CSRF token of the session this request arrived on, or null when it
              *     arrived on no session.
@@ -4264,7 +4284,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;

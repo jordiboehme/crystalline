@@ -47,7 +47,7 @@ export function answersFor(routes: Record<string, Answer>) {
 
 /** A `me` answer, defaulting to the anonymous-refused shape: no identity. */
 export function meResponse(overrides: Partial<MeResponse> = {}): MeResponse {
-  return {
+  const probe = {
     user: null,
     anonymous: false,
     read_only: false,
@@ -57,6 +57,13 @@ export function meResponse(overrides: Partial<MeResponse> = {}): MeResponse {
     csrf: null,
     version: import.meta.env.VITE_APP_VERSION,
     ...overrides,
+  };
+  return {
+    ...probe,
+    // The default mode, which is what every fixture is unless it says
+    // otherwise: one machine credential does every share, so an admin may and
+    // nobody else does. A personal-mode test passes `can_share` itself.
+    can_share: overrides.can_share ?? probe.user?.role === "admin",
   };
 }
 

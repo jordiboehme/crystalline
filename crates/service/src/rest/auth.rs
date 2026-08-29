@@ -35,7 +35,7 @@ use axum::http::{HeaderMap, HeaderName, header};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
-use crystalline_core::config::GlobalConfig;
+use crystalline_core::config::{GlobalConfig, ShareIdentityMode};
 use tokio::sync::Semaphore;
 
 use super::auth_store::{AuthStore, PasswordCheck, Role, SessionMint, User, dummy_verify};
@@ -208,6 +208,28 @@ impl Identity {
     /// it is told to authenticate rather than that it is forbidden.
     pub fn require_admin(&self) -> Result<Caller, ApiError> {
         self.require(Role::Admin)
+    }
+
+    /// The caller, when the request may drive this instance's share surfaces.
+    ///
+    /// The one rule, in one place, for the routes that act on a team
+    /// repository AND for the capability probe that tells a client whether to
+    /// draw them at all. Two readers of one predicate rather than two copies
+    /// of it: a client that drew a share card the routes then refused, or hid
+    /// one they would have served, is worse than either answer on its own.
+    ///
+    /// The gate moves with `github.share_identity`, because what it protects
+    /// moves with it: in `instance` mode every share goes out on the one
+    /// machine credential and carries nobody's own name, so it stays admin
+    /// only; in `personal` mode the share is signed by the acting account's
+    /// own GitHub identity, which is the accountability the admin gate stood
+    /// in for, so the role that may already write the knowledge may propose it
+    /// too. A viewer never may, in either mode.
+    pub fn may_share(&self, mode: ShareIdentityMode) -> Result<Caller, ApiError> {
+        match mode {
+            ShareIdentityMode::Instance => self.require_admin(),
+            ShareIdentityMode::Personal => self.require_editor(),
+        }
     }
 
     fn require(&self, min: Role) -> Result<Caller, ApiError> {
@@ -512,6 +534,23 @@ pub struct MeResponse {
     /// deliberate: the login page needs to know before any identity exists, and
     /// the state itself is what makes `POST /auth/setup` answer at all.
     needs_setup: bool,
+    /// Whether this session may drive the share surfaces: the sync status of a
+    /// team domain, the share preview, the share, a withdrawal and a conflict.
+    ///
+    /// Computed here rather than derived by a client from the role, because
+    /// the answer is not a property of the role alone: it is the role read
+    /// against `github.share_identity`, which is instance configuration a
+    /// browser cannot see. An admin may always; an editor may when this
+    /// instance shares as the acting person rather than as the machine; a
+    /// viewer and the anonymous reader never may.
+    ///
+    /// It is a rendering signal, never the gate. Every share route still
+    /// refuses on its own, off this same predicate, so a stale or forged
+    /// `true` costs a 403 rather than access. What it
+    /// buys is a client that does not have to ask a domain's origin whether it
+    /// is allowed to ask: an editor on an instance-mode install draws no share
+    /// card and issues no request behind it.
+    can_share: bool,
     /// The server version, so a mismatched UI can say so.
     #[schema(example = "0.12.0")]
     version: &'static str,
@@ -1098,8 +1137,9 @@ pub async fn logout(
 
 /// The capability probe a client calls before anything else: who it is, whether
 /// it is being served anonymously, whether this instance refuses content
-/// mutations, whether it has any accounts at all, and which server version it
-/// is talking to, so a mismatched UI can say so instead of failing later.
+/// mutations, whether it has any accounts at all, whether this session may
+/// drive the share surfaces, and which server version it is talking to, so a
+/// mismatched UI can say so instead of failing later.
 ///
 /// Answers without an identity on purpose. `user: null, anonymous: false` is
 /// what tells a browser to show a login form; `anonymous: true` tells it to
@@ -1117,7 +1157,10 @@ pub async fn logout(
     description = "Who the caller is, whether it is being served anonymously, \
                    whether this instance refuses content mutations, whether it \
                    has no accounts yet and so still needs its first admin \
-                   (`needs_setup`, which is what opens `POST /auth/setup`), and \
+                   (`needs_setup`, which is what opens `POST /auth/setup`), \
+                   whether this session may drive the share surfaces \
+                   (`can_share`: an admin always, an editor when \
+                   `github.share_identity` is `personal`), and \
                    which server version it is talking to. Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
                    cookie session has its token reissued here, and a \
@@ -1207,6 +1250,13 @@ pub async fn me(
             jar = jar.add(cookie);
         }
     }
+    // Read before the identity is taken apart below, and read LIVE rather than
+    // captured at start: `share_identity` is a setting an admin can flip
+    // through `configure`, and the next probe is what tells an editor's browser
+    // the surfaces just opened to them.
+    let can_share = identity
+        .may_share(state.engine.share_identity_mode())
+        .is_ok();
     Ok((
         jar,
         no_store(),
@@ -1216,6 +1266,10 @@ pub async fn me(
             anonymous: identity.anonymous,
             read_only: state.engine.read_only(),
             needs_setup: state.auth.user_count().await? == 0,
+            // The share routes' own predicate, asked rather than re-derived:
+            // one rule decides what they serve and what a client draws.
+            // Resolved off `identity` before it is moved into `user` above.
+            can_share,
             version: crystalline_core::VERSION,
         }),
     ))

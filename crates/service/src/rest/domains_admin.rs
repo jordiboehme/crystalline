@@ -13,37 +13,30 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
-use crystalline_core::config::ShareIdentityMode;
-
 use super::auth::Identity;
 use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only};
 use crate::engine::{EngineError, ShareActor};
 
-/// The caller, when they may drive this instance's share verbs - the preview,
-/// the share, a withdrawal, and reading or resolving a conflict, the five
-/// routes that act on the team's repository. The conflict READ is gated with
-/// them rather than with the plain admin reads beside it: whoever may settle a
-/// conflict has to be able to see the three sides they are choosing between,
-/// so splitting the pair would leave an editor able to resolve blind.
+/// The caller, when they may drive this instance's share surfaces - the status
+/// report, the preview, the share, a withdrawal, and reading or resolving a
+/// conflict, the six routes that act on or describe the team's repository.
 ///
-/// The gate moves with `github.share_identity`, because what it is protecting
-/// moves with it:
+/// Two of them are reads gated with the writes rather than with the plain
+/// admin reads beside them, and both for the same reason. The conflict READ:
+/// whoever may settle a conflict has to see the three sides they are choosing
+/// between, so splitting the pair would leave an editor resolving blind. The
+/// STATUS: it is the report every share surface is drawn from - the open
+/// layers, who authored them, what is wedged - so an editor who may share and
+/// may not read it would be sharing into a card they cannot see.
 ///
-/// - `instance` (the default): every share goes out on the ONE machine
-///   credential, so it carries the instance's name and nobody's own. Admin
-///   only, exactly as today - this branch is byte for byte the previous
-///   behaviour, and an instance that never changes the setting never sees a
-///   difference.
-/// - `personal`: a share goes out on the acting account's own GitHub identity
-///   and is signed by it on the forge. The accountability an admin gate stood
-///   in for is now carried by the identity itself, so an editor - the role that
-///   may already write the knowledge - may also propose it. A viewer still
-///   cannot, here as everywhere else.
+/// The rule itself lives on [`Identity::may_share`], which the `/auth/me`
+/// probe reads too, so what a client draws and what these routes serve can
+/// never disagree. This wrapper is the local reading of the instance's mode,
+/// which is deliberately taken LIVE on every call: a `configure` that flips
+/// `github.share_identity` opens or closes these surfaces at the next request
+/// rather than at the next restart.
 fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, ApiError> {
-    match state.engine.share_identity_mode() {
-        ShareIdentityMode::Instance => identity.require_admin(),
-        ShareIdentityMode::Personal => identity.require_editor(),
-    }
+    identity.may_share(state.engine.share_identity_mode())
 }
 
 /// What `POST /domains` takes: a mode and whatever that mode needs.
@@ -498,6 +491,13 @@ fn single_domain(
 /// a sync card to show) - the engine documents `origin_status` as allowed
 /// there, and the group's ruling is that read_only refuses writes, not reads.
 ///
+/// Gated with the share verbs rather than with the plain admin reads beside
+/// it, the same move the conflict READ made and for the same reason: this is
+/// the report every share surface is drawn from - which layers are open, who
+/// authored them, what is wedged - so whoever may share has to be able to read
+/// it, or they would be sharing blind into a card they cannot see. In instance
+/// mode that is admin only, byte for byte what it always was.
+///
 /// A domain with no origin answers 404 rather than an empty status: the
 /// resource "team sync status" does not exist for a local or virtual domain.
 /// A client can therefore treat any 404 here as "show no card" while the
@@ -520,7 +520,12 @@ fn single_domain(
     tag = "domains",
     operation_id = "get_domain_sync_status",
     summary = "Where a team domain stands relative to its GitHub origin.",
-    description = "Admin only. A pure read, served even on a read-only \
+    description = "Admin only, or an editor when this instance shares with \
+                   personal GitHub identities (`github.share_identity` = \
+                   `personal`): this is the report every share surface is \
+                   drawn from, so it is gated with the share verbs rather \
+                   than with the plain admin reads. A pure read, served even \
+                   on a read-only \
                    instance. Answers 404 for a domain with no origin - only \
                    a GitHub team domain has sync status - so a client can \
                    treat any 404 as `no sync card`. An instance with no \
@@ -600,8 +605,10 @@ fn single_domain(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or the trusted-header \
-                           identity names a disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), or the \
+                           trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -628,7 +635,9 @@ pub async fn sync_status(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    // The share verbs' own gate: whoever may share reads the report they would
+    // be sharing into. See the doc comment.
+    require_share_role(&state, &identity)?;
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.

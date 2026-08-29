@@ -586,7 +586,9 @@ async fn team_sync_status_and_sync_now_walk_the_contract() {
     .unwrap();
     assert_eq!(ghost_post.status(), 404, "no such resource to sync either");
 
-    // The GET is admin-only too (the write matrix covers only the POST).
+    // The GET is admin-only here too (the write matrix covers only the POST).
+    // "Here" is this instance-mode fixture: the read is gated with the share
+    // verbs, so personal mode opens it to an editor - pinned in its own test.
     for (name, pw) in [("eddy", "eddypw"), ("vera", "verapw")] {
         let session = login(fx.addr, name, pw).await;
         let resp = as_session(
@@ -2216,8 +2218,8 @@ async fn read_only_serves_the_identity_read_and_refuses_its_mutations() {
 }
 
 /// Instance mode is today's instance, byte for byte: one credential does every
-/// share, so the four sync writes stay admin-only and an editor is refused on
-/// all of them.
+/// share, so the four sync writes stay admin-only, the two reads that are
+/// gated with them do too, and an editor is refused on all of them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_share_routes_stay_admin_only_in_instance_mode() {
     let (fx, _mock) = serve_team_with_mock().await;
@@ -2284,6 +2286,97 @@ async fn the_share_routes_stay_admin_only_in_instance_mode() {
     .await
     .unwrap();
     assert_eq!(detail.status(), 403);
+
+    // And the STATUS read, which is the report every share surface is drawn
+    // from: an editor who cannot share here cannot read it either, which is
+    // what lets a client draw no card and ask nothing behind it.
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(status.status(), 403, "an editor reads no sync status here");
+
+    // The probe says the same thing in advance, which is the whole point of
+    // it: one rule, read by the routes and by the client that draws them.
+    let me: serde_json::Value = as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &eddy)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["can_share"], false, "{me}");
+    let admin_me: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &admin)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(admin_me["can_share"], true, "{admin_me}");
+}
+
+/// Reading the sync status is gated WITH sharing rather than with the plain
+/// admin reads beside it: an editor who may share in personal mode has to be
+/// able to read the report they are sharing into - the open layers, who
+/// authored them, what is wedged - or they would be sharing into a card they
+/// cannot see. The instance arm of the same rule is pinned above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_editor_reads_the_sync_status_they_may_share_into_in_personal_mode() {
+    let (fx, _mock) = serve_team_with_mock_sharing(true).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(status.status(), 200, "{}", status.text().await.unwrap());
+
+    // The probe agrees, which is what makes the client draw the card at all.
+    let me: serde_json::Value = as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &eddy)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(me["can_share"], true, "{me}");
+
+    // A viewer is nobody's sharer, in either mode, and is told so before they
+    // ask as well as when they do.
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &vera,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 403);
+    let viewer_me: serde_json::Value =
+        as_session(fx.addr, reqwest::Method::GET, "/api/v1/auth/me", &vera)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(viewer_me["can_share"], false, "{viewer_me}");
 }
 
 /// Reading a conflict is gated WITH resolving it rather than with the plain
