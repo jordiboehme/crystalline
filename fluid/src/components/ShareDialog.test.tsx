@@ -144,6 +144,46 @@ function sentBody(path: string, method: string): unknown {
   return JSON.parse(body) as unknown;
 }
 
+/**
+ * The connection block of an instance that shares as whoever is acting, rather
+ * than as the machine. The owner's own slot rides along on the real report and
+ * is deliberately not what the browser reads: the acting identity here is the
+ * session's, and `/me/github-identity` is what answers for it.
+ */
+function personalConnection(overrides: Record<string, unknown> = {}) {
+  return {
+    connected: true,
+    user: "octo",
+    token_store: "keychain",
+    share_identity: "personal",
+    owner_identity: { account: "owner", connected: false, user: null },
+    ...overrides,
+  };
+}
+
+/** The session's own identity, in the wire shape the profile surface sends. */
+function identityPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    account: "ada",
+    connected: false,
+    login: null,
+    connected_at: null,
+    token_store: null,
+    pending: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+/** A plan with something in it, so the dialog has a share to offer. */
+function createPlan() {
+  return {
+    action: "create",
+    effective_title: "Share 1 new engram from eng",
+    changes: [{ path: "notes/a.md", kind: "added" }],
+  };
+}
+
 /** Open the dialog off the card's header button, once the card is up. */
 async function openShareDialog(): Promise<HTMLElement> {
   const card = await screen.findByRole("region", { name: "Proposals" });
@@ -1044,5 +1084,81 @@ describe("the share dialog", () => {
     expect(
       within(dialog).getByRole("button", { name: "Share" }),
     ).toBeDisabled();
+  });
+
+  it("offers to connect an identity, where a share goes out as whoever makes it", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () => identityPayload(),
+      "/domains/eng/sync/changes": createPlan,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The plan is a read, and reading needs nobody's personal credential: what
+    // a share would carry is still on the screen, which is what makes the
+    // connect worth doing rather than a hoop before an unknown.
+    expect(
+      await within(dialog).findByText(/opens a new proposal/i),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("notes/a.md")).toBeInTheDocument();
+
+    // The primary action is the one that can actually be taken, and it leads
+    // where the identity is connected.
+    const connect = await within(dialog).findByRole("link", {
+      name: "Connect GitHub to share",
+    });
+    expect(connect).toHaveAttribute("href", "/profile");
+    expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
+  });
+
+  it("names the identity a share would go out on", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () =>
+        identityPayload({ connected: true, login: "octo" }),
+      "/domains/eng/sync/changes": createPlan,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Quietly, beside the button: in personal mode the proposal carries
+    // somebody's own name on the forge, and that is worth knowing before the
+    // press rather than after it.
+    expect(
+      await within(dialog).findByText("Sharing as @octo"),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+  });
+
+  it("asks nothing about your identity when the instance shares as itself", async () => {
+    serve({ "/domains/eng/sync/changes": createPlan });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    // The default mode is the whole install base of this feature's first day,
+    // and the dialog it draws is the one it always drew: no line about whose
+    // identity this is, and not one request asking.
+    expect(within(dialog).queryByText(/sharing as/i)).toBeNull();
+    expect(
+      within(dialog).queryByRole("link", { name: /connect github/i }),
+    ).toBeNull();
+    expect(
+      requested().filter((path) => path.startsWith("/me/github-identity")),
+    ).toEqual([]);
   });
 });

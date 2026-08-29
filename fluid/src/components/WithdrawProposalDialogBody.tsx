@@ -31,7 +31,9 @@ import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
 import { plural } from "../format";
+import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { BUTTON } from "./primitives";
+import { useShareIdentity } from "./useShareIdentity";
 import type { WithdrawProposalDialogProps } from "./WithdrawProposalDialog";
 
 export default function WithdrawProposalDialogBody({
@@ -44,6 +46,10 @@ export default function WithdrawProposalDialogBody({
 }: WithdrawProposalDialogProps): ReactElement {
   const queryClient = useQueryClient();
   const [revert, setRevert] = useState(false);
+  // Closing a proposal is a write on the forge exactly as a share is, so it
+  // goes out on the same credential and is refused for want of the same one.
+  // Read off the status the card behind this dialog already holds.
+  const identity = useShareIdentity(domain);
 
   const withdraw = useMutation({
     mutationFn: () => withdrawProposal(domain, proposal.number, revert),
@@ -114,7 +120,10 @@ export default function WithdrawProposalDialogBody({
             />
             Restore shared files
           </label>
-          <div className="mt-3 flex justify-end gap-2">
+          <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+            {identity.sharingAs !== null && (
+              <SharingAs login={identity.sharingAs} />
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -123,17 +132,24 @@ export default function WithdrawProposalDialogBody({
               Cancel
             </button>
             {/* Destructive: this closes a thread other people are reading,
-                and on the revert path it rewrites files on disk. */}
-            <button
-              type="button"
-              disabled={withdraw.isPending}
-              onClick={() => {
-                withdraw.mutate();
-              }}
-              className={BUTTON.destructive}
-            >
-              Withdraw proposal
-            </button>
+                and on the revert path it rewrites files on disk. Where the
+                engine would refuse this session's write for want of an
+                identity, the way to get one takes its place - everything
+                above it is a read, and stays. */}
+            {identity.mustConnect ? (
+              <ConnectToShare />
+            ) : (
+              <button
+                type="button"
+                disabled={withdraw.isPending || identity.asking}
+                onClick={() => {
+                  withdraw.mutate();
+                }}
+                className={BUTTON.destructive}
+              >
+                Withdraw proposal
+              </button>
+            )}
           </div>
         </Dialog.Content>
       </Dialog.Portal>

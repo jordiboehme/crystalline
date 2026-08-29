@@ -106,6 +106,36 @@ function stackedProposals() {
   ];
 }
 
+/**
+ * The connection block of an instance that shares as whoever is acting rather
+ * than as the machine. The owner slot rides along on the real report; the
+ * browser reads the SESSION's identity instead, off `/me/github-identity`.
+ */
+function personalConnection(overrides: Record<string, unknown> = {}) {
+  return {
+    connected: true,
+    user: "octo",
+    token_store: "keychain",
+    share_identity: "personal",
+    owner_identity: { account: "owner", connected: false, user: null },
+    ...overrides,
+  };
+}
+
+/** The session's own identity, in the wire shape the profile surface sends. */
+function identityPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    account: "ada",
+    connected: false,
+    login: null,
+    connected_at: null,
+    token_store: null,
+    pending: null,
+    error: null,
+    ...overrides,
+  };
+}
+
 function serve(routes: Record<string, Answer> = {}) {
   apiMock.mockImplementation(
     answersFor({
@@ -761,5 +791,103 @@ describe("the proposals card", () => {
       ).toBe(false);
     });
     expect(screen.queryByRole("region", { name: "Proposals" })).toBeNull();
+  });
+
+  it("names who shared each layer, where the report says", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              ...openProposal(4, "Refine 2 engrams in eng"),
+              author_login: "octo",
+            },
+            // Shared before the login was recorded, or by a credential with no
+            // login to name: the row simply says nothing about it.
+            openProposal(7, "One more pass on the routing"),
+          ],
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // A chain can carry layers by different people, so each row says whose it
+    // is - and exactly one of these two rows has an answer to give.
+    expect(within(card).getByText("@octo")).toBeVisible();
+    expect(within(card).getAllByText(/^@/)).toHaveLength(1);
+  });
+
+  it("offers to connect an identity instead of withdrawing, where a write goes out as you", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () => identityPayload(),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+
+    // Closing a proposal is a write on the forge like a share is, so it needs
+    // the same credential - and offers the same way of getting one.
+    const connect = await within(dialog).findByRole("link", {
+      name: "Connect GitHub to share",
+    });
+    expect(connect).toHaveAttribute("href", "/profile");
+    expect(
+      within(dialog).queryByRole("button", { name: "Withdraw proposal" }),
+    ).toBeNull();
+  });
+
+  it("names the identity a withdraw would go out on", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () =>
+        identityPayload({ connected: true, login: "octo" }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+
+    expect(
+      await within(dialog).findByText("Sharing as @octo"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Withdraw proposal" }),
+    ).toBeEnabled();
+  });
+
+  it("asks nothing about your identity when the instance shares as itself", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+
+    // The default mode draws the dialog it always drew, and asks nothing about
+    // a credential that is not in play.
+    expect(
+      within(dialog).getByRole("button", { name: "Withdraw proposal" }),
+    ).toBeEnabled();
+    expect(within(dialog).queryByText(/sharing as/i)).toBeNull();
+    expect(
+      requested().filter((path) => path.startsWith("/me/github-identity")),
+    ).toEqual([]);
   });
 });

@@ -367,6 +367,35 @@ export interface SyncProposal {
   amendedUpstream: boolean;
   feedback: ProposalFeedback[];
   updatedAt: string | null;
+  /**
+   * The GitHub login the share that wrote this acted as, or null when nobody
+   * is named.
+   *
+   * Null twice over: a proposal shared before the engine recorded this carries
+   * nothing, and so does one shared by a credential with no login to name. A
+   * row says who owns a layer where there is an answer and says nothing where
+   * there is not - a chain's layers can belong to different people, and a
+   * blank is never worth a guess.
+   */
+  authorLogin: string | null;
+}
+
+/**
+ * The machine OWNER's personal slot, as the status report names it in personal
+ * mode.
+ *
+ * Never the browser's own acting identity: a share made from Fluid goes out as
+ * the SESSION's identity, which `/me/github-identity` answers for. This is what
+ * a CLI or a local stdio-MCP share would resolve, reported here so a client can
+ * say so where that is what it is describing.
+ */
+export interface OwnerIdentity {
+  /** The account the slot belongs to, the fixed local owner name. */
+  account: string;
+  /** Whether a personal credential is on file for it. */
+  connected: boolean;
+  /** The login it authenticated as, when there is one. */
+  user: string | null;
 }
 
 /** One file a pull could not merge, as the status report lists it. */
@@ -460,6 +489,27 @@ export interface SyncStatus {
   repairPending: boolean;
   /** Every layer exists, but they are not grouped on the forge yet. */
   stackLinkPending: boolean;
+  /**
+   * Whose credential a write to this origin goes out on: `instance` for the
+   * one machine credential, `personal` for the acting person's own. Null when
+   * the report did not say.
+   *
+   * The mode only, never the credential itself. In the browser the acting
+   * person is the SESSION, so this says which QUESTION to ask and
+   * `/me/github-identity` answers it: a dialog in personal mode asks whether
+   * this session has an identity, and one in instance mode asks nothing at
+   * all. Anything that is not the word `personal` leaves a dialog exactly as
+   * it was, which is what keeps an older report drawing the dialog it always
+   * drew.
+   */
+  shareIdentity: string | null;
+  /**
+   * The machine owner's personal slot, sent in personal mode only, or null.
+   *
+   * Read because the report carries it, and pointedly not what a browser
+   * dialog acts on: see {@link OwnerIdentity}.
+   */
+  ownerIdentity: OwnerIdentity | null;
 }
 
 /** The cache key of one domain's sync status. */
@@ -586,6 +636,29 @@ function readProposal(value: unknown): SyncProposal | null {
       .map(readFeedback)
       .filter((item): item is ProposalFeedback => item !== null),
     updatedAt: asString(record?.updated_at),
+    // Absent on everything shared before the engine recorded it, and null
+    // wherever the acting credential had no login: both read as "nobody
+    // named", and a row draws nothing rather than a gap.
+    authorLogin: asString(record?.author_login),
+  };
+}
+
+/**
+ * The owner's personal slot, or null when the report carries none.
+ *
+ * The account is the gate: instance mode sends no block at all, and a block
+ * that names no account is nothing a screen could say a sentence about.
+ */
+function readOwnerIdentity(value: unknown): OwnerIdentity | null {
+  const record = asObject(value);
+  const account = asString(record?.account);
+  if (account === null) {
+    return null;
+  }
+  return {
+    account,
+    connected: record?.connected === true,
+    user: asString(record?.user),
   };
 }
 
@@ -632,7 +705,8 @@ function readConflict(value: unknown): SyncConflict | null {
 /** Read a sync status out of the engine's own per-domain report. */
 function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
-  const connected = asObject(record?.connection)?.connected;
+  const connection = asObject(record?.connection);
+  const connected = connection?.connected;
   return {
     repo: asString(record?.repo) ?? "",
     branch: asString(record?.branch),
@@ -665,6 +739,12 @@ function readSyncStatus(payload: unknown): SyncStatus {
     stackWedged: asNumbers(record?.stack_wedged),
     repairPending: record?.repair_pending === true,
     stackLinkPending: record?.stack_link_pending === true,
+    // Both off the connection block, where the route puts them, and both
+    // tolerant: a mode that is not a word and a slot that is not a record are
+    // "this report does not say", which every reader treats as the default
+    // mode rather than as personal.
+    shareIdentity: asString(connection?.share_identity),
+    ownerIdentity: readOwnerIdentity(connection?.owner_identity),
   };
 }
 

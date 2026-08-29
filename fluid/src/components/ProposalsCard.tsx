@@ -389,6 +389,17 @@ function ProposalRow({
             // The title is still worth reading; the link is not worth having.
             <span className="font-medium">{proposal.title}</span>
           )}
+          {/* Whose layer this is, where the report says so. Muted and beside
+              the title rather than in the standing at the far end: on a chain
+              that several people share into, the author belongs to the layer's
+              name rather than to its state, and a record that names nobody -
+              anything shared before this was recorded, or by a credential with
+              no login - draws nothing at all rather than a gap. */}
+          {proposal.authorLogin !== null && (
+            <span className="text-caption text-slate-500 dark:text-slate-400">
+              {`@${proposal.authorLogin}`}
+            </span>
+          )}
           {/* Where this one stands, pushed to the far end of the row: the rail
               says the order, and this side says the standing. */}
           <span className="ml-auto flex flex-wrap items-center gap-2">

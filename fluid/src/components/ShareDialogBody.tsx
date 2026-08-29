@@ -69,7 +69,9 @@ import { asNumber, asObject, asString } from "../api/json";
 import { plural } from "../format";
 import { ChangeList } from "./ChangeList";
 import type { ShareDialogProps } from "./ShareDialog";
+import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { BUTTON, Field } from "./primitives";
+import { useShareIdentity } from "./useShareIdentity";
 
 const FIELD_CLASSES =
   "w-full rounded border border-slate-300 bg-transparent px-2 py-1 text-sm focus-visible:ring-2 focus-visible:ring-accent-600 dark:focus-visible:ring-accent-400 focus-visible:outline-none dark:border-slate-700";
@@ -149,6 +151,12 @@ export default function ShareDialogBody({
     retry: false,
     enabled: outcome === null,
   });
+  // Whose credential the share would go out on, off the same status: in the
+  // mode where that is the acting person's own, a session without one is
+  // offered the way to get one instead of a button the engine would refuse.
+  // Switched off with the two queries above, and for the same reason.
+  const identity = useShareIdentity(domain, outcome === null);
+
   const openLayers = (status.data?.proposals ?? []).filter(
     (proposal) => proposal.status === "open",
   );
@@ -268,7 +276,15 @@ export default function ShareDialogBody({
               className="mt-3 flex flex-col gap-3"
               onSubmit={(event) => {
                 event.preventDefault();
-                if (shareable && !share.isPending) {
+                // The button's own conditions, because a form submits on
+                // Enter as well as on a press - including from a field, in a
+                // dialog whose primary action is a link rather than a submit.
+                if (
+                  shareable &&
+                  !share.isPending &&
+                  !identity.mustConnect &&
+                  !identity.asking
+                ) {
                   setProblem(null);
                   share.mutate();
                 }
@@ -375,7 +391,10 @@ export default function ShareDialogBody({
                   }}
                 />
               </Field>
-              <div className="flex justify-end gap-2">
+              <div className="flex flex-wrap items-center justify-end gap-2">
+                {identity.sharingAs !== null && (
+                  <SharingAs login={identity.sharingAs} />
+                )}
                 <button
                   type="button"
                   onClick={onClose}
@@ -385,14 +404,22 @@ export default function ShareDialogBody({
                 </button>
                 {/* The primary tier, and its disabled face is what makes an
                     unshareable plan legible: a filled button gone grey reads
-                    as "not now", which is what the sentence above it says. */}
-                <button
-                  type="submit"
-                  disabled={!shareable || share.isPending}
-                  className={BUTTON.primary}
-                >
-                  Share
-                </button>
+                    as "not now", which is what the sentence above it says.
+                    Where the engine would refuse this session's share for
+                    want of an identity, the fix takes the same place: the
+                    plan above stays exactly as it is, because reading it
+                    needed nobody's credential. */}
+                {identity.mustConnect ? (
+                  <ConnectToShare />
+                ) : (
+                  <button
+                    type="submit"
+                    disabled={!shareable || share.isPending || identity.asking}
+                    className={BUTTON.primary}
+                  >
+                    Share
+                  </button>
+                )}
               </div>
             </form>
           ) : (
