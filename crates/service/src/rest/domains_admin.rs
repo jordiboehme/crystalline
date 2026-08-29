@@ -519,7 +519,13 @@ fn single_domain(
                            the proposals a live check found merged upstream \
                            that this domain has not pulled in yet: they stand \
                            in neither proposal list, and the next sync \
-                           consumes them.\n\nFour keys say where the domain's \
+                           consumes them. Each proposal record carries \
+                           `author_login`, the GitHub login the share that \
+                           wrote it acted as - null on records shared before \
+                           this was recorded and whenever the acting \
+                           credential has no login to name, so a client shows \
+                           it where it is present and nothing where it is \
+                           not.\n\nFour keys say where the domain's \
                            chain of stacked proposals stands. `stack_number` \
                            is the chain's number on the forge, null when \
                            nothing is stacked. `stack_wedged` lists the \

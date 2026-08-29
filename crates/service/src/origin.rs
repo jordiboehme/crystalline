@@ -744,6 +744,7 @@ mod tests {
             review_state: None,
             feedback: Vec::new(),
             updated_at: None,
+            author_login: None,
         }
     }
 
@@ -1493,6 +1494,46 @@ mod tests {
         // The full record travels, feedback included: this is the channel a
         // REST client reads review comments from.
         assert!(v["open_proposals"][0]["feedback"].is_array(), "{v}");
+    }
+
+    /// Who shared each layer rides both proposal lists, and rides them the way
+    /// every other optional record field does: present as `null` when nothing
+    /// is recorded, so a reader tells "nobody named" from "this build does not
+    /// report it" without a version check.
+    #[test]
+    fn status_report_json_names_who_shared_each_proposal() {
+        let mut alice = proposal_fixture(1, "https://github.test/pull/1", "One");
+        alice.author_login = Some("alice".to_string());
+        let bob = proposal_fixture(2, "https://github.test/pull/2", "Two");
+        let mut declined = proposal_fixture(3, "https://github.test/pull/3", "Three");
+        declined.status = ProposalStatus::Declined;
+        declined.author_login = Some("carol".to_string());
+
+        let report = OriginStatusReport {
+            repo: "acme/brand-knowledge".to_string(),
+            branch: "main".to_string(),
+            base_commit: "abc123".to_string(),
+            behind: Some(false),
+            local_changes: 0,
+            skipped_large: vec![],
+            open_proposals: vec![alice, bob],
+            declined_proposals: vec![declined],
+            merged_unconsumed: vec![],
+            conflicts: vec![],
+            last_checked: None,
+            amended_upstream: vec![],
+            stack_number: None,
+            stack_wedged: vec![],
+            repair_pending: false,
+            stack_link_pending: false,
+        };
+        let v = status_report_json("eng", &report, None);
+        assert_eq!(v["open_proposals"][0]["author_login"], "alice");
+        assert!(
+            v["open_proposals"][1]["author_login"].is_null(),
+            "a proposal with no recorded author says so rather than going quiet: {v}"
+        );
+        assert_eq!(v["declined_proposals"][0]["author_login"], "carol");
     }
 
     #[test]

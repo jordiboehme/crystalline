@@ -1177,6 +1177,7 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&state_dir).unwrap();
     mock.set_proposal_state(7, ProposalState::Merged);
@@ -2091,6 +2092,7 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&state_dir).unwrap();
 
@@ -2180,6 +2182,7 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&state_dir).unwrap();
 

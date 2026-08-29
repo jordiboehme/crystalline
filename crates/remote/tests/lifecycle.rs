@@ -167,6 +167,21 @@ async fn shared_once(mock: &MockProvider) -> (Subscribed, crystalline_remote::op
     (sub, report)
 }
 
+/// Writes a recorded author onto saved proposals, standing in for shares that
+/// went out on other people's credentials before this test's own call.
+fn set_authors(state_dir: &Path, authors: &[(u64, &str)]) {
+    let mut st = load_state(state_dir);
+    for (number, login) in authors {
+        let record = st
+            .proposals
+            .iter_mut()
+            .find(|p| p.number == *number)
+            .expect("the proposal to attribute is recorded");
+        record.author_login = Some((*login).to_string());
+    }
+    st.save(state_dir).unwrap();
+}
+
 /// Overwrites the saved base commit, the corruption scenario 11 needs to force
 /// the compare-404 re-baseline path.
 fn set_base_commit(state_dir: &Path, commit: &str) {
@@ -199,6 +214,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     st.save(state_dir).unwrap();
 }
@@ -1752,6 +1768,7 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&sub.state_dir).unwrap();
 
@@ -2082,6 +2099,7 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
             description: Some("My own description, written by hand."),
             proposal: None,
             stacks_allowed: false,
+            author_login: None,
         },
     )
     .await
@@ -3244,6 +3262,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
             description: None,
             proposal: None,
             stacks_allowed: false,
+            author_login: None,
         },
     )
     .await
@@ -3817,6 +3836,7 @@ async fn the_probe_runs_once_and_caches_the_verdict() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -3850,6 +3870,7 @@ async fn the_probe_runs_once_and_caches_the_verdict() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -3884,6 +3905,7 @@ async fn config_off_never_probes() {
             description: None,
             proposal: None,
             stacks_allowed: false,
+            author_login: None,
         },
     )
     .await
@@ -3918,6 +3940,7 @@ async fn stacked_share(mock: &MockProvider, sub: &Subscribed) -> ProposeOutcome 
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4097,6 +4120,7 @@ async fn divergence_on_the_top_layer_refuses_the_stacked_share() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4136,6 +4160,7 @@ async fn preview_names_the_stack_action() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4369,6 +4394,7 @@ async fn preview_stacks_on_the_surviving_layer_when_the_top_ref_is_gone() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4420,6 +4446,7 @@ async fn preview_of_a_diverged_top_still_measures_against_the_tip() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4446,6 +4473,17 @@ async fn preview_of_a_diverged_top_still_measures_against_the_tip() {
 /// Shares with an explicit layer to amend, the call every amend scenario
 /// makes.
 async fn amend_share(mock: &MockProvider, sub: &Subscribed, number: u64) -> ProposeOutcome {
+    amend_share_as(mock, sub, number, None).await
+}
+
+/// The same amend, run as a named GitHub login: the acting identity a personal
+/// share resolves, handed to ops as opaque metadata.
+async fn amend_share_as(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    number: u64,
+    author_login: Option<&str>,
+) -> ProposeOutcome {
     propose(
         mock,
         &spec(),
@@ -4457,6 +4495,7 @@ async fn amend_share(mock: &MockProvider, sub: &Subscribed, number: u64) -> Prop
             description: None,
             proposal: Some(number),
             stacks_allowed: true,
+            author_login,
         },
     )
     .await
@@ -4493,10 +4532,20 @@ async fn amending_the_bottom_layer_cascades_force_replays_above() {
     let (sub, layers) = stacked_three_layers(&mock).await;
     let (first, second, third) = (&layers[0], &layers[1], &layers[2]);
     let old_bottom_head = mock.branch_commit(&first.branch).expect("the bottom head");
+    // A mixed-author chain, the shape spec section 9 exists for: three layers
+    // shared by three people, amended by a fourth.
+    set_authors(
+        &sub.state_dir,
+        &[
+            (first.number, "alice"),
+            (second.number, "bob"),
+            (third.number, "carol"),
+        ],
+    );
 
     write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
     let before = mock.calls().len();
-    let report = updated(amend_share(&mock, &sub, first.number).await);
+    let report = updated(amend_share_as(&mock, &sub, first.number, Some("dave")).await);
     assert_eq!(report.number, first.number, "the named layer, amended");
     assert_eq!(
         report.stack_position,
@@ -4589,6 +4638,20 @@ async fn amending_the_bottom_layer_cascades_force_replays_above() {
         );
     }
 
+    // The amender's token rewrote the bottom layer, so that layer is theirs
+    // now. The layers above were replayed, not re-authored: a cascade moves a
+    // commit onto a new parent and says nothing about who proposed it.
+    let authors: Vec<Option<&str>> = state
+        .proposals
+        .iter()
+        .map(|p| p.author_login.as_deref())
+        .collect();
+    assert_eq!(
+        authors,
+        vec![Some("dave"), Some("bob"), Some("carol")],
+        "only the amended layer is re-attributed"
+    );
+
     // An amend changes no base ref, so the stack's membership holds and no
     // stack call is made at all.
     assert!(
@@ -4666,6 +4729,7 @@ async fn amend_refuses_a_number_that_is_not_an_open_layer() {
             description: None,
             proposal: Some(999),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4713,6 +4777,7 @@ async fn amend_preview_counts_the_layers_above() {
             description: None,
             proposal: Some(middle.number),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -4928,6 +4993,7 @@ async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
             description: None,
             proposal: Some(first.number),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -5012,6 +5078,7 @@ async fn a_refusal_on_a_later_kept_entry_leaves_no_orphan_blob_behind() {
             description: None,
             proposal: Some(first.number),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -5056,6 +5123,7 @@ async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend()
             description: None,
             proposal: Some(first.number),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -5091,6 +5159,7 @@ async fn amend_preview_refuses_over_an_unreplayable_layer_above() {
         description: None,
         proposal: Some(first.number),
         stacks_allowed: true,
+        author_login: None,
     };
     let err = propose_preview(
         &mock,
@@ -6251,6 +6320,7 @@ async fn share_with_stacks(mock: &MockProvider, sub: &Subscribed, allowed: bool)
             description: None,
             proposal: None,
             stacks_allowed: allowed,
+            author_login: None,
         },
     )
     .await
@@ -6835,6 +6905,7 @@ async fn an_amend_refusal_lists_the_layers_the_repair_left_open() {
             description: None,
             proposal: Some(999),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -6908,6 +6979,7 @@ async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
             description: None,
             proposal: Some(layers[0].number),
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -6975,6 +7047,7 @@ async fn a_fallback_amend_runs_no_repair_machinery() {
                 description: None,
                 proposal: Some(first.number),
                 stacks_allowed: false,
+                author_login: None,
             },
         )
         .await
@@ -7084,6 +7157,7 @@ async fn a_reviewer_commit_above_refuses_the_repair_too() {
             description: None,
             proposal: None,
             stacks_allowed: true,
+            author_login: None,
         },
     )
     .await
@@ -7628,6 +7702,132 @@ async fn a_layer_with_no_recorded_head_does_not_silence_the_repair_above_it() {
         "and its record now stands on the layer below it"
     );
     assert!(!healed.repair_pending, "the repair finished");
+}
+
+// Who shared a proposal: recorded on the record a share creates or rewrites,
+// carried as opaque metadata on `ShareOptions` so `ops` never resolves an
+// identity of its own.
+
+/// A stacked share as a named login, the call a mixed-author chain is built
+/// out of.
+async fn stacked_share_as(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    author_login: Option<&str>,
+) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login,
+        },
+    )
+    .await
+    .expect("a stacked share should succeed")
+}
+
+#[tokio::test]
+async fn every_share_path_records_the_login_it_acted_as() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The create path: the bottom layer stands on nothing, and is alice's.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(stacked_share_as(&mock, &sub, Some("alice")).await);
+
+    // The stacking path: a second layer, shared by somebody else.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share_as(&mock, &sub, Some("bob")).await);
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[0].number, first.number);
+    assert_eq!(state.proposals[0].author_login.as_deref(), Some("alice"));
+    assert_eq!(state.proposals[1].number, second.number);
+    assert_eq!(
+        state.proposals[1].author_login.as_deref(),
+        Some("bob"),
+        "the new layer is the acting login's, and alice's stays hers"
+    );
+}
+
+#[tokio::test]
+async fn a_share_with_no_login_to_name_records_none() {
+    let mock = MockProvider::new();
+    let (sub, _) = shared_once(&mock).await;
+
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0].author_login,
+        None,
+        "an instance whose credential carries no login (an env token) names nobody"
+    );
+}
+
+#[tokio::test]
+async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_known() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    set_authors(&sub.state_dir, &[(first.number, "alice")]);
+
+    // An update by bob is bob's work on bob's credential: the record follows.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let report = updated(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions {
+                title: None,
+                description: None,
+                proposal: None,
+                stacks_allowed: false,
+                author_login: Some("bob"),
+            },
+        )
+        .await
+        .expect("the open proposal is updated"),
+    );
+    assert_eq!(report.number, first.number);
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0]
+            .author_login
+            .as_deref(),
+        Some("bob")
+    );
+
+    // An update with no login to name leaves the recorded author alone rather
+    // than erasing it: unknown is not "nobody".
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .expect("the open proposal is updated again");
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0]
+            .author_login
+            .as_deref(),
+        Some("bob"),
+        "an unknown login never overwrites a recorded one"
+    );
 }
 
 /// The boundary this whole crate is on the right side of: `ops` orchestrates a

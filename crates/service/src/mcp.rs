@@ -2954,6 +2954,10 @@ fn is_index_change(change: &Value) -> bool {
 /// is present on both arrays for one shape, and null on a declined proposal,
 /// which stands in no chain.
 ///
+/// `author_login` joins them, and is the one key here that is omitted rather
+/// than nulled: a chain whose layers belong to different people is worth the
+/// line, while "nobody recorded" is a line that buys a reader nothing.
+///
 /// **The four domain-level stack keys are dropped while they are quiet**, and
 /// that is deliberately not what [`crate::origin::status_report_json`] does:
 /// the JSON surface emits all four always so one reader handles either path,
@@ -2972,6 +2976,7 @@ fn lean_origin_status(mut value: Value) -> Value {
                 let in_the_chain = key == "open_proposals";
                 if let Some(entries) = domain.get_mut(key).and_then(Value::as_array_mut) {
                     for (index, entry) in entries.iter_mut().enumerate() {
+                        let author = entry.get("author_login").cloned();
                         *entry = json!({
                             "number": entry["number"],
                             "url": entry["url"],
@@ -2993,6 +2998,12 @@ fn lean_origin_status(mut value: Value) -> Value {
                                 Value::Null
                             },
                         });
+                        // A tenth key only where there is somebody to name.
+                        if let Some(author) = author.filter(|a| !a.is_null())
+                            && let Some(object) = entry.as_object_mut()
+                        {
+                            object.insert("author_login".to_string(), author);
+                        }
                     }
                 }
             }
@@ -4301,6 +4312,41 @@ mod tests {
             assert!(
                 !domain.contains_key(key),
                 "{key} is dropped while it is quiet: {domain:?}"
+            );
+        }
+    }
+
+    /// Who shared a layer is worth a line only when there is somebody to name.
+    ///
+    /// A mixed-author chain is what the key exists for, so it survives the
+    /// trim; a null one says nothing a caller can act on, so it is dropped
+    /// rather than spent - the same budget rule the quiet stack keys follow.
+    #[test]
+    fn lean_origin_status_keeps_an_author_and_drops_a_null_one() {
+        let leaned = lean_origin_status(json!({
+            "domains": [{
+                "domain": "kb",
+                "open_proposals": [
+                    {
+                        "number": 7,
+                        "status": "Open",
+                        "feedback": [],
+                        "author_login": "alice",
+                    },
+                    { "number": 8, "status": "Open", "feedback": [], "author_login": null },
+                    // A record from before proposals named their author at all.
+                    { "number": 9, "status": "Open", "feedback": [] },
+                ],
+            }],
+        }));
+
+        let open = &leaned["domains"][0]["open_proposals"];
+        assert_eq!(open[0]["author_login"], "alice");
+        for index in [1, 2] {
+            assert!(
+                open[index].get("author_login").is_none(),
+                "an unnamed author costs no key: {}",
+                open[index]
             );
         }
     }

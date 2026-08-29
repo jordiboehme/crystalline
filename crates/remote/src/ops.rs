@@ -1006,6 +1006,14 @@ pub struct ShareOptions<'a> {
     pub proposal: Option<u64>,
     /// Whether stacked proposals may be used at all (github.stacks config).
     pub stacks_allowed: bool,
+    /// The GitHub login this share acts as, recorded on the proposal record it
+    /// creates or rewrites (see [`Proposal::author_login`]).
+    ///
+    /// Opaque here: the caller resolves who is sharing and hands the answer
+    /// down as a string, so nothing in this crate learns what an identity is.
+    /// `None` is "no login to name" rather than "nobody", so an update never
+    /// erases a recorded author with it.
+    pub author_login: Option<&'a str>,
 }
 
 /// The cached stacks verdict for this origin, probing once when unknown.
@@ -1356,7 +1364,10 @@ pub async fn propose(
     options: ShareOptions<'_>,
 ) -> Result<ProposeOutcome, RemoteError> {
     let ShareOptions {
-        title, description, ..
+        title,
+        description,
+        author_login,
+        ..
     } = options;
     // Freshness first: every proposal must be mergeable at creation.
     pull(provider, spec, domain_root, state_dir).await?;
@@ -1414,6 +1425,7 @@ pub async fn propose(
                 index,
                 title,
                 description,
+                author_login,
             )
             .await;
         }
@@ -1536,6 +1548,7 @@ pub async fn propose(
             local,
             title,
             description,
+            author_login,
         )
         .await;
     }
@@ -1573,6 +1586,7 @@ pub async fn propose(
                     local,
                     title,
                     description,
+                    author_login,
                 )
                 .await;
             }
@@ -1650,6 +1664,7 @@ pub async fn propose(
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: author_login.map(str::to_string),
     });
     state.save(state_dir)?;
 
@@ -2162,6 +2177,7 @@ async fn update_open_proposal(
     local: crate::changes::LocalChanges,
     title: Option<&str>,
     description: Option<&str>,
+    author_login: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
@@ -2229,6 +2245,12 @@ async fn update_open_proposal(
     if let Some(t) = title {
         record.title = t.to_string();
     }
+    // The credential that just rewrote the proposal is whose it is now. An
+    // unknown login leaves the recorded one standing: see
+    // [`ShareOptions::author_login`].
+    if let Some(login) = author_login {
+        record.author_login = Some(login.to_string());
+    }
     state.save(state_dir)?;
 
     Ok(ProposeOutcome::Updated(ProposeReport {
@@ -2281,6 +2303,7 @@ async fn stack_new_layer(
     local: crate::changes::LocalChanges,
     title: Option<&str>,
     description: Option<&str>,
+    author_login: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
@@ -2336,6 +2359,7 @@ async fn stack_new_layer(
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: author_login.map(str::to_string),
     });
 
     // With no stack number yet the chain is exactly the layer below plus this
@@ -2668,6 +2692,7 @@ async fn amend_layer(
     index: usize,
     title: Option<&str>,
     description: Option<&str>,
+    author_login: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
     // Nothing is written until every layer this cascade replays is known to be
     // replayable AND known to be ours: a chain re-based halfway is worse than
@@ -2788,6 +2813,13 @@ async fn amend_layer(
         record.updated_at = Some(Utc::now());
         if let Some(t) = title {
             record.title = t.to_string();
+        }
+        // The amended layer becomes the amender's: their credential rewrote
+        // it. Only this one - the layers the cascade replays below keep the
+        // author they were shared under, since a replay moves a commit onto a
+        // new parent and proposes nothing of its own.
+        if let Some(login) = author_login {
+            record.author_login = Some(login.to_string());
         }
     }
     state.save(state_dir)?;
@@ -3014,6 +3046,11 @@ async fn collect_amend_changes(
 /// back where it belongs without a human re-basing anything. A layer's content
 /// comes from its record rather than from the working tree, which holds the
 /// chain tip and could not tell one layer's work from another's.
+///
+/// It never touches a replayed layer's [`Proposal::author_login`], and that is
+/// the rule rather than an omission: a replay re-parents somebody else's
+/// proposal, it does not propose it, so a chain amended by a fourth person
+/// still names the three who shared its layers.
 ///
 /// The heads of the layers it replays ARE its precondition, and one it does
 /// not check itself: [`ensure_cascade_ready`] probes every one of them in the

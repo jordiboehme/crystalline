@@ -211,6 +211,21 @@ pub struct Proposal {
     /// Set on every share-update and feedback refresh.
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
+    /// The GitHub login the share that wrote this record acted as, recorded at
+    /// share time from the acting credential's stored user.
+    ///
+    /// A chain's layers may be authored by different people, so this is per
+    /// proposal rather than per domain: it is what a stack rail names each
+    /// layer's owner from. A layer amended by somebody else becomes theirs -
+    /// their credential rewrote it - while a layer a cascade merely replayed
+    /// onto a new parent keeps the author it had.
+    ///
+    /// `None` on a record written before this field existed and whenever the
+    /// acting credential carries no login to name (the environment token),
+    /// which is unknown rather than nobody: a share that cannot name its author
+    /// leaves a recorded one standing.
+    #[serde(default)]
+    pub author_login: Option<String>,
 }
 
 /// The lifecycle state of a [`Proposal`].
@@ -1189,6 +1204,7 @@ mod tests {
                 review_state: None,
                 feedback: Vec::new(),
                 updated_at: None,
+                author_login: None,
             });
         }
         assert_eq!(state.history.len(), 20);
@@ -1444,9 +1460,44 @@ mod tests {
                 kind: FeedbackKind::ReviewComment,
             }],
             updated_at: Some(chrono::Utc::now()),
+            author_login: Some("octo".to_string()),
         });
         state.save(dir.path()).unwrap();
         let loaded = OriginState::load(dir.path()).unwrap();
         assert_eq!(loaded, Some(state));
+    }
+
+    /// A record written before proposals recorded who shared them still loads,
+    /// with no author to name. Nothing back-fills it: an old share went out on
+    /// a credential this machine can no longer ask about.
+    #[test]
+    fn a_pre_feature_proposal_loads_with_no_author() {
+        let dir = tempfile::tempdir().unwrap();
+        let json = serde_json::json!({
+            "version": 1,
+            "repo": "acme/brand-knowledge",
+            "branch": "main",
+            "base_commit": "deadbeef",
+            "files": {},
+            "proposals": [{
+                "number": 3,
+                "url": "https://github.com/acme/brand-knowledge/pull/3",
+                "branch": "crystalline/share-eng-260101120000-ab12",
+                "title": "Share updates from eng",
+                "created_at": "2026-01-01T12:00:00Z",
+                "status": "Open",
+                "files": []
+            }],
+            "history": [],
+            "conflicts": []
+        });
+        std::fs::write(
+            dir.path().join(STATE_FILE_NAME),
+            serde_json::to_vec(&json).unwrap(),
+        )
+        .unwrap();
+
+        let loaded = OriginState::load(dir.path()).unwrap().expect("state loads");
+        assert_eq!(loaded.proposals[0].author_login, None);
     }
 }

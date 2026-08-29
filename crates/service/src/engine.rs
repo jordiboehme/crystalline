@@ -8527,6 +8527,11 @@ impl Engine {
     /// `actor` is who the share runs as, which decides the credential the
     /// forge writes go out on (see [`Engine::resolve_share_provider`]); it is
     /// inert while `github.share_identity` is `instance`, the default.
+    ///
+    /// The login that credential was connected as is recorded on the proposal
+    /// this share creates or rewrites, in both modes
+    /// (`crystalline_remote::state::Proposal::author_login`), so a chain whose
+    /// layers belong to different people can say so.
     pub async fn origin_share(
         &self,
         domain: &str,
@@ -8561,6 +8566,10 @@ impl Engine {
                 description,
                 proposal,
                 stacks_allowed,
+                // Who the proposal record names, in either identity mode: the
+                // credential this share actually went out on. `None` only when
+                // that credential carries no login (the environment token).
+                author_login: login.as_deref(),
             },
         )
         .await
@@ -8666,6 +8675,9 @@ impl Engine {
                 description: None,
                 proposal,
                 stacks_allowed,
+                // Carried for the same reason the provider is: a preview
+                // resolves exactly what the share would. It records nothing.
+                author_login: login.as_deref(),
             },
         )
         .await
@@ -12428,6 +12440,45 @@ mod share_actor_tests {
             Some("instance-gh"),
             "and the flip back is live too"
         );
+    }
+
+    /// The login a share records as its author is the one the acting credential
+    /// was connected as, in BOTH modes: instance mode names the instance's own
+    /// login rather than nobody, which is what makes a mixed-mode team's
+    /// proposals read consistently.
+    ///
+    /// The provider half of the resolution is what a share actually calls, so
+    /// it is what is asserted here; a test-injected provider has no credential
+    /// behind it and names nobody, which is why every mock-driven share in this
+    /// tree records a null author.
+    #[tokio::test]
+    async fn a_share_acts_as_the_login_its_credential_was_connected_as() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, None).await;
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+        write_token(&tokens, &personal("alice"), "alice-gh");
+
+        let (_provider, login) = engine
+            .resolve_share_provider(&ShareActor::Owner)
+            .expect("the instance credential resolves");
+        assert_eq!(
+            login.as_deref(),
+            Some("instance-gh"),
+            "instance mode records the login it shares as too"
+        );
+
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.share_identity".to_string(),
+                value: "personal".to_string(),
+            })
+            .await
+            .unwrap();
+        let (_provider, login) = engine
+            .resolve_share_provider(&ShareActor::Account("alice".to_string()))
+            .expect("alice's own credential");
+        assert_eq!(login.as_deref(), Some("alice-gh"), "the actor's own login");
     }
 
     /// The cache key separates every identity from every other one and from the
