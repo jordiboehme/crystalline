@@ -465,6 +465,11 @@ impl From<EngineError> for ApiError {
                 ApiError::not_found(detail)
             }
             EngineError::ReadOnly => ApiError::forbidden(detail),
+            // A second divergence for the same reason: HTTP has a status for
+            // "the request is fine, the resource is busy", and a client that
+            // reads 409 knows to retry once the sign-in in flight is done,
+            // where a 422 would read as "your request was wrong".
+            EngineError::ConnectInProgress => ApiError::conflict(detail),
             EngineError::Ambiguous(_)
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)

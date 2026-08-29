@@ -13,6 +13,7 @@ mod engrams;
 mod error;
 mod evolve;
 mod files;
+mod github_identity;
 mod github_settings;
 mod graph;
 mod users_api;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use tokio::sync::Semaphore;
 
 pub use auth::{
@@ -134,6 +135,10 @@ use crate::engine::Engine;
         github_settings::connect,
         github_settings::token,
         github_settings::disconnect,
+        github_identity::status,
+        github_identity::connect,
+        github_identity::token,
+        github_identity::disconnect,
     ),
     components(schemas(
         ProblemDetail,
@@ -170,6 +175,7 @@ use crate::engine::Engine;
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
         github_settings::GithubPendingView,
+        github_identity::GithubIdentityResponse,
     )),
 )]
 struct ApiDoc;
@@ -560,6 +566,22 @@ pub fn router(state: RestState) -> Router {
         )
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
+        // The self-service half of the same surface, and the one settings
+        // path that is not admin-only: an account's OWN GitHub identity, the
+        // credential its shares go out on when this instance shares
+        // personally. No name in the path - the session already names the
+        // account - so a caller can only ever manage their own. The GET is a
+        // pure read and stays served on a read-only instance; the three
+        // mutations are refused there like every other write here.
+        .route(
+            "/me/github-identity",
+            get(github_identity::status).delete(github_identity::disconnect),
+        )
+        .route(
+            "/me/github-identity/connect",
+            post(github_identity::connect),
+        )
+        .route("/me/github-identity/token", put(github_identity::token))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

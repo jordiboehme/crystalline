@@ -103,6 +103,10 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/settings/github",
     "POST /api/v1/settings/github/connect",
     "POST /api/v1/settings/github/token",
+    "GET /api/v1/me/github-identity",
+    "DELETE /api/v1/me/github-identity",
+    "POST /api/v1/me/github-identity/connect",
+    "PUT /api/v1/me/github-identity/token",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
@@ -195,6 +199,10 @@ struct Inner {
     close_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers `RemoteError::Offline`.
     open_list_fails: bool,
+    /// Whether every WRITE to the forge answers GitHub's 403, the shape a
+    /// token that authenticates fine but may not push to this repository comes
+    /// back as. Set through `MockProvider::forbid_writes`.
+    forbid_writes: bool,
     /// Whether this forge answers the stack probe at all. Off by default, so
     /// every test that does not ask for stacking keeps the single living
     /// proposal this mock has always modelled.
@@ -410,6 +418,14 @@ impl MockProvider {
         self.inner.lock().unwrap().open_list_fails = true;
     }
 
+    /// Makes every write to this forge answer GitHub's 403 - the shape a
+    /// credential that authenticated fine but cannot push to this repository
+    /// comes back as. Checked on the first write a share makes, which is
+    /// enough: the share never reaches the second one.
+    pub fn forbid_writes(&self) {
+        self.inner.lock().unwrap().forbid_writes = true;
+    }
+
     /// Makes `close_proposal` fail with a 500 for `number`.
     pub fn fail_close_proposal(&self, number: u64) {
         self.inner.lock().unwrap().close_failures.insert(number);
@@ -616,8 +632,16 @@ impl Provider for MockProvider {
     ) -> Result<String, RemoteError> {
         let sha = sha256_hex(content);
         let mut inner = self.inner.lock().unwrap();
-        inner.blobs.insert(sha.clone(), content.to_vec());
+        // Logged before the failure check, like every other injected failure
+        // here, so a refused write still leaves a trace of the attempt.
         inner.calls.push(format!("create_blob:{sha}"));
+        if inner.forbid_writes {
+            return Err(RemoteError::Api {
+                status: 403,
+                message: "Resource not accessible by personal access token".to_string(),
+            });
+        }
+        inner.blobs.insert(sha.clone(), content.to_vec());
         Ok(sha)
     }
 

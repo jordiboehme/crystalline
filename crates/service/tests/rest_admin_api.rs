@@ -40,6 +40,10 @@ struct Options {
     read_only: bool,
     /// Start with `github.enabled` already on.
     github: bool,
+    /// Share as the acting account's own GitHub identity rather than as the
+    /// one instance credential: `github.share_identity = personal`. Only read
+    /// when `github` is on, since the whole block is absent otherwise.
+    personal_identity: bool,
     /// The connect double this engine authenticates through. Defaults to
     /// `StubConnectAuth::accepting("octo")`, which validates any token and
     /// runs no device flow.
@@ -81,6 +85,7 @@ async fn serve(opts: Options) -> Fixture {
         }),
         github: opts.github.then(|| GitHubConfig {
             enabled: Some(true),
+            share_identity: opts.personal_identity.then(|| "personal".to_string()),
             ..GitHubConfig::default()
         }),
         ..GlobalConfig::default()
@@ -168,6 +173,13 @@ async fn serve(opts: Options) -> Fixture {
         .await
         .unwrap();
     auth.add_user("vera", "Vera", None, Role::Viewer, "verapw")
+        .await
+        .unwrap();
+    // A perfectly legal account name that cannot address a credential: the
+    // auth store allows any non-whitespace name, while a personal GitHub
+    // identity is stored under a strict `[a-z0-9._-]` allowlist. This account
+    // exists so the connect-time teaching refusal has a caller.
+    auth.add_user("ann+lee", "Ann Lee", None, Role::Editor, "annpw")
         .await
         .unwrap();
 
@@ -405,6 +417,13 @@ async fn a_team_domain_registers_under_the_trimmed_name() {
 /// tree lands under the server's domains root:
 /// `fx._tmp.path().join("domains-root/kb")`.
 async fn serve_team_with_mock() -> (Fixture, Arc<support::MockProvider>) {
+    serve_team_with_mock_sharing(false).await
+}
+
+/// [`serve_team_with_mock`] with this instance's share-identity mode chosen:
+/// `personal` makes a share run as the acting account's own GitHub identity,
+/// which is the mode the share routes accept an editor in.
+async fn serve_team_with_mock_sharing(personal: bool) -> (Fixture, Arc<support::MockProvider>) {
     let mock = Arc::new(support::MockProvider::new());
     let commit = mock.add_commit(std::collections::BTreeMap::from([
         (
@@ -419,6 +438,7 @@ async fn serve_team_with_mock() -> (Fixture, Arc<support::MockProvider>) {
     mock.set_branch("main", &commit);
     let fx = serve(Options {
         github: true,
+        personal_identity: personal,
         origin_provider: Some(mock.clone()),
         ..Options::default()
     })
@@ -1843,6 +1863,526 @@ async fn the_device_flow_polls_over_get_and_reports_failure_once() {
     let again: serde_json::Value = again.json().await.unwrap();
     assert!(again["error"].is_null());
     assert_eq!(again["connected"], false);
+}
+
+/// The self-service identity surface, always the caller's own: there is no
+/// account name in the path, because the session already names one.
+const ME: &str = "/api/v1/me/github-identity";
+
+/// An editor manages the GitHub identity of their own account: the read
+/// starts disconnected, a pasted token connects it and names the login it
+/// authenticated as, and the delete forgets it again. The instance
+/// credential is a different credential throughout - connecting a personal
+/// identity must never be mistaken for connecting the machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_connects_and_forgets_its_own_github_identity() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    let before = as_session(fx.addr, reqwest::Method::GET, ME, &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(before.status(), 200, "an editor reads their own identity");
+    let before: serde_json::Value = before.json().await.unwrap();
+    assert_eq!(before["account"], "eddy");
+    assert_eq!(before["connected"], false);
+    assert!(before["login"].is_null(), "{before}");
+    assert!(before["connected_at"].is_null(), "{before}");
+    assert!(before["token_store"].is_null(), "{before}");
+
+    let connected = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/me/github-identity/token",
+        &eddy,
+    )
+    .json(&serde_json::json!({"token": "pat-personal-123"}))
+    .send()
+    .await
+    .unwrap();
+    let status = connected.status();
+    let body = connected.text().await.unwrap();
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        !body.contains("pat-personal-123"),
+        "write-only means write-only: {body}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["connected"], true);
+    assert_eq!(body["login"], "octo");
+    assert_eq!(body["token_store"], "file");
+    assert!(
+        body["connected_at"].as_str().is_some(),
+        "the card says since when: {body}"
+    );
+
+    // The instance credential is untouched: two slots, not one.
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let instance = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/settings/github",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let instance: serde_json::Value = instance.json().await.unwrap();
+    assert_eq!(
+        instance["connected"], false,
+        "a personal connect is not an instance connect: {instance}"
+    );
+
+    let gone = as_session(fx.addr, reqwest::Method::DELETE, ME, &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 200, "{}", gone.text().await.unwrap());
+    let gone: serde_json::Value = gone.json().await.unwrap();
+    assert_eq!(gone["connected"], false);
+    assert!(gone["login"].is_null());
+
+    // Idempotent, like the method it is spelled with.
+    let again = as_session(fx.addr, reqwest::Method::DELETE, ME, &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+}
+
+/// A viewer cannot share, so there is nothing for a GitHub identity of theirs
+/// to do: the whole surface is refused, and the refusal says why rather than
+/// reciting a role table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_viewer_has_no_github_identity_to_manage() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let vera = login(fx.addr, "vera", "verapw").await;
+
+    for (method, path) in [
+        (reqwest::Method::GET, ME),
+        (reqwest::Method::DELETE, ME),
+        (reqwest::Method::POST, "/api/v1/me/github-identity/connect"),
+    ] {
+        let resp = as_session(fx.addr, method.clone(), path, &vera)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{method} {path} must be refused");
+        let problem: serde_json::Value = resp.json().await.unwrap();
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("share"),
+            "the refusal teaches why: {problem}"
+        );
+    }
+
+    let token = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/me/github-identity/token",
+        &vera,
+    )
+    .json(&serde_json::json!({"token": "pat-personal-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(token.status(), 403);
+}
+
+/// An account name the auth store allows but a credential cannot be addressed
+/// by is caught at CONNECT time, in this surface's own words, rather than
+/// months later as a generic store refusal on somebody's first share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_account_name_that_cannot_hold_an_identity_is_taught_at_connect_time() {
+    let fx = serve(Options {
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let ann = login(fx.addr, "ann+lee", "annpw").await;
+
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/me/github-identity/token",
+        &ann,
+    )
+    .json(&serde_json::json!({"token": "pat-personal-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422);
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        problem["detail"],
+        "your account name 'ann+lee' cannot hold a GitHub identity - account \
+         names for sharing use lowercase letters, digits, dots, hyphens and \
+         underscores; ask an admin to recreate the account"
+    );
+
+    // The device path is the same story, and neither one stored anything.
+    let device = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/github-identity/connect",
+        &ann,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(device.status(), 422);
+    let read = as_session(fx.addr, reqwest::Method::GET, ME, &ann)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 422, "the read cannot resolve one either");
+}
+
+/// One device sign-in at a time, per engine, and the pending slot knows whose
+/// it is: a second account's connect is refused rather than completing into
+/// the first account's credential, the instance connect is refused for the
+/// same reason, and the token the flow issues lands in the account's own slot
+/// with the instance credential still empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn one_device_sign_in_runs_at_a_time_and_lands_in_its_own_slot() {
+    // The run arm blocks on the stub's gate until this test releases it, so
+    // the "still waiting on the user" state is observable before it lands.
+    let auth = support::fake_auth(
+        Ok(support::device_flow_start()),
+        Ok("device-issued-token".to_string()),
+        Ok("octo".to_string()),
+    );
+    let fx = serve(Options {
+        github: true,
+        connect_auth: Some(auth.clone()),
+        ..Options::default()
+    })
+    .await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+
+    let started = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/github-identity/connect",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(started.status(), 202, "{}", started.text().await.unwrap());
+    let started: serde_json::Value = started.json().await.unwrap();
+    assert_eq!(started["pending"]["user_code"], "ABCD-1234");
+
+    // Another account's connect cannot start one: the slot is taken, and the
+    // refusal is a conflict rather than a silent join of somebody else's flow.
+    let second = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/github-identity/connect",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), 409);
+    let problem: serde_json::Value = second.json().await.unwrap();
+    assert!(
+        problem["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("another sign-in is in progress"),
+        "{problem}"
+    );
+
+    // Nor can the instance connect: a machine sign-in must never complete into
+    // a person's credential slot.
+    let instance = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/settings/github/connect",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(instance.status(), 409, "{}", instance.text().await.unwrap());
+
+    // The same account asking again is a double click, not a second flow: it
+    // reports the code already outstanding.
+    let repeat = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/github-identity/connect",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(repeat.status(), 202);
+    let repeat: serde_json::Value = repeat.json().await.unwrap();
+    assert_eq!(repeat["pending"]["user_code"], "ABCD-1234");
+
+    auth.run_gate.notify_one();
+
+    let mut connected = None;
+    for _ in 0..50 {
+        let poll = as_session(fx.addr, reqwest::Method::GET, ME, &eddy)
+            .send()
+            .await
+            .unwrap();
+        let poll: serde_json::Value = poll.json().await.unwrap();
+        if poll["pending"].is_null() {
+            connected = Some(poll);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let connected = connected.expect("the flow must end");
+    assert_eq!(connected["connected"], true, "{connected}");
+    assert_eq!(connected["login"], "octo", "{connected}");
+
+    let instance = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/settings/github",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let instance: serde_json::Value = instance.json().await.unwrap();
+    assert_eq!(
+        instance["connected"], false,
+        "the device token landed in eddy's slot, not the machine's: {instance}"
+    );
+}
+
+/// The identity surface follows the same read-only rule as every other
+/// settings surface: the read is served, the three mutations are refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_serves_the_identity_read_and_refuses_its_mutations() {
+    let ro = serve(Options {
+        read_only: true,
+        github: true,
+        ..Options::default()
+    })
+    .await;
+    let eddy = login(ro.addr, "eddy", "eddypw").await;
+
+    let read = as_session(ro.addr, reqwest::Method::GET, ME, &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(read.status(), 200, "a pure read stays served");
+
+    let token = as_session(
+        ro.addr,
+        reqwest::Method::PUT,
+        "/api/v1/me/github-identity/token",
+        &eddy,
+    )
+    .json(&serde_json::json!({"token": "pat-personal-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(token.status(), 403);
+
+    let device = as_session(
+        ro.addr,
+        reqwest::Method::POST,
+        "/api/v1/me/github-identity/connect",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(device.status(), 403);
+
+    let gone = as_session(ro.addr, reqwest::Method::DELETE, ME, &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(gone.status(), 403);
+}
+
+/// Instance mode is today's instance, byte for byte: one credential does every
+/// share, so the four sync writes stay admin-only and an editor is refused on
+/// all of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_share_routes_stay_admin_only_in_instance_mode() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    let preview = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(preview.status(), 403, "an editor previews nothing here");
+
+    let shared = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &eddy,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(shared.status(), 403, "and shares nothing either");
+
+    let withdrawn = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/proposals/1/withdraw",
+        &eddy,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(withdrawn.status(), 403);
+
+    let resolved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/conflicts/abc12345/resolve",
+        &eddy,
+    )
+    .json(&serde_json::json!({"resolution": "mine"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resolved.status(), 403);
+}
+
+/// Personal mode moves the gate down one role and no further: the personal
+/// identity carries the accountability an admin gate stood in for, so an
+/// editor shares as themselves - and a viewer still cannot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn personal_mode_lets_an_editor_share_and_still_refuses_a_viewer() {
+    let (fx, _mock) = serve_team_with_mock_sharing(true).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+    write_kb_engram(&kb_root, "editors.md", "Editors", "editors");
+
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let preview = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(preview.status(), 200, "{}", preview.text().await.unwrap());
+
+    let shared = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &eddy,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(shared.status(), 200, "{}", shared.text().await.unwrap());
+    let shared: serde_json::Value = shared.json().await.unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &vera,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 403, "a viewer never writes");
+
+    // And an admin is still an editor's superior, not their opposite.
+    let admin_share = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(admin_share.status(), 200);
+}
+
+/// The share reaches the engine as the SESSION'S OWN account, which is what
+/// makes the strict refusal land on the person who has not connected yet: with
+/// no provider override in this fixture, the share resolves a real credential
+/// for `eddy`, finds none and teaches the two ways back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_share_without_a_connected_identity_teaches_the_fix() {
+    let fx = serve(Options {
+        github: true,
+        personal_identity: true,
+        origin_domain: true,
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    // The instance credential is what the READ side (and the route's own
+    // readiness gate) needs; the write side is the one that goes personal.
+    let connected = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/settings/github/token",
+        &admin,
+    )
+    .json(&serde_json::json!({"token": "pat-secret-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(connected.status(), 200);
+
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &eddy,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422, "{}", refused.text().await.unwrap());
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        problem["detail"],
+        "This instance shares with personal GitHub identities. Connect yours \
+         in Fluid (profile > GitHub identity) or run 'crystalline connect \
+         github --personal', then share again."
+    );
 }
 
 /// The download IS the backup story: a zip whose entries reproduce the

@@ -1811,6 +1811,93 @@ async fn an_injected_provider_short_circuits_personal_mode_too() {
     assert_eq!(shared["outcome"], "updated", "{shared}");
 }
 
+/// A 403 from the forge on a personal write is unreadable in its raw form,
+/// and the fix is not the caller's to guess: personal mode's stacks are
+/// same-repo and forks are unsupported, so collaborator access is a hard
+/// requirement rather than a suggestion.
+///
+/// This drives the failure through the SHARE VERB rather than through the
+/// enrichment function alone, which is the half a unit test cannot pin: the
+/// teaching text has to be wired into the verb, with the login the write
+/// actually went out as and the repository it was refused by interpolated. The
+/// instance half of the same rule rides along - in instance mode the raw text
+/// is what a failure keeps (spec section 8).
+#[tokio::test]
+async fn a_403_on_a_personal_share_teaches_the_collaborator_requirement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    // The injected provider has no credential behind it to read a login off,
+    // so the login it acts as is supplied beside it.
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await
+    .with_origin_provider_login("alice-gh");
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "personal".to_string(),
+    })
+    .await
+    .unwrap();
+    let root = tmp.path().join("kb");
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha v2"),
+    )
+    .unwrap();
+
+    mock.forbid_writes();
+    let err = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .expect_err("the forge refused the write");
+    assert_eq!(
+        err.to_string(),
+        "your GitHub account @alice-gh needs write access to acme/kb - ask a maintainer to add you as a collaborator."
+    );
+
+    // The same failure on the instance credential keeps today's text: nobody
+    // is being told to fix a personal connection that was never used.
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "instance".to_string(),
+    })
+    .await
+    .unwrap();
+    let err = eng
+        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("the forge refuses this one too");
+    assert!(
+        !err.to_string().contains("collaborator"),
+        "an instance-token failure keeps its own words: {err}"
+    );
+}
+
 #[tokio::test]
 async fn origin_withdraw_closes_the_pr_and_records_withdrawn() {
     let tmp = tempfile::tempdir().unwrap();

@@ -3281,7 +3281,11 @@ fn to_error(e: EngineError) -> ErrorData {
         | EngineError::Conflict(_)
         | EngineError::Invalid(_)
         | EngineError::ReadOnly
-        | EngineError::EnvTokenConnect => ErrorData::invalid_params(e.to_string(), None),
+        | EngineError::EnvTokenConnect
+        // The caller asked at the wrong moment rather than for the wrong
+        // thing, and the message says to try again once the other sign-in is
+        // done: actionable input-class guidance, like the two above it.
+        | EngineError::ConnectInProgress => ErrorData::invalid_params(e.to_string(), None),
         EngineError::Remote(remote) => remote_to_error(remote),
         EngineError::Io { .. } | EngineError::Internal(_) => {
             ErrorData::internal_error(e.to_string(), None)

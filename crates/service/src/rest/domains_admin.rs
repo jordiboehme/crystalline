@@ -13,9 +13,35 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
+use crystalline_core::config::ShareIdentityMode;
+
 use super::auth::Identity;
-use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
+use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only};
 use crate::engine::{EngineError, ShareActor};
+
+/// The caller, when they may drive this instance's share verbs - the preview,
+/// the share, a withdrawal and a conflict resolution, the four routes that act
+/// on the team's repository.
+///
+/// The gate moves with `github.share_identity`, because what it is protecting
+/// moves with it:
+///
+/// - `instance` (the default): every share goes out on the ONE machine
+///   credential, so it carries the instance's name and nobody's own. Admin
+///   only, exactly as today - this branch is byte for byte the previous
+///   behaviour, and an instance that never changes the setting never sees a
+///   difference.
+/// - `personal`: a share goes out on the acting account's own GitHub identity
+///   and is signed by it on the forge. The accountability an admin gate stood
+///   in for is now carried by the identity itself, so an editor - the role that
+///   may already write the knowledge - may also propose it. A viewer still
+///   cannot, here as everywhere else.
+fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, ApiError> {
+    match state.engine.share_identity_mode() {
+        ShareIdentityMode::Instance => identity.require_admin(),
+        ShareIdentityMode::Personal => identity.require_editor(),
+    }
+}
 
 /// What `POST /domains` takes: a mode and whatever that mode needs.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -935,7 +961,9 @@ pub async fn sync_now(
     tag = "domains",
     operation_id = "get_domain_share_changes",
     summary = "Preview what sharing this team domain would do.",
-    description = "Admin only. Pulls the origin first, then reports the \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Pulls the origin first, then reports the \
                    action a share would take (`create`, `update` with the \
                    proposal number and url, `stack` with the layer it would \
                    sit on, `amend` with the layer it would land on, \
@@ -996,9 +1024,11 @@ pub async fn sync_now(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, this instance is \
-                           read-only, or the trusted-header identity names a \
-                           disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), this \
+                           instance is read-only, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1023,7 +1053,7 @@ pub async fn share_changes_preview(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     if !state.engine.github_ready().await {
@@ -1088,7 +1118,9 @@ pub struct ShareBody {
     tag = "domains",
     operation_id = "share_domain",
     summary = "Share a team domain's local changes as a proposal.",
-    description = "Admin only. Opens a pull request against the domain's \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Opens a pull request against the domain's \
                    origin, stacks a new layer on the chain already open, or \
                    updates the one living proposal in place. With `proposal` \
                    in the body it amends that open layer instead, rebuilding \
@@ -1144,10 +1176,12 @@ pub struct ShareBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), the \
+                           request did not echo its CSRF token, this instance \
+                           is read-only, or the trusted-header identity names \
+                           a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1188,7 +1222,7 @@ pub async fn share_now(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<ShareBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
@@ -1235,7 +1269,9 @@ pub struct WithdrawBody {
     tag = "domains",
     operation_id = "withdraw_domain_proposal",
     summary = "Withdraw one of a team domain's open proposals.",
-    description = "Admin only. Closes the proposal's pull request, deletes \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Closes the proposal's pull request, deletes \
                    its branch best-effort and records it as withdrawn. With \
                    `revert` true the shared files are restored from the \
                    origin as well, and files a reviewer amended on the \
@@ -1284,10 +1320,12 @@ pub struct WithdrawBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), the \
+                           request did not echo its CSRF token, this instance \
+                           is read-only, or the trusted-header identity names \
+                           a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1319,7 +1357,7 @@ pub async fn withdraw_proposal(
     ApiPath((domain, number)): ApiPath<(String, u64)>,
     ApiJson(body): ApiJson<WithdrawBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
@@ -1456,7 +1494,9 @@ pub struct ResolveBody {
     tag = "domains",
     operation_id = "resolve_domain_conflict",
     summary = "Resolve one recorded conflict by id.",
-    description = "Admin only. Settles the conflict by keeping the local \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Settles the conflict by keeping the local \
                    side (`mine`), taking the team's (`theirs`) or writing \
                    merged content (`merged`, which requires `content`), then \
                    re-indexes the domain. Entirely local - no GitHub \
@@ -1483,10 +1523,12 @@ pub struct ResolveBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), the \
+                           request did not echo its CSRF token, this instance \
+                           is read-only, or the trusted-header identity names \
+                           a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1525,7 +1567,7 @@ pub async fn resolve_conflict(
     ApiPath((domain, id)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     // Resolve BY ID: look the path up first, then run the path-based verb.

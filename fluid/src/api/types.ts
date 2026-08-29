@@ -543,7 +543,7 @@ export interface paths {
         };
         /**
          * Preview what sharing this team domain would do.
-         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
          */
         get: operations["get_domain_share_changes"];
         put?: never;
@@ -585,7 +585,7 @@ export interface paths {
         put?: never;
         /**
          * Resolve one recorded conflict by id.
-         * @description Admin only. Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.
          */
         post: operations["resolve_domain_conflict"];
         delete?: never;
@@ -605,7 +605,7 @@ export interface paths {
         put?: never;
         /**
          * Withdraw one of a team domain's open proposals.
-         * @description Admin only. Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
          */
         post: operations["withdraw_domain_proposal"];
         delete?: never;
@@ -625,7 +625,7 @@ export interface paths {
         put?: never;
         /**
          * Share a team domain's local changes as a proposal.
-         * @description Admin only. Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
          */
         post: operations["share_domain"];
         delete?: never;
@@ -739,6 +739,70 @@ export interface paths {
          */
         get: operations["get_graph"];
         put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/github-identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's own GitHub identity, and their device flow's poll.
+         * @description Editors and admins only - a viewer cannot share, so there is no identity of theirs to manage. A pure read, served even on a read-only instance. Also the device flow's poll: while one of this account's runs, `pending` carries the short code and its URL; once it ends, `pending` goes null and a failed flow's reason is reported in `error` on exactly one read, then cleared.
+         */
+        get: operations["get_my_github_identity"];
+        put?: never;
+        post?: never;
+        /**
+         * Forget the caller's own GitHub credential.
+         * @description Editors and admins only, and refused on a read-only instance. Idempotent: disconnecting an account that holds no credential succeeds and answers `connected: false` rather than 404. The instance connection is untouched.
+         */
+        delete: operations["disconnect_my_github_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/github-identity/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a device-code sign-in for the caller's own identity.
+         * @description Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow; one made while another identity's sign-in is in flight is refused 409. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.
+         */
+        post: operations["connect_my_github_identity_device"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/github-identity/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Connect the caller's own identity with a personal access token.
+         * @description Editors and admins only, and refused on a read-only instance. The token is validated against GitHub before it is stored, and is never echoed: the answer is the same token-material-free status the GET returns. Replaces whatever this account had connected before.
+         */
+        put: operations["connect_my_github_identity_token"];
         post?: never;
         delete?: never;
         options?: never;
@@ -1250,6 +1314,41 @@ export interface components {
              * @example decision
              */
             type?: string | null;
+        };
+        /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
+        GithubIdentityResponse: {
+            /**
+             * @description The account this identity belongs to: always the caller's own.
+             * @example ada
+             */
+            account: string;
+            /**
+             * @description Whether a personal credential is on file for that account.
+             * @example true
+             */
+            connected: boolean;
+            /**
+             * @description When the credential was stored, RFC 3339. The card's "connected since".
+             * @example 2026-08-29T09:12:44Z
+             */
+            connected_at?: string | null;
+            /**
+             * @description This account's device flow's failure (expired, denied), reported on
+             *     exactly one status read after the flow ends, then cleared.
+             */
+            error?: string | null;
+            /**
+             * @description The GitHub login it authenticated as, when connected.
+             * @example octo
+             */
+            login?: string | null;
+            pending?: null | components["schemas"]["GithubPendingView"];
+            /**
+             * @description keyring | file; null when disconnected. Never `environment`: the
+             *     environment supplies the machine's credential and never a personal one.
+             * @example keyring
+             */
+            token_store?: string | null;
         };
         /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid. */
         GithubPendingView: {
@@ -4297,7 +4396,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4441,7 +4540,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4539,7 +4638,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4637,7 +4736,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5054,6 +5153,225 @@ export interface operations {
                 };
             };
             /** @description The anchor is not a `crystalline://` URL. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_my_github_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The identity. No token material. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account's name cannot address a credential (account names for sharing use lowercase letters, digits, dots, hyphens and underscores). The detail names the fix. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    disconnect_my_github_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The identity as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account's name cannot address a credential. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    connect_my_github_identity_device: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The flow started (or this account's was already running): `pending` carries the code to confirm. Poll `GET /me/github-identity` for the outcome. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Another identity's device sign-in is in flight. There is one flow at a time per instance; wait for it to finish and start again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account's name cannot address a credential, or GitHub refused to start the flow. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    connect_my_github_identity_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenBody"];
+            };
+        };
+        responses: {
+            /** @description The identity as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description The body is not JSON. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is JSON but not a token, the token is empty, GitHub refused it, or this account's name cannot address a credential. */
             422: {
                 headers: {
                     [name: string]: unknown;

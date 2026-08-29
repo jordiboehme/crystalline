@@ -294,6 +294,15 @@ pub enum EngineError {
         "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
     )]
     EnvTokenConnect,
+    /// A device-flow sign-in was started while another identity's was still in
+    /// flight. There is exactly one flow slot per engine and it is tagged with
+    /// the credential it will store into (see `Engine::begin_device_flow`), so
+    /// two sign-ins cannot complete into each other's slot; the second caller
+    /// is told to wait rather than silently joining somebody else's flow.
+    #[error(
+        "another sign-in is in progress on this instance: wait for it to finish, then start yours again"
+    )]
+    ConnectInProgress,
     /// A filesystem error.
     #[error("io error at {path}: {source}{}", crystalline_core::config::io_hint_suffix(.path, .source))]
     Io {
@@ -747,6 +756,32 @@ const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub 
 /// missing token for an identity the caller never chose.
 const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
 
+/// The [`TokenIdentity`] one account's personal credential lives under, or the
+/// teaching refusal for a name that cannot address a credential at all.
+///
+/// The auth store allows any non-whitespace name, while a credential is
+/// addressed by a strict `[a-z0-9._-]` allowlist
+/// ([`crystalline_remote::valid_identity_name`], which is what stops a name
+/// from choosing where a token file lands). The gap is small and real, so it is
+/// caught HERE - when someone connects an identity - and said in words that
+/// name the fix, rather than months later as the token store's generic refusal
+/// on that person's first share.
+///
+/// The rejected name is quoted back through `escape_debug`: it failed the
+/// allowlist, so unlike everywhere else this crate interpolates an identity
+/// name, it may carry a control byte or a terminal escape, and this message is
+/// rendered in a browser, a terminal and a log line alike. A name that is
+/// merely outside the allowlist (`ann+lee`) prints exactly as it was typed.
+fn personal_identity(account: &str) -> Result<TokenIdentity> {
+    if !crystalline_remote::valid_identity_name(account) {
+        return Err(EngineError::Invalid(format!(
+            "your account name '{}' cannot hold a GitHub identity - account names for sharing use lowercase letters, digits, dots, hyphens and underscores; ask an admin to recreate the account",
+            account.escape_debug()
+        )));
+    }
+    Ok(TokenIdentity::Personal(account.to_string()))
+}
+
 /// The [`Engine::github_tokens`] cache key for one credential on one host.
 ///
 /// A unit separator joins the parts because an identity name can never contain
@@ -1073,6 +1108,19 @@ impl Engine {
     /// a full snapshot.
     pub fn github_enabled(&self) -> bool {
         self.config.read().unwrap().github_enabled()
+    }
+
+    /// Whose GitHub identity a share on this instance runs as, read live from
+    /// the effective config: `instance` (the default, one credential does
+    /// everything) or `personal` (the acting identity's own).
+    ///
+    /// Public because it is a fact about the instance that surfaces branch on
+    /// before they ever reach a credential - the REST share routes pick their
+    /// role gate with it (an admin-only instance credential, versus a personal
+    /// one that carries its own accountability), and Fluid renders a different
+    /// share dialog.
+    pub fn share_identity_mode(&self) -> ShareIdentityMode {
+        self.config.read().unwrap().github_share_identity()
     }
 
     /// The open `subscriptions/listen` streams a moved tool list is announced
@@ -9378,18 +9426,38 @@ impl Engine {
         Ok((store, token))
     }
 
+    /// The plan a connect flow saves the INSTANCE credential through.
+    fn github_save_plan(&self, host: Option<&str>) -> Result<TokenSavePlan> {
+        self.github_save_plan_for(&TokenIdentity::Instance, host)
+    }
+
     /// The plan a connect flow saves its token through: the test file override
     /// or a real `save_resolving`, plus a handle to the token cache to refresh
     /// after the write. `host` is the token host this connect targets, captured
     /// by value so the device-flow task can own the plan across the spawn.
-    fn github_save_plan(&self, host: Option<&str>) -> Result<TokenSavePlan> {
+    ///
+    /// `identity` decides both halves of where the token lands - the keyring
+    /// account (or the fallback file name) and the cache slot the write
+    /// refreshes - so a person's connect can never overwrite the machine's
+    /// credential, nor leave the machine's client cached under a name it no
+    /// longer belongs to.
+    fn github_save_plan_for(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<TokenSavePlan> {
         let target = match &self.token_store_dir_override {
-            Some(dir) => SaveTarget::File(dir.join("github-token.json")),
+            // The same derivation `github_credential_for` reads back through,
+            // rather than a second spelling of the file name here.
+            Some(dir) => SaveTarget::File(
+                TokenStore::file_fallback_for(identity, dir).map_err(EngineError::Remote)?,
+            ),
             None => SaveTarget::Resolve {
                 fallback_dir: self.origins_base_dir()?,
             },
         };
         Ok(TokenSavePlan {
+            identity: identity.clone(),
             host: host.map(str::to_string),
             target,
             cache: Arc::clone(&self.github_tokens),
@@ -9441,33 +9509,69 @@ impl Engine {
             .unwrap_or_else(|| crystalline_remote::GITHUB_CLIENT_ID.to_string())
     }
 
-    /// The pending device flow's display view, `{ pending: true, user_code,
-    /// verification_url, expires_in_secs }`, or `None` when no flow is
-    /// running.
+    /// The pending INSTANCE device flow's display view, `{ pending: true,
+    /// user_code, verification_url, expires_in_secs }`, or `None` when no
+    /// instance flow is running. A person's sign-in is invisible here: the two
+    /// are different credentials and neither surface may report the other's
+    /// code.
     fn pending_view(&self) -> Option<Value> {
-        self.pending_connect.lock().unwrap().as_ref().map(|p| {
-            json!({
-                "pending": true,
-                "user_code": p.user_code,
-                "verification_url": p.verification_url,
-                "expires_in_secs": p.expires_in_secs,
-            })
-        })
+        self.pending_view_for(&TokenIdentity::Instance)
     }
 
-    /// Takes the pending flow's outcome if it has landed, clearing the slot
-    /// so a later connect starts fresh. Returns `None` both when no flow is
-    /// pending at all and when one is pending but still waiting on the
-    /// user; a caller distinguishes those with [`Engine::pending_view`].
+    /// [`Engine::pending_view`] for one identity.
+    fn pending_view_for(&self, identity: &TokenIdentity) -> Option<Value> {
+        self.pending_connect
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|p| p.identity == *identity)
+            .map(|p| {
+                json!({
+                    "pending": true,
+                    "user_code": p.user_code,
+                    "verification_url": p.verification_url,
+                    "expires_in_secs": p.expires_in_secs,
+                })
+            })
+    }
+
+    /// Takes the pending INSTANCE flow's outcome if it has landed, clearing
+    /// the slot so a later connect starts fresh. Returns `None` both when no
+    /// instance flow is pending at all and when one is pending but still
+    /// waiting on the user; a caller distinguishes those with
+    /// [`Engine::pending_view`].
     fn take_finished_pending(&self) -> Option<std::result::Result<String, RemoteError>> {
+        self.take_finished_pending_for(&TokenIdentity::Instance)
+    }
+
+    /// [`Engine::take_finished_pending`] for one identity: a landed outcome is
+    /// reported to - and cleared by - whoever the flow belonged to, never by
+    /// the surface that happens to read first.
+    fn take_finished_pending_for(
+        &self,
+        identity: &TokenIdentity,
+    ) -> Option<std::result::Result<String, RemoteError>> {
         let mut guard = self.pending_connect.lock().unwrap();
         let landed = guard
             .as_ref()
+            .filter(|p| p.identity == *identity)
             .and_then(|p| p.outcome.lock().unwrap().take());
         if landed.is_some() {
             *guard = None;
         }
         landed
+    }
+
+    /// Drops a pending flow belonging to `identity`, leaving another
+    /// identity's alone. What a connect that settles the same credential by
+    /// another route (a pasted token) and a disconnect both do: the flow in
+    /// flight is about to be answered by a stale background task, and only for
+    /// this one credential.
+    fn clear_pending_for(&self, identity: &TokenIdentity) {
+        let mut guard = self.pending_connect.lock().unwrap();
+        if guard.as_ref().is_some_and(|p| p.identity == *identity) {
+            *guard = None;
+        }
     }
 
     /// The `github` block of the `configure` tool's snapshot: `{ connected,
@@ -9579,7 +9683,9 @@ impl Engine {
             store.delete().map_err(EngineError::Remote)?;
         }
         self.github_tokens.lock().unwrap().clear();
-        *self.pending_connect.lock().unwrap() = None;
+        // Only the machine's own sign-in: a person's device flow is a
+        // different credential and is left to run.
+        self.clear_pending_for(&TokenIdentity::Instance);
         Ok(json!({ "connected": false, "token_store": kind }))
     }
 
@@ -9664,7 +9770,7 @@ impl Engine {
             user: user.clone(),
             created_at: chrono::Utc::now(),
         })?;
-        *self.pending_connect.lock().unwrap() = None;
+        self.clear_pending_for(&TokenIdentity::Instance);
 
         let mut github = self.origin_connection_json().await?;
         github["pending_connect"] = Value::Null;
@@ -9692,9 +9798,55 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        if self.pending_connect.lock().unwrap().is_some() {
+        let Some(view) = self
+            .begin_device_flow(&TokenIdentity::Instance, host)
+            .await?
+        else {
             let github = self.configure_connection_block().await?;
             return self.configure_snapshot_with(github);
+        };
+
+        let enabled = self.config.read().unwrap().github_enabled();
+        self.configure_snapshot_with(json!({
+            "connected": false,
+            "user": Value::Null,
+            "token_store": Value::Null,
+            "pending_connect": view,
+            "github_enabled": enabled,
+            "note": connect_enablement_note(enabled, true),
+        }))
+    }
+
+    /// Starts a device-flow sign-in that will store its token as `identity`,
+    /// spawning the background task that runs it to completion, validates the
+    /// token, saves it and stashes the outcome in the pending slot.
+    ///
+    /// Answers `Some(view)` with the code to show when a flow was started, and
+    /// `None` when this same identity already has one running - the double
+    /// click a caller reports the outstanding code for rather than stranding a
+    /// second one.
+    ///
+    /// There is exactly ONE flow slot per engine and it is tagged, so a
+    /// sign-in started while a DIFFERENT identity's is still in flight is
+    /// refused with [`EngineError::ConnectInProgress`] instead of joining it.
+    /// The one exception is a flow whose outcome has already landed: that
+    /// sign-in is finished rather than in progress - its token, if any, is
+    /// saved and every status reads the store, so the only thing dropped is an
+    /// unread error line for a flow nobody came back to look at - and the slot
+    /// is taken over.
+    async fn begin_device_flow(
+        &self,
+        identity: &TokenIdentity,
+        host: Option<&str>,
+    ) -> Result<Option<Value>> {
+        {
+            let mut guard = self.pending_connect.lock().unwrap();
+            match guard.as_ref() {
+                Some(p) if p.identity == *identity => return Ok(None),
+                Some(p) if p.outcome.lock().unwrap().is_some() => *guard = None,
+                Some(_) => return Err(EngineError::ConnectInProgress),
+                None => {}
+            }
         }
 
         let api_url = self.connect_api_url(host);
@@ -9708,6 +9860,7 @@ impl Engine {
         let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
             Arc::new(std::sync::Mutex::new(None));
         let pending = PendingConnect {
+            identity: identity.clone(),
             user_code: start.user_code.clone(),
             verification_url: start.verification_url.clone(),
             expires_in_secs: start.expires_in_secs,
@@ -9723,7 +9876,7 @@ impl Engine {
 
         let auth = self.connect_auth.clone();
         let token_host = origin::token_host(api_url.as_deref());
-        let plan = self.github_save_plan(token_host.as_deref())?;
+        let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
         tokio::spawn(async move {
             let result: std::result::Result<String, RemoteError> = async {
                 let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
@@ -9743,16 +9896,130 @@ impl Engine {
             .await;
             *outcome_slot.lock().unwrap() = Some(result);
         });
+        Ok(Some(view))
+    }
 
-        let enabled = self.config.read().unwrap().github_enabled();
-        self.configure_snapshot_with(json!({
-            "connected": false,
-            "user": Value::Null,
-            "token_store": Value::Null,
-            "pending_connect": view,
-            "github_enabled": enabled,
-            "note": connect_enablement_note(enabled, true),
-        }))
+    // --- one account's own GitHub identity ----------------------------------
+
+    /// One account's personal GitHub connection, for the profile card that
+    /// manages it: whether a token is on file, the login it was connected as,
+    /// since when, where it lives, and the device flow's poll.
+    ///
+    /// The account name is the identity anchor (spec section 4), so a name a
+    /// credential cannot be addressed by is refused here, in words that name
+    /// the fix, rather than at the person's first share (see the
+    /// `personal_identity` gate every verb on this surface goes through).
+    ///
+    /// A pure read, like the instance status it mirrors: it is served on a
+    /// read-only instance, and it doubles as the device flow's poll, reporting
+    /// a failed flow's reason on exactly one read.
+    pub async fn github_identity_status(&self, account: &str) -> Result<GithubIdentity> {
+        let identity = personal_identity(account)?;
+        let error = match self.take_finished_pending_for(&identity) {
+            Some(Err(e)) => Some(e.to_string()),
+            _ => None,
+        };
+        let host = self.github_token_host();
+        let (store, token) = self.github_credential_for(&identity, host.as_deref())?;
+        let pending = self.pending_view_for(&identity).map(|v| GithubPending {
+            user_code: v["user_code"].as_str().unwrap_or_default().to_string(),
+            verification_url: v["verification_url"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            expires_in_secs: v["expires_in_secs"].as_u64().unwrap_or_default(),
+        });
+        Ok(GithubIdentity {
+            account: account.to_string(),
+            connected: token.is_some(),
+            login: token
+                .as_ref()
+                .and_then(|t| t.user_display())
+                .map(str::to_string),
+            connected_at: token.as_ref().map(|t| t.created_at),
+            token_store: token.is_some().then(|| store.kind().to_string()),
+            pending,
+            error,
+        })
+    }
+
+    /// Connect one account's GitHub identity with a personal access token,
+    /// validated against GitHub before it is stored so the login on file is
+    /// the one the token actually belongs to.
+    ///
+    /// `CRYSTALLINE_GITHUB_TOKEN` is deliberately NOT a bar here, unlike on
+    /// the instance connect: that variable fixes the MACHINE's identity (the
+    /// environment store is instance-only, by construction in
+    /// `crystalline_remote::token`), and an instance whose machine credential
+    /// comes from the environment is exactly the kind that shares personally.
+    pub async fn connect_github_identity_token(
+        &self,
+        account: &str,
+        token: &str,
+    ) -> Result<GithubIdentity> {
+        let identity = personal_identity(account)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let api_url = self.connect_api_url(None);
+        let user = self
+            .connect_auth
+            .validate_token(api_url.as_deref(), token)
+            .await?;
+        let token_host = origin::token_host(api_url.as_deref());
+        let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
+        plan.save(&StoredToken {
+            access_token: token.to_string(),
+            host: token_host.unwrap_or_else(|| "github.com".to_string()),
+            user,
+            created_at: chrono::Utc::now(),
+        })?;
+        // A pasted token settles this identity now, so a device flow of this
+        // person's still in flight must not land on top of it later.
+        self.clear_pending_for(&identity);
+        self.github_identity_status(account).await
+    }
+
+    /// Start a device-code sign-in for one account's GitHub identity. Returns
+    /// immediately with the status carrying the code to confirm; the flow runs
+    /// in the background and its outcome is read from
+    /// [`Engine::github_identity_status`].
+    ///
+    /// One sign-in at a time across the whole engine: a second account's
+    /// connect while this one runs is [`EngineError::ConnectInProgress`], and
+    /// the same account asking again reports the code already outstanding.
+    pub async fn start_github_identity_device_flow(&self, account: &str) -> Result<GithubIdentity> {
+        let identity = personal_identity(account)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        self.begin_device_flow(&identity, None).await?;
+        self.github_identity_status(account).await
+    }
+
+    /// Forget one account's GitHub identity: delete the credential where it
+    /// lives, drop its cache slot and cancel a device flow of its own.
+    /// Idempotent - disconnecting an identity that holds nothing succeeds.
+    ///
+    /// Only this identity's cache entry is evicted, not the whole cache: every
+    /// other credential this process resolved is still valid, and re-reading
+    /// them would cost a keychain prompt each for nothing.
+    pub async fn disconnect_github_identity(&self, account: &str) -> Result<GithubIdentity> {
+        let identity = personal_identity(account)?;
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let host = self.github_token_host();
+        let (store, token) = self.github_credential_for(&identity, host.as_deref())?;
+        if token.is_some() {
+            store.delete().map_err(EngineError::Remote)?;
+        }
+        self.github_tokens
+            .lock()
+            .unwrap()
+            .remove(&credential_cache_key(&identity, host.as_deref()));
+        self.clear_pending_for(&identity);
+        self.github_identity_status(account).await
     }
 }
 
@@ -9893,6 +10160,29 @@ pub struct GithubPending {
     pub expires_in_secs: u64,
 }
 
+/// One account's own GitHub identity, as the profile card that manages it
+/// renders and polls it. Carries no token material - only whose identity it is,
+/// whether one is on file, the login it authenticated as, since when and where
+/// it lives.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GithubIdentity {
+    /// The crystalline account this identity belongs to.
+    pub account: String,
+    /// Whether a personal credential is on file for that account.
+    pub connected: bool,
+    /// The GitHub login it authenticated as, when connected.
+    pub login: Option<String>,
+    /// When the credential was stored, for the card's "connected since".
+    pub connected_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// "keyring" | "file", when connected. Never "environment": the
+    /// environment supplies the machine's credential and never a personal one.
+    pub token_store: Option<String>,
+    /// This account's device flow waiting for the browser side.
+    pub pending: Option<GithubPending>,
+    /// The once-reported failure of this account's last device flow.
+    pub error: Option<String>,
+}
+
 /// One in-flight GitHub device-flow sign-in, held by
 /// [`Engine::pending_connect`] so a second `configure` connect call while
 /// one is running reports the same code instead of starting another. The
@@ -9900,6 +10190,15 @@ pub struct GithubPending {
 /// result into `outcome` once, for the next `configure` call (any call, not
 /// just a connect) to observe and clear.
 struct PendingConnect {
+    /// Whose credential this flow will store into when it lands. The slot is
+    /// engine-wide and there is exactly one, so without this tag an instance
+    /// sign-in and a person's sign-in could report - and clear - each other's
+    /// outcome. Every read of the slot is filtered by it (see
+    /// [`Engine::pending_view_for`] and
+    /// [`Engine::take_finished_pending_for`]), and a connect for a different
+    /// identity while one is running is refused rather than joined (see
+    /// [`Engine::begin_device_flow`]).
+    identity: TokenIdentity,
     /// The short code the user types in at `verification_url`.
     user_code: String,
     /// Where the user confirms the code.
@@ -9920,6 +10219,9 @@ struct PendingConnect {
 /// value (an `Arc` handle to the cache plus an owned host and target),
 /// mirroring how the pending outcome slot is moved into that task.
 struct TokenSavePlan {
+    /// Whose credential this write is: the machine's, or one person's. Decides
+    /// the store the token lands in and the cache slot refreshed after it.
+    identity: TokenIdentity,
     /// The token host this connect targets, `None` for GitHub.com. Owned so
     /// the plan survives the move into the device-flow task.
     host: Option<String>,
@@ -9934,8 +10236,8 @@ struct TokenSavePlan {
 /// real `save_resolving` that writes through the keychain and lands in a file
 /// only when the keychain write itself fails.
 enum SaveTarget {
-    /// The test token-directory override's fixed file path.
-    File(PathBuf),
+    /// The test token-directory override's file store for this identity.
+    File(TokenStore),
     /// Production: `save_resolving` under this origins state directory.
     Resolve {
         /// The origins state directory the file fallback lives under.
@@ -9950,16 +10252,22 @@ impl TokenSavePlan {
     /// therefore one keychain write and zero reads.
     fn save(&self, token: &StoredToken) -> std::result::Result<(), RemoteError> {
         let store = match &self.target {
-            SaveTarget::File(path) => {
-                let store = TokenStore::File { path: path.clone() };
+            SaveTarget::File(store) => {
                 store.save(token)?;
-                store
+                store.clone()
             }
-            SaveTarget::Resolve { fallback_dir } => {
-                TokenStore::save_resolving(self.host.as_deref(), fallback_dir, token)?
-            }
+            SaveTarget::Resolve { fallback_dir } => TokenStore::save_resolving_for(
+                &self.identity,
+                self.host.as_deref(),
+                fallback_dir,
+                token,
+            )?,
         };
-        let key = credential_cache_key(&TokenIdentity::Instance, self.host.as_deref());
+        // This identity's own slot, never a fixed one: a personal connect that
+        // refreshed the instance entry would both strand the stale personal
+        // client (the very next share would use the token just replaced) and
+        // hand the machine's reads somebody's personal credential.
+        let key = credential_cache_key(&self.identity, self.host.as_deref());
         self.cache.lock().unwrap().insert(
             key,
             CachedGithub {
@@ -12284,6 +12592,179 @@ mod share_actor_tests {
 
     fn personal(name: &str) -> TokenIdentity {
         TokenIdentity::Personal(name.to_string())
+    }
+
+    /// A [`ConnectAuth`] that validates any token as one fixed login and has
+    /// no device path: enough to drive a personal connect with no network,
+    /// and no keychain, behind it.
+    struct AcceptingAuth(&'static str);
+
+    #[async_trait::async_trait]
+    impl ConnectAuth for AcceptingAuth {
+        async fn start_device_flow(
+            &self,
+            _auth_base: &str,
+            _client_id: &str,
+        ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+            Err(RemoteError::NotConnected)
+        }
+
+        async fn run_device_flow(
+            &self,
+            _auth_base: &str,
+            _client_id: &str,
+            _start: &crystalline_remote::DeviceFlowStart,
+        ) -> std::result::Result<String, RemoteError> {
+            Err(RemoteError::NotConnected)
+        }
+
+        async fn validate_token(
+            &self,
+            _api_url: Option<&str>,
+            _token: &str,
+        ) -> std::result::Result<String, RemoteError> {
+            Ok(self.0.to_string())
+        }
+    }
+
+    /// Connecting an identity that already had one REPLACES the credential
+    /// every later write resolves - the cache slot is refreshed rather than
+    /// left holding the token that was just superseded. The bug this pins is
+    /// silent and expensive: a person who rotates a revoked token would keep
+    /// sharing with the revoked one until the process restarted.
+    #[tokio::test]
+    async fn a_personal_connect_refreshes_that_identitys_cached_credential() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal"))
+            .await
+            .with_connect_auth(Arc::new(AcceptingAuth("alice-gh")));
+
+        let connected = engine
+            .connect_github_identity_token("alice", "first-token")
+            .await
+            .unwrap();
+        assert_eq!(connected.login.as_deref(), Some("alice-gh"));
+        assert!(connected.connected_at.is_some(), "the card says since when");
+
+        // Resolve once, so the credential is definitely cached.
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect("alice's credential");
+        assert_eq!(token.access_token, "first-token");
+
+        engine
+            .connect_github_identity_token("alice", "second-token")
+            .await
+            .unwrap();
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect("alice's credential");
+        assert_eq!(
+            token.access_token, "second-token",
+            "the reconnect must not leave the superseded token cached"
+        );
+
+        // And a personal connect never touched the machine's own slot.
+        let cache = engine.github_tokens.lock().unwrap();
+        assert!(
+            !cache.contains_key(&credential_cache_key(&TokenIdentity::Instance, None)),
+            "a personal connect is not an instance connect"
+        );
+    }
+
+    /// Disconnecting forgets the credential AND the cached client built from
+    /// it: a share right after a disconnect must be refused, not served the
+    /// token that was just deleted.
+    #[tokio::test]
+    async fn disconnecting_an_identity_evicts_its_cached_credential_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal"))
+            .await
+            .with_connect_auth(Arc::new(AcceptingAuth("alice-gh")));
+        engine
+            .connect_github_identity_token("alice", "first-token")
+            .await
+            .unwrap();
+        // Bob stays connected throughout: a disconnect is one credential's.
+        engine
+            .connect_github_identity_token("bob", "bobs-token")
+            .await
+            .unwrap();
+        engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect("cached before the disconnect");
+
+        let gone = engine.disconnect_github_identity("alice").await.unwrap();
+        assert!(!gone.connected);
+        assert!(gone.login.is_none());
+
+        let err = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect_err("the deleted credential must not be served from cache");
+        assert_eq!(err.to_string(), PERSONAL_TOKEN_MISSING);
+
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("bob".to_string()))
+            .expect("bob is untouched");
+        assert_eq!(token.access_token, "bobs-token");
+
+        // Idempotent: disconnecting again is a success, not a 404.
+        assert!(
+            !engine
+                .disconnect_github_identity("alice")
+                .await
+                .unwrap()
+                .connected
+        );
+    }
+
+    /// The gap between what the auth store allows as a name and what a
+    /// credential can be addressed by is taught where it is discovered - at
+    /// connect time, in words that name the fix - rather than left to surface
+    /// as the token store's generic refusal on a first share.
+    #[tokio::test]
+    async fn a_name_that_cannot_address_a_credential_is_refused_at_connect_time() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal"))
+            .await
+            .with_connect_auth(Arc::new(AcceptingAuth("alice-gh")));
+
+        let err = engine
+            .connect_github_identity_token("ann+lee", "some-token")
+            .await
+            .expect_err("'+' is outside the credential name class");
+        assert_eq!(
+            err.to_string(),
+            "your account name 'ann+lee' cannot hold a GitHub identity - account names for sharing use lowercase letters, digits, dots, hyphens and underscores; ask an admin to recreate the account"
+        );
+
+        // Every verb on the surface says the same thing, so the card never
+        // half-works for such an account.
+        for err in [
+            engine.github_identity_status("ann+lee").await.unwrap_err(),
+            engine
+                .start_github_identity_device_flow("ann+lee")
+                .await
+                .unwrap_err(),
+            engine
+                .disconnect_github_identity("ann+lee")
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(err.to_string().contains("cannot hold a GitHub identity"));
+        }
+
+        // A rejected name is quoted through `escape_debug`, so a name carrying
+        // a terminal escape cannot smuggle one into a log line or a console.
+        let err = engine
+            .connect_github_identity_token("ann\u{1b}[31m", "some-token")
+            .await
+            .expect_err("an escape is outside the class too");
+        assert!(
+            !err.to_string().contains('\u{1b}'),
+            "the escape is rendered, not executed: {err}"
+        );
+        assert!(err.to_string().contains("\\u{1b}"), "{err}");
     }
 
     /// The default mode is unchanged behaviour: one instance credential does
