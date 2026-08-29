@@ -1522,6 +1522,63 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
     assert!(root.join("notes/new.md").exists());
 }
 
+/// The join the whole feature hangs on: the login `resolve_share_provider`
+/// hands back is what the proposal record names, in the default identity mode.
+///
+/// It is worth a whole share rather than a shaper assertion because the engine
+/// holds a second, same-typed `Option<String>` at that call site - the
+/// personal-mode-only login write failures are enriched with - and swapping
+/// the two would zero every instance-mode share's author while every other test
+/// in this tree stayed green.
+#[tokio::test]
+async fn a_share_records_the_login_it_acted_as_on_the_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    // The default identity mode, and a credential that names somebody: the
+    // shape resolution 3 locked, where instance mode records its own login
+    // rather than nobody.
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false)
+        .await
+        .with_origin_provider_login("instance-gh");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let result = eng
+        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+
+    let state = OriginState::load(&origins_dir.join("brand"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.proposals[0].author_login.as_deref(),
+        Some("instance-gh"),
+        "the acting login reaches the record, not the personal-mode-only one"
+    );
+}
+
 #[tokio::test]
 async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     let tmp = tempfile::tempdir().unwrap();

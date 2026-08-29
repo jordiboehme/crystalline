@@ -630,6 +630,13 @@ pub struct Engine {
     // provider's own identity rather than a real, untestable OS credential
     // store. Production code never sets this.
     origin_provider_override: Option<Arc<dyn Provider>>,
+    // The GitHub login the injected provider stands in as, for tests that need
+    // a share to record an author (`Proposal::author_login`): a mock has no
+    // credential behind it, so the login it would have carried is supplied
+    // beside it. `None` - the default, and what every test that does not care
+    // leaves it as - reads exactly as an instance whose credential names
+    // nobody. Production code never sets this either.
+    origin_provider_override_login: Option<String>,
     // Overrides where per-domain origin state (the base snapshot, conflict
     // records, `state.json`) is read and written, for tests: `None` means the
     // real `crystalline_core::config::origin_state_dir`, a real machine path
@@ -907,6 +914,7 @@ impl Engine {
             origin_locks: std::sync::Mutex::new(HashMap::new()),
             write_locks: std::sync::Mutex::new(HashMap::new()),
             origin_provider_override: None,
+            origin_provider_override_login: None,
             origins_dir_override: None,
             connect_auth: Arc::new(RealConnectAuth),
             pending_connect: std::sync::Mutex::new(None),
@@ -995,6 +1003,19 @@ impl Engine {
     /// still picked up without a restart.
     pub fn with_origin_provider(mut self, provider: Arc<dyn Provider>) -> Engine {
         self.origin_provider_override = Some(provider);
+        self
+    }
+
+    /// The GitHub login the injected provider acts as, for tests that need a
+    /// share to record an author (see
+    /// [`crystalline_remote::state::Proposal::author_login`]). Test-only, and
+    /// only meaningful beside [`Engine::with_origin_provider`]: a mock has no
+    /// credential for [`Engine::resolve_share_provider`] to read a login off,
+    /// so the login it would have carried is supplied here. Leaving it unset
+    /// keeps the injected provider's original behaviour - a write that names
+    /// nobody.
+    pub fn with_origin_provider_login(mut self, login: impl Into<String>) -> Engine {
+        self.origin_provider_override_login = Some(login.into());
         self
     }
 
@@ -9139,14 +9160,17 @@ impl Engine {
     ///   a teaching text; there is no fallback to the instance credential, by
     ///   design (spec section 6).
     ///
-    /// The test provider override short-circuits BOTH modes, with no login: an
-    /// injected mock has no credential behind it to name.
+    /// The test provider override short-circuits BOTH modes: an injected mock
+    /// has no credential behind it to read a login off, so the login it acts as
+    /// is whatever [`Engine::with_origin_provider_login`] supplied beside it -
+    /// `None` unless a test asked for one, which is the same answer as a
+    /// credential that names nobody.
     fn resolve_share_provider(
         &self,
         actor: &ShareActor,
     ) -> Result<(Arc<dyn Provider>, Option<String>)> {
         if let Some(p) = &self.origin_provider_override {
-            return Ok((p.clone(), None));
+            return Ok((p.clone(), self.origin_provider_override_login.clone()));
         }
         let (api_url, token) = self.resolve_share_credential(actor)?;
         let login = token.user_display().map(str::to_string);
