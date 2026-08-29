@@ -215,6 +215,35 @@ impl Harness {
         )
     }
 
+    /// Re-open this harness's instance sharing with personal GitHub
+    /// identities, on a fresh engine with NO provider injected in front of it.
+    ///
+    /// Both halves are load-bearing. The mode is what splits the write
+    /// credential off the instance one, and dropping the injected provider is
+    /// what lets the split actually run: an injected mock short-circuits
+    /// credential resolution for both modes (`Engine::resolve_share_provider`),
+    /// so a test that kept it would never reach the token store and never see
+    /// the refusal. The config, the domain registration and the origin state
+    /// the mock already wrote are all on disk, so the new engine picks up the
+    /// same team domain; the token-store directory is the empty one the
+    /// harness created, which is what "connected nothing yet" means here and
+    /// is why no keychain is ever touched.
+    async fn share_personally(&mut self, agent_identity: Option<&str>) {
+        let config_path = self.root.join("config.yaml");
+        let mut cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+        let github = cfg.github.get_or_insert_with(GitHubConfig::default);
+        github.enabled = Some(true);
+        github.share_identity = Some("personal".to_string());
+        github.agent_identity = agent_identity.map(str::to_string);
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let store = TursoStore::open_in_memory().await.unwrap();
+        self.engine = Arc::new(
+            Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+                .with_token_store_dir(self.root.join("token-store"))
+                .with_origins_dir(self.root.join("origins")),
+        );
+    }
+
     /// A raw newline-delimited JSON-RPC conversation over the same duplex
     /// transport the stdio bridge uses. The bytes are the subject here, so no
     /// rmcp client sits between the assertions and the wire.
@@ -2973,6 +3002,90 @@ async fn the_share_round_runs_over_http_too() {
         answered["result"]["resultType"],
         json!("input_required"),
         "{answered}"
+    );
+}
+
+// --- personal share identity, resolved from the transport -------------------
+//
+// An instance can be configured to share as the acting person's own GitHub
+// account rather than as the one instance credential. MCP has two transports
+// and they are two different actors: a stdio session is a process this
+// machine's harness started, so it acts as the machine owner, while an HTTP
+// session carries no user auth at all and acts as the account
+// `github.agent_identity` names. Wiring that up is the release gate these
+// three tests stand on - without it a remote agent's share would go out under
+// the machine owner's name.
+
+/// The two refusal texts, quoted from `crate::engine` rather than retyped:
+/// they travel to the caller verbatim, so a paraphrase here would pass while
+/// the product said something else.
+const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again.";
+const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
+
+/// **A stdio session shares as the machine owner**, so an instance sharing
+/// personally with no owner connection on file teaches the two ways to make
+/// one - as `invalid_params`, because it is a situation the caller can get out
+/// of rather than a server fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_stdio_share_without_an_owner_connection_teaches_the_fix() {
+    let (mut h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    h.share_personally(None).await;
+    let mut wire = h.stdio().await;
+
+    let refused = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        json!(PERSONAL_TOKEN_MISSING),
+        "{refused}"
+    );
+}
+
+/// **Strictness surfaces in round one.** An eliciting peer is asked before a
+/// share, and a question about a proposal this instance would then refuse to
+/// open is a question it cannot honour - so the preview resolves the same
+/// identity the confirmed call would and answers the refusal instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_share_refuses_in_round_one_rather_than_asking() {
+    let (mut h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    h.share_personally(None).await;
+    let mut wire = h.stdio().await;
+
+    let refused = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert!(
+        refused["result"]["resultType"] != json!("input_required"),
+        "no question it could not honour: {refused}"
+    );
+    assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        json!(PERSONAL_TOKEN_MISSING),
+        "{refused}"
+    );
+}
+
+/// **An HTTP session shares as the configured agent identity**, and with none
+/// configured the refusal names the setting an admin has to write rather than
+/// reporting a missing token for an identity the caller never chose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_http_share_without_an_agent_identity_names_the_setting() {
+    let (mut h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    h.share_personally(None).await;
+    let addr = h.http().await;
+
+    // A refused call is answered as a JSON-RPC error, which rmcp's HTTP
+    // transport frames with a 400 rather than the 200 a result gets - the
+    // status is that layer's business, the message is ours.
+    let raw = modern_post(addr, 1, "tools/call", share_kb(None)).await;
+    let refused = payload(&raw);
+    assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        json!(AGENT_IDENTITY_UNSET),
+        "{refused}"
     );
 }
 

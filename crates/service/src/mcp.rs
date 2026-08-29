@@ -1031,6 +1031,30 @@ impl McpServer {
         self.harness_onboarded = onboarded;
         self
     }
+
+    /// Who a write verb over this connection acts as, when this instance
+    /// shares with personal GitHub identities (`github.share_identity =
+    /// personal`). Inert in the default `instance` mode, where one credential
+    /// does everything.
+    ///
+    /// **The transport is the identity here, because it is the only thing
+    /// there is.** A stdio session is a process this machine's harness
+    /// started, so it is the machine owner in exactly the sense the CLI is -
+    /// the same local `owner` credential, connected once with `crystalline
+    /// connect github --personal`. An HTTP session carries no user auth at all
+    /// (there is nobody to be), so it acts as the account
+    /// `github.agent_identity` names, and refuses with a text naming that
+    /// setting when an admin has named none.
+    ///
+    /// Read per call rather than stored: the two constructors already record
+    /// the transport, and one more copy of it would be one more thing that can
+    /// disagree with them.
+    fn share_actor(&self) -> ShareActor {
+        match self.transport {
+            Transport::Stdio => ShareActor::Owner,
+            Transport::Http => ShareActor::HttpAgent,
+        }
+    }
 }
 
 #[tool_router]
@@ -1547,7 +1571,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1573,9 +1597,11 @@ impl McpServer {
                             &p.domain,
                             p.title.as_deref(),
                             p.proposal,
-                            // Task 6 wires the transport: stdio MCP is the
-                            // machine owner, HTTP MCP is the agent identity.
-                            ShareActor::Owner,
+                            // The preview resolves the identity the confirmed
+                            // call would, so an instance that would refuse the
+                            // share refuses here instead of asking a question
+                            // it could not honour.
+                            self.share_actor(),
                         )
                         .await
                         .map_err(to_error)?;
@@ -1595,8 +1621,7 @@ impl McpServer {
                 p.title.as_deref(),
                 p.description.as_deref(),
                 p.proposal,
-                // Task 6 wires the transport.
-                ShareActor::Owner,
+                self.share_actor(),
             )
             .await
             .map_err(to_error)
@@ -1632,7 +1657,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP use the account github.agent_identity names; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -1653,7 +1678,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP use the account github.agent_identity names). resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1716,8 +1741,7 @@ impl McpServer {
             }
         };
         self.engine
-            // Task 6 wires the transport.
-            .origin_resolve(&p.domain, &p.path, keep, content, ShareActor::Owner)
+            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor())
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1727,7 +1751,7 @@ impl McpServer {
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1755,8 +1779,7 @@ impl McpServer {
                     // about a proposal that does not exist.
                     let preview = self
                         .engine
-                        // Task 6 wires the transport.
-                        .origin_withdraw_preview(&p.domain, p.proposal, revert, ShareActor::Owner)
+                        .origin_withdraw_preview(&p.domain, p.proposal, revert, self.share_actor())
                         .await
                         .map_err(to_error)?;
                     return Ok(confirm_question(withdraw_question(&preview)).into());
@@ -1768,8 +1791,7 @@ impl McpServer {
             }
         }
         self.engine
-            // Task 6 wires the transport.
-            .origin_withdraw(&p.domain, p.proposal, revert, ShareActor::Owner)
+            .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor())
             .await
             .map_err(to_error)
             .and_then(ok)

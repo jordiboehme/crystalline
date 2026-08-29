@@ -117,6 +117,29 @@ async fn connect_with<H: ClientHandler>(
     (client, server)
 }
 
+/// `connect`, served as the streamable-HTTP transport serves it
+/// (`McpServer::new_http`, the constructor the daemon's router mounts) rather
+/// than as stdio does.
+///
+/// The transport is the only difference, and it is exactly the difference the
+/// write verbs read: a stdio session acts as the machine owner, an HTTP one as
+/// the account `github.agent_identity` names.
+async fn connect_http(
+    engine: Arc<Engine>,
+) -> (
+    RunningService<RoleClient, ()>,
+    RunningService<RoleServer, McpServer>,
+) {
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    let server_task =
+        tokio::spawn(
+            async move { rmcp::serve_server(McpServer::new_http(engine), server_io).await },
+        );
+    let client = rmcp::serve_client((), client_io).await.unwrap();
+    let server = server_task.await.unwrap().unwrap();
+    (client, server)
+}
+
 /// Call a tool, returning its JSON body on success or the error message on
 /// failure.
 async fn call(peer: &Peer<RoleClient>, tool: &str, args: Value) -> Result<Value, String> {
@@ -1479,6 +1502,154 @@ async fn share_changes_tool_wires_through_to_origin_share() {
     assert_eq!(out["outcome"], json!("proposed"));
     assert_eq!(out["added"][0], json!("notes/new.md"));
     assert!(out["url"].as_str().unwrap().starts_with("https://"));
+}
+
+/// Share one new engram of a fresh team domain and return the tool's answer,
+/// over the transport asked for. Everything about the two fixtures is the
+/// same except the transport, so the answers are comparable.
+async fn share_one_engram_over(transport_is_http: bool) -> Value {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = if transport_is_http {
+        connect_http(eng).await
+    } else {
+        connect(eng).await
+    };
+    call(client.peer(), "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap()
+}
+
+/// **The transport decides the identity, and in instance mode there is only
+/// one identity to decide.** `github.share_identity` defaults to `instance`,
+/// where every share goes out on the one instance credential whoever asked -
+/// so a stdio share and an HTTP one answer the same thing, which is the
+/// byte-for-byte promise a default install rides on.
+///
+/// Only the branch is allowed to differ, and the review URL that carries it:
+/// a share branch is named for the wall-clock second it was cut plus a random
+/// suffix, so two fixtures never agree on one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_mode_answers_a_share_the_same_over_stdio_and_over_http() {
+    let mut over_stdio = share_one_engram_over(false).await;
+    let mut over_http = share_one_engram_over(true).await;
+    assert_eq!(over_stdio["outcome"], json!("proposed"), "{over_stdio}");
+    for answer in [&mut over_stdio, &mut over_http] {
+        let branch = answer["branch"].as_str().unwrap_or_default().to_string();
+        assert!(branch.starts_with("crystalline/share-brand-"), "{branch}");
+        let url = answer["url"].as_str().unwrap_or_default().to_string();
+        assert!(url.contains(&branch) && url.ends_with("/pull/1"), "{url}");
+        let object = answer.as_object_mut().unwrap();
+        object.remove("branch");
+        object.remove("url");
+    }
+    assert_eq!(over_stdio, over_http);
+}
+
+/// Write a personal token file into `dir` exactly where the engine's test
+/// override reads one for `identity`, so a share in personal mode finds a
+/// credential without a keychain, a network or a connect flow.
+fn seed_personal_token_file(dir: &std::path::Path, identity: &str, user: &str) {
+    std::fs::create_dir_all(dir).unwrap();
+    TokenStore::File {
+        path: dir.join(format!("github-token-personal-{identity}.json")),
+    }
+    .save(&StoredToken {
+        access_token: "seeded-personal-token".to_string(),
+        host: "github.com".to_string(),
+        user: user.to_string(),
+        created_at: chrono::Utc::now(),
+    })
+    .unwrap();
+}
+
+/// **An HTTP share runs as the configured agent identity, and with one
+/// configured it goes through.** The refusals are the loud half of this
+/// feature; this is the quiet half, and it is the one a deployment depends on:
+/// an admin names a bot account in `github.agent_identity`, connects its
+/// GitHub identity once, and remote agents share again.
+///
+/// The injected provider short-circuits credential resolution (see
+/// `Engine::resolve_share_provider`), so what this pins is the plumbing - an
+/// `HttpAgent` actor reaching the share verb and the share completing on it.
+/// The credential half is pinned where a real resolution runs: the engine's
+/// own unit tests, and the refusal wire tests in `mcp_modern_era.rs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_http_share_proceeds_on_the_configured_agent_identity() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let token_dir = tmp.path().join("tokens");
+    let root = tmp.path().join("brand-knowledge");
+    seed_personal_token_file(&token_dir, "bot", "kb-bot");
+    let mut cfg = config(true);
+    cfg.github = Some(GitHubConfig {
+        enabled: Some(true),
+        share_identity: Some("personal".to_string()),
+        agent_identity: Some("bot".to_string()),
+        ..GitHubConfig::default()
+    });
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let eng = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(store)),
+            cfg,
+            None,
+            Some(config_path.clone()),
+        )
+        .with_origin_provider(mock)
+        .with_origins_dir(origins_dir)
+        .with_token_store_dir(token_dir),
+    );
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect_http(eng).await;
+    let out = call(client.peer(), "share_changes", json!({ "domain": "brand" }))
+        .await
+        .unwrap();
+    assert_eq!(out["outcome"], json!("proposed"), "{out}");
+    assert_eq!(out["added"][0], json!("notes/new.md"), "{out}");
 }
 
 /// The `proposal` argument reaches the engine rather than being decoration on
