@@ -363,6 +363,18 @@ mod chain {
         /// Bind the socket, write the owner record and serve one command with
         /// `data` as its payload.
         fn answering(tag: &str, data: Value) -> Daemon {
+            Daemon::serving(tag, json!({ "v": 1, "ok": true, "data": data }))
+        }
+
+        /// The same, refusing the one command it serves with `message` - the
+        /// shape the engine's teaching refusals arrive in.
+        fn refusing(tag: &str, message: &str) -> Daemon {
+            Daemon::serving(tag, json!({ "v": 1, "ok": false, "error": message }))
+        }
+
+        /// Bind the socket, write the owner record and answer one command with
+        /// `envelope` exactly as given.
+        fn serving(tag: &str, envelope: Value) -> Daemon {
             let nanos = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
@@ -401,7 +413,6 @@ mod chain {
                     let _ = tx.send(request);
                 }
                 let mut write = stream;
-                let envelope = json!({ "v": 1, "ok": true, "data": data });
                 let _ = writeln!(write, "{envelope}");
                 let _ = write.flush();
             });
@@ -410,6 +421,19 @@ mod chain {
 
         /// Run the real binary against this daemon and return its stdout.
         fn run(&self, args: &[&str]) -> String {
+            let out = self.invoke(args);
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        }
+
+        /// The same, for a command this daemon refuses: returns its stderr.
+        fn run_failing(&self, args: &[&str]) -> String {
+            let out = self.invoke(args);
+            assert!(!out.status.success(), "{out:?}");
+            String::from_utf8(out.stderr).unwrap()
+        }
+
+        fn invoke(&self, args: &[&str]) -> std::process::Output {
             let mut cmd = Command::cargo_bin("crystalline").unwrap();
             cmd.env("HOME", &self.dir)
                 .env("XDG_CONFIG_HOME", self.dir.join("config"))
@@ -417,9 +441,7 @@ mod chain {
                 .env("XDG_CACHE_HOME", self.dir.join("cache"))
                 .env("CRYSTALLINE_SERVICE_HTTP", "false")
                 .args(args);
-            let out = cmd.output().unwrap();
-            assert!(out.status.success(), "{out:?}");
-            String::from_utf8(out.stdout).unwrap()
+            cmd.output().unwrap()
         }
 
         /// The single ctl command the CLI sent.
@@ -706,5 +728,91 @@ mod chain {
         assert!(!out.contains("layer"), "{out}");
         assert!(!out.contains("wedged"), "{out}");
         assert!(!out.contains("pending"), "{out}");
+        assert!(
+            !out.contains("personal"),
+            "an instance-mode status says nothing about a personal identity: {out}"
+        );
+    }
+
+    /// In personal mode the connection line only names the credential that
+    /// READS; the line under it names the identity this caller's own share
+    /// would go out as.
+    #[test]
+    fn status_names_the_personal_identity_a_share_would_go_out_as() {
+        let mut payload = status_payload(vec![open_proposal(3, "Only work")], vec![], false, false);
+        payload["connection"]["share_identity"] = json!("personal");
+        payload["connection"]["owner_identity"] =
+            json!({ "account": "owner", "connected": true, "user": "alice-gh" });
+        let daemon = Daemon::answering("status-personal", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(out.contains("GitHub: connected as octocat"), "{out}");
+        assert!(out.contains("sharing as @alice-gh (personal)"), "{out}");
+    }
+
+    /// The same instance, with nothing connected for this caller: the refusal
+    /// their next share would get, said before they hit it, with the command
+    /// that fixes it.
+    #[test]
+    fn status_teaches_the_connect_command_when_no_personal_identity_is_connected() {
+        let mut payload = status_payload(vec![], vec![], false, false);
+        payload["connection"]["share_identity"] = json!("personal");
+        payload["connection"]["owner_identity"] =
+            json!({ "account": "owner", "connected": false, "user": Value::Null });
+        let daemon = Daemon::answering("status-unconnected", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(
+            out.contains(
+                "no personal GitHub identity connected - run: crystalline connect github --personal"
+            ),
+            "{out}"
+        );
+    }
+
+    /// A chain whose layers belong to different people says so, layer by
+    /// layer; a proposal that recorded no author reads exactly as it always
+    /// did.
+    #[test]
+    fn status_names_each_layers_author_where_one_was_recorded() {
+        let mut alice = open_proposal(3, "Bottom layer");
+        alice["author_login"] = json!("alice-gh");
+        let mut payload = status_payload(
+            vec![alice, open_proposal(8, "Top layer")],
+            vec![],
+            false,
+            false,
+        );
+        payload["domains"][0]["declined_proposals"] = json!([{
+            "number": 7, "title": "Declined work",
+            "url": "https://github.test/acme/brand/pull/7",
+            "author_login": "carol-gh",
+        }]);
+        let daemon = Daemon::answering("status-authors", payload);
+        let out = daemon.run(&["origin", "status"]);
+        assert!(
+            out.contains("layer 1: open proposal #3 by @alice-gh: Bottom layer"),
+            "{out}"
+        );
+        assert!(
+            out.contains("layer 2: open proposal #8: Top layer"),
+            "a layer with no recorded author reads as it always did: {out}"
+        );
+        assert!(
+            out.contains("declined proposal #7 by @carol-gh: Declined work"),
+            "{out}"
+        );
+    }
+
+    /// The engine's teaching refusals reach the caller word for word: the CLI
+    /// renders a ctl error as plain text, so the text the engine chose is the
+    /// text a person reads. Pinned here in full, because these words are the
+    /// whole feature for someone whose share just stopped working.
+    #[test]
+    fn a_refused_share_reaches_the_caller_word_for_word() {
+        let refusal = "This instance shares with personal GitHub identities. Connect yours in \
+                       Fluid (profile > GitHub identity) or run 'crystalline connect github \
+                       --personal', then share again.";
+        let daemon = Daemon::refusing("share-refused", refusal);
+        let err = daemon.run_failing(&["origin", "share", "brand"]);
+        assert!(err.contains(refusal), "{err}");
     }
 }

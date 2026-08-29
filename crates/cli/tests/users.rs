@@ -311,6 +311,61 @@ fn a_mistyped_name_is_reported() {
     assert!(err.contains("no such user"), "{err}");
 }
 
+/// An account that connected a GitHub identity for sharing leaves a credential
+/// behind; disabling or removing the account sweeps it, best effort, and never
+/// touches anybody else's.
+///
+/// The probe account's name is one no real install carries, because the sweep
+/// does reach this machine's credential store: it deletes whatever is filed
+/// under that name, so only a name nobody connected is safe to point it at.
+#[test]
+#[cfg(unix)]
+fn disabling_and_removing_an_account_forget_its_github_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let origins = home.path().join("state/crystalline/origins");
+    std::fs::create_dir_all(&origins).unwrap();
+    let credential = |account: &str| origins.join(format!("github-token-personal-{account}.json"));
+    let write_credential = |account: &str| {
+        std::fs::write(
+            credential(account),
+            r#"{"access_token":"gho_x","host":"github.com","user":"probe","created_at":"2026-08-29T00:00:00Z"}"#,
+        )
+        .unwrap();
+    };
+
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    users_ok(
+        home.path(),
+        &["add", "sweep-probe", "--role", "editor", "--password-stdin"],
+        Some("hunter2\n"),
+    );
+    write_credential("sweep-probe");
+    write_credential("ada");
+
+    users_ok(home.path(), &["disable", "sweep-probe"], None);
+    assert!(
+        !credential("sweep-probe").exists(),
+        "disabling an account forgets the identity it shared with"
+    );
+    assert!(
+        credential("ada").exists(),
+        "and forgets nobody else's identity"
+    );
+
+    users_ok(home.path(), &["enable", "sweep-probe"], None);
+    write_credential("sweep-probe");
+    users_ok(home.path(), &["remove", "sweep-probe"], None);
+    assert!(
+        !credential("sweep-probe").exists(),
+        "removing an account forgets it too"
+    );
+    assert!(credential("ada").exists());
+}
+
 #[test]
 fn an_empty_list_says_so() {
     let home = tempfile::tempdir().unwrap();

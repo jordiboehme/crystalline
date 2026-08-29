@@ -966,6 +966,19 @@ enum ConnectCommand {
         /// github.api_url.
         #[arg(long)]
         host: Option<String>,
+        /// Connect a personal identity for sharing, instead of this machine's
+        /// own credential. Sharing runs on it wherever github.share_identity
+        /// is personal; reading and pulling always stay on the machine's.
+        #[arg(long)]
+        personal: bool,
+        /// Connect on behalf of another Crystalline account (admin use), for
+        /// example a bot account remote agents share as. Requires --personal.
+        #[arg(long = "as", value_name = "ACCOUNT", requires = "personal")]
+        as_account: Option<String>,
+        /// Forget the addressed credential instead of connecting one. With
+        /// --personal it forgets that identity; on its own, this machine's.
+        #[arg(long, conflicts_with = "token")]
+        disconnect: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1648,8 +1661,25 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
         ConnectCommand::Github {
             token,
             host,
+            personal,
+            as_account,
+            disconnect,
             config,
-        } => cmd::connect_github(token.as_deref(), host.as_deref(), config.as_deref(), json).await,
+        } => {
+            // The identity is resolved before anything else happens, so a name
+            // that cannot address a credential is taught here rather than after
+            // a browser sign-in the caller cannot get back.
+            let identity = cmd::connect_identity(personal, as_account.as_deref())?;
+            cmd::connect_github(
+                token.as_deref(),
+                host.as_deref(),
+                &identity,
+                disconnect,
+                config.as_deref(),
+                json,
+            )
+            .await
+        }
     }
 }
 
@@ -1807,6 +1837,18 @@ fn print_origin_update(data: &serde_json::Value, json: bool) {
     }
 }
 
+/// ` by @login` for a proposal that recorded who shared it, and nothing at all
+/// for one that did not - a proposal from before shares carried an author, or
+/// from an instance whose credential names nobody. A chain whose layers belong
+/// to different people is the case this exists for: on an instance that shares
+/// with personal identities, layer 2 may be alice's under bob's layer 3.
+fn shared_by(proposal: &serde_json::Value) -> String {
+    match proposal["author_login"].as_str() {
+        Some(login) if !login.is_empty() => format!(" by @{login}"),
+        _ => String::new(),
+    }
+}
+
 /// Render `origin status`'s result: the connection line, then per team
 /// domain its repo, branch, how far ahead (local changes) and behind it is,
 /// a note when the live probe itself failed (offline, rate limited, an
@@ -1840,6 +1882,24 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         }
     } else {
         println!("GitHub: not connected. Run: crystalline connect github");
+    }
+    // In personal mode the line above is only half the answer: it names the
+    // credential that READS, while a share of this caller's own goes out on
+    // their personal identity. Absent keys mean instance mode (or a daemon from
+    // before this existed), which says nothing extra and reads as it always
+    // did.
+    if connection["share_identity"].as_str() == Some("personal") {
+        let owner = &connection["owner_identity"];
+        if owner["connected"].as_bool().unwrap_or(false) {
+            println!(
+                "  sharing as @{} (personal)",
+                owner["user"].as_str().unwrap_or("?")
+            );
+        } else {
+            println!(
+                "  no personal GitHub identity connected - run: crystalline connect github --personal"
+            );
+        }
     }
 
     let empty = Vec::new();
@@ -1882,8 +1942,9 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
                 String::new()
             };
             println!(
-                "  {layer}open proposal #{}: {} - {}",
+                "  {layer}open proposal #{}{}: {} - {}",
                 p["number"].as_u64().unwrap_or(0),
+                shared_by(p),
                 p["title"].as_str().unwrap_or(""),
                 p["url"].as_str().unwrap_or("")
             );
@@ -1911,8 +1972,9 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         }
         for p in d["declined_proposals"].as_array().unwrap_or(&empty) {
             println!(
-                "  declined proposal #{}: {} - {}",
+                "  declined proposal #{}{}: {} - {}",
                 p["number"].as_u64().unwrap_or(0),
+                shared_by(p),
                 p["title"].as_str().unwrap_or(""),
                 p["url"].as_str().unwrap_or("")
             );

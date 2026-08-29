@@ -8307,7 +8307,7 @@ impl Engine {
             return Err(RemoteError::NotEnabled.into());
         }
         let targets = self.origin_targets(domain)?;
-        let connection = self.origin_connection_json().await?;
+        let connection = self.origin_status_connection().await?;
 
         let mut domains = Vec::new();
         let mut errors = Vec::new();
@@ -9345,6 +9345,56 @@ impl Engine {
             "user": token.as_ref().and_then(|t| t.user_display()),
             "token_store": store.kind(),
         }))
+    }
+
+    /// [`Engine::origin_connection_json`] plus the two facts a caller needs to
+    /// know WHICH credential a share of theirs would go out on: the mode
+    /// (`share_identity`, always) and, in personal mode, the machine owner's
+    /// own connection (`owner_identity`, absent in instance mode because there
+    /// is no personal slot in play).
+    ///
+    /// Only `origin_status` is enriched, not [`Engine::origin_connection_json`]
+    /// itself: the settings screen and the `configure` snapshot report the
+    /// instance connection, and the personal identities they care about are the
+    /// SESSION's, served by `/me/github-identity`. The owner slot is the one a
+    /// CLI or stdio-MCP share resolves ([`Engine::acting_identity_name`]), which
+    /// is exactly who reads `origin status`.
+    ///
+    /// A credential that cannot be resolved reports as not connected rather
+    /// than failing the whole status read: this is a report, and every other
+    /// line of it survives an unreadable credential store.
+    async fn origin_status_connection(&self) -> Result<Value> {
+        let mut connection = self.origin_connection_json().await?;
+        let mode = self.config.read().unwrap().github_share_identity();
+        connection["share_identity"] = json!(mode.as_str());
+        if mode == ShareIdentityMode::Personal {
+            let (connected, user) = if self.origin_provider_override.is_some() {
+                // An injected provider IS the credential (see
+                // `origin_connection_json`); reading a token store here would
+                // reach the machine's real keychain from a test.
+                (
+                    connection["connected"].as_bool().unwrap_or(false),
+                    connection["user"].clone(),
+                )
+            } else {
+                let identity = TokenIdentity::Personal(OWNER_IDENTITY_NAME.to_string());
+                let host = self.github_token_host();
+                let token = self
+                    .github_credential_for(&identity, host.as_deref())
+                    .ok()
+                    .and_then(|(_store, token)| token);
+                (
+                    token.is_some(),
+                    json!(token.as_ref().and_then(|t| t.user_display())),
+                )
+            };
+            connection["owner_identity"] = json!({
+                "account": OWNER_IDENTITY_NAME,
+                "connected": connected,
+                "user": user,
+            });
+        }
+        Ok(connection)
     }
 
     /// The INSTANCE GitHub token store for `host` and the token it holds -
@@ -13107,6 +13157,50 @@ mod share_actor_tests {
                 .contains("crystalline connect github --personal"),
             "{err}"
         );
+    }
+
+    /// `origin status` names the mode a share would run in, and in personal
+    /// mode whether the machine owner has connected an identity at all - the
+    /// two facts the CLI renders its connection line from, since a status that
+    /// only reported the instance token would tell a caller in personal mode
+    /// nothing about whether their next share can go out.
+    #[tokio::test]
+    async fn origin_status_names_the_share_identity_and_the_owners_connection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, None).await;
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+
+        let status = engine.origin_status(None).await.unwrap();
+        assert_eq!(status["connection"]["share_identity"], "instance");
+        assert!(
+            status["connection"].get("owner_identity").is_none(),
+            "instance mode has no personal slot to report: {status}"
+        );
+
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.share_identity".to_string(),
+                value: "personal".to_string(),
+            })
+            .await
+            .unwrap();
+        let status = engine.origin_status(None).await.unwrap();
+        assert_eq!(status["connection"]["share_identity"], "personal");
+        assert_eq!(
+            status["connection"]["owner_identity"]["account"],
+            OWNER_IDENTITY_NAME
+        );
+        assert_eq!(status["connection"]["owner_identity"]["connected"], false);
+        assert!(
+            status["connection"]["connected"].as_bool().unwrap(),
+            "the instance credential is still what reads: {status}"
+        );
+
+        write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
+        let status = engine.origin_status(None).await.unwrap();
+        assert_eq!(status["connection"]["owner_identity"]["connected"], true);
+        assert_eq!(status["connection"]["owner_identity"]["user"], "owner-gh");
     }
 
     /// Instance-token failures keep today's texts (spec section 8), and any
