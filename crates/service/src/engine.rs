@@ -8639,6 +8639,7 @@ impl Engine {
                 // credential this share actually went out on. `None` only when
                 // that credential carries no login (the environment token).
                 author_login: login.as_deref(),
+                files: None,
             },
         )
         .await
@@ -8747,6 +8748,7 @@ impl Engine {
                 // Carried for the same reason the provider is: a preview
                 // resolves exactly what the share would. It records nothing.
                 author_login: login.as_deref(),
+                files: None,
             },
         )
         .await

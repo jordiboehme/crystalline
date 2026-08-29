@@ -1014,6 +1014,102 @@ pub struct ShareOptions<'a> {
     /// `None` is "no login to name" rather than "nobody", so an update never
     /// erases a recorded author with it.
     pub author_login: Option<&'a str>,
+    /// The domain-relative paths this share carries, or `None` for the whole
+    /// unshared delta.
+    ///
+    /// Opaque here in the same sense `author_login` is: the caller decides
+    /// which files a person or an agent picked, and this crate only filters
+    /// the delta it detected down to them (see [`select_share_files`]). An
+    /// empty slice is a selection of nothing, which is
+    /// [`ProposeOutcome::NothingToShare`] rather than an error.
+    pub files: Option<&'a [String]>,
+}
+
+/// The changes a share carries once the caller's selection is applied: the
+/// whole delta for `None`, and exactly the chosen paths (plus the generated
+/// listings of the folders they live in) for `Some`.
+///
+/// Filtering happens here rather than inside detection, and after it rather
+/// than before, for one reason: what a path is measured against is the delta
+/// this share would carry, so a path that is not among it can be refused by
+/// name instead of quietly sharing nothing. Every unknown path is named at
+/// once, since a caller fixing a typo would rather see all of them than one
+/// per attempt.
+///
+/// **A folder's generated listing rides along with the folder's own files.**
+/// An `index.md` is derived from the engrams beside it, so a selection that
+/// shares an engram and leaves its folder's listing behind would publish a
+/// listing that disagrees with the folder it describes. The rule is the
+/// narrow one: the listing of the folder a selected path lives in, never the
+/// listings above it, which describe folders this share is not changing the
+/// contents of. A listing named explicitly is a selected path like any other.
+///
+/// A selection that matches nothing leaves an empty change list, which every
+/// caller already reads as [`ProposeOutcome::NothingToShare`].
+fn select_share_files(
+    local: crate::changes::LocalChanges,
+    files: Option<&[String]>,
+) -> Result<crate::changes::LocalChanges, RemoteError> {
+    let Some(files) = files else {
+        return Ok(local);
+    };
+    let detected: BTreeSet<&str> = local.changes.iter().map(|c| c.path()).collect();
+    let mut chosen: BTreeSet<String> = BTreeSet::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for raw in files {
+        let path = normalize_selected_path(raw);
+        if detected.contains(path.as_str()) {
+            chosen.insert(path);
+        } else if !unknown.contains(&path) {
+            unknown.push(path);
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(RemoteError::Refused(format!(
+            "not among this domain's unshared changes: {}; share what origin status lists as changed, or leave the file list out to share everything",
+            unknown.join(", ")
+        )));
+    }
+    let folders: BTreeSet<&str> = chosen
+        .iter()
+        .filter(|path| !crystalline_core::is_index_path(path))
+        .map(|path| folder_of(path))
+        .collect();
+    let changes = local
+        .changes
+        .into_iter()
+        .filter(|change| {
+            let path = change.path();
+            chosen.contains(path)
+                || (crystalline_core::is_index_path(path) && folders.contains(folder_of(path)))
+        })
+        .collect();
+    Ok(crate::changes::LocalChanges {
+        changes,
+        skipped_large: local.skipped_large,
+    })
+}
+
+/// The folder a domain-relative path lives in, `""` for the domain root.
+fn folder_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(at) => &path[..at],
+        None => "",
+    }
+}
+
+/// A selected path in the shape detection reports paths in.
+///
+/// Only the shapes a person or a shell plausibly types: surrounding
+/// whitespace, a `./` prefix and Windows separators. Anything else is left
+/// alone and simply fails to match, which is a refusal naming the path rather
+/// than a guess about what was meant.
+fn normalize_selected_path(raw: &str) -> String {
+    let trimmed = raw.trim().replace('\\', "/");
+    trimmed
+        .strip_prefix("./")
+        .unwrap_or(trimmed.as_str())
+        .to_string()
 }
 
 /// The cached stacks verdict for this origin, probing once when unknown.
@@ -1349,6 +1445,15 @@ async fn retry_stack_link(
 /// (an open pull request with no branch counts as declined) and the share
 /// falls through to a fresh creation.
 ///
+/// `options.files` narrows what the share carries to a chosen subset of the
+/// detected delta ([`select_share_files`]): the paths named, plus the
+/// generated listings of the folders they live in. It applies to every path
+/// through this function, a new layer and an amend alike, and what it leaves
+/// out simply stays an unshared local change for a later share. A path that
+/// is not among the detected changes refuses the whole share by name rather
+/// than being dropped, and a selection matching nothing is
+/// [`ProposeOutcome::NothingToShare`].
+///
 /// Creating uploads each added or modified file's content as a blob, builds a
 /// tree from the base commit with every domain-relative path re-prefixed to
 /// its repo-relative form (see [`to_repo_relative`]), commits it, opens a
@@ -1426,6 +1531,7 @@ pub async fn propose(
                 title,
                 description,
                 author_login,
+                options.files,
             )
             .await;
         }
@@ -1464,7 +1570,7 @@ pub async fn propose(
             Some(_) => effective_tip_files(&state),
             None => state.files.clone(),
         };
-        let local = detect_local_changes(domain_root, &base)?;
+        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
         if local.changes.is_empty() {
             return Ok(ProposeOutcome::NothingToShare {
                 skipped_large: local.skipped_large,
@@ -1769,8 +1875,11 @@ pub enum PlannedAction {
 ///
 /// `domain_name` plays the same role it plays in [`propose`]: it is what the
 /// generated title calls the domain when the caller supplies none. Of
-/// `options` a preview reads the title alone: a description is only ever
-/// written by a real share, and previewing writes nothing.
+/// `options` a preview reads the title and the file selection: a description
+/// is only ever written by a real share, and previewing writes nothing. The
+/// selection is applied exactly as the share would apply it, refusal for an
+/// unknown path included, so a plan describes the share it is a plan of
+/// rather than the whole delta standing behind it.
 pub async fn propose_preview(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -1811,7 +1920,7 @@ pub async fn propose_preview(
         } else {
             state.files.clone()
         };
-        let local = detect_local_changes(domain_root, &base)?;
+        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
         if !state.conflicts.is_empty() {
             return Ok(SharePlan {
                 action: PlannedAction::ConflictsPending {
@@ -1922,7 +2031,7 @@ pub async fn propose_preview(
     } else {
         state.files.clone()
     };
-    let local = detect_local_changes(domain_root, &base)?;
+    let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
 
     if !state.conflicts.is_empty() {
         return Ok(SharePlan {
@@ -2693,6 +2802,7 @@ async fn amend_layer(
     title: Option<&str>,
     description: Option<&str>,
     author_login: Option<&str>,
+    files: Option<&[String]>,
 ) -> Result<ProposeOutcome, RemoteError> {
     // Nothing is written until every layer this cascade replays is known to be
     // replayable AND known to be ours: a chain re-based halfway is worse than
@@ -2730,7 +2840,10 @@ async fn amend_layer(
 
     // This share's own work is what stands against the chain tip; the layer's
     // recorded files are already proposed and are not it.
-    let fresh = detect_local_changes(domain_root, &effective_tip_files(&state))?;
+    let fresh = select_share_files(
+        detect_local_changes(domain_root, &effective_tip_files(&state))?,
+        files,
+    )?;
     if fresh.changes.is_empty() {
         return Ok(ProposeOutcome::NothingToShare {
             skipped_large: fresh.skipped_large,

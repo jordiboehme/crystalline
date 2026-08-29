@@ -2100,6 +2100,7 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
             proposal: None,
             stacks_allowed: false,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -3263,6 +3264,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
             proposal: None,
             stacks_allowed: false,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -3837,6 +3839,7 @@ async fn the_probe_runs_once_and_caches_the_verdict() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -3871,6 +3874,7 @@ async fn the_probe_runs_once_and_caches_the_verdict() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -3906,6 +3910,7 @@ async fn config_off_never_probes() {
             proposal: None,
             stacks_allowed: false,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -3941,6 +3946,7 @@ async fn stacked_share(mock: &MockProvider, sub: &Subscribed) -> ProposeOutcome 
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4121,6 +4127,7 @@ async fn divergence_on_the_top_layer_refuses_the_stacked_share() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4161,6 +4168,7 @@ async fn preview_names_the_stack_action() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4395,6 +4403,7 @@ async fn preview_stacks_on_the_surviving_layer_when_the_top_ref_is_gone() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4447,6 +4456,7 @@ async fn preview_of_a_diverged_top_still_measures_against_the_tip() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4496,6 +4506,7 @@ async fn amend_share_as(
             proposal: Some(number),
             stacks_allowed: true,
             author_login,
+            files: None,
         },
     )
     .await
@@ -4730,6 +4741,7 @@ async fn amend_refuses_a_number_that_is_not_an_open_layer() {
             proposal: Some(999),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4778,6 +4790,7 @@ async fn amend_preview_counts_the_layers_above() {
             proposal: Some(middle.number),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -4994,6 +5007,7 @@ async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
             proposal: Some(first.number),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -5079,6 +5093,7 @@ async fn a_refusal_on_a_later_kept_entry_leaves_no_orphan_blob_behind() {
             proposal: Some(first.number),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -5124,6 +5139,7 @@ async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend()
             proposal: Some(first.number),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -5160,6 +5176,7 @@ async fn amend_preview_refuses_over_an_unreplayable_layer_above() {
         proposal: Some(first.number),
         stacks_allowed: true,
         author_login: None,
+        files: None,
     };
     let err = propose_preview(
         &mock,
@@ -6321,6 +6338,7 @@ async fn share_with_stacks(mock: &MockProvider, sub: &Subscribed, allowed: bool)
             proposal: None,
             stacks_allowed: allowed,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -6906,6 +6924,7 @@ async fn an_amend_refusal_lists_the_layers_the_repair_left_open() {
             proposal: Some(999),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -6980,6 +6999,7 @@ async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
             proposal: Some(layers[0].number),
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -7048,6 +7068,7 @@ async fn a_fallback_amend_runs_no_repair_machinery() {
                 proposal: Some(first.number),
                 stacks_allowed: false,
                 author_login: None,
+                files: None,
             },
         )
         .await
@@ -7158,6 +7179,7 @@ async fn a_reviewer_commit_above_refuses_the_repair_too() {
             proposal: None,
             stacks_allowed: true,
             author_login: None,
+            files: None,
         },
     )
     .await
@@ -7727,6 +7749,7 @@ async fn stacked_share_as(
             proposal: None,
             stacks_allowed: true,
             author_login,
+            files: None,
         },
     )
     .await
@@ -7795,6 +7818,7 @@ async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_know
                 proposal: None,
                 stacks_allowed: false,
                 author_login: Some("bob"),
+                files: None,
             },
         )
         .await
@@ -7845,4 +7869,274 @@ fn ops_signatures_carry_no_identity_types() {
     for name in ["ShareActor", "TokenIdentity", "Caller"] {
         assert!(!ops.contains(name), "{name} leaked into ops.rs");
     }
+}
+
+// File-scoped shares: a share may carry a chosen subset of the detected delta
+// instead of all of it. The selection is filtered in after detection and
+// before anything is planned or collected, so every path a share takes -
+// a create, a stacked layer, an amend, a preview - sees the same shortened
+// change list.
+
+/// A domain with two folders, each holding an engram and a generated folder
+/// listing, and a local edit to every one of them. The starting point for the
+/// selection scenarios: whatever is chosen, something in another folder is
+/// left behind.
+async fn two_folders_all_edited(mock: &MockProvider) -> Subscribed {
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/index.md", b"# notes\n"),
+            ("guides/g.md", b"guide\n"),
+            ("guides/index.md", b"# guides\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# notes, again\n");
+    write(&sub.domain_root.join("guides/g.md"), b"guide v2\n");
+    write(
+        &sub.domain_root.join("guides/index.md"),
+        b"# guides, again\n",
+    );
+    sub
+}
+
+/// Shares `sub` carrying exactly `files`, on the stacked path.
+async fn share_files(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    files: &[String],
+) -> Result<ProposeOutcome, crystalline_remote::error::RemoteError> {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: Some(files),
+        },
+    )
+    .await
+}
+
+/// The paths one recorded proposal proposes, sorted.
+fn recorded_paths(state_dir: &Path, number: u64) -> Vec<String> {
+    let st = load_state(state_dir);
+    let record = st
+        .proposals
+        .iter()
+        .find(|p| p.number == number)
+        .expect("the proposal is recorded");
+    let mut paths: Vec<String> = record.files.iter().map(|f| f.path.clone()).collect();
+    paths.sort();
+    paths
+}
+
+#[tokio::test]
+async fn a_share_of_chosen_files_carries_them_and_their_folders_listing() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let first = proposed(
+        share_files(&mock, &sub, &["notes/a.md".to_string()])
+            .await
+            .expect("a share of one file should succeed"),
+    );
+
+    // Exactly the chosen file and the listing of the folder it lives in: the
+    // other folder's engram and its listing stay behind.
+    assert_eq!(
+        recorded_paths(&sub.state_dir, first.number),
+        vec!["notes/a.md".to_string(), "notes/index.md".to_string()]
+    );
+    let branch_commit = mock.branch_commit(&first.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(tree.get("notes/a.md"), Some(&b"alpha v2\n".to_vec()));
+    assert_eq!(
+        tree.get("guides/g.md"),
+        Some(&b"guide\n".to_vec()),
+        "an unselected file keeps the origin's content in the proposed tree"
+    );
+    assert_eq!(
+        tree.get("guides/index.md"),
+        Some(&b"# guides\n".to_vec()),
+        "another folder's listing does not ride along"
+    );
+
+    // What was left out is simply still unshared: the next share carries it.
+    let second = proposed(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions {
+                stacks_allowed: true,
+                ..ShareOptions::default()
+            },
+        )
+        .await
+        .expect("the rest is still there to share"),
+    );
+    assert_eq!(
+        recorded_paths(&sub.state_dir, second.number),
+        vec!["guides/g.md".to_string(), "guides/index.md".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_share_naming_a_file_that_is_not_a_change_refuses_naming_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let err = share_files(
+        &mock,
+        &sub,
+        &[
+            "notes/a.md".to_string(),
+            "notes/ghost.md".to_string(),
+            "elsewhere/other.md".to_string(),
+        ],
+    )
+    .await
+    .expect_err("a path that is not a change refuses the share");
+    let message = err.to_string();
+    assert!(
+        message.contains("notes/ghost.md") && message.contains("elsewhere/other.md"),
+        "every unknown path is named: {message}"
+    );
+    assert!(
+        message.contains("unshared changes"),
+        "the refusal says what the paths were measured against: {message}"
+    );
+
+    // Refused before a single provider write: nothing was opened, nothing was
+    // pushed, and the domain still has everything to share.
+    let writes: Vec<String> = mock
+        .calls()
+        .into_iter()
+        .filter(|c| is_write_call(c))
+        .collect();
+    assert!(writes.is_empty(), "{writes:?}");
+    assert!(load_state(&sub.state_dir).proposals.is_empty());
+}
+
+#[tokio::test]
+async fn a_share_whose_selection_is_empty_has_nothing_to_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let outcome = share_files(&mock, &sub, &[])
+        .await
+        .expect("an empty selection is an answer, not an error");
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "{outcome:?}"
+    );
+    assert!(load_state(&sub.state_dir).proposals.is_empty());
+}
+
+#[tokio::test]
+async fn an_amend_with_a_selection_carries_only_the_chosen_fresh_work() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // Two pieces of fresh work standing on the layer, one of them chosen.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    write(&sub.domain_root.join("guides/g.md"), b"guide\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(first.number),
+            stacks_allowed: true,
+            files: Some(&["notes/b.md".to_string()]),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("an amend carrying one file should succeed");
+    let report = updated(outcome);
+    assert_eq!(report.number, first.number);
+
+    assert_eq!(
+        recorded_paths(&sub.state_dir, first.number),
+        vec!["notes/a.md".to_string(), "notes/b.md".to_string()],
+        "the layer's own work plus the chosen fresh file, and nothing else"
+    );
+    let branch_commit = mock.branch_commit(&first.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert!(
+        !tree.contains_key("guides/g.md"),
+        "the unchosen fresh file stays out of the amended layer"
+    );
+}
+
+#[tokio::test]
+async fn a_preview_plans_the_selection_rather_than_the_whole_delta() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let chosen = ["guides/g.md".to_string()];
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            stacks_allowed: true,
+            files: Some(&chosen),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("a preview of a selection should plan it");
+
+    assert!(
+        matches!(plan.action, PlannedAction::Create),
+        "{:?}",
+        plan.action
+    );
+    let mut paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["guides/g.md", "guides/index.md"]);
+
+    // And an empty one plans nothing at all, the same answer the share gives.
+    let nothing = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            stacks_allowed: true,
+            files: Some(&[]),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("an empty selection previews as nothing to share");
+    assert!(
+        matches!(nothing.action, PlannedAction::NothingToShare),
+        "{:?}",
+        nothing.action
+    );
 }
