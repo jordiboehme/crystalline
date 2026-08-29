@@ -291,9 +291,25 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Ok(proposal) => proposal,
                 Err(message) => return (envelope_err(message), false),
             };
+            // The chosen files, when the caller named any: absent and an empty
+            // array are different answers, so an absent key stays `None` (the
+            // whole delta) rather than becoming a selection of nothing.
+            let files: Option<Vec<String>> = req.get("files").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            });
             match shared
                 .engine
-                .origin_share(domain, title, description, proposal, ShareActor::Owner)
+                .origin_share(
+                    domain,
+                    title,
+                    description,
+                    proposal,
+                    files.as_deref(),
+                    ShareActor::Owner,
+                )
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

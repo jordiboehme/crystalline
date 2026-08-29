@@ -1702,6 +1702,69 @@ async fn share_changes_forwards_the_proposal_number_to_the_engine() {
     );
 }
 
+/// The `files` argument reaches the engine too: a share naming one of two new
+/// engrams carries that one, and the other stays a local change.
+///
+/// The refusal half rides along for the same reason the amend's does: a path
+/// that is not among the unshared changes is a caller's mistake, and being
+/// told which one is the difference between fixing a typo and guessing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn share_changes_forwards_the_file_selection_to_the_engine() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = Arc::new(engine_with_provider(&config_path, &origins_dir, mock).await);
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/one.md"),
+        engram("One", "one", "the first thing"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("notes/two.md"),
+        engram("Two", "two", "the second thing"),
+    )
+    .unwrap();
+
+    let (client, _server) = connect(eng).await;
+    let peer = client.peer();
+    let err = call(
+        peer,
+        "share_changes",
+        json!({ "domain": "brand", "files": ["notes/nowhere.md"] }),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        err.contains("notes/nowhere.md"),
+        "the path the caller named: {err}"
+    );
+
+    let out = call(
+        peer,
+        "share_changes",
+        json!({ "domain": "brand", "files": ["notes/one.md"] }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["outcome"], json!("proposed"), "{out}");
+    assert_eq!(out["added"], json!(["notes/one.md"]), "{out}");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_domain_tool_wires_through_to_origin_update() {
     let tmp = tempfile::tempdir().unwrap();

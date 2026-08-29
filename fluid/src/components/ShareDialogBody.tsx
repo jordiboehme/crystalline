@@ -31,6 +31,17 @@
  * one line there rather than grouped, for the same reason: they are what keeps
  * the team repository browsable, never what somebody is deciding about.
  *
+ * Which of those files travel is a choice too, and on a shared instance it is
+ * the choice that matters most: the delta in front of somebody may be half
+ * their colleague's afternoon. Every file carries a box, and the boxes open
+ * where the guess is best - where the plan says this session's own account
+ * last wrote something, exactly those files start ticked and a quiet line says
+ * how much was left out; where it says nothing about anybody, everything
+ * starts ticked, which is what this dialog has always done. It is a guess and
+ * it is meant to be corrected: one press on a group heading takes the whole
+ * group back in. A share of everything sends no file list at all, so the
+ * common case is the request it always was.
+ *
  * An untouched title is not sent. The field is prefilled with the title the
  * server would generate anyway, so echoing it back as an explicit title would
  * change nothing on a create and would rename an open proposal on an update -
@@ -51,7 +62,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Dialog } from "radix-ui";
 import type { ReactElement } from "react";
-import { useEffect, useId, useState } from "react";
+import { useEffect, useId, useMemo, useState } from "react";
 
 import type { SharePlan } from "../api/admin";
 import {
@@ -66,10 +77,12 @@ import {
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { asNumber, asObject, asString } from "../api/json";
+import { useAuth } from "../auth/AuthContext";
 import { plural } from "../format";
 import { ChangeList } from "./ChangeList";
 import type { ShareDialogProps } from "./ShareDialog";
 import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
+import { preselect, substantive } from "./changes";
 import { BUTTON, Field } from "./primitives";
 import { useShareIdentity } from "./useShareIdentity";
 
@@ -85,6 +98,11 @@ export default function ShareDialogBody({
   onClose,
 }: ShareDialogProps): ReactElement {
   const queryClient = useQueryClient();
+  // Whose work the boxes open ticked for. The session's own account, which is
+  // what the engine records as `human:<name>` when this person writes an
+  // engram through it; an anonymous reader has none, and everything opens
+  // ticked for them exactly as it always did.
+  const account = useAuth().user?.name ?? null;
   const titleField = useId();
   const descriptionField = useId();
   const proposalField = useId();
@@ -97,6 +115,10 @@ export default function ShareDialogBody({
   const [description, setDescription] = useState("");
   const [outcome, setOutcome] = useState<string | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  // `null` is "nobody has touched a box", which is what lets the preselection
+  // below stay in charge while the plan is still arriving and re-arriving. A
+  // set - empty included - is a choice somebody made.
+  const [picked, setPicked] = useState<ReadonlySet<string> | null>(null);
 
   // Always fresh, and never retried: the plan is the whole point of opening
   // this, a cached one would describe a share somebody else's session already
@@ -174,6 +196,25 @@ export default function ShareDialogBody({
   /** A title of the author's own, as opposed to the prefill handed back. */
   const ownTitle = typed !== "" && typed !== effectiveTitle.trim();
 
+  // What would travel, and which of it is ticked. The plan lists every
+  // unshared change; the boxes decide which of them this share carries, and
+  // the generated folder listings are never among them - the engine carries
+  // the listing of any folder a chosen file lives in, whoever asked.
+  const changes = plan.data?.changes ?? [];
+  const real = substantive(changes);
+  // Keyed on the plan itself rather than on its change array, which is a
+  // fresh array on every render while the plan is still arriving.
+  const preset = useMemo(
+    () => preselect(plan.data?.changes ?? [], account),
+    [plan.data, account],
+  );
+  const selected: ReadonlySet<string> = picked ?? new Set(preset.paths);
+  /** Everything a reader could choose is chosen: the share it always was. */
+  const allPicked = real.every((change) => selected.has(change.path));
+  /** Nothing is: there is a decision to make before there is a share. */
+  const nothingPicked =
+    real.length > 0 && !real.some((change) => selected.has(change.path));
+
   const share = useMutation({
     mutationFn: () =>
       shareDomain(domain, {
@@ -185,6 +226,17 @@ export default function ShareDialogBody({
         // otherwise, and sending the one it would have picked would turn a
         // stack into an amend of the layer under it.
         ...(amending === null ? {} : { proposal: amending }),
+        // And only when the ticks are a subset. A share of everything sends
+        // no file list at all, so the ordinary case is byte for byte the
+        // request it has always been - and the folder listings the engine
+        // carries along stay the engine's business either way.
+        ...(allPicked
+          ? {}
+          : {
+              files: real
+                .filter((change) => selected.has(change.path))
+                .map((change) => change.path),
+            }),
       }),
     onSuccess: (result) => {
       setOutcome(describeOutcome(result));
@@ -231,7 +283,6 @@ export default function ShareDialogBody({
     action === "stack" ||
     action === "amend";
   const planProblem = plan.error === null ? null : problemDetail(plan.error);
-  const changes = plan.data?.changes ?? [];
 
   return (
     <Dialog.Root
@@ -281,6 +332,7 @@ export default function ShareDialogBody({
                 // dialog whose primary action is a link rather than a submit.
                 if (
                   shareable &&
+                  !nothingPicked &&
                   !share.isPending &&
                   !identity.mustConnect &&
                   !identity.asking
@@ -347,8 +399,39 @@ export default function ShareDialogBody({
                 </p>
               )}
               {/* What would travel, after what it would travel into: the
-                  grouping is what keeps a sweep's worth of files readable. */}
-              <ChangeList changes={changes} />
+                  grouping is what keeps a sweep's worth of files readable,
+                  and the boxes are what make it a choice. The hint is shown
+                  only while nobody has touched them - once somebody has, it
+                  describes a state that is no longer on the screen. */}
+              <ChangeList
+                changes={changes}
+                selected={selected}
+                hint={picked === null ? preset.hint : null}
+                onToggle={(path, next) => {
+                  setPicked((current) => {
+                    const now = new Set(current ?? selected);
+                    if (next) {
+                      now.add(path);
+                    } else {
+                      now.delete(path);
+                    }
+                    return now;
+                  });
+                }}
+                onToggleGroup={(paths, next) => {
+                  setPicked((current) => {
+                    const now = new Set(current ?? selected);
+                    for (const path of paths) {
+                      if (next) {
+                        now.add(path);
+                      } else {
+                        now.delete(path);
+                      }
+                    }
+                    return now;
+                  });
+                }}
+              />
               <Field
                 id={titleField}
                 label="Title"
@@ -414,7 +497,12 @@ export default function ShareDialogBody({
                 ) : (
                   <button
                     type="submit"
-                    disabled={!shareable || share.isPending || identity.asking}
+                    disabled={
+                      !shareable ||
+                      nothingPicked ||
+                      share.isPending ||
+                      identity.asking
+                    }
                     className={BUTTON.primary}
                   >
                     Share

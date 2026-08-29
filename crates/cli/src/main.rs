@@ -1026,6 +1026,11 @@ enum OriginCommand {
         /// the layers above it are re-based automatically.
         #[arg(long)]
         proposal: Option<u64>,
+        /// Share only this changed file, relative to the domain root. Repeat
+        /// for several; omit to share every unshared change. The generated
+        /// index.md of each chosen file's folder rides along.
+        #[arg(long = "file")]
+        files: Vec<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -1713,13 +1718,19 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             title,
             message,
             proposal,
+            files,
             config,
         } => {
+            // No `--file` at all is the whole delta, which is a different
+            // answer from an empty selection: the flag's absence must not
+            // become a selection of nothing.
+            let chosen = (!files.is_empty()).then_some(files.as_slice());
             let data = crystalline_service::origin_share(
                 &domain,
                 title.as_deref(),
                 message.as_deref(),
                 proposal,
+                chosen,
                 db.as_deref(),
                 config.as_deref(),
             )

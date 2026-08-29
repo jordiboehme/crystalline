@@ -201,7 +201,7 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     .await;
 
     let share_err = eng
-        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -219,7 +219,7 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     );
 
     let preview_err = eng
-        .origin_share_preview("brand", None, None, ShareActor::Owner)
+        .origin_share_preview("brand", None, None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -253,7 +253,7 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     // None of these need a registered domain: read-only refuses before the
     // domain is even resolved, exactly like `origin_add` above.
     let share_err = eng
-        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(matches!(share_err, EngineError::ReadOnly), "{share_err}");
@@ -268,7 +268,7 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     );
 
     let preview_err = eng
-        .origin_share_preview("brand", None, None, ShareActor::Owner)
+        .origin_share_preview("brand", None, None, None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -1489,7 +1489,7 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
     .unwrap();
 
     let result = eng
-        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(result["outcome"], "proposed");
@@ -1564,7 +1564,7 @@ async fn a_share_records_the_login_it_acted_as_on_the_proposal() {
     .unwrap();
 
     let result = eng
-        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(result["outcome"], "proposed", "{result}");
@@ -1613,7 +1613,7 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     eng.origin_update(Some("brand")).await.unwrap();
 
     let result = eng
-        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(result["outcome"], "conflicts_pending");
@@ -1674,7 +1674,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     mock.set_branch("main", &c2);
 
     let plan = eng
-        .origin_share_preview("brand", None, None, ShareActor::Owner)
+        .origin_share_preview("brand", None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     // Nothing this domain knows is unshared. What the plan does carry is the
@@ -1723,7 +1723,7 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     .unwrap();
 
     let result = eng
-        .origin_share("brand", None, None, None, ShareActor::Owner)
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(result["outcome"], "proposed", "{result}");
@@ -1772,7 +1772,7 @@ async fn shared_team_engine(
     )
     .unwrap();
     let shared = eng
-        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(shared["outcome"], "proposed", "{shared}");
@@ -1801,6 +1801,7 @@ async fn an_injected_provider_short_circuits_personal_mode_too() {
     let shared = eng
         .origin_share(
             "kb",
+            None,
             None,
             None,
             None,
@@ -1871,6 +1872,7 @@ async fn a_403_on_a_personal_share_teaches_the_collaborator_requirement() {
             None,
             None,
             None,
+            None,
             ShareActor::Account("alice".to_string()),
         )
         .await
@@ -1889,7 +1891,7 @@ async fn a_403_on_a_personal_share_teaches_the_collaborator_requirement() {
     .await
     .unwrap();
     let err = eng
-        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
         .await
         .expect_err("the forge refuses this one too");
     assert!(
@@ -1941,7 +1943,7 @@ async fn origin_share_maps_updated_and_diverged() {
 
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
     let second = eng
-        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(second["outcome"], "updated");
@@ -1953,7 +1955,7 @@ async fn origin_share_maps_updated_and_diverged() {
     mock.set_branch(&branch, &amended);
     std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
     let third = eng
-        .origin_share("kb", None, None, None, ShareActor::Owner)
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(third["outcome"], "proposal_diverged");
@@ -1975,7 +1977,7 @@ async fn origin_share_amend_param_reaches_ops() {
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
 
     let v = eng
-        .origin_share("kb", None, None, Some(number), ShareActor::Owner)
+        .origin_share("kb", None, None, Some(number), None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(v["outcome"], "updated", "{v}");
@@ -1999,7 +2001,7 @@ async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
 
     let err = eng
-        .origin_share("kb", None, None, Some(9999), ShareActor::Owner)
+        .origin_share("kb", None, None, Some(9999), None, ShareActor::Owner)
         .await
         .unwrap_err()
         .to_string();
@@ -2037,7 +2039,7 @@ async fn origin_share_preview_names_the_action_and_changes() {
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
     let v = eng
-        .origin_share_preview("kb", None, None, ShareActor::Owner)
+        .origin_share_preview("kb", None, None, None, ShareActor::Owner)
         .await
         .unwrap();
     assert_eq!(v["action"], "update");

@@ -2598,6 +2598,44 @@ async fn an_eliciting_share_is_asked_before_anything_is_shared() {
     );
 }
 
+/// A share carrying a file selection is asked about the selection, never
+/// about the whole delta.
+///
+/// The question is the user's one chance to see what leaves this machine, so
+/// naming files the call would not carry would be worse than naming none: a
+/// yes would then have been given to a share that was never planned. The
+/// preview behind the question runs the same filter the share runs, which is
+/// what makes the two the same share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_share_asks_about_the_selection_rather_than_the_whole_delta() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let mut wire = h.stdio().await;
+
+    let asked = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            json!({
+                "name": "share_changes",
+                "arguments": { "domain": "kb", "files": ["notes/b.md"] },
+            }),
+        ))
+        .await;
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("notes/b.md"),
+        "the chosen file is named: {message}"
+    );
+    assert!(
+        !message.contains("notes/a.md"),
+        "and the one left behind is not: {message}"
+    );
+}
+
 /// Round two with a yes shares, and the next round one names the update.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {

@@ -304,13 +304,15 @@ fn origin_share_withdraw_and_resolve_reach_the_engine_once_enabled() {
 }
 
 #[test]
-fn origin_share_help_names_the_amend_flag() {
+fn origin_share_help_names_the_amend_and_file_flags() {
     bin()
         .args(["origin", "share", "--help"])
         .assert()
         .success()
         .stdout(predicates::str::contains("--proposal"))
-        .stdout(predicates::str::contains("Amend this open proposal"));
+        .stdout(predicates::str::contains("Amend this open proposal"))
+        .stdout(predicates::str::contains("--file"))
+        .stdout(predicates::str::contains("Share only this changed file"));
 }
 
 #[test]
@@ -483,6 +485,47 @@ mod chain {
         assert!(
             out.contains("proposal #6, layer 2 of 3 on stack #42"),
             "{out}"
+        );
+    }
+
+    /// `--file` is repeatable and every path reaches the daemon in order: a
+    /// share of some of the delta is the caller's list, not a flag the CLI
+    /// interprets. A share with no `--file` sends no list at all, which is a
+    /// different answer from an empty one - the whole delta rather than
+    /// nothing - and both halves are pinned here because the CLI is where
+    /// they could be conflated.
+    #[test]
+    fn share_with_files_carries_each_one_and_without_them_carries_none() {
+        let outcome = || {
+            json!({
+                "outcome": "proposed",
+                "url": "https://github.test/acme/brand/pull/8",
+                "number": 8,
+                "branch": "crystalline/brand-8",
+                "summary": "2 engrams added",
+                "added": ["notes/a.md"], "updated": [], "deleted": [],
+                "skipped_large": [],
+            })
+        };
+        let daemon = Daemon::answering("files", outcome());
+        daemon.run(&[
+            "origin",
+            "share",
+            "brand",
+            "--file",
+            "notes/a.md",
+            "--file",
+            "guides/g.md",
+        ]);
+        let request = daemon.request();
+        assert_eq!(request["cmd"], "origin_share");
+        assert_eq!(request["files"], json!(["notes/a.md", "guides/g.md"]));
+
+        let plain = Daemon::answering("nofiles", outcome());
+        plain.run(&["origin", "share", "brand"]);
+        assert!(
+            plain.request()["files"].is_null(),
+            "no --file is the whole delta, never a selection of nothing"
         );
     }
 

@@ -544,7 +544,7 @@ export interface paths {
         };
         /**
          * Preview what sharing this team domain would do.
-         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
          */
         get: operations["get_domain_share_changes"];
         put?: never;
@@ -1684,13 +1684,23 @@ export interface components {
              */
             token?: string | null;
         };
-        /** @description The proposal's title and description, and optionally the open proposal to amend instead of stacking a new layer. All optional: with none of them, the share carries a title the engine generates from the changes themselves and targets the layer it picks itself. */
+        /** @description The proposal's title and description, optionally the open proposal to amend instead of stacking a new layer, and optionally the files to carry. All optional: with none of them, the share carries every unshared change under a title the engine generates from the changes themselves, and targets the layer it picks itself. */
         ShareBody: {
             /**
              * @description A longer description of what changed and why.
              * @example Sharper wording on the routing rules.
              */
             description?: string | null;
+            /**
+             * @description Share only these changed files, as domain-relative paths. Absent
+             *     shares every unshared change; the generated `index.md` of each chosen
+             *     file's folder rides along, and a path that is not among this domain's
+             *     unshared changes is refused by name.
+             * @example [
+             *       "notes/a.md"
+             *     ]
+             */
+            files?: string[] | null;
             /**
              * Format: int64
              * @description An open proposal to amend, rather than letting the share pick its own

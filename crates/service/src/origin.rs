@@ -7,11 +7,16 @@
 //! [`crystalline_core::config::GlobalConfig`] rather than reaching into the
 //! engine itself.
 //!
-//! Nothing here talks to GitHub, the filesystem or the token store; that is
+//! Nothing here talks to GitHub or the token store; that is
 //! `crystalline_remote::ops` and `crystalline_remote::token`'s job. This
 //! module only shapes the inputs (a default domain name, a default folder, a
 //! token-store host key, a validated conflict resolution) and the outputs
 //! (aggregate JSON) around those calls.
+//!
+//! One output reads the working tree: a share plan says who last wrote each
+//! changed file ([`last_author`]), which is a line of the file's own
+//! frontmatter and nowhere else. It is a read of files the plan already names,
+//! and every failure of it is an absent author rather than a failed plan.
 
 use std::path::{Path, PathBuf};
 
@@ -361,15 +366,41 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
     }
 }
 
+/// Who last wrote the file at `root/rel`, as its own frontmatter records it:
+/// the OKF `generated.by` actor, or `None`.
+///
+/// Read tolerantly, and every branch of that word is a real case rather than
+/// defensive habit. A deleted file has nothing left on disk to ask. A file
+/// somebody edited in an editor bypasses the engine entirely and simply
+/// carries whatever provenance it had, often none. A non-engram - an asset,
+/// a `.crystalline.yaml` - has no frontmatter at all, and neither has a file
+/// whose frontmatter is mid-edit and does not parse. None of those is a
+/// problem with the share, so none of them is allowed to be a problem with
+/// the plan: they are files nobody is named for, and the surfaces that read
+/// this treat an unnamed file as one that stays unticked.
+///
+/// This is last-writer provenance, never authorship: it says which actor
+/// wrote the revision on disk, not who the knowledge belongs to.
+fn last_author(root: &Path, rel: &str) -> Option<String> {
+    let source = std::fs::read_to_string(root.join(rel)).ok()?;
+    let engram = crystalline_core::parse_engram(&source).ok()?;
+    engram.frontmatter.generated.map(|g| g.by)
+}
+
 /// Shapes [`ops::propose_preview`]'s plan for `origin_share_preview` and the
 /// REST changes route: always `effective_title` and `changes` (one
-/// `{ path, kind }` entry per detected local change), plus the fields the
-/// planned action itself carries - `number` and `url` for an update,
+/// `{ path, kind, last_author }` entry per detected local change), plus the
+/// fields the planned action itself carries - `number` and `url` for an update,
 /// `top_number` and `top_title` for a `stack` (a new layer on an open chain),
 /// `number`, `url`, `title` and `layers_above` for an `amend`, all three of `number`,
 /// `url` and `branch` for a diverged proposal, `count` for pending conflicts
 /// and nothing extra for a create or a no-op.
-pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
+///
+/// `root` is the domain's working tree, which is where `last_author` comes
+/// from: the plan already names every changed file, so saying who last wrote
+/// each one costs one read per path and is what lets a browser preselect the
+/// person's own work out of a mixed delta (see [`last_author`]).
+pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: &Path) -> Value {
     let changes: Vec<Value> = plan
         .changes
         .changes
@@ -380,7 +411,11 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan) -> Value {
                 LocalChange::Modified { .. } => "modified",
                 LocalChange::Deleted { .. } => "deleted",
             };
-            json!({ "path": c.path(), "kind": kind })
+            json!({
+                "path": c.path(),
+                "kind": kind,
+                "last_author": last_author(root, c.path()),
+            })
         })
         .collect();
     let mut v = json!({
@@ -1188,19 +1223,89 @@ mod tests {
             },
             effective_title: "Share updates from brand".to_string(),
         };
-        let v = share_plan_json(&plan);
+        let v = share_plan_json(&plan, Path::new("/nowhere"));
         assert_eq!(v["action"], "update");
         assert_eq!(v["number"], 4);
         assert_eq!(v["url"], "https://github.com/acme/brand-knowledge/pull/4");
         assert_eq!(v["effective_title"], "Share updates from brand");
         assert_eq!(
             v["changes"][0],
-            json!({"path": "notes/new.md", "kind": "added"})
+            json!({"path": "notes/new.md", "kind": "added", "last_author": null})
         );
         assert_eq!(
             v["changes"][1],
-            json!({"path": "notes/old.md", "kind": "deleted"})
+            json!({"path": "notes/old.md", "kind": "deleted", "last_author": null})
         );
+    }
+
+    /// Every shape the working tree can hand a plan, and the one rule they
+    /// answer to: an engram that records who wrote it says so, and everything
+    /// else is simply unattributed.
+    ///
+    /// The three "everything else" cases are the ones the browser's
+    /// preselection depends on being quiet: a file with no `generated` block
+    /// (somebody edited it in an editor), a file that does not parse (they are
+    /// still editing it) and a file that is gone (they deleted it). A plan
+    /// that failed on any of them would take the whole share dialog down with
+    /// it.
+    #[test]
+    fn a_plan_names_the_actor_that_wrote_each_change_where_there_is_one() {
+        use crystalline_remote::changes::{LocalChange, LocalChanges};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(
+            root.join("written.md"),
+            "---\ntype: engram\ntitle: Written\npermalink: written\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\ngenerated: { by: human:ada, at: 2026-08-29T09:00:00+00:00 }\n---\n\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("hand-written.md"),
+            "---\ntype: engram\ntitle: Hand\npermalink: hand\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("broken.md"), "---\nnot: [valid\n").unwrap();
+
+        let changed = |path: &str| LocalChange::Modified {
+            path: path.to_string(),
+            sha256: "aa".to_string(),
+        };
+        let plan = ops::SharePlan {
+            action: ops::PlannedAction::Create,
+            changes: LocalChanges {
+                changes: vec![
+                    changed("written.md"),
+                    changed("hand-written.md"),
+                    changed("broken.md"),
+                    LocalChange::Deleted {
+                        path: "gone.md".to_string(),
+                    },
+                ],
+                skipped_large: vec![],
+            },
+            effective_title: "Share".to_string(),
+        };
+        let v = share_plan_json(&plan, root);
+        let authors: Vec<&Value> = v["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| &c["last_author"])
+            .collect();
+        assert_eq!(authors[0], &json!("human:ada"));
+        for (at, why) in [
+            (1, "an engram with no provenance"),
+            (2, "frontmatter mid-edit"),
+            (3, "a file that is gone"),
+        ] {
+            assert_eq!(authors[at], &Value::Null, "{why} is unattributed: {v}");
+        }
+    }
+
+    /// [`share_plan_json`] over a working tree that holds nothing, for the
+    /// plans whose change lists are empty anyway: no path is read, so no
+    /// fixture is needed to shape one.
+    fn plan_json(plan: &ops::SharePlan) -> Value {
+        share_plan_json(plan, Path::new("/nowhere"))
     }
 
     #[test]
@@ -1212,17 +1317,17 @@ mod tests {
             effective_title: String::new(),
         };
         assert_eq!(
-            share_plan_json(&plan(ops::PlannedAction::Create))["action"],
+            plan_json(&plan(ops::PlannedAction::Create))["action"],
             "create"
         );
         assert_eq!(
-            share_plan_json(&plan(ops::PlannedAction::NothingToShare))["action"],
+            plan_json(&plan(ops::PlannedAction::NothingToShare))["action"],
             "nothing_to_share"
         );
-        let conflicts = share_plan_json(&plan(ops::PlannedAction::ConflictsPending { count: 2 }));
+        let conflicts = plan_json(&plan(ops::PlannedAction::ConflictsPending { count: 2 }));
         assert_eq!(conflicts["action"], "conflicts_pending");
         assert_eq!(conflicts["count"], 2);
-        let diverged = share_plan_json(&plan(ops::PlannedAction::ProposalDiverged {
+        let diverged = plan_json(&plan(ops::PlannedAction::ProposalDiverged {
             number: 9,
             url: "https://github.test/pull/9".to_string(),
             branch: "crystalline/share-brand".to_string(),
@@ -1240,14 +1345,14 @@ mod tests {
             changes: LocalChanges::default(),
             effective_title: String::new(),
         };
-        let stack = share_plan_json(&plan(ops::PlannedAction::StackOnTop {
+        let stack = plan_json(&plan(ops::PlannedAction::StackOnTop {
             top_number: 6,
             top_title: "Share glossary edits".to_string(),
         }));
         assert_eq!(stack["action"], "stack");
         assert_eq!(stack["top_number"], 6);
         assert_eq!(stack["top_title"], "Share glossary edits");
-        let amend = share_plan_json(&plan(ops::PlannedAction::Amend {
+        let amend = plan_json(&plan(ops::PlannedAction::Amend {
             number: 9,
             url: "https://github.test/pull/9".to_string(),
             title: "Refine the glossary".to_string(),

@@ -836,7 +836,10 @@ describe("the admin client layer", () => {
       action: "update",
       effective_title: "Refine 2 engrams in kb",
       changes: [
-        { path: "notes/a.md", kind: "modified" },
+        { path: "notes/a.md", kind: "modified", last_author: "human:ada" },
+        // A change nobody is named for: an engram edited outside the engine,
+        // or an older server that names nobody at all.
+        { path: "notes/b.md", kind: "modified" },
         // A change with no path is not a file anybody can be shown.
         { kind: "modified" },
       ],
@@ -849,7 +852,10 @@ describe("the admin client layer", () => {
     expect(plan).toEqual({
       action: "update",
       effectiveTitle: "Refine 2 engrams in kb",
-      changes: [{ path: "notes/a.md", kind: "modified" }],
+      changes: [
+        { path: "notes/a.md", kind: "modified", lastAuthor: "human:ada" },
+        { path: "notes/b.md", kind: "modified", lastAuthor: null },
+      ],
       number: 4,
       url: "https://github.example/acme/kb/pull/4",
       // An update carries no conflict count, and none is invented for it.

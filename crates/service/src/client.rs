@@ -1195,6 +1195,7 @@ pub async fn origin_share(
     title: Option<&str>,
     description: Option<&str>,
     proposal: Option<u64>,
+    files: Option<&[String]>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -1203,6 +1204,7 @@ pub async fn origin_share(
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "origin_share", "domain": domain,
             "title": title, "description": description, "proposal": proposal,
+            "files": files,
         }))
         .await?
     {
@@ -1212,7 +1214,14 @@ pub async fn origin_share(
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
     Ok(engine
-        .origin_share(domain, title, description, proposal, ShareActor::Owner)
+        .origin_share(
+            domain,
+            title,
+            description,
+            proposal,
+            files,
+            ShareActor::Owner,
+        )
         .await?)
 }
 

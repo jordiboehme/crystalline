@@ -488,6 +488,10 @@ pub struct ShareChangesParams {
     /// way to answer its review feedback.
     #[serde(default)]
     pub proposal: Option<u64>,
+    /// Share only these changed files (domain-relative); omitted shares every
+    /// unshared change. Folder indexes of the affected folders ride along.
+    #[serde(default)]
+    pub files: Option<Vec<String>>,
 }
 
 /// Parameters for `update_domain`.

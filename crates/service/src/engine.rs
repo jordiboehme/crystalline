@@ -8593,6 +8593,12 @@ impl Engine {
     /// `proposal` names an open layer to amend instead of letting the share
     /// pick its own target; `None` is the ordinary call.
     ///
+    /// `files` narrows what the share carries to those domain-relative paths,
+    /// the generated listings of their folders riding along; `None` is the
+    /// whole unshared delta. A path that is not among the domain's unshared
+    /// changes refuses the share by name (see
+    /// `crystalline_remote::ops::ShareOptions::files`).
+    ///
     /// `actor` is who the share runs as, which decides the credential the
     /// forge writes go out on (see [`Engine::resolve_share_provider`]); it is
     /// inert while `github.share_identity` is `instance`, the default.
@@ -8607,6 +8613,7 @@ impl Engine {
         title: Option<&str>,
         description: Option<&str>,
         proposal: Option<u64>,
+        files: Option<&[String]>,
         actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
@@ -8639,7 +8646,7 @@ impl Engine {
                 // credential this share actually went out on. `None` only when
                 // that credential carries no login (the environment token).
                 author_login: login.as_deref(),
-                files: None,
+                files,
             },
         )
         .await
@@ -8717,6 +8724,7 @@ impl Engine {
         domain: &str,
         title: Option<&str>,
         proposal: Option<u64>,
+        files: Option<&[String]>,
         actor: ShareActor,
     ) -> Result<Value> {
         let stacks_allowed = {
@@ -8748,7 +8756,7 @@ impl Engine {
                 // Carried for the same reason the provider is: a preview
                 // resolves exactly what the share would. It records nothing.
                 author_login: login.as_deref(),
-                files: None,
+                files,
             },
         )
         .await
@@ -8756,7 +8764,7 @@ impl Engine {
         .map_err(|e| enrich_write_error(e, acting.as_deref(), &spec.repo))?;
         self.index_what_the_share_pull_applied(domain, "previewing a share")
             .await;
-        Ok(origin::share_plan_json(&plan))
+        Ok(origin::share_plan_json(&plan, &root))
     }
 
     /// Previews which proposal a withdrawal would take out, without touching

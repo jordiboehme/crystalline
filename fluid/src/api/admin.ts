@@ -807,6 +807,22 @@ export async function syncDomain(domain: string): Promise<unknown> {
   });
 }
 
+/**
+ * One file a share would carry, as the plan reports it.
+ *
+ * `lastAuthor` is the OKF actor the file's own frontmatter records as having
+ * written it - `human:ada` for a person, an agent's own name for an agent -
+ * and null wherever there is nothing to read: a deleted file, a file edited
+ * outside the engine, an older server that names nobody. It is last-writer
+ * provenance rather than authorship, and it is what lets the share dialog
+ * open with a person's own work already ticked.
+ */
+export interface ShareChange {
+  path: string;
+  kind: string;
+  lastAuthor: string | null;
+}
+
 /** What a share would do, before anybody commits to doing it. */
 export interface SharePlan {
   /**
@@ -818,7 +834,7 @@ export interface SharePlan {
   action: string;
   /** The title the proposal would carry, the server's own if none was given. */
   effectiveTitle: string;
-  changes: { path: string; kind: string }[];
+  changes: ShareChange[];
   /** The proposal an `update` would go into; null for the other actions. */
   number: number | null;
   url: string | null;
@@ -897,11 +913,15 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
         const path = asString(change?.path);
         return path === null
           ? null
-          : { path, kind: asString(change?.kind) ?? "" };
+          : {
+              path,
+              kind: asString(change?.kind) ?? "",
+              // A server that names nobody reads exactly like a file nobody
+              // is named for, which is the same thing to every reader of it.
+              lastAuthor: asString(change?.last_author),
+            };
       })
-      .filter(
-        (change): change is { path: string; kind: string } => change !== null,
-      ),
+      .filter((change): change is ShareChange => change !== null),
     number: asNumber(record?.number),
     url: asString(record?.url),
     count: asNumber(record?.count),
@@ -924,7 +944,17 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
  */
 export async function shareDomain(
   domain: string,
-  body: { title?: string; description?: string; proposal?: number },
+  body: {
+    title?: string;
+    description?: string;
+    proposal?: number;
+    /**
+     * The files to carry, when they are some of them rather than all of them.
+     * Left out entirely for a share of everything, so the common case is the
+     * request it always was.
+     */
+    files?: string[];
+  },
 ): Promise<unknown> {
   return api<unknown>(`/domains/${encodeSegment(domain)}/sync/share`, {
     method: "POST",

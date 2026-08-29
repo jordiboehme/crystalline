@@ -986,6 +986,13 @@ pub async fn sync_now(
                    it is derived rather than written and is left out of the \
                    domain's `local_changes` count: a renderer counts these \
                    into one line rather than listing them beside the engrams. \
+                   Each entry also carries `last_author`, the actor the \
+                   file's own frontmatter records as having written it \
+                   (`human:ada` for a person, an agent's own name for an \
+                   agent) and null wherever there is nothing to read - a \
+                   deleted file, one edited outside the engine. It is \
+                   last-writer provenance rather than authorship, and it is \
+                   what lets a client offer somebody their own changes first. \
                    Writes nothing to the origin; refused on a \
                    read-only instance because the freshness pull writes the \
                    working tree.",
@@ -1013,7 +1020,11 @@ pub async fn sync_now(
                         "number": 4,
                         "url": "https://github.com/acme/knowledge/pull/4",
                         "effective_title": "Refine 2 engrams in kb",
-                        "changes": [{ "path": "notes/a.md", "kind": "modified" }]
+                        "changes": [{
+                            "path": "notes/a.md",
+                            "kind": "modified",
+                            "last_author": "human:ada"
+                        }]
                     })
                 )),
                 ("stack" = (
@@ -1023,7 +1034,11 @@ pub async fn sync_now(
                         "top_number": 4,
                         "top_title": "Refine 2 engrams in kb",
                         "effective_title": "Share 1 new engram in kb",
-                        "changes": [{ "path": "notes/b.md", "kind": "added" }]
+                        "changes": [{
+                            "path": "notes/b.md",
+                            "kind": "added",
+                            "last_author": null
+                        }]
                     })
                 )),
             ),
@@ -1081,6 +1096,10 @@ pub async fn share_changes_preview(
                 &domain,
                 None,
                 None,
+                // A preview is always of the whole delta: what a browser
+                // ticks boxes in is this list, so narrowing it here would
+                // hide the very files somebody is choosing between.
+                None,
                 ShareActor::Account(caller.name().to_string()),
             )
             .await?,
@@ -1091,11 +1110,13 @@ pub async fn share_changes_preview(
 /// the engine writes a summary of its own when no title is given and picks the
 /// share's own target when no proposal is named.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-#[schema(description = "The proposal's title and description, and optionally \
-                        the open proposal to amend instead of stacking a new \
-                        layer. All optional: with none of them, the share \
-                        carries a title the engine generates from the changes \
-                        themselves and targets the layer it picks itself.")]
+#[schema(description = "The proposal's title and description, optionally the \
+                        open proposal to amend instead of stacking a new \
+                        layer, and optionally the files to carry. All \
+                        optional: with none of them, the share carries every \
+                        unshared change under a title the engine generates \
+                        from the changes themselves, and targets the layer it \
+                        picks itself.")]
 pub struct ShareBody {
     /// The pull request title. Defaults to a generated summary.
     #[serde(default)]
@@ -1111,6 +1132,13 @@ pub struct ShareBody {
     #[serde(default)]
     #[schema(example = 4)]
     pub proposal: Option<u64>,
+    /// Share only these changed files, as domain-relative paths. Absent
+    /// shares every unshared change; the generated `index.md` of each chosen
+    /// file's folder rides along, and a path that is not among this domain's
+    /// unshared changes is refused by name.
+    #[serde(default)]
+    #[schema(example = json!(["notes/a.md"]))]
+    pub files: Option<Vec<String>>,
 }
 
 /// `POST /domains/{domain}/sync/share` - propose this domain's local changes
@@ -1251,6 +1279,7 @@ pub async fn share_now(
                 body.title.as_deref(),
                 body.description.as_deref(),
                 body.proposal,
+                body.files.as_deref(),
                 ShareActor::Account(caller.name().to_string()),
             )
             .await?,

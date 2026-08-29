@@ -1,5 +1,6 @@
 /**
- * The files a share would carry, grouped by what happened to them.
+ * The files a share would carry, grouped by what happened to them, each with a
+ * box saying whether it goes.
  *
  * A flat line per file is fine for the handful somebody edited by hand and
  * useless for what a sweep produces: an evolve pass or an ingest lands dozens
@@ -21,18 +22,28 @@
  * box scrolls, and a row that has been scrolled away from its heading still has
  * to say what it is.
  *
- * Generated folder listings are the one thing kept out of the groups. An
- * `index.md` is rebuilt from the engrams beside it so a team repository stays
- * browsable on the forge, and it travels with a share for that reason alone: a
- * sweep that touched forty folders would put forty derived paths in front of a
- * reader looking for the three engrams they wrote. So they are counted rather
- * than listed, in one muted line under the groups, and the line is absent
- * entirely when there are none.
+ * The checkboxes are what make this a decision rather than a report. A share
+ * used to carry the whole delta, which on a shared instance means carrying
+ * everybody's afternoon; now each file says whether it goes, and the box on a
+ * group heading is the way back to all of it in one press - it reads as
+ * indeterminate while some of its group is ticked, so a reader can see at a
+ * glance that a group is partly in.
+ *
+ * Generated folder listings are the one thing kept out of the groups, and the
+ * one thing with no box. An `index.md` is rebuilt from the engrams beside it so
+ * a team repository stays browsable on the forge, and it travels with a share
+ * for that reason alone: a sweep that touched forty folders would put forty
+ * derived paths in front of a reader looking for the three engrams they wrote.
+ * So they are counted rather than listed, in one muted line under the groups,
+ * and the count follows the ticks - the listing of a folder nothing was chosen
+ * from stays behind with it.
  */
 
 import type { ReactElement } from "react";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import type { ShareChange } from "../api/admin";
+import { isFolderIndex, ridingIndexes, substantive } from "./changes";
 import { CHIP_VARIANTS } from "./primitives";
 
 /**
@@ -43,12 +54,6 @@ import { CHIP_VARIANTS } from "./primitives";
  * box without scrolling.
  */
 const SHOWN_PER_GROUP = 5;
-
-/** One change, as the share plan reports it. */
-export interface Change {
-  path: string;
-  kind: string;
-}
 
 /**
  * The one face the chips have no name for: a rename is neither good news nor a
@@ -123,7 +128,9 @@ export function ChangeKindBadge({ kind }: { kind: string }): ReactElement {
 }
 
 /** The changes of one kind, in the order the plan listed them. */
-function groupChanges(changes: Change[]): { kind: string; paths: string[] }[] {
+function groupChanges(
+  changes: ShareChange[],
+): { kind: string; paths: string[] }[] {
   const groups = new Map<string, string[]>();
   for (const change of changes) {
     const paths = groups.get(change.kind);
@@ -146,28 +153,88 @@ function rank(kind: string): number {
   return at < 0 ? KIND_ORDER.length : at;
 }
 
+/** The box on a group heading, which is a third state as often as a second. */
+function GroupCheckbox({
+  label,
+  checked,
+  indeterminate,
+  onChange,
+}: {
+  label: string;
+  checked: boolean;
+  indeterminate: boolean;
+  onChange: (next: boolean) => void;
+}): ReactElement {
+  const box = useRef<HTMLInputElement>(null);
+  // `indeterminate` is a property with no attribute, so it is set on the node
+  // rather than rendered. Without it a partly-ticked group would draw as
+  // unticked and one press would look like it did nothing.
+  useEffect(() => {
+    if (box.current !== null) {
+      box.current.indeterminate = indeterminate;
+    }
+  }, [indeterminate]);
+  return (
+    <input
+      ref={box}
+      type="checkbox"
+      aria-label={label}
+      checked={checked}
+      onChange={(event) => {
+        onChange(event.target.checked);
+      }}
+      className="size-3.5 shrink-0 accent-accent-600 dark:accent-accent-400"
+    />
+  );
+}
+
 /** One kind's heading, its first few paths, and the rest behind a press. */
 function ChangeGroup({
   kind,
   paths,
+  selected,
+  onToggle,
+  onToggleGroup,
 }: {
   kind: string;
   paths: string[];
+  selected: ReadonlySet<string>;
+  onToggle: (path: string, next: boolean) => void;
+  onToggleGroup: (paths: string[], next: boolean) => void;
 }): ReactElement {
   const [expanded, setExpanded] = useState(false);
   const face = faceFor(kind);
   const shown = expanded ? paths : paths.slice(0, SHOWN_PER_GROUP);
   const rest = paths.length - SHOWN_PER_GROUP;
+  const ticked = paths.filter((path) => selected.has(path)).length;
   return (
     <div className="flex flex-col gap-1">
       {/* The shape of the share, before any of its detail: what happened, and
-          to how many. */}
-      <p className="text-caption font-medium text-slate-600 dark:text-slate-300">
+          to how many - with the one control that takes a whole group in or
+          out at once. */}
+      <p className="flex items-center gap-2 text-caption font-medium text-slate-600 dark:text-slate-300">
+        <GroupCheckbox
+          label={`Share all ${face.word.toLowerCase()}`}
+          checked={ticked === paths.length}
+          indeterminate={ticked > 0 && ticked < paths.length}
+          onChange={(next) => {
+            onToggleGroup(paths, next);
+          }}
+        />
         {`${face.word} ${String(paths.length)}`}
       </p>
       <ul className="flex flex-col gap-0.5">
         {shown.map((path) => (
           <li key={path} className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              aria-label={path}
+              checked={selected.has(path)}
+              onChange={(event) => {
+                onToggle(path, event.target.checked);
+              }}
+              className="size-3.5 shrink-0 accent-accent-600 dark:accent-accent-400"
+            />
             <ChangeKindBadge kind={kind} />
             <span className="font-mono text-xs break-all">{path}</span>
           </li>
@@ -200,27 +267,33 @@ function ChangeGroup({
 }
 
 /**
- * Whether a path is a generated folder listing rather than something somebody
- * wrote, read off its filename the way the engine reads it.
- */
-function isFolderIndex(path: string): boolean {
-  return path === "index.md" || path.endsWith("/index.md");
-}
-
-/**
  * Every file a share would carry, by kind, inside a box that cannot grow past
  * the dialog it sits in, with the folder listings counted beneath them.
+ *
+ * `selected` is the caller's, not this component's: the dialog posts it, so it
+ * holds it. What is drawn here is that set and the two ways to change it, one
+ * file and one group at a time.
  */
 export function ChangeList({
   changes,
+  selected,
+  onToggle,
+  onToggleGroup,
+  hint,
 }: {
-  changes: Change[];
+  changes: ShareChange[];
+  selected: ReadonlySet<string>;
+  onToggle: (path: string, next: boolean) => void;
+  onToggleGroup: (paths: string[], next: boolean) => void;
+  /** Why the boxes opened the way they did, when that needs saying. */
+  hint?: string | null;
 }): ReactElement | null {
-  const indexes = changes.filter((change) => isFolderIndex(change.path)).length;
-  const groups = groupChanges(
-    changes.filter((change) => !isFolderIndex(change.path)),
-  );
-  if (groups.length === 0 && indexes === 0) {
+  const indexes = ridingIndexes(changes, selected);
+  const groups = groupChanges(substantive(changes));
+  const listings = changes.filter((change) =>
+    isFolderIndex(change.path),
+  ).length;
+  if (groups.length === 0 && listings === 0) {
     return null;
   }
   return (
@@ -229,8 +302,20 @@ export function ChangeList({
     // screen on a share nobody sized beforehand.
     <div className="flex max-h-56 flex-col gap-3 overflow-y-auto pr-1 text-sm">
       {groups.map((group) => (
-        <ChangeGroup key={group.kind} kind={group.kind} paths={group.paths} />
+        <ChangeGroup
+          key={group.kind}
+          kind={group.kind}
+          paths={group.paths}
+          selected={selected}
+          onToggle={onToggle}
+          onToggleGroup={onToggleGroup}
+        />
       ))}
+      {(hint ?? null) !== null && (
+        <p className="text-caption text-slate-500 dark:text-slate-400">
+          {hint}
+        </p>
+      )}
       {indexes > 0 && (
         // Under the groups and quieter than them, because that is exactly the
         // weight it carries: something the share does, not something the

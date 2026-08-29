@@ -773,6 +773,113 @@ async fn share_kb(fx: &Fixture, admin: &(String, String)) -> serde_json::Value {
     shared.json().await.unwrap()
 }
 
+/// The share body's `files` scopes what a share carries, and the plan says
+/// who last wrote each change so a browser can preselect somebody's own work.
+///
+/// Both halves are read off one walk, because they are the two ends of the
+/// same feature: the plan is what a person ticks boxes in, and the ticks come
+/// back as `files`. The provenance is read tolerantly - an engram written
+/// straight into the working tree carries no `generated` block, and that is a
+/// file nobody is attributed for rather than a plan that fails.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_share_carries_only_the_chosen_files_and_the_plan_names_their_authors() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    // One engram with write provenance, one without: the tolerant read has to
+    // answer for both.
+    std::fs::write(
+        kb_root.join("mine.md"),
+        b"---\ntype: engram\ntitle: Mine\npermalink: mine\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\ngenerated: { by: human:root, at: 2026-08-29T09:00:00+00:00 }\n---\n\nMine.\n",
+    )
+    .unwrap();
+    write_kb_engram(&kb_root, "theirs.md", "Theirs", "theirs");
+
+    let changes = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let changes: serde_json::Value = changes.json().await.unwrap();
+    let authors: std::collections::BTreeMap<String, serde_json::Value> = changes["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["path"].as_str().unwrap().to_string(),
+                c["last_author"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        authors.get("mine.md"),
+        Some(&serde_json::json!("human:root")),
+        "{changes}"
+    );
+    assert_eq!(
+        authors.get("theirs.md"),
+        Some(&serde_json::json!(null)),
+        "an engram with no provenance is unattributed, not missing: {changes}"
+    );
+
+    // A path that is not a change is a teaching refusal naming it.
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({ "files": ["nowhere.md"] }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422, "a teaching refusal, not a failure");
+    let refused: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        refused["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("nowhere.md"),
+        "{refused}"
+    );
+
+    // And a selection carries exactly what it named.
+    let shared = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &admin,
+    )
+    .json(&serde_json::json!({ "files": ["mine.md"] }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(shared.status(), 200, "{}", shared.text().await.unwrap());
+    let shared: serde_json::Value = shared.json().await.unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    // The chosen file and the generated listing of the folder it lives in -
+    // here the domain root - and nothing else: the listing is derived from
+    // the engrams beside it, so it travels with them rather than being left
+    // to disagree with the folder it describes.
+    assert_eq!(
+        shared["added"],
+        serde_json::json!(["index.md", "mine.md"]),
+        "{shared}"
+    );
+    assert_eq!(
+        shared["updated"],
+        serde_json::json!([]),
+        "the file nobody ticked stays behind: {shared}"
+    );
+}
+
 /// The stacked half of the share route. `the_share_routes_walk_the_loop`
 /// pins the quiet chain values an unstacked forge produces; this pins the
 /// populated ones, which is the half a client actually renders a layer from.

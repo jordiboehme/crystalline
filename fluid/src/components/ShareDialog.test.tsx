@@ -1161,4 +1161,179 @@ describe("the share dialog", () => {
       requested().filter((path) => path.startsWith("/me/github-identity")),
     ).toEqual([]);
   });
+
+  it("shares only the ticked files, and recounts the listings that ride with them", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "proposed",
+      number: 7,
+      url: "https://github.com/acme/knowledge/pull/7",
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "added" },
+          { path: "guides/g.md", kind: "added" },
+          { path: "notes/index.md", kind: "modified" },
+          { path: "guides/index.md", kind: "modified" },
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Everything is ticked to begin with, so the line counts the delta's own
+    // listings: this share sends no file list and carries all of it.
+    expect(
+      await within(dialog).findByText("Also refreshes 2 folder indexes"),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("checkbox", { name: "guides/g.md" }),
+    );
+
+    // Untick a file and its folder's listing goes with it, because the share
+    // now names the files it carries and the engine adds only their folders.
+    expect(
+      await within(dialog).findByText("Also refreshes 1 folder index"),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // Exactly what was ticked, and never the listings: those are the engine's
+    // to add for the folders it was handed.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      files: ["notes/a.md"],
+    });
+  });
+
+  it("preselects your own changes and says how much it left behind", async () => {
+    const shared = vi.fn(() => ({ outcome: "proposed", number: 7 }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 3 engrams from eng",
+        changes: [
+          { path: "notes/mine.md", kind: "modified", last_author: "human:ada" },
+          {
+            path: "notes/theirs.md",
+            kind: "modified",
+            last_author: "human:bob",
+          },
+          { path: "notes/gone.md", kind: "deleted", last_author: null },
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The session is `ada`, so her own file opens ticked and the other two -
+    // somebody else's edit and a deletion nobody is named for - do not.
+    expect(
+      await within(dialog).findByText(
+        "Preselected your 1 change - 2 more from others left unticked.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/mine.md" }),
+    ).toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/theirs.md" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/gone.md" }),
+    ).not.toBeChecked();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      files: ["notes/mine.md"],
+    });
+  });
+
+  it("takes a whole group back in from its heading, and sends nothing when it is all of them", async () => {
+    const shared = vi.fn(() => ({ outcome: "proposed", number: 7 }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "notes/mine.md", kind: "modified", last_author: "human:ada" },
+          {
+            path: "notes/theirs.md",
+            kind: "modified",
+            last_author: "human:bob",
+          },
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    const group = await within(dialog).findByRole("checkbox", {
+      name: "Share all modified",
+    });
+    // Partly in, which is a third state rather than an unticked box: one
+    // press from here is "all of it".
+    expect(group).toHaveProperty("indeterminate", true);
+    await userEvent.click(group);
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/theirs.md" }),
+    ).toBeChecked();
+    // The line described the boxes as they opened; they have been changed, so
+    // it steps out of the way rather than describing a state nobody is in.
+    expect(within(dialog).queryByText(/preselected your/i)).toBeNull();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // Everything is ticked again, so this is the request it has always been:
+    // no file list at all.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({});
+  });
+
+  it("has nothing to share once every box is unticked", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await userEvent.click(
+      await within(dialog).findByRole("checkbox", { name: "notes/a.md" }),
+    );
+    // A share of nothing is not a share, and the button says so before the
+    // press rather than the server saying it afterwards.
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeDisabled();
+    });
+  });
 });
