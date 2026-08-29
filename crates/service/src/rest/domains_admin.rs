@@ -20,8 +20,11 @@ use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse
 use crate::engine::{EngineError, ShareActor};
 
 /// The caller, when they may drive this instance's share verbs - the preview,
-/// the share, a withdrawal and a conflict resolution, the four routes that act
-/// on the team's repository.
+/// the share, a withdrawal, and reading or resolving a conflict, the five
+/// routes that act on the team's repository. The conflict READ is gated with
+/// them rather than with the plain admin reads beside it: whoever may settle a
+/// conflict has to be able to see the three sides they are choosing between,
+/// so splitting the pair would leave an editor able to resolve blind.
 ///
 /// The gate moves with `github.share_identity`, because what it is protecting
 /// moves with it:
@@ -1391,7 +1394,9 @@ pub async fn withdraw_proposal(
     tag = "domains",
     operation_id = "get_domain_conflict",
     summary = "One recorded conflict, with every side.",
-    description = "Admin only. Reads the conflict the domain's origin state \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Reads the conflict the domain's origin state \
                    recorded under this id: the base and upstream sides kept \
                    beside it, plus the current local content. A side that \
                    exists but is not UTF-8 comes back null with `note` saying \
@@ -1425,8 +1430,11 @@ pub async fn withdraw_proposal(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or the trusted-header \
-                           identity names a disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), or the \
+                           trusted-header identity names a disabled \
+                           account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1450,7 +1458,10 @@ pub async fn conflict_detail(
     identity: Identity,
     ApiPath((domain, id)): ApiPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    // The same gate the resolve carries, for the same reason: whoever may
+    // settle a conflict has to be able to read the three sides they are
+    // choosing between first.
+    require_share_role(&state, &identity)?;
     // No connection check: every side of a conflict is already on this
     // machine. See the doc comment.
     require_team_domain(&state, &domain, Refusal::Missing)?;

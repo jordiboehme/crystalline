@@ -2271,6 +2271,125 @@ async fn the_share_routes_stay_admin_only_in_instance_mode() {
     .await
     .unwrap();
     assert_eq!(resolved.status(), 403);
+
+    // Including the conflict READ, which moves with the resolve: refused here
+    // before any lookup, so the 403 is the gate rather than a missing id.
+    let detail = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/conflicts/abc12345",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(detail.status(), 403);
+}
+
+/// Reading a conflict is gated WITH resolving it rather than with the plain
+/// admin reads beside it: an editor who may settle a conflict in personal mode
+/// has to be able to see the three sides first, or they would be resolving
+/// blind. The instance arm of the same rule is pinned above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_editor_reads_the_conflict_they_may_resolve_in_personal_mode() {
+    let (fx, mock) = serve_team_with_mock_sharing(true).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    // Local and upstream edit the same engram differently, then pull.
+    std::fs::write(
+        kb_root.join("shared.md"),
+        b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nmy local text\n",
+    )
+    .unwrap();
+    let c2 = mock.add_commit(std::collections::BTreeMap::from([
+        (
+            "MANIFEST.md".to_string(),
+            std::fs::read(kb_root.join("MANIFEST.md")).unwrap(),
+        ),
+        (
+            "shared.md".to_string(),
+            b"---\ntype: engram\ntitle: Shared\npermalink: shared\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nthe team's text\n".to_vec(),
+        ),
+    ]));
+    mock.set_branch("main", &c2);
+    let pulled = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(pulled.status(), 200, "{}", pulled.text().await.unwrap());
+
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    let status: serde_json::Value = status.json().await.unwrap();
+    let id = status["conflicts"][0]["id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the pull recorded a conflict: {status}"))
+        .to_string();
+
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let detail = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/kb/sync/conflicts/{id}"),
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(detail.status(), 200, "{}", detail.text().await.unwrap());
+    let detail: serde_json::Value = detail.json().await.unwrap();
+    assert_eq!(detail["id"], id.as_str());
+    assert!(
+        detail["local"].as_str().unwrap().contains("my local text"),
+        "both sides, not just an id: {detail}"
+    );
+    assert!(
+        detail["upstream"]
+            .as_str()
+            .unwrap()
+            .contains("the team's text"),
+        "{detail}"
+    );
+
+    // A viewer still sees neither half of the pair.
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        &format!("/api/v1/domains/kb/sync/conflicts/{id}"),
+        &vera,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 403);
+
+    // And the read leads where it is supposed to: the same editor settles it.
+    let resolved = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        &format!("/api/v1/domains/kb/sync/conflicts/{id}/resolve"),
+        &eddy,
+    )
+    .json(&serde_json::json!({"resolution": "mine"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resolved.status(), 200, "{}", resolved.text().await.unwrap());
 }
 
 /// Personal mode moves the gate down one role and no further: the personal

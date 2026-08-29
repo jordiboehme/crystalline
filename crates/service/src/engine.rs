@@ -9664,11 +9664,19 @@ impl Engine {
         matches!(self.github_credential(host.as_deref()), Ok((_, Some(_))))
     }
 
-    /// Forget the stored credential: delete it where it lives, drop the
-    /// in-process cache and cancel any pending device flow. Refuses under an
+    /// Forget the stored credential: delete it where it lives, drop its cache
+    /// entries and cancel any pending device flow. Refuses under an
     /// environment token (only the environment can retire it) and on a
     /// read-only instance. github.enabled is untouched: turning the feature
     /// off stays a configure concern.
+    ///
+    /// Only the INSTANCE credential's cache entries go - every host's, since
+    /// the delete above may have been for one host while a GHES entry for
+    /// another is stale for the same reason. Personal slots stay: they are
+    /// different credentials that this call did not delete, and clearing them
+    /// would cost every connected person a keychain read (a prompt, on a real
+    /// machine) to recover something that never changed. Same rule as
+    /// [`Engine::disconnect_github_identity`], read from the other side.
     pub async fn github_disconnect(&self) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -9682,7 +9690,14 @@ impl Engine {
         if token.is_some() {
             store.delete().map_err(EngineError::Remote)?;
         }
-        self.github_tokens.lock().unwrap().clear();
+        // Keyed by prefix rather than by the one host this call resolved: the
+        // cache holds one entry per identity per host, and the instance's are
+        // exactly the ones this delete invalidates.
+        let instance_prefix = credential_cache_key(&TokenIdentity::Instance, None);
+        self.github_tokens
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&instance_prefix));
         // Only the machine's own sign-in: a person's device flow is a
         // different credential and is left to run.
         self.clear_pending_for(&TokenIdentity::Instance);
@@ -12716,6 +12731,61 @@ mod share_actor_tests {
                 .unwrap()
                 .connected
         );
+    }
+
+    /// Forgetting the MACHINE's credential forgets the machine's cache
+    /// entries, every host's, and nobody else's: a personal credential is a
+    /// different credential that this call did not delete, and evicting it
+    /// would cost its owner a keychain read - a prompt, on a real machine - to
+    /// recover something that never changed.
+    #[tokio::test]
+    async fn an_instance_disconnect_leaves_the_personal_credentials_cached() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal"))
+            .await
+            .with_connect_auth(Arc::new(AcceptingAuth("alice-gh")));
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+        engine
+            .connect_github_identity_token("alice", "alices-token")
+            .await
+            .unwrap();
+
+        // Warm the instance slot for two hosts and alice's for one.
+        engine.github_credential(None).unwrap();
+        engine
+            .github_credential_for(&TokenIdentity::Instance, Some("ghes.example"))
+            .unwrap();
+        engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .unwrap();
+        assert_eq!(engine.github_tokens.lock().unwrap().len(), 3);
+
+        engine.github_disconnect().await.unwrap();
+
+        {
+            let cache = engine.github_tokens.lock().unwrap();
+            assert!(
+                !cache.contains_key(&credential_cache_key(&TokenIdentity::Instance, None)),
+                "the machine's own entry is gone"
+            );
+            assert!(
+                !cache.contains_key(&credential_cache_key(
+                    &TokenIdentity::Instance,
+                    Some("ghes.example")
+                )),
+                "every host's, not only the one this call resolved"
+            );
+            assert!(
+                cache.contains_key(&credential_cache_key(&personal("alice"), None)),
+                "alice's credential was neither deleted nor invalidated"
+            );
+        }
+
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect("alice still shares as herself");
+        assert_eq!(token.access_token, "alices-token");
     }
 
     /// The gap between what the auth store allows as a name and what a

@@ -563,7 +563,7 @@ export interface paths {
         };
         /**
          * One recorded conflict, with every side.
-         * @description Admin only. Reads the conflict the domain's origin state recorded under this id: the base and upstream sides kept beside it, plus the current local content. A side that exists but is not UTF-8 comes back null with `note` saying so. Entirely local - no GitHub connection is needed, and a read-only instance serves it.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Reads the conflict the domain's origin state recorded under this id: the base and upstream sides kept beside it, plus the current local content. A side that exists but is not UTF-8 comes back null with `note` saying so. Entirely local - no GitHub connection is needed, and a read-only instance serves it.
          */
         get: operations["get_domain_conflict"];
         put?: never;
@@ -4469,7 +4469,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
