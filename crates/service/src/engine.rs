@@ -9366,7 +9366,7 @@ impl Engine {
     /// under a long-running daemon is dropped and the next `github_credential`
     /// re-reads from the keychain or file, picking up a standalone CLI connect
     /// that wrote a fresh token while the daemon ran. Coarse on purpose:
-    /// clearing every host's entry (there is at most one per host) avoids
+    /// clearing every entry (up to one per identity per host now) avoids
     /// threading the offending host through every provider-op call site and
     /// costs only one extra keychain read per host on the next touch.
     fn drop_github_credential_on_auth(&self, e: &RemoteError) {
