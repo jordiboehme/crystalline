@@ -13,10 +13,14 @@
 //! token-store host key, a validated conflict resolution) and the outputs
 //! (aggregate JSON) around those calls.
 //!
-//! One output reads the working tree: a share plan says who last wrote each
+//! Two things here read the working tree. A share plan says who last wrote each
 //! changed file ([`last_author`]), which is a line of the file's own
-//! frontmatter and nowhere else. It is a read of files the plan already names,
+//! frontmatter and nowhere else; it is a read of files the plan already names,
 //! and every failure of it is an absent author rather than a failed plan.
+//! [`unshared_work`] walks a team domain's tree against its base snapshot to
+//! answer "what does this domain owe its origin, and since when" offline, which
+//! the sweep, the owned-changes enrichment and the Stop hook all ask. Neither
+//! touches the network.
 
 use std::path::{Path, PathBuf};
 
@@ -387,6 +391,91 @@ fn last_author(root: &Path, rel: &str) -> Option<String> {
     engram.frontmatter.generated.map(|g| g.by)
 }
 
+/// What a team domain owes its origin, read from the working tree alone.
+///
+/// Substantive changes only: a regenerated folder listing rides along with a
+/// share and is never a reason for one, so it is filtered out here rather than
+/// by every reader (the same rule [`crystalline_remote::changes::LocalChanges::substantive_count`]
+/// applies to the count `status` reports).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnsharedWork {
+    /// The changed paths, relative to the domain root and forward-slash
+    /// normalized. Deletions are in here too: a file removed locally is work
+    /// the team has not seen either.
+    pub paths: Vec<String>,
+    /// When the oldest of those changes was last written, from the file's own
+    /// mtime. `None` when nothing changed, when every change is a deletion (a
+    /// path with no file left to stat) or when the tree could not be stat'ed
+    /// at all - all three read as "no age to assert".
+    pub oldest_change: Option<DateTime<Utc>>,
+}
+
+impl UnsharedWork {
+    /// How many substantive changes are waiting.
+    pub fn count(&self) -> usize {
+        self.paths.len()
+    }
+
+    /// [`UnsharedWork::oldest_change`] as a plain date, which is what the
+    /// consolidation sweep compares against its `today`.
+    pub fn oldest_change_date(&self) -> Option<chrono::NaiveDate> {
+        self.oldest_change.map(|at| at.date_naive())
+    }
+
+    /// How many of the changes `actor` last wrote, by the changed file's own
+    /// `generated.by` line.
+    ///
+    /// Tolerant in exactly the way [`last_author`] is, and for the same
+    /// reasons: a deleted file, a file with no provenance and a file whose
+    /// frontmatter does not parse are all "nobody named", which is not this
+    /// actor. Last-writer provenance, never authorship.
+    pub fn owned_by(&self, root: &Path, actor: &str) -> u64 {
+        self.paths
+            .iter()
+            .filter(|path| last_author(root, path).as_deref() == Some(actor))
+            .count() as u64
+    }
+}
+
+/// One team domain's unshared substantive work, detected offline: the local
+/// delta against the base snapshot, exactly as `origin status` computes it,
+/// with no probe and no forge call of any kind.
+///
+/// `None` when the domain has no recorded origin state, when the state cannot
+/// be read and when the working tree cannot be walked. All three mean the same
+/// thing to every caller here - nothing is KNOWN to be unshared - and none of
+/// them is worth failing a status enrichment, a sweep or a Stop hook over.
+///
+/// The cost is one walk of the domain root with a hash per file, the same walk
+/// `origin status` performs. Callers that already ran a status pay it twice;
+/// that is deliberate, because the alternative is threading a change list out
+/// through an aggregate JSON report that deliberately carries counts.
+pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWork> {
+    let state = OriginState::load(state_dir).ok().flatten()?;
+    let detected = crystalline_remote::changes::detect_local_changes(domain_root, &state.files)
+        .ok()?
+        .changes;
+    let paths: Vec<String> = detected
+        .iter()
+        .filter(|change| !change.is_generated_index())
+        .map(|change| change.path().to_string())
+        .collect();
+    let oldest_change = paths
+        .iter()
+        .filter_map(|path| {
+            std::fs::metadata(domain_root.join(path))
+                .ok()?
+                .modified()
+                .ok()
+        })
+        .min()
+        .map(DateTime::<Utc>::from);
+    Some(UnsharedWork {
+        paths,
+        oldest_change,
+    })
+}
+
 /// Shapes [`ops::propose_preview`]'s plan for `origin_share_preview` and the
 /// REST changes route: always `effective_title` and `changes` (one
 /// `{ path, kind, last_author }` entry per detected local change), plus the
@@ -643,6 +732,125 @@ pub(crate) fn resolution_from<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engram written by `actor`, or one with no provenance block at all
+    /// when `actor` is `None`.
+    fn engram_source(title: &str, actor: Option<&str>) -> String {
+        let generated = match actor {
+            Some(actor) => {
+                format!("generated: {{ by: {actor}, at: 2026-08-29T09:00:00+00:00 }}\n")
+            }
+            None => String::new(),
+        };
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {}\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n{generated}---\n\nBody.\n",
+            title.to_lowercase()
+        )
+    }
+
+    /// A domain root and an origin state directory whose base snapshot is
+    /// empty, so every file written into the root reads as unshared work.
+    fn tracked_domain() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("domain");
+        let state_dir = dir.path().join("state");
+        std::fs::create_dir_all(&root).unwrap();
+        OriginState::new("acme/kb".to_string(), "main".to_string())
+            .save(&state_dir)
+            .unwrap();
+        (dir, root, state_dir)
+    }
+
+    #[test]
+    fn unshared_work_counts_real_work_and_leaves_the_listings_out() {
+        let (_dir, root, state_dir) = tracked_domain();
+        std::fs::write(root.join("alpha.md"), engram_source("Alpha", None)).unwrap();
+        std::fs::create_dir_all(root.join("runbooks")).unwrap();
+        std::fs::write(root.join("index.md"), "# listing\n").unwrap();
+        std::fs::write(root.join("runbooks/index.md"), "# listing\n").unwrap();
+
+        let work = unshared_work(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(work.paths, vec!["alpha.md".to_string()]);
+        assert_eq!(work.count(), 1);
+        assert!(work.oldest_change.is_some(), "a written file has an mtime");
+    }
+
+    #[test]
+    fn unshared_work_is_absent_for_a_domain_with_no_origin_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("domain");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("alpha.md"), engram_source("Alpha", None)).unwrap();
+
+        assert_eq!(unshared_work(&root, &dir.path().join("state")), None);
+    }
+
+    /// The owned count is the same tolerant read the share plan makes: only a
+    /// file whose own frontmatter names the actor counts, and every other
+    /// shape is somebody else's or nobody's.
+    #[test]
+    fn owned_by_counts_only_what_this_actor_last_wrote() {
+        let (_dir, root, state_dir) = tracked_domain();
+        std::fs::write(
+            root.join("mine.md"),
+            engram_source("Mine", Some("human:ada")),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("also-mine.md"),
+            engram_source("AlsoMine", Some("human:ada")),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("theirs.md"),
+            engram_source("Theirs", Some("human:bob")),
+        )
+        .unwrap();
+        std::fs::write(root.join("nobodys.md"), engram_source("Nobodys", None)).unwrap();
+        std::fs::write(root.join("broken.md"), "---\nnot: [valid\n").unwrap();
+
+        let work = unshared_work(&root, &state_dir).unwrap();
+        assert_eq!(work.count(), 5);
+        assert_eq!(work.owned_by(&root, "human:ada"), 2);
+        assert_eq!(work.owned_by(&root, "human:bob"), 1);
+        assert_eq!(
+            work.owned_by(&root, "human:nobody"),
+            0,
+            "an account that wrote nothing owns nothing"
+        );
+    }
+
+    #[test]
+    fn owned_by_never_claims_a_deleted_file() {
+        let (_dir, root, state_dir) = tracked_domain();
+        std::fs::write(
+            root.join("gone.md"),
+            engram_source("Gone", Some("human:ada")),
+        )
+        .unwrap();
+        let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+        state.files.insert(
+            "gone.md".to_string(),
+            crystalline_remote::state::BaseStamp {
+                sha256: "aa".repeat(32),
+                size: 1,
+            },
+        );
+        state.save(&state_dir).unwrap();
+        std::fs::remove_file(root.join("gone.md")).unwrap();
+
+        let work = unshared_work(&root, &state_dir).unwrap();
+        assert_eq!(work.paths, vec!["gone.md".to_string()]);
+        assert_eq!(
+            work.owned_by(&root, "human:ada"),
+            0,
+            "a file that is gone has no frontmatter left to name anybody"
+        );
+        assert_eq!(
+            work.oldest_change, None,
+            "a deletion carries no mtime to age the delta by"
+        );
+    }
 
     #[test]
     fn parse_origin_spec_reads_owner_and_repo() {

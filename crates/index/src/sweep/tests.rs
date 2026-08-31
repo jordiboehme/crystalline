@@ -503,6 +503,82 @@ fn v006_ignores_retired_and_speculative_statuses() {
     }
 }
 
+/// A sweep input whose domain owes its team origin `unshared` substantive
+/// changes, the oldest of them written `days` ago.
+fn sharing(unshared: usize, days: i64) -> SweepInput {
+    let mut sweep = input(vec![fact(1, "alpha")]);
+    sweep.share = Some(ShareFacts {
+        unshared,
+        oldest_change: Some(today() - chrono::TimeDelta::days(days)),
+    });
+    sweep
+}
+
+#[test]
+fn v009_asks_for_work_that_has_sat_unshared_for_a_week() {
+    let report = detect(&sharing(3, 10));
+
+    let finding = only(&report, "V009");
+    assert_eq!(finding.family, Family::Temporal);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.domain, DOMAIN);
+    assert_eq!(
+        finding.permalink, "",
+        "V009 is about the domain rather than one engram"
+    );
+    assert!(finding.finding.contains('3'), "{}", finding.finding);
+    assert!(finding.finding.contains("10 days"), "{}", finding.finding);
+    assert!(
+        finding.evidence.contains("oldest change 2026-07-23"),
+        "{}",
+        finding.evidence
+    );
+    assert!(
+        finding.fix.contains("share_changes"),
+        "the next action names the tool: {}",
+        finding.fix
+    );
+    let info = rule_info("V009").expect("V009 is in the catalog");
+    assert!(info.instruction.contains("share_changes"), "{info:?}");
+    assert!(info.instruction.contains("origin share"), "{info:?}");
+}
+
+#[test]
+fn v009_stays_quiet_while_the_unshared_work_is_still_fresh() {
+    let report = detect(&sharing(3, SHARE_STALE_DAYS - 1));
+    assert!(!fired(&report).contains(&"V009"), "{:?}", fired(&report));
+
+    // The window is inclusive at its edge, so a week-old change does fire.
+    let report = detect(&sharing(3, SHARE_STALE_DAYS));
+    assert!(fired(&report).contains(&"V009"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v009_stays_quiet_when_only_generated_listings_changed() {
+    // The assembler counts substantive changes only, so an index-only delta
+    // reaches the detector as nothing unshared however old it is.
+    let report = detect(&sharing(0, 90));
+    assert!(!fired(&report).contains(&"V009"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v009_never_speaks_about_a_domain_with_no_origin() {
+    let report = detect(&input(vec![fact(1, "alpha")]));
+    assert!(!fired(&report).contains(&"V009"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v009_stays_quiet_when_no_changed_file_carries_a_date() {
+    let mut sweep = input(vec![fact(1, "alpha")]);
+    sweep.share = Some(ShareFacts {
+        unshared: 4,
+        oldest_change: None,
+    });
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V009"), "{:?}", fired(&report));
+}
+
 // ---------------------------------------------------------------------------
 // V1xx - structural integrity
 // ---------------------------------------------------------------------------
@@ -1231,8 +1307,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_nineteen_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 19);
+fn the_catalog_carries_twenty_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 20);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -1274,8 +1350,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
     assert_eq!(
         ids,
         vec![
-            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V101", "V102", "V103",
-            "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
+            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V101", "V102",
+            "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
         ]
     );
     for rule in RULES {

@@ -39,7 +39,7 @@ use crystalline_index::{
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
     EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, Family, FileStamp,
     Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES, RecentFilter, SearchMode,
-    SearchQuery, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
+    SearchQuery, ShareFacts, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
     chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
     provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
@@ -6038,11 +6038,28 @@ impl Engine {
             tag_aliases: vocab.aliases,
             known_domains: known_domains.to_vec(),
             attachments,
+            share: self.share_facts(name),
             include_acknowledged,
             options: SweepOptions::default(),
         };
         let report = detect(&input);
         Ok(Some(DomainSweep { report, unparsed }))
+    }
+
+    /// What a domain owes its team origin, for `V009`, or `None` for a domain
+    /// with no origin, no recorded origin state or no readable working tree.
+    ///
+    /// Offline by construction: [`crate::origin::unshared_work`] walks the tree
+    /// against the base snapshot and never probes the forge, so a sweep costs
+    /// the same whether the machine is connected or on a train. The rule reads
+    /// substantive changes only, which is the filter that helper applies.
+    fn share_facts(&self, name: &str) -> Option<ShareFacts> {
+        let (_spec, root, state_dir) = self.origin_spec_for_domain(name).ok()?;
+        let work = origin::unshared_work(&root, &state_dir)?;
+        Some(ShareFacts {
+            unshared: work.count(),
+            oldest_change: work.oldest_change_date(),
+        })
     }
 
     /// The resolved graph around a whole domain, at depth 1 so every
