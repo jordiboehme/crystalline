@@ -8358,6 +8358,16 @@ impl Engine {
     /// message rides along verbatim as `probe_error` instead of aborting
     /// the domain. Any other failure (corrupt local state, and so on) is a
     /// genuine per-domain error, propagated to the caller's `errors` array.
+    ///
+    /// One thing this read is not allowed to do is settle an owed stack link.
+    /// [`ops::status`] can pay that debt off with `create_stack`/`extend_stack`,
+    /// which are forge WRITES, and the credential it would spend is the probe's
+    /// own: the instance one, since a status carries no actor. In instance mode
+    /// that is the credential every write goes out on anyway and the settlement
+    /// runs exactly as it always has; in personal mode it would be the one
+    /// instance-credential write the wave promises never happens, so permission
+    /// is withheld and the debt stays recorded until the next share, amend or
+    /// withdrawal pays it off on the acting identity's own credential.
     async fn origin_status_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
@@ -8365,8 +8375,11 @@ impl Engine {
         // A probe is best-effort: no connection, or a provider that fails to
         // build, must never turn a status call into a hard failure.
         let probe = self.resolve_origin_provider().ok();
-        let stacks_allowed = self.config.read().unwrap().github_stacks();
-        match ops::status(&spec, &root, &state_dir, probe.as_deref(), stacks_allowed).await {
+        let settle_owed_link = {
+            let config = self.config.read().unwrap();
+            config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
+        };
+        match ops::status(&spec, &root, &state_dir, probe.as_deref(), settle_owed_link).await {
             Ok(report) => Ok(origin::status_report_json(name, &report, None)),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
@@ -8375,7 +8388,7 @@ impl Engine {
                 // credential here too; the retry below runs probe-free, so
                 // status still comes back offline.
                 self.drop_github_credential_on_auth(&e);
-                let report = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await?;
+                let report = ops::status(&spec, &root, &state_dir, None, settle_owed_link).await?;
                 Ok(origin::status_report_json(
                     name,
                     &report,
@@ -8568,15 +8581,16 @@ impl Engine {
         let (connected, token_store) = self.origin_connection_offline();
         let rate_limit_wait_until = self.origin_poller.rate_limited_until();
         let targets = self.origin_targets(None).unwrap_or_default();
-        let stacks_allowed = self.config.read().unwrap().github_stacks();
 
         let mut domains = Vec::new();
         for (name, entry) in targets {
             let Ok((spec, root, state_dir)) = self.origin_spec_for(&name, &entry) else {
                 continue;
             };
-            let Ok(report) = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await
-            else {
+            // No provider, so nothing here could settle an owed stack link
+            // anyway; withholding the permission says so at the call rather
+            // than leaving it to be inferred from the `None` beside it.
+            let Ok(report) = ops::status(&spec, &root, &state_dir, None, false).await else {
                 continue;
             };
             let next_due = self.origin_poller.next_due_at(&name);
@@ -8836,7 +8850,9 @@ impl Engine {
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
         let (_provider, _login) = self.resolve_share_provider(&actor)?;
-        let report = ops::status(&spec, &root, &state_dir, None, stacks_allowed).await?;
+        // Probe-free, so no forge call of any kind: the settlement permission
+        // is withheld for the same reason the provider was dropped.
+        let report = ops::status(&spec, &root, &state_dir, None, false).await?;
         Ok(origin::withdraw_plan_json(
             &report,
             proposal,

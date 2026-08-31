@@ -795,19 +795,25 @@ async fn rebased_head(
 /// flags), never failing the status.
 ///
 /// The four stack fields are read off local state, with one exception: an
-/// owed stack link is settled before they are read ([`retry_stack_link`]), so
-/// a status that could pay the debt reports the healed truth rather than the
-/// debt. That needs a provider and `github.stacks` on, and it costs nothing
+/// owed stack link may be settled before they are read ([`retry_stack_link`]),
+/// so a status that could pay the debt reports the healed truth rather than the
+/// debt. That needs a provider and `settle_owed_link`, and it costs nothing
 /// when nothing is owed - the flag is tested before the capability is.
 ///
-/// `stacks_allowed` carries `github.stacks` through to that retry; nothing
-/// else in the report depends on it.
+/// `settle_owed_link` is the permission for that one settlement, and nothing
+/// else in the report depends on it: `false` reports the debt exactly as it
+/// stands, probes nothing and touches no cache, leaving whoever says yes next
+/// to pay it off. `github.stacks` is carried through it, and so is one thing
+/// this crate deliberately cannot see for itself - whether `probe` is a
+/// credential a forge WRITE may go out on. Where it is not (a read verb
+/// probing with an instance credential while shares run on somebody's personal
+/// one), the layer above passes `false` and the debt waits for a write.
 pub async fn status(
     spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
     probe: Option<&dyn Provider>,
-    stacks_allowed: bool,
+    settle_owed_link: bool,
 ) -> Result<OriginStatusReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
         RemoteError::Refused(
@@ -844,7 +850,8 @@ pub async fn status(
     // A link this machine owes the forge is settled before anything is
     // reported, so a status names the chain as it really stands rather than as
     // the last failed call left it. The debt is tested first: an origin that
-    // owes nothing never asks whether the forge serves stacks at all.
+    // owes nothing never asks whether the forge serves stacks at all. A caller
+    // that withheld its permission settles nothing and simply reports the debt.
     //
     // Nothing on this path may fail the status, the capability check included:
     // its one error is the save that caches a fresh verdict, and a status that
@@ -852,7 +859,7 @@ pub async fn status(
     if let Some(provider) = probe
         && state.stack_link_pending
     {
-        match stacks_available(provider, spec, &mut state, state_dir, stacks_allowed).await {
+        match stacks_available(provider, spec, &mut state, state_dir, settle_owed_link).await {
             Ok(true) => retry_stack_link(provider, spec, &mut state, state_dir).await,
             Ok(false) => {}
             Err(e) => {

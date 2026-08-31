@@ -6260,6 +6260,67 @@ async fn status_reports_link_pending_and_heals_it_with_a_probe() {
     assert!(!state.stack_link_pending);
 }
 
+/// Settling an owed link is a forge WRITE, so it is the caller's to permit: a
+/// status that says no reports the debt exactly as it stands and makes no
+/// stack call at all - not the settlement, not even the capability probe in
+/// front of it - and the debt is still there afterwards for a caller that says
+/// yes to pay off. The permission is the only difference between the two runs
+/// below, which is what makes this a pin on the flag rather than on the
+/// weather.
+#[tokio::test]
+async fn a_status_refused_the_permission_reports_the_owed_link_and_writes_nothing() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "the chain is degraded to begin with"
+    );
+    mock.heal_create_stack();
+
+    let before = mock.calls().len();
+    let refused = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .expect("a status should succeed");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("list_stacks")),
+        "no stack call was permitted: {delta:?}"
+    );
+    assert!(
+        refused.stack_link_pending,
+        "the debt is reported, not settled: {refused:?}"
+    );
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "and it is still owed on disk"
+    );
+
+    // The same call with the permission granted pays it off, on the same
+    // provider and the same debt.
+    let settled = stacked_status(&mock, &sub).await;
+    assert!(!settled.stack_link_pending, "{settled:?}");
+    assert!(
+        mock.calls().contains(&format!(
+            "create_stack:[{},{}]",
+            first.number, second.number
+        )),
+        "{:?}",
+        mock.calls()
+    );
+}
+
 #[tokio::test]
 async fn merging_the_top_consumes_the_whole_chain_in_one_pull() {
     let mock = MockProvider::new();

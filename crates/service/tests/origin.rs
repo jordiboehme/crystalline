@@ -1812,6 +1812,186 @@ async fn an_injected_provider_short_circuits_personal_mode_too() {
     assert_eq!(shared["outcome"], "updated", "{shared}");
 }
 
+/// A team engine over a stack-serving mock with a two-layer chain this machine
+/// still owes the forge a link for. Both layers are real shares, and the saved
+/// link is then broken by hand exactly as a failed `create_stack` leaves it -
+/// the stack number cleared, the debt recorded - which is the state a status
+/// probe would otherwise pay off. Returns the engine, the mock, the working
+/// tree root and the origin state directory.
+async fn engine_owing_a_stack_link(
+    tmp: &tempfile::TempDir,
+) -> (
+    Engine,
+    Arc<MockProvider>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let mock = Arc::new(MockProvider::new());
+    mock.enable_stacks();
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    let origins_dir = tmp.path().join("origins");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &origins_dir,
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let root = tmp.path().join("kb");
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha v2"),
+    )
+    .unwrap();
+    let first = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+    let second = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    assert!(
+        second["stack_number"].is_number(),
+        "the second layer is stacked on the first: {second}"
+    );
+
+    let state_dir = origins_dir.join("kb");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.stack_number = None;
+    state.stack_link_pending = true;
+    state.save(&state_dir).unwrap();
+    (eng, mock, root, state_dir)
+}
+
+/// The stack calls a delta of the mock's call log carries, which is what
+/// separates "the status wrote to the forge" from "the status read from it".
+fn stack_calls(delta: &[String]) -> Vec<String> {
+    delta
+        .iter()
+        .filter(|c| {
+            c.starts_with("create_stack")
+                || c.starts_with("extend_stack")
+                || c.starts_with("dissolve_stack")
+        })
+        .cloned()
+        .collect()
+}
+
+/// **A probed status in personal mode never spends the instance credential on
+/// a forge write.** Settling an owed stack link is a `create_stack` /
+/// `extend_stack`, and the provider a status probes with is the instance one,
+/// since a read verb carries no actor. Instance mode is where that is the
+/// credential every write goes out on anyway, so the settlement stays; personal
+/// mode leaves the debt standing, and the next write on the acting identity's
+/// own credential is what pays it off.
+#[tokio::test]
+async fn a_personal_mode_status_leaves_an_owed_stack_link_for_the_next_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, state_dir) = engine_owing_a_stack_link(&tmp).await;
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "personal".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let before = mock.calls().len();
+    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let delta = mock.calls().split_off(before);
+    assert!(
+        stack_calls(&delta).is_empty(),
+        "a read verb made a forge write on the instance credential: {delta:?}"
+    );
+    assert_eq!(
+        status["domains"][0]["stack_link_pending"], true,
+        "the debt is reported rather than paid: {status}"
+    );
+    assert!(
+        OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .stack_link_pending,
+        "and it is still owed on disk"
+    );
+
+    // The next write-class call settles it, on the credential the write itself
+    // goes out on - here the acting account's, through the injected provider.
+    let before = mock.calls().len();
+    std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
+    let shared = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        delta.iter().any(|c| c.starts_with("create_stack:")),
+        "the share paid the debt off: {delta:?}"
+    );
+    assert!(
+        !OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .stack_link_pending,
+        "the debt is settled"
+    );
+}
+
+/// The instance-mode half of the same rule, pinned so the fix above cannot
+/// quietly become a behavior change for the default install: with one
+/// credential doing everything, a probed status settles the owed link exactly
+/// as it always has.
+#[tokio::test]
+async fn an_instance_mode_status_still_settles_an_owed_stack_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, _root, state_dir) = engine_owing_a_stack_link(&tmp).await;
+
+    let before = mock.calls().len();
+    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let delta = mock.calls().split_off(before);
+    assert!(
+        delta.iter().any(|c| c.starts_with("create_stack:")),
+        "the probe settled the owed link: {delta:?}"
+    );
+    assert_eq!(
+        status["domains"][0]["stack_link_pending"], false,
+        "{status}"
+    );
+    assert!(
+        !OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .stack_link_pending,
+        "the debt is cleared on disk"
+    );
+}
+
 /// A 403 from the forge on a personal write is unreadable in its raw form,
 /// and the fix is not the caller's to guess: personal mode's stacks are
 /// same-repo and forks are unsupported, so collaborator access is a hard
