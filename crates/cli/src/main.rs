@@ -1675,12 +1675,14 @@ async fn run_connect(command: ConnectCommand, json: bool) -> anyhow::Result<()> 
             // that cannot address a credential is taught here rather than after
             // a browser sign-in the caller cannot get back.
             let identity = cmd::connect_identity(personal, as_account.as_deref())?;
+            let token_store_dir = cmd::test_token_store_dir();
             cmd::connect_github(
                 token.as_deref(),
                 host.as_deref(),
                 &identity,
                 disconnect,
                 config.as_deref(),
+                token_store_dir.as_deref(),
                 json,
             )
             .await

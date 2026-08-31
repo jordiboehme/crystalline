@@ -1517,16 +1517,25 @@ pub(crate) fn connect_identity(
 /// holding a token it no longer uses). The environment is untouched either way;
 /// unsetting the variable is what changes who this machine is.
 ///
-/// A daemon that already resolved that credential keeps it cached for the rest
-/// of its process life (it re-reads on an expired token, never on a deleted
-/// one), so a running daemon sees a disconnect on its next restart - stated
-/// here rather than papered over.
+/// A daemon that already resolved that credential holds it in a
+/// process-lifetime cache and never re-reads a deleted one, so a disconnect
+/// here is told to it over the control socket ([`notify_daemon_forgot`]) - a
+/// credential is forgotten because somebody wants it to stop working, and
+/// "stops working at the next restart" is the wrong answer to that. No daemon
+/// running is nothing to tell; a daemon that could not be told is said out
+/// loud rather than left to be discovered.
+///
+/// `token_store_dir` forces the credential to a plain file under that
+/// directory instead of the OS keychain, mirroring
+/// [`crystalline_service::engine::Engine::with_token_store_dir`]. Test-only:
+/// production passes `None` and a real connect writes through the keychain.
 pub async fn connect_github(
     token: Option<&str>,
     host: Option<&str>,
     identity: &crystalline_remote::TokenIdentity,
     disconnect: bool,
     config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
     json: bool,
 ) -> Result<()> {
     let instance = *identity == crystalline_remote::TokenIdentity::Instance;
@@ -1542,20 +1551,35 @@ pub async fn connect_github(
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
     let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
     let token_host = bare_host(&auth_base);
-    let state_dir = config::origins_state_dir()
-        .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
+    let state_dir = match token_store_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => config::origins_state_dir()
+            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
+    };
 
     if disconnect {
-        forget_credential(identity, token_host.as_deref(), &state_dir);
+        match token_store_dir {
+            // The seam's own disconnect: the file beside the connect it
+            // undoes, and no keychain touched on the way.
+            Some(dir) => forget_file_credential(identity, dir),
+            None => forget_credential(identity, token_host.as_deref(), &state_dir),
+        }
+        let told = notify_daemon_forgot(identity).await;
         if json {
             println!(
                 "{}",
                 serde_json::json!({
                     "disconnected": identity_label(identity),
+                    "daemon_notified": told.is_ok(),
                 })
             );
         } else {
             println!("Disconnected {}.", identity_phrase(identity));
+            if let Err(e) = told {
+                println!(
+                    "A running daemon could not be told ({e}); restart it so it stops sharing with the credential this just deleted."
+                );
+            }
         }
         return Ok(());
     }
@@ -1586,13 +1610,21 @@ pub async fn connect_github(
         user: login.clone(),
         created_at: chrono::Utc::now(),
     };
-    let store = crystalline_remote::TokenStore::save_resolving_for(
-        identity,
-        token_host.as_deref(),
-        &state_dir,
-        &stored,
-    )
-    .map_err(|e| anyhow!("{e}"))?;
+    let store = match token_store_dir {
+        Some(dir) => {
+            let store = crystalline_remote::TokenStore::file_fallback_for(identity, dir)
+                .map_err(|e| anyhow!("{e}"))?;
+            store.save(&stored).map_err(|e| anyhow!("{e}"))?;
+            store
+        }
+        None => crystalline_remote::TokenStore::save_resolving_for(
+            identity,
+            token_host.as_deref(),
+            &state_dir,
+            &stored,
+        )
+        .map_err(|e| anyhow!("{e}"))?,
+    };
 
     // A personal connect that lands on an instance-mode installation is a
     // credential nothing will use yet, so the mode is named where it is
@@ -1669,6 +1701,60 @@ pub(crate) fn forget_credential(
         }
         Err(e) => tracing::debug!("could not resolve the file credential to forget: {e}"),
     }
+}
+
+/// The directory `CRYSTALLINE_TEST_TOKEN_STORE_DIR` names, when it names one.
+///
+/// The test-only seam behind [`connect_github`]'s `token_store_dir`, needed
+/// because the CLI's own end-to-end tests drive a real child process: an
+/// in-process builder override like the engine's cannot cross that boundary,
+/// and a `connect` that reached the OS keychain would write to the
+/// developer's own login keychain and stop for its dialog. Named `TEST` for
+/// the same reason `CRYSTALLINE_TEST_POSTGRES_URL` is: it is not a knob an
+/// install is meant to set, and nothing documents it as one.
+///
+/// Redirecting where a token is written is not a privilege escalation: a
+/// process that can set this can already set `CRYSTALLINE_GITHUB_TOKEN` and
+/// decide which credential this machine acts as outright.
+pub(crate) fn test_token_store_dir() -> Option<PathBuf> {
+    std::env::var_os("CRYSTALLINE_TEST_TOKEN_STORE_DIR").map(PathBuf::from)
+}
+
+/// Deletes `identity`'s credential from the file store under `dir` and touches
+/// nothing else. The disconnect half of the token-store seam
+/// ([`connect_github`]'s `token_store_dir`): a test must not reach the
+/// developer's own keychain even to ask it whether it holds something.
+fn forget_file_credential(identity: &crystalline_remote::TokenIdentity, dir: &Path) {
+    match crystalline_remote::TokenStore::file_fallback_for(identity, dir) {
+        Ok(store) => {
+            if let Err(e) = store.delete() {
+                tracing::debug!("could not forget the file credential: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("could not resolve the file credential to forget: {e}"),
+    }
+}
+
+/// Tells a running daemon that this machine just forgot `identity`'s
+/// credential, so it drops the copy its process cache is holding.
+///
+/// `Ok(())` covers both "told" and "there is no daemon to tell", because both
+/// leave nothing behind that could still share with the deleted token. An
+/// `Err` is the one case worth a sentence: a daemon IS running and did not
+/// take the message, so it goes on holding a credential this machine no longer
+/// has until it restarts.
+async fn notify_daemon_forgot(identity: &crystalline_remote::TokenIdentity) -> Result<(), String> {
+    let account = match identity {
+        crystalline_remote::TokenIdentity::Instance => serde_json::Value::Null,
+        crystalline_remote::TokenIdentity::Personal(name) => serde_json::json!(name),
+    };
+    crystalline_service::client::ctl_if_running(serde_json::json!({
+        "cmd": "forget_credential",
+        "account": account,
+    }))
+    .await
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// The account name a credential is addressed by, for machine output:
