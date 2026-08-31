@@ -1566,16 +1566,17 @@ pub async fn connect_github(
         }
         let told = notify_daemon_forgot(identity).await;
         if json {
-            println!(
-                "{}",
-                serde_json::json!({
-                    "disconnected": identity_label(identity),
-                    "daemon_notified": told.is_ok(),
-                })
-            );
+            let mut report = serde_json::json!({
+                "disconnected": identity_label(identity),
+                "daemon": told.as_str(),
+            });
+            if let DaemonNotice::Refused(e) = &told {
+                report["daemon_error"] = serde_json::json!(e);
+            }
+            println!("{report}");
         } else {
             println!("Disconnected {}.", identity_phrase(identity));
-            if let Err(e) = told {
+            if let DaemonNotice::Refused(e) = &told {
                 println!(
                     "A running daemon could not be told ({e}); restart it so it stops sharing with the credential this just deleted."
                 );
@@ -1735,26 +1736,57 @@ fn forget_file_credential(identity: &crystalline_remote::TokenIdentity, dir: &Pa
     }
 }
 
+/// What telling a running daemon about a forgotten credential came to.
+///
+/// Three states rather than two, because two of them are only the same answer
+/// to a person. "Nothing holds the credential now" covers both a daemon that
+/// took the message and no daemon at all, and that is what the human line
+/// says by staying quiet - but a machine field named for one of them and set
+/// on both would assert something that did not happen.
+pub(crate) enum DaemonNotice {
+    /// A daemon was running and dropped its cached copy.
+    Notified,
+    /// No daemon was running, so nothing was holding a copy to drop.
+    NotRunning,
+    /// A daemon is running and did not take the message: it goes on holding a
+    /// credential this machine no longer has until it restarts.
+    Refused(String),
+}
+
+impl DaemonNotice {
+    /// The machine-readable word for this outcome.
+    fn as_str(&self) -> &'static str {
+        match self {
+            DaemonNotice::Notified => "notified",
+            DaemonNotice::NotRunning => "not_running",
+            DaemonNotice::Refused(_) => "refused",
+        }
+    }
+}
+
 /// Tells a running daemon that this machine just forgot `identity`'s
 /// credential, so it drops the copy its process cache is holding.
 ///
-/// `Ok(())` covers both "told" and "there is no daemon to tell", because both
-/// leave nothing behind that could still share with the deleted token. An
-/// `Err` is the one case worth a sentence: a daemon IS running and did not
-/// take the message, so it goes on holding a credential this machine no longer
-/// has until it restarts.
-async fn notify_daemon_forgot(identity: &crystalline_remote::TokenIdentity) -> Result<(), String> {
+/// Best effort in every direction: the credential is already gone from the
+/// store by the time this runs, and nothing here can put it back or fail the
+/// command that deleted it.
+pub(crate) async fn notify_daemon_forgot(
+    identity: &crystalline_remote::TokenIdentity,
+) -> DaemonNotice {
     let account = match identity {
         crystalline_remote::TokenIdentity::Instance => serde_json::Value::Null,
         crystalline_remote::TokenIdentity::Personal(name) => serde_json::json!(name),
     };
-    crystalline_service::client::ctl_if_running(serde_json::json!({
+    match crystalline_service::client::ctl_if_running(serde_json::json!({
         "cmd": "forget_credential",
         "account": account,
     }))
     .await
-    .map(|_| ())
-    .map_err(|e| e.to_string())
+    {
+        Ok(Some(_)) => DaemonNotice::Notified,
+        Ok(None) => DaemonNotice::NotRunning,
+        Err(e) => DaemonNotice::Refused(e.to_string()),
+    }
 }
 
 /// The account name a credential is addressed by, for machine output:
