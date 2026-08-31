@@ -2563,6 +2563,34 @@ async fn an_editor_reads_the_sync_status_they_may_share_into_in_personal_mode() 
     assert_eq!(viewer_me["can_share"], false, "{viewer_me}");
 }
 
+/// The instance-wide summary follows the same rule, and it is the half that
+/// decides whether a sharer has a way IN: the top bar's share action reads
+/// this before it draws itself, so an editor who may share and cannot read it
+/// gets the share cards on a domain's home and no button anywhere else. A
+/// viewer stays refused, and the instance arm - where the predicate is
+/// `require_admin` and an editor is refused exactly as before - is pinned by
+/// `the_sync_summary_counts_what_every_team_domain_has_to_share`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_editor_reads_the_sync_summary_the_share_action_is_drawn_from() {
+    let (fx, _mock) = serve_team_with_mock_sharing(true).await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    let resp = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &eddy)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200, "{}", resp.text().await.unwrap());
+
+    let vera = login(fx.addr, "vera", "verapw").await;
+    let refused = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &vera)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403, "a viewer is nobody's sharer");
+}
+
 /// Reading a conflict is gated WITH resolving it rather than with the plain
 /// admin reads beside it: an editor who may settle a conflict in personal mode
 /// has to be able to see the three sides first, or they would be resolving

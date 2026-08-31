@@ -733,13 +733,25 @@ pub async fn sync_status(
 /// A domain whose own status read fails does not take the summary down with
 /// it: `origin_status` collects that failure into `errors` and answers with
 /// every domain that did report.
+///
+/// Guarded by [`require_share_role`], the same predicate [`sync_status`] uses
+/// and for the same reason: this read is what the top-bar share action asks
+/// before it draws itself, so a session that may share and cannot read it is a
+/// session offered the share cards on a domain's home and no way into them
+/// from anywhere else. In `instance` mode the predicate IS `require_admin`, so
+/// nothing about that mode moves.
 #[utoipa::path(
     get,
     path = "/api/v1/sync",
     tag = "domains",
     operation_id = "get_sync_summary",
     summary = "Where every team domain on this instance stands, in counts.",
-    description = "Admin only. One instance-wide answer to `does anything \
+    description = "Admin only, or an editor when this instance shares with \
+                   personal GitHub identities (`github.share_identity` = \
+                   `personal`): this is what a share action reads before it \
+                   draws itself, so it is gated with the share verbs rather \
+                   than with the plain admin reads. One instance-wide answer \
+                   to `does anything \
                    have something to share?`: the GitHub connection plus, per \
                    team domain, its repository, when it was last checked and \
                    the counts a share action needs - unshared local changes, \
@@ -809,8 +821,10 @@ pub async fn sync_status(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or the trusted-header \
-                           identity names a disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), or the \
+                           trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -830,7 +844,7 @@ pub async fn sync_summary(
     State(state): State<RestState>,
     identity: Identity,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     // No refuse_read_only, and no connection check: see the doc comment, and
     // [`sync_status`], which makes both calls the same way.
     if !state.engine.github_enabled() {

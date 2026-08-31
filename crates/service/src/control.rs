@@ -260,6 +260,28 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // A credential the CLI just deleted from this machine's store, so this
+        // daemon stops serving the deleted token out of its process cache.
+        // `account` absent or null is this machine's own credential; a string
+        // is one person's. Nothing is deleted here - the delete already
+        // happened in the process that sent this - and nothing is refused on a
+        // read-only instance, since dropping a cached secret is not a mutation
+        // this instance serves.
+        "forget_credential" => {
+            let account = match optional_account(req, "account") {
+                Ok(account) => account,
+                Err(message) => return (envelope_err(message), false),
+            };
+            match shared.engine.forget_cached_credential(account.as_deref()) {
+                Ok(()) => (
+                    envelope_ok(json!({
+                        "forgotten": account.as_deref().unwrap_or("instance"),
+                    })),
+                    false,
+                ),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {
             let domain = req.get("domain").and_then(Value::as_str);
@@ -291,15 +313,10 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Ok(proposal) => proposal,
                 Err(message) => return (envelope_err(message), false),
             };
-            // The chosen files, when the caller named any: absent and an empty
-            // array are different answers, so an absent key stays `None` (the
-            // whole delta) rather than becoming a selection of nothing.
-            let files: Option<Vec<String>> = req.get("files").and_then(Value::as_array).map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .map(str::to_string)
-                    .collect()
-            });
+            let files = match optional_string_list(req, "files") {
+                Ok(files) => files,
+                Err(message) => return (envelope_err(message), false),
+            };
             match shared
                 .engine
                 .origin_share(
@@ -453,6 +470,52 @@ fn optional_number(req: &Value, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
+/// The account a credential verb addresses: absent or null is this machine's
+/// own credential, a string is one person's.
+///
+/// A value that is neither refuses. The absent case means "the machine's", so
+/// a number or an object read leniently would not merely be ignored - it would
+/// forget a different credential from the one the caller named, and answer ok.
+fn optional_account(req: &Value, key: &str) -> Result<Option<String>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone())),
+        Some(other) => Err(format!(
+            "invalid {key}: expected an account name, got {other}"
+        )),
+    }
+}
+
+/// The file selection a share carries, when the caller named one.
+///
+/// Absent and an empty array are different answers, so an absent key stays
+/// `None` - the whole delta - rather than becoming a selection of nothing.
+///
+/// An element that is not a string refuses the whole request instead of being
+/// dropped. Dropping it would share a DIFFERENT set of files from the one that
+/// was asked for and report success for it, which is the one outcome a
+/// selection exists to prevent; and the drop is invisible, because the layer
+/// below only ever sees the paths that survived. A path that IS a string and
+/// names nothing is a separate matter, and already answered there: the share
+/// refuses it by name.
+fn optional_string_list(req: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    format!("invalid {key}: expected an array of paths, got {item} in it")
+                })
+            })
+            .collect::<Result<Vec<String>, String>>()
+            .map(Some),
+        Some(value) => Err(format!(
+            "invalid {key}: expected an array of paths, got {value}"
+        )),
+    }
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
@@ -496,6 +559,68 @@ mod tests {
                     .contains("expected a proposal number"),
                 "{envelope}"
             );
+        }
+    }
+
+    /// Which credential a forget addresses: absent is the machine's own, so a
+    /// value read leniently would forget a different one from the one named
+    /// and report success for it.
+    #[test]
+    fn a_credential_verb_refuses_an_account_that_is_not_a_name() {
+        assert_eq!(optional_account(&json!({}), "account"), Ok(None));
+        assert_eq!(
+            optional_account(&json!({ "account": Value::Null }), "account"),
+            Ok(None),
+            "absent and null are both this machine's own"
+        );
+        assert_eq!(
+            optional_account(&json!({ "account": "alice" }), "account"),
+            Ok(Some("alice".to_string()))
+        );
+
+        for bad in [json!(7), json!(true), json!(["alice"]), json!({})] {
+            let refused = optional_account(&json!({ "account": bad }), "account")
+                .expect_err("a value that is not an account name is refused");
+            assert!(refused.starts_with("invalid account:"), "{refused}");
+        }
+    }
+
+    /// A share's file selection decides what the team is asked to review, so
+    /// an element the reader cannot make a path of refuses the request rather
+    /// than being dropped: a dropped element shares a different set of files
+    /// from the one asked for and calls it success.
+    #[test]
+    fn a_file_selection_refuses_an_element_that_is_not_a_path() {
+        assert_eq!(optional_string_list(&json!({}), "files"), Ok(None));
+        assert_eq!(
+            optional_string_list(&json!({ "files": Value::Null }), "files"),
+            Ok(None),
+            "absent and null both mean the whole delta"
+        );
+        assert_eq!(
+            optional_string_list(&json!({ "files": [] }), "files"),
+            Ok(Some(Vec::new())),
+            "an empty array is a selection of nothing, not the whole delta"
+        );
+        assert_eq!(
+            optional_string_list(&json!({ "files": ["notes/a.md", "notes/b.md"] }), "files"),
+            Ok(Some(vec![
+                "notes/a.md".to_string(),
+                "notes/b.md".to_string()
+            ]))
+        );
+
+        for bad in [
+            json!(["notes/a.md", 7]),
+            json!(["notes/a.md", null]),
+            json!([["notes/a.md"]]),
+            json!({ "path": "notes/a.md" }),
+            json!("notes/a.md"),
+        ] {
+            let refused = optional_string_list(&json!({ "files": bad }), "files")
+                .expect_err("a selection that is not a list of paths is refused");
+            assert!(refused.starts_with("invalid files:"), "{refused}");
+            assert!(refused.contains("expected an array of paths"), "{refused}");
         }
     }
 

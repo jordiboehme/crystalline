@@ -10186,6 +10186,41 @@ impl Engine {
         self.clear_pending_for(&identity);
         self.github_identity_status(account).await
     }
+
+    /// Drop every cached slot for one credential, without touching the
+    /// credential itself. `account` is `None` for this machine's own.
+    ///
+    /// This exists for the credential store's OTHER writer. `crystalline
+    /// connect github --disconnect` runs in the CLI process and deletes the
+    /// token where it lives, which a running daemon cannot notice: its cache
+    /// is a process-lifetime map ([`Engine::github_tokens`]), so it would go
+    /// on sharing with a token this machine no longer has until it was
+    /// restarted. A credential is forgotten because somebody wanted it to stop
+    /// working, so "until the next restart" is the wrong answer; the CLI tells
+    /// the daemon over the control socket and this is what it reaches.
+    ///
+    /// Every host is dropped, not the one host this process would resolve: the
+    /// cache holds a slot per identity per host, and the delete the CLI just
+    /// performed is not scoped to one either. The prefix is exact - the key
+    /// puts a unit separator after the name, and
+    /// [`crystalline_remote::valid_identity_name`] keeps that byte out of
+    /// names - so `alice` can never evict `alice2`.
+    ///
+    /// Read-only is not consulted: forgetting a cached secret is not a
+    /// mutation this instance serves, and refusing it would leave the token in
+    /// memory precisely where the instance can still write with it.
+    pub fn forget_cached_credential(&self, account: Option<&str>) -> Result<()> {
+        let identity = match account {
+            None => TokenIdentity::Instance,
+            Some(name) => personal_identity(name)?,
+        };
+        let prefix = credential_cache_key(&identity, None);
+        self.github_tokens
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&prefix));
+        Ok(())
+    }
 }
 
 /// Rank a context slice by personalized PageRank so the neighbors on the
@@ -12938,6 +12973,79 @@ mod share_actor_tests {
         assert_eq!(token.access_token, "alices-token");
     }
 
+    /// A credential the CLI deleted out from under a running daemon stops
+    /// being served the moment the daemon is told, rather than at its next
+    /// restart: the eviction is what the control socket reaches, and it drops
+    /// every host of the named identity and nobody else's.
+    ///
+    /// The delete itself happened in the other process, which is why this test
+    /// removes the file by hand: this call is the eviction alone.
+    #[tokio::test]
+    async fn a_forgotten_credential_stops_being_served_from_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal"))
+            .await
+            .with_connect_auth(Arc::new(AcceptingAuth("alice-gh")));
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+        write_token(&tokens, &personal("alice"), "alice-gh");
+        write_token(&tokens, &personal("bob"), "bob-gh");
+
+        // Warm alice on two hosts, plus bob and the machine's own.
+        engine
+            .github_credential_for(&personal("alice"), None)
+            .unwrap();
+        engine
+            .github_credential_for(&personal("alice"), Some("ghes.example"))
+            .unwrap();
+        engine
+            .github_credential_for(&personal("bob"), None)
+            .unwrap();
+        engine.github_credential(None).unwrap();
+        assert_eq!(engine.github_tokens.lock().unwrap().len(), 4);
+
+        // What `crystalline connect github --personal --disconnect` did over
+        // in the CLI process.
+        TokenStore::file_fallback_for(&personal("alice"), &tokens)
+            .unwrap()
+            .delete()
+            .unwrap();
+        engine.forget_cached_credential(Some("alice")).unwrap();
+
+        let err = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
+            .expect_err("the deleted credential must not be served from cache");
+        assert_eq!(err.to_string(), PERSONAL_TOKEN_MISSING);
+        {
+            let cache = engine.github_tokens.lock().unwrap();
+            assert!(
+                !cache.contains_key(&credential_cache_key(
+                    &personal("alice"),
+                    Some("ghes.example")
+                )),
+                "every host of that identity, not only the default one"
+            );
+            assert!(
+                cache.contains_key(&credential_cache_key(&personal("bob"), None))
+                    && cache.contains_key(&credential_cache_key(&TokenIdentity::Instance, None)),
+                "and nobody else's: re-reading them would cost a keychain prompt for nothing"
+            );
+        }
+
+        // A name that could address something other than its own credential is
+        // refused here too, rather than quietly evicting nothing.
+        assert!(engine.forget_cached_credential(Some("../x")).is_err());
+        // The machine's own, addressed by absence.
+        engine.forget_cached_credential(None).unwrap();
+        assert!(
+            !engine
+                .github_tokens
+                .lock()
+                .unwrap()
+                .contains_key(&credential_cache_key(&TokenIdentity::Instance, None))
+        );
+    }
+
     /// The gap between what the auth store allows as a name and what a
     /// credential can be addressed by is taught where it is discovered - at
     /// connect time, in words that name the fix - rather than left to surface
@@ -13172,10 +13280,17 @@ mod share_actor_tests {
     /// login rather than nobody, which is what makes a mixed-mode team's
     /// proposals read consistently.
     ///
-    /// The provider half of the resolution is what a share actually calls, so
-    /// it is what is asserted here; a test-injected provider has no credential
-    /// behind it and names nobody, which is why every mock-driven share in this
-    /// tree records a null author.
+    /// Asserted on the credential half, and the test below pins that the
+    /// provider half reads the login from exactly here. That split is not
+    /// tidiness: building the provider builds a `reqwest` client, which loads
+    /// the platform trust store - on macOS that reaches the OS keychain, the
+    /// one thing no test in this tree may touch, and it is not hypothetical.
+    /// This test used to call the provider half twice and was measured at over
+    /// four minutes (killed by the runner's slow timeout) against
+    /// milliseconds for every neighbour that resolves only the credential.
+    ///
+    /// A test-injected provider names whatever login it was given, which is
+    /// why every mock-driven share in this tree records a null author.
     #[tokio::test]
     async fn a_share_acts_as_the_login_its_credential_was_connected_as() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13184,11 +13299,11 @@ mod share_actor_tests {
         write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
         write_token(&tokens, &personal("alice"), "alice-gh");
 
-        let (_provider, login) = engine
-            .resolve_share_provider(&ShareActor::Owner)
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Owner)
             .expect("the instance credential resolves");
         assert_eq!(
-            login.as_deref(),
+            token.user_display(),
             Some("instance-gh"),
             "instance mode records the login it shares as too"
         );
@@ -13200,10 +13315,42 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let (_provider, login) = engine
-            .resolve_share_provider(&ShareActor::Account("alice".to_string()))
+        let (_api_url, token) = engine
+            .resolve_share_credential(&ShareActor::Account("alice".to_string()))
             .expect("alice's own credential");
-        assert_eq!(login.as_deref(), Some("alice-gh"), "the actor's own login");
+        assert_eq!(
+            token.user_display(),
+            Some("alice-gh"),
+            "the actor's own login"
+        );
+    }
+
+    /// And the provider half really does take its login from the credential
+    /// the test above resolves, rather than from anywhere else.
+    ///
+    /// A source pin rather than a call, for the reason that test states: the
+    /// only thing this function adds to `resolve_share_credential` is an HTTP
+    /// client whose construction reads the machine's trust store. What is left
+    /// worth checking is the wiring, and the wiring is readable.
+    #[test]
+    fn the_share_provider_takes_its_login_from_the_resolved_credential() {
+        let source = include_str!("engine.rs");
+        let start = source
+            .find("fn resolve_share_provider")
+            .expect("no resolve_share_provider");
+        let rest = &source[start..];
+        // Up to the closing brace at the function's own indentation, which no
+        // nested block can reach. Move this function to another nesting level
+        // and this slice stops being its body - so move the pattern with it.
+        let body = &rest[..rest.find("\n    }").unwrap_or(rest.len())];
+        assert!(
+            body.contains("self.resolve_share_credential(actor)?"),
+            "the provider resolves the same credential: {body}"
+        );
+        assert!(
+            body.contains("token.user_display()"),
+            "and reports the login that credential carries: {body}"
+        );
     }
 
     /// The cache key separates every identity from every other one and from the
