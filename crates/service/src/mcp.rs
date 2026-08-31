@@ -917,7 +917,9 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
-use crate::engine::{AckIntent, ConfigureAction, Engine, EngineError, ProvisionAction, ShareActor};
+use crate::engine::{
+    AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential, ProvisionAction, ShareActor,
+};
 use crate::params::*;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
@@ -1608,6 +1610,7 @@ impl McpServer {
                             // share refuses here instead of asking a question
                             // it could not honour.
                             self.share_actor(),
+                            PreviewCredential::ActingIdentity,
                         )
                         .await
                         .map_err(to_error)?;

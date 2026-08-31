@@ -735,6 +735,31 @@ pub enum ShareActor {
     HttpAgent,
 }
 
+/// Which credential a SHARE PREVIEW may compute on when the acting identity has
+/// no personal one of its own. A preview writes nothing to the forge - it pulls,
+/// detects local changes and names the layer a share would target - so the two
+/// answers differ only in what a caller wants a missing connection to mean.
+///
+/// This is a preview-only choice. The share itself always resolves the acting
+/// identity's own credential and refuses without it, in every mode and on every
+/// surface, which is what makes serving the plan a read rather than a loophole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PreviewCredential {
+    /// The share's own, or the share's own refusal. A caller about to ASK
+    /// whether to go ahead needs the answer the confirmed call would give, so a
+    /// question is never put about a share this instance would then refuse -
+    /// the MCP confirmation round (spec section 3, propose_preview's
+    /// write-class refusal probes ride along).
+    ActingIdentity,
+    /// The instance credential where the acting identity holds no personal
+    /// token: the read-scope plan of spec section 6, which is what lets a
+    /// browser show what a share would carry BEFORE the person connects. A
+    /// personal token is a read superset of the instance one - any collaborator
+    /// reads what the instance reads - so nothing here is served that the
+    /// connected answer would have hidden, and nothing is written either way.
+    ReadScopeFallback,
+}
+
 /// The fixed identity name the machine owner's personal credential is stored
 /// under - the CLI and stdio MCP have no account to be, so they share one local
 /// name rather than inventing one per machine. `crystalline connect github
@@ -796,6 +821,19 @@ fn credential_cache_key(identity: &TokenIdentity, host: Option<&str>) -> String 
         TokenIdentity::Instance => format!("i\u{1f}{host}"),
         TokenIdentity::Personal(name) => format!("p\u{1f}{name}\u{1f}{host}"),
     }
+}
+
+/// Whether a refusal is the one a share preview may compute past: personal mode
+/// with no credential on file for the acting identity.
+///
+/// Matched on the frozen text rather than on a variant of its own, because that
+/// text IS the distinguishing fact - [`PERSONAL_TOKEN_MISSING`] is produced at
+/// exactly one place ([`Engine::resolve_share_credential`]) and every other
+/// refusal a preview can meet (an unset agent identity, a name no credential can
+/// be addressed under, no instance connection at all, an unreadable store) has
+/// to keep standing for both kinds of caller.
+fn is_personal_token_missing(e: &EngineError) -> bool {
+    matches!(e, EngineError::Remote(RemoteError::Refused(text)) if text == PERSONAL_TOKEN_MISSING)
 }
 
 /// Turns a write failure on a PERSONAL credential into the teaching error that
@@ -8758,6 +8796,16 @@ impl Engine {
     /// It carries the share's own credential resolution too, `actor` and all:
     /// a preview that resolved a different identity than the share would could
     /// promise a plan this instance then refuses to perform.
+    ///
+    /// `credential` is the one place that resolution bends, and only for the
+    /// personal-token refusal (see [`PreviewCredential`]): a caller that asks
+    /// for [`PreviewCredential::ReadScopeFallback`] gets the plan computed on
+    /// the instance credential when the acting identity has connected none of
+    /// its own, which is the browser's case - the checkbox list a person picks
+    /// files in is fed by this call, so refusing it would make connecting a
+    /// hoop in front of an unknown. Every other refusal stands for both
+    /// callers, the acting login is `None` on that path (nothing personal was
+    /// resolved to name), and the share itself still refuses.
     pub async fn origin_share_preview(
         &self,
         domain: &str,
@@ -8765,6 +8813,7 @@ impl Engine {
         proposal: Option<u64>,
         files: Option<&[String]>,
         actor: ShareActor,
+        credential: PreviewCredential,
     ) -> Result<Value> {
         let stacks_allowed = {
             let config = self.config.read().unwrap();
@@ -8779,7 +8828,16 @@ impl Engine {
         let lock = self.origin_lock_registered(domain)?;
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for_domain(domain)?;
-        let (provider, login) = self.resolve_share_provider(&actor)?;
+        let (provider, login) = match self.resolve_share_provider(&actor) {
+            Ok(resolved) => resolved,
+            Err(e)
+                if credential == PreviewCredential::ReadScopeFallback
+                    && is_personal_token_missing(&e) =>
+            {
+                (self.resolve_origin_provider()?, None)
+            }
+            Err(e) => return Err(e),
+        };
         let acting = self.personal_write_login(login.as_deref());
         let plan = ops::propose_preview(
             provider.as_ref(),

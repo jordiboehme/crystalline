@@ -24,7 +24,7 @@ use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
     FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
-use crystalline_service::engine::{EngineError, ShareActor};
+use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
 use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::{Engine, EnvOverlay};
 use support::{CountingEmbedder, MockProvider, sha256_hex};
@@ -219,7 +219,14 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     );
 
     let preview_err = eng
-        .origin_share_preview("brand", None, None, None, ShareActor::Owner)
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -268,7 +275,14 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
     );
 
     let preview_err = eng
-        .origin_share_preview("brand", None, None, None, ShareActor::Owner)
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -1674,7 +1688,14 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     mock.set_branch("main", &c2);
 
     let plan = eng
-        .origin_share_preview("brand", None, None, None, ShareActor::Owner)
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
         .await
         .unwrap();
     // Nothing this domain knows is unshared. What the plan does carry is the
@@ -2219,7 +2240,14 @@ async fn origin_share_preview_names_the_action_and_changes() {
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
     let v = eng
-        .origin_share_preview("kb", None, None, None, ShareActor::Owner)
+        .origin_share_preview(
+            "kb",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
         .await
         .unwrap();
     assert_eq!(v["action"], "update");

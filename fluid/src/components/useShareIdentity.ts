@@ -22,10 +22,17 @@
  * The strictness this serves is the spec's, not a nicety: in personal mode a
  * write with no personal credential is REFUSED by the engine, with a sentence
  * naming the fix. A dialog that still offered its button would be offering a
- * refusal, so the primary action becomes the fix itself. Everything a read can
- * show still shows: a share plan needs nobody's personal credential, and hiding
- * it would make the connect a hoop in front of an unknown rather than the last
- * step before a decision.
+ * refusal, so the primary action becomes the fix itself.
+ *
+ * Everything a read can show still shows, and that is the server's behavior
+ * rather than this file's hope: `GET /domains/{domain}/sync/changes` serves the
+ * plan to a caller with no personal identity, computing it on the instance
+ * credential, because it writes nothing and a personal token reads nothing more
+ * (pinned on the wire in `rest_admin_api.rs`, "a disconnected editor previews a
+ * share and is still refused the share"). So the checkbox list is on the screen
+ * before the connect, which is what makes connecting the last step before a
+ * decision rather than a hoop in front of an unknown - while the share itself,
+ * one route down, still refuses.
  */
 
 import { useQuery } from "@tanstack/react-query";

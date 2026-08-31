@@ -52,6 +52,11 @@ struct Options {
     /// github-mode tests so nothing here dials github.com; unset means no
     /// override, which is fine for every test that never reaches a provider.
     origin_provider: Option<Arc<support::MockProvider>>,
+    /// `github.api_url`, for the one test that needs REAL credential
+    /// resolution (the injected provider above short-circuits it) and so has
+    /// to point the built client at a local stand-in rather than at
+    /// github.com.
+    github_api_url: Option<String>,
     /// Register a domain `kb` that carries a GitHub origin in the config,
     /// with the origin state a first pull would have left behind, without ever
     /// downloading one. The only way to address a team domain on an instance
@@ -86,6 +91,7 @@ async fn serve(opts: Options) -> Fixture {
         github: opts.github.then(|| GitHubConfig {
             enabled: Some(true),
             share_identity: opts.personal_identity.then(|| "personal".to_string()),
+            api_url: opts.github_api_url.clone(),
             ..GitHubConfig::default()
         }),
         ..GlobalConfig::default()
@@ -2789,6 +2795,117 @@ async fn a_personal_share_without_a_connected_identity_teaches_the_fix() {
     assert_eq!(connected.status(), 200);
 
     let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let refused = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/kb/sync/share",
+        &eddy,
+    )
+    .json(&serde_json::json!({}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(refused.status(), 422, "{}", refused.text().await.unwrap());
+    let problem: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(
+        problem["detail"],
+        "This instance shares with personal GitHub identities. Connect yours \
+         in Fluid (profile > GitHub identity) or run 'crystalline connect \
+         github --personal', then share again."
+    );
+}
+
+/// A stand-in forge for the one test that cannot use the injected provider.
+///
+/// The injection short-circuits credential resolution, which is precisely what
+/// is under test below, so the client this daemon builds has to have somewhere
+/// local to talk to. It answers the single call a preview's freshness pull
+/// makes on a branch that has not moved - the head probe, answered "not
+/// modified" - and 404s everything else, which is how the optional stacks probe
+/// degrades rather than fails. Nothing here is a forge write; the test asserts
+/// that separately, by the share still being refused.
+async fn stub_forge() -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let router = axum::Router::new().route(
+        "/repos/{owner}/{name}/git/ref/heads/{branch}",
+        axum::routing::get(|| async { axum::http::StatusCode::NOT_MODIFIED }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    format!("http://{addr}")
+}
+
+/// **An editor who has connected no GitHub identity still sees what a share
+/// would carry, and still cannot make it.** The plan is read-scope (spec
+/// section 6): it comes out of local change detection plus reads any
+/// collaborator could make, so the browser can draw its checkbox list before
+/// anybody connects - which is what makes connecting the last step before a
+/// decision rather than a hoop in front of an unknown. The share one route
+/// down is unchanged: the strict refusal, in the frozen words.
+///
+/// No injected provider here, deliberately: the injection short-circuits the
+/// credential resolution these two routes disagree about, so this runs against
+/// a real resolution and a local stand-in forge.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disconnected_editor_previews_a_share_and_is_still_refused_the_share() {
+    let fx = serve(Options {
+        github: true,
+        personal_identity: true,
+        origin_domain: true,
+        github_api_url: Some(stub_forge().await),
+        ..Options::default()
+    })
+    .await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    let connected = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/settings/github/token",
+        &admin,
+    )
+    .json(&serde_json::json!({"token": "pat-secret-123"}))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(
+        connected.status(),
+        200,
+        "the instance credential is on file"
+    );
+    write_kb_engram(
+        &fx._tmp.path().join("kb"),
+        "unshared.md",
+        "Unshared",
+        "unshared",
+    );
+
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let preview = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync/changes",
+        &eddy,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(preview.status(), 200, "{}", preview.text().await.unwrap());
+    let plan: serde_json::Value = preview.json().await.unwrap();
+    assert_eq!(plan["action"], "create", "{plan}");
+    let paths: Vec<&str> = plan["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|c| c["path"].as_str())
+        .collect();
+    assert!(
+        paths.contains(&"unshared.md"),
+        "the checkbox list is there to tick: {plan}"
+    );
+
+    // And the write it plans is still refused, in the frozen words.
     let refused = as_session(
         fx.addr,
         reqwest::Method::POST,

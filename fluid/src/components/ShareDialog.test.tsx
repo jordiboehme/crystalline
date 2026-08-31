@@ -1097,13 +1097,19 @@ describe("the share dialog", () => {
     renderApp("/d/eng");
     const dialog = await openShareDialog();
 
-    // The plan is a read, and reading needs nobody's personal credential: what
-    // a share would carry is still on the screen, which is what makes the
-    // connect worth doing rather than a hoop before an unknown.
+    // The plan endpoint really does answer a disconnected caller - it computes
+    // on the instance credential, writes nothing and reads nothing a personal
+    // token could not (pinned on the wire by
+    // `rest_admin_api.rs::a_disconnected_editor_previews_a_share_and_is_still_refused_the_share`),
+    // which is what this stub stands in for. So what a share would carry, down
+    // to the tickable file, is on the screen before anybody connects.
     expect(
       await within(dialog).findByText(/opens a new proposal/i),
     ).toBeInTheDocument();
     expect(within(dialog).getByText("notes/a.md")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/a.md" }),
+    ).toBeInTheDocument();
 
     // The primary action is the one that can actually be taken, and it leads
     // where the identity is connected.

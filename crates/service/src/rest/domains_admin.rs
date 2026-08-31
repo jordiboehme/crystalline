@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 
 use super::auth::Identity;
 use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only};
-use crate::engine::{EngineError, ShareActor};
+use crate::engine::{EngineError, PreviewCredential, ShareActor};
 
 /// The caller, when they may drive this instance's share surfaces - the status
 /// report, the preview, the share, a withdrawal, and reading or resolving a
@@ -1076,7 +1076,11 @@ pub async fn sync_now(
                    what lets a client offer somebody their own changes first. \
                    Writes nothing to the origin; refused on a \
                    read-only instance because the freshness pull writes the \
-                   working tree.",
+                   working tree. Where this instance shares with personal \
+                   GitHub identities, a caller who has connected none of \
+                   their own still gets the plan - reading it needs nobody's \
+                   personal credential - while `POST \
+                   /domains/{domain}/sync/share` refuses until they connect.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     responses(
         (
@@ -1182,6 +1186,12 @@ pub async fn share_changes_preview(
                 // hide the very files somebody is choosing between.
                 None,
                 ShareActor::Account(caller.name().to_string()),
+                // The plan is read-scope on this surface (spec section 6): an
+                // editor who has connected no GitHub identity of their own
+                // still sees what a share would carry, and finds the connect
+                // where the Share button would have been. The share itself,
+                // one route down, still refuses.
+                PreviewCredential::ReadScopeFallback,
             )
             .await?,
     ))
