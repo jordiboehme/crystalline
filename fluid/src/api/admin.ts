@@ -380,24 +380,6 @@ export interface SyncProposal {
   authorLogin: string | null;
 }
 
-/**
- * The machine OWNER's personal slot, as the status report names it in personal
- * mode.
- *
- * Never the browser's own acting identity: a share made from Fluid goes out as
- * the SESSION's identity, which `/me/github-identity` answers for. This is what
- * a CLI or a local stdio-MCP share would resolve, reported here so a client can
- * say so where that is what it is describing.
- */
-export interface OwnerIdentity {
-  /** The account the slot belongs to, the fixed local owner name. */
-  account: string;
-  /** Whether a personal credential is on file for it. */
-  connected: boolean;
-  /** The login it authenticated as, when there is one. */
-  user: string | null;
-}
-
 /** One file a pull could not merge, as the status report lists it. */
 export interface SyncConflict {
   id: string;
@@ -515,14 +497,14 @@ export interface SyncStatus {
    * drew.
    */
   shareIdentity: string | null;
-  /**
-   * The machine owner's personal slot, sent in personal mode only, or null.
-   *
-   * Read because the report carries it, and pointedly not what a browser
-   * dialog acts on: see {@link OwnerIdentity}.
-   */
-  ownerIdentity: OwnerIdentity | null;
 }
+// The report also carries `owner_identity` in personal mode - the MACHINE
+// owner's slot, what a CLI or local stdio share would resolve. It is not read
+// here on purpose: a share made from Fluid goes out as the SESSION's identity,
+// which `/me/github-identity` answers for, and no screen in this app describes
+// the owner's slot. A reader with nothing behind it is a claim to keep true
+// for nothing, so the key is ignored until a surface asks for it - at which
+// point it is five lines beside `shareIdentity`. The CLI renders it today.
 
 /** The cache key of one domain's sync status. */
 export function syncStatusKey(domain: string): readonly unknown[] {
@@ -661,25 +643,6 @@ function readProposal(value: unknown): SyncProposal | null {
   };
 }
 
-/**
- * The owner's personal slot, or null when the report carries none.
- *
- * The account is the gate: instance mode sends no block at all, and a block
- * that names no account is nothing a screen could say a sentence about.
- */
-function readOwnerIdentity(value: unknown): OwnerIdentity | null {
-  const record = asObject(value);
-  const account = asString(record?.account);
-  if (account === null) {
-    return null;
-  }
-  return {
-    account,
-    connected: record?.connected === true,
-    user: asString(record?.user),
-  };
-}
-
 /** One feedback item. A comment with no body is nothing to show. */
 function readFeedback(value: unknown): ProposalFeedback | null {
   const record = asObject(value);
@@ -761,12 +724,10 @@ function readSyncStatus(payload: unknown): SyncStatus {
     stackWedged: asNumbers(record?.stack_wedged),
     repairPending: record?.repair_pending === true,
     stackLinkPending: record?.stack_link_pending === true,
-    // Both off the connection block, where the route puts them, and both
-    // tolerant: a mode that is not a word and a slot that is not a record are
-    // "this report does not say", which every reader treats as the default
-    // mode rather than as personal.
+    // Off the connection block, where the route puts it, and tolerant: a mode
+    // that is not a word is "this report does not say", which every reader
+    // treats as the default mode rather than as personal.
     shareIdentity: asString(connection?.share_identity),
-    ownerIdentity: readOwnerIdentity(connection?.owner_identity),
   };
 }
 

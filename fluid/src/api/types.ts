@@ -937,7 +937,7 @@ export interface paths {
         };
         /**
          * Where every team domain on this instance stands, in counts.
-         * @description Admin only. One instance-wide answer to `does anything have something to share?`: the GitHub connection plus, per team domain, its repository, when it was last checked and the counts a share action needs - unshared local changes, open and declined proposals, waiting conflicts - and whether its chain of stacked proposals is healthy. A pure read, served even on a read-only instance. An instance with no GitHub connection is reported, not refused, and an instance with no team domain answers an empty list. Use `GET /domains/{domain}/sync` for one domain's full report.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`): this is what a share action reads before it draws itself, so it is gated with the share verbs rather than with the plain admin reads. One instance-wide answer to `does anything have something to share?`: the GitHub connection plus, per team domain, its repository, when it was last checked and the counts a share action needs - unshared local changes, open and declined proposals, waiting conflicts - and whether its chain of stacked proposals is healthy. A pure read, served even on a read-only instance. An instance with no GitHub connection is reported, not refused, and an instance with no team domain answers an empty list. Use `GET /domains/{domain}/sync` for one domain's full report.
          */
         get: operations["get_sync_summary"];
         put?: never;
@@ -5843,7 +5843,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;

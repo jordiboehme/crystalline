@@ -179,7 +179,9 @@ beforeEach(() => {
 });
 
 describe("the top bar's share action", () => {
-  it("offers nothing to a session that may not administer", async () => {
+  it("offers nothing to a session that may not share", async () => {
+    // An editor on the default instance mode, where sharing is the admin's:
+    // `can_share` is the server's verdict and it says no.
     serve({ "/settings/github": () => githubStatus() }, "editor");
 
     renderApp("/");
@@ -188,10 +190,45 @@ describe("the top bar's share action", () => {
     expect(
       within(await topBar()).queryByRole("button", { name: "Share changes" }),
     ).toBeNull();
-    // And the two reads behind the action never happen: both are admin-only
-    // routes, and the summary probes GitHub for every team domain at once.
+    // And the two reads behind the action never happen: one is admin-only and
+    // the other probes GitHub for every team domain at once.
     expect(requested()).not.toContain("/settings/github");
     expect(requested()).not.toContain("/sync");
+  });
+
+  /**
+   * The other half of the same rule. In personal mode an editor shares as
+   * their own identity, and the server says so on `/auth/me` - so the action
+   * is theirs, and the summary behind it answers them.
+   *
+   * The readiness probe is not: `/settings/github` is the instance's own
+   * settings and an editor is refused it, so the action must not wait on an
+   * answer that is never coming. Without this the editor had the share cards
+   * on a domain's home and no way in from anywhere else.
+   */
+  it("offers the action to an editor who may share, with no admin probe", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/auth/me": () =>
+          meResponse({
+            user: userFixture({ role: "editor" }),
+            can_share: true,
+          }),
+        "/domains": domainsResponse,
+        "/activity": () => ({ timeframe: "7d", count: 0, engrams: [] }),
+        "/sync": () => summaryResponse([summaryEntry("eng", 2)]),
+      }),
+    );
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+    expect(requested()).toContain("/sync");
+    expect(requested()).not.toContain("/settings/github");
   });
 
   it("offers nothing on an instance with GitHub switched off", async () => {

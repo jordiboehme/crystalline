@@ -422,11 +422,10 @@ describe("the admin client layer", () => {
         },
       ],
       conflictList: [],
-      // The identity keys the connection block carries on an instance that
-      // has them: a report with no block says nothing about either rather
-      // than defaulting to a mode nobody set.
+      // The identity key the connection block carries on an instance that has
+      // one: a report with no block says nothing about it rather than
+      // defaulting to a mode nobody set.
       shareIdentity: null,
-      ownerIdentity: null,
       // The four chain keys the route always sends, read out of a report that
       // sent none of them: nothing is stacked, nothing is wedged and neither
       // debt is outstanding. Quiet defaults rather than holes, because every
@@ -543,7 +542,7 @@ describe("the admin client layer", () => {
     ]);
   });
 
-  it("reads which identity this instance shares as, and the owner's slot", async () => {
+  it("reads which identity this instance shares as", async () => {
     apiMock.mockResolvedValueOnce({
       domain: "eng",
       repo: "acme/kb",
@@ -553,23 +552,19 @@ describe("the admin client layer", () => {
         user: "octo",
         token_store: "keychain",
         share_identity: "personal",
-        // The MACHINE owner's slot, which is what a CLI or stdio share
-        // resolves. Read because the report sends it; never mistaken for the
-        // browser's own acting identity, which is the session's.
+        // The MACHINE owner's slot rides along in personal mode and is
+        // deliberately not read: a share made here goes out as the SESSION's
+        // identity. An unread key must not disturb the keys that are read.
         owner_identity: { account: "owner", connected: false, user: null },
       },
     });
     const status = await fetchSyncStatus("eng");
 
     expect(status.shareIdentity).toBe("personal");
-    expect(status.ownerIdentity).toEqual({
-      account: "owner",
-      connected: false,
-      user: null,
-    });
+    expect(status).not.toHaveProperty("ownerIdentity");
   });
 
-  it("reads an instance-mode report as saying nothing about an owner slot", async () => {
+  it("reads an instance-mode report as the mode it names", async () => {
     apiMock.mockResolvedValueOnce({
       domain: "eng",
       repo: "acme/kb",
@@ -581,21 +576,19 @@ describe("the admin client layer", () => {
     const status = await fetchSyncStatus("eng");
 
     expect(status.shareIdentity).toBe("instance");
-    expect(status.ownerIdentity).toBeNull();
   });
 
-  it("reads identity keys of nonsense as no answer rather than as a mode", async () => {
+  it("reads an identity key of nonsense as no answer rather than as a mode", async () => {
     apiMock.mockResolvedValueOnce({
       repo: "acme/kb",
       connection: { share_identity: 7, owner_identity: "nonsense" },
     });
     const status = await fetchSyncStatus("eng");
 
-    // Only a word is a mode, and only a record is a slot: a screen that read
-    // either of these as `personal` would swap a working button for a connect
-    // link on an instance that never asked for one.
+    // Only a word is a mode: a screen that read this as `personal` would swap
+    // a working button for a connect link on an instance that never asked for
+    // one.
     expect(status.shareIdentity).toBeNull();
-    expect(status.ownerIdentity).toBeNull();
   });
 
   it("reads the login a proposal was shared as, where the record names one", async () => {

@@ -163,6 +163,41 @@ describe("the profile screen", () => {
     ).toBeInTheDocument();
   });
 
+  /**
+   * The half the flow's own screen cannot see: the confirmation happens in
+   * another window, so nothing tells this card it happened and the poll is
+   * what learns it. No click anywhere - the card is rendered already waiting,
+   * which is the state the server reports to a browser that reloaded mid-flow
+   * as much as to the one that started it.
+   *
+   * On the real clock, and the generous timeouts are why: the card polls every
+   * three seconds, and testing-library's waiter does not recognise vitest's
+   * fake clock (it looks for jest's), so a faked one would never be advanced
+   * by the wait and the test would hang rather than run fast. One real poll
+   * interval is the price of covering the one thing this card does that
+   * nothing else can cover for it.
+   */
+  it("polls a pending sign-in through to connected", async () => {
+    let identity: Record<string, unknown> = identityPayload({
+      pending: PENDING,
+    });
+    serveAs("editor", { "/me/github-identity": () => identity });
+    renderApp("/profile");
+
+    expect(await screen.findByText("ABCD-1234")).toBeInTheDocument();
+
+    // Confirmed in the other window.
+    identity = CONNECTED;
+
+    expect(
+      await screen.findByText(/connected as @octo/i, {}, { timeout: 8000 }),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("ABCD-1234")).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/waiting for the browser confirmation/i),
+    ).not.toBeInTheDocument();
+  }, 15000);
+
   it("surfaces a sign-in somebody else already started, in the server's words", async () => {
     serveAs("editor", {
       "/me/github-identity/connect": () => {

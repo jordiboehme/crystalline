@@ -254,9 +254,16 @@ const PROBE_STALE_MS = SYNC_SUMMARY_STALE_MS;
 function useShareAction(): ShareAction {
   const { capabilities } = useAuth();
   const admin = capabilities.canAdminister;
+  // Who the share surfaces are open to, which is not the same question as who
+  // administers the instance: `can_share` is an admin always and an editor
+  // where `github.share_identity` is `personal`, and it is the server's own
+  // verdict - the very predicate the share routes gate on - rather than a rule
+  // this side re-derives. The domain home already draws its share cards on it.
+  const sharer = capabilities.canShare;
 
   // Under the settings screen's own key, so an admin who has been there pays
-  // nothing for it here.
+  // nothing for it here. Admin-only, because the route is: an editor who may
+  // share cannot read the instance's GitHub settings and never asks.
   const connection = useQuery({
     queryKey: GITHUB_STATUS_KEY,
     queryFn: fetchGithubStatus,
@@ -266,8 +273,18 @@ function useShareAction(): ShareAction {
   // control that appears a beat late is better than one that appears and then
   // admits it was never there. Read-only rules it out on its own - a share
   // writes to the origin, and this instance refuses writes.
+  //
+  // The readiness half is asked of whichever source this session can reach.
+  // An admin has the settings probe and waits for it. An editor who may share
+  // has no such route, and `can_share` is already the answer it would give:
+  // the server only says yes where sharing is turned on and this session's
+  // role reaches it. The reads below carry their own connection verdict, and
+  // in personal mode the instance credential is not what an editor shares
+  // with anyway, so there is nothing here for a missing one to gate.
   const visible =
-    admin && !capabilities.readOnly && connection.data?.enabled === true;
+    sharer &&
+    !capabilities.readOnly &&
+    (!admin || connection.data?.enabled === true);
 
   // `useMatch` rather than `useParams`, for the reason `DomainSidebar` spells
   // out: inside a layout route the params are the layout's own, which are none.
@@ -361,9 +378,16 @@ function useShareAction(): ShareAction {
     reason:
       waiting.length > 0
         ? null
-        : summary.data === undefined
-          ? LOOKING
-          : "Nothing to share",
+        : summary.isError
+          ? // A read that failed is not a read still out: retries have been
+            // spent and nothing else is coming, so LOOKING would be a
+            // permanent lie. The server's own sentence is better than a house
+            // one - the reachable case is GitHub switched off, which says so
+            // and says where to turn it on.
+            problemDetail(summary.error)
+          : summary.data === undefined
+            ? LOOKING
+            : "Nothing to share",
     count: waiting.length > 0 ? shareBadgeCount(owned, total) : null,
     waiting:
       waiting.length > 0 ? ownedPhrase(owned, known, "unshared changes") : null,
