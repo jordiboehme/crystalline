@@ -690,7 +690,10 @@ crystalline connect github --personal
 ```
 
 *Or from Fluid, the web UI: the profile card, GitHub identity, the same short
-browser code.* Until you do, a share refuses and says exactly that, because it
+browser code. Connect on the surface you share from - the command above covers
+the machine owner's shares from the terminal and locally attached agents, the
+profile card covers your own shares from Fluid.* Until you do, a share
+refuses and says exactly that, because it
 never quietly goes out on somebody else's credential. One thing rides along with
 personal sharing: a proposal is a branch in the team's own repository and never a
 fork, so a maintainer adds you to that repository as a collaborator once. Pulling
