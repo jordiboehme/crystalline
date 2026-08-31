@@ -5,7 +5,7 @@
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! sessions, tool, configure, origin_add, origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
-//! shutdown. This is the operator channel plus the `tool` command, which
+//! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
 //! MCP handshake.

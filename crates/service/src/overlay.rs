@@ -83,6 +83,13 @@ const RESERVED_VARS: &[&str] = &[
     "CRYSTALLINE_HEARTBEAT_SECS",
     "CRYSTALLINE_STALE_SECS",
     "CRYSTALLINE_TEST_POSTGRES_URL",
+    // The CLI's token-store seam (`crystalline::cmd::test_token_store_dir`):
+    // it points a `connect github` at a plain file under a tempdir so the
+    // tests never reach this machine's keychain. Read straight from the
+    // environment in the CLI, never through the settings registry, so reserve
+    // it here or every run that uses it logs a spurious warning - the same
+    // reason the postgres line above it is here.
+    "CRYSTALLINE_TEST_TOKEN_STORE_DIR",
     // The install-channel marker (see [`crate::stub::CHANNEL_ENV`]): the mcpb
     // manifest sets it so the degraded status server can tell the Desktop
     // extension apart from a plain install. It is read straight from the

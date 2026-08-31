@@ -10209,6 +10209,12 @@ impl Engine {
     /// Read-only is not consulted: forgetting a cached secret is not a
     /// mutation this instance serves, and refusing it would leave the token in
     /// memory precisely where the instance can still write with it.
+    ///
+    /// A device flow this daemon is running for the same identity is cancelled
+    /// too, exactly as [`Engine::disconnect_github_identity`] cancels it: the
+    /// flow ends in a token being written, and a flow left running would land a
+    /// fresh credential on top of the one somebody just revoked. Narrow window,
+    /// but it is the window the whole verb exists to close.
     pub fn forget_cached_credential(&self, account: Option<&str>) -> Result<()> {
         let identity = match account {
             None => TokenIdentity::Instance,
@@ -10219,6 +10225,7 @@ impl Engine {
             .lock()
             .unwrap()
             .retain(|key, _| !key.starts_with(&prefix));
+        self.clear_pending_for(&identity);
         Ok(())
     }
 }
@@ -12825,6 +12832,81 @@ mod share_actor_tests {
         ) -> std::result::Result<String, RemoteError> {
             Ok(self.0.to_string())
         }
+    }
+
+    /// A [`ConnectAuth`] whose device flow starts and then never finishes:
+    /// enough to leave one pending flow standing for a test to cancel.
+    struct HangingAuth;
+
+    #[async_trait::async_trait]
+    impl ConnectAuth for HangingAuth {
+        async fn start_device_flow(
+            &self,
+            _auth_base: &str,
+            _client_id: &str,
+        ) -> std::result::Result<crystalline_remote::DeviceFlowStart, RemoteError> {
+            Ok(crystalline_remote::DeviceFlowStart {
+                device_code: "device".to_string(),
+                user_code: "ABCD-1234".to_string(),
+                verification_url: "https://github.test/device".to_string(),
+                expires_in_secs: 900,
+                interval_secs: 5,
+            })
+        }
+
+        async fn run_device_flow(
+            &self,
+            _auth_base: &str,
+            _client_id: &str,
+            _start: &crystalline_remote::DeviceFlowStart,
+        ) -> std::result::Result<String, RemoteError> {
+            // Never lands: the flow is still waiting on its browser half.
+            std::future::pending::<()>().await;
+            unreachable!("a pending future never resolves")
+        }
+
+        async fn validate_token(
+            &self,
+            _api_url: Option<&str>,
+            _token: &str,
+        ) -> std::result::Result<String, RemoteError> {
+            Ok("never".to_string())
+        }
+    }
+
+    /// Forgetting a credential cancels a device flow for the same identity, the
+    /// way the Fluid disconnect does. Without that, a sign-in this daemon is
+    /// running would land a fresh token on top of the credential somebody just
+    /// revoked - which is the one outcome the whole verb exists to prevent.
+    ///
+    /// Observed through the engine's own one-flow-at-a-time rule: while a flow
+    /// stands, a second identity's start is refused, so bob starting cleanly is
+    /// the proof that alice's was cancelled rather than left running.
+    #[tokio::test]
+    async fn forgetting_a_credential_cancels_a_device_flow_for_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, Some("personal"))
+            .await
+            .with_connect_auth(Arc::new(HangingAuth));
+
+        engine
+            .start_github_identity_device_flow("alice")
+            .await
+            .expect("the flow starts and stays pending");
+        assert!(
+            matches!(
+                engine.start_github_identity_device_flow("bob").await,
+                Err(EngineError::ConnectInProgress)
+            ),
+            "a standing flow is what blocks the next one"
+        );
+
+        engine.forget_cached_credential(Some("alice")).unwrap();
+
+        engine
+            .start_github_identity_device_flow("bob")
+            .await
+            .expect("alice's flow was cancelled, so the slot is free");
     }
 
     /// Connecting an identity that already had one REPLACES the credential
