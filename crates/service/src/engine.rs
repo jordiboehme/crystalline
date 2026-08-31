@@ -10210,11 +10210,13 @@ impl Engine {
     /// mutation this instance serves, and refusing it would leave the token in
     /// memory precisely where the instance can still write with it.
     ///
-    /// A device flow this daemon is running for the same identity is cancelled
-    /// too, exactly as [`Engine::disconnect_github_identity`] cancels it: the
-    /// flow ends in a token being written, and a flow left running would land a
-    /// fresh credential on top of the one somebody just revoked. Narrow window,
-    /// but it is the window the whole verb exists to close.
+    /// The pending device-flow record for the same identity is dropped too,
+    /// exactly as [`Engine::disconnect_github_identity`] drops it. That frees
+    /// the one-flow-at-a-time slot and forgets the flow's outcome; it does not
+    /// stop the spawned exchange itself, which on a later completion still
+    /// saves its token and re-fills the cache - a residue both disconnect
+    /// paths share (see plans/backlog.md), narrow because that flow was
+    /// user-initiated moments earlier.
     pub fn forget_cached_credential(&self, account: Option<&str>) -> Result<()> {
         let identity = match account {
             None => TokenIdentity::Instance,
@@ -12874,16 +12876,17 @@ mod share_actor_tests {
         }
     }
 
-    /// Forgetting a credential cancels a device flow for the same identity, the
-    /// way the Fluid disconnect does. Without that, a sign-in this daemon is
-    /// running would land a fresh token on top of the credential somebody just
-    /// revoked - which is the one outcome the whole verb exists to prevent.
+    /// Forgetting a credential drops the pending device-flow record for the
+    /// same identity, the way the Fluid disconnect does, freeing the
+    /// one-flow-at-a-time slot. The spawned exchange itself is not stopped
+    /// (see [`Engine::forget_cached_credential`]'s doc for the shared
+    /// residue); what this pins is the record's removal.
     ///
     /// Observed through the engine's own one-flow-at-a-time rule: while a flow
     /// stands, a second identity's start is refused, so bob starting cleanly is
-    /// the proof that alice's was cancelled rather than left running.
+    /// the proof that alice's record was dropped rather than left standing.
     #[tokio::test]
-    async fn forgetting_a_credential_cancels_a_device_flow_for_it() {
+    async fn forgetting_a_credential_drops_its_pending_device_flow() {
         let tmp = tempfile::tempdir().unwrap();
         let engine = credential_engine(&tmp, Some("personal"))
             .await
