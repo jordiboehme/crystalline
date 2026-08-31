@@ -265,6 +265,128 @@ fn the_ride_along_ask_names_the_pending_domains_and_stamps_the_nudge() {
     );
 }
 
+/// The sharing paragraph, duplicated here for the reason the two above it
+/// are: this is a black-box check on what the subprocess printed.
+const SHARE_NUDGE_REASON: &str = "If the work here is done, propose sharing them with share_changes so the domain owner can review them and the team's archive stays current - and wait for a yes.";
+
+/// A registered team domain under `work`, holding `files`, with an origin
+/// state whose base snapshot is empty - so everything in the root reads as
+/// work the team has not seen.
+///
+/// The state file is written by hand rather than through the library: this is
+/// a black-box test of the binary, and what it pins is that the hook finds the
+/// state exactly where `<state_dir>/origins/<domain>/state.json` puts it.
+fn write_team_domain(work: &Path, home: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+    let root = work.join(name);
+    std::fs::create_dir_all(&root).unwrap();
+    for (file, body) in files {
+        std::fs::write(root.join(file), body).unwrap();
+    }
+    let origin_dir = home
+        .join("state")
+        .join("crystalline")
+        .join("origins")
+        .join(name);
+    std::fs::create_dir_all(&origin_dir).unwrap();
+    std::fs::write(
+        origin_dir.join("state.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "repo": "acme/kb",
+            "branch": "main",
+            "base_commit": "",
+            "ref_etag": null,
+            "last_checked": null,
+            "files": {},
+            "proposals": [],
+            "history": [],
+            "conflicts": [],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    root
+}
+
+/// A session that earns the capture nudge and sits on unshared team work is
+/// asked to propose it, by name and by count. Offline throughout: no forge is
+/// reachable from this test, and the paragraph still arrives.
+#[test]
+fn the_nudge_asks_for_work_a_team_domain_has_not_shared() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    let engram = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nBody.\n";
+    let root = write_team_domain(
+        work.path(),
+        &home,
+        "eng",
+        &[
+            ("alpha.md", engram),
+            ("beta.md", engram),
+            // A regenerated listing is never a reason to share, so it is
+            // never counted.
+            ("index.md", "# eng\n\n- alpha\n"),
+        ],
+    );
+    std::fs::write(
+        &config,
+        format!(
+            "domains:\n  eng:\n    path: {}\n    origin:\n      repo: acme/kb\n",
+            root.display()
+        ),
+    )
+    .unwrap();
+    let transcript = substantial_transcript(work.path());
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(stop_payload("session-share", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        decision["reason"],
+        serde_json::Value::String(format!(
+            "{NUDGE_REASON} Also: 2 changes in the team domain eng are not yet shared. {SHARE_NUDGE_REASON}"
+        )),
+        "the listing is left out and the one domain is named"
+    );
+}
+
+/// A local domain holds no unshared work, whatever is written into it: there
+/// is nowhere to share it to, so the nudge says nothing about sharing.
+#[test]
+fn the_nudge_says_nothing_about_sharing_without_a_team_domain() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop"])
+        .write_stdin(stop_payload("session-no-share", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let decision: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(
+        decision["reason"],
+        serde_json::Value::String(NUDGE_REASON.to_string()),
+        "the capture nudge alone, byte for byte"
+    );
+}
+
 /// A domain that went pending and was later unregistered is a ghost: no sweep
 /// can reach it, so the ask must neither arm on it nor name it. The session
 /// still earns its capture nudge, the maintenance paragraph stays away, and the
