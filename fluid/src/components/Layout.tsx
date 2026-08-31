@@ -82,6 +82,7 @@ import { HelpOverlay } from "./HelpOverlay";
 import { ShareDialog } from "./ShareDialog";
 import { SharePickerDialog } from "./SharePickerDialog";
 import { ShatterGem } from "./ShatterGem";
+import { ownedPhrase, shareBadgeCount } from "./changes";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 import { BUTTON, Chip, FOCUS_RING, IconButton, Tooltip } from "./primitives";
 
@@ -183,6 +184,18 @@ interface ShareAction {
   enabled: boolean;
   /** Why it will not act, for the tooltip; null while it will. */
   reason: string | null;
+  /**
+   * How much is waiting, for the badge on the face of the button: this
+   * session's own share of it where the server said, everything waiting
+   * otherwise. Null while there is nothing to draw a number for.
+   */
+  count: number | null;
+  /**
+   * What is waiting, said in words, for the tooltip of a button that WILL act -
+   * "2 of 5 unshared changes are yours". Null when the report carried no owned
+   * count, which leaves the tooltip exactly as it always read.
+   */
+  waiting: string | null;
 }
 
 /**
@@ -199,6 +212,8 @@ const NO_SHARE: ShareAction = {
   domain: null,
   enabled: false,
   reason: null,
+  count: null,
+  waiting: null,
 };
 
 /**
@@ -299,29 +314,38 @@ function useShareAction(): ShareAction {
   // the other reasons cannot be trusted without a credential to read them.
   if (connection.data?.connected === false) {
     return {
+      ...NO_SHARE,
       visible: true,
-      domain: null,
-      enabled: false,
       reason: "Connect GitHub first",
     };
   }
   if (!instanceWide) {
-    const waiting = status.data?.localChanges ?? 0;
+    const total = status.data?.localChanges ?? 0;
+    const owned = status.data?.ownedChanges ?? null;
     return {
       visible: true,
       domain: routeDomain,
-      enabled: waiting > 0,
+      enabled: total > 0,
       reason:
-        waiting > 0
+        total > 0
           ? null
           : status.data === undefined
             ? LOOKING
             : `Nothing to share in ${routeDomain}`,
+      count: total > 0 ? shareBadgeCount(owned, total) : null,
+      waiting: total > 0 ? ownedPhrase(owned, total, "unshared changes") : null,
     };
   }
   const waiting = (summary.data?.domains ?? []).filter(
     (entry) => entry.localChanges > 0,
   );
+  const total = waiting.reduce((sum, entry) => sum + entry.localChanges, 0);
+  // Summed across the domains that answered with a number, and null when none
+  // of them did: an instance whose report says nothing about ownership must
+  // not be summed into a confident zero.
+  const owned = waiting.some((entry) => entry.ownedChanges !== null)
+    ? waiting.reduce((sum, entry) => sum + (entry.ownedChanges ?? 0), 0)
+    : null;
   return {
     visible: true,
     domain: null,
@@ -332,6 +356,9 @@ function useShareAction(): ShareAction {
         : summary.data === undefined
           ? LOOKING
           : "Nothing to share",
+    count: waiting.length > 0 ? shareBadgeCount(owned, total) : null,
+    waiting:
+      waiting.length > 0 ? ownedPhrase(owned, total, "unshared changes") : null,
   };
 }
 
@@ -661,7 +688,7 @@ function ShareChanges({
     // unmount and rebuild the button under a reader who had just focused it,
     // and below the small breakpoint the tooltip is also the only place the
     // folded-away word is drawn for a pointer.
-    <Tooltip label={share.reason ?? "Share changes"}>
+    <Tooltip label={share.reason ?? share.waiting ?? "Share changes"}>
       <button
         type="button"
         aria-label="Share changes"
@@ -675,6 +702,17 @@ function ShareChanges({
       >
         <Share2 aria-hidden="true" size={16} strokeWidth={1.75} />
         <span className="hidden sm:inline">Share</span>
+        {/*
+          How much is waiting, drawn rather than spoken: the label stays the
+          one control name a reader hears at either width, and the tooltip
+          above says the same number in words - with the pairing, where the
+          server sent one - so nothing here is only visible.
+        */}
+        {share.count !== null && (
+          <span aria-hidden="true" className="text-caption tabular-nums">
+            {share.count}
+          </span>
+        )}
       </button>
     </Tooltip>
   );

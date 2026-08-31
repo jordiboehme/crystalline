@@ -9374,6 +9374,22 @@ impl Engine {
         }))
     }
 
+    /// How many of one team domain's unshared substantive changes `account`
+    /// last wrote, by the changed file's own `generated.by` line.
+    ///
+    /// `None` for a domain with no origin state to compare against, which is
+    /// the same answer a domain with no origin gets: nothing is known to be
+    /// unshared, so nothing is known to be anybody's. Never an error - this
+    /// enriches a report, and a report survives an unreadable working tree.
+    ///
+    /// Last-writer provenance, never authorship: it says which actor wrote the
+    /// revision on disk, not who the knowledge belongs to.
+    pub async fn owned_local_changes(&self, domain: &str, account: &str) -> Option<u64> {
+        let (_spec, root, state_dir) = self.origin_spec_for_domain(domain).ok()?;
+        let work = origin::unshared_work(&root, &state_dir)?;
+        Some(work.owned_by(&root, &format!("human:{account}")))
+    }
+
     /// [`Engine::origin_connection_json`] plus the two facts a caller needs to
     /// know WHICH credential a share of theirs would go out on: the mode
     /// (`share_identity`, always) and, in personal mode, the machine owner's
@@ -9385,13 +9401,16 @@ impl Engine {
     /// instance connection, and the personal identities they care about are the
     /// SESSION's, served by `/me/github-identity`.
     ///
-    /// The slot reported is the machine OWNER's, which is what a CLI or stdio-MCP
-    /// share resolves ([`Engine::acting_identity_name`]) - not what every reader
-    /// of this status resolves. An HTTP-MCP peer calls the same status tool and
-    /// its own shares run as `github.agent_identity`, so `owner_identity` is
-    /// under-reporting for that caller rather than wrong about it; naming the
-    /// agent slot beside this one is Task 13's call, not a claim this doc gets
-    /// to make.
+    /// Two slots, because two callers resolve two different credentials.
+    /// `owner_identity` is the machine OWNER's, which is what a CLI or
+    /// stdio-MCP share resolves ([`Engine::acting_identity_name`]).
+    /// `agent_identity` is the one an HTTP-MCP peer's share runs as
+    /// (`github.agent_identity`), and it is reported on exactly the same terms:
+    /// personal mode only, and only when that setting names an account at all,
+    /// because an unset agent slot is not a connection somebody has failed to
+    /// make - it is a deployment that has no HTTP agent sharing on it. Both
+    /// carry `{ account, connected, user }`, and neither is a claim about who
+    /// the reader is: a caller reads the slot it would share on.
     ///
     /// A credential that cannot be resolved reports as not connected rather
     /// than failing the whole status read: this is a report, and every other
@@ -9404,41 +9423,64 @@ impl Engine {
     /// `crystalline connect github --personal` be seen without a restart.
     async fn origin_status_connection(&self) -> Result<Value> {
         let mut connection = self.origin_connection_json().await?;
-        let mode = self.config.read().unwrap().github_share_identity();
+        let (mode, agent) = {
+            let config = self.config.read().unwrap();
+            (
+                config.github_share_identity(),
+                config.github_agent_identity().map(str::to_string),
+            )
+        };
         connection["share_identity"] = json!(mode.as_str());
         if mode == ShareIdentityMode::Personal {
-            let (connected, user) = if self.origin_provider_override.is_some() {
-                // An injected provider IS the credential (see
-                // `origin_connection_json`); reading a token store here would
-                // reach the machine's real keychain from a test. The login is
-                // deliberately null rather than the mock's: that login belongs
-                // to the injected INSTANCE provider, and reporting it here would
-                // invent a personal connection nobody made - the one thing this
-                // block must never do, since the whole point of the field is to
-                // say whether a share can go out at all.
-                (
-                    connection["connected"].as_bool().unwrap_or(false),
-                    Value::Null,
-                )
-            } else {
-                let identity = TokenIdentity::Personal(OWNER_IDENTITY_NAME.to_string());
-                let host = self.github_token_host();
-                let token = self
-                    .github_credential_for(&identity, host.as_deref())
-                    .ok()
-                    .and_then(|(_store, token)| token);
-                (
-                    token.is_some(),
-                    json!(token.as_ref().and_then(|t| t.user_display())),
-                )
-            };
-            connection["owner_identity"] = json!({
-                "account": OWNER_IDENTITY_NAME,
-                "connected": connected,
-                "user": user,
-            });
+            connection["owner_identity"] =
+                self.personal_slot_json(OWNER_IDENTITY_NAME, &connection);
+            // Only where an HTTP agent has a slot at all: an absent
+            // `github.agent_identity` means no share ever runs as one, and a
+            // slot reported for it would read as a connection somebody forgot
+            // to make.
+            if let Some(agent) = agent.as_deref() {
+                connection["agent_identity"] = self.personal_slot_json(agent, &connection);
+            }
         }
         Ok(connection)
+    }
+
+    /// One personal identity slot for the status connection block:
+    /// `{ account, connected, user }`, read from the credential store for
+    /// `account`.
+    ///
+    /// A credential that cannot be resolved reports as not connected rather
+    /// than failing the whole status read.
+    ///
+    /// With an injected test provider the store is never touched at all -
+    /// reading it would reach the machine's real keychain from a test - and the
+    /// login is deliberately null rather than the mock's: that login belongs to
+    /// the injected INSTANCE provider, and reporting it here would invent a
+    /// personal connection nobody made, the one thing this must never do, since
+    /// the whole point of the slot is to say whether a share can go out at all.
+    fn personal_slot_json(&self, account: &str, connection: &Value) -> Value {
+        let (connected, user) = if self.origin_provider_override.is_some() {
+            (
+                connection["connected"].as_bool().unwrap_or(false),
+                Value::Null,
+            )
+        } else {
+            let identity = TokenIdentity::Personal(account.to_string());
+            let host = self.github_token_host();
+            let token = self
+                .github_credential_for(&identity, host.as_deref())
+                .ok()
+                .and_then(|(_store, token)| token);
+            (
+                token.is_some(),
+                json!(token.as_ref().and_then(|t| t.user_display())),
+            )
+        };
+        json!({
+            "account": account,
+            "connected": connected,
+            "user": user,
+        })
     }
 
     /// The INSTANCE GitHub token store for `host` and the token it holds -
@@ -13245,6 +13287,85 @@ mod share_actor_tests {
         let status = engine.origin_status(None).await.unwrap();
         assert_eq!(status["connection"]["owner_identity"]["connected"], true);
         assert_eq!(status["connection"]["owner_identity"]["user"], "owner-gh");
+    }
+
+    /// The agent slot rides beside the owner's, on the same terms: personal
+    /// mode only, and only where `github.agent_identity` names an account -
+    /// which is what lets an operator running an HTTP agent see whether the
+    /// bot's own shares can go out, instead of reading the owner's slot and
+    /// drawing the wrong conclusion from it.
+    #[tokio::test]
+    async fn origin_status_names_the_agent_identity_where_one_is_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, None).await;
+        let tokens = tmp.path().join("tokens");
+        write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.agent_identity".to_string(),
+                value: "share-bot".to_string(),
+            })
+            .await
+            .unwrap();
+
+        // Instance mode has no personal slot in play at all, agent or owner.
+        let status = engine.origin_status(None).await.unwrap();
+        assert!(
+            status["connection"].get("agent_identity").is_none(),
+            "instance mode reports no personal slot: {status}"
+        );
+
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.share_identity".to_string(),
+                value: "personal".to_string(),
+            })
+            .await
+            .unwrap();
+        let status = engine.origin_status(None).await.unwrap();
+        let agent = &status["connection"]["agent_identity"];
+        assert_eq!(agent["account"], "share-bot");
+        assert_eq!(agent["connected"], false, "nothing is on file for it yet");
+        assert!(
+            status["connection"]["owner_identity"]["account"].is_string(),
+            "the owner's slot is untouched beside it: {status}"
+        );
+
+        write_token(&tokens, &personal("share-bot"), "bot-gh");
+        let status = engine.origin_status(None).await.unwrap();
+        assert_eq!(status["connection"]["agent_identity"]["connected"], true);
+        assert_eq!(status["connection"]["agent_identity"]["user"], "bot-gh");
+        assert_eq!(
+            status["connection"]["owner_identity"]["connected"], false,
+            "the bot's credential is not the owner's: {status}"
+        );
+    }
+
+    /// No agent slot where the setting names nobody: an absent
+    /// `github.agent_identity` is a deployment with no HTTP agent sharing on
+    /// it, not a connection somebody forgot to make.
+    #[tokio::test]
+    async fn origin_status_reports_no_agent_slot_when_none_is_configured() {
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = credential_engine(&tmp, None).await;
+        write_token(
+            &tmp.path().join("tokens"),
+            &TokenIdentity::Instance,
+            "instance-gh",
+        );
+        engine
+            .configure(&ConfigureAction::Set {
+                key: "github.share_identity".to_string(),
+                value: "personal".to_string(),
+            })
+            .await
+            .unwrap();
+
+        let status = engine.origin_status(None).await.unwrap();
+        assert!(
+            status["connection"].get("agent_identity").is_none(),
+            "{status}"
+        );
     }
 
     /// Instance-token failures keep today's texts (spec section 8), and any

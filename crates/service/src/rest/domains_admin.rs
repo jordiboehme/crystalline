@@ -39,6 +39,38 @@ fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, 
     identity.may_share(state.engine.share_identity_mode())
 }
 
+/// The account a request is being served as, or `None` for the anonymous
+/// viewer, which has no account to attribute anybody's work to.
+///
+/// The gate on `owned_changes`: without a session account there is no question
+/// to answer, and the routes send `null` rather than a zero that would read as
+/// "none of this is yours".
+fn session_account(caller: &Caller) -> Option<&str> {
+    match caller {
+        Caller::Account(user) => Some(user.name.as_str()),
+        Caller::Anonymous => None,
+    }
+}
+
+/// How many of one team domain's unshared substantive changes this session's
+/// account last wrote, as a JSON number, or `null` when nobody can be asked
+/// about: no session account, or a domain whose origin state cannot be read.
+///
+/// Costs one walk of the domain root, the same walk the status read beside it
+/// already performed. Deliberate: the alternative is threading a change list
+/// out through an aggregate report that carries counts on purpose.
+async fn owned_changes(state: &RestState, domain: &str, caller: &Caller) -> Value {
+    let Some(account) = session_account(caller) else {
+        return Value::Null;
+    };
+    state
+        .engine
+        .owned_local_changes(domain, account)
+        .await
+        .map(Value::from)
+        .unwrap_or(Value::Null)
+}
+
 /// What `POST /domains` takes: a mode and whatever that mode needs.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
 #[schema(description = "A domain to register. `mode` picks which of the three \
@@ -543,7 +575,14 @@ fn single_domain(
                            counting real work only: a refreshed folder listing \
                            (`index.md`) is derived from the engrams beside it \
                            and rides along with a share without ever being the \
-                           reason for one; \
+                           reason for one. `owned_changes` counts how many of \
+                           those changes THIS session's account last wrote, by \
+                           the changed file's own `generated.by` line - \
+                           last-writer provenance, never authorship - so a \
+                           surface can say `2 of 5 unshared changes are \
+                           yours`. It is null when the request carries no \
+                           session account or the domain's origin state cannot \
+                           be read, which is a different thing from zero; \
                            `probe_error` is set when the live check could not \
                            reach GitHub and the rest of the report came from \
                            local state alone; `connection.connected` is false \
@@ -584,6 +623,7 @@ fn single_domain(
                 "base_commit": "9f3c1a2",
                 "behind": false,
                 "local_changes": 2,
+                "owned_changes": 1,
                 "open_proposals": [],
                 "declined_proposals": [],
                 "merged_unconsumed": [],
@@ -637,7 +677,7 @@ pub async fn sync_status(
 ) -> Result<Json<Value>, ApiError> {
     // The share verbs' own gate: whoever may share reads the report they would
     // be sharing into. See the doc comment.
-    require_share_role(&state, &identity)?;
+    let caller = require_share_role(&state, &identity)?;
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
@@ -651,6 +691,13 @@ pub async fn sync_status(
     // this surface's own, since a client that sees a sync card has to know
     // which kind of origin it is looking at.
     report.insert("mode".to_string(), Value::from("github"));
+    // How much of the waiting work is this session's own, so a share surface
+    // can say "2 of 5 unshared changes are yours" rather than only how much is
+    // waiting. Always present, `null` when nobody can be asked about.
+    report.insert(
+        "owned_changes".to_string(),
+        owned_changes(&state, &domain, &caller).await,
+    );
     // The connection rides along so a card can say WHY a degraded report is
     // degraded: `connected: false` is "connect GitHub", while a set
     // `probe_error` on a connected instance is "could not reach it".
@@ -710,8 +757,12 @@ pub async fn sync_status(
                            failed. `local_changes` is the unshared-work count \
                            a share action shows as pending, real work only: a \
                            refreshed folder listing (`index.md`) rides along \
-                           with a share and never makes one worth offering; \
-                           `open_proposals`, `declined_proposals` and \
+                           with a share and never makes one worth offering. \
+                           `owned_changes` is how many of that domain's \
+                           changes this session's account last wrote, by the \
+                           file's own `generated.by` line, or null when there \
+                           is nobody to ask about - the pairing a picker row \
+                           draws. `open_proposals`, `declined_proposals` and \
                            `conflicts` are counts here rather than the \
                            records the per-domain route returns. `errors` \
                            holds one entry per domain that could not be read \
@@ -742,6 +793,7 @@ pub async fn sync_status(
                     "declined_proposals": 0,
                     "conflicts": 0,
                     "local_changes": 2,
+                    "owned_changes": 1,
                     "stack_wedged": [],
                     "repair_pending": false,
                     "stack_link_pending": false
@@ -778,18 +830,29 @@ pub async fn sync_summary(
     State(state): State<RestState>,
     identity: Identity,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     // No refuse_read_only, and no connection check: see the doc comment, and
     // [`sync_status`], which makes both calls the same way.
     if !state.engine.github_enabled() {
         return Err(github_off_conflict());
     }
     let aggregate = state.engine.origin_status(None).await?;
-    let domains: Vec<Value> = aggregate
+    let mut domains: Vec<Value> = Vec::new();
+    for entry in aggregate
         .get("domains")
         .and_then(Value::as_array)
-        .map(|domains| domains.iter().map(summarize_origin_domain).collect())
-        .unwrap_or_default();
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        // Per row rather than per request: the picker offers one domain at a
+        // time, so the count that decides which row a reader recognizes as
+        // their own has to be that domain's.
+        let owned = match entry.get("domain").and_then(Value::as_str) {
+            Some(domain) => owned_changes(&state, domain, &caller).await,
+            None => Value::Null,
+        };
+        domains.push(summarize_origin_domain(entry, owned));
+    }
     Ok(Json(serde_json::json!({
         "connection": aggregate.get("connection").cloned().unwrap_or(Value::Null),
         "domains": domains,
@@ -822,7 +885,7 @@ pub async fn sync_summary(
 /// call that probes, degrades offline and collects per-domain failures, and
 /// re-implementing it here to keep a struct would be a second copy of exactly
 /// the part worth having only once.
-fn summarize_origin_domain(entry: &Value) -> Value {
+fn summarize_origin_domain(entry: &Value, owned: Value) -> Value {
     let field = |key: &str| entry.get(key).cloned().unwrap_or(Value::Null);
     let count = |key: &str| {
         entry
@@ -843,6 +906,10 @@ fn summarize_origin_domain(entry: &Value) -> Value {
         "declined_proposals": count("declined_proposals"),
         "conflicts": count("conflicts"),
         "local_changes": field("local_changes"),
+        // Not the engine's, but the route's own, computed for the session that
+        // asked: how much of this domain's waiting work that account last
+        // wrote. Null when there is nobody to ask about.
+        "owned_changes": owned,
         // Whole lists rather than counts, exactly as the engine reports them:
         // a wedged layer is named by number because that number is what the
         // caller withdraws or reopens.
@@ -1824,6 +1891,37 @@ mod tests {
         let err = require_absent(&Some("acme/kb".to_string()), "repo", "local").unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err.detail.contains("repo"), "{}", err.detail);
+    }
+
+    /// A summary row carries the owned count exactly as the route computed it,
+    /// null included: "nobody to ask about" is a different sentence from "none
+    /// of this is yours", and a row that folded the two would let a picker say
+    /// the second when it means the first.
+    #[test]
+    fn a_summary_row_carries_the_owned_count_or_says_it_does_not_know() {
+        let entry = serde_json::json!({
+            "domain": "eng",
+            "repo": "acme/kb",
+            "local_changes": 5,
+            "open_proposals": [{ "number": 1 }],
+        });
+        let row = summarize_origin_domain(&entry, Value::from(2u64));
+        assert_eq!(row["local_changes"], 5);
+        assert_eq!(row["owned_changes"], 2);
+        assert_eq!(row["open_proposals"], 1, "records become counts");
+
+        let unknown = summarize_origin_domain(&entry, Value::Null);
+        assert!(
+            unknown["owned_changes"].is_null(),
+            "the key is present and null: {unknown}"
+        );
+    }
+
+    /// The anonymous viewer has no account, so there is nothing to attribute
+    /// the waiting work to.
+    #[test]
+    fn the_anonymous_viewer_has_no_session_account() {
+        assert_eq!(session_account(&Caller::Anonymous), None);
     }
 
     /// The aggregate the origin verbs answer with is flattened to the one

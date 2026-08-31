@@ -1247,6 +1247,83 @@ async fn the_sync_summary_counts_what_every_team_domain_has_to_share() {
     }
 }
 
+/// How much of the waiting work is the session's own, on both share surfaces.
+///
+/// Three files sit unshared: one the session's account last wrote, one another
+/// account wrote and one nobody is named for. The per-domain report and the
+/// summary row both answer the same pairing, because the two surfaces draw the
+/// same sentence ("2 of 5 unshared changes are yours") and disagreeing would
+/// make the picker and the button contradict each other. A generated listing
+/// counts in neither number.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sync_surfaces_count_the_unshared_work_this_session_wrote() {
+    let (fx, _mock) = serve_team_with_mock().await;
+    let admin = login(fx.addr, "root", "rootpw").await;
+    register_kb(&fx, &admin).await;
+    let kb_root = fx._tmp.path().join("domains-root").join("kb");
+
+    let engram = |title: &str, permalink: &str, actor: Option<&str>| {
+        let generated = match actor {
+            Some(actor) => {
+                format!("generated: {{ by: {actor}, at: 2026-08-29T09:00:00+00:00 }}\n")
+            }
+            None => String::new(),
+        };
+        format!(
+            "---\ntype: engram\ntitle: {title}\npermalink: {permalink}\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-01\n{generated}---\n\nBody.\n"
+        )
+    };
+    std::fs::write(
+        kb_root.join("mine.md"),
+        engram("Mine", "mine", Some("human:root")),
+    )
+    .unwrap();
+    std::fs::write(
+        kb_root.join("theirs.md"),
+        engram("Theirs", "theirs", Some("human:eddy")),
+    )
+    .unwrap();
+    std::fs::write(
+        kb_root.join("nobodys.md"),
+        engram("Nobodys", "nobodys", None),
+    )
+    .unwrap();
+    // A regenerated listing is never work, so it counts in neither number.
+    std::fs::write(kb_root.join("index.md"), "# kb\n\n- mine\n").unwrap();
+
+    let status = as_session(
+        fx.addr,
+        reqwest::Method::GET,
+        "/api/v1/domains/kb/sync",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(status.status(), 200, "{}", status.text().await.unwrap());
+    let status: serde_json::Value = status.json().await.unwrap();
+    assert_eq!(
+        status["local_changes"], 3,
+        "three files of real work, the listing left out: {status}"
+    );
+    assert_eq!(
+        status["owned_changes"], 1,
+        "only the file this account last wrote is theirs: {status}"
+    );
+
+    let summary = as_session(fx.addr, reqwest::Method::GET, "/api/v1/sync", &admin)
+        .send()
+        .await
+        .unwrap();
+    let summary: serde_json::Value = summary.json().await.unwrap();
+    let kb = &summary["domains"][0];
+    assert_eq!(kb["local_changes"], 3, "{kb}");
+    assert_eq!(
+        kb["owned_changes"], 1,
+        "the picker row draws the same pairing the button does: {kb}"
+    );
+}
+
 /// The summary row's chain health, against a chain that really is wedged.
 ///
 /// The test above pins the quiet values a sound chain produces, which cannot

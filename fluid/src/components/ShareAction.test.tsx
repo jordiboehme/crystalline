@@ -440,6 +440,118 @@ describe("the top bar's share action", () => {
     ).toBeVisible();
   });
 
+  it("counts what is yours on the button, and says the pairing in words", async () => {
+    serve({
+      "/settings/github": () => githubStatus(),
+      "/domains/eng/sync": () =>
+        syncResponse({ local_changes: 5, owned_changes: 2 }),
+      ...domainScreenRoutes("eng"),
+    });
+
+    renderApp("/d/eng");
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+
+    // The badge is this reader's own work where there is any: it is what they
+    // would be sharing, and the total is one hover away.
+    await waitFor(() => {
+      expect(action).toHaveTextContent("2");
+    });
+    await userEvent.hover(action);
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("2 of 5 unshared changes are yours");
+  });
+
+  it("falls back to everything waiting when none of it is yours", async () => {
+    serve({
+      "/settings/github": () => githubStatus(),
+      "/domains/eng/sync": () =>
+        syncResponse({ local_changes: 5, owned_changes: 0 }),
+      ...domainScreenRoutes("eng"),
+    });
+
+    renderApp("/d/eng");
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+
+    // A `0` badge beside a live share action would read as nothing to share,
+    // so the badge is how much is waiting - and the tooltip still says whose.
+    await waitFor(() => {
+      expect(action).toHaveTextContent("5");
+    });
+    await userEvent.hover(action);
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("0 of 5 unshared changes are yours");
+  });
+
+  it("says only what it knows when the report names no owner", async () => {
+    serve({
+      "/settings/github": () => githubStatus(),
+      // No owned count at all, which is every report an older server sends.
+      "/domains/eng/sync": () => syncResponse({ local_changes: 3 }),
+      ...domainScreenRoutes("eng"),
+    });
+
+    renderApp("/d/eng");
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+
+    await waitFor(() => {
+      expect(action).toHaveTextContent("3");
+    });
+    await userEvent.hover(action);
+    const tip = await screen.findByRole("tooltip", {}, { timeout: 2000 });
+    expect(tip).toHaveTextContent("Share changes");
+    expect(tip).not.toHaveTextContent("yours");
+  });
+
+  it("pairs each picker row's own work with its total", async () => {
+    serve({
+      "/settings/github": () => githubStatus(),
+      "/sync": () =>
+        summaryResponse([
+          summaryEntry("eng", 5, { owned_changes: 2 }),
+          summaryEntry("ops", 3),
+        ]),
+    });
+
+    renderApp("/");
+    await screen.findByRole("heading", { name: "Home" });
+    const action = await shareAction();
+    await waitFor(() => {
+      expect(action).toHaveAttribute("aria-disabled", "false");
+    });
+    // Summed across the domains that answered: two of the eight waiting
+    // changes are this reader's.
+    await waitFor(() => {
+      expect(action).toHaveTextContent("2");
+    });
+
+    await userEvent.click(action);
+    const picker = await screen.findByRole("dialog", {
+      name: "Share from a domain",
+    });
+    expect(within(picker).getByText("2 yours")).toBeVisible();
+    // Spoken as the same pairing, and the row that carries no owned count
+    // still reads exactly as it always did.
+    expect(
+      within(picker).getByRole("button", {
+        name: "eng - 5 pending changes, 2 yours",
+      }),
+    ).toBeVisible();
+    expect(
+      within(picker).getByRole("button", { name: "ops - 3 pending changes" }),
+    ).toBeVisible();
+  });
+
   it("has nothing to offer when no domain anywhere is holding work", async () => {
     serve({
       "/settings/github": () => githubStatus(),

@@ -413,6 +413,18 @@ export interface SyncStatus {
   lastChecked: string | null;
   /** Unshared local work, as a count. */
   localChanges: number;
+  /**
+   * How much of that work this session's own account last wrote, or null when
+   * the report did not say - an older server, a request with no session
+   * account, a domain whose origin state could not be read.
+   *
+   * Null and zero are different sentences and are kept apart on purpose: zero
+   * is "none of this is yours", which a surface can say out loud, while null is
+   * "nobody was asked", which it must not turn into either answer. Last-writer
+   * provenance rather than authorship: it counts the files this account wrote
+   * the current revision of.
+   */
+  ownedChanges: number | null;
   /** Proposals still open on the origin, as a count. */
   openProposals: number;
   /** Proposals the team turned down, as a count. */
@@ -545,6 +557,12 @@ export interface SyncSummaryEntry {
   domain: string;
   /** Unshared local work, as a count. */
   localChanges: number;
+  /**
+   * How much of it this session's account last wrote, or null when the report
+   * did not say. The pairing a picker row draws, for the reason
+   * {@link SyncStatus.ownedChanges} spells out.
+   */
+  ownedChanges: number | null;
   openProposals: number;
   declinedProposals: number;
   conflicts: number;
@@ -712,6 +730,10 @@ function readSyncStatus(payload: unknown): SyncStatus {
     branch: asString(record?.branch),
     lastChecked: asString(record?.last_checked),
     localChanges: asCount(record?.local_changes),
+    // A number or nothing, never a count of a list: this is the one field
+    // here that is genuinely absent on an older report, and asNumber keeps
+    // "did not say" apart from "none of it is yours".
+    ownedChanges: asNumber(record?.owned_changes),
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
     conflicts: asCount(record?.conflicts),
@@ -771,6 +793,7 @@ function readSummaryEntry(value: unknown): SyncSummaryEntry | null {
   return {
     domain,
     localChanges: asCount(record?.local_changes),
+    ownedChanges: asNumber(record?.owned_changes),
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
     conflicts: asCount(record?.conflicts),

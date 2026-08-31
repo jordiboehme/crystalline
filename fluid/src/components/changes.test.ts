@@ -12,7 +12,13 @@
 import { describe, expect, it } from "vitest";
 
 import type { ShareChange } from "../api/admin";
-import { isFolderIndex, preselect, ridingIndexes } from "./changes";
+import {
+  isFolderIndex,
+  ownedPhrase,
+  preselect,
+  ridingIndexes,
+  shareBadgeCount,
+} from "./changes";
 
 /** One change, with the author the plan named for it. */
 function change(
@@ -106,5 +112,29 @@ describe("preselection", () => {
     const preset = preselect(changes, "ada");
     expect(preset.paths).toEqual(["notes/a.md", "notes/b.md"]);
     expect(preset.hint).toBeNull();
+  });
+});
+
+describe("the owned share of what is waiting", () => {
+  it("draws this account's own count where there is one", () => {
+    expect(shareBadgeCount(2, 5)).toBe(2);
+    // None of it is this account's, so the badge is back to how much is
+    // waiting: a zero badge would read as "nothing to share" on a button
+    // that is about to open a dialog full of changes.
+    expect(shareBadgeCount(0, 5)).toBe(5);
+    // The server did not say, which is the shape every older report has.
+    expect(shareBadgeCount(null, 5)).toBe(5);
+  });
+
+  it("says how much of the waiting work is yours, or nothing at all", () => {
+    expect(ownedPhrase(2, 5, "unshared changes")).toBe(
+      "2 of 5 unshared changes are yours",
+    );
+    expect(ownedPhrase(0, 3, "pending changes")).toBe(
+      "0 of 3 pending changes are yours",
+    );
+    // Null is "this report does not say", which is not a sentence anybody
+    // can be shown: the surfaces fall back to what they always said.
+    expect(ownedPhrase(null, 5, "unshared changes")).toBeNull();
   });
 });

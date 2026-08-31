@@ -373,6 +373,9 @@ describe("the admin client layer", () => {
       branch: "main",
       lastChecked: "2026-08-10T08:00:00Z",
       localChanges: 2,
+      // The report said nothing about whose work it is, which is not the same
+      // as saying none of it is this account's.
+      ownedChanges: null,
       openProposals: 2,
       // Nothing declined and nothing conflicting is nothing to count: a report
       // that leaves the keys out says zero rather than "unknown".
@@ -490,6 +493,54 @@ describe("the admin client layer", () => {
 
     expect(status.mode).toBe("github");
     expect(status.connected).toBe(true);
+  });
+
+  it("reads how much of the waiting work is this session's own", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      local_changes: 5,
+      owned_changes: 2,
+      open_proposals: [],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.localChanges).toBe(5);
+    expect(status.ownedChanges).toBe(2);
+
+    // Zero is an answer and stays one; a non-number is not an answer at all,
+    // and folding it to zero would tell a reader none of the waiting work is
+    // theirs on the word of a report that never said so.
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      local_changes: 5,
+      owned_changes: 0,
+      open_proposals: [],
+    });
+    expect((await fetchSyncStatus("eng")).ownedChanges).toBe(0);
+
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      local_changes: 5,
+      owned_changes: "two",
+      open_proposals: [],
+    });
+    expect((await fetchSyncStatus("eng")).ownedChanges).toBeNull();
+  });
+
+  it("reads the owned count on a summary row the same way", async () => {
+    apiMock.mockResolvedValueOnce({
+      domains: [
+        { domain: "eng", local_changes: 5, owned_changes: 2 },
+        { domain: "ops", local_changes: 3 },
+      ],
+    });
+    const summary = await fetchSyncSummary();
+
+    expect(summary.domains.map((entry) => entry.ownedChanges)).toEqual([
+      2,
+      null,
+    ]);
   });
 
   it("reads which identity this instance shares as, and the owner's slot", async () => {
@@ -760,6 +811,7 @@ describe("the admin client layer", () => {
         {
           domain: "eng",
           localChanges: 2,
+          ownedChanges: null,
           openProposals: 1,
           declinedProposals: 0,
           conflicts: 0,
@@ -791,6 +843,7 @@ describe("the admin client layer", () => {
       {
         domain: "eng",
         localChanges: 0,
+        ownedChanges: null,
         openProposals: 0,
         declinedProposals: 0,
         conflicts: 0,

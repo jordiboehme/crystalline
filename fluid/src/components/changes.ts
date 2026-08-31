@@ -66,6 +66,40 @@ export function ridingIndexes(
   ).length;
 }
 
+/**
+ * The number a share surface draws for one domain's waiting work: this
+ * account's own share of it where there is any, and everything waiting
+ * otherwise.
+ *
+ * Zero owned falls back to the total rather than drawing a nought, because a
+ * button showing `0` beside a live share action reads as "nothing to share"
+ * while a dialog full of somebody else's changes waits behind it. A null owned
+ * count is the same fallback for a different reason: the report did not say.
+ */
+export function shareBadgeCount(owned: number | null, total: number): number {
+  return owned !== null && owned > 0 ? owned : total;
+}
+
+/**
+ * How much of what is waiting this account last wrote, said in words, or null
+ * when the report carried no owned count to say it from.
+ *
+ * Last-writer provenance rather than authorship, exactly as the server means
+ * it: it says which files this account wrote the current revision of, and the
+ * surfaces keep the sentence short enough that the pairing - mine, and all of
+ * it - is what a reader takes away.
+ */
+export function ownedPhrase(
+  owned: number | null,
+  total: number,
+  noun: string,
+): string | null {
+  if (owned === null) {
+    return null;
+  }
+  return `${String(owned)} of ${String(total)} ${noun} are yours`;
+}
+
 /** The OKF actor a person writing through this instance is recorded as. */
 function actorFor(account: string | null): string | null {
   return account === null || account === "" ? null : `human:${account}`;

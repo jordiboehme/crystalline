@@ -4247,7 +4247,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and rides along with a share without ever being the reason for one; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
+             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and rides along with a share without ever being the reason for one. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
              *
              *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
              */
@@ -4274,6 +4274,7 @@ export interface operations {
                      *       "merged_unconsumed": [],
                      *       "mode": "github",
                      *       "open_proposals": [],
+                     *       "owned_changes": 1,
                      *       "probe_error": null,
                      *       "repair_pending": false,
                      *       "repo": "acme/knowledge",
@@ -5794,7 +5795,7 @@ export interface operations {
         requestBody?: never;
         responses: {
             /**
-             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) rides along with a share and never makes one worth offering; `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) rides along with a share and never makes one worth offering. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
              *
              *     Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
              */
@@ -5820,6 +5821,7 @@ export interface operations {
                      *           "local_changes": 2,
                      *           "mode": "github",
                      *           "open_proposals": 1,
+                     *           "owned_changes": 1,
                      *           "repair_pending": false,
                      *           "repo": "acme/knowledge",
                      *           "stack_link_pending": false,

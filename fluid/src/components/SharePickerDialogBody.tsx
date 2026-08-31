@@ -61,10 +61,32 @@ function chainBadge(entry: SyncSummaryEntry): string | null {
   return entry.stackLinkPending ? "stack link pending" : null;
 }
 
-/** The whole row said as one line, which is what a row is called. */
-function rowLabel(domain: string, count: number, badge: string | null): string {
+/**
+ * How much of this domain's waiting work the reader last wrote, as a chip
+ * beside the name, or null when the report did not say or none of it is
+ * theirs.
+ *
+ * Nought is drawn as nothing rather than as "0 yours": the row already says
+ * how much is waiting, and a chip whose only content is a zero adds a glyph
+ * without adding a fact. The spoken row still carries the pairing.
+ */
+function ownedChip(entry: SyncSummaryEntry): string | null {
+  const owned = entry.ownedChanges;
+  return owned !== null && owned > 0 ? `${String(owned)} yours` : null;
+}
+
+/**
+ * The whole row said as one line, which is what a row is called.
+ *
+ * The pairing rides here in full - "eng - 5 pending changes, 2 of 5 pending
+ * changes are yours" would repeat itself, so the count is said once and the
+ * reader's own share follows it.
+ */
+function rowLabel(entry: SyncSummaryEntry, badge: string | null): string {
   const chain = badge === null ? "" : `, ${badge}`;
-  return `${domain} - ${pendingChanges(count)}${chain}`;
+  const owned =
+    entry.ownedChanges === null ? "" : `, ${String(entry.ownedChanges)} yours`;
+  return `${entry.domain} - ${pendingChanges(entry.localChanges)}${owned}${chain}`;
 }
 
 export default function SharePickerDialogBody({
@@ -110,6 +132,7 @@ export default function SharePickerDialogBody({
             <ul className="mt-3 flex flex-col gap-1">
               {waiting.map((entry) => {
                 const badge = chainBadge(entry);
+                const owned = ownedChip(entry);
                 return (
                   <li key={entry.domain}>
                     {/*
@@ -124,11 +147,7 @@ export default function SharePickerDialogBody({
                     */}
                     <button
                       type="button"
-                      aria-label={rowLabel(
-                        entry.domain,
-                        entry.localChanges,
-                        badge,
-                      )}
+                      aria-label={rowLabel(entry, badge)}
                       onClick={() => {
                         onPick(entry.domain);
                       }}
@@ -138,6 +157,7 @@ export default function SharePickerDialogBody({
                         <span className="truncate font-medium">
                           {entry.domain}
                         </span>
+                        {owned !== null && <Chip>{owned}</Chip>}
                         {badge !== null && (
                           <Chip variant="caution">{badge}</Chip>
                         )}
