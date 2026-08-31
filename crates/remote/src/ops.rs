@@ -2790,6 +2790,15 @@ fn tip_below_layer(state: &OriginState, index: usize) -> BTreeMap<String, BaseSt
 ///   ([`ensure_cascade_ready`]) rather than being silently replaced.
 /// - not one stack call is made. No base ref moves, so the forge's membership
 ///   holds exactly as it stands.
+///
+/// **The tail of this signature is full.** `title`, `description`,
+/// `author_login` and `files` are four adjacent `Option`s, three of them
+/// `Option<&str>`, and at four a caller can swap two of them and still
+/// compile. They are passed as plain values rather than through
+/// [`ShareOptions`] on purpose - this function is identity-unaware and takes
+/// what it is given - but that reason does not stretch to a fifth. Whoever
+/// needs to pass one more thing restructures instead: a small parameter struct
+/// for the amend, or the fields moved onto one the caller already builds.
 #[allow(clippy::too_many_arguments)]
 async fn amend_layer(
     provider: &dyn Provider,
