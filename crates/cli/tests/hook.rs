@@ -267,7 +267,7 @@ fn the_ride_along_ask_names_the_pending_domains_and_stamps_the_nudge() {
 
 /// The sharing paragraph, duplicated here for the reason the two above it
 /// are: this is a black-box check on what the subprocess printed.
-const SHARE_NUDGE_REASON: &str = "If the work here is done, propose sharing them with share_changes so the domain owner can review them and the team's archive stays current - and wait for a yes.";
+const SHARE_NUDGE_REASON: &str = "If that work is done, propose sharing it with share_changes so the domain owner can review it and the team's archive stays current - and wait for a yes.";
 
 /// A registered team domain under `work`, holding `files`, with an origin
 /// state whose base snapshot is empty - so everything in the root reads as

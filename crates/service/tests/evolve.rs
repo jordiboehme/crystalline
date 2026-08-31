@@ -10,9 +10,11 @@
 mod support;
 
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
-use crystalline_core::config::{DomainEntry, GlobalConfig};
+use crystalline_core::config::{DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_index::TursoStore;
+use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
 use crystalline_service::params::EvolveParams;
 use serde_json::Value;
@@ -1597,4 +1599,127 @@ async fn a_note_starting_with_remove_still_records() {
         "{receipt}"
     );
     assert!(receipt["evolve_ack_removed"].is_null(), "{receipt}");
+}
+
+/// The instant `alpha.md` is backdated to in [`team_fixture`], as seconds since
+/// the epoch: `2026-07-01T00:00:00Z`, a month and a day before [`TODAY`].
+///
+/// An absolute instant rather than "now minus a month" so the age the sweep
+/// computes is the same number on every run and on every machine: the engine
+/// supplies `today`, the file supplies the mtime, and both ends of the
+/// subtraction are pinned here.
+const OLDEST_CHANGE_EPOCH_SECS: u64 = 1_782_864_000;
+
+/// An engine over a TEAM domain holding one unshared engram whose own mtime is
+/// [`OLDEST_CHANGE_EPOCH_SECS`].
+///
+/// Deliberately not the big fixture: `V009` is the one rule whose facts come
+/// from outside the index - the working tree measured against the recorded
+/// base snapshot - so it needs a domain with an origin, a state file and a
+/// tree that disagrees with it, which is a different shape of fixture rather
+/// than another engram in the existing one.
+///
+/// The snapshot is empty, which is what a freshly connected domain has before
+/// its first share: every substantive file in the tree is then work the team
+/// has not seen.
+async fn team_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let dir = root.join("kb");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- shared knowledge\n\n## When to Use\n\n- Route here for team questions\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("alpha.md"),
+        "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-06-01\n---\n\nWhat the team already agreed.\n",
+    )
+    .unwrap();
+    let mut cfg = GlobalConfig::default();
+    cfg.domains.insert(
+        "kb".to_string(),
+        DomainEntry {
+            origin: Some(OriginConfig {
+                repo: "acme/kb".to_string(),
+                path: None,
+                branch: None,
+                poll_secs: None,
+            }),
+            ..DomainEntry::file(dir.clone())
+        },
+    );
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    OriginState::new("acme/kb", "main")
+        .save(&root.join("origins").join("kb"))
+        .unwrap();
+
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            // Load-bearing: the registration and the sweep both read origin
+            // state, and it must land in the temp dir rather than in the
+            // developer's real state directory.
+            .with_origins_dir(root.join("origins")),
+    );
+    engine.sync(None).await.unwrap();
+    // Backdated AFTER the sync, which writes the generated folder index and
+    // would otherwise be the newest thing in the tree - and, more to the
+    // point, because a sync that touched this file would reset exactly what
+    // the rule measures.
+    std::fs::File::options()
+        .write(true)
+        .open(dir.join("alpha.md"))
+        .unwrap()
+        .set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(OLDEST_CHANGE_EPOCH_SECS))
+        .unwrap();
+    (tmp, engine)
+}
+
+/// The engine hands the sweep a real domain's unshared work, and `V009` comes
+/// back out of it.
+///
+/// The one test that crosses the seam: the detector's own unit tests build
+/// `ShareFacts` by hand and the origin helper's tests stop at the delta, so
+/// without this nothing proves that `Engine::share_facts` reaches a registered
+/// team domain, walks its tree, and lands on the `share` field of the
+/// `SweepInput` this rule reads. Both directions are asserted from the same
+/// fixture, because a `share` field wired to a constant would pass either half
+/// alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn v009_comes_out_of_a_real_team_domains_unshared_work() {
+    let (_tmp, engine) = team_fixture().await;
+
+    let v = sweep(&engine, TODAY, EvolveParams::default()).await;
+    let row = v["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["rule"] == "V009")
+        .unwrap_or_else(|| panic!("V009 fires on a month-old unshared delta: {v}"));
+    assert_eq!(row["domain"], "kb");
+    assert_eq!(row["class"], "judgment", "sharing is proposed, never done");
+    assert_eq!(row["fix"], "share_changes domain=kb", "{row}");
+    // The age is read from the file rather than from the frontmatter, so the
+    // evidence names the instant the fixture pinned.
+    let evidence = row["evidence"].as_str().unwrap();
+    assert!(
+        evidence.contains("oldest change 2026-07-01"),
+        "the backdated mtime is what the rule aged from: {evidence}"
+    );
+    assert!(
+        evidence.contains("threshold 7 days"),
+        "and the window it compared it against: {evidence}"
+    );
+
+    // The day after that change, the same domain through the same call path
+    // says nothing: the field carries the tree's real age rather than a
+    // constant, and the rule only speaks once the work has actually sat.
+    let fresh = sweep(&engine, "2026-07-02", EvolveParams::default()).await;
+    assert!(
+        !rules(&fresh).contains(&"V009".to_string()),
+        "a day-old delta is not stale: {fresh}"
+    );
 }

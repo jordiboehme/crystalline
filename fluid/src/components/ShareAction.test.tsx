@@ -529,11 +529,18 @@ describe("the top bar's share action", () => {
     await waitFor(() => {
       expect(action).toHaveAttribute("aria-disabled", "false");
     });
-    // Summed across the domains that answered: two of the eight waiting
-    // changes are this reader's.
+    // The badge is this reader's own count across the instance.
     await waitFor(() => {
       expect(action).toHaveTextContent("2");
     });
+    // And the sentence pairs it against the five changes ownership was
+    // actually reported for, not against all eight: `ops` answered nothing
+    // about who wrote its three, so claiming they are not this reader's would
+    // be a claim the report never made.
+    await userEvent.hover(action);
+    expect(
+      await screen.findByRole("tooltip", {}, { timeout: 2000 }),
+    ).toHaveTextContent("2 of 5 unshared changes are yours");
 
     await userEvent.click(action);
     const picker = await screen.findByRole("dialog", {

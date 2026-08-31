@@ -340,12 +340,20 @@ function useShareAction(): ShareAction {
     (entry) => entry.localChanges > 0,
   );
   const total = waiting.reduce((sum, entry) => sum + entry.localChanges, 0);
-  // Summed across the domains that answered with a number, and null when none
-  // of them did: an instance whose report says nothing about ownership must
-  // not be summed into a confident zero.
-  const owned = waiting.some((entry) => entry.ownedChanges !== null)
-    ? waiting.reduce((sum, entry) => sum + (entry.ownedChanges ?? 0), 0)
+  // The pairing is summed over the domains that ANSWERED with an owned count,
+  // both halves of it: a row that said nothing about ownership contributes to
+  // neither the numerator nor the denominator. Summing its changes into the
+  // denominator alone would say "2 of 8 are yours" about eight changes when
+  // three of them were never attributed to anybody - a claim the report never
+  // made. The badge keeps counting everything that waits (that is what the
+  // button acts on); only the sentence narrows to what is known.
+  const answered = waiting.filter((entry) => entry.ownedChanges !== null);
+  // Null when nothing answered: an instance whose report says nothing about
+  // ownership must not be summed into a confident zero.
+  const owned = answered.length
+    ? answered.reduce((sum, entry) => sum + (entry.ownedChanges ?? 0), 0)
     : null;
+  const known = answered.reduce((sum, entry) => sum + entry.localChanges, 0);
   return {
     visible: true,
     domain: null,
@@ -358,7 +366,7 @@ function useShareAction(): ShareAction {
           : "Nothing to share",
     count: waiting.length > 0 ? shareBadgeCount(owned, total) : null,
     waiting:
-      waiting.length > 0 ? ownedPhrase(owned, total, "unshared changes") : null,
+      waiting.length > 0 ? ownedPhrase(owned, known, "unshared changes") : null,
   };
 }
 

@@ -1377,6 +1377,14 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 /// assembler counts substantive changes only; and a delta whose age cannot be
 /// read carries no `oldest_change`, and an age this rule cannot establish is one
 /// it will not assert.
+///
+/// A fourth silence comes from the caller rather than from here, and is stated
+/// so nobody hunts for it as a bug: the service assembles `share` only after it
+/// has engrams for the domain in hand, so a team domain with nothing indexed
+/// yet - freshly connected, mid-reindex, or every engram unparseable - never
+/// reaches this rule at all. That is the wanted behaviour rather than a gap. A
+/// domain the archive cannot yet read is a domain whose delta nobody has
+/// reviewed, and a nudge to publish it would be a nudge made in the dark.
 fn detect_unshared(input: &SweepInput, report: &mut SweepReport) {
     let Some(share) = input.share else {
         return;

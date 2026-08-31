@@ -6038,7 +6038,7 @@ impl Engine {
             tag_aliases: vocab.aliases,
             known_domains: known_domains.to_vec(),
             attachments,
-            share: self.share_facts(name),
+            share: self.share_facts(name).await,
             include_acknowledged,
             options: SweepOptions::default(),
         };
@@ -6053,7 +6053,15 @@ impl Engine {
     /// against the base snapshot and never probes the forge, so a sweep costs
     /// the same whether the machine is connected or on a train. The rule reads
     /// substantive changes only, which is the filter that helper applies.
-    fn share_facts(&self, name: &str) -> Option<ShareFacts> {
+    ///
+    /// Under the domain's [`Engine::origin_lock`], like every other origin
+    /// read: the tree and `state.json` are compared against each other, and a
+    /// share or a pull rewrites both. Unlocked, a sweep landing mid-share reads
+    /// one of them from before the write and the other from after, and answers
+    /// a count for a delta that never existed.
+    async fn share_facts(&self, name: &str) -> Option<ShareFacts> {
+        let lock = self.origin_lock(name);
+        let _guard = lock.lock().await;
         let (_spec, root, state_dir) = self.origin_spec_for_domain(name).ok()?;
         let work = origin::unshared_work(&root, &state_dir)?;
         Some(ShareFacts {
@@ -9384,7 +9392,13 @@ impl Engine {
     ///
     /// Last-writer provenance, never authorship: it says which actor wrote the
     /// revision on disk, not who the knowledge belongs to.
+    ///
+    /// Under the domain's [`Engine::origin_lock`], for the reason
+    /// [`Engine::share_facts`] gives: a status read that races a share would
+    /// otherwise compare a half-written pair and attribute a delta nobody made.
     pub async fn owned_local_changes(&self, domain: &str, account: &str) -> Option<u64> {
+        let lock = self.origin_lock(domain);
+        let _guard = lock.lock().await;
         let (_spec, root, state_dir) = self.origin_spec_for_domain(domain).ok()?;
         let work = origin::unshared_work(&root, &state_dir)?;
         Some(work.owned_by(&root, &format!("human:{account}")))
