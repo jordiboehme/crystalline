@@ -680,6 +680,22 @@ repo fleet/fleet-ops.
 git, no SSH keys - then registers `fleet-ops` as a team domain tracking that
 repository's main branch and downloads it.*
 
+Where a crew shares one Crystalline between them, the chief can set it to share
+under personal identities instead of under the ship's single credential. Then
+every proposal carries the name of the person who opened it, and nobody ends up
+reviewing their own work by accident. Sign in once as yourself:
+
+```sh
+crystalline connect github --personal
+```
+
+*Or from Fluid, the web UI: the profile card, GitHub identity, the same short
+browser code.* Until you do, a share refuses and says exactly that, because it
+never quietly goes out on somebody else's credential. One thing rides along with
+personal sharing: a proposal is a branch in the team's own repository and never a
+fork, so a maintainer adds you to that repository as a collaborator once. Pulling
+and reading stay on the ship's credential either way, so catching up is unchanged.
+
 The loop is a rhythm you speak. Ask where the domain stands at session start, pull
 the team's merged work before you dig in and share when your own work is worth it:
 
@@ -692,6 +708,27 @@ URL.
 person at command reads it and merges on GitHub; the agent never merges its own
 work, it only relays the link. If two edits collide, ask the agent to resolve the
 conflict, keeping your side or theirs.
+
+A share carries everything the domain holds that the team has not seen. When that
+is more than you mean - a session that wandered, or a shared console with a
+crewmate's work sitting in the tree beside yours - name what goes:
+
+```text
+Share only the docking clamp engram to fleet-ops and leave the rest for later.
+```
+
+*The agent shares exactly that path, with its folder's generated listing riding
+along; everything left out stays an unshared local change for the next share, and
+a path that is not actually among the changes is refused by name rather than
+skipped in silence.* Fluid's share dialog offers the same choice as checkboxes and
+opens with your own changes ticked, going by who last wrote each file - a helpful
+guess about "the work I just did", never a ruling on who owns the knowledge, so
+tick and untick freely; the line under the list says how much it left out, and
+counts anything unattributed, deletions included, as somebody else's. Worth
+knowing on a shared console: what you write is visible to everyone using that
+instance the moment you save it, because the working tree is what they all read.
+Picking files decides what command is asked to review, not what your crewmates
+can see.
 
 You do not have to wait for that review before the next piece of work goes out.
 Share again while the first proposal is still open and the new work stacks on top
@@ -725,8 +762,14 @@ A declined layer with work stacked on it is normal too and needs nothing from yo
 the next share or withdrawal on that domain repairs the chain as it goes. Where
 the forge does not serve stacked pull requests, a domain keeps one living proposal
 instead and sharing again updates it in place, same number and same URL; the
-conversation you have with the agent is the same either way. Hard-won knowledge is
-worth the review.
+conversation you have with the agent is the same either way.
+
+You will be reminded rather than nagged. When a team domain holds work the team
+has not seen, the session-end check counts it and the agent offers to share it;
+if it goes on sitting there for a week, the Evolve sweep raises the same delta as
+something to decide on. Both ask first, because sharing puts somebody's work in
+front of reviewers - a refreshed folder listing is never a reason on its own.
+Hard-won knowledge is worth the review.
 
 ## Appendix
 
@@ -747,6 +790,7 @@ worth the review.
 | Tidy vocabulary | "Have our hyperdrive tags drifted?" |
 | Ask what needs work | "Sweep ship-ops and tell me what the archive needs." |
 | Share with the team | "Share the clamp findings as a proposal for review." |
+| Share part of it | "Share only the clamp engram to fleet-ops and keep the rest local." |
 | Answer a review | "Spell out the clamp threshold and update proposal 1." |
 | Withdraw a proposal | "Withdraw the fleet-ops proposal and keep my local edits." |
 
@@ -789,6 +833,8 @@ crystalline install claude-code                     # wire up a harness (Setup)
 crystalline import ./old-notes --domain ship-ops    # convert a legacy markdown tree
 crystalline tags rename <old> <new>                 # rename a tag everywhere
 crystalline tags merge <old> <into>                 # fold one tag into another
+crystalline connect github --personal               # sign in as yourself for sharing
+crystalline origin share fleet-ops --file clamp.md  # share one changed file, not all
 crystalline origin share fleet-ops --proposal 4     # amend that layer after review
 crystalline origin withdraw fleet-ops --proposal 4  # close and clear a proposal
 crystalline verify                                  # static check: frontmatter, links, schema
