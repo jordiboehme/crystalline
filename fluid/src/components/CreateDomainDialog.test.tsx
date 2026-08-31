@@ -183,6 +183,44 @@ describe("registering a domain", () => {
     });
   });
 
+  it("a cached disconnected answer never gates a local registration", async () => {
+    // The regression the browser smoke caught: the top bar's share readiness
+    // probe fills the GitHub-status cache on every screen, and on a
+    // disconnected instance the dialog read that cached answer as a reason to
+    // disable "Create domain" even for a local domain. Reproduced here through
+    // the dialog itself: team mode fetches the disconnected answer into the
+    // shared cache, and switching back to local must leave the submit alive.
+    const created = vi.fn(() => ({ domain: "notes", root: "/srv/kb/notes" }));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(false),
+      "/domains": (_path, init) =>
+        init?.method === "POST" ? created() : domainsResponse(),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await within(dialog).findByRole("link", {
+      name: "Connect GitHub in settings",
+    });
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "Local folder" }),
+    );
+    await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
+    const submit = within(dialog).getByRole("button", {
+      name: "Create domain",
+    });
+    await waitFor(() => {
+      expect(submit).toBeEnabled();
+    });
+    await userEvent.click(submit);
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+  });
+
   it("creates a virtual domain", async () => {
     const created = vi.fn(() => ({ domain: "scratch", root: null }));
     serveAs("admin", {

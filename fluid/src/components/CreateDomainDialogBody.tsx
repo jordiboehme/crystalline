@@ -82,11 +82,17 @@ export default function CreateDomainDialogBody({
     queryFn: fetchGithubStatus,
     enabled: mode === "github",
   });
-  // Only once an answer is actually in hand. A probe still in flight is not a
-  // disconnected instance, and saying so before the server has spoken would
-  // put a refusal on screen that may be about to be wrong.
+  // Only in team mode, and only once an answer is actually in hand. A probe
+  // still in flight is not a disconnected instance, and saying so before the
+  // server has spoken would put a refusal on screen that may be about to be
+  // wrong. The mode guard is load bearing beyond the enabled flag above:
+  // other screens (the top bar's share readiness probe) fill this cache key,
+  // and a cached "disconnected" answer must never gate a local or virtual
+  // registration.
   const disconnected =
-    connection.data !== undefined && !connection.data.connected;
+    mode === "github" &&
+    connection.data !== undefined &&
+    !connection.data.connected;
 
   const create = useMutation({
     mutationFn: () => createDomain(requestBody()),
