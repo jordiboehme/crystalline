@@ -1066,7 +1066,7 @@ fn select_share_files(
     }
     if !unknown.is_empty() {
         return Err(RemoteError::Refused(format!(
-            "not among this domain's unshared changes: {}; share what origin status lists as changed, or leave the file list out to share everything",
+            "not among this domain's unshared changes: {}; take the paths from the share preview, which lists every file a share would carry, or leave the file list out to share everything",
             unknown.join(", ")
         )));
     }
@@ -3432,6 +3432,21 @@ async fn repair_chain(
         }
         cascade_replays(provider, spec, state, state_dir, index, parent).await?;
         state.repair_pending = false;
+        // This path never links anything: the membership was never dissolved,
+        // so there is nothing to recreate. That leaves one case it must not
+        // pass over in silence - a chain of two or more open layers with no
+        // recorded stack number is not grouped on the forge at all, and with
+        // the debt unrecorded nothing ever groups it (`chain_is_stacked`
+        // reads exactly this pair, and answers false, which drops the domain
+        // onto the unstacked flows for good). Record it, and the next
+        // operation's `retry_stack_link` pays it off - the same honest
+        // degradation the long path records when its recreate fails.
+        // `first_misaligned_layer` needs a layer below the break, so an
+        // intact chain that got here has at least two open layers by
+        // construction.
+        if state.stack_number.is_none() {
+            state.stack_link_pending = true;
+        }
         state.save(state_dir)?;
         return Ok(RepairOutcome {
             repaired: true,
@@ -4097,7 +4112,22 @@ async fn settle_up_to_date(
 /// materializes only upstream files with no local counterpart (never
 /// overwriting or deleting a local file that differs, which simply becomes a
 /// local change against the new base), replaces the base snapshot wholesale
-/// and keeps proposals and conflicts as they are.
+/// and keeps conflicts as they are.
+///
+/// Merged proposals are consumed here exactly as the other two arms of
+/// [`pull`] consume them, and for the same reason: a merged record left in the
+/// chain blocks every repair around it ([`merged_layer_blocking_repair`]), and
+/// that refusal's way out is "pull this domain first". An arm that pulls and
+/// leaves the record standing turns that advice into a loop - the base commit
+/// is gone upstream, so this is the arm this domain takes on every pull from
+/// here on, and nothing would ever clear it.
+///
+/// [`PullReport::merged`] stays empty and says nothing about this: it lists
+/// the paths a three-way text merge produced, and a re-baseline performs none
+/// (a local file that differs is left alone as a local change). The consumed
+/// proposal is reported where every other arm reports it, in
+/// [`PullReport::proposals`], which carries the transition
+/// [`refresh_proposals`] recorded for it before this arm was chosen.
 #[allow(clippy::too_many_arguments)]
 async fn rebaseline(
     provider: &dyn Provider,
@@ -4134,7 +4164,27 @@ async fn rebaseline(
     state.base_commit = head;
     state.ref_etag = new_etag;
     state.last_checked = Some(Utc::now());
+
+    // Consume merged proposals in memory and adopt whatever the forge did to
+    // the layers still standing above them, then persist the base replacement
+    // and the consumption together in one save, so a crash cannot leave a
+    // merged proposal half-consumed. The same order the moved-trunk arm uses.
+    let consumed = consume_merged(&mut state);
+    if !consumed.is_empty()
+        && state
+            .proposals
+            .iter()
+            .any(|p| p.status == ProposalStatus::Open)
+    {
+        adopt_rebased_layers(provider, spec, &mut state).await;
+    }
     state.save(state_dir)?;
+
+    // Best-effort branch cleanup once the state is durable; a branch lingering
+    // upstream harms nothing, so errors are ignored entirely.
+    for prop in &consumed {
+        let _ = provider.delete_branch(spec, &prop.branch).await;
+    }
 
     Ok(PullReport {
         up_to_date: false,

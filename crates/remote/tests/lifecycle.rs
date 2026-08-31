@@ -863,6 +863,74 @@ async fn scenario_11_missing_base_commit_re_baselines() {
     assert_eq!(status_report.local_changes, 1);
 }
 
+/// A re-baselining pull consumes the merged layer it finds, like every other
+/// arm of `pull`.
+///
+/// This was the one arm that did not, and the gap had teeth: a merged record
+/// still sitting in the chain blocks every repair around it, and that
+/// refusal's way out is "pull this domain first". A domain whose base commit
+/// is gone upstream takes THIS arm on every pull it will ever make, so the
+/// advice named an operation that could not clear the record - the chain
+/// stayed wedged for good.
+#[tokio::test]
+async fn a_re_baselining_pull_consumes_the_merge_it_finds() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // The middle layer merged upstream while the trunk this domain records
+    // was rewritten out of existence.
+    mock.set_proposal_state(layers[1].number, ProposalState::Merged);
+    let mut state = load_state(&sub.state_dir);
+    state.base_commit = "ghost-commit".to_string();
+    state.save(&sub.state_dir).unwrap();
+    mock.gc_commit("ghost-commit");
+    let moved = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    mock.set_branch("main", &moved);
+
+    let before = mock.calls().len();
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    assert!(report.re_baselined, "{report:?}");
+    assert!(
+        report
+            .proposals
+            .contains(&(layers[1].number, ProposalStatus::Merged)),
+        "the pull reports where it reports every other consumption: {report:?}"
+    );
+    assert!(
+        report.merged.is_empty(),
+        "and says nothing in the three-way-merge field, which a re-baseline \
+         never fills: {report:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        !state.proposals.iter().any(|p| p.number == layers[1].number),
+        "the merged layer left the chain: {:?}",
+        state.proposals
+    );
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number && p.status == ProposalStatus::Merged),
+        "and landed in history: {:?}",
+        state.history
+    );
+    assert!(
+        delta.contains(&format!("delete_branch:{}", layers[1].branch)),
+        "its branch is cleaned up after the state is durable: {delta:?}"
+    );
+    assert_eq!(state.base_commit, moved, "on the new trunk");
+}
+
 // Scenario 12: an oversized upstream file is skipped with a warning, never
 // written and never recorded in the base manifest.
 
@@ -6656,6 +6724,60 @@ async fn a_half_cascaded_chain_re_bases_without_churning_the_stack() {
     );
 }
 
+/// The intact heal never links anything - membership was never dissolved, so
+/// there is nothing to recreate - which leaves one thing it must not pass over
+/// in silence: a chain of open layers with no stack number is not grouped on
+/// the forge at all, and a debt nobody records is a debt nobody pays. The heal
+/// records it, and the very next step of the same operation settles it.
+///
+/// Without that, `chain_is_stacked` reads the same pair (no number, no owed
+/// link) and answers false, which drops the domain onto the unstacked flows
+/// for good.
+#[tokio::test]
+async fn an_intact_heal_of_an_ungrouped_chain_records_the_owed_link() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    half_cascaded_chain(&mock, &sub, &layers).await;
+
+    // Intact and misaligned, and nothing groups it: the residue of a create
+    // that failed, which leaves the number unset. `repair_pending` is what
+    // carries this into the heal at all - the shape test does not fire
+    // without a stack number to disagree with.
+    let mut state = load_state(&sub.state_dir);
+    state.stack_number = None;
+    state.stack_link_pending = false;
+    state.repair_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    let linked = format!(
+        "create_stack:[{},{},{}]",
+        layers[0].number, layers[1].number, layers[2].number
+    );
+    let link_at = call_at(&delta, &linked);
+    let close_at = call_at(&delta, &format!("close_proposal:{}", layers[2].number));
+    assert!(
+        link_at < close_at,
+        "the healed chain is grouped before this withdrawal does its own work: {delta:?}"
+    );
+
+    // And the debt is gone by the end: the withdrawal's own repair recreates
+    // over the two survivors, and nothing is left owed.
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the debt was paid, not carried");
+    assert!(state.stack_number.is_some(), "the survivors are grouped");
+    assert!(!state.repair_pending);
+    assert!(report.repaired);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number]
+    );
+}
+
 /// Runs an amend of the bottom layer whose cascade died before it moved a
 /// single layer above it: the amended layer is committed, pushed and RECORDED,
 /// and every layer over it still stands exactly where it stood. Returns the
@@ -6960,21 +7082,18 @@ async fn an_amend_refusal_lists_the_layers_the_repair_left_open() {
     assert!(!load_state(&sub.state_dir).repair_pending);
 }
 
-#[tokio::test]
-async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
-    let mock = MockProvider::new();
-    mock.enable_stacks();
-    let (sub, layers) = stacked_three_layers(&mock).await;
-
-    // The middle layer merged and this domain has not taken it in: its content
-    // sits on the trunk and nowhere the chain can see, so rebuilding the
-    // survivors around it would read as deleting what it brought. Every pull
-    // consumes such a record except the re-baselining arm, which is what leaves
-    // one standing for a share to meet.
+/// Builds the wedge itself: a three-layer chain whose middle layer merged
+/// while the trunk this domain records was rewritten out of existence, with a
+/// repair owed on top. Returns the layers.
+///
+/// The owed repair is what makes an operation enter the repair machinery at
+/// all - a merge-wedged chain reads as shape-fine by design.
+async fn merge_wedged_chain(
+    mock: &MockProvider,
+) -> (Subscribed, Vec<crystalline_remote::ops::ProposeReport>) {
+    let (sub, layers) = stacked_three_layers(mock).await;
     let mut state = load_state(&sub.state_dir);
     state.proposals[1].status = ProposalStatus::Merged;
-    // A repair a withdrawal never finished: what makes this share enter the
-    // repair at all, since a merge-wedged chain reads as shape-fine by design.
     state.repair_pending = true;
     state.base_commit = "ghost-commit".to_string();
     state.save(&sub.state_dir).unwrap();
@@ -6984,23 +7103,32 @@ async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
         None,
     );
     mock.set_branch("main", &moved);
+    (sub, layers)
+}
 
-    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+/// A withdrawal over a chain carrying a merge this domain has not taken in is
+/// refused, naming the layer and the way out.
+///
+/// The merged layer's content sits on the trunk and nowhere the chain can see,
+/// so rebuilding the survivors around it would read as deleting what it
+/// brought. The withdraw path is where this is still met: it does not pull
+/// first, while a share does - and every arm of that pull, the re-baselining
+/// one included, consumes the record (the test below this one).
+#[tokio::test]
+async fn a_withdrawal_on_a_merge_wedged_chain_still_refuses_pull_first() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = merge_wedged_chain(&mock).await;
+
     let before = mock.calls().len();
-    let err = propose(
+    let err = withdraw(
         &mock,
         &spec(),
         &sub.domain_root,
-        "eng",
         &sub.state_dir,
-        ShareOptions {
-            title: None,
-            description: None,
-            proposal: Some(layers[0].number),
-            stacks_allowed: true,
-            author_login: None,
-            files: None,
-        },
+        Some(layers[2].number),
+        false,
+        true,
     )
     .await
     .expect_err("the merge has to be pulled in before this chain is rebuilt");
@@ -7023,7 +7151,7 @@ async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
         !delta.iter().any(|c| is_write_call(c)
             || c.starts_with("dissolve_stack")
             || c.starts_with("create_stack")),
-        "the pull-first refusal wins before a single repair call: {delta:?}"
+        "the pull-first refusal wins before a single repair write: {delta:?}"
     );
     let state = load_state(&sub.state_dir);
     assert!(
@@ -7031,6 +7159,63 @@ async fn an_amend_on_a_merge_wedged_chain_still_refuses_pull_first() {
         "and the repair stays owed until the pull clears the way"
     );
     assert_eq!(state.proposals.len(), 3, "the chain is left as it stands");
+}
+
+/// The share path cannot meet an unconsumed merge at all: every share pulls
+/// first, and every arm of that pull consumes the record - the re-baselining
+/// arm included, which is the arm a domain whose base commit is gone takes
+/// every time. So the same chain that refuses a withdrawal above lets an
+/// amend through, on a chain the pull left two layers deep.
+///
+/// This is what makes the refusal's own advice - "pull this domain first" -
+/// true rather than a loop.
+#[tokio::test]
+async fn an_amend_over_a_merge_wedged_chain_pulls_the_merge_in_and_proceeds() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = merge_wedged_chain(&mock).await;
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let report = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(layers[0].number),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect("the pull in front of the share takes the merge in");
+    assert!(
+        matches!(
+            report,
+            ProposeOutcome::Updated(ref r) if r.number == layers[0].number
+        ),
+        "the named layer is amended: {report:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number],
+        "the merged layer is out of the chain"
+    );
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number && p.status == ProposalStatus::Merged),
+        "and in history: {:?}",
+        state.history
+    );
+    assert!(!state.repair_pending, "the repair the pull unblocked ran");
 }
 
 #[tokio::test]
@@ -8019,6 +8204,11 @@ async fn a_share_naming_a_file_that_is_not_a_change_refuses_naming_it() {
     assert!(
         message.contains("unshared changes"),
         "the refusal says what the paths were measured against: {message}"
+    );
+    assert!(
+        message.contains("share preview"),
+        "and points at the surface that lists the real paths - a status report \
+         carries only a count: {message}"
     );
 
     // Refused before a single provider write: nothing was opened, nothing was

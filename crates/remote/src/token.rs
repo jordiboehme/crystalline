@@ -433,14 +433,43 @@ fn check_identity(identity: &TokenIdentity) -> Result<(), RemoteError> {
     match identity {
         TokenIdentity::Instance => Ok(()),
         TokenIdentity::Personal(name) if valid_identity_name(name) => Ok(()),
-        // Quoting the rejected name back is safe only because
-        // `valid_identity_name` is an allowlist: no control byte, newline or
-        // terminal escape can reach this message. Widen that allowlist and
-        // this interpolation stops being safe.
+        // The name quoted here is by construction one the allowlist REFUSED,
+        // so it may carry anything at all: a newline, a NUL, a terminal
+        // escape sequence, a kilobyte of it. It is sanitized rather than
+        // interpolated raw ([`quotable`]).
         TokenIdentity::Personal(name) => Err(RemoteError::Refused(format!(
-            "\"{name}\" is not a usable account name for a personal GitHub token; use the account name Crystalline knows this person by."
+            "\"{}\" is not a usable account name for a personal GitHub token; use the account name Crystalline knows this person by.",
+            quotable(name)
         ))),
     }
+}
+
+/// Makes a rejected identity name safe to quote back at the caller.
+///
+/// Everything outside printable ASCII becomes `?` and anything past
+/// [`MAX_IDENTITY_NAME_BYTES`] characters is cut with a trailing `...`. This
+/// is the one place a name that failed [`valid_identity_name`] is put into a
+/// message, and that message travels to a terminal, a log line and a JSON
+/// error body - none of which should be rewritten by a control byte or an
+/// escape sequence somebody chose. Echoing the name at all is worth this much
+/// care because seeing which request was refused is what makes the refusal
+/// actionable.
+fn quotable(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .take(MAX_IDENTITY_NAME_BYTES)
+        .map(|c| {
+            if c.is_ascii_graphic() || c == ' ' {
+                c
+            } else {
+                '?'
+            }
+        })
+        .collect();
+    if name.chars().nth(MAX_IDENTITY_NAME_BYTES).is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Opens a keyring entry, mapping the (rare) failure to build one at all to
@@ -640,6 +669,51 @@ mod tests {
                 "nothing was written: {name}: {entries:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_refused_name_is_sanitized_before_it_is_quoted_back() {
+        // The name in this refusal is one the allowlist just rejected, so it
+        // carries whatever the caller sent: a terminal escape that would
+        // repaint a log line, a newline that would forge a second line, a NUL
+        // that truncates at a syscall boundary, and more bytes than the
+        // ceiling allows. None of it survives into the message.
+        let hostile = format!(
+            "a\u{1b}[2Jb\nc\u{0}d\u{7}{}",
+            "z".repeat(MAX_IDENTITY_NAME_BYTES)
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let err = TokenStore::save_resolving_for(
+            &TokenIdentity::Personal(hostile.clone()),
+            None,
+            dir.path(),
+            &sample_token(),
+        )
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(matches!(err, RemoteError::Refused(_)), "{err:?}");
+        assert!(
+            msg.chars().all(|c| c.is_ascii_graphic() || c == ' '),
+            "no control byte and no escape reaches the message: {msg:?}"
+        );
+        assert!(
+            !msg.contains(&hostile),
+            "the raw name is never echoed: {msg:?}"
+        );
+        assert!(
+            msg.contains("a?[2Jb?c?d?"),
+            "what was rejected is still recognizable: {msg:?}"
+        );
+        assert!(
+            msg.contains("..."),
+            "an over-long name is cut rather than pasted whole: {msg:?}"
+        );
+        assert!(
+            msg.len() < hostile.len() + 200,
+            "the message stays bounded: {} chars",
+            msg.len()
+        );
     }
 
     #[test]
