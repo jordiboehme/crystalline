@@ -638,7 +638,7 @@ async fn the_share_routes_walk_the_loop() {
     assert_eq!(changes.status(), 200, "{}", changes.text().await.unwrap());
     let changes: serde_json::Value = changes.json().await.unwrap();
     assert_eq!(changes["action"], "create");
-    assert_eq!(changes["changes"][0]["path"], "shared.md", "{changes}");
+    assert_eq!(changes["changes"][1]["path"], "shared.md", "{changes}");
     assert!(changes["effective_title"].as_str().is_some());
 
     // Share it.

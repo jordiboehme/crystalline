@@ -134,7 +134,10 @@ impl LocalChanges {
 /// - a base entry with no file on disk is [`LocalChange::Deleted`].
 ///
 /// Relative paths are always forward-slash normalized, regardless of
-/// platform.
+/// platform, and the returned changes are sorted by path: directory walk
+/// order differs per filesystem, and everything downstream - proposal
+/// bodies, outcome listings, previews - reads better and tests stably when
+/// the order is the paths' own.
 pub fn detect_local_changes(
     domain_root: &Path,
     base: &BTreeMap<String, BaseStamp>,
@@ -192,6 +195,8 @@ pub fn detect_local_changes(
             changes.push(LocalChange::Deleted { path: rel.clone() });
         }
     }
+
+    changes.sort_by(|a, b| a.path().cmp(b.path()));
 
     Ok(LocalChanges {
         changes,

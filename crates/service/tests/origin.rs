@@ -1507,7 +1507,10 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
         .await
         .unwrap();
     assert_eq!(result["outcome"], "proposed");
-    assert_eq!(result["added"][0], "notes/new.md");
+    assert_eq!(
+        result["added"],
+        serde_json::json!(["index.md", "notes/new.md"])
+    );
     assert!(
         result["url"].as_str().unwrap().starts_with("https://"),
         "{result}"
