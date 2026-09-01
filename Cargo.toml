@@ -58,16 +58,16 @@ sha2 = "0.11.0"
 chrono = "0.4.45"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-indexmap = "2.14.0"
+indexmap = "2.14.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
 axum = { version = "0.8.9", features = ["ws"] }
 # The yrs `sync` feature makes observer callbacks Send + Sync for the
 # multi-threaded server; the `yrs::sync` protocol module itself is
 # unconditional. Wire format pinned in crates/service/tests/collab_wire.rs.
-yrs = { version = "0.27.3", features = ["sync"] }
+yrs = { version = "0.27.4", features = ["sync"] }
 # Text diffing for collaborative merge conflict surfacing (crates/service).
-similar = "3.1.2"
+similar = "3.2.0"
 # Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
 # axum's WebSocket binary frames take, so a frame crosses the seam without a
 # copy. Already in the graph through axum and tokio.
@@ -86,7 +86,7 @@ libc = "0.2.189"
 serde_yaml_ng = "0.10.0"
 toml = "1.1.4"
 async-trait = "0.1.92"
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.26.0", features = ["v4"] }
 thiserror = "2.0.20"
 anyhow = "1.0.104"
 etcetera = "0.11.0"
@@ -100,14 +100,14 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 # GitHub collaboration (crates/remote): plain-text three-way merge, the
 # GitHub-issued token in the OS keychain and repository tarball extraction.
-diffy = "0.5.1"
+diffy = "0.5.2"
 # `v1` pulls in exactly the apple-native (Keychain), windows-native and
 # zbus-secret-service (pure-Rust, no libdbus) backends; the 0600 file fallback
 # in crates/remote covers everything else (headless Linux without a session
 # bus, CI).
-keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 tar = "0.4.46"
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 base64 = "0.23.1"
 # Percent-decoding for the MCP `resources/read` uri (crates/service). Already
 # in the graph through axum and url; named directly because the MCP surface
