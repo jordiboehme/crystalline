@@ -664,12 +664,17 @@ async fn a_dropped_subscription_is_unregistered_rather_than_written_to() {
 
     drop(subscription);
     // Cancellation travels to the server as a notification, so the
-    // unregistration is not synchronous with the drop.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(
-        h.engine.list_subscribers().is_empty(),
-        "the ended stream left no sink behind"
-    );
+    // unregistration is not synchronous with the drop. Poll for the state
+    // instead of trusting one fixed window: under full-suite load a fixed
+    // 200ms lost this race (locally and on the windows CI leg, 2026-08-31).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !h.engine.list_subscribers().is_empty() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the ended stream left a sink behind after 5s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 
     // And the flip still works with nobody listening.
     flip_github_enabled(client.peer()).await;
