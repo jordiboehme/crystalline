@@ -51,6 +51,7 @@ async fn serve(opts: Options) -> Fixture {
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
             anonymous: Some(opts.anonymous),
+            mcp: None,
             max_users: None,
         }),
         ..GlobalConfig::default()
@@ -1329,6 +1330,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
         auth: Some(AuthConfig {
             trusted_header: None,
             anonymous: Some(false),
+            mcp: None,
             max_users: None,
         }),
         ..GlobalConfig::default()

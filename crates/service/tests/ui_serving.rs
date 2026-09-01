@@ -477,6 +477,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
         auth: Some(AuthConfig {
             trusted_header: None,
             anonymous: Some(opts.anonymous),
+            mcp: None,
             max_users: None,
         }),
         ..GlobalConfig::default()

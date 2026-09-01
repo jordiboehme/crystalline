@@ -92,6 +92,9 @@ pub struct AuthCfg {
     /// Whether a request carrying no identity is served anyway, from
     /// `auth.anonymous`.
     pub anonymous: bool,
+    /// Whether every MCP connection over HTTP requires authentication with a
+    /// personal MCP token, from `auth.mcp`.
+    pub mcp: bool,
     /// How many accounts trusted-header provisioning may mint in total, from
     /// `auth.max_users`. Only minting a *new* account is capped; an existing
     /// one always resolves, and the `crystalline users` CLI is never capped.
@@ -103,13 +106,14 @@ impl Default for AuthCfg {
         AuthCfg {
             trusted_header: None,
             anonymous: false,
+            mcp: false,
             max_users: crystalline_core::config::DEFAULT_MAX_USERS,
         }
     }
 }
 
 impl AuthCfg {
-    /// Read all three settings out of `config`, validating the header name.
+    /// Read all four settings out of `config`, validating the header name.
     ///
     /// The settings layer only checks that the value is non-empty and has no
     /// whitespace (see `settings::set_trusted_header`), which still admits
@@ -126,6 +130,7 @@ impl AuthCfg {
         Ok(AuthCfg {
             trusted_header,
             anonymous: config.auth_anonymous(),
+            mcp: config.auth_mcp(),
             max_users: config.auth_max_users(),
         })
     }
@@ -1507,6 +1512,7 @@ mod tests {
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("Remote-User".to_string()),
             anonymous: Some(true),
+            mcp: None,
             max_users: Some(5),
         });
         let cfg = AuthCfg::resolve(&config).unwrap();
@@ -1517,6 +1523,7 @@ mod tests {
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("not a header".to_string()),
             anonymous: None,
+            mcp: None,
             max_users: None,
         });
         let err = AuthCfg::resolve(&config).unwrap_err().to_string();

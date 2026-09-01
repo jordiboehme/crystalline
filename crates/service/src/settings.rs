@@ -317,6 +317,15 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: anonymous_effective,
         },
         SettingSpec {
+            key: "auth.mcp",
+            doc: "Require every MCP connection over HTTP to authenticate with a personal MCP token (issue one in Fluid under profile > Agent access); off means the legacy open HTTP tier (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            apply: set_mcp,
+            clear: clear_mcp,
+            effective: mcp_effective,
+        },
+        SettingSpec {
             key: "auth.max_users",
             doc: "How many accounts trusted-header provisioning may mint in total (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
             kind: SettingKind::String,
@@ -1266,6 +1275,28 @@ fn anonymous_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_anonymous().to_string(), is_default)
 }
 
+// --- auth.mcp -----------------------------------------------------------
+
+fn set_mcp(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("auth.mcp must be true or false, got '{value}'")))?;
+    config.auth.get_or_insert_with(AuthConfig::default).mcp = Some(parsed);
+    Ok(())
+}
+
+fn clear_mcp(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.mcp = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn mcp_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.mcp).is_none();
+    (config.auth_mcp().to_string(), is_default)
+}
+
 // --- auth.max_users -----------------------------------------------------------
 
 fn set_max_users(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1332,7 +1363,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_twenty_four_keys_in_order() {
+    fn registry_lists_exactly_the_twenty_five_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1359,6 +1390,7 @@ mod tests {
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.mcp",
                 "auth.max_users",
             ]
         );
@@ -1427,6 +1459,7 @@ mod tests {
                     "CRYSTALLINE_AUTH_TRUSTED_HEADER".to_string()
                 ),
                 ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
+                ("auth.mcp", "CRYSTALLINE_AUTH_MCP".to_string()),
                 ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
             ]
         );
@@ -1911,7 +1944,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 24);
+        assert_eq!(views.len(), 25);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1938,6 +1971,7 @@ mod tests {
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.mcp",
                 "auth.max_users",
             ]
         );
@@ -2588,6 +2622,17 @@ mod tests {
         );
         assert_eq!(cfg.auth_trusted_header(), Some("X-Forwarded-User"));
         assert!(!cfg.auth_anonymous());
+    }
+
+    // --- auth.mcp -----------------------------------------------------------
+
+    #[test]
+    fn auth_mcp_round_trips_and_defaults_off() {
+        let mut config = GlobalConfig::default();
+        apply(&mut config, "auth.mcp", "true").unwrap();
+        assert!(config.auth_mcp());
+        unset(&mut config, "auth.mcp").unwrap();
+        assert!(!config.auth_mcp());
     }
 
     // --- auth.max_users -----------------------------------------------------------
