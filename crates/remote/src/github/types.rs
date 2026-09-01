@@ -133,21 +133,26 @@ pub(super) struct CurrentUserResponse {
     pub(super) login: String,
 }
 
-/// `PATCH .../git/refs/heads/{name}` request body. `force: false` always:
-/// a share-update is a fast-forward on a branch only this machine writes.
+/// `PATCH .../git/refs/heads/{name}` request body. `force` is false for a
+/// share-update, which fast-forwards a branch only this machine writes, and
+/// true for a layer branch rewritten on top of a moved base.
 #[derive(Debug, Serialize)]
 pub(super) struct UpdateRefRequest {
     pub(super) sha: String,
     pub(super) force: bool,
 }
 
-/// `PATCH .../pulls/{number}` request body for a share-update. The title is
-/// omitted entirely (not sent null) unless the caller supplied one.
+/// `PATCH .../pulls/{number}` request body. Every field is omitted entirely
+/// (never sent null) unless the caller supplied one, so a retarget carries
+/// the base alone and leaves the title and body as they stand.
 #[derive(Debug, Serialize)]
 pub(super) struct UpdateProposalRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) title: Option<String>,
-    pub(super) body: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) body: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) base: Option<String>,
 }
 
 /// `PATCH .../pulls/{number}` request body for a withdraw.
@@ -208,6 +213,38 @@ pub(super) struct OpenProposalListItem {
 pub(super) struct HeadRef {
     #[serde(rename = "ref")]
     pub(super) reference: String,
+    pub(super) sha: String,
+}
+
+/// `POST .../stacks` and `POST .../stacks/{number}/add` request body: the
+/// proposals to group, bottom layer first.
+#[derive(Debug, Serialize)]
+pub(super) struct StackWriteRequest {
+    pub(super) pull_requests: Vec<u64>,
+}
+
+/// One stack as `GET .../stacks`, `POST .../stacks` and
+/// `POST .../stacks/{number}/add` all report it. `pull_requests` defaults to
+/// empty rather than being required: a stack whose members have all gone is
+/// still a well-formed answer.
+#[derive(Debug, Deserialize)]
+pub(super) struct StackResponse {
+    pub(super) number: u64,
+    pub(super) open: bool,
+    #[serde(default)]
+    pub(super) pull_requests: Vec<StackMemberResponse>,
+}
+
+/// One member of a stack, in stack order.
+#[derive(Debug, Deserialize)]
+pub(super) struct StackMemberResponse {
+    pub(super) number: u64,
+    pub(super) state: String,
+    pub(super) head: StackMemberHead,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct StackMemberHead {
     pub(super) sha: String,
 }
 

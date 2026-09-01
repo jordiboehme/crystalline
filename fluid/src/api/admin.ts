@@ -16,10 +16,18 @@
  */
 
 import { API_BASE, api, encodeSegment } from "./client";
-import { asArray, asNumber, asObject, asString, asStrings } from "./json";
+import {
+  asArray,
+  asNumber,
+  asNumbers,
+  asObject,
+  asString,
+  asStrings,
+} from "./json";
 import type {
   ArchiveReport as ArchiveReportWire,
   CreateDomainWireBody,
+  GithubIdentityResponse,
   GithubStatusResponse,
 } from "./model";
 
@@ -142,6 +150,130 @@ export async function disconnectGithub(): Promise<GithubStatus> {
   );
 }
 
+/**
+ * One account's own GitHub identity, as the profile card renders and polls it.
+ *
+ * The instance connection's personal counterpart, and the same promise holds:
+ * no token material, ever. Only whose identity it is, whether a credential is
+ * on file, the login it authenticated as, since when and where it lives.
+ */
+export interface GithubIdentity {
+  /** The account it belongs to, which is always the caller's own. */
+  account: string;
+  /** Whether a personal credential is on file for that account. */
+  connected: boolean;
+  /** The GitHub login it authenticated as, when connected. */
+  login: string | null;
+  /** When the credential was stored, RFC 3339; null when disconnected. */
+  connectedAt: string | null;
+  /**
+   * `keyring` or `file`; null when disconnected. Never `environment`: the
+   * environment supplies the machine's credential and never a personal one.
+   */
+  tokenStore: string | null;
+  /** This account's device flow waiting for the browser side, or null. */
+  pending: GithubPending | null;
+  /**
+   * This account's finished flow's failure, in the server's words. Reported on
+   * exactly one read after the flow ends, then cleared.
+   */
+  error: string | null;
+}
+
+/**
+ * The cache key of the caller's own GitHub identity, and the third key in this
+ * app that sits outside the `["domains", ...]` family.
+ *
+ * A personal credential is not domain content: react-query invalidates by
+ * prefix, and an identity filed under `["domains"]` would be re-read by every
+ * bulk domain invalidation in the app - including the ones a share fires on its
+ * way out, which is precisely when this card is being watched. It is not the
+ * instance connection's key either: the two are different credentials with
+ * different lifetimes, and a disconnect on one must not blank the other's card.
+ */
+export const MY_GITHUB_IDENTITY_KEY = ["me-github-identity"] as const;
+
+/**
+ * Read an identity payload, whatever arrived.
+ *
+ * Defensive rather than cast, for the reason {@link readGithubStatus} is: this
+ * one is also the device flow's poll, read on a timer while a background flow
+ * finishes, and a field that is briefly missing should leave the card saying
+ * "not connected" rather than throwing inside a render.
+ */
+export function readMyGithubIdentity(payload: unknown): GithubIdentity {
+  const record = asObject(payload);
+  return {
+    account: asString(record?.account) ?? "",
+    connected: record?.connected === true,
+    login: asString(record?.login),
+    connectedAt: asString(record?.connected_at),
+    tokenStore: asString(record?.token_store),
+    pending: readPending(record?.pending),
+    error: asString(record?.error),
+  };
+}
+
+/**
+ * The caller's own identity as it stands. Also the device flow's poll: the
+ * flow finishes in another window, so there is no event to wait for.
+ *
+ * No account in the path, because the session already names one: this surface
+ * manages the caller's own credential and no one else's.
+ */
+export async function fetchMyGithubIdentity(): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity"),
+  );
+}
+
+/**
+ * Start a device-code sign-in for the caller's own identity.
+ *
+ * A second call from the same account reports the code already outstanding, so
+ * a double press is safe; one made while ANOTHER identity's sign-in is in
+ * flight is refused 409, which is the server's sentence to show as it stands.
+ */
+export async function startMyGithubIdentityDevice(): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity/connect", {
+      method: "POST",
+    }),
+  );
+}
+
+/**
+ * Connect the caller's own identity with a personal access token.
+ *
+ * `PUT`, unlike the instance surface's `POST`: this replaces the caller's one
+ * identity rather than adding to a collection, so re-pasting a token is the
+ * same request twice with the same result. The token goes out in this one body
+ * and is held nowhere - the answer is the same token-material-free identity
+ * every other verb here returns.
+ */
+export async function connectMyGithubIdentityToken(
+  token: string,
+): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity/token", {
+      method: "PUT",
+      body: JSON.stringify({ token }),
+    }),
+  );
+}
+
+/**
+ * Forget the caller's own credential. Idempotent, and the instance connection
+ * is untouched: each credential lives in its own store entry.
+ */
+export async function disconnectMyGithubIdentity(): Promise<GithubIdentity> {
+  return readMyGithubIdentity(
+    await api<GithubIdentityResponse>("/me/github-identity", {
+      method: "DELETE",
+    }),
+  );
+}
+
 /** Which of the three kinds of domain is being registered. */
 export type DomainMode = "local" | "virtual" | "github";
 
@@ -235,6 +367,17 @@ export interface SyncProposal {
   amendedUpstream: boolean;
   feedback: ProposalFeedback[];
   updatedAt: string | null;
+  /**
+   * The GitHub login the share that wrote this acted as, or null when nobody
+   * is named.
+   *
+   * Null twice over: a proposal shared before the engine recorded this carries
+   * nothing, and so does one shared by a credential with no login to name. A
+   * row says who owns a layer where there is an answer and says nothing where
+   * there is not - a chain's layers can belong to different people, and a
+   * blank is never worth a guess.
+   */
+  authorLogin: string | null;
 }
 
 /** One file a pull could not merge, as the status report lists it. */
@@ -252,6 +395,18 @@ export interface SyncStatus {
   lastChecked: string | null;
   /** Unshared local work, as a count. */
   localChanges: number;
+  /**
+   * How much of that work this session's own account last wrote, or null when
+   * the report did not say - an older server, a request with no session
+   * account, a domain whose origin state could not be read.
+   *
+   * Null and zero are different sentences and are kept apart on purpose: zero
+   * is "none of this is yours", which a surface can say out loud, while null is
+   * "nobody was asked", which it must not turn into either answer. Last-writer
+   * provenance rather than authorship: it counts the files this account wrote
+   * the current revision of.
+   */
+  ownedChanges: number | null;
   /** Proposals still open on the origin, as a count. */
   openProposals: number;
   /** Proposals the team turned down, as a count. */
@@ -306,7 +461,50 @@ export interface SyncStatus {
    * a conflict by.
    */
   conflictList: SyncConflict[];
+  /**
+   * The chain's own number on the forge, or null when nothing is stacked.
+   *
+   * Never the gate on whether there is a chain to draw: on the stacked path
+   * this is null for as long as the call that groups the layers on the forge
+   * has not landed, and a screen that keyed off it would print "stack #null"
+   * over a chain that is perfectly real. {@link SyncStatus.stackLinkPending}
+   * is what that state says out loud.
+   */
+  stackNumber: number | null;
+  /**
+   * The declined layers still carrying open layers above them, by number.
+   *
+   * Empty when the chain is sound, and the one stack fact a screen must not
+   * hide: a wedged chain cannot grow until one of these is withdrawn or the
+   * chain is repaired, and the number is what either verb is addressed by.
+   */
+  stackWedged: number[];
+  /** A rebuild left half-done, which the next share or withdraw finishes. */
+  repairPending: boolean;
+  /** Every layer exists, but they are not grouped on the forge yet. */
+  stackLinkPending: boolean;
+  /**
+   * Whose credential a write to this origin goes out on: `instance` for the
+   * one machine credential, `personal` for the acting person's own. Null when
+   * the report did not say.
+   *
+   * The mode only, never the credential itself. In the browser the acting
+   * person is the SESSION, so this says which QUESTION to ask and
+   * `/me/github-identity` answers it: a dialog in personal mode asks whether
+   * this session has an identity, and one in instance mode asks nothing at
+   * all. Anything that is not the word `personal` leaves a dialog exactly as
+   * it was, which is what keeps an older report drawing the dialog it always
+   * drew.
+   */
+  shareIdentity: string | null;
 }
+// The report also carries `owner_identity` in personal mode - the MACHINE
+// owner's slot, what a CLI or local stdio share would resolve. It is not read
+// here on purpose: a share made from Fluid goes out as the SESSION's identity,
+// which `/me/github-identity` answers for, and no screen in this app describes
+// the owner's slot. A reader with nothing behind it is a claim to keep true
+// for nothing, so the key is ignored until a surface asks for it - at which
+// point it is five lines beside `shareIdentity`. The CLI renders it today.
 
 /** The cache key of one domain's sync status. */
 export function syncStatusKey(domain: string): readonly unknown[] {
@@ -327,6 +525,80 @@ export function syncStatusKey(domain: string): readonly unknown[] {
 export function sharePlanKey(domain: string): readonly unknown[] {
   return ["share-plan", domain];
 }
+
+/**
+ * One team domain's standing, as the instance-wide summary counts it.
+ *
+ * Counts and a name, and nothing else. The entry carries its repository, its
+ * branch and when it was last checked as well, and none of them is read here on
+ * purpose: this is what a share action needs to decide whether to offer itself
+ * and what to fill a picker with, while the card that draws a repository reads
+ * the per-domain report {@link SyncStatus} is made of.
+ */
+export interface SyncSummaryEntry {
+  domain: string;
+  /** Unshared local work, as a count. */
+  localChanges: number;
+  /**
+   * How much of it this session's account last wrote, or null when the report
+   * did not say. The pairing a picker row draws, for the reason
+   * {@link SyncStatus.ownedChanges} spells out.
+   */
+  ownedChanges: number | null;
+  openProposals: number;
+  declinedProposals: number;
+  conflicts: number;
+  /**
+   * The declined layers still carrying open layers above them, by number.
+   *
+   * The one stack fact a picker must not hide, which is why it rides along
+   * with a row that otherwise carries only counts: a wedged chain cannot
+   * grow, so a domain offered without it is a domain somebody picks and then
+   * finds out about from a refusal. Where the domain sits IN its chain is
+   * detail rather than a decision, and stays on the per-domain report.
+   */
+  stackWedged: number[];
+  /** A rebuild left half-done, which the next share or withdraw finishes. */
+  repairPending: boolean;
+  /** Every layer exists, but they are not grouped on the forge yet. */
+  stackLinkPending: boolean;
+}
+
+/** Where every team domain on this instance stands, in one read. */
+export interface SyncSummary {
+  /**
+   * Whether this instance has a GitHub credential on file, or null when the
+   * report carried no connection block at all. The three states are three
+   * different sentences, for the reason {@link SyncStatus.connected} spells
+   * out.
+   */
+  connected: boolean | null;
+  /** One entry per team domain; empty on an instance that has none. */
+  domains: SyncSummaryEntry[];
+}
+
+/**
+ * The cache key of the instance-wide sync summary, and the second key in this
+ * app that deliberately sits outside the `["domains", ...]` family.
+ *
+ * Reading the summary probes GitHub for every team domain at once, so it is not
+ * a cache of domain content: react-query invalidates by prefix, and a summary
+ * filed under `["domains"]` would be refetched - which is to say, would probe -
+ * by every bulk domain invalidation in the app, including the ones a share and
+ * an import fire on their way out. {@link sharePlanKey} carries the same
+ * reasoning for the same reason.
+ */
+export const SYNC_SUMMARY_KEY = ["sync-summary"] as const;
+
+/**
+ * How long a summary stays fresh, in milliseconds.
+ *
+ * Here rather than at one use site because there are two - the frame's share
+ * action and the picker it opens - and a picker that considered the frame's
+ * answer stale would probe every origin again in the act of being opened,
+ * which is a round trip to GitHub per domain to draw a list already in hand.
+ */
+export const SYNC_SUMMARY_STALE_MS = 30_000;
 
 /**
  * A count that may arrive as a number or as the list it counts.
@@ -364,6 +636,10 @@ function readProposal(value: unknown): SyncProposal | null {
       .map(readFeedback)
       .filter((item): item is ProposalFeedback => item !== null),
     updatedAt: asString(record?.updated_at),
+    // Absent on everything shared before the engine recorded it, and null
+    // wherever the acting credential had no login: both read as "nobody
+    // named", and a row draws nothing rather than a gap.
+    authorLogin: asString(record?.author_login),
   };
 }
 
@@ -410,12 +686,17 @@ function readConflict(value: unknown): SyncConflict | null {
 /** Read a sync status out of the engine's own per-domain report. */
 function readSyncStatus(payload: unknown): SyncStatus {
   const record = asObject(payload);
-  const connected = asObject(record?.connection)?.connected;
+  const connection = asObject(record?.connection);
+  const connected = connection?.connected;
   return {
     repo: asString(record?.repo) ?? "",
     branch: asString(record?.branch),
     lastChecked: asString(record?.last_checked),
     localChanges: asCount(record?.local_changes),
+    // A number or nothing, never a count of a list: this is the one field
+    // here that is genuinely absent on an older report, and asNumber keeps
+    // "did not say" apart from "none of it is yours".
+    ownedChanges: asNumber(record?.owned_changes),
     openProposals: asCount(record?.open_proposals),
     declinedProposals: asCount(record?.declined_proposals),
     conflicts: asCount(record?.conflicts),
@@ -436,6 +717,17 @@ function readSyncStatus(payload: unknown): SyncStatus {
     conflictList: asArray(record?.conflicts)
       .map(readConflict)
       .filter((conflict): conflict is SyncConflict => conflict !== null),
+    // The four chain keys, which the route always sends and an older report
+    // never did: quiet defaults rather than holes, so one reader handles the
+    // stacked path and the unstacked one.
+    stackNumber: asNumber(record?.stack_number),
+    stackWedged: asNumbers(record?.stack_wedged),
+    repairPending: record?.repair_pending === true,
+    stackLinkPending: record?.stack_link_pending === true,
+    // Off the connection block, where the route puts it, and tolerant: a mode
+    // that is not a word is "this report does not say", which every reader
+    // treats as the default mode rather than as personal.
+    shareIdentity: asString(connection?.share_identity),
   };
 }
 
@@ -446,6 +738,52 @@ export async function fetchSyncStatus(domain: string): Promise<SyncStatus> {
   );
 }
 
+/**
+ * One summary entry.
+ *
+ * The name or nothing: it is the handle a share is addressed by, so an entry
+ * without one is dropped rather than offered as a row that would open a dialog
+ * pointing at no domain.
+ */
+function readSummaryEntry(value: unknown): SyncSummaryEntry | null {
+  const record = asObject(value);
+  const domain = asString(record?.domain);
+  if (domain === null) {
+    return null;
+  }
+  return {
+    domain,
+    localChanges: asCount(record?.local_changes),
+    ownedChanges: asNumber(record?.owned_changes),
+    openProposals: asCount(record?.open_proposals),
+    declinedProposals: asCount(record?.declined_proposals),
+    conflicts: asCount(record?.conflicts),
+    stackWedged: asNumbers(record?.stack_wedged),
+    repairPending: record?.repair_pending === true,
+    stackLinkPending: record?.stack_link_pending === true,
+  };
+}
+
+/**
+ * Where every team domain stands, in counts. Admin only.
+ *
+ * An instance with GitHub switched off refuses this with a 409, and an instance
+ * with no credential on file is reported rather than refused - `connected` is
+ * false and the entries are local state alone.
+ */
+export async function fetchSyncSummary(): Promise<SyncSummary> {
+  const record = asObject(await api<unknown>("/sync"));
+  const connected = asObject(record?.connection)?.connected;
+  return {
+    // Only a literal boolean is an answer, the way the per-domain report reads
+    // the same block: anything else is "this report does not say".
+    connected: typeof connected === "boolean" ? connected : null,
+    domains: asArray(record?.domains)
+      .map(readSummaryEntry)
+      .filter((entry): entry is SyncSummaryEntry => entry !== null),
+  };
+}
+
 /** Pull this team domain's origin now. */
 export async function syncDomain(domain: string): Promise<unknown> {
   return api<unknown>(`/domains/${encodeSegment(domain)}/sync`, {
@@ -453,17 +791,34 @@ export async function syncDomain(domain: string): Promise<unknown> {
   });
 }
 
+/**
+ * One file a share would carry, as the plan reports it.
+ *
+ * `lastAuthor` is the OKF actor the file's own frontmatter records as having
+ * written it - `human:ada` for a person, an agent's own name for an agent -
+ * and null wherever there is nothing to read: a deleted file, a file edited
+ * outside the engine, an older server that names nobody. It is last-writer
+ * provenance rather than authorship, and it is what lets the share dialog
+ * open with a person's own work already ticked.
+ */
+export interface ShareChange {
+  path: string;
+  kind: string;
+  lastAuthor: string | null;
+}
+
 /** What a share would do, before anybody commits to doing it. */
 export interface SharePlan {
   /**
-   * `create`, `update`, `nothing_to_share`, `conflicts_pending` or
-   * `proposal_diverged` - the server's own word for what the button would do,
-   * which is also what decides whether there is a button at all.
+   * `create`, `update`, `stack`, `amend`, `nothing_to_share`,
+   * `conflicts_pending` or `proposal_diverged` - the server's own word for
+   * what the button would do, which is also what decides whether there is a
+   * button at all.
    */
   action: string;
   /** The title the proposal would carry, the server's own if none was given. */
   effectiveTitle: string;
-  changes: { path: string; kind: string }[];
+  changes: ShareChange[];
   /** The proposal an `update` would go into; null for the other actions. */
   number: number | null;
   url: string | null;
@@ -475,6 +830,51 @@ export interface SharePlan {
    * reader can size the work from before opening the screen that settles them.
    */
   count: number | null;
+  /**
+   * The open layer a `stack` would sit on, and its title; null on every other
+   * action. The whole difference between stacking and opening a lone proposal
+   * is what it lands on, so the plan names it.
+   */
+  topNumber: number | null;
+  topTitle: string | null;
+  /**
+   * How many layers an `amend` would rebuild; null on every other action.
+   *
+   * The difference between amending the top layer and amending one under it:
+   * the second re-bases work that is already in front of reviewers.
+   */
+  layersAbove: number | null;
+}
+
+/**
+ * Where a shared proposal sits in its chain, as the share outcome reports it.
+ *
+ * Two fields with one rule between them, which is why they are read together
+ * rather than field by field at a use site: `stackPosition` is `[layer, open
+ * layers]` with a 1-based layer and is the gate on whether there is a chain at
+ * all, while `stackNumber` is named only when there is one. On the stacked
+ * path the position is always set and the number is null until the call that
+ * groups the chain on the forge lands, so a renderer that keyed off the number
+ * would print "stack #null" over a chain that is perfectly real.
+ */
+export interface StackPlacement {
+  stackNumber: number | null;
+  /** `[layer, open layers]`, 1-based, or null off the stacked path. */
+  stackPosition: [number, number] | null;
+}
+
+/** Read a placement off whatever the share outcome carried. */
+export function readStackPlacement(payload: unknown): StackPlacement {
+  const record = asObject(payload);
+  const position = asArray(record?.stack_position);
+  const layer = asNumber(position[0]);
+  const open = asNumber(position[1]);
+  return {
+    stackNumber: asNumber(record?.stack_number),
+    // Both halves or nothing: half a position says neither which layer this
+    // is nor how many there are, and either alone is unprintable.
+    stackPosition: layer === null || open === null ? null : [layer, open],
+  };
 }
 
 /**
@@ -497,28 +897,48 @@ export async function fetchShareChanges(domain: string): Promise<SharePlan> {
         const path = asString(change?.path);
         return path === null
           ? null
-          : { path, kind: asString(change?.kind) ?? "" };
+          : {
+              path,
+              kind: asString(change?.kind) ?? "",
+              // A server that names nobody reads exactly like a file nobody
+              // is named for, which is the same thing to every reader of it.
+              lastAuthor: asString(change?.last_author),
+            };
       })
-      .filter(
-        (change): change is { path: string; kind: string } => change !== null,
-      ),
+      .filter((change): change is ShareChange => change !== null),
     number: asNumber(record?.number),
     url: asString(record?.url),
     count: asNumber(record?.count),
+    topNumber: asNumber(record?.top_number),
+    topTitle: asString(record?.top_title),
+    layersAbove: asNumber(record?.layers_above),
   };
 }
 
 /**
- * Share this domain's local changes as a proposal, or into the open one.
+ * Share this domain's local changes as a proposal, as a new layer on the chain
+ * already open, or into an open layer named by number.
  *
  * The outcome comes back as the engine's own report rather than as a shape read
  * here: it is five different answers (`proposed`, `updated`,
  * `nothing_to_share`, `conflicts_pending`, `proposal_diverged`) and the screen
  * that asked is the one that knows which of them it is looking for.
+ * {@link readStackPlacement} is how the two that landed say where in the chain
+ * they landed.
  */
 export async function shareDomain(
   domain: string,
-  body: { title?: string; description?: string },
+  body: {
+    title?: string;
+    description?: string;
+    proposal?: number;
+    /**
+     * The files to carry, when they are some of them rather than all of them.
+     * Left out entirely for a share of everything, so the common case is the
+     * request it always was.
+     */
+    files?: string[];
+  },
 ): Promise<unknown> {
   return api<unknown>(`/domains/${encodeSegment(domain)}/sync/share`, {
     method: "POST",
@@ -545,6 +965,24 @@ export interface WithdrawReceipt {
   deleted: string[];
   /** Files a reviewer amended on the branch, which a revert leaves alone. */
   skippedDiverged: string[];
+  /**
+   * Files whose pre-share content is nowhere to be had, so no revert could put
+   * them back. A different reason from {@link WithdrawReceipt.skippedDiverged}
+   * and worth its own sentence: nobody moved on from these, they simply cannot
+   * be restored, and somebody has to know which ones.
+   */
+  skippedReverts: string[];
+  /** Whether the chain around the withdrawn layer was rebuilt. */
+  repaired: boolean;
+  /**
+   * The NEW stack number that rebuild allocated, or null.
+   *
+   * Null covers both "no repair happened" and "the survivors no longer make a
+   * chain", so it is read together with {@link WithdrawReceipt.repaired}
+   * rather than alone. Stack numbers come off the same sequence as proposal
+   * numbers, so the old one never comes back.
+   */
+  restacked: number | null;
 }
 
 /** Close a proposal on the forge; `revert` also restores the shared files. */
@@ -567,6 +1005,9 @@ export async function withdrawProposal(
     restored: asStrings(record?.restored),
     deleted: asStrings(record?.deleted),
     skippedDiverged: asStrings(record?.skipped_diverged),
+    skippedReverts: asStrings(record?.skipped_reverts),
+    repaired: record?.repaired === true,
+    restacked: asNumber(record?.restacked),
   };
 }
 

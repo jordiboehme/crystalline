@@ -13,6 +13,7 @@ mod engrams;
 mod error;
 mod evolve;
 mod files;
+mod github_identity;
 mod github_settings;
 mod graph;
 mod users_api;
@@ -21,7 +22,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{delete, get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use tokio::sync::Semaphore;
 
 pub use auth::{
@@ -91,6 +92,7 @@ use crate::engine::Engine;
         domains_admin::remove,
         domains_admin::sync_status,
         domains_admin::sync_now,
+        domains_admin::sync_summary,
         domains_admin::share_changes_preview,
         domains_admin::share_now,
         domains_admin::withdraw_proposal,
@@ -133,6 +135,10 @@ use crate::engine::Engine;
         github_settings::connect,
         github_settings::token,
         github_settings::disconnect,
+        github_identity::status,
+        github_identity::connect,
+        github_identity::token,
+        github_identity::disconnect,
     ),
     components(schemas(
         ProblemDetail,
@@ -169,6 +175,7 @@ use crate::engine::Engine;
         github_settings::TokenBody,
         github_settings::GithubStatusResponse,
         github_settings::GithubPendingView,
+        github_identity::GithubIdentityResponse,
     )),
 )]
 struct ApiDoc;
@@ -421,6 +428,11 @@ pub fn router(state: RestState) -> Router {
             "/domains/{domain}/sync",
             get(domains_admin::sync_status).post(domains_admin::sync_now),
         )
+        // The instance-wide read behind the top bar's share action: one call
+        // that says whether any team domain has something to share. A pure
+        // read like the per-domain GET above, and served the same way on a
+        // read-only instance.
+        .route("/sync", get(domains_admin::sync_summary))
         // The share half of the same card. The preview is a GET that pulls,
         // so it is refused on a read-only instance like the writes below it;
         // the two conflict routes are offline verbs and need no connection.
@@ -554,6 +566,22 @@ pub fn router(state: RestState) -> Router {
         )
         .route("/settings/github/connect", post(github_settings::connect))
         .route("/settings/github/token", post(github_settings::token))
+        // The self-service half of the same surface, and the one settings
+        // path that is not admin-only: an account's OWN GitHub identity, the
+        // credential its shares go out on when this instance shares
+        // personally. No name in the path - the session already names the
+        // account - so a caller can only ever manage their own. The GET is a
+        // pure read and stays served on a read-only instance; the three
+        // mutations are refused there like every other write here.
+        .route(
+            "/me/github-identity",
+            get(github_identity::status).delete(github_identity::disconnect),
+        )
+        .route(
+            "/me/github-identity/connect",
+            post(github_identity::connect),
+        )
+        .route("/me/github-identity/token", put(github_identity::token))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

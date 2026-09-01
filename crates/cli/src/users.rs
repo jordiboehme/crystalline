@@ -89,6 +89,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         }
         UsersCommand::Disable { name } => {
             store.set_disabled(&name, true).await?;
+            sweep_personal_credential(&name).await;
             println!(
                 "Disabled '{}' and revoked its sessions. Enabling it again does not bring them back.",
                 stored_name(&name)
@@ -115,6 +116,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         UsersCommand::Remove { name, force } => {
             if force {
                 store.remove_user_force(&name).await?;
+                sweep_personal_credential(&name).await;
                 println!(
                     "Removed '{}' and every session it held (forced). The installation \
                      may now have no admin; add one with `crystalline users add <name> --role admin`.",
@@ -122,6 +124,7 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 );
             } else {
                 store.remove_user(&name).await?;
+                sweep_personal_credential(&name).await;
                 println!(
                     "Removed '{}' and every session it held.",
                     stored_name(&name)
@@ -130,6 +133,61 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Forgets the GitHub identity an account connected for sharing, after that
+/// account has been disabled or removed. Best effort in every direction: the
+/// account is already gone from the auth store, and a credential this cannot
+/// resolve or delete is an orphan rather than a failure - it addresses nothing
+/// once no account carries the name, and reconnecting overwrites it.
+///
+/// Silent by design (a debug log, findable with `RUST_LOG`): the command's own
+/// confirmation line is about the account, and a person who never connected an
+/// identity - the common case - must not be told about a credential that was
+/// never there. The name is folded exactly as the auth store folds it, so the
+/// credential swept is the one that account's own connect would have written;
+/// a name the credential allowlist cannot address never had one.
+///
+/// A running daemon is told, exactly as `connect github --disconnect` tells
+/// it: this is the second writer of the credential store, and it is the
+/// "person leaving" case - the daemon's process cache would otherwise go on
+/// holding a token for an account that no longer exists until it restarted.
+/// The telling stays silent whatever it comes to, unlike the disconnect verb's:
+/// there the caller asked to forget a credential and a daemon that refused is
+/// news, while here the sweep is a side effect they were never told about, so
+/// a line about an unreachable daemon would name a credential the operator
+/// does not know was in play.
+async fn sweep_personal_credential(name: &str) {
+    let account = stored_name(name);
+    if !crystalline_remote::valid_identity_name(&account) {
+        tracing::debug!("'{account}' cannot address a credential; nothing to forget");
+        return;
+    }
+    let identity = crystalline_remote::TokenIdentity::Personal(account);
+    // The host the credential is filed under, from the same config the connect
+    // path reads. A config that will not load is not worth failing an account
+    // change over: github.com is where all but the Enterprise Server installs
+    // keep it anyway.
+    let host = crate::cmd::load(None)
+        .ok()
+        .and_then(|loaded| {
+            loaded
+                .effective
+                .github
+                .as_ref()
+                .and_then(|g| g.api_url.clone())
+        })
+        .and_then(|api_url| {
+            crate::cmd::bare_host(&crystalline_remote::github::auth::auth_base(Some(&api_url)))
+        });
+    match crystalline_core::config::origins_state_dir() {
+        Ok(dir) => crate::cmd::forget_credential(&identity, host.as_deref(), &dir),
+        Err(e) => tracing::debug!("could not resolve the state directory to sweep: {e}"),
+    }
+    if let crate::cmd::DaemonNotice::Refused(e) = crate::cmd::notify_daemon_forgot(&identity).await
+    {
+        tracing::debug!("a running daemon still holds the swept credential: {e}");
+    }
 }
 
 /// The form the store keys on, for confirmation messages only: it is what the

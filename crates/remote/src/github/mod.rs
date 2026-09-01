@@ -33,14 +33,15 @@ use serde::de::DeserializeOwned;
 use crate::error::RemoteError;
 use crate::provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
-    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
+    ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
 use types::{
     BlobResponse, CloseProposalRequest, CommitResponse, CompareFile, CompareResponse,
     CreateBlobRequest, CreateCommitRequest, CreateProposalRequest, CreateProposalResponse,
     CreateRefRequest, CreateTreeRequest, CurrentUserResponse, ErrorBody, IssueCommentResponse,
     OpenProposalListItem, ProposalStateResponse, RefResponse, ReviewCommentResponse,
-    ReviewResponse, ShaResponse, TreeEntryRequest, UpdateProposalRequest, UpdateRefRequest,
+    ReviewResponse, ShaResponse, StackResponse, StackWriteRequest, TreeEntryRequest,
+    UpdateProposalRequest, UpdateRefRequest,
 };
 
 /// The default GitHub REST API base url.
@@ -58,6 +59,17 @@ const COMPARE_PER_PAGE: usize = 100;
 /// for one comparison. Reaching it means there may be more files than shown;
 /// callers fall back to a tarball diff against the base snapshot.
 const COMPARE_FILES_CAP: usize = 300;
+
+/// How many attempts a stack write makes in total. GitHub answers 409 while
+/// the stack is being modified elsewhere, which is a race rather than a
+/// refusal, so the write is retried a bounded number of times before the
+/// conflict is handed to the caller.
+const STACK_WRITE_ATTEMPTS: usize = 3;
+
+/// How long to wait before each retry of a conflicted stack write, one entry
+/// per retry, so `STACK_WRITE_ATTEMPTS` attempts wait at most 750ms in total.
+const STACK_WRITE_BACKOFF: [Duration; STACK_WRITE_ATTEMPTS - 1] =
+    [Duration::from_millis(250), Duration::from_millis(500)];
 
 /// The per-request timeout. Generous enough for a large tarball download,
 /// short enough that a stalled connection is reported as
@@ -196,6 +208,57 @@ impl GitHubProvider {
             page += 1;
         }
         Ok(out)
+    }
+
+    /// Posts a stack write (creating a stack, or adding layers to one) and
+    /// reads the stack it answers with.
+    ///
+    /// Two answers are read before [`check`](GitHubProvider::check) sees
+    /// them. A 409 is GitHub reporting that the stack is being modified
+    /// concurrently: the write is retried up to [`STACK_WRITE_ATTEMPTS`]
+    /// times with [`STACK_WRITE_BACKOFF`] between the tries, and only a
+    /// conflict that survives all of them is surfaced, as an ordinary
+    /// [`RemoteError::Api`] carrying GitHub's message.
+    ///
+    /// A 404 depends on what `path` names, which is what `numbered` says. On
+    /// the collection path (`POST /stacks`, creating a stack) it is the forge
+    /// saying it has no stack endpoints at all, so it becomes
+    /// [`RemoteError::StacksUnsupported`]. On a path carrying a concrete
+    /// stack number it means THAT stack is gone - somebody dissolved it on
+    /// the website - which says nothing about the forge, so it comes back as
+    /// a plain `Api { status: 404 }` for the caller to rebuild from. Reading
+    /// the second as the first would stand a whole origin down to the
+    /// fallback path over one dissolved stack.
+    async fn stack_write(
+        &self,
+        repo: &str,
+        path: &str,
+        pull_requests: &[u64],
+        numbered: bool,
+    ) -> Result<StackInfo, RemoteError> {
+        let body = StackWriteRequest {
+            pull_requests: pull_requests.to_vec(),
+        };
+        let mut attempt = 1usize;
+        loop {
+            let response = self
+                .send(self.request(Method::POST, path).json(&body))
+                .await?;
+            if !numbered && response.status() == StatusCode::NOT_FOUND {
+                return Err(RemoteError::StacksUnsupported);
+            }
+            if response.status() == StatusCode::CONFLICT && attempt < STACK_WRITE_ATTEMPTS {
+                tokio::time::sleep(STACK_WRITE_BACKOFF[attempt - 1]).await;
+                attempt += 1;
+                continue;
+            }
+            // A numbered path passes no repository to `check`, so its 404
+            // stays a 404 rather than becoming `RepoNotFound`.
+            let repo = (!numbered).then_some(repo);
+            let response = self.check(response, repo).await?;
+            let stack: StackResponse = parse_json(response).await?;
+            return Ok(map_stack(stack));
+        }
     }
 }
 
@@ -410,12 +473,13 @@ impl Provider for GitHubProvider {
         origin: &OriginSpec,
         name: &str,
         commit: &str,
+        force: bool,
     ) -> Result<(), RemoteError> {
         let (owner, repo_name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{repo_name}/git/refs/heads/{name}");
         let body = UpdateRefRequest {
             sha: commit.to_string(),
-            force: false,
+            force,
         };
         let response = self
             .send(self.request(Method::PATCH, &path).json(&body))
@@ -429,13 +493,15 @@ impl Provider for GitHubProvider {
         origin: &OriginSpec,
         number: u64,
         title: Option<&str>,
-        body: &str,
+        body: Option<&str>,
+        base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let (owner, name) = split_repo(&origin.repo)?;
         let path = format!("/repos/{owner}/{name}/pulls/{number}");
         let body = UpdateProposalRequest {
             title: title.map(str::to_string),
-            body: body.to_string(),
+            body: body.map(str::to_string),
+            base: base.map(str::to_string),
         };
         let response = self
             .send(self.request(Method::PATCH, &path).json(&body))
@@ -564,6 +630,74 @@ impl Provider for GitHubProvider {
         let body: CurrentUserResponse = parse_json(response).await?;
         Ok(body.login)
     }
+
+    async fn list_stacks(
+        &self,
+        origin: &OriginSpec,
+        pull_request: Option<u64>,
+    ) -> Result<Vec<StackInfo>, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        let path = match pull_request {
+            Some(number) => format!("/repos/{owner}/{name}/stacks?pull_request={number}"),
+            None => format!("/repos/{owner}/{name}/stacks"),
+        };
+        let response = self.send(self.request(Method::GET, &path)).await?;
+        if response.status() == StatusCode::NOT_FOUND {
+            // A forge that does not serve stacks answers 404 on this path:
+            // that is an answer about the forge, not a repository problem,
+            // so it is read here before check() maps it to RepoNotFound.
+            return Err(RemoteError::StacksUnsupported);
+        }
+        let response = self.check(response, Some(&origin.repo)).await?;
+        let stacks: Vec<StackResponse> = parse_json(response).await?;
+        Ok(stacks.into_iter().map(map_stack).collect())
+    }
+
+    async fn create_stack(
+        &self,
+        origin: &OriginSpec,
+        pull_requests: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{name}/stacks");
+        self.stack_write(&origin.repo, &path, pull_requests, false)
+            .await
+    }
+
+    async fn extend_stack(
+        &self,
+        origin: &OriginSpec,
+        stack_number: u64,
+        pull_requests: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let (owner, name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{name}/stacks/{stack_number}/add");
+        self.stack_write(&origin.repo, &path, pull_requests, true)
+            .await
+    }
+
+    async fn dissolve_stack(
+        &self,
+        origin: &OriginSpec,
+        stack_number: u64,
+    ) -> Result<(), RemoteError> {
+        let (owner, repo_name) = split_repo(&origin.repo)?;
+        let path = format!("/repos/{owner}/{repo_name}/stacks/{stack_number}/unstack");
+        let response = self.send(self.request(Method::POST, &path)).await?;
+        // GitHub answers 204 when every member left the stack and 200 with
+        // whatever remains when some member could not be released (a queued
+        // merge holds it). Both mean the request was carried out, and this
+        // client has nothing to do with the remainder, so the body is
+        // deliberately not read.
+        //
+        // The path names a concrete stack, so a 404 means that stack is gone
+        // rather than that the forge has no stacks - and a dissolve of
+        // something already dissolved is a dissolve that is done. Passing no
+        // repository to `check` keeps it a 404 instead of `RepoNotFound`, and
+        // every caller reads it as done.
+        self.check(response, None).await?;
+        Ok(())
+    }
 }
 
 /// Splits `repo` (`owner/name`) into its two halves. `OriginSpec.repo` is
@@ -662,6 +796,25 @@ fn map_compare_file(file: CompareFile) -> UpstreamChange {
         path: file.filename,
         kind,
         blob_sha: if removed { None } else { Some(file.sha) },
+    }
+}
+
+/// Maps one stack, as GitHub reports it, to the forge-neutral [`StackInfo`].
+/// Member order is GitHub's own: bottom layer first, which is the order every
+/// caller here relies on.
+fn map_stack(stack: StackResponse) -> StackInfo {
+    StackInfo {
+        number: stack.number,
+        open: stack.open,
+        members: stack
+            .pull_requests
+            .into_iter()
+            .map(|member| StackMember {
+                number: member.number,
+                state: member.state,
+                head_sha: member.head.sha,
+            })
+            .collect(),
     }
 }
 

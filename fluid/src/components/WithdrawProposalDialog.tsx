@@ -23,8 +23,21 @@ export interface WithdrawProposalDialogProps {
   domain: string;
   /** The proposal being taken back, for its number and its title. */
   proposal: SyncProposal;
+  /**
+   * How many open layers sit on this one, and so how many a withdraw here
+   * would re-base. Zero for the top layer and for a proposal in no chain,
+   * which is the same thing as far as this dialog is concerned: nothing is
+   * rebuilt, so nothing is warned about.
+   */
+  layersAbove: number;
   /** Leave the dialog: cancelled, dismissed, or a withdraw that landed. */
   onClose: () => void;
+  /**
+   * What the withdraw could not do, though it landed - handed back for the
+   * reason {@link WithdrawProposalDialogProps.onProblem} is: this dialog is
+   * closed by the time there is anything to say.
+   */
+  onNotice: (detail: string) => void;
   /**
    * A refusal in the server's own words.
    *

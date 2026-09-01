@@ -7,8 +7,11 @@
 //! download for `subscribe`, a diff-based compare for `pull`, a conditional
 //! branch probe for `status`, and a working write side
 //! (`create_blob`/`create_tree`/`create_commit`/`create_branch`/
-//! `create_proposal`) against the same in-memory graph for `origin_share`.
-//! Production code never depends on this; it exists only under `tests/`.
+//! `create_proposal`) against the same in-memory graph for `origin_share`,
+//! plus a minimal stack registry so a stacked share can publish a second
+//! layer here (see [`MockProvider::enable_stacks`] for what that model does
+//! and does not cover). Production code never depends on this; it exists only
+//! under `tests/`.
 
 #![allow(dead_code)]
 
@@ -19,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use crystalline_index::EmbeddingProvider;
 use crystalline_remote::provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
-    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
+    ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
 use crystalline_remote::{DeviceFlowStart, RemoteError};
 use crystalline_service::engine::ConnectAuth;
@@ -81,6 +84,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/domains/{domain}/retire",
     "POST /api/v1/domains/{domain}/move",
     "POST /api/v1/validate",
+    "GET /api/v1/sync",
     "GET /api/v1/collab/{domain}/{permalink}",
     "GET /api/v1/search",
     "GET /api/v1/vocabulary",
@@ -99,6 +103,10 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/settings/github",
     "POST /api/v1/settings/github/connect",
     "POST /api/v1/settings/github/token",
+    "GET /api/v1/me/github-identity",
+    "DELETE /api/v1/me/github-identity",
+    "POST /api/v1/me/github-identity/connect",
+    "PUT /api/v1/me/github-identity/token",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
@@ -174,6 +182,14 @@ struct Inner {
     /// `MockProvider::register_proposal_branch` for a proposal a test seeded
     /// straight into origin state.
     proposal_branches: HashMap<u64, String>,
+    /// The branch each proposal targets, filled by `create_proposal` and moved
+    /// by a retargeting `update_proposal`. This is the base half of the
+    /// branch-head bookkeeping a stacked chain is read off.
+    proposal_bases: HashMap<u64, String>,
+    /// The stack registry: stack number to its members, bottom layer first.
+    /// Numbers come off `proposal_counter`, the way the forge hands stack and
+    /// pull-request numbers out of one series.
+    stacks: HashMap<u64, Vec<u64>>,
     /// The feedback `proposal_feedback` reports per proposal number, set
     /// through `MockProvider::set_feedback`.
     feedback: HashMap<u64, Feedback>,
@@ -183,9 +199,56 @@ struct Inner {
     close_failures: HashSet<u64>,
     /// Whether `list_open_proposals` answers `RemoteError::Offline`.
     open_list_fails: bool,
+    /// Whether every WRITE to the forge answers GitHub's 403, the shape a
+    /// token that authenticates fine but may not push to this repository comes
+    /// back as. Set through `MockProvider::forbid_writes`.
+    forbid_writes: bool,
+    /// Whether this forge answers the stack probe at all. Off by default, so
+    /// every test that does not ask for stacking keeps the single living
+    /// proposal this mock has always modelled.
+    stacks_enabled: bool,
     /// Every provider call made so far, in order, for tests asserting on the
     /// exact sequence a share-update or withdraw drives.
     calls: Vec<String>,
+}
+
+impl Inner {
+    /// One stack as the forge reports it: the stored member order, each
+    /// member's state and head sha read live, and `open` true while any member
+    /// is still open.
+    fn stack_info(&self, number: u64, members: &[u64]) -> StackInfo {
+        let members: Vec<StackMember> = members
+            .iter()
+            .map(|member| StackMember {
+                number: *member,
+                state: match self.proposal_states.get(member) {
+                    Some(ProposalState::Open) => "open",
+                    Some(ProposalState::Merged) => "merged",
+                    Some(ProposalState::Declined) => "closed",
+                    None => "unknown",
+                }
+                .to_string(),
+                head_sha: self
+                    .proposal_branches
+                    .get(member)
+                    .and_then(|branch| self.branches.get(branch))
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect();
+        StackInfo {
+            number,
+            open: members.iter().any(|member| member.state == "open"),
+            members,
+        }
+    }
+}
+
+/// A member list in the `[6,8]` shape the call log records stack writes in,
+/// matching the remote crate's mock so an assertion reads the same in both.
+fn number_list(numbers: &[u64]) -> String {
+    let joined: Vec<String> = numbers.iter().map(u64::to_string).collect();
+    format!("[{}]", joined.join(","))
 }
 
 /// An in-memory forge implementing [`Provider`] for the origin engine tests.
@@ -355,6 +418,14 @@ impl MockProvider {
         self.inner.lock().unwrap().open_list_fails = true;
     }
 
+    /// Makes every write to this forge answer GitHub's 403 - the shape a
+    /// credential that authenticated fine but cannot push to this repository
+    /// comes back as. Checked on the first write a share makes, which is
+    /// enough: the share never reaches the second one.
+    pub fn forbid_writes(&self) {
+        self.inner.lock().unwrap().forbid_writes = true;
+    }
+
     /// Makes `close_proposal` fail with a 500 for `number`.
     pub fn fail_close_proposal(&self, number: u64) {
         self.inner.lock().unwrap().close_failures.insert(number);
@@ -363,6 +434,55 @@ impl MockProvider {
     /// Makes `proposal_feedback` fail with a 500 for `number`.
     pub fn fail_feedback(&self, number: u64) {
         self.inner.lock().unwrap().feedback_failures.insert(number);
+    }
+
+    /// Makes this forge answer the stack probe and the three stack writes, so
+    /// a share takes the stacked path instead of updating one living proposal
+    /// and can actually publish a second layer.
+    ///
+    /// The chain model here is deliberately minimal: a registry of member
+    /// lists with the branch bookkeeping needed to report each member's state
+    /// and head, and no chain validation at all. The forge's own rules - a
+    /// member's base ref must be the layer below's head ref, a closed top
+    /// blocks an extend, a stacked proposal cannot be retargeted - are
+    /// modelled and exercised end to end in `crates/remote/tests/mock`, where
+    /// the stacked lifecycle lives. What these tests need from a forge is that
+    /// a stacked share reaches the wire and comes back with populated chain
+    /// values, and that is what this covers.
+    pub fn enable_stacks(&self) {
+        self.inner.lock().unwrap().stacks_enabled = true;
+    }
+
+    /// The branch proposal `number` targets, as its opening request or a later
+    /// retarget left it. This is how a test reads which layer a stacked
+    /// proposal was actually opened against.
+    pub fn proposal_base(&self, number: u64) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .proposal_bases
+            .get(&number)
+            .cloned()
+    }
+
+    /// Every stack in the registry, lowest number first.
+    pub fn stacks(&self) -> Vec<StackInfo> {
+        let inner = self.inner.lock().unwrap();
+        let mut numbers: Vec<u64> = inner.stacks.keys().copied().collect();
+        numbers.sort_unstable();
+        numbers
+            .into_iter()
+            .map(|number| inner.stack_info(number, &inner.stacks[&number]))
+            .collect()
+    }
+
+    /// One stack as the forge reports it, or `None` once it is dissolved.
+    pub fn stack(&self, number: u64) -> Option<StackInfo> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .stacks
+            .get(&number)
+            .map(|members| inner.stack_info(number, members))
     }
 }
 
@@ -512,8 +632,16 @@ impl Provider for MockProvider {
     ) -> Result<String, RemoteError> {
         let sha = sha256_hex(content);
         let mut inner = self.inner.lock().unwrap();
-        inner.blobs.insert(sha.clone(), content.to_vec());
+        // Logged before the failure check, like every other injected failure
+        // here, so a refused write still leaves a trace of the attempt.
         inner.calls.push(format!("create_blob:{sha}"));
+        if inner.forbid_writes {
+            return Err(RemoteError::Api {
+                status: 403,
+                message: "Resource not accessible by personal access token".to_string(),
+            });
+        }
+        inner.blobs.insert(sha.clone(), content.to_vec());
         Ok(sha)
     }
 
@@ -618,13 +746,18 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         name: &str,
         commit: &str,
+        force: bool,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.etag_counter += 1;
         let etag = format!("etag{}", inner.etag_counter);
         inner.branches.insert(name.to_string(), commit.to_string());
         inner.etags.insert(name.to_string(), etag);
-        inner.calls.push(format!("update_branch:{name}:{commit}"));
+        // Extends the old `update_branch:{name}:{commit}` with the force flag
+        // rather than rewording it, so `starts_with` assertions keep matching.
+        inner
+            .calls
+            .push(format!("update_branch:{name}:{commit}:force={force}"));
         Ok(())
     }
 
@@ -633,10 +766,22 @@ impl Provider for MockProvider {
         _origin: &OriginSpec,
         number: u64,
         _title: Option<&str>,
-        _body: &str,
+        _body: Option<&str>,
+        base: Option<&str>,
     ) -> Result<(), RemoteError> {
         let mut inner = self.inner.lock().unwrap();
         inner.calls.push(format!("update_proposal:{number}"));
+        // A retarget is recorded as its own line, mirroring the remote crate's
+        // mock: an amend re-bases the layers above it, and the only evidence
+        // that reached this double is the base each `update_proposal` carried.
+        // Recorded beside the plain line rather than instead of it, so
+        // existing `update_proposal:{number}` assertions keep matching.
+        if let Some(base) = base {
+            inner.proposal_bases.insert(number, base.to_string());
+            inner
+                .calls
+                .push(format!("update_proposal_base:{number}:{base}"));
+        }
         Ok(())
     }
 
@@ -715,6 +860,7 @@ impl Provider for MockProvider {
         let number = inner.proposal_counter;
         inner.proposal_states.insert(number, ProposalState::Open);
         inner.proposal_branches.insert(number, req.branch.clone());
+        inner.proposal_bases.insert(number, req.base_branch.clone());
         inner.calls.push(format!("create_proposal:{}", req.branch));
         Ok(ProposalHandle {
             number,
@@ -740,6 +886,94 @@ impl Provider for MockProvider {
 
     async fn current_user(&self) -> Result<String, RemoteError> {
         Ok(self.inner.lock().unwrap().current_user.clone())
+    }
+
+    /// The capability probe and the chain listing. An enabled forge answers
+    /// out of the registry, which is empty until something is grouped - what a
+    /// repository that serves the endpoints and has stacked nothing looks
+    /// like. A disabled one refuses exactly as the trait default does, so the
+    /// single-proposal fallback stays the default here.
+    async fn list_stacks(
+        &self,
+        _origin: &OriginSpec,
+        pull_request: Option<u64>,
+    ) -> Result<Vec<StackInfo>, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        match pull_request {
+            Some(number) => inner.calls.push(format!("list_stacks:{number}")),
+            None => inner.calls.push("list_stacks".to_string()),
+        }
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        let mut numbers: Vec<u64> = inner.stacks.keys().copied().collect();
+        numbers.sort_unstable();
+        Ok(numbers
+            .into_iter()
+            .filter(|number| match pull_request {
+                Some(wanted) => inner.stacks[number].contains(&wanted),
+                None => true,
+            })
+            .map(|number| inner.stack_info(number, &inner.stacks[&number]))
+            .collect())
+    }
+
+    async fn create_stack(
+        &self,
+        _origin: &OriginSpec,
+        numbers: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .push(format!("create_stack:{}", number_list(numbers)));
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        inner.proposal_counter += 1;
+        let number = inner.proposal_counter;
+        inner.stacks.insert(number, numbers.to_vec());
+        Ok(inner.stack_info(number, numbers))
+    }
+
+    async fn extend_stack(
+        &self,
+        _origin: &OriginSpec,
+        stack: u64,
+        numbers: &[u64],
+    ) -> Result<StackInfo, RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner
+            .calls
+            .push(format!("extend_stack:{stack}:{}", number_list(numbers)));
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        let Some(members) = inner.stacks.get_mut(&stack) else {
+            return Err(RemoteError::Api {
+                status: 404,
+                message: format!("no stack {stack}"),
+            });
+        };
+        members.extend_from_slice(numbers);
+        let members = members.clone();
+        Ok(inner.stack_info(stack, &members))
+    }
+
+    async fn dissolve_stack(&self, _origin: &OriginSpec, stack: u64) -> Result<(), RemoteError> {
+        let mut inner = self.inner.lock().unwrap();
+        inner.calls.push(format!("dissolve_stack:{stack}"));
+        if !inner.stacks_enabled {
+            return Err(RemoteError::StacksUnsupported);
+        }
+        inner
+            .stacks
+            .remove(&stack)
+            .map(|_| ())
+            .ok_or_else(|| RemoteError::Api {
+                status: 404,
+                message: format!("no stack {stack}"),
+            })
     }
 }
 

@@ -14,8 +14,62 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
 use super::auth::Identity;
-use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
-use crate::engine::EngineError;
+use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only};
+use crate::engine::{EngineError, PreviewCredential, ShareActor};
+
+/// The caller, when they may drive this instance's share surfaces - the status
+/// report, the preview, the share, a withdrawal, and reading or resolving a
+/// conflict, the six routes that act on or describe the team's repository.
+///
+/// Two of them are reads gated with the writes rather than with the plain
+/// admin reads beside them, and both for the same reason. The conflict READ:
+/// whoever may settle a conflict has to see the three sides they are choosing
+/// between, so splitting the pair would leave an editor resolving blind. The
+/// STATUS: it is the report every share surface is drawn from - the open
+/// layers, who authored them, what is wedged - so an editor who may share and
+/// may not read it would be sharing into a card they cannot see.
+///
+/// The rule itself lives on [`Identity::may_share`], which the `/auth/me`
+/// probe reads too, so what a client draws and what these routes serve can
+/// never disagree. This wrapper is the local reading of the instance's mode,
+/// which is deliberately taken LIVE on every call: a `configure` that flips
+/// `github.share_identity` opens or closes these surfaces at the next request
+/// rather than at the next restart.
+fn require_share_role(state: &RestState, identity: &Identity) -> Result<Caller, ApiError> {
+    identity.may_share(state.engine.share_identity_mode())
+}
+
+/// The account a request is being served as, or `None` for the anonymous
+/// viewer, which has no account to attribute anybody's work to.
+///
+/// The gate on `owned_changes`: without a session account there is no question
+/// to answer, and the routes send `null` rather than a zero that would read as
+/// "none of this is yours".
+fn session_account(caller: &Caller) -> Option<&str> {
+    match caller {
+        Caller::Account(user) => Some(user.name.as_str()),
+        Caller::Anonymous => None,
+    }
+}
+
+/// How many of one team domain's unshared substantive changes this session's
+/// account last wrote, as a JSON number, or `null` when nobody can be asked
+/// about: no session account, or a domain whose origin state cannot be read.
+///
+/// Costs one walk of the domain root, the same walk the status read beside it
+/// already performed. Deliberate: the alternative is threading a change list
+/// out through an aggregate report that carries counts on purpose.
+async fn owned_changes(state: &RestState, domain: &str, caller: &Caller) -> Value {
+    let Some(account) = session_account(caller) else {
+        return Value::Null;
+    };
+    state
+        .engine
+        .owned_local_changes(domain, account)
+        .await
+        .map(Value::from)
+        .unwrap_or(Value::Null)
+}
 
 /// What `POST /domains` takes: a mode and whatever that mode needs.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
@@ -469,6 +523,13 @@ fn single_domain(
 /// a sync card to show) - the engine documents `origin_status` as allowed
 /// there, and the group's ruling is that read_only refuses writes, not reads.
 ///
+/// Gated with the share verbs rather than with the plain admin reads beside
+/// it, the same move the conflict READ made and for the same reason: this is
+/// the report every share surface is drawn from - which layers are open, who
+/// authored them, what is wedged - so whoever may share has to be able to read
+/// it, or they would be sharing blind into a card they cannot see. In instance
+/// mode that is admin only, byte for byte what it always was.
+///
 /// A domain with no origin answers 404 rather than an empty status: the
 /// resource "team sync status" does not exist for a local or virtual domain.
 /// A client can therefore treat any 404 here as "show no card" while the
@@ -491,7 +552,12 @@ fn single_domain(
     tag = "domains",
     operation_id = "get_domain_sync_status",
     summary = "Where a team domain stands relative to its GitHub origin.",
-    description = "Admin only. A pure read, served even on a read-only \
+    description = "Admin only, or an editor when this instance shares with \
+                   personal GitHub identities (`github.share_identity` = \
+                   `personal`): this is the report every share surface is \
+                   drawn from, so it is gated with the share verbs rather \
+                   than with the plain admin reads. A pure read, served even \
+                   on a read-only \
                    instance. Answers 404 for a domain with no origin - only \
                    a GitHub team domain has sync status - so a client can \
                    treat any 404 as `no sync card`. An instance with no \
@@ -505,13 +571,49 @@ fn single_domain(
             description = "The engine's own status report for this one \
                            domain, plus the mode it is synced in and this \
                            instance's GitHub connection. `local_changes` is \
-                           the unshared-work count a client shows as pending; \
+                           the unshared-work count a client shows as pending, \
+                           counting real work only: a refreshed folder listing \
+                           (`index.md`) is derived from the engrams beside it \
+                           and rides along with a share without ever being the \
+                           reason for one. `owned_changes` counts how many of \
+                           those changes THIS session's account last wrote, by \
+                           the changed file's own `generated.by` line - \
+                           last-writer provenance, never authorship - so a \
+                           surface can say `2 of 5 unshared changes are \
+                           yours`. It is null when the request carries no \
+                           session account or the domain's origin state cannot \
+                           be read, which is a different thing from zero; \
                            `probe_error` is set when the live check could not \
                            reach GitHub and the rest of the report came from \
                            local state alone; `connection.connected` is false \
                            when no credential is on file, which is why a \
                            disconnected instance still answers here instead \
-                           of refusing.",
+                           of refusing. `merged_unconsumed` names, by number, \
+                           the proposals a live check found merged upstream \
+                           that this domain has not pulled in yet: they stand \
+                           in neither proposal list, and the next sync \
+                           consumes them. Each proposal record carries \
+                           `author_login`, the GitHub login the share that \
+                           wrote it acted as - null on records shared before \
+                           this was recorded and whenever the acting \
+                           credential has no login to name, so a client shows \
+                           it where it is present and nothing where it is \
+                           not.\n\nFour keys say where the domain's \
+                           chain of stacked proposals stands. `stack_number` \
+                           is the chain's number on the forge, null when \
+                           nothing is stacked. `stack_wedged` lists the \
+                           declined layers still carrying open layers above \
+                           them, empty when the chain is sound - a client \
+                           surfaces those numbers, because a wedged chain \
+                           cannot grow until one of them is withdrawn or \
+                           reopened. `repair_pending` and \
+                           `stack_link_pending` are the two debts a caller \
+                           settles by sharing or by checking status again: a \
+                           rebuild left half-done, and a chain whose layers \
+                           all exist but are not grouped on the forge yet. \
+                           All four are always present, quiet rather than \
+                           absent off the stacked path, so one reader handles \
+                           either path.",
             body = Object,
             example = json!({
                 "domain": "eng",
@@ -521,11 +623,17 @@ fn single_domain(
                 "base_commit": "9f3c1a2",
                 "behind": false,
                 "local_changes": 2,
+                "owned_changes": 1,
                 "open_proposals": [],
                 "declined_proposals": [],
+                "merged_unconsumed": [],
                 "conflicts": [],
                 "last_checked": "2026-08-10T08:00:00Z",
                 "probe_error": null,
+                "stack_number": 42,
+                "stack_wedged": [],
+                "repair_pending": false,
+                "stack_link_pending": false,
                 "connection": { "connected": true, "user": "octo", "token_store": "keychain" }
             }),
         ),
@@ -537,8 +645,10 @@ fn single_domain(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or the trusted-header \
-                           identity names a disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), or the \
+                           trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -565,7 +675,9 @@ pub async fn sync_status(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    // The share verbs' own gate: whoever may share reads the report they would
+    // be sharing into. See the doc comment.
+    let caller = require_share_role(&state, &identity)?;
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
@@ -579,6 +691,13 @@ pub async fn sync_status(
     // this surface's own, since a client that sees a sync card has to know
     // which kind of origin it is looking at.
     report.insert("mode".to_string(), Value::from("github"));
+    // How much of the waiting work is this session's own, so a share surface
+    // can say "2 of 5 unshared changes are yours" rather than only how much is
+    // waiting. Always present, `null` when nobody can be asked about.
+    report.insert(
+        "owned_changes".to_string(),
+        owned_changes(&state, &domain, &caller).await,
+    );
     // The connection rides along so a card can say WHY a degraded report is
     // degraded: `connected: false` is "connect GitHub", while a set
     // `probe_error` on a connected instance is "could not reach it".
@@ -586,6 +705,232 @@ pub async fn sync_status(
         report.insert("connection".to_string(), connection);
     }
     Ok(Json(Value::Object(report)))
+}
+
+/// `GET /sync` - the instance-wide sync summary: this machine's GitHub
+/// connection and, per team domain, how much unshared work it holds and how
+/// many proposals and conflicts are open.
+///
+/// One call rather than a request per domain, because the caller is a top-bar
+/// share action: it has to know whether ANY team domain has something to share
+/// before it can decide to render itself at all, and then which domains to
+/// offer in its picker.
+///
+/// Counts, not records. [`sync_status`] beside it answers with the full
+/// per-domain report (every open proposal's record, every conflict) because it
+/// draws a card; this feeds a button and a picker, so each entry carries the
+/// same counted shape [`crate::origin::origin_poll_status_json`] gives the
+/// offline `status` overview - minus the poller's `next_due` and `last_result`,
+/// which belong to a schedule view and not to a share decision.
+///
+/// Read-only instances are served (a pure read, exactly like [`sync_status`]),
+/// and a missing GitHub CONNECTION is reported rather than refused, for the
+/// same reason: `connection.connected` false is what lets the button say
+/// "connect GitHub" instead of going quiet. GitHub switched OFF is the one
+/// refusal, and it is the shared 409 rather than the engine's bare 422, so the
+/// caller has a sentence to show.
+///
+/// A domain whose own status read fails does not take the summary down with
+/// it: `origin_status` collects that failure into `errors` and answers with
+/// every domain that did report.
+///
+/// Guarded by [`require_share_role`], the same predicate [`sync_status`] uses
+/// and for the same reason: this read is what the top-bar share action asks
+/// before it draws itself, so a session that may share and cannot read it is a
+/// session offered the share cards on a domain's home and no way into them
+/// from anywhere else. In `instance` mode the predicate IS `require_admin`, so
+/// nothing about that mode moves.
+#[utoipa::path(
+    get,
+    path = "/api/v1/sync",
+    tag = "domains",
+    operation_id = "get_sync_summary",
+    summary = "Where every team domain on this instance stands, in counts.",
+    description = "Admin only, or an editor when this instance shares with \
+                   personal GitHub identities (`github.share_identity` = \
+                   `personal`): this is what a share action reads before it \
+                   draws itself, so it is gated with the share verbs rather \
+                   than with the plain admin reads. One instance-wide answer \
+                   to `does anything \
+                   have something to share?`: the GitHub connection plus, per \
+                   team domain, its repository, when it was last checked and \
+                   the counts a share action needs - unshared local changes, \
+                   open and declined proposals, waiting conflicts - and \
+                   whether its chain of stacked proposals is healthy. A pure \
+                   read, served even on a read-only instance. An instance \
+                   with no GitHub connection is reported, not refused, and an \
+                   instance with no team domain answers an empty list. Use \
+                   `GET /domains/{domain}/sync` for one domain's full report.",
+    responses(
+        (
+            status = 200,
+            description = "The connection block, one counted entry per team \
+                           domain, and the domains whose own status read \
+                           failed. `local_changes` is the unshared-work count \
+                           a share action shows as pending, real work only: a \
+                           refreshed folder listing (`index.md`) rides along \
+                           with a share and never makes one worth offering. \
+                           `owned_changes` is how many of that domain's \
+                           changes this session's account last wrote, by the \
+                           file's own `generated.by` line, or null when there \
+                           is nobody to ask about - the pairing a picker row \
+                           draws. `open_proposals`, `declined_proposals` and \
+                           `conflicts` are counts here rather than the \
+                           records the per-domain route returns. `errors` \
+                           holds one entry per domain that could not be read \
+                           at all, so a single broken domain never blanks the \
+                           summary.\n\nThree chain-health keys ride along, \
+                           because a picker has to know which domains it can \
+                           actually offer: `stack_wedged` names the declined \
+                           layers still carrying open layers above them (empty \
+                           when the chain is sound, and the one stack fact a \
+                           picker must not hide, since a wedged chain cannot \
+                           grow), and `repair_pending` and \
+                           `stack_link_pending` say whether the chain is \
+                           mid-repair or not yet grouped on the forge. Where a \
+                           domain sits IN its chain - `stack_number` and \
+                           `stack_position` - is detail rather than a \
+                           decision, so it stays on `GET \
+                           /domains/{domain}/sync` and out of this row.",
+            body = Object,
+            example = json!({
+                "connection": { "connected": true, "user": "octo", "token_store": "keychain" },
+                "domains": [{
+                    "domain": "eng",
+                    "mode": "github",
+                    "repo": "acme/knowledge",
+                    "branch": "main",
+                    "last_checked": "2026-08-10T08:00:00Z",
+                    "open_proposals": 1,
+                    "declined_proposals": 0,
+                    "conflicts": 0,
+                    "local_changes": 2,
+                    "owned_changes": 1,
+                    "stack_wedged": [],
+                    "repair_pending": false,
+                    "stack_link_pending": false
+                }],
+                "errors": []
+            }),
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), or the \
+                           trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "GitHub is switched off on this instance, so no \
+                           origin can be reached - the detail says where to \
+                           turn it on. A missing connection is NOT refused \
+                           here: the summary comes back with \
+                           `connection.connected` false instead.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn sync_summary(
+    State(state): State<RestState>,
+    identity: Identity,
+) -> Result<Json<Value>, ApiError> {
+    let caller = require_share_role(&state, &identity)?;
+    // No refuse_read_only, and no connection check: see the doc comment, and
+    // [`sync_status`], which makes both calls the same way.
+    if !state.engine.github_enabled() {
+        return Err(github_off_conflict());
+    }
+    let aggregate = state.engine.origin_status(None).await?;
+    let mut domains: Vec<Value> = Vec::new();
+    for entry in aggregate
+        .get("domains")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        // Per row rather than per request: the picker offers one domain at a
+        // time, so the count that decides which row a reader recognizes as
+        // their own has to be that domain's.
+        let owned = match entry.get("domain").and_then(Value::as_str) {
+            Some(domain) => owned_changes(&state, domain, &caller).await,
+            None => Value::Null,
+        };
+        domains.push(summarize_origin_domain(entry, owned));
+    }
+    Ok(Json(serde_json::json!({
+        "connection": aggregate.get("connection").cloned().unwrap_or(Value::Null),
+        "domains": domains,
+        "errors": aggregate
+            .get("errors")
+            .cloned()
+            .unwrap_or_else(|| Value::Array(Vec::new())),
+    })))
+}
+
+/// Condenses one entry of `origin_status`'s aggregate into [`sync_summary`]'s
+/// row: the three record arrays become their lengths and everything a detail
+/// view alone needs (the base commit, the skipped-large list, the probe error)
+/// is dropped, leaving the counted shape plus the `mode` this surface adds the
+/// way [`sync_status`] does.
+///
+/// Three of the four chain keys survive the condensing, and the line drawn is
+/// "can the caller act on it here?". `stack_wedged` decides whether the picker
+/// can offer the domain at all - a chain held by a declined layer cannot grow,
+/// and the numbers it lists are what a caller withdraws or reopens - while
+/// `repair_pending` and `stack_link_pending` are debts the next share settles,
+/// so a row that hid them would let a client call a mid-repair chain healthy.
+/// `stack_number` and `stack_position` are dropped with the rest of the
+/// detail: where a domain sits in its chain says nothing about whether to
+/// offer it, and the per-domain route is one request away for the client that
+/// wants to draw it.
+///
+/// Reads the aggregate's JSON rather than the `OriginStatusReport` behind it
+/// because that report never leaves the engine: `origin_status` is the one
+/// call that probes, degrades offline and collects per-domain failures, and
+/// re-implementing it here to keep a struct would be a second copy of exactly
+/// the part worth having only once.
+fn summarize_origin_domain(entry: &Value, owned: Value) -> Value {
+    let field = |key: &str| entry.get(key).cloned().unwrap_or(Value::Null);
+    let count = |key: &str| {
+        entry
+            .get(key)
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+    };
+    serde_json::json!({
+        "domain": field("domain"),
+        // This surface's own, like the per-domain route's: a picker has to
+        // know which kind of origin it is offering.
+        "mode": "github",
+        "repo": field("repo"),
+        "branch": field("branch"),
+        "last_checked": field("last_checked"),
+        "open_proposals": count("open_proposals"),
+        "declined_proposals": count("declined_proposals"),
+        "conflicts": count("conflicts"),
+        "local_changes": field("local_changes"),
+        // Not the engine's, but the route's own, computed for the session that
+        // asked: how much of this domain's waiting work that account last
+        // wrote. Null when there is nobody to ask about.
+        "owned_changes": owned,
+        // Whole lists rather than counts, exactly as the engine reports them:
+        // a wedged layer is named by number because that number is what the
+        // caller withdraws or reopens.
+        "stack_wedged": field("stack_wedged"),
+        "repair_pending": field("repair_pending"),
+        "stack_link_pending": field("stack_link_pending"),
+    })
 }
 
 /// `POST /domains/{domain}/sync` - pull this domain's origin now, rather than
@@ -709,28 +1054,79 @@ pub async fn sync_now(
     tag = "domains",
     operation_id = "get_domain_share_changes",
     summary = "Preview what sharing this team domain would do.",
-    description = "Admin only. Pulls the origin first, then reports the \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Pulls the origin first, then reports the \
                    action a share would take (`create`, `update` with the \
-                   proposal number and url, `nothing_to_share`, \
-                   `conflicts_pending`, `proposal_diverged`), the effective \
-                   title and the changed files. Writes nothing to the origin; \
-                   refused on a read-only instance because the freshness pull \
-                   writes the working tree.",
+                   proposal number and url, `stack` with the layer it would \
+                   sit on, `amend` with the layer it would land on, \
+                   `nothing_to_share`, `conflicts_pending`, \
+                   `proposal_diverged`), the effective title and the changed \
+                   files. A generated folder listing (`index.md`) is a change \
+                   like any other here, because a share really carries it, but \
+                   it is derived rather than written and is left out of the \
+                   domain's `local_changes` count: a renderer counts these \
+                   into one line rather than listing them beside the engrams. \
+                   Each entry also carries `last_author`, the actor the \
+                   file's own frontmatter records as having written it \
+                   (`human:ada` for a person, an agent's own name for an \
+                   agent) and null wherever there is nothing to read - a \
+                   deleted file, one edited outside the engine. It is \
+                   last-writer provenance rather than authorship, and it is \
+                   what lets a client offer somebody their own changes first. \
+                   Writes nothing to the origin; refused on a \
+                   read-only instance because the freshness pull writes the \
+                   working tree. Where this instance shares with personal \
+                   GitHub identities, a caller who has connected none of \
+                   their own still gets the plan - reading it needs nobody's \
+                   personal credential - while `POST \
+                   /domains/{domain}/sync/share` refuses until they connect.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     responses(
         (
             status = 200,
             description = "The share plan: the action it would take, the \
                            title it would carry and one entry per changed \
-                           file.",
+                           file. Each action carries its own fields - \
+                           `number` and `url` for an `update`, `top_number` \
+                           and `top_title` for a `stack` (the open layer the \
+                           new one would sit on), `number`, `url`, `title` \
+                           and `layers_above` for an `amend` (the layer it \
+                           lands on and how many layers the amend would \
+                           rebuild), `count` for \
+                           `conflicts_pending`, and nothing extra for a \
+                           `create` or a `nothing_to_share`.",
             body = Object,
-            example = json!({
-                "action": "update",
-                "number": 4,
-                "url": "https://github.com/acme/knowledge/pull/4",
-                "effective_title": "Refine 2 engrams in kb",
-                "changes": [{ "path": "notes/a.md", "kind": "modified" }]
-            }),
+            examples(
+                ("update" = (
+                    summary = "The one open proposal would be updated in place.",
+                    value = json!({
+                        "action": "update",
+                        "number": 4,
+                        "url": "https://github.com/acme/knowledge/pull/4",
+                        "effective_title": "Refine 2 engrams in kb",
+                        "changes": [{
+                            "path": "notes/a.md",
+                            "kind": "modified",
+                            "last_author": "human:ada"
+                        }]
+                    })
+                )),
+                ("stack" = (
+                    summary = "A new layer would be stacked on the open one.",
+                    value = json!({
+                        "action": "stack",
+                        "top_number": 4,
+                        "top_title": "Refine 2 engrams in kb",
+                        "effective_title": "Share 1 new engram in kb",
+                        "changes": [{
+                            "path": "notes/b.md",
+                            "kind": "added",
+                            "last_author": null
+                        }]
+                    })
+                )),
+            ),
         ),
         (
             status = 401,
@@ -740,9 +1136,11 @@ pub async fn sync_now(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, this instance is \
-                           read-only, or the trusted-header identity names a \
-                           disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), this \
+                           instance is read-only, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -767,7 +1165,7 @@ pub async fn share_changes_preview(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     if !state.engine.github_ready().await {
@@ -777,16 +1175,39 @@ pub async fn share_changes_preview(
         ));
     }
     Ok(Json(
-        state.engine.origin_share_preview(&domain, None).await?,
+        state
+            .engine
+            .origin_share_preview(
+                &domain,
+                None,
+                None,
+                // A preview is always of the whole delta: what a browser
+                // ticks boxes in is this list, so narrowing it here would
+                // hide the very files somebody is choosing between.
+                None,
+                ShareActor::Account(caller.name().to_string()),
+                // The plan is read-scope on this surface (spec section 6): an
+                // editor who has connected no GitHub identity of their own
+                // still sees what a share would carry, and finds the connect
+                // where the Share button would have been. The share itself,
+                // one route down, still refuses.
+                PreviewCredential::ReadScopeFallback,
+            )
+            .await?,
     ))
 }
 
-/// What `POST /domains/{domain}/sync/share` takes: both fields optional, since
-/// the engine writes a summary of its own when neither is given.
+/// What `POST /domains/{domain}/sync/share` takes: every field optional, since
+/// the engine writes a summary of its own when no title is given and picks the
+/// share's own target when no proposal is named.
 #[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
-#[schema(description = "The proposal's title and description. Both optional: \
-                        with neither, the share carries a title the engine \
-                        generates from the changes themselves.")]
+#[schema(description = "The proposal's title and description, optionally the \
+                        open proposal to amend instead of stacking a new \
+                        layer, and optionally the files to carry. All \
+                        optional: with none of them, the share carries every \
+                        unshared change under a title the engine generates \
+                        from the changes themselves, and targets the layer it \
+                        picks itself.")]
 pub struct ShareBody {
     /// The pull request title. Defaults to a generated summary.
     #[serde(default)]
@@ -796,6 +1217,19 @@ pub struct ShareBody {
     #[serde(default)]
     #[schema(example = "Sharper wording on the routing rules.")]
     pub description: Option<String>,
+    /// An open proposal to amend, rather than letting the share pick its own
+    /// target. Absent is the ordinary share: a new layer on the chain, or an
+    /// update of the one living proposal off the stacked path.
+    #[serde(default)]
+    #[schema(example = 4)]
+    pub proposal: Option<u64>,
+    /// Share only these changed files, as domain-relative paths. Absent
+    /// shares every unshared change; the generated `index.md` of each chosen
+    /// file's folder rides along, and a path that is not among this domain's
+    /// unshared changes is refused by name.
+    #[serde(default)]
+    #[schema(example = json!(["notes/a.md"]))]
+    pub files: Option<Vec<String>>,
 }
 
 /// `POST /domains/{domain}/sync/share` - propose this domain's local changes
@@ -804,19 +1238,29 @@ pub struct ShareBody {
 /// A write against the origin, so a read-only instance refuses it, and it
 /// needs a GitHub connection for the same reason the pull does: with no
 /// credential it has nothing to publish with.
+///
+/// `proposal` in the body is the amend verb: it names the open layer to land
+/// on instead of letting the share pick its own target. A number that is not
+/// an open layer is a teaching refusal (422) naming what IS open, rather than
+/// a silent share against the wrong target.
 #[utoipa::path(
     post,
     path = "/api/v1/domains/{domain}/sync/share",
     tag = "domains",
     operation_id = "share_domain",
     summary = "Share a team domain's local changes as a proposal.",
-    description = "Admin only. Opens a pull request against the domain's \
-                   origin, or updates the one already open in place. Answers \
-                   `nothing_to_share` when the team already has everything, \
-                   `conflicts_pending` with the conflicts that need resolving \
-                   first, and `proposal_diverged` when a reviewer moved the \
-                   proposal branch and nothing was written. Refused on a \
-                   read-only instance.",
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Opens a pull request against the domain's \
+                   origin, stacks a new layer on the chain already open, or \
+                   updates the one living proposal in place. With `proposal` \
+                   in the body it amends that open layer instead, rebuilding \
+                   the layers above it. Answers `nothing_to_share` when the \
+                   team already has everything, `conflicts_pending` with the \
+                   conflicts that need resolving first, and \
+                   `proposal_diverged` when a reviewer moved the proposal \
+                   branch and nothing was written. Refused on a read-only \
+                   instance.",
     params(("domain" = String, Path, description = "The registered team domain.")),
     request_body = ShareBody,
     responses(
@@ -826,7 +1270,20 @@ pub struct ShareBody {
                            new proposal's number and url, `updated` carrying \
                            the proposal it refreshed, `nothing_to_share`, \
                            `conflicts_pending` with the conflicts, or \
-                           `proposal_diverged` with guidance.",
+                           `proposal_diverged` with guidance.\n\nA `proposed` \
+                           or `updated` outcome also names where the proposal \
+                           sits in its chain: `stack_number` is the chain's \
+                           number on the forge and `stack_position` is \
+                           `[layer, open layers]` with a 1-based layer. Both \
+                           are null off the stacked path - an unstacked forge, \
+                           a lone proposal - rather than absent, so one reader \
+                           handles either path. On the stacked path \
+                           `stack_position` is always set while `stack_number` \
+                           is null when the call that groups the chain on the \
+                           forge has not landed yet, so a client keys off \
+                           `stack_position` to decide whether it is looking at \
+                           a layer at all and names the stack number only when \
+                           it has one.",
             body = Object,
             example = json!({
                 "outcome": "proposed",
@@ -837,7 +1294,9 @@ pub struct ShareBody {
                 "updated": ["notes/a.md"],
                 "deleted": [],
                 "skipped_large": [],
-                "summary": "Refine 2 engrams in kb"
+                "summary": "Refine 2 engrams in kb",
+                "stack_number": 42,
+                "stack_position": [2, 2]
             }),
         ),
         (
@@ -848,10 +1307,12 @@ pub struct ShareBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), the \
+                           request did not echo its CSRF token, this instance \
+                           is read-only, or the trusted-header identity names \
+                           a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -875,6 +1336,15 @@ pub struct ShareBody {
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
+        (
+            status = 422,
+            description = "The `proposal` named is not an open layer of this \
+                           domain. The detail names the open layers with their \
+                           positions in the chain, so a client can retry \
+                           against a real number without a second call.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
     ),
 )]
 pub async fn share_now(
@@ -883,7 +1353,7 @@ pub async fn share_now(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<ShareBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
@@ -895,7 +1365,14 @@ pub async fn share_now(
     Ok(Json(
         state
             .engine
-            .origin_share(&domain, body.title.as_deref(), body.description.as_deref())
+            .origin_share(
+                &domain,
+                body.title.as_deref(),
+                body.description.as_deref(),
+                body.proposal,
+                body.files.as_deref(),
+                ShareActor::Account(caller.name().to_string()),
+            )
             .await?,
     ))
 }
@@ -924,7 +1401,9 @@ pub struct WithdrawBody {
     tag = "domains",
     operation_id = "withdraw_domain_proposal",
     summary = "Withdraw one of a team domain's open proposals.",
-    description = "Admin only. Closes the proposal's pull request, deletes \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Closes the proposal's pull request, deletes \
                    its branch best-effort and records it as withdrawn. With \
                    `revert` true the shared files are restored from the \
                    origin as well, and files a reviewer amended on the \
@@ -941,7 +1420,17 @@ pub struct WithdrawBody {
             description = "The engine's own withdraw report: the number, \
                            whether a live pull request was closed, the \
                            `withdrawn` status the record now carries and the \
-                           working-tree lists a revert produced.",
+                           working-tree lists a revert produced. \
+                           `skipped_diverged` holds the paths whose local file \
+                           moved on, `skipped_reverts` the paths whose \
+                           pre-share content is nowhere to be had - two \
+                           different reasons a revert left a file alone. \
+                           `repaired` says the chain around the withdrawn \
+                           layer was rebuilt, and `restacked` names the NEW \
+                           stack number that rebuild allocated: null covers \
+                           both `no repair happened` and `the survivors no \
+                           longer make a chain`, so a client reads it together \
+                           with `repaired` rather than alone.",
             body = Object,
             example = json!({
                 "number": 4,
@@ -949,7 +1438,10 @@ pub struct WithdrawBody {
                 "status": "withdrawn",
                 "restored": ["notes/a.md"],
                 "deleted": [],
-                "skipped_diverged": []
+                "skipped_diverged": [],
+                "skipped_reverts": [],
+                "repaired": true,
+                "restacked": 43
             }),
         ),
         (
@@ -960,10 +1452,12 @@ pub struct WithdrawBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), the \
+                           request did not echo its CSRF token, this instance \
+                           is read-only, or the trusted-header identity names \
+                           a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -995,7 +1489,7 @@ pub async fn withdraw_proposal(
     ApiPath((domain, number)): ApiPath<(String, u64)>,
     ApiJson(body): ApiJson<WithdrawBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
@@ -1007,7 +1501,12 @@ pub async fn withdraw_proposal(
     Ok(Json(
         state
             .engine
-            .origin_withdraw(&domain, Some(number), body.revert.unwrap_or(false))
+            .origin_withdraw(
+                &domain,
+                Some(number),
+                body.revert.unwrap_or(false),
+                ShareActor::Account(caller.name().to_string()),
+            )
             .await?,
     ))
 }
@@ -1024,7 +1523,9 @@ pub async fn withdraw_proposal(
     tag = "domains",
     operation_id = "get_domain_conflict",
     summary = "One recorded conflict, with every side.",
-    description = "Admin only. Reads the conflict the domain's origin state \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Reads the conflict the domain's origin state \
                    recorded under this id: the base and upstream sides kept \
                    beside it, plus the current local content. A side that \
                    exists but is not UTF-8 comes back null with `note` saying \
@@ -1058,8 +1559,11 @@ pub async fn withdraw_proposal(
         ),
         (
             status = 403,
-            description = "The caller is not an admin, or the trusted-header \
-                           identity names a disabled account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), or the \
+                           trusted-header identity names a disabled \
+                           account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1083,7 +1587,10 @@ pub async fn conflict_detail(
     identity: Identity,
     ApiPath((domain, id)): ApiPath<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    // The same gate the resolve carries, for the same reason: whoever may
+    // settle a conflict has to be able to read the three sides they are
+    // choosing between first.
+    require_share_role(&state, &identity)?;
     // No connection check: every side of a conflict is already on this
     // machine. See the doc comment.
     require_team_domain(&state, &domain, Refusal::Missing)?;
@@ -1127,7 +1634,9 @@ pub struct ResolveBody {
     tag = "domains",
     operation_id = "resolve_domain_conflict",
     summary = "Resolve one recorded conflict by id.",
-    description = "Admin only. Settles the conflict by keeping the local \
+    description = "Admin only, or an editor when this instance shares with personal \
+                   GitHub identities (`github.share_identity` = \
+                   `personal`). Settles the conflict by keeping the local \
                    side (`mine`), taking the team's (`theirs`) or writing \
                    merged content (`merged`, which requires `content`), then \
                    re-indexes the domain. Entirely local - no GitHub \
@@ -1154,10 +1663,12 @@ pub struct ResolveBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not share on this instance (an \
+                           admin, or an editor when \
+                           `github.share_identity` is `personal`), the \
+                           request did not echo its CSRF token, this instance \
+                           is read-only, or the trusted-header identity names \
+                           a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1196,7 +1707,7 @@ pub async fn resolve_conflict(
     ApiPath((domain, id)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<ResolveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     // Resolve BY ID: look the path up first, then run the path-based verb.
@@ -1228,7 +1739,13 @@ pub async fn resolve_conflict(
     Ok(Json(
         state
             .engine
-            .origin_resolve(&domain, &path, keep, content.as_deref())
+            .origin_resolve(
+                &domain,
+                &path,
+                keep,
+                content.as_deref(),
+                ShareActor::Account(caller.name().to_string()),
+            )
             .await?,
     ))
 }
@@ -1273,12 +1790,21 @@ fn require_team_domain(state: &RestState, domain: &str, refusal: Refusal) -> Res
         });
     }
     if !state.engine.github_enabled() {
-        return Err(ApiError::conflict(
-            "GitHub is switched off on this instance, so its origin cannot be \
-             reached: turn it on under Settings > GitHub",
-        ));
+        return Err(github_off_conflict());
     }
     Ok(())
+}
+
+/// The one sentence every sync surface refuses a GitHub-off instance with,
+/// written once so the per-domain routes and the instance-wide summary teach
+/// the same fix. A 409 rather than the 422 `RemoteError::NotEnabled` maps to:
+/// the state is the instance's, not the request's, and the detail names the
+/// screen that changes it.
+fn github_off_conflict() -> ApiError {
+    ApiError::conflict(
+        "GitHub is switched off on this instance, so no origin can be \
+         reached: turn it on under Settings > GitHub",
+    )
 }
 
 #[cfg(test)]
@@ -1389,6 +1915,37 @@ mod tests {
         let err = require_absent(&Some("acme/kb".to_string()), "repo", "local").unwrap_err();
         assert_eq!(err.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(err.detail.contains("repo"), "{}", err.detail);
+    }
+
+    /// A summary row carries the owned count exactly as the route computed it,
+    /// null included: "nobody to ask about" is a different sentence from "none
+    /// of this is yours", and a row that folded the two would let a picker say
+    /// the second when it means the first.
+    #[test]
+    fn a_summary_row_carries_the_owned_count_or_says_it_does_not_know() {
+        let entry = serde_json::json!({
+            "domain": "eng",
+            "repo": "acme/kb",
+            "local_changes": 5,
+            "open_proposals": [{ "number": 1 }],
+        });
+        let row = summarize_origin_domain(&entry, Value::from(2u64));
+        assert_eq!(row["local_changes"], 5);
+        assert_eq!(row["owned_changes"], 2);
+        assert_eq!(row["open_proposals"], 1, "records become counts");
+
+        let unknown = summarize_origin_domain(&entry, Value::Null);
+        assert!(
+            unknown["owned_changes"].is_null(),
+            "the key is present and null: {unknown}"
+        );
+    }
+
+    /// The anonymous viewer has no account, so there is nothing to attribute
+    /// the waiting work to.
+    #[test]
+    fn the_anonymous_viewer_has_no_session_account() {
+        assert_eq!(session_account(&Caller::Anonymous), None);
     }
 
     /// The aggregate the origin verbs answer with is flattened to the one

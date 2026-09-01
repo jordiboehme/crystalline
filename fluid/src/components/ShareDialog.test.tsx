@@ -107,6 +107,23 @@ function requested(): string[] {
   return apiMock.mock.calls.map((call) => call[0]);
 }
 
+/** Whether one element is drawn before another, in document order. */
+function precedes(before: Element, after: Element): boolean {
+  return (
+    (before.compareDocumentPosition(after) &
+      Node.DOCUMENT_POSITION_FOLLOWING) !==
+    0
+  );
+}
+
+/** `count` changes of one kind, named apart so each is findable. */
+function changesOf(kind: string, count: number, prefix: string) {
+  return Array.from({ length: count }, (_unused, index) => ({
+    path: `notes/${prefix}-${String(index)}.md`,
+    kind,
+  }));
+}
+
 /** How many times a route was asked for, exactly. */
 function reads(path: string): number {
   return requested().filter((asked) => asked === path).length;
@@ -125,6 +142,46 @@ function sentBody(path: string, method: string): unknown {
     throw new Error(`the ${method} to ${path} carried no JSON body`);
   }
   return JSON.parse(body) as unknown;
+}
+
+/**
+ * The connection block of an instance that shares as whoever is acting, rather
+ * than as the machine. The owner's own slot rides along on the real report and
+ * is deliberately not what the browser reads: the acting identity here is the
+ * session's, and `/me/github-identity` is what answers for it.
+ */
+function personalConnection(overrides: Record<string, unknown> = {}) {
+  return {
+    connected: true,
+    user: "octo",
+    token_store: "keychain",
+    share_identity: "personal",
+    owner_identity: { account: "owner", connected: false, user: null },
+    ...overrides,
+  };
+}
+
+/** The session's own identity, in the wire shape the profile surface sends. */
+function identityPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    account: "ada",
+    connected: false,
+    login: null,
+    connected_at: null,
+    token_store: null,
+    pending: null,
+    error: null,
+    ...overrides,
+  };
+}
+
+/** A plan with something in it, so the dialog has a share to offer. */
+function createPlan() {
+  return {
+    action: "create",
+    effective_title: "Share 1 new engram from eng",
+    changes: [{ path: "notes/a.md", kind: "added" }],
+  };
 }
 
 /** Open the dialog off the card's header button, once the card is up. */
@@ -295,6 +352,599 @@ describe("the share dialog", () => {
     });
   });
 
+  it("names the layer a new proposal would stack on", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A stack is a proposal of its own, so the share is offered rather than
+    // refused, and the line says what it would sit on.
+    expect(
+      await within(dialog).findByText(
+        "Will stack a new proposal on top of #4.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+  });
+
+  it("offers the share on an amend plan, and says what it rebuilds", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "updated",
+      proposal: {
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        stack_number: 42,
+        stack_position: [1, 2],
+      },
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "amend",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        number: 4,
+        url: "https://github.com/acme/knowledge/pull/4",
+        layers_above: 1,
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // An amend puts a fresh commit on a proposal that already exists, so it is
+    // shareable like an update - and it says how much work above it would be
+    // rebuilt, which is the whole difference from amending the top layer.
+    expect(
+      await within(dialog).findByText(
+        "Sharing amends proposal #4 and re-bases 1 layer above it.",
+      ),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // The server already planned this target, so nothing names it again: the
+    // number travels only when somebody picked a layer of their own.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({});
+    expect(
+      await within(dialog).findByText(
+        "Updated proposal #4, layer 1 of 2 on stack #42.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("offers the open layers to amend, and names the one that was chosen", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "updated",
+      proposal: { number: 4, url: "https://github.com/acme/knowledge/pull/4" },
+    }));
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "https://github.com/acme/knowledge/pull/4",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: "changes_requested",
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+            {
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              title: "One more pass on the routing",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+          stack_number: 42,
+        }),
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 7,
+        top_title: "One more pass on the routing",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Stacking on top is the default: acting on a layer's review feedback is
+    // the deliberate choice, and it is made by naming the layer.
+    const select = await within(dialog).findByLabelText("Proposal");
+    expect(select).toHaveValue("");
+    await userEvent.selectOptions(select, "4");
+
+    // The one thing somebody amending a lower layer has to know, because the
+    // layer above it would simply overwrite the change.
+    expect(
+      within(dialog).getByText(
+        "Changes to files a higher layer already touched belong in that layer instead.",
+      ),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // The chosen layer is the whole of what the choice sends: the prefilled
+    // title still stays behind.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      proposal: 4,
+    });
+  });
+
+  it("offers the newest layer first, under the default that stacks", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "https://github.com/acme/knowledge/pull/4",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+            {
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              title: "One more pass on the routing",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+        }),
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 7,
+        top_title: "One more pass on the routing",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    const select = await within(dialog).findByLabelText("Proposal");
+
+    // The report orders a chain bottom first, and a picker that repeated that
+    // order would put the layer somebody just shared - the one their review
+    // feedback is about - at the far end of the list. The layer that is
+    // stacked on is the layer most likely to be amended, so it comes first,
+    // under the default that stacks a new one over the top of it.
+    expect(
+      within(select)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual([
+      "New proposal (stack on top)",
+      "Amend #7 - One more pass on the routing",
+      "Amend #4 - Refine 2 engrams in eng",
+    ]);
+  });
+
+  it("groups a long change list by kind and keeps the rest one press away", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 11 engrams from eng",
+        changes: [
+          ...changesOf("added", 3, "new"),
+          ...changesOf("modified", 7, "mod"),
+          { path: "notes/gone.md", kind: "deleted" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A sweep shares dozens to hundreds of files at once. The count per kind
+    // is the shape of the share; the paths are the detail behind it.
+    expect(await within(dialog).findByText("Added 3")).toBeVisible();
+    expect(within(dialog).getByText("Modified 7")).toBeVisible();
+    expect(within(dialog).getByText("Deleted 1")).toBeVisible();
+
+    // A group under the cap is whole, so nothing offers to expand it.
+    expect(within(dialog).getByText("notes/new-2.md")).toBeVisible();
+    // The one over it shows its first few and counts the rest.
+    expect(within(dialog).getByText("notes/mod-4.md")).toBeVisible();
+    expect(within(dialog).queryByText("notes/mod-5.md")).toBeNull();
+
+    // The toggle names its own group. Beside its heading the short words are
+    // unambiguous, but a dialog with three over-cap groups would otherwise
+    // offer three controls all called "and 2 more".
+    const more = within(dialog).getByRole("button", {
+      name: "Show 2 more modified",
+    });
+    expect(more).toHaveTextContent("and 2 more");
+    expect(more).toHaveAttribute("aria-expanded", "false");
+    await userEvent.click(more);
+
+    // Nothing is lost: the whole group is one press away, inside the same
+    // scrolling box rather than growing the dialog past the screen.
+    expect(within(dialog).getByText("notes/mod-5.md")).toBeVisible();
+    expect(within(dialog).getByText("notes/mod-6.md")).toBeVisible();
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Show fewer modified" }),
+    );
+    expect(within(dialog).queryByText("notes/mod-5.md")).toBeNull();
+  });
+
+  it("offers nothing to expand on a group that is exactly full", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 5 new engrams from eng",
+        changes: changesOf("added", 5, "new"),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The cap is what a group draws, not what it draws before hiding one: a
+    // group that fits exactly is whole, and a toggle over it would open onto
+    // nothing.
+    expect(await within(dialog).findByText("Added 5")).toBeVisible();
+    expect(within(dialog).getByText("notes/new-4.md")).toBeVisible();
+    expect(within(dialog).queryByText(/more$/)).toBeNull();
+  });
+
+  it("counts the single file over the cap as one", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 6 new engrams from eng",
+        changes: changesOf("added", 6, "new"),
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // One over the cap is the first press worth offering, and it says one
+    // rather than rounding up into a plural.
+    const more = await within(dialog).findByRole("button", {
+      name: "Show 1 more added",
+    });
+    expect(more).toHaveTextContent("and 1 more");
+    expect(within(dialog).queryByText("notes/new-5.md")).toBeNull();
+    await userEvent.click(more);
+    expect(within(dialog).getByText("notes/new-5.md")).toBeVisible();
+  });
+
+  it("says nothing about folder listings when a share carries none", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(await within(dialog).findByText("Added 1")).toBeVisible();
+    expect(within(dialog).queryByText(/folder index/)).toBeNull();
+  });
+
+  it("counts refreshed folder listings in one line instead of listing them", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "index.md", kind: "modified" },
+          ...changesOf("added", 2, "new"),
+          { path: "notes/index.md", kind: "modified" },
+          { path: "runbooks/index.md", kind: "added" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The engrams are the share; the listings are what the share does to keep
+    // the repository browsable, and they never crowd the engrams out.
+    expect(await within(dialog).findByText("Added 2")).toBeVisible();
+    expect(within(dialog).queryByText("Modified 2")).toBeNull();
+    expect(within(dialog).queryByText("notes/index.md")).toBeNull();
+    expect(
+      within(dialog).getByText("Also refreshes 3 folder indexes"),
+    ).toBeVisible();
+  });
+
+  it("names a single refreshed listing in the singular", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [
+          { path: "notes/a.md", kind: "added" },
+          { path: "index.md", kind: "modified" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    expect(
+      await within(dialog).findByText("Also refreshes 1 folder index"),
+    ).toBeVisible();
+  });
+
+  it("still shows the line when the listings are all a share carries", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Refresh the listings in eng",
+        changes: [
+          { path: "index.md", kind: "modified" },
+          { path: "notes/index.md", kind: "modified" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Nothing to group, and still something to say: somebody who opened this
+    // dialog is owed the reason the Share button is live.
+    expect(
+      await within(dialog).findByText("Also refreshes 2 folder indexes"),
+    ).toBeVisible();
+    expect(within(dialog).getByRole("button", { name: "Share" })).toBeEnabled();
+  });
+
+  it("badges each change with its kind letter and the word behind it", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 3 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "added" },
+          { path: "notes/b.md", kind: "modified" },
+          { path: "notes/c.md", kind: "deleted" },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The source-control idiom: one letter per row, color behind it rather
+    // than under it, and the word itself for anything that reads the page -
+    // color is never the only thing carrying the meaning.
+    const added = await within(dialog).findByRole("img", { name: "Added" });
+    expect(added).toHaveTextContent("A");
+    expect(
+      within(dialog).getByRole("img", { name: "Modified" }),
+    ).toHaveTextContent("M");
+    expect(
+      within(dialog).getByRole("img", { name: "Deleted" }),
+    ).toHaveTextContent("D");
+  });
+
+  it("keeps a kind it has not been taught, as the word it arrived as", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "vaporized" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // A word this side has not been taught is somebody else's vocabulary
+    // rather than a malformed one: it gets the neutral face and its own
+    // initial, and the group still says what it is and how much of it there
+    // is.
+    expect(await within(dialog).findByText("vaporized 1")).toBeVisible();
+    expect(
+      within(dialog).getByRole("img", { name: "vaporized" }),
+    ).toHaveTextContent("V");
+  });
+
+  it("asks which layer first, then says what the share would do", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              number: 4,
+              url: "https://github.com/acme/knowledge/pull/4",
+              title: "Refine 2 engrams in eng",
+              status: "Open",
+              review_state: null,
+              amended_upstream: false,
+              feedback: [],
+              updated_at: null,
+            },
+          ],
+        }),
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The order the decision is actually made in: which layer this lands on
+    // decides what the sentence under it says, the changes are what is being
+    // landed, and the two fields are the wording somebody writes last.
+    const select = await within(dialog).findByLabelText("Proposal");
+    const line = within(dialog).getByText(
+      "Will stack a new proposal on top of #4.",
+    );
+    const changes = within(dialog).getByText("Modified 1");
+    const title = within(dialog).getByLabelText("Title");
+    const description = within(dialog).getByLabelText("Description");
+
+    expect(precedes(select, line)).toBe(true);
+    expect(precedes(line, changes)).toBe(true);
+    expect(precedes(changes, title)).toBe(true);
+    expect(precedes(title, description)).toBe(true);
+
+    // And the choice still rewrites the sentence rather than leaving the
+    // server's own plan standing over a target somebody just changed.
+    await userEvent.selectOptions(select, "4");
+    expect(
+      within(dialog).getByText("Sharing amends proposal #4."),
+    ).toBeVisible();
+  });
+
+  it("says where the proposal it just opened sits in the chain", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              stack_number: 42,
+              stack_position: [2, 2],
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    expect(
+      await within(dialog).findByText(
+        "Opened proposal #7, layer 2 of 2 on stack #42.",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("names no stack number for a chain that is not linked yet", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "stack",
+        effective_title: "Refine 1 engram in eng",
+        changes: [{ path: "notes/a.md", kind: "modified" }],
+        top_number: 4,
+        top_title: "Refine 2 engrams in eng",
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              outcome: "proposed",
+              number: 7,
+              url: "https://github.com/acme/knowledge/pull/7",
+              // The layers all exist; the call that groups them has not
+              // landed, so there is no number to name.
+              stack_number: null,
+              stack_position: [2, 2],
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+
+    expect(
+      await within(dialog).findByText(
+        "Opened proposal #7, layer 2 of 2 (stack link pending).",
+      ),
+    ).toBeInTheDocument();
+  });
+
+  it("offers no layer to amend when nothing is open", async () => {
+    serve({
+      "/domains/eng/sync": () => syncResponse({ open_proposals: [] }),
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 new engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await within(dialog).findByText(/opens a new proposal/i);
+    // A choice between one thing is not a choice, and there is no layer to
+    // amend at all here.
+    expect(within(dialog).queryByLabelText("Proposal")).toBeNull();
+  });
+
   it("disables the share with the reason when there is nothing to confirm", async () => {
     serve({
       "/domains/eng/sync/changes": () => ({
@@ -434,5 +1084,262 @@ describe("the share dialog", () => {
     expect(
       within(dialog).getByRole("button", { name: "Share" }),
     ).toBeDisabled();
+  });
+
+  it("offers to connect an identity, where a share goes out as whoever makes it", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () => identityPayload(),
+      "/domains/eng/sync/changes": createPlan,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The plan endpoint really does answer a disconnected caller - it computes
+    // on the instance credential, writes nothing and reads nothing a personal
+    // token could not (pinned on the wire by
+    // `rest_admin_api.rs::a_disconnected_editor_previews_a_share_and_is_still_refused_the_share`),
+    // which is what this stub stands in for. So what a share would carry, down
+    // to the tickable file, is on the screen before anybody connects.
+    expect(
+      await within(dialog).findByText(/opens a new proposal/i),
+    ).toBeInTheDocument();
+    expect(within(dialog).getByText("notes/a.md")).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/a.md" }),
+    ).toBeInTheDocument();
+
+    // The primary action is the one that can actually be taken, and it leads
+    // where the identity is connected.
+    const connect = await within(dialog).findByRole("link", {
+      name: "Connect GitHub to share",
+    });
+    expect(connect).toHaveAttribute("href", "/profile");
+    expect(within(dialog).queryByRole("button", { name: "Share" })).toBeNull();
+  });
+
+  it("names the identity a share would go out on", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () =>
+        identityPayload({ connected: true, login: "octo" }),
+      "/domains/eng/sync/changes": createPlan,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Quietly, beside the button: in personal mode the proposal carries
+    // somebody's own name on the forge, and that is worth knowing before the
+    // press rather than after it.
+    expect(
+      await within(dialog).findByText("Sharing as @octo"),
+    ).toBeInTheDocument();
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+  });
+
+  it("asks nothing about your identity when the instance shares as itself", async () => {
+    serve({ "/domains/eng/sync/changes": createPlan });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeEnabled();
+    });
+    // The default mode is the whole install base of this feature's first day,
+    // and the dialog it draws is the one it always drew: no line about whose
+    // identity this is, and not one request asking.
+    expect(within(dialog).queryByText(/sharing as/i)).toBeNull();
+    expect(
+      within(dialog).queryByRole("link", { name: /connect github/i }),
+    ).toBeNull();
+    expect(
+      requested().filter((path) => path.startsWith("/me/github-identity")),
+    ).toEqual([]);
+  });
+
+  it("shares only the ticked files, and recounts the listings that ride with them", async () => {
+    const shared = vi.fn(() => ({
+      outcome: "proposed",
+      number: 7,
+      url: "https://github.com/acme/knowledge/pull/7",
+    }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "notes/a.md", kind: "added" },
+          { path: "guides/g.md", kind: "added" },
+          { path: "notes/index.md", kind: "modified" },
+          { path: "guides/index.md", kind: "modified" },
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // Everything is ticked to begin with, so the line counts the delta's own
+    // listings: this share sends no file list and carries all of it.
+    expect(
+      await within(dialog).findByText("Also refreshes 2 folder indexes"),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("checkbox", { name: "guides/g.md" }),
+    );
+
+    // Untick a file and its folder's listing goes with it, because the share
+    // now names the files it carries and the engine adds only their folders.
+    expect(
+      await within(dialog).findByText("Also refreshes 1 folder index"),
+    ).toBeVisible();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // Exactly what was ticked, and never the listings: those are the engine's
+    // to add for the folders it was handed.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      files: ["notes/a.md"],
+    });
+  });
+
+  it("preselects your own changes and says how much it left behind", async () => {
+    const shared = vi.fn(() => ({ outcome: "proposed", number: 7 }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 3 engrams from eng",
+        changes: [
+          { path: "notes/mine.md", kind: "modified", last_author: "human:ada" },
+          {
+            path: "notes/theirs.md",
+            kind: "modified",
+            last_author: "human:bob",
+          },
+          { path: "notes/gone.md", kind: "deleted", last_author: null },
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    // The session is `ada`, so her own file opens ticked and the other two -
+    // somebody else's edit and a deletion nobody is named for - do not.
+    expect(
+      await within(dialog).findByText(
+        "Preselected your 1 change - 2 more from others left unticked.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/mine.md" }),
+    ).toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/theirs.md" }),
+    ).not.toBeChecked();
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/gone.md" }),
+    ).not.toBeChecked();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({
+      files: ["notes/mine.md"],
+    });
+  });
+
+  it("takes a whole group back in from its heading, and sends nothing when it is all of them", async () => {
+    const shared = vi.fn(() => ({ outcome: "proposed", number: 7 }));
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 2 engrams from eng",
+        changes: [
+          { path: "notes/mine.md", kind: "modified", last_author: "human:ada" },
+          {
+            path: "notes/theirs.md",
+            kind: "modified",
+            last_author: "human:bob",
+          },
+        ],
+      }),
+      "/domains/eng/sync/share": (_path, init) =>
+        init?.method === "POST" ? shared() : null,
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    const group = await within(dialog).findByRole("checkbox", {
+      name: "Share all modified",
+    });
+    // Partly in, which is a third state rather than an unticked box: one
+    // press from here is "all of it".
+    expect(group).toHaveProperty("indeterminate", true);
+    await userEvent.click(group);
+    expect(
+      within(dialog).getByRole("checkbox", { name: "notes/theirs.md" }),
+    ).toBeChecked();
+    // The line described the boxes as they opened; they have been changed, so
+    // it steps out of the way rather than describing a state nobody is in.
+    expect(within(dialog).queryByText(/preselected your/i)).toBeNull();
+
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Share" }),
+    );
+    await waitFor(() => {
+      expect(shared).toHaveBeenCalled();
+    });
+    // Everything is ticked again, so this is the request it has always been:
+    // no file list at all.
+    expect(sentBody("/domains/eng/sync/share", "POST")).toEqual({});
+  });
+
+  it("has nothing to share once every box is unticked", async () => {
+    serve({
+      "/domains/eng/sync/changes": () => ({
+        action: "create",
+        effective_title: "Share 1 engram from eng",
+        changes: [{ path: "notes/a.md", kind: "added" }],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const dialog = await openShareDialog();
+
+    await userEvent.click(
+      await within(dialog).findByRole("checkbox", { name: "notes/a.md" }),
+    );
+    // A share of nothing is not a share, and the button says so before the
+    // press rather than the server saying it afterwards.
+    await waitFor(() => {
+      expect(
+        within(dialog).getByRole("button", { name: "Share" }),
+      ).toBeDisabled();
+    });
   });
 });

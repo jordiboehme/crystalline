@@ -24,7 +24,7 @@ use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
     FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
-use crystalline_service::engine::EngineError;
+use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
 use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::{Engine, EnvOverlay};
 use support::{CountingEmbedder, MockProvider, sha256_hex};
@@ -200,26 +200,42 @@ async fn github_disabled_refuses_share_withdraw_preview_and_resolve() {
     )
     .await;
 
-    let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
+    let share_err = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap_err();
     assert!(
         matches!(share_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{share_err}"
     );
 
-    let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
+    let withdraw_err = eng
+        .origin_withdraw("brand", None, false, ShareActor::Owner)
+        .await
+        .unwrap_err();
     assert!(
         matches!(withdraw_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{withdraw_err}"
     );
 
-    let preview_err = eng.origin_share_preview("brand", None).await.unwrap_err();
+    let preview_err = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap_err();
     assert!(
         matches!(preview_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{preview_err}"
     );
 
     let resolve_err = eng
-        .origin_resolve("brand", "notes/a.md", Some("mine"), None)
+        .origin_resolve("brand", "notes/a.md", Some("mine"), None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -243,23 +259,39 @@ async fn read_only_refuses_share_withdraw_preview_and_resolve() {
 
     // None of these need a registered domain: read-only refuses before the
     // domain is even resolved, exactly like `origin_add` above.
-    let share_err = eng.origin_share("brand", None, None).await.unwrap_err();
+    let share_err = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap_err();
     assert!(matches!(share_err, EngineError::ReadOnly), "{share_err}");
 
-    let withdraw_err = eng.origin_withdraw("brand", None, false).await.unwrap_err();
+    let withdraw_err = eng
+        .origin_withdraw("brand", None, false, ShareActor::Owner)
+        .await
+        .unwrap_err();
     assert!(
         matches!(withdraw_err, EngineError::ReadOnly),
         "{withdraw_err}"
     );
 
-    let preview_err = eng.origin_share_preview("brand", None).await.unwrap_err();
+    let preview_err = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap_err();
     assert!(
         matches!(preview_err, EngineError::ReadOnly),
         "{preview_err}"
     );
 
     let resolve_err = eng
-        .origin_resolve("brand", "notes/a.md", Some("mine"), None)
+        .origin_resolve("brand", "notes/a.md", Some("mine"), None, ShareActor::Owner)
         .await
         .unwrap_err();
     assert!(
@@ -1159,6 +1191,7 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&state_dir).unwrap();
     mock.set_proposal_state(7, ProposalState::Merged);
@@ -1469,9 +1502,15 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
     )
     .unwrap();
 
-    let result = eng.origin_share("brand", None, None).await.unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["outcome"], "proposed");
-    assert_eq!(result["added"][0], "notes/new.md");
+    assert_eq!(
+        result["added"],
+        serde_json::json!(["index.md", "notes/new.md"])
+    );
     assert!(
         result["url"].as_str().unwrap().starts_with("https://"),
         "{result}"
@@ -1498,6 +1537,63 @@ async fn origin_share_happy_path_opens_a_proposal_and_records_it() {
 
     // Nothing local changed: a share never touches the working tree.
     assert!(root.join("notes/new.md").exists());
+}
+
+/// The join the whole feature hangs on: the login `resolve_share_provider`
+/// hands back is what the proposal record names, in the default identity mode.
+///
+/// It is worth a whole share rather than a shaper assertion because the engine
+/// holds a second, same-typed `Option<String>` at that call site - the
+/// personal-mode-only login write failures are enriched with - and swapping
+/// the two would zero every instance-mode share's author while every other test
+/// in this tree stayed green.
+#[tokio::test]
+async fn a_share_records_the_login_it_acted_as_on_the_proposal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    // The default identity mode, and a credential that names somebody: the
+    // shape resolution 3 locked, where instance mode records its own login
+    // rather than nobody.
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false)
+        .await
+        .with_origin_provider_login("instance-gh");
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::create_dir_all(root.join("notes")).unwrap();
+    std::fs::write(
+        root.join("notes/new.md"),
+        engram("New", "new", "brand new content"),
+    )
+    .unwrap();
+
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(result["outcome"], "proposed", "{result}");
+
+    let state = OriginState::load(&origins_dir.join("brand"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        state.proposals[0].author_login.as_deref(),
+        Some("instance-gh"),
+        "the acting login reaches the record, not the personal-mode-only one"
+    );
 }
 
 #[tokio::test]
@@ -1533,7 +1629,10 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
     mock.set_branch("main", &c2);
     eng.origin_update(Some("brand")).await.unwrap();
 
-    let result = eng.origin_share("brand", None, None).await.unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["outcome"], "conflicts_pending");
     assert_eq!(result["count"], 1);
     let conflicts = result["conflicts"].as_array().unwrap();
@@ -1591,8 +1690,34 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     ]));
     mock.set_branch("main", &c2);
 
-    let plan = eng.origin_share_preview("brand", None).await.unwrap();
-    assert_eq!(plan["action"], "nothing_to_share", "{plan}");
+    let plan = eng
+        .origin_share_preview(
+            "brand",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
+    // Nothing this domain knows is unshared. What the plan does carry is the
+    // folder listings the generator wrote when the domain was subscribed: an
+    // origin that has never seen them is genuinely behind on them, and they
+    // ride along with a share rather than being one - so the action is a
+    // create, and every path in it is a listing.
+    assert_eq!(plan["action"], "create", "{plan}");
+    let changes = plan["changes"].as_array().unwrap();
+    assert!(
+        !changes.is_empty(),
+        "the listings are what makes this a create: {plan}"
+    );
+    assert!(
+        changes
+            .iter()
+            .all(|c| c["path"].as_str().unwrap_or_default().ends_with("index.md")),
+        "{plan}"
+    );
     assert!(root.join("notes/upstream-one.md").exists());
     assert_eq!(
         found("first upstream arrival").await,
@@ -1621,7 +1746,10 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     )
     .unwrap();
 
-    let result = eng.origin_share("brand", None, None).await.unwrap();
+    let result = eng
+        .origin_share("brand", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["outcome"], "proposed", "{result}");
     assert_eq!(
         found("second upstream arrival").await,
@@ -1667,17 +1795,323 @@ async fn shared_team_engine(
         engram("Alpha", "notes/a", "alpha v2"),
     )
     .unwrap();
-    let shared = eng.origin_share("kb", None, None).await.unwrap();
+    let shared = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(shared["outcome"], "proposed", "{shared}");
     let number = shared["number"].as_u64().unwrap();
     (eng, mock, root, number)
+}
+
+/// The injected test provider short-circuits BOTH share-identity modes, which
+/// is what keeps every origin test in this file (and every other one that
+/// injects a mock) free of a credential: an engine sharing personally, with no
+/// token of any kind on disk, still shares through the mock and never reaches
+/// the token store. Personal mode's refusals are engine unit tests, where a
+/// real credential resolution actually runs.
+#[tokio::test]
+async fn an_injected_provider_short_circuits_personal_mode_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, _number) = shared_team_engine(&tmp).await;
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "personal".to_string(),
+    })
+    .await
+    .unwrap();
+
+    std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
+    let shared = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "updated", "{shared}");
+}
+
+/// A team engine over a stack-serving mock with a two-layer chain this machine
+/// still owes the forge a link for. Both layers are real shares, and the saved
+/// link is then broken by hand exactly as a failed `create_stack` leaves it -
+/// the stack number cleared, the debt recorded - which is the state a status
+/// probe would otherwise pay off. Returns the engine, the mock, the working
+/// tree root and the origin state directory.
+async fn engine_owing_a_stack_link(
+    tmp: &tempfile::TempDir,
+) -> (
+    Engine,
+    Arc<MockProvider>,
+    std::path::PathBuf,
+    std::path::PathBuf,
+) {
+    let mock = Arc::new(MockProvider::new());
+    mock.enable_stacks();
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    let origins_dir = tmp.path().join("origins");
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &origins_dir,
+        mock.clone(),
+        true,
+        false,
+    )
+    .await;
+    let root = tmp.path().join("kb");
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha v2"),
+    )
+    .unwrap();
+    let first = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(first["outcome"], "proposed", "{first}");
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+    let second = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(second["outcome"], "proposed", "{second}");
+    assert!(
+        second["stack_number"].is_number(),
+        "the second layer is stacked on the first: {second}"
+    );
+
+    let state_dir = origins_dir.join("kb");
+    let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+    state.stack_number = None;
+    state.stack_link_pending = true;
+    state.save(&state_dir).unwrap();
+    (eng, mock, root, state_dir)
+}
+
+/// The stack calls a delta of the mock's call log carries, which is what
+/// separates "the status wrote to the forge" from "the status read from it".
+fn stack_calls(delta: &[String]) -> Vec<String> {
+    delta
+        .iter()
+        .filter(|c| {
+            c.starts_with("create_stack")
+                || c.starts_with("extend_stack")
+                || c.starts_with("dissolve_stack")
+        })
+        .cloned()
+        .collect()
+}
+
+/// **A probed status in personal mode never spends the instance credential on
+/// a forge write.** Settling an owed stack link is a `create_stack` /
+/// `extend_stack`, and the provider a status probes with is the instance one,
+/// since a read verb carries no actor. Instance mode is where that is the
+/// credential every write goes out on anyway, so the settlement stays; personal
+/// mode leaves the debt standing, and the next write on the acting identity's
+/// own credential is what pays it off.
+#[tokio::test]
+async fn a_personal_mode_status_leaves_an_owed_stack_link_for_the_next_write() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, root, state_dir) = engine_owing_a_stack_link(&tmp).await;
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "personal".to_string(),
+    })
+    .await
+    .unwrap();
+
+    let before = mock.calls().len();
+    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let delta = mock.calls().split_off(before);
+    assert!(
+        stack_calls(&delta).is_empty(),
+        "a read verb made a forge write on the instance credential: {delta:?}"
+    );
+    assert_eq!(
+        status["domains"][0]["stack_link_pending"], true,
+        "the debt is reported rather than paid: {status}"
+    );
+    assert!(
+        OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .stack_link_pending,
+        "and it is still owed on disk"
+    );
+
+    // The next write-class call settles it, on the credential the write itself
+    // goes out on - here the acting account's, through the injected provider.
+    let before = mock.calls().len();
+    std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
+    let shared = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(shared["outcome"], "proposed", "{shared}");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        delta.iter().any(|c| c.starts_with("create_stack:")),
+        "the share paid the debt off: {delta:?}"
+    );
+    assert!(
+        !OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .stack_link_pending,
+        "the debt is settled"
+    );
+}
+
+/// The instance-mode half of the same rule, pinned so the fix above cannot
+/// quietly become a behavior change for the default install: with one
+/// credential doing everything, a probed status settles the owed link exactly
+/// as it always has.
+#[tokio::test]
+async fn an_instance_mode_status_still_settles_an_owed_stack_link() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, mock, _root, state_dir) = engine_owing_a_stack_link(&tmp).await;
+
+    let before = mock.calls().len();
+    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let delta = mock.calls().split_off(before);
+    assert!(
+        delta.iter().any(|c| c.starts_with("create_stack:")),
+        "the probe settled the owed link: {delta:?}"
+    );
+    assert_eq!(
+        status["domains"][0]["stack_link_pending"], false,
+        "{status}"
+    );
+    assert!(
+        !OriginState::load(&state_dir)
+            .unwrap()
+            .unwrap()
+            .stack_link_pending,
+        "the debt is cleared on disk"
+    );
+}
+
+/// A 403 from the forge on a personal write is unreadable in its raw form,
+/// and the fix is not the caller's to guess: personal mode's stacks are
+/// same-repo and forks are unsupported, so collaborator access is a hard
+/// requirement rather than a suggestion.
+///
+/// This drives the failure through the SHARE VERB rather than through the
+/// enrichment function alone, which is the half a unit test cannot pin: the
+/// teaching text has to be wired into the verb, with the login the write
+/// actually went out as and the repository it was refused by interpolated. The
+/// instance half of the same rule rides along - in instance mode the raw text
+/// is what a failure keeps (spec section 8).
+#[tokio::test]
+async fn a_403_on_a_personal_share_teaches_the_collaborator_requirement() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/a.md", engram("Alpha", "notes/a", "alpha")),
+    ]));
+    mock.set_branch("main", &commit);
+    // The injected provider has no credential behind it to read a login off,
+    // so the login it acts as is supplied beside it.
+    let eng = engine_with(
+        &tmp.path().join("config.yaml"),
+        &tmp.path().join("origins"),
+        mock.clone(),
+        true,
+        false,
+    )
+    .await
+    .with_origin_provider_login("alice-gh");
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "personal".to_string(),
+    })
+    .await
+    .unwrap();
+    let root = tmp.path().join("kb");
+    eng.origin_add(
+        "acme/kb",
+        Some("kb"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        root.join("notes/a.md"),
+        engram("Alpha", "notes/a", "alpha v2"),
+    )
+    .unwrap();
+
+    mock.forbid_writes();
+    let err = eng
+        .origin_share(
+            "kb",
+            None,
+            None,
+            None,
+            None,
+            ShareActor::Account("alice".to_string()),
+        )
+        .await
+        .expect_err("the forge refused the write");
+    assert_eq!(
+        err.to_string(),
+        "your GitHub account @alice-gh needs write access to acme/kb - ask a maintainer to add you as a collaborator."
+    );
+
+    // The same failure on the instance credential keeps today's text: nobody
+    // is being told to fix a personal connection that was never used.
+    eng.configure(&crystalline_service::engine::ConfigureAction::Set {
+        key: "github.share_identity".to_string(),
+        value: "instance".to_string(),
+    })
+    .await
+    .unwrap();
+    let err = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .expect_err("the forge refuses this one too");
+    assert!(
+        !err.to_string().contains("collaborator"),
+        "an instance-token failure keeps its own words: {err}"
+    );
 }
 
 #[tokio::test]
 async fn origin_withdraw_closes_the_pr_and_records_withdrawn() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, mock, root, _number) = shared_team_engine(&tmp).await;
-    let v = eng.origin_withdraw("kb", None, false).await.unwrap();
+    let v = eng
+        .origin_withdraw("kb", None, false, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(v["status"], "withdrawn");
     assert_eq!(v["closed"], true);
     assert!(v["restored"].as_array().unwrap().is_empty());
@@ -1697,7 +2131,10 @@ async fn origin_withdraw_closes_the_pr_and_records_withdrawn() {
 async fn origin_withdraw_with_revert_restores_files() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
-    let v = eng.origin_withdraw("kb", Some(number), true).await.unwrap();
+    let v = eng
+        .origin_withdraw("kb", Some(number), true, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(v["restored"][0], "notes/a.md");
     let text = std::fs::read_to_string(root.join("notes/a.md")).unwrap();
     assert!(!text.contains("alpha v2"), "restored to base: {text}");
@@ -1709,7 +2146,10 @@ async fn origin_share_maps_updated_and_diverged() {
     let (eng, mock, root, number) = shared_team_engine(&tmp).await;
 
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
-    let second = eng.origin_share("kb", None, None).await.unwrap();
+    let second = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(second["outcome"], "updated");
     assert_eq!(second["proposal"]["number"], number);
 
@@ -1718,7 +2158,10 @@ async fn origin_share_maps_updated_and_diverged() {
     let amended = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
     mock.set_branch(&branch, &amended);
     std::fs::write(root.join("notes/c.md"), engram("Gamma", "notes/c", "gamma")).unwrap();
-    let third = eng.origin_share("kb", None, None).await.unwrap();
+    let third = eng
+        .origin_share("kb", None, None, None, None, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(third["outcome"], "proposal_diverged");
     assert_eq!(third["proposal"]["number"], number);
     assert!(
@@ -1727,12 +2170,89 @@ async fn origin_share_maps_updated_and_diverged() {
     );
 }
 
+/// The `proposal` argument reaches `ops::propose` rather than being dropped
+/// on the way: naming the one open layer amends exactly it, and the response
+/// carries the stack fields (null here, since the mock forge serves no stacks
+/// and the share takes the single-proposal fallback).
+#[tokio::test]
+async fn origin_share_amend_param_reaches_ops() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+
+    let v = eng
+        .origin_share("kb", None, None, Some(number), None, ShareActor::Owner)
+        .await
+        .unwrap();
+    assert_eq!(v["outcome"], "updated", "{v}");
+    assert_eq!(v["proposal"]["number"].as_u64(), Some(number), "{v}");
+    assert!(v["proposal"]["stack_number"].is_null(), "{v}");
+    assert!(v["proposal"]["stack_position"].is_null(), "{v}");
+}
+
+/// A share naming a proposal that is not an open layer earns `ops`'s teaching
+/// refusal, and that text has to reach a control or MCP client word for word:
+/// it names what was asked for and lists the layers that are actually open, so
+/// the caller retries against a real number without a second round trip. The
+/// engine boundary must not summarize it away - and nothing may be prepended
+/// to it either: a framing clause in front of the guidance blames the machine
+/// for what the request asked for, so the rendered error starts with the
+/// teaching text itself.
+#[tokio::test]
+async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
+    std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
+
+    let err = eng
+        .origin_share("kb", None, None, Some(9999), None, ShareActor::Owner)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        format!(
+            "proposal #9999 is not an open layer of this domain; open layers: #{number} (layer 1)"
+        ),
+        "the refusal reaches a control or MCP client whole and unprefixed"
+    );
+}
+
+/// `origin_status`'s per-domain entry names the stack and every debt around
+/// it, even when there is nothing stacked: a caller reads the same four keys
+/// whichever path the domain is on.
+#[tokio::test]
+async fn origin_status_json_names_wedge_and_pending_flags() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (eng, _mock, _root, _number) = shared_team_engine(&tmp).await;
+    let v = eng.origin_status(Some("kb")).await.unwrap();
+    let domain = &v["domains"][0];
+    assert!(domain["stack_number"].is_null(), "{v}");
+    assert_eq!(
+        domain["stack_wedged"].as_array().map(Vec::len),
+        Some(0),
+        "{v}"
+    );
+    assert_eq!(domain["repair_pending"], false, "{v}");
+    assert_eq!(domain["stack_link_pending"], false, "{v}");
+}
+
 #[tokio::test]
 async fn origin_share_preview_names_the_action_and_changes() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, root, number) = shared_team_engine(&tmp).await;
     std::fs::write(root.join("notes/b.md"), engram("Beta", "notes/b", "beta")).unwrap();
-    let v = eng.origin_share_preview("kb", None).await.unwrap();
+    let v = eng
+        .origin_share_preview(
+            "kb",
+            None,
+            None,
+            None,
+            ShareActor::Owner,
+            PreviewCredential::ActingIdentity,
+        )
+        .await
+        .unwrap();
     assert_eq!(v["action"], "update");
     assert_eq!(v["number"].as_u64(), Some(number));
     let changes = v["changes"].as_array().unwrap();
@@ -1795,7 +2315,9 @@ async fn origin_status_flags_an_amended_open_proposal() {
 async fn conflicted_team_engine(tmp: &tempfile::TempDir) -> (Engine, std::path::PathBuf, String) {
     let (eng, mock, root, _number) = shared_team_engine(tmp).await;
     // Clear the open proposal so the conflict setup is the only moving part.
-    eng.origin_withdraw("kb", None, false).await.unwrap();
+    eng.origin_withdraw("kb", None, false, ShareActor::Owner)
+        .await
+        .unwrap();
     // Local and upstream edit the same engram differently, then pull.
     std::fs::write(
         root.join("notes/a.md"),
@@ -1918,6 +2440,8 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
             path: "notes/keep.md".to_string(),
             change: ProposedChange::Modified,
             sha256: Some(sha256_hex(&proposed)),
+            blob_sha: None,
+            size: Some(proposed.len() as u64),
         }],
         head_commit: None,
         pending_head_commit: None,
@@ -1925,10 +2449,14 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&state_dir).unwrap();
 
-    let result = eng.origin_withdraw("brand", Some(5), true).await.unwrap();
+    let result = eng
+        .origin_withdraw("brand", Some(5), true, ShareActor::Owner)
+        .await
+        .unwrap();
     assert_eq!(result["restored"][0], "notes/keep.md");
     assert_eq!(
         result["closed"], false,
@@ -2002,6 +2530,8 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
             path: "notes/keep.md".to_string(),
             change: ProposedChange::Modified,
             sha256: Some(sha256_hex(&proposed)),
+            blob_sha: None,
+            size: Some(proposed.len() as u64),
         }],
         head_commit: None,
         pending_head_commit: None,
@@ -2009,10 +2539,13 @@ async fn origin_withdraw_schedules_embedding_on_the_worker_channel() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&state_dir).unwrap();
 
-    eng.origin_withdraw("brand", Some(5), true).await.unwrap();
+    eng.origin_withdraw("brand", Some(5), true, ShareActor::Owner)
+        .await
+        .unwrap();
     assert!(
         rx.try_recv().is_ok(),
         "origin_withdraw must schedule a background embed instead of embedding inline"
@@ -2066,7 +2599,13 @@ async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
     );
 
     let result = eng
-        .origin_resolve("brand", "notes/a.md", Some("theirs"), None)
+        .origin_resolve(
+            "brand",
+            "notes/a.md",
+            Some("theirs"),
+            None,
+            ShareActor::Owner,
+        )
         .await
         .unwrap();
     assert_eq!(result["remaining"], 0);
@@ -2114,7 +2653,13 @@ async fn origin_resolve_unknown_path_errors_without_writing() {
     .unwrap();
 
     let err = eng
-        .origin_resolve("brand", "notes/missing.md", Some("mine"), None)
+        .origin_resolve(
+            "brand",
+            "notes/missing.md",
+            Some("mine"),
+            None,
+            ShareActor::Owner,
+        )
         .await
         .unwrap_err();
     assert!(

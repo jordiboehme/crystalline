@@ -59,6 +59,38 @@ const ERA: &str = "2026-07-28";
 /// `initialize` handshake.
 const LEGACY: &str = "2025-11-25";
 
+/// Every generated folder index under `root`, as domain-relative paths.
+///
+/// The engine writes one per directory it holds, and they travel with a share
+/// like any other file, so a fixture that wants a tree matching its origin has
+/// to put them in the origin too.
+fn generated_indexes(root: &std::path::Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), String::new())];
+    while let Some((dir, prefix)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') {
+                continue;
+            }
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            if entry.path().is_dir() {
+                stack.push((entry.path(), rel));
+            } else if crystalline_core::is_index_file(&name) {
+                found.push(rel);
+            }
+        }
+    }
+    found
+}
+
 // --- the engine, and the two wires ------------------------------------------
 
 struct Harness {
@@ -132,14 +164,13 @@ impl Harness {
         std::fs::create_dir_all(&token_store).unwrap();
 
         let mock = Arc::new(MockProvider::new());
-        let c1 = mock.add_commit(
-            [
+        let mut origin_tree: std::collections::BTreeMap<String, Vec<u8>> = [
                 ("MANIFEST.md".to_string(), b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n".to_vec()),
                 ("notes/a.md".to_string(), b"---\ntype: engram\ntitle: Alpha\npermalink: notes/a\ntags:\n  - test\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nalpha\n".to_vec()),
             ]
             .into_iter()
-            .collect(),
-        );
+            .collect();
+        let c1 = mock.add_commit(origin_tree.clone());
         mock.set_branch("main", &c1);
 
         let store = TursoStore::open_in_memory().await.unwrap();
@@ -160,6 +191,20 @@ impl Harness {
             )
             .await
             .unwrap();
+        // Subscribing generates a folder index per directory, and those travel
+        // with a share now: left as they are, this domain would stand one
+        // refresh ahead of an origin that has never seen them, and "the tree
+        // matches the origin" would not be true of it. So the listings the
+        // generator just wrote are seeded into the origin and pulled back,
+        // which is exactly what the first share after an upgrade does. From
+        // here the tree really does match.
+        for rel in generated_indexes(&domain_root) {
+            let bytes = std::fs::read(domain_root.join(&rel)).unwrap();
+            origin_tree.insert(rel, bytes);
+        }
+        let c2 = mock.add_commit(origin_tree);
+        mock.set_branch("main", &c2);
+        engine.origin_update(Some("kb")).await.unwrap();
         (
             Harness {
                 _tmp: tmp,
@@ -168,6 +213,35 @@ impl Harness {
             },
             mock,
         )
+    }
+
+    /// Re-open this harness's instance sharing with personal GitHub
+    /// identities, on a fresh engine with NO provider injected in front of it.
+    ///
+    /// Both halves are load-bearing. The mode is what splits the write
+    /// credential off the instance one, and dropping the injected provider is
+    /// what lets the split actually run: an injected mock short-circuits
+    /// credential resolution for both modes (`Engine::resolve_share_provider`),
+    /// so a test that kept it would never reach the token store and never see
+    /// the refusal. The config, the domain registration and the origin state
+    /// the mock already wrote are all on disk, so the new engine picks up the
+    /// same team domain; the token-store directory is the empty one the
+    /// harness created, which is what "connected nothing yet" means here and
+    /// is why no keychain is ever touched.
+    async fn share_personally(&mut self, agent_identity: Option<&str>) {
+        let config_path = self.root.join("config.yaml");
+        let mut cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+        let github = cfg.github.get_or_insert_with(GitHubConfig::default);
+        github.enabled = Some(true);
+        github.share_identity = Some("personal".to_string());
+        github.agent_identity = agent_identity.map(str::to_string);
+        crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+        let store = TursoStore::open_in_memory().await.unwrap();
+        self.engine = Arc::new(
+            Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+                .with_token_store_dir(self.root.join("token-store"))
+                .with_origins_dir(self.root.join("origins")),
+        );
     }
 
     /// A raw newline-delimited JSON-RPC conversation over the same duplex
@@ -2524,6 +2598,44 @@ async fn an_eliciting_share_is_asked_before_anything_is_shared() {
     );
 }
 
+/// A share carrying a file selection is asked about the selection, never
+/// about the whole delta.
+///
+/// The question is the user's one chance to see what leaves this machine, so
+/// naming files the call would not carry would be worse than naming none: a
+/// yes would then have been given to a share that was never planned. The
+/// preview behind the question runs the same filter the share runs, which is
+/// what makes the two the same share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_share_asks_about_the_selection_rather_than_the_whole_delta() {
+    let (h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let mut wire = h.stdio().await;
+
+    let asked = wire
+        .open(eliciting(
+            1,
+            "tools/call",
+            json!({
+                "name": "share_changes",
+                "arguments": { "domain": "kb", "files": ["notes/b.md"] },
+            }),
+        ))
+        .await;
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains("notes/b.md"),
+        "the chosen file is named: {message}"
+    );
+    assert!(
+        !message.contains("notes/a.md"),
+        "and the one left behind is not: {message}"
+    );
+}
+
 /// Round two with a yes shares, and the next round one names the update.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
@@ -2540,6 +2652,126 @@ async fn a_confirmed_share_round_two_shares_and_an_update_names_the_proposal() {
         message.contains(&format!("Update open proposal #{number}")),
         "{message}"
     );
+}
+
+/// The same round one on a forge that stacks: the question names the layer
+/// the new proposal would land on, and the forge is still untouched.
+///
+/// This is the stacked model's own version of the assertion above, and it is
+/// worth its own test because the two differ in what the user is agreeing to.
+/// An update moves a proposal reviewers are already looking at; a stack opens
+/// a second one on top of it. A gate that let the stacked plan through
+/// unasked would publish a pull request the user never saw a word about,
+/// which is precisely what `share_plan_needs_confirmation` fails safe on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_share_on_a_stacking_forge_is_asked_before_the_layer_is_opened() {
+    let (h, mock) = Harness::team().await;
+    // On before the first share, so the capability answer this domain caches
+    // is the stacked one from the start.
+    mock.enable_stacks();
+    let (mut wire, number, _branch) = first_shared_proposal(&h).await;
+
+    // Everything the forge was told while the first proposal was legitimately
+    // opened, so the silence asserted below is about this round alone.
+    let before = mock.calls().len();
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "a stacked share is confirmed too, not waved through: {asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Stack a new proposal on top of #{number}")),
+        "the question names the layer it lands on: {message}"
+    );
+    assert!(
+        message.contains("notes/b.md"),
+        "and the file it carries: {message}"
+    );
+
+    assert!(
+        !mock.calls()[before..]
+            .iter()
+            .any(|c| c.starts_with("create_")),
+        "round one opens no layer: {:?}",
+        &mock.calls()[before..]
+    );
+}
+
+/// And the yes that follows: round two on a stacking forge publishes the
+/// layer, opened against the branch below it and grouped into a stack.
+///
+/// The round-one test above proves the question is asked; this proves what
+/// the answer buys, over the wire rather than in the remote crate's own
+/// harness - a second pull request, based on the layer below it rather than
+/// on the trunk, and a `create_stack` linking the two.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_stacked_share_opens_the_layer_on_the_one_below_it() {
+    let (h, mock) = Harness::team().await;
+    mock.enable_stacks();
+    let (mut wire, first, first_branch) = first_shared_proposal(&h).await;
+
+    write_kb_engram(&h, "notes/b.md", "Beta", "notes/b", "beta");
+    let asked = wire.call(eliciting(3, "tools/call", share_kb(None))).await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let done = wire
+        .call(eliciting(
+            4,
+            "tools/call",
+            share_kb(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        body["outcome"], "proposed",
+        "a second proposal, not an update: {body}"
+    );
+    let second = body["number"].as_u64().unwrap();
+    assert_ne!(second, first, "the layer below is left alone");
+    assert_eq!(
+        body["stack_position"],
+        json!([2, 2]),
+        "layer 2 of 2: {body}"
+    );
+
+    // The layer targets the branch below it, not the trunk, and the two were
+    // grouped on the forge.
+    assert_eq!(
+        mock.proposal_base(second).as_deref(),
+        Some(first_branch.as_str()),
+        "the new layer is based on the one below it"
+    );
+    assert!(
+        mock.calls()
+            .contains(&format!("create_stack:[{first},{second}]")),
+        "the chain is linked bottom first: {:?}",
+        mock.calls()
+    );
+    let stack = body["stack_number"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the chain is linked: {body}"));
+    let members: Vec<u64> = mock
+        .stack(stack)
+        .expect("the stack is in the registry")
+        .members
+        .iter()
+        .map(|member| member.number)
+        .collect();
+    assert_eq!(members, vec![first, second]);
 }
 
 /// Round two with a yes on an *update* lands on the open proposal rather than
@@ -2811,6 +3043,90 @@ async fn the_share_round_runs_over_http_too() {
     );
 }
 
+// --- personal share identity, resolved from the transport -------------------
+//
+// An instance can be configured to share as the acting person's own GitHub
+// account rather than as the one instance credential. MCP has two transports
+// and they are two different actors: a stdio session is a process this
+// machine's harness started, so it acts as the machine owner, while an HTTP
+// session carries no user auth at all and acts as the account
+// `github.agent_identity` names. Wiring that up is the release gate these
+// three tests stand on - without it a remote agent's share would go out under
+// the machine owner's name.
+
+/// The two refusal texts, quoted from `crate::engine` rather than retyped:
+/// they travel to the caller verbatim, so a paraphrase here would pass while
+/// the product said something else.
+const PERSONAL_TOKEN_MISSING: &str = "This instance shares with personal GitHub identities. Connect yours in Fluid (profile > GitHub identity) or run 'crystalline connect github --personal', then share again.";
+const AGENT_IDENTITY_UNSET: &str = "This instance shares with personal GitHub identities and no agent identity is configured: set github.agent_identity to the account whose GitHub connection agent shares should use, or share from Fluid or the CLI.";
+
+/// **A stdio session shares as the machine owner**, so an instance sharing
+/// personally with no owner connection on file teaches the two ways to make
+/// one - as `invalid_params`, because it is a situation the caller can get out
+/// of rather than a server fault.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_stdio_share_without_an_owner_connection_teaches_the_fix() {
+    let (mut h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    h.share_personally(None).await;
+    let mut wire = h.stdio().await;
+
+    let refused = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        json!(PERSONAL_TOKEN_MISSING),
+        "{refused}"
+    );
+}
+
+/// **Strictness surfaces in round one.** An eliciting peer is asked before a
+/// share, and a question about a proposal this instance would then refuse to
+/// open is a question it cannot honour - so the preview resolves the same
+/// identity the confirmed call would and answers the refusal instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_share_refuses_in_round_one_rather_than_asking() {
+    let (mut h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    h.share_personally(None).await;
+    let mut wire = h.stdio().await;
+
+    let refused = wire.open(eliciting(1, "tools/call", share_kb(None))).await;
+    assert!(
+        refused["result"]["resultType"] != json!("input_required"),
+        "no question it could not honour: {refused}"
+    );
+    assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        json!(PERSONAL_TOKEN_MISSING),
+        "{refused}"
+    );
+}
+
+/// **An HTTP session shares as the configured agent identity**, and with none
+/// configured the refusal names the setting an admin has to write rather than
+/// reporting a missing token for an identity the caller never chose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_http_share_without_an_agent_identity_names_the_setting() {
+    let (mut h, _mock) = Harness::team().await;
+    edit_kb(&h);
+    h.share_personally(None).await;
+    let addr = h.http().await;
+
+    // A refused call is answered as a JSON-RPC error, which rmcp's HTTP
+    // transport frames with a 400 rather than the 200 a result gets - the
+    // status is that layer's business, the message is ours.
+    let raw = modern_post(addr, 1, "tools/call", share_kb(None)).await;
+    let refused = payload(&raw);
+    assert_eq!(refused["error"]["code"], json!(-32602), "{refused}");
+    assert_eq!(
+        refused["error"]["message"],
+        json!(AGENT_IDENTITY_UNSET),
+        "{refused}"
+    );
+}
+
 // --- the conflict resolution round ------------------------------------------
 
 /// Manufacture one conflict in the team domain: edit locally, advance the
@@ -2978,8 +3294,32 @@ async fn a_conflicted_share_answers_round_one_with_the_pending_count() {
     assert_eq!(body["count"], json!(1), "{body}");
 }
 
-// --- withdraw_proposal -------------------------------------------------------
+// --- withdraw_proposal, and its own confirmation round -----------------------
+//
+// Withdrawing closes a pull request the team is looking at, and a `revert`
+// rewrites the working tree besides, so the eliciting peer is asked the same
+// way `share_changes` asks. The gate is the same two-sided one: a peer that
+// declared no elicitation capability is served exactly one round, unchanged.
 
+/// A withdraw call's params, optionally naming a layer and carrying a round 2
+/// answer.
+fn withdraw_kb(proposal: Option<u64>, responses: Option<Value>) -> Value {
+    let mut arguments = json!({ "domain": "kb" });
+    if let Some(number) = proposal {
+        arguments["proposal"] = json!(number);
+    }
+    let mut params = json!({
+        "name": "withdraw_proposal",
+        "arguments": arguments,
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// The peer that cannot be asked keeps today's behaviour: one round, and the
+/// proposal is closed on the forge by the time it answers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn withdraw_proposal_closes_the_open_proposal_single_round() {
     let (h, mock) = Harness::team().await;
@@ -2988,21 +3328,13 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
     let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
     assert!(shared["error"].is_null(), "{shared}");
 
-    // Single round even for an eliciting peer: no MRTR on withdraw (spec).
     let done = wire
-        .call(eliciting(
-            2,
-            "tools/call",
-            json!({
-                "name": "withdraw_proposal",
-                "arguments": { "domain": "kb" },
-            }),
-        ))
+        .call(modern(2, "tools/call", withdraw_kb(None, None)))
         .await;
     assert_ne!(
         done["result"]["resultType"],
         json!("input_required"),
-        "{done}"
+        "a peer that declared no elicitation is never asked: {done}"
     );
     assert!(done["result"]["isError"] != json!(true), "{done}");
     let body: Value =
@@ -3014,6 +3346,108 @@ async fn withdraw_proposal_closes_the_open_proposal_single_round() {
             .iter()
             .any(|c| c.starts_with("close_proposal:")),
         "{:?}",
+        mock.calls()
+    );
+}
+
+/// Round one names the proposal and closes nothing; round two closes it.
+///
+/// The negative half is the point, as it is for the share and delete rounds:
+/// an `input_required` answered after the pull request was already closed
+/// would be a confirmation of something the team can already see.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_withdrawal_is_asked_before_the_proposal_is_closed() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    let body: Value =
+        serde_json::from_str(shared["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let number = body["number"].as_u64().unwrap();
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", withdraw_kb(None, None)))
+        .await;
+    assert_eq!(
+        asked["result"]["resultType"],
+        json!("input_required"),
+        "{asked}"
+    );
+    let message = asked["result"]["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        message.contains(&format!("Withdraws proposal #{number}")),
+        "the question names the layer it would close: {message}"
+    );
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "round one closes nothing: {:?}",
+        mock.calls()
+    );
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            withdraw_kb(None, Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "{done}"
+    );
+    let body: Value =
+        serde_json::from_str(done["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["number"], json!(number));
+    assert_eq!(body["status"], "withdrawn");
+    assert_eq!(body["closed"], true);
+    assert!(
+        mock.calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "and round two does close it: {:?}",
+        mock.calls()
+    );
+}
+
+/// A withdrawal that cannot resolve a target is reported, not negotiated: the
+/// teaching text arrives verbatim as an `invalid_params` error rather than as
+/// a question about a proposal that does not exist.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eliciting_withdrawal_of_an_unknown_number_is_refused_rather_than_asked() {
+    let (h, mock) = Harness::team().await;
+    edit_kb(&h);
+    let mut wire = h.stdio().await;
+    let shared = wire.open(modern(1, "tools/call", share_kb(None))).await;
+    assert!(shared["error"].is_null(), "{shared}");
+
+    let refused = wire
+        .call(eliciting(2, "tools/call", withdraw_kb(Some(99), None)))
+        .await;
+    assert!(
+        refused["result"]["resultType"] != json!("input_required"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["error"]["code"],
+        json!(-32602),
+        "an unresolvable target is the caller's mistake: {refused}"
+    );
+    assert_eq!(
+        refused["error"]["message"],
+        json!("no open or declined proposal #99 found for this domain"),
+        "{refused}"
+    );
+    assert!(
+        !mock
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("close_proposal:")),
+        "and nothing was closed: {:?}",
         mock.calls()
     );
 }

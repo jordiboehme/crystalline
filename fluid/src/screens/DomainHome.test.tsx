@@ -187,10 +187,11 @@ function vocabularyResponse() {
 function serve(
   routes: Record<string, Answer> = {},
   role: "admin" | "editor" = "editor",
+  probe: () => unknown = () => meResponse({ user: userFixture({ role }) }),
 ) {
   apiMock.mockImplementation(
     answersFor({
-      "/auth/me": () => meResponse({ user: userFixture({ role }) }),
+      "/auth/me": probe,
       "/domains": domainsResponse,
       "/domains/eng/manifest": () => ({ domain: "eng", markdown: MANIFEST }),
       "/domains/eng/tree": treeResponse,
@@ -199,6 +200,20 @@ function serve(
       ...routes,
     }),
   );
+}
+
+/**
+ * A probe from a server that predates `can_share`, so this side has to fall
+ * back to the rule that held before the field existed.
+ */
+function olderProbe(role: "admin" | "editor"): () => unknown {
+  return () => {
+    const probe: Record<string, unknown> = {
+      ...meResponse({ user: userFixture({ role }) }),
+    };
+    delete probe.can_share;
+    return probe;
+  };
 }
 
 /** The listing as it reads for a domain of the given kind. */
@@ -1069,13 +1084,154 @@ describe("the team sync card", () => {
     const body = await screenBody();
     await within(body).findByRole("link", { name: /Alpha/ });
 
-    // The endpoints are admin-only, so an editor's screen must not knock on
-    // them at all: a 403 in the console is noise nobody can act on.
+    // On an instance that shares as itself the endpoints are admin-only, so an
+    // editor's screen must not knock on them at all: a 403 in the console is
+    // noise nobody can act on. The probe is what says so - the screen never
+    // asks a domain's origin whether it is allowed to ask.
     expect(
       requested().some((path) => path.startsWith("/domains/eng/sync")),
     ).toBe(false);
     expect(
       within(body).queryByRole("region", { name: "Team sync" }),
     ).toBeNull();
+    expect(
+      within(body).queryByRole("region", { name: "Proposals" }),
+    ).toBeNull();
+  });
+
+  it("gives an editor both cards where the instance shares as they do", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            open_proposals: [],
+            declined_proposals: [],
+            conflicts: [],
+            connection: {
+              connected: true,
+              user: "octo",
+              token_store: "keychain",
+              share_identity: "personal",
+            },
+          }),
+        "/domains/eng/sync/changes": () => ({
+          action: "create",
+          effective_title: "Share 1 new engram from eng",
+          changes: [{ path: "notes/a.md", kind: "added" }],
+        }),
+        // This session has connected nothing yet, which is what the dialog
+        // has something to say about.
+        "/me/github-identity": () => ({
+          account: "ada",
+          connected: false,
+          login: null,
+          connected_at: null,
+          token_store: null,
+          pending: null,
+          error: null,
+        }),
+      },
+      "editor",
+      () =>
+        meResponse({ user: userFixture({ role: "editor" }), can_share: true }),
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    // Both cards, because both routes behind them serve this account now.
+    const proposals = await within(body).findByRole("region", {
+      name: "Proposals",
+    });
+    expect(
+      await within(body).findByRole("region", { name: "Team sync" }),
+    ).toBeVisible();
+
+    // And the identity affordance the dialogs carry: an editor sharing on
+    // their own name is exactly the session that may not have connected one.
+    await userEvent.click(
+      within(proposals).getByRole("button", { name: "Share changes" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /share/i });
+    expect(
+      await within(dialog).findByRole("link", {
+        name: "Connect GitHub to share",
+      }),
+    ).toHaveAttribute("href", "/profile");
+  });
+
+  it("keeps an admin's cards whichever identity the instance shares as", async () => {
+    serve(
+      {
+        "/domains/eng/sync": () =>
+          syncResponse({
+            connection: {
+              connected: true,
+              user: "octo",
+              token_store: "keychain",
+              share_identity: "personal",
+            },
+          }),
+        "/me/github-identity": () => ({
+          account: "root",
+          connected: true,
+          login: "octo",
+          connected_at: "2026-08-29T09:12:44Z",
+          token_store: "keyring",
+          pending: null,
+          error: null,
+        }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+
+    // Personal mode widens who may share; it never narrows it.
+    expect(
+      await within(body).findByRole("region", { name: "Team sync" }),
+    ).toBeVisible();
+    expect(
+      await within(body).findByRole("region", { name: "Proposals" }),
+    ).toBeVisible();
+  });
+
+  it("keeps an admin's cards when the probe says nothing about sharing", async () => {
+    serve(
+      { "/domains/eng/sync": () => syncResponse() },
+      "admin",
+      olderProbe("admin"),
+    );
+
+    renderApp("/d/eng");
+
+    // A server that predates the field draws the screens it always drew.
+    expect(
+      await within(await screenBody()).findByRole("region", {
+        name: "Team sync",
+      }),
+    ).toBeVisible();
+  });
+
+  it("gives an editor nothing when the probe says nothing about sharing", async () => {
+    serve(
+      { "/domains/eng/sync": () => syncResponse() },
+      "editor",
+      olderProbe("editor"),
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await within(body).findByRole("link", { name: /Alpha/ });
+
+    // The other half of the same fallback: an absent answer is read as the
+    // rule that held before there was one, so nothing is widened by silence.
+    expect(
+      within(body).queryByRole("region", { name: "Team sync" }),
+    ).toBeNull();
+    expect(
+      requested().some((path) => path.startsWith("/domains/eng/sync")),
+    ).toBe(false);
   });
 });

@@ -80,7 +80,10 @@ pub struct SubscribeReport {
     pub adopted: bool,
     /// How many local files differ from the new base snapshot right after
     /// subscribing: kept local edits plus local-only files, all shareable or
-    /// updatable through the ordinary flows. Always 0 for a fresh download.
+    /// updatable through the ordinary flows. Counted the way
+    /// [`OriginStatusReport::local_changes`] is, real work only, so a directory
+    /// index the local generator will rewrite anyway is not reported as kept
+    /// work. Always 0 for a fresh download.
     pub local_changes: usize,
 }
 
@@ -120,7 +123,10 @@ pub struct OriginStatusReport {
     /// Whether the branch has moved ahead of the base commit, or `None` when
     /// the origin was not probed (offline mode).
     pub behind: Option<bool>,
-    /// How many local working-tree changes stand against the base snapshot.
+    /// How many local working-tree changes stand against the base snapshot,
+    /// counting only real work: a refreshed directory index is derived from the
+    /// files beside it, so it never on its own makes a domain look like it has
+    /// something to say.
     pub local_changes: usize,
     /// Working-tree files skipped for exceeding [`MAX_SHARED_FILE_BYTES`],
     /// each with its size in bytes.
@@ -129,6 +135,17 @@ pub struct OriginStatusReport {
     pub open_proposals: Vec<Proposal>,
     /// Share proposals closed without merging.
     pub declined_proposals: Vec<Proposal>,
+    /// Numbers of proposals this domain knows have merged but has not pulled
+    /// in yet.
+    ///
+    /// A [`status`] with a probe flips a record to [`ProposalStatus::Merged`]
+    /// without consuming it - consumption stays [`pull`]'s job - so the record
+    /// sits in state, in neither list above, until the next pull moves it to
+    /// history. Reported by number rather than as records because the one
+    /// thing a caller does with it is recognize a number: a merged proposal
+    /// cannot be withdrawn, and [`withdraw`] says so in those words rather
+    /// than claiming the number does not exist.
+    pub merged_unconsumed: Vec<u64>,
     /// Conflicts still waiting to be resolved.
     pub conflicts: Vec<Conflict>,
     /// When the branch was last checked for new upstream commits.
@@ -138,6 +155,22 @@ pub struct OriginStatusReport {
     /// live list was not consulted (offline, no probe, or the list call
     /// failed and status degraded to local state).
     pub amended_upstream: Vec<u64>,
+    /// The stack number linking this domain's open chain on the forge, `None`
+    /// when nothing is stacked (zero or one open layer, the fallback path, or
+    /// a chain whose link is still owed).
+    pub stack_number: Option<u64>,
+    /// Numbers of Declined layers that still carry open layers above them: the
+    /// chain is wedged on them, and the next share or withdrawal repairs it
+    /// (see [`crate::state::OriginState::proposals`] for the bottom-to-top
+    /// order this walks).
+    pub stack_wedged: Vec<u64>,
+    /// Whether a chain repair was interrupted and is still owed. The next
+    /// stacked share or withdrawal finishes it before its own work.
+    pub repair_pending: bool,
+    /// Whether a stack link this machine owes the forge is still unpaid: every
+    /// pull request exists, they are simply not grouped. A status with a probe
+    /// tries to settle it first, so this reads false once the retry lands.
+    pub stack_link_pending: bool,
 }
 
 /// What [`propose`] did with a domain's local changes.
@@ -191,6 +224,14 @@ pub struct ProposeReport {
     /// line of the generated proposal body, when the caller supplies no
     /// description of their own).
     pub summary: String,
+    /// The stack number linking this proposal's chain on the forge. `None`
+    /// off the stacked path, and `None` on a stacked layer whose linking call
+    /// failed (the chain is degraded, which
+    /// [`crate::state::OriginState::stack_link_pending`] carries).
+    pub stack_number: Option<u64>,
+    /// Where this proposal sits in the open chain, as `(position, open
+    /// layers)` with a 1-based position. `None` off the stacked path.
+    pub stack_position: Option<(usize, usize)>,
 }
 
 /// What [`withdraw`] did with a declined or still-open proposal.
@@ -211,6 +252,21 @@ pub struct WithdrawReport {
     /// Paths left untouched because the local file diverged since sharing:
     /// newer work is never destroyed.
     pub skipped_diverged: Vec<String>,
+    /// Paths a revert could not restore because their pre-share content is
+    /// nowhere to be had: the trunk snapshot never carried the file (a layer
+    /// below the withdrawn one added it) and that layer's record names no blob
+    /// to fetch it back from, or the fetch itself failed. The path is left
+    /// exactly as it stands rather than failing the withdrawal.
+    pub skipped_reverts: Vec<String>,
+    /// True when the chain around the withdrawn layer was repaired: the stack
+    /// was dissolved and, where two layers survived, recreated, with every
+    /// layer above the hole replayed onto the one below it.
+    pub repaired: bool,
+    /// The NEW stack number a repair's recreate allocated, `None` when no
+    /// stack was recreated (fewer than two survivors, or no repair at all).
+    /// A dissolve plus recreate never keeps the old number: stack numbers come
+    /// off the same sequence as issue and pull request numbers.
+    pub restacked: Option<u64>,
 }
 
 /// How to settle one recorded conflict, passed to [`resolve`].
@@ -318,7 +374,7 @@ pub async fn subscribe(
 
     let engrams = extracted.keys().filter(|p| p.ends_with(".md")).count();
     let local_changes = if adopted {
-        detect_local_changes(domain_root, &files)?.changes.len()
+        detect_local_changes(domain_root, &files)?.substantive_count()
     } else {
         0
     };
@@ -350,6 +406,20 @@ pub async fn subscribe(
 /// merge each change into the working tree, record conflicts, advance the base
 /// snapshot over every processed path (conflicted ones included) and consume
 /// any merged proposals.
+///
+/// One kind of upstream change is deliberately not merged: a generated
+/// directory index (`index.md`). Its stamp is advanced like any other file's,
+/// so a share can carry the local generator's listing upstream and the
+/// repository converges, but the file on disk is left exactly as the generator
+/// wrote it. So an index whose local content differs from its recorded stamp is
+/// the expected steady state here rather than drift, it never appears in
+/// [`PullReport::applied`], and it can never raise a conflict.
+///
+/// Consuming a merged layer is also what puts a stacked chain back together
+/// after the forge moved it: merging one layer rebases every layer above it,
+/// so once the merge is in history [`adopt_rebased_layers`] takes each
+/// survivor's new head where the move carried none of that layer's own work.
+/// Without that a plain merge would leave the whole chain looking amended.
 pub async fn pull(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -357,7 +427,7 @@ pub async fn pull(
     state_dir: &Path,
 ) -> Result<PullReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -441,6 +511,18 @@ pub async fn pull(
 
     for edit in &edits {
         let rel = &edit.path;
+        // A generated directory index rides along with a share so the team
+        // repository stays browsable, but the local generator is the single
+        // authority on its content: the origin's copy is recorded in the base
+        // snapshot below - so the next share carries the delta and the
+        // repository converges on this machine's listing - and is never
+        // written over the file on disk. Skipping the whole merge here is also
+        // what keeps a diverged index structurally incapable of raising a
+        // conflict: a derived file is nothing to ask a person to choose sides
+        // over.
+        if crystalline_core::is_index_path(rel) {
+            continue;
+        }
         let base = state::read_base_file(state_dir, rel)?;
         let wt_path = checked_working_path(state_dir, domain_root, rel)?;
         let local = read_optional_file(&wt_path)?;
@@ -518,20 +600,24 @@ pub async fn pull(
     state.ref_etag = new_etag;
     state.last_checked = Some(Utc::now());
 
-    // Consume merged proposals in memory, then persist base advance,
+    // Consume merged proposals in memory, adopt the rebase the forge performed
+    // on whatever still stands above them, then persist base advance,
     // conflicts and history together in one atomic save so a crash cannot
     // leave a merged proposal half-consumed.
-    for prop in &merged_to_consume {
-        state.proposals.retain(|p| p.number != prop.number);
-        let mut consumed = prop.clone();
-        consumed.status = ProposalStatus::Merged;
-        state.push_history(consumed);
+    let consumed = consume_merged(&mut state);
+    if !consumed.is_empty()
+        && state
+            .proposals
+            .iter()
+            .any(|p| p.status == ProposalStatus::Open)
+    {
+        adopt_rebased_layers(provider, spec, &mut state).await;
     }
     state.save(state_dir)?;
 
     // Best-effort branch cleanup, after the state is durable; errors are
     // ignored entirely (the branch lingering upstream harms nothing).
-    for prop in &merged_to_consume {
+    for prop in &consumed {
         let _ = provider.delete_branch(spec, &prop.branch).await;
     }
 
@@ -544,6 +630,150 @@ pub async fn pull(
         skipped_large,
         re_baselined: false,
     })
+}
+
+/// Moves every Merged record out of the chain and into history, returning
+/// them so the caller can delete their branches once its state is durable.
+///
+/// The one rule beyond the move: when the last open layer leaves this way, the
+/// stack number goes with it. A number naming a chain with nothing open in it
+/// names nothing, and leaving it behind would have the next share dissolve a
+/// stack that is already finished.
+fn consume_merged(state: &mut OriginState) -> Vec<Proposal> {
+    let merged: Vec<Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Merged)
+        .cloned()
+        .collect();
+    if merged.is_empty() {
+        return merged;
+    }
+    state
+        .proposals
+        .retain(|p| p.status != ProposalStatus::Merged);
+    for prop in &merged {
+        state.push_history(prop.clone());
+    }
+    if !state
+        .proposals
+        .iter()
+        .any(|p| p.status == ProposalStatus::Open)
+    {
+        state.stack_number = None;
+    }
+    merged
+}
+
+/// Adopts the rebase the forge performs on a chain when a layer below it
+/// merges, so a surviving layer is not reported as amended for work nobody
+/// did.
+///
+/// Merging one layer of a stack moves every layer above it: GitHub rebases
+/// each survivor onto the new trunk, which gives it a new head sha carrying
+/// the same content. Left alone, that reads exactly like a reviewer's
+/// amendment ([`status`]'s `amended_upstream`), and a share would refuse with
+/// [`ProposeOutcome::ProposalDiverged`] over a move this domain asked for.
+///
+/// Telling the two apart is one comparison per moved layer: a rebase changes
+/// what the layer's commit stands on and nothing the layer itself proposes, so
+/// a compare from the recorded head to the live one that touches NONE of the
+/// layer's own files is a rebase, and the record simply takes the new head.
+/// The spec's blob-by-blob check is the same statement over the verbs this
+/// provider actually has. Anything else leaves the record exactly as it
+/// stands: a compare that touches an own path is a real amendment and must
+/// stay visible, a truncated compare is no answer at all (the next poll asks
+/// again), and a gone branch ref is the settling paths' business rather than
+/// this one's.
+///
+/// Only ever called after a merge was consumed, and best effort throughout: a
+/// failure here leaves the layer looking amended, which is the safe reading
+/// and one the user can act on, so it never fails the pull that healed
+/// everything else.
+async fn adopt_rebased_layers(provider: &dyn Provider, spec: &OriginSpec, state: &mut OriginState) {
+    let sub = spec.subpath.as_deref();
+    // What each layer stands on, walked bottom to top: the freshly advanced
+    // trunk for the bottom layer, the layer below for every other. Recording
+    // it keeps the chain's recorded shape intact, which is what
+    // `stack_shape_broken` reads to decide a repair is owed.
+    let mut parent_head = state.base_commit.clone();
+    for index in 0..state.proposals.len() {
+        if state.proposals[index].status != ProposalStatus::Open {
+            continue;
+        }
+        let layer = state.proposals[index].clone();
+        match rebased_head(provider, spec, &layer, sub).await {
+            Some(live) => {
+                let record = &mut state.proposals[index];
+                record.head_commit = Some(live.clone());
+                record.base_commit = Some(parent_head);
+                parent_head = live;
+            }
+            None => {
+                // A layer left alone keeps its recorded head, so the layer
+                // above it records a base that is stale upstream. That is the
+                // consistent reading rather than a guess: the chain stays
+                // self-consistent (`stack_shape_broken` sees each base still
+                // matching the head below it, so no repair is ordered) and the
+                // divergence surfaces where it belongs, as `amended_upstream`
+                // on the layer that really moved.
+                if let Some(head) = layer.head_commit {
+                    parent_head = head;
+                }
+            }
+        }
+    }
+}
+
+/// The live head of `layer`'s branch when a rebase is the only thing that
+/// moved it, `None` in every other case (see [`adopt_rebased_layers`] for what
+/// those cases are and why each one is left alone).
+async fn rebased_head(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    layer: &Proposal,
+    sub: Option<&str>,
+) -> Option<String> {
+    let recorded = layer.head_commit.as_deref()?;
+    let live = match provider.branch_ref(spec, &layer.branch).await {
+        Ok(Some(live)) => live,
+        Ok(None) => return None,
+        Err(e) => {
+            tracing::debug!(
+                "reading proposal #{}'s branch failed; leaving its recorded head alone: {e}",
+                layer.number
+            );
+            return None;
+        }
+    };
+    // A head this machine put there - settled or half-pushed - is nothing to
+    // adopt: the share paths own both.
+    if head_is_ours(layer, &live) {
+        return None;
+    }
+    let cmp = match provider.compare(spec, recorded, &live).await {
+        Ok(cmp) => cmp,
+        Err(e) => {
+            tracing::debug!(
+                "comparing proposal #{}'s heads failed; leaving its recorded head alone: {e}",
+                layer.number
+            );
+            return None;
+        }
+    };
+    if cmp.truncated {
+        return None;
+    }
+    let own: BTreeSet<String> = layer
+        .files
+        .iter()
+        .map(|file| to_repo_relative(&file.path, sub))
+        .collect();
+    let touches_own = cmp.files.iter().any(|change| {
+        own.contains(&change.path)
+            || matches!(&change.kind, ChangeKind::Renamed { previous } if own.contains(previous))
+    });
+    if touches_own { None } else { Some(live) }
 }
 
 /// Reports where a domain stands relative to its origin.
@@ -563,14 +793,30 @@ pub async fn pull(
 /// history stays [`pull`]'s job. The list call is best-effort: a failure logs
 /// and degrades to the offline picture (local statuses unchanged, no amended
 /// flags), never failing the status.
+///
+/// The four stack fields are read off local state, with one exception: an
+/// owed stack link may be settled before they are read ([`retry_stack_link`]),
+/// so a status that could pay the debt reports the healed truth rather than the
+/// debt. That needs a provider and `settle_owed_link`, and it costs nothing
+/// when nothing is owed - the flag is tested before the capability is.
+///
+/// `settle_owed_link` is the permission for that one settlement, and nothing
+/// else in the report depends on it: `false` reports the debt exactly as it
+/// stands, probes nothing and touches no cache, leaving whoever says yes next
+/// to pay it off. `github.stacks` is carried through it, and so is one thing
+/// this crate deliberately cannot see for itself - whether `probe` is a
+/// credential a forge WRITE may go out on. Where it is not (a read verb
+/// probing with an instance credential while shares run on somebody's personal
+/// one), the layer above passes `false` and the debt waits for a write.
 pub async fn status(
     spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
     probe: Option<&dyn Provider>,
+    settle_owed_link: bool,
 ) -> Result<OriginStatusReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -597,6 +843,27 @@ pub async fn status(
                 }
                 state.last_checked = Some(Utc::now());
                 state.save(state_dir)?;
+            }
+        }
+    }
+
+    // A link this machine owes the forge is settled before anything is
+    // reported, so a status names the chain as it really stands rather than as
+    // the last failed call left it. The debt is tested first: an origin that
+    // owes nothing never asks whether the forge serves stacks at all. A caller
+    // that withheld its permission settles nothing and simply reports the debt.
+    //
+    // Nothing on this path may fail the status, the capability check included:
+    // its one error is the save that caches a fresh verdict, and a status that
+    // could not write that cache still has every answer it came for.
+    if let Some(provider) = probe
+        && state.stack_link_pending
+    {
+        match stacks_available(provider, spec, &mut state, state_dir, settle_owed_link).await {
+            Ok(true) => retry_stack_link(provider, spec, &mut state, state_dir).await,
+            Ok(false) => {}
+            Err(e) => {
+                tracing::debug!("the stacks probe failed; reporting the owed link as it is: {e}");
             }
         }
     }
@@ -681,20 +948,449 @@ pub async fn status(
         .filter(|p| p.status == ProposalStatus::Declined)
         .cloned()
         .collect();
+    // Every Merged record still standing in `state.proposals` is one this
+    // domain has not pulled in: a consumed one has already moved to history.
+    let merged_unconsumed = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Merged)
+        .map(|p| p.number)
+        .collect();
 
     Ok(OriginStatusReport {
         repo: state.repo.clone(),
         branch: state.branch.clone(),
         base_commit: state.base_commit.clone(),
         behind,
-        local_changes: local.changes.len(),
+        local_changes: local.substantive_count(),
         skipped_large: local.skipped_large,
         open_proposals,
         declined_proposals,
+        merged_unconsumed,
         conflicts: state.conflicts.clone(),
         last_checked: state.last_checked,
         amended_upstream,
+        stack_number: state.stack_number,
+        stack_wedged: under_an_open_layer(&state)
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Declined)
+            .map(|p| p.number)
+            .collect(),
+        repair_pending: state.repair_pending,
+        stack_link_pending: state.stack_link_pending,
     })
+}
+
+/// The recorded layers that still carry an OPEN layer above them, in chain
+/// order.
+///
+/// One walk answers both questions this crate asks about a closed layer left
+/// inside a chain, because they are the same question: is there still open
+/// work standing on it? A Declined one there is a wedge a repair has to close
+/// ([`OriginStatusReport::stack_wedged`]); a Merged one there is content a
+/// replay would rebuild without ([`merged_layer_blocking_repair`]). Above the
+/// topmost open layer neither is true: nothing is stacked on it, so nothing is
+/// replayed over it.
+fn under_an_open_layer(state: &OriginState) -> &[Proposal] {
+    match state
+        .proposals
+        .iter()
+        .rposition(|p| p.status == ProposalStatus::Open)
+    {
+        Some(top) => &state.proposals[..top],
+        None => &[],
+    }
+}
+
+/// Everything a share call carries besides the domain itself.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ShareOptions<'a> {
+    /// The proposal's title (a new layer) or commit message (an amend).
+    pub title: Option<&'a str>,
+    /// The proposal's description body.
+    pub description: Option<&'a str>,
+    /// Amend this open layer instead of stacking a new proposal.
+    pub proposal: Option<u64>,
+    /// Whether stacked proposals may be used at all (github.stacks config).
+    pub stacks_allowed: bool,
+    /// The GitHub login this share acts as, recorded on the proposal record it
+    /// creates or rewrites (see [`Proposal::author_login`]).
+    ///
+    /// Opaque here: the caller resolves who is sharing and hands the answer
+    /// down as a string, so nothing in this crate learns what an identity is.
+    /// `None` is "no login to name" rather than "nobody", so an update never
+    /// erases a recorded author with it.
+    pub author_login: Option<&'a str>,
+    /// The domain-relative paths this share carries, or `None` for the whole
+    /// unshared delta.
+    ///
+    /// Opaque here in the same sense `author_login` is: the caller decides
+    /// which files a person or an agent picked, and this crate only filters
+    /// the delta it detected down to them (see [`select_share_files`]). An
+    /// empty slice is a selection of nothing, which is
+    /// [`ProposeOutcome::NothingToShare`] rather than an error.
+    pub files: Option<&'a [String]>,
+}
+
+/// The changes a share carries once the caller's selection is applied: the
+/// whole delta for `None`, and exactly the chosen paths (plus the generated
+/// listings of the folders they live in) for `Some`.
+///
+/// Filtering happens here rather than inside detection, and after it rather
+/// than before, for one reason: what a path is measured against is the delta
+/// this share would carry, so a path that is not among it can be refused by
+/// name instead of quietly sharing nothing. Every unknown path is named at
+/// once, since a caller fixing a typo would rather see all of them than one
+/// per attempt.
+///
+/// **A folder's generated listing rides along with the folder's own files.**
+/// An `index.md` is derived from the engrams beside it, so a selection that
+/// shares an engram and leaves its folder's listing behind would publish a
+/// listing that disagrees with the folder it describes. The rule is the
+/// narrow one: the listing of the folder a selected path lives in, never the
+/// listings above it, which describe folders this share is not changing the
+/// contents of. A listing named explicitly is a selected path like any other.
+///
+/// A selection that matches nothing leaves an empty change list, which every
+/// caller already reads as [`ProposeOutcome::NothingToShare`].
+fn select_share_files(
+    local: crate::changes::LocalChanges,
+    files: Option<&[String]>,
+) -> Result<crate::changes::LocalChanges, RemoteError> {
+    let Some(files) = files else {
+        return Ok(local);
+    };
+    let detected: BTreeSet<&str> = local.changes.iter().map(|c| c.path()).collect();
+    let mut chosen: BTreeSet<String> = BTreeSet::new();
+    let mut unknown: Vec<String> = Vec::new();
+    for raw in files {
+        let path = normalize_selected_path(raw);
+        if detected.contains(path.as_str()) {
+            chosen.insert(path);
+        } else if !unknown.contains(&path) {
+            unknown.push(path);
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(RemoteError::Refused(format!(
+            "not among this domain's unshared changes: {}; take the paths from the share preview, which lists every file a share would carry, or leave the file list out to share everything",
+            unknown.join(", ")
+        )));
+    }
+    let folders: BTreeSet<&str> = chosen
+        .iter()
+        .filter(|path| !crystalline_core::is_index_path(path))
+        .map(|path| folder_of(path))
+        .collect();
+    let changes = local
+        .changes
+        .into_iter()
+        .filter(|change| {
+            let path = change.path();
+            chosen.contains(path)
+                || (crystalline_core::is_index_path(path) && folders.contains(folder_of(path)))
+        })
+        .collect();
+    Ok(crate::changes::LocalChanges {
+        changes,
+        skipped_large: local.skipped_large,
+    })
+}
+
+/// The folder a domain-relative path lives in, `""` for the domain root.
+fn folder_of(path: &str) -> &str {
+    match path.rfind('/') {
+        Some(at) => &path[..at],
+        None => "",
+    }
+}
+
+/// A selected path in the shape detection reports paths in.
+///
+/// Only the shapes a person or a shell plausibly types: surrounding
+/// whitespace, a `./` prefix and Windows separators. Anything else is left
+/// alone and simply fails to match, which is a refusal naming the path rather
+/// than a guess about what was meant.
+fn normalize_selected_path(raw: &str) -> String {
+    let trimmed = raw.trim().replace('\\', "/");
+    trimmed
+        .strip_prefix("./")
+        .unwrap_or(trimmed.as_str())
+        .to_string()
+}
+
+/// The cached stacks verdict for this origin, probing once when unknown.
+///
+/// A forge either serves stacks or it does not, and that answer does not
+/// change between two shares, so it is asked once per origin and kept in
+/// origin state. `stacks_allowed = false` (the `github.stacks` config) is the
+/// user saying no before the question is worth asking: it short-circuits
+/// without probing and without consulting or touching the cache, so turning
+/// the setting back on finds the cache exactly as it was.
+///
+/// Only two answers are verdicts worth remembering: the forge served the
+/// listing, or it said it does not serve stacks at all. Any other failure -
+/// offline, a 500, a timeout - is this probe failing rather than the forge
+/// answering, so the share falls back for this run alone and nothing is
+/// cached: the next share asks again. An optional capability is never worth
+/// failing a share over.
+async fn stacks_available(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+    stacks_allowed: bool,
+) -> Result<bool, RemoteError> {
+    if !stacks_allowed {
+        return Ok(false);
+    }
+    if let Some(cached) = state.stacks_available {
+        return Ok(cached);
+    }
+    let verdict = match provider.list_stacks(spec, None).await {
+        Ok(_) => true,
+        Err(RemoteError::StacksUnsupported) => false,
+        Err(e) => {
+            tracing::debug!("the stacks probe failed; sharing without stacking this time: {e}");
+            return Ok(false);
+        }
+    };
+    state.stacks_available = Some(verdict);
+    state.save(state_dir)?;
+    Ok(verdict)
+}
+
+/// Whether this origin's open chain is one more layers may be stacked onto.
+///
+/// Zero or one open proposal is trivially compatible: there is no chain to be
+/// inconsistent with. Beyond that the chain must be one this machine knows as
+/// a stack - a recorded stack number, or a link it still owes the forge. A
+/// multi-open state carrying neither predates stacking, and its shares take
+/// the fallback flows.
+fn chain_is_stacked(state: &OriginState) -> bool {
+    let open = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .count();
+    open <= 1 || state.stack_number.is_some() || state.stack_link_pending
+}
+
+/// The chain tip: what the working tree would look like if every open layer
+/// were already merged, as a base snapshot manifest
+/// [`detect_local_changes`] can compare against.
+///
+/// This is the base a stacked share detects against, and it is a base rather
+/// than a filter on purpose. A layer must record ITS delta and nothing else:
+/// with the trunk as the base, every layer re-proposes what the layers below
+/// it already carry, a share with nothing new opens an empty layer instead of
+/// reporting nothing to share, and a delete of a file only a lower layer
+/// holds is invisible, because the trunk never carried that file at all.
+///
+/// The overlay is the trunk snapshot with each OPEN layer's own recorded
+/// files laid over it in `state.proposals` order (bottom to top, which is the
+/// order the layers stack in): an added or modified path takes that layer's
+/// recorded digest and size, a deleted path leaves the map. Tasks 7, 8 and 9
+/// reuse this - an amend recomputes one layer's delta against the tip below
+/// it, a withdrawal excises a layer from the chain, and a pull adopts what a
+/// merged layer brought in.
+fn effective_tip_files(state: &OriginState) -> BTreeMap<String, BaseStamp> {
+    let open: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    tip_files_over(&state.files, &open)
+}
+
+/// [`effective_tip_files`] over an explicit layer list, for a caller that
+/// knows some recorded layer is about to leave the chain (a preview mirroring
+/// the settle a share would perform on a gone branch ref).
+///
+/// A layer entry with no recorded digest is skipped rather than guessed at:
+/// the path keeps its trunk stamp, so the file reads as this share's own work
+/// again. That costs a redundant tree write and never loses a change. Only a
+/// record written before those fields existed can be in that shape, and such
+/// a record cannot sit on a stacked chain, since stacking and the fields
+/// shipped together. A recorded size is used when present and falls back to
+/// the trunk's, which can at worst produce that same redundant write.
+fn tip_files_over(
+    base: &BTreeMap<String, BaseStamp>,
+    layers: &[&Proposal],
+) -> BTreeMap<String, BaseStamp> {
+    let mut tip = base.clone();
+    for layer in layers {
+        for file in &layer.files {
+            match file.change {
+                ProposedChange::Added | ProposedChange::Modified => {
+                    let Some(sha256) = file.sha256.clone() else {
+                        continue;
+                    };
+                    let size = file
+                        .size
+                        .or_else(|| base.get(&file.path).map(|stamp| stamp.size))
+                        .unwrap_or_default();
+                    tip.insert(file.path.clone(), BaseStamp { sha256, size });
+                }
+                ProposedChange::Deleted => {
+                    tip.remove(&file.path);
+                }
+            }
+        }
+    }
+    tip
+}
+
+/// Whether a stack write failed because the stack this machine records is no
+/// longer the open chain, rather than because the write itself went wrong.
+///
+/// Two answers say it, and neither is retryable - the identical call would
+/// fail identically forever, which is exactly the wedge this exists to end:
+///
+/// - the forge's base-ref 422 ("pull requests must form a stack..."), which
+///   an `extend_stack` earns whenever the recorded stack's TOP member is not
+///   the layer the new one was branched from. A member closed out from under
+///   the chain is the everyday reason, since closing a member neither removes
+///   it from the stack nor retargets anything;
+/// - a 404 on a path naming a concrete stack number, which is that stack
+///   being gone outright - dissolved on the website by somebody who did not
+///   tell this machine. (The GitHub client keeps that distinct from
+///   [`RemoteError::StacksUnsupported`] precisely so this can read it.)
+///
+/// [`rebuild_stack`] is what settles both.
+fn stack_no_longer_matches(e: &RemoteError) -> bool {
+    match e {
+        RemoteError::Api { status: 404, .. } => true,
+        RemoteError::Api {
+            status: 422,
+            message,
+        } => message.to_lowercase().contains("form a stack"),
+        _ => false,
+    }
+}
+
+/// Dissolves the stack this machine records and creates a fresh one over the
+/// whole open chain: the one move that settles a stack the forge no longer
+/// matches, and the only thing that unwedges an `extend_stack` the forge
+/// refuses on the chain rule.
+///
+/// Bounded on purpose: one dissolve, one create, no loop and no second
+/// attempt. A dissolve of a stack that is already gone is a 404 and means the
+/// work is done; a create that fails leaves the caller to record the debt as
+/// [`crate::state::OriginState::stack_link_pending`], and the next operation
+/// comes back through here rather than around again.
+async fn rebuild_stack(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    stack: u64,
+    open: &[u64],
+) -> Result<u64, RemoteError> {
+    match provider.dissolve_stack(spec, stack).await {
+        Ok(()) => {}
+        Err(RemoteError::Api { status: 404, .. }) => {
+            tracing::debug!("stack {stack} was already gone");
+        }
+        Err(RemoteError::StacksUnsupported) => {
+            tracing::debug!("this forge no longer serves stacks; nothing to dissolve");
+        }
+        Err(e) => return Err(e),
+    }
+    provider
+        .create_stack(spec, open)
+        .await
+        .map(|info| info.number)
+}
+
+/// Settles a stack link this machine still owes the forge, best effort.
+///
+/// A layer whose `create_stack` or `extend_stack` call failed leaves the
+/// chain degraded rather than wrong: every pull request exists, they are
+/// simply not grouped. [`crate::state::OriginState::stack_link_pending`]
+/// records that debt, and this pays it off at the start of the next share,
+/// withdrawal or status, before that operation does any work of its own.
+///
+/// Which call settles it follows from what is already known: with no stack
+/// number the whole open chain is grouped in one `create_stack`; with one,
+/// the forge is asked which members it holds and only the missing layers are
+/// added. Fewer than two open layers is not a chain at all, so the flag is
+/// simply cleared. Every failure here is swallowed and logged - the debt
+/// stays recorded and the next operation tries again.
+///
+/// With one exception, because retrying is exactly what must not happen
+/// there: an extend the forge refuses because the recorded stack is no longer
+/// the open chain ([`stack_no_longer_matches`]) would be retried forever and
+/// heal nothing, so it is rebuilt instead ([`rebuild_stack`]) - once, in this
+/// call, over the whole open chain.
+async fn retry_stack_link(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) {
+    if !state.stack_link_pending {
+        return;
+    }
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    if open.len() < 2 {
+        state.stack_link_pending = false;
+        if let Err(e) = state.save(state_dir) {
+            tracing::debug!("clearing the stale stack-link debt failed: {e}");
+        }
+        return;
+    }
+
+    let linked = match state.stack_number {
+        None => provider
+            .create_stack(spec, &open)
+            .await
+            .map(|info| Some(info.number)),
+        Some(number) => match provider.list_stacks(spec, Some(open[0])).await {
+            Ok(stacks) => {
+                let known: Vec<u64> = stacks
+                    .iter()
+                    .find(|s| s.number == number)
+                    .map(|s| s.members.iter().map(|m| m.number).collect())
+                    .unwrap_or_default();
+                let missing: Vec<u64> = open
+                    .iter()
+                    .copied()
+                    .filter(|n| !known.contains(n))
+                    .collect();
+                if missing.is_empty() {
+                    Ok(Some(number))
+                } else {
+                    match provider.extend_stack(spec, number, &missing).await {
+                        Ok(_) => Ok(Some(number)),
+                        // The recorded stack is not the open chain any more,
+                        // so no number of retries adds anything to it.
+                        Err(e) if stack_no_longer_matches(&e) => {
+                            rebuild_stack(provider, spec, number, &open).await.map(Some)
+                        }
+                        Err(e) => Err(e),
+                    }
+                }
+            }
+            Err(e) => Err(e),
+        },
+    };
+
+    match linked {
+        Ok(number) => {
+            state.stack_number = number;
+            state.stack_link_pending = false;
+            if let Err(e) = state.save(state_dir) {
+                tracing::debug!("recording the settled stack link failed: {e}");
+            }
+        }
+        Err(e) => {
+            tracing::debug!("the owed stack link still fails; the chain stays degraded: {e}");
+        }
+    }
 }
 
 /// Proposes a domain's local changes as a pull request against its origin.
@@ -714,7 +1410,38 @@ pub async fn status(
 /// `Declined`, its branch best-effort deleted); then either update the one
 /// open proposal in place or create a new one.
 ///
-/// A domain has at most one open proposal at a time. When one is open, this
+/// Two shapes of chain live behind that last step. On a forge that serves
+/// stacks, with `stacks_allowed` on, a share never rewrites what is already
+/// open: it opens a NEW proposal layered on the top open one (its tree built
+/// on that layer's head, its commit carrying exactly one parent, its pull
+/// request targeting that layer's branch) and links it into the forge's
+/// stack, so every share stays reviewable on its own. A layer is detected
+/// against the chain TIP rather than the trunk (see [`effective_tip_files`]),
+/// so it records its own delta and nothing the layers below it already carry:
+/// a share with nothing new is [`ProposeOutcome::NothingToShare`] even with a
+/// chain open, and retiring a file only a lower layer holds is a change like
+/// any other. Everything below is the fallback that path falls back to, and
+/// the flow a chain this machine does not know as a stack keeps.
+///
+/// `options.proposal` names a layer to amend instead, the verb a reviewer's
+/// feedback is answered with: the share lands on that layer's own branch and
+/// [`amend_layer`] replays every layer above it onto the amended head, so the
+/// chain heals itself rather than needing a manual re-base. A number that is
+/// not an open layer is refused with the open layers listed. Off the stacked
+/// path the number can only name the one living proposal, and amending it is
+/// exactly the in-place update this function has always done.
+///
+/// An amend whose cascade dies half-way is answered by retrying the same
+/// amend, so the repair a stacking share runs happens on this path too, and it
+/// happens BEFORE the named layer is resolved: the amended content is recorded
+/// before the cascade starts, so the retry has nothing new to share, and a
+/// target resolved first would carry that answer back over a chain still
+/// broken. Healing first also means the layer the number names, and the layers
+/// a refusal lists, are read off the records the repair left rather than the
+/// ones it was handed. Off the stacked path no repair machinery runs at all.
+///
+/// On the fallback path a domain has at most one open proposal at a time.
+/// When one is open, this
 /// pushes a fresh commit onto its branch and rewrites its body rather than
 /// opening a second pull request ([`ProposeOutcome::Updated`]), and refuses
 /// with [`ProposeOutcome::ProposalDiverged`] - before any provider write -
@@ -724,6 +1451,15 @@ pub async fn status(
 /// record whose branch ref is gone is settled from the proposal's own state
 /// (an open pull request with no branch counts as declined) and the share
 /// falls through to a fresh creation.
+///
+/// `options.files` narrows what the share carries to a chosen subset of the
+/// detected delta ([`select_share_files`]): the paths named, plus the
+/// generated listings of the folders they live in. It applies to every path
+/// through this function, a new layer and an amend alike, and what it leaves
+/// out simply stays an unshared local change for a later share. A path that
+/// is not among the detected changes refuses the whole share by name rather
+/// than being dropped, and a selection matching nothing is
+/// [`ProposeOutcome::NothingToShare`].
 ///
 /// Creating uploads each added or modified file's content as a blob, builds a
 /// tree from the base commit with every domain-relative path re-prefixed to
@@ -737,13 +1473,18 @@ pub async fn propose(
     domain_root: &Path,
     domain_name: &str,
     state_dir: &Path,
-    title: Option<&str>,
-    description: Option<&str>,
+    options: ShareOptions<'_>,
 ) -> Result<ProposeOutcome, RemoteError> {
+    let ShareOptions {
+        title,
+        description,
+        author_login,
+        ..
+    } = options;
     // Freshness first: every proposal must be mergeable at creation.
     pull(provider, spec, domain_root, state_dir).await?;
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -753,14 +1494,136 @@ pub async fn propose(
         });
     }
 
-    let local = detect_local_changes(domain_root, &state.files)?;
-    if local.changes.is_empty() {
-        return Ok(ProposeOutcome::NothingToShare {
-            skipped_large: local.skipped_large,
-        });
+    // Ask the forge once, before any share work: whether this share can stack
+    // is a property of the origin, and the answer is cached from here on.
+    let stacked_path = stacks_available(
+        provider,
+        spec,
+        &mut state,
+        state_dir,
+        options.stacks_allowed,
+    )
+    .await?;
+
+    // 1b. A share naming a proposal is the amend verb: it lands on that
+    //     layer's own branch instead of opening a new one. On a stackable
+    //     chain that is [`amend_layer`], cascade and all; off it, the number
+    //     can only name the one living proposal, and the amend IS the
+    //     ordinary update below - merge commit and all - so it falls through.
+    if let Some(number) = options.proposal {
+        // A repair a previous operation left half-done is finished BEFORE the
+        // named layer is resolved - the same entry the new-layer arm below
+        // makes, and here for a sharper reason. Retrying the SAME amend is how
+        // a person answers an amend whose cascade died half-way, and by then
+        // the amended content is already recorded: resolve the target first
+        // and the retry detects nothing new, answers NothingToShare and leaves
+        // the chain exactly as broken as it found it.
+        if stacked_path && chain_is_stacked(&state) {
+            finish_pending_repair(provider, spec, &mut state, state_dir).await?;
+        }
+        // Everything below reads the POST-repair records. A repair settles what
+        // left the chain into history, so the vec the number is looked up in
+        // shrinks and re-indexes under it, and the refusal that lists what is
+        // open owes the same post-repair truth.
+        let index = amend_target_index(&state, number, stacked_path)?;
+        if stacked_path && chain_is_stacked(&state) {
+            return amend_layer(
+                provider,
+                spec,
+                domain_root,
+                domain_name,
+                state_dir,
+                state,
+                index,
+                title,
+                description,
+                author_login,
+                options.files,
+            )
+            .await;
+        }
     }
 
-    // 2. A declined proposal is superseded by this share: record to history
+    // 2. What this share is measured against, and the layer it would sit on,
+    //    are one question on a stackable chain: the base is the chain tip
+    //    (see [`effective_tip_files`]) rather than the trunk, and which
+    //    layers make up that tip depends on which of them are still really
+    //    open - a gone branch ref settles its layer and the tip shrinks with
+    //    it, so the walk down and the detection run together.
+    if stacked_path && chain_is_stacked(&state) {
+        // A repair a previous operation left half-done - and a chain that came
+        // apart without one, which is what a settled gone-top ref leaves - is
+        // finished before anything is stacked onto it: growing a chain whose
+        // stack still holds a closed member wedges every later link call.
+        finish_pending_repair(provider, spec, &mut state, state_dir).await?;
+        // Any link still owed to the forge is settled next: growing the
+        // chain over an unsettled gap would only widen it.
+        retry_stack_link(provider, spec, &mut state, state_dir).await;
+    }
+    let (local, stack_top) = loop {
+        let top = if stacked_path && chain_is_stacked(&state) {
+            state
+                .proposals
+                .iter()
+                .rev()
+                .find(|p| p.status == ProposalStatus::Open)
+                .cloned()
+        } else {
+            None
+        };
+        // Off the stacked path, and for a chain that emptied out, a share is
+        // measured against the trunk exactly as it always was.
+        let base = match top {
+            Some(_) => effective_tip_files(&state),
+            None => state.files.clone(),
+        };
+        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+        if local.changes.is_empty() {
+            return Ok(ProposeOutcome::NothingToShare {
+                skipped_large: local.skipped_large,
+            });
+        }
+        let Some(top) = top else {
+            break (local, None);
+        };
+        match provider.branch_ref(spec, &top.branch).await? {
+            Some(live_head) => {
+                if !head_is_ours(&top, &live_head) {
+                    // A reviewer moved the layer this one would sit on;
+                    // refuse before any write, naming the top.
+                    return Ok(ProposeOutcome::ProposalDiverged {
+                        number: top.number,
+                        url: top.url.clone(),
+                        branch: top.branch.clone(),
+                    });
+                }
+                break (local, Some((top, live_head)));
+            }
+            None => {
+                // The ref is gone: settle this layer exactly as the fallback
+                // path settles a gone ref, then go round again - the layer
+                // below becomes the new top and leaves the tip as it goes.
+                let refreshed = provider.proposal_state(spec, top.number).await?;
+                state.proposals.retain(|p| p.number != top.number);
+                let mut settled = top.clone();
+                settled.status = match refreshed {
+                    ProposalState::Merged => ProposalStatus::Merged,
+                    ProposalState::Declined | ProposalState::Open => ProposalStatus::Declined,
+                };
+                settled.pending_head_commit = None;
+                state.push_history(settled);
+                state.save(state_dir)?;
+            }
+        }
+    };
+    if stacked_path && stack_top.is_none() {
+        // Nothing is left to stack onto, so the create path below opens a
+        // fresh bottom layer and the old chain's stack number goes with the
+        // chain it named.
+        state.stack_number = None;
+    }
+
+    // 3. A declined proposal is superseded by this share: record to history
     //    (keeping Declined), branch best-effort deleted, exactly like the
     //    merged path's cleanup.
     let declined: Vec<Proposal> = state
@@ -780,7 +1643,30 @@ pub async fn propose(
         }
     }
 
-    // 3. An open proposal is updated in place, never paralleled.
+    // 4a. On a stackable chain a share never rewrites what is already open:
+    //     it opens a new layer on top of the one resolved above, so each
+    //     share stays reviewable on its own. A chain this machine does not
+    //     know as a stack (multi-open residue from before stacking) never
+    //     reaches here and falls through to 4b untouched.
+    if let Some((top, live_head)) = stack_top {
+        return stack_new_layer(
+            provider,
+            spec,
+            domain_root,
+            domain_name,
+            state_dir,
+            state,
+            top,
+            live_head,
+            local,
+            title,
+            description,
+            author_login,
+        )
+        .await;
+    }
+
+    // 4b. An open proposal is updated in place, never paralleled.
     let open = state
         .proposals
         .iter()
@@ -813,6 +1699,7 @@ pub async fn propose(
                     local,
                     title,
                     description,
+                    author_login,
                 )
                 .await;
             }
@@ -837,22 +1724,14 @@ pub async fn propose(
         }
     }
 
-    // 4. Create, as today, plus head_commit/base_commit on the fresh record.
+    // 5. Create, as today, plus head_commit/base_commit on the fresh record.
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
 
-    let generated_title = generate_title(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-        domain_name,
-    );
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-    );
+    let summary = generate_summary_line(added, updated, deleted, indexes);
     let body = description
         .map(str::to_string)
         .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
@@ -898,6 +1777,7 @@ pub async fn propose(
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: author_login.map(str::to_string),
     });
     state.save(state_dir)?;
 
@@ -910,6 +1790,9 @@ pub async fn propose(
         deleted: collected.deleted,
         skipped_large: local.skipped_large,
         summary,
+        // A bottom layer is not stacked onto anything: the chain starts here.
+        stack_number: None,
+        stack_position: None,
     }))
 }
 
@@ -919,7 +1802,11 @@ pub struct SharePlan {
     /// What a share run right now would do with the detected changes.
     pub action: PlannedAction,
     /// The local changes a share would carry, exactly as [`propose`] would
-    /// detect them against the freshly pulled base.
+    /// detect them against the freshly pulled base - refreshed directory
+    /// indexes included, since the share really does carry them. A surface
+    /// that lists this splits it with
+    /// [`crate::changes::LocalChange::is_generated_index`] and draws the
+    /// indexes as one line rather than among the engrams.
     pub changes: crate::changes::LocalChanges,
     /// The caller's title, or the generated one for this change mix. Empty
     /// when there is nothing to title (nothing to share, conflicts pending).
@@ -931,6 +1818,30 @@ pub struct SharePlan {
 pub enum PlannedAction {
     /// A share would open a new proposal.
     Create,
+    /// A share would stack a new layer on top of this open proposal, leaving
+    /// it and every layer below it exactly as they stand.
+    StackOnTop {
+        /// The top open layer's number, the one the new layer would sit on.
+        top_number: u64,
+        /// The top open layer's title, so a caller can name what is being
+        /// built on without a second lookup.
+        top_title: String,
+    },
+    /// A share would amend this open layer in place, leaving the layers below
+    /// it alone and re-basing every layer above it onto the amended head.
+    Amend {
+        /// The amended layer's number.
+        number: u64,
+        /// The web URL a human reviews the layer at.
+        url: String,
+        /// The layer's own title, so a caller can name the proposal it is
+        /// about to move without a second lookup - the same reason
+        /// [`PlannedAction::StackOnTop`] carries `top_title`.
+        title: String,
+        /// How many open layers sit above it, each one replayed by the
+        /// cascade the amend runs.
+        layers_above: usize,
+    },
     /// A share would update this open proposal in place.
     Update {
         /// The open proposal's number.
@@ -963,23 +1874,171 @@ pub enum PlannedAction {
 /// computed against a stale base would name changes a real share would never
 /// make.
 ///
+/// On a stackable chain it walks the open layers down exactly as [`propose`]
+/// does, skipping each layer whose branch ref is gone (a share settles those
+/// and stacks onto the layer below) and dropping it out of the chain tip it
+/// then detects against, so both the named action and the change list match
+/// the share the plan describes.
+///
 /// `domain_name` plays the same role it plays in [`propose`]: it is what the
-/// generated title calls the domain when the caller supplies none.
+/// generated title calls the domain when the caller supplies none. Of
+/// `options` a preview reads the title and the file selection: a description
+/// is only ever written by a real share, and previewing writes nothing. The
+/// selection is applied exactly as the share would apply it, refusal for an
+/// unknown path included, so a plan describes the share it is a plan of
+/// rather than the whole delta standing behind it.
 pub async fn propose_preview(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
     domain_name: &str,
     state_dir: &Path,
-    title: Option<&str>,
+    options: ShareOptions<'_>,
 ) -> Result<SharePlan, RemoteError> {
+    let title = options.title;
     pull(provider, spec, domain_root, state_dir).await?;
-    let state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+    let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
-    let local = detect_local_changes(domain_root, &state.files)?;
+    // The same capability question a real share asks, and the same cached
+    // answer: a preview that guessed would name an action the share then
+    // would not take.
+    let stacked_path = stacks_available(
+        provider,
+        spec,
+        &mut state,
+        state_dir,
+        options.stacks_allowed,
+    )
+    .await?;
+
+    // A share naming a layer is the amend verb, previewed the same way it is
+    // validated: the number must be an open layer (and, off the stacked path,
+    // the one living proposal), and what it would carry is the work standing
+    // against the chain tip - the layer's own recorded files are already
+    // proposed and are not this share's doing.
+    if let Some(number) = options.proposal {
+        let index = amend_target_index(&state, number, stacked_path)?;
+        let stacked = stacked_path && chain_is_stacked(&state);
+        let base = if stacked {
+            effective_tip_files(&state)
+        } else {
+            state.files.clone()
+        };
+        let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
+        if !state.conflicts.is_empty() {
+            return Ok(SharePlan {
+                action: PlannedAction::ConflictsPending {
+                    count: state.conflicts.len(),
+                },
+                changes: local,
+                effective_title: String::new(),
+            });
+        }
+        // Read-only, and the same question the amend asks before its first
+        // write: a layer above that cannot be replayed refuses the share, so
+        // the preview must refuse too rather than promise an Amend. The share
+        // raises this exact error, so the preview raises it rather than
+        // inventing a plan classification for it.
+        ensure_replayable(&state, index + 1)?;
+        // The same probe the amend makes, in the same order, so a preview
+        // never promises an amend the share then refuses.
+        let layer = &state.proposals[index];
+        let diverged = match provider.branch_ref(spec, &layer.branch).await? {
+            Some(live_head) if head_is_ours(layer, &live_head) => None,
+            Some(_) => Some(PlannedAction::ProposalDiverged {
+                number: layer.number,
+                url: layer.url.clone(),
+                branch: layer.branch.clone(),
+            }),
+            None => return Err(branch_gone(layer)),
+        };
+        if diverged.is_none() && local.changes.is_empty() {
+            return Ok(SharePlan {
+                action: PlannedAction::NothingToShare,
+                changes: local,
+                effective_title: String::new(),
+            });
+        }
+        let (added, updated, deleted, indexes) = count_changes(&local);
+        let effective_title = title
+            .map(str::to_string)
+            .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
+        if let Some(action) = diverged {
+            return Ok(SharePlan {
+                action,
+                changes: local,
+                effective_title,
+            });
+        }
+        let layers_above = state.proposals[index + 1..]
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Open)
+            .count();
+        return Ok(SharePlan {
+            action: PlannedAction::Amend {
+                number: layer.number,
+                url: layer.url.clone(),
+                title: layer.title.clone(),
+                layers_above,
+            },
+            changes: local,
+            effective_title,
+        });
+    }
+
+    // The stacked walk, read-only: `propose` settles a layer whose branch ref
+    // is gone and stacks onto the one below, so a preview walks down the same
+    // way and drops each vanished layer out of the tip it detects against. A
+    // share naming a layer to amend is a different action, and not this one.
+    let stacked = stacked_path && chain_is_stacked(&state) && options.proposal.is_none();
+    let mut surviving: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    let mut stacked_action = None;
+    if stacked {
+        while let Some(top) = surviving.last().copied() {
+            match provider.branch_ref(spec, &top.branch).await? {
+                Some(live_head) if head_is_ours(top, &live_head) => {
+                    stacked_action = Some(PlannedAction::StackOnTop {
+                        top_number: top.number,
+                        top_title: top.title.clone(),
+                    });
+                    break;
+                }
+                Some(_) => {
+                    stacked_action = Some(PlannedAction::ProposalDiverged {
+                        number: top.number,
+                        url: top.url.clone(),
+                        branch: top.branch.clone(),
+                    });
+                    break;
+                }
+                // Gone: a real share would settle this record, so its files
+                // leave the tip and the layer below becomes the top.
+                None => {
+                    surviving.pop();
+                }
+            }
+        }
+    }
+
+    // Detection runs against the chain tip whenever the walk above found a
+    // chain, and against the trunk otherwise - the same base the share the
+    // plan describes would use. A diverged top counts as a chain like any
+    // other: that share writes nothing, but the changes it reports are still
+    // the work standing on the chain, never the whole chain re-read against
+    // the trunk.
+    let base = if stacked_action.is_some() {
+        tip_files_over(&state.files, &surviving)
+    } else {
+        state.files.clone()
+    };
+    let local = select_share_files(detect_local_changes(domain_root, &base)?, options.files)?;
 
     if !state.conflicts.is_empty() {
         return Ok(SharePlan {
@@ -998,14 +2057,22 @@ pub async fn propose_preview(
         });
     }
 
-    let (added, updated, deleted) = count_changes(&local);
+    let (added, updated, deleted, indexes) = count_changes(&local);
     let effective_title = title
         .map(str::to_string)
-        .unwrap_or_else(|| generate_title(added, updated, deleted, domain_name));
+        .unwrap_or_else(|| generate_title(added, updated, deleted, indexes, domain_name));
 
-    // Classification mirrors propose's, read-only: a declined record would be
-    // superseded (so it reads as Create), an open one is an Update unless a
-    // reviewer amended its branch, and a gone ref would be re-created.
+    if let Some(action) = stacked_action {
+        return Ok(SharePlan {
+            action,
+            changes: local,
+            effective_title,
+        });
+    }
+
+    // The fallback classification: a declined record would be superseded (so
+    // it reads as Create), an open one is an Update unless a reviewer amended
+    // its branch, and a gone ref would be re-created.
     let open = state
         .proposals
         .iter()
@@ -1041,10 +2108,21 @@ pub async fn propose_preview(
     })
 }
 
-/// The (added, updated, deleted) counts of a detected change set.
-fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize) {
-    let mut counts = (0usize, 0usize, 0usize);
+/// The (added, updated, deleted) counts of the real work in a detected change
+/// set, with the generated directory indexes counted separately as a fourth
+/// number.
+///
+/// The split is what keeps a generated title honest. A share carries its
+/// folder listings so the team repository stays browsable, but calling two
+/// refreshed listings "2 new engrams" on the pull request would be a plain
+/// falsehood, and it is the first thing a reviewer reads.
+fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize, usize) {
+    let mut counts = (0usize, 0usize, 0usize, 0usize);
     for change in &local.changes {
+        if change.is_generated_index() {
+            counts.3 += 1;
+            continue;
+        }
         match change {
             LocalChange::Added { .. } => counts.0 += 1,
             LocalChange::Modified { .. } => counts.1 += 1,
@@ -1052,6 +2130,25 @@ fn count_changes(local: &crate::changes::LocalChanges) -> (usize, usize, usize) 
         }
     }
     counts
+}
+
+/// The same split over the path lists a collected share carries: how many of
+/// each kind are real work, and how many generated directory indexes ride along
+/// across all three.
+fn count_collected(collected: &CollectedChanges) -> (usize, usize, usize, usize) {
+    let work = |paths: &[String]| {
+        paths
+            .iter()
+            .filter(|p| !crystalline_core::is_index_path(p))
+            .count()
+    };
+    let indexes = |paths: &[String]| paths.len() - work(paths);
+    (
+        work(&collected.added),
+        work(&collected.updated),
+        work(&collected.deleted),
+        indexes(&collected.added) + indexes(&collected.updated) + indexes(&collected.deleted),
+    )
 }
 
 /// Everything a share commit is built from, collected in one pass over the
@@ -1091,10 +2188,11 @@ async fn collect_changes(
             LocalChange::Added { path, sha256 } => {
                 let wt_path = checked_working_path(state_dir, domain_root, path)?;
                 let bytes = std::fs::read(&wt_path)?;
+                let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
                     path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: Some(blob_sha),
+                    blob_sha: Some(blob_sha.clone()),
                 });
                 out.entries.added.push((path.clone(), bytes));
                 out.added.push(path.clone());
@@ -1102,15 +2200,18 @@ async fn collect_changes(
                     path: path.clone(),
                     change: ProposedChange::Added,
                     sha256: Some(sha256.clone()),
+                    blob_sha: Some(blob_sha),
+                    size: Some(size),
                 });
             }
             LocalChange::Modified { path, sha256 } => {
                 let wt_path = checked_working_path(state_dir, domain_root, path)?;
                 let bytes = std::fs::read(&wt_path)?;
+                let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 out.writes.push(TreeWrite {
                     path: to_repo_relative(path, spec.subpath.as_deref()),
-                    blob_sha: Some(blob_sha),
+                    blob_sha: Some(blob_sha.clone()),
                 });
                 out.entries.updated.push((path.clone(), bytes));
                 out.updated.push(path.clone());
@@ -1118,6 +2219,8 @@ async fn collect_changes(
                     path: path.clone(),
                     change: ProposedChange::Modified,
                     sha256: Some(sha256.clone()),
+                    blob_sha: Some(blob_sha),
+                    size: Some(size),
                 });
             }
             LocalChange::Deleted { path } => {
@@ -1137,6 +2240,8 @@ async fn collect_changes(
                     path: path.clone(),
                     change: ProposedChange::Deleted,
                     sha256: None,
+                    blob_sha: None,
+                    size: None,
                 });
             }
         }
@@ -1188,22 +2293,15 @@ async fn update_open_proposal(
     local: crate::changes::LocalChanges,
     title: Option<&str>,
     description: Option<&str>,
+    author_login: Option<&str>,
 ) -> Result<ProposeOutcome, RemoteError> {
     let collected =
         collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
 
-    let generated_title = generate_title(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-        domain_name,
-    );
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
     let effective_title = title.map(str::to_string).unwrap_or(generated_title);
-    let summary = generate_summary_line(
-        collected.added.len(),
-        collected.updated.len(),
-        collected.deleted.len(),
-    );
+    let summary = generate_summary_line(added, updated, deleted, indexes);
     let body = description
         .map(str::to_string)
         .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
@@ -1243,10 +2341,10 @@ async fn update_open_proposal(
     state.save(state_dir)?;
 
     provider
-        .update_branch(spec, &prop.branch, &commit_sha)
+        .update_branch(spec, &prop.branch, &commit_sha, false)
         .await?;
     provider
-        .update_proposal(spec, prop.number, title, &body)
+        .update_proposal(spec, prop.number, title, Some(&body), None)
         .await?;
 
     let record = state
@@ -1263,6 +2361,12 @@ async fn update_open_proposal(
     if let Some(t) = title {
         record.title = t.to_string();
     }
+    // The credential that just rewrote the proposal is whose it is now. An
+    // unknown login leaves the recorded one standing: see
+    // [`ShareOptions::author_login`].
+    if let Some(login) = author_login {
+        record.author_login = Some(login.to_string());
+    }
     state.save(state_dir)?;
 
     Ok(ProposeOutcome::Updated(ProposeReport {
@@ -1274,7 +2378,1298 @@ async fn update_open_proposal(
         deleted: collected.deleted,
         skipped_large: local.skipped_large,
         summary,
+        // The living-proposal path is the fallback: no chain, no position.
+        stack_number: None,
+        stack_position: None,
     }))
+}
+
+/// Stacks a new layer on top of the open chain: a commit whose single parent
+/// is the top layer's head, a branch of its own and a pull request targeting
+/// the top layer's branch, then linked into the forge's stack.
+///
+/// The tree is built on `top_head` rather than on the trunk, so the layer
+/// carries everything the layers below it carry and the forge's diff shows
+/// only what this share adds. The commit has exactly one parent for the same
+/// reason: a merge commit would drag the trunk into a layer that is meant to
+/// read as one reviewable step.
+///
+/// Linkage comes last and is allowed to fail. The pull request already
+/// exists by then, so a failed `create_stack`/`extend_stack` leaves the chain
+/// degraded (every layer open, none of them grouped) rather than losing the
+/// share: [`crate::state::OriginState::stack_link_pending`] records the debt
+/// and [`retry_stack_link`] pays it off at the start of the next operation.
+///
+/// One failure is not a debt but a mismatch, and retrying it would wedge the
+/// chain forever: an extend the forge refuses because the recorded stack is
+/// no longer the open chain ([`stack_no_longer_matches`] - a member closed
+/// out from under it, or the stack dissolved on the website). That one is
+/// settled here and now, by rebuilding the stack over the open chain with
+/// this layer in it ([`rebuild_stack`]).
+#[allow(clippy::too_many_arguments)]
+async fn stack_new_layer(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    top: Proposal,
+    top_head: String,
+    local: crate::changes::LocalChanges,
+    title: Option<&str>,
+    description: Option<&str>,
+    author_login: Option<&str>,
+) -> Result<ProposeOutcome, RemoteError> {
+    let collected =
+        collect_changes(provider, spec, domain_root, state_dir, &local, description).await?;
+
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
+    let effective_title = title.map(str::to_string).unwrap_or(generated_title);
+    let summary = generate_summary_line(added, updated, deleted, indexes);
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+
+    let tree_sha = provider
+        .create_tree(spec, &top_head, &collected.writes)
+        .await?;
+    let commit_sha = provider
+        .create_commit(
+            spec,
+            &effective_title,
+            &tree_sha,
+            std::slice::from_ref(&top_head),
+        )
+        .await?;
+    let branch = share_branch_name(domain_name);
+    provider.create_branch(spec, &branch, &commit_sha).await?;
+    let handle = provider
+        .create_proposal(
+            spec,
+            &ProposalRequest {
+                title: effective_title.clone(),
+                body,
+                branch: branch.clone(),
+                base_branch: top.branch.clone(),
+            },
+        )
+        .await?;
+
+    // The record joins the chain before the linkage is attempted, so the
+    // rebuild below has the whole open chain - this layer included - to
+    // recreate the stack over.
+    state.proposals.push(Proposal {
+        number: handle.number,
+        url: handle.url.clone(),
+        branch: branch.clone(),
+        title: effective_title,
+        created_at: Utc::now(),
+        status: ProposalStatus::Open,
+        files: collected.files,
+        head_commit: Some(commit_sha),
+        pending_head_commit: None,
+        // A layer's base is the layer below it, never the trunk.
+        base_commit: Some(top_head),
+        review_state: None,
+        feedback: Vec::new(),
+        updated_at: None,
+        author_login: author_login.map(str::to_string),
+    });
+
+    // With no stack number yet the chain is exactly the layer below plus this
+    // one: `chain_is_stacked` only lets an unlinked chain here while a single
+    // layer is open, so those two are the whole stack.
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    let linked = match state.stack_number {
+        None => provider
+            .create_stack(spec, &[top.number, handle.number])
+            .await
+            .map(|info| info.number),
+        Some(number) => match provider.extend_stack(spec, number, &[handle.number]).await {
+            Ok(_) => Ok(number),
+            // The stack this machine records is no longer the open chain -
+            // a member settled out from under it, or somebody dissolved it -
+            // and every later extend would be refused the same way. Rebuild
+            // it once rather than wedging the chain forever. One 404 arrives
+            // here wearing the same clothes and is not that at all: a
+            // repository deleted or made invisible answers every stack path
+            // the same way, so the rebuild fails too and the chain simply
+            // records `stack_link_pending` instead of reporting the missing
+            // repository - the proposals all exist and the next operation
+            // against the repository is what names the real problem.
+            Err(e) if stack_no_longer_matches(&e) => {
+                rebuild_stack(provider, spec, number, &open).await
+            }
+            Err(e) => Err(e),
+        },
+    };
+    match linked {
+        Ok(number) => {
+            state.stack_number = Some(number);
+            state.stack_link_pending = false;
+        }
+        Err(e) => {
+            tracing::debug!(
+                "linking proposal #{} into the stack failed; the chain is degraded until the next share: {e}",
+                handle.number
+            );
+            state.stack_link_pending = true;
+        }
+    }
+    state.save(state_dir)?;
+
+    Ok(ProposeOutcome::Proposed(ProposeReport {
+        url: handle.url,
+        number: handle.number,
+        branch,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
+        skipped_large: local.skipped_large,
+        summary,
+        stack_number: state.stack_number,
+        stack_position: Some(open_position(&state, handle.number)),
+    }))
+}
+
+/// Where the proposal numbered `number` sits among the open layers, as
+/// `(1-based position, open layers)`. A number that is not open reads as the
+/// top, which is what a freshly pushed layer is anyway.
+fn open_position(state: &OriginState, number: u64) -> (usize, usize) {
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    let position = open
+        .iter()
+        .position(|n| *n == number)
+        .map(|i| i + 1)
+        .unwrap_or(open.len());
+    (position, open.len())
+}
+
+/// The index into `state.proposals` of the layer a share named to amend, or
+/// the teaching refusal listing what is actually open.
+///
+/// Two rules, one message. The number must name an OPEN record, and off the
+/// stacked path it must name the only one: the fallback flow has a single
+/// living proposal by construction, and a chain of records left over from
+/// before stacking is exactly the state where naming one of them would mean
+/// something this machine cannot deliver.
+fn amend_target_index(
+    state: &OriginState,
+    number: u64,
+    stacked_path: bool,
+) -> Result<usize, RemoteError> {
+    let open: Vec<(usize, &Proposal)> = state
+        .proposals
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.status == ProposalStatus::Open)
+        .collect();
+    let stacked = stacked_path && chain_is_stacked(state);
+    match open.iter().find(|(_, p)| p.number == number) {
+        Some((index, _)) if stacked || open.len() == 1 => Ok(*index),
+        _ => Err(not_an_open_layer(state, number)),
+    }
+}
+
+/// The refusal a share naming an unamendable proposal gets: what it named and
+/// what is open instead, each layer with its position in the chain, so the
+/// caller can retry against a real number without a second call.
+fn not_an_open_layer(state: &OriginState, number: u64) -> RemoteError {
+    let open: Vec<String> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .enumerate()
+        .map(|(position, p)| format!("#{} (layer {})", p.number, position + 1))
+        .collect();
+    if open.is_empty() {
+        return RemoteError::Refused(format!(
+            "proposal #{number} is not an open layer of this domain; this domain has no open layers"
+        ));
+    }
+    RemoteError::Refused(format!(
+        "proposal #{number} is not an open layer of this domain; open layers: {}",
+        open.join(", ")
+    ))
+}
+
+/// The refusal a share naming a layer whose branch is gone upstream earns:
+/// there is no branch left to amend, and re-creating one behind the same
+/// pull request would be a different operation than the caller asked for.
+fn branch_gone(layer: &Proposal) -> RemoteError {
+    RemoteError::Refused(format!(
+        "proposal #{}'s branch {} is gone upstream; withdraw the proposal and share again",
+        layer.number, layer.branch
+    ))
+}
+
+/// The refusal a layer that cannot be replayed earns, named rather than
+/// worked around: rebuilding a layer's tree needs the blob shas its record
+/// carries, and a record written before those existed (pre-0.17.0) has none.
+fn unreplayable_layer(number: u64) -> RemoteError {
+    RemoteError::Refused(format!(
+        "layer #{number} predates stacked shares and cannot be replayed; withdraw it or merge it first"
+    ))
+}
+
+/// Checks every open layer from `from_index` up for the blob shas a replay
+/// needs, so an amend or a repair refuses BEFORE its first write rather than
+/// halfway up the chain. A deletion needs no blob and is never the reason.
+fn ensure_replayable(state: &OriginState, from_index: usize) -> Result<(), RemoteError> {
+    for layer in state
+        .proposals
+        .iter()
+        .skip(from_index)
+        .filter(|p| p.status == ProposalStatus::Open)
+    {
+        let missing = layer.files.iter().any(|file| {
+            matches!(
+                file.change,
+                ProposedChange::Added | ProposedChange::Modified
+            ) && file.blob_sha.is_none()
+        });
+        if missing {
+            return Err(unreplayable_layer(layer.number));
+        }
+    }
+    Ok(())
+}
+
+/// The refusal a cascade earns when a layer it would replay is carrying
+/// commits this machine did not make.
+///
+/// A replay force-updates a branch, so running it over a reviewer's work
+/// would destroy that work with nothing to recover it from. The whole
+/// operation stops instead, naming the layer that is holding it up and the
+/// two ways forward: take the commits in, or leave that layer alone until its
+/// review is done.
+fn upper_layer_diverged(layer: &Proposal) -> RemoteError {
+    RemoteError::Refused(format!(
+        "proposal #{} carries commits this machine did not make, and re-basing the chain would overwrite them; pull this domain to take in what was pushed onto {}, or let that layer's review finish before changing the chain below it",
+        layer.number, layer.branch
+    ))
+}
+
+/// The upfront pass every cascade makes before its first write: each open
+/// layer from `from_index` up has to be replayable from its own record
+/// ([`ensure_replayable`]) AND still standing where this machine left it.
+///
+/// The second half is the safety rule that gives the cascade the protection
+/// every other write path here already has. A replay is a forced ref move, so
+/// a reviewer's commits on a layer ABOVE the one being changed would be
+/// obliterated by an amend or a repair that never looked at them. So every
+/// layer the cascade would replay is probed with `branch_ref` first, and a
+/// live head that is neither the recorded head nor a half-finished push of
+/// this machine's ([`head_is_ours`]) stops the WHOLE operation - not that one
+/// layer, the operation - before anything at all is written. Which is why
+/// this is one pass and one call site per operation rather than a check
+/// inside [`cascade_replays`]: a refusal halfway up would leave a chain worse
+/// than it found it.
+///
+/// The diverged layer is RETURNED rather than raised, because the two callers
+/// owe their callers different answers for it: a share reports
+/// [`ProposeOutcome::ProposalDiverged`] naming that layer, a repair raises
+/// [`upper_layer_diverged`].
+///
+/// A branch that is simply gone is neither replayable-nor-ours nor a
+/// divergence, and is not refused here: the settle paths a share and a repair
+/// already carry are what speak for those.
+async fn ensure_cascade_ready(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &OriginState,
+    from_index: usize,
+) -> Result<Option<Proposal>, RemoteError> {
+    ensure_replayable(state, from_index)?;
+    for layer in state
+        .proposals
+        .iter()
+        .skip(from_index)
+        .filter(|p| p.status == ProposalStatus::Open)
+    {
+        if let Some(live_head) = provider.branch_ref(spec, &layer.branch).await?
+            && !head_is_ours(layer, &live_head)
+        {
+            return Ok(Some(layer.clone()));
+        }
+    }
+    Ok(None)
+}
+
+/// The lowest OPEN layer standing on a commit that is no longer the head of
+/// the layer below it, together with the head it should be standing on.
+///
+/// This is what a cascade that died half-way leaves behind, and it is a
+/// different shape from a hole: nothing left the chain, every member is still
+/// a member, and one branch simply never made it onto its new parent. The
+/// repair it needs is therefore only a re-base - dissolving and recreating an
+/// intact membership would churn the stack number for nothing.
+///
+/// The bottom layer is deliberately not measured against the trunk here. An
+/// advanced trunk under an intact chain is ordinary (an amend re-bases a
+/// layer onto it; a repair does not), and [`stack_shape_broken`] only reads
+/// that comparison where a hole opened beneath the bottom survivor - which is
+/// the other repair's business.
+fn first_misaligned_layer(state: &OriginState) -> Option<(usize, String)> {
+    let mut below: Option<&Proposal> = None;
+    for (index, prop) in state.proposals.iter().enumerate() {
+        if prop.status != ProposalStatus::Open {
+            continue;
+        }
+        if let Some(layer) = below {
+            // A layer below with no recorded head says nothing about where the
+            // one above it belongs, so there is no re-base to plan for THIS
+            // pair - and only for this pair. Abandoning the whole walk on one
+            // such layer would let a record written before head commits
+            // existed, or one an interrupted push left blank, silence the scan
+            // for every pair above it too, and the chain would sit wedged on a
+            // misalignment nothing was looking for any more.
+            match layer.head_commit.as_deref() {
+                Some(parent) if prop.base_commit.as_deref() != Some(parent) => {
+                    return Some((index, parent.to_string()));
+                }
+                _ => {}
+            }
+        }
+        below = Some(prop);
+    }
+    None
+}
+
+/// The chain tip BELOW the layer at `index`: the trunk snapshot with every
+/// open layer beneath it laid over ([`tip_files_over`]), which is both what
+/// that layer's own delta is measured against and the presence walk a replay
+/// asks before writing a deletion - retiring a path nothing below carries is
+/// not a change, it is noise in someone's review.
+fn tip_below_layer(state: &OriginState, index: usize) -> BTreeMap<String, BaseStamp> {
+    let below: Vec<&Proposal> = state.proposals[..index]
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    tip_files_over(&state.files, &below)
+}
+
+/// Amends the open layer at `index`: a fresh commit on ITS branch carrying
+/// its own delta again, then [`cascade_replays`] over every layer above it.
+///
+/// What the layer proposes afterwards is its recorded files with this share's
+/// work merged in, recomputed against the tip below it: a path this share
+/// touched takes the working tree's content, and a path it did not keeps
+/// exactly what the record carries, blob sha and digest included. The working
+/// tree cannot speak for the latter - it holds the chain TIP, so a file a
+/// layer above changed reads there as that layer's content, not this one's -
+/// and re-reading it would quietly move one layer's work into another's. A
+/// fresh change is dropped from the layer when its content already matches
+/// the tip below (there is nothing left to propose there) and a retirement is
+/// dropped when nothing below carries the path; a KEPT entry is not re-tested
+/// that way, since its own recorded content is what defines the layer.
+///
+/// One consequence to know before reaching for this verb: a fresh edit to a
+/// path an open layer ABOVE owns lands in the amended layer's commit, and
+/// then that layer's replay writes its own recorded content over it, so at
+/// the chain tip the edit is gone and the file reads as an unshared local
+/// change again on the next share. Nothing is lost on disk and no layer is
+/// corrupted, but the edit is not where the caller meant it to be. Amending
+/// the layer that OWNS the path is the way to change it.
+///
+/// Three properties the shape of this function exists for:
+///
+/// - the commit's parent is ALWAYS the layer's live head alone. A stacked
+///   layer is one reviewable step, and a merge commit would drag the trunk
+///   into it; an advanced trunk arrives through the tree instead, since the
+///   tree is built on the tip below rather than on the layer's own history.
+/// - divergence is checked on every layer this touches, this one and each one
+///   above it, and all of it before the first write. The layers above are
+///   rewritten from their records by a forced ref move, so a reviewer's
+///   commits sitting on one of them refuse the whole amend
+///   ([`ensure_cascade_ready`]) rather than being silently replaced.
+/// - not one stack call is made. No base ref moves, so the forge's membership
+///   holds exactly as it stands.
+///
+/// **The tail of this signature is full.** `title`, `description`,
+/// `author_login` and `files` are four adjacent `Option`s, three of them
+/// `Option<&str>`, and at four a caller can swap two of them and still
+/// compile. They are passed as plain values rather than through
+/// [`ShareOptions`] on purpose - this function is identity-unaware and takes
+/// what it is given - but that reason does not stretch to a fifth. Whoever
+/// needs to pass one more thing restructures instead: a small parameter struct
+/// for the amend, or the fields moved onto one the caller already builds.
+#[allow(clippy::too_many_arguments)]
+async fn amend_layer(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    domain_name: &str,
+    state_dir: &Path,
+    mut state: OriginState,
+    index: usize,
+    title: Option<&str>,
+    description: Option<&str>,
+    author_login: Option<&str>,
+    files: Option<&[String]>,
+) -> Result<ProposeOutcome, RemoteError> {
+    // Nothing is written until every layer this cascade replays is known to be
+    // replayable AND known to be ours: a chain re-based halfway is worse than
+    // one never touched, and a reviewer's commits above are not this share's
+    // to overwrite. The amended layer itself is not in that set - it is
+    // rebuilt from the working tree rather than replayed from its record, so
+    // [`collect_amend_changes`] decides per file what it can stand on, and
+    // its own divergence is checked just below.
+    if let Some(above) = ensure_cascade_ready(provider, spec, &state, index + 1).await? {
+        return Ok(ProposeOutcome::ProposalDiverged {
+            number: above.number,
+            url: above.url,
+            branch: above.branch,
+        });
+    }
+
+    let layer = state.proposals[index].clone();
+    let live_head = match provider.branch_ref(spec, &layer.branch).await? {
+        Some(live_head) => {
+            if !head_is_ours(&layer, &live_head) {
+                // A reviewer moved the very layer this share would amend;
+                // refuse before any write, exactly as a stacking share does.
+                return Ok(ProposeOutcome::ProposalDiverged {
+                    number: layer.number,
+                    url: layer.url,
+                    branch: layer.branch,
+                });
+            }
+            live_head
+        }
+        // The branch is gone. A stacking share settles such a layer and
+        // carries on, but this share named it: there is nothing to amend.
+        None => return Err(branch_gone(&layer)),
+    };
+
+    // This share's own work is what stands against the chain tip; the layer's
+    // recorded files are already proposed and are not it.
+    let fresh = select_share_files(
+        detect_local_changes(domain_root, &effective_tip_files(&state))?,
+        files,
+    )?;
+    if fresh.changes.is_empty() {
+        return Ok(ProposeOutcome::NothingToShare {
+            skipped_large: fresh.skipped_large,
+        });
+    }
+
+    // Which paths the layers above claim decides whether the working tree may
+    // be read for a file this layer's record can no longer name a blob for:
+    // where a layer above owns the path, the tree holds that layer's content.
+    let owned_above: BTreeSet<String> = state.proposals[index + 1..]
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .flat_map(|p| p.files.iter().map(|file| file.path.clone()))
+        .collect();
+
+    let below = tip_below_layer(&state, index);
+    let collected = collect_amend_changes(
+        provider,
+        spec,
+        domain_root,
+        state_dir,
+        &layer,
+        &below,
+        &owned_above,
+        &fresh,
+        description,
+    )
+    .await?;
+
+    let (added, updated, deleted, indexes) = count_collected(&collected);
+    let generated_title = generate_title(added, updated, deleted, indexes, domain_name);
+    let effective_title = title.map(str::to_string).unwrap_or(generated_title);
+    let summary = generate_summary_line(added, updated, deleted, indexes);
+    let body = description
+        .map(str::to_string)
+        .unwrap_or_else(|| generate_body(&summary, &collected.entries, domain_name));
+
+    // The tree is built on the tip below this layer - the layer beneath it,
+    // or the trunk for the bottom one - so the layer's diff stays its own
+    // delta and an advanced trunk costs no merge commit.
+    let below_head = state.proposals[..index]
+        .iter()
+        .rev()
+        .find(|p| p.status == ProposalStatus::Open)
+        .and_then(|p| p.head_commit.clone())
+        .unwrap_or_else(|| state.base_commit.clone());
+
+    let tree_sha = provider
+        .create_tree(spec, &below_head, &collected.writes)
+        .await?;
+    let commit_sha = provider
+        .create_commit(
+            spec,
+            &effective_title,
+            &tree_sha,
+            std::slice::from_ref(&live_head),
+        )
+        .await?;
+
+    // The push is announced before it is made, the same interrupted-update
+    // protocol an ordinary share update follows (see `pending_head_commit`
+    // and `head_is_ours`), and the branch moves fast-forward: this layer's
+    // own history is being extended, not rewritten.
+    state.proposals[index].pending_head_commit = Some(commit_sha.clone());
+    state.save(state_dir)?;
+
+    provider
+        .update_branch(spec, &layer.branch, &commit_sha, false)
+        .await?;
+    provider
+        .update_proposal(spec, layer.number, title, Some(&body), None)
+        .await?;
+
+    {
+        let record = &mut state.proposals[index];
+        record.files = collected.files;
+        record.head_commit = Some(commit_sha.clone());
+        record.pending_head_commit = None;
+        record.base_commit = Some(below_head);
+        record.updated_at = Some(Utc::now());
+        if let Some(t) = title {
+            record.title = t.to_string();
+        }
+        // The amended layer becomes the amender's: their credential rewrote
+        // it. Only this one - the layers the cascade replays below keep the
+        // author they were shared under, since a replay moves a commit onto a
+        // new parent and proposes nothing of its own.
+        if let Some(login) = author_login {
+            record.author_login = Some(login.to_string());
+        }
+    }
+    state.save(state_dir)?;
+
+    // Every layer above now sits on a commit that is no longer this layer's
+    // head, so each is replayed onto the amended one, bottom-up.
+    cascade_replays(provider, spec, &mut state, state_dir, index + 1, commit_sha).await?;
+
+    Ok(ProposeOutcome::Updated(ProposeReport {
+        url: layer.url,
+        number: layer.number,
+        branch: layer.branch,
+        added: collected.added,
+        updated: collected.updated,
+        deleted: collected.deleted,
+        skipped_large: fresh.skipped_large,
+        summary,
+        stack_number: state.stack_number,
+        stack_position: Some(open_position(&state, layer.number)),
+    }))
+}
+
+/// Collects what an amended layer proposes: its recorded files with `fresh`
+/// merged in, every entry recomputed against `below` (the tip beneath the
+/// layer), and a blob uploaded for each path this share touched.
+///
+/// A recorded entry is kept verbatim - its blob sha is what rebuilds the
+/// tree - unless this share speaks for the same path or the entry stopped
+/// being a change against `below`. A fresh change whose content already
+/// matches `below` takes the path OUT of the layer entirely: the layer has
+/// nothing left to propose there.
+///
+/// A kept entry from before blob shas were recorded (pre-0.17.0) has nothing
+/// to rebuild the tree from, and there is exactly one place to get it back:
+/// the working tree. That is sound only where no OPEN layer above owns the
+/// path, since above it the tree holds the upper layer's content rather than
+/// this one's - `owned_above` is that set, and a path in it refuses the whole
+/// amend with the teaching error instead. Where the re-read is allowed it is
+/// still checked rather than trusted: a kept entry is by construction one
+/// that did not change against the chain tip, so the bytes on disk must hash
+/// to the digest the record carries, and content that does not is a refusal
+/// rather than a blob upload of the wrong bytes.
+#[allow(clippy::too_many_arguments)]
+async fn collect_amend_changes(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    layer: &Proposal,
+    below: &BTreeMap<String, BaseStamp>,
+    owned_above: &BTreeSet<String>,
+    fresh: &crate::changes::LocalChanges,
+    description: Option<&str>,
+) -> Result<CollectedChanges, RemoteError> {
+    let sub = spec.subpath.as_deref();
+    let fresh_paths: BTreeSet<&str> = fresh.changes.iter().map(LocalChange::path).collect();
+
+    let mut merged: BTreeMap<String, ProposedFile> = BTreeMap::new();
+    // Every kept entry is judged before a single blob goes up. A refusal on
+    // the third entry used to land after the first two had already been
+    // uploaded, leaving orphan blobs behind on a share that refused, so the
+    // re-read and its checks run as a pre-pass and the uploads follow only
+    // once the whole set has passed.
+    let mut rebuild: Vec<(String, Vec<u8>)> = Vec::new();
+    for file in &layer.files {
+        if fresh_paths.contains(file.path.as_str()) {
+            continue;
+        }
+        let still_a_change = match file.change {
+            ProposedChange::Added | ProposedChange::Modified => true,
+            ProposedChange::Deleted => below.contains_key(&file.path),
+        };
+        if !still_a_change {
+            continue;
+        }
+        let kept = file.clone();
+        let needs_blob = matches!(
+            kept.change,
+            ProposedChange::Added | ProposedChange::Modified
+        ) && kept.blob_sha.is_none();
+        if needs_blob {
+            if owned_above.contains(&kept.path) {
+                return Err(unreplayable_layer(layer.number));
+            }
+            let Some(recorded) = kept.sha256.clone() else {
+                // No blob and no digest: nothing to rebuild the file from and
+                // nothing to check a re-read against.
+                return Err(unreplayable_layer(layer.number));
+            };
+            let wt_path = checked_working_path(state_dir, domain_root, &kept.path)?;
+            let Some(bytes) = read_optional_file(&wt_path)? else {
+                return Err(unreplayable_layer(layer.number));
+            };
+            if state::sha256_hex(&bytes) != recorded {
+                return Err(RemoteError::Refused(format!(
+                    "layer #{} records {} at content the working tree no longer holds; share that change or withdraw the layer",
+                    layer.number, kept.path
+                )));
+            }
+            rebuild.push((kept.path.clone(), bytes));
+        }
+        merged.insert(kept.path.clone(), kept);
+    }
+    for (path, bytes) in rebuild {
+        let blob_sha = provider.create_blob(spec, &bytes).await?;
+        // Every rebuilt path was inserted into `merged` by the pass above, in
+        // the same iteration that queued it here, and nothing removes from
+        // `merged` in between: a miss would mean the two passes disagree.
+        let entry = merged
+            .get_mut(&path)
+            .expect("a rebuilt path is one the pre-pass kept");
+        entry.blob_sha = Some(blob_sha);
+        entry.size = Some(bytes.len() as u64);
+    }
+
+    for change in &fresh.changes {
+        match change {
+            LocalChange::Added { path, sha256 } | LocalChange::Modified { path, sha256 } => {
+                let beneath = below.get(path);
+                if beneath.map(|stamp| stamp.sha256.as_str()) == Some(sha256.as_str()) {
+                    // The tip below already carries exactly this content.
+                    merged.remove(path);
+                    continue;
+                }
+                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let bytes = std::fs::read(&wt_path)?;
+                let blob_sha = provider.create_blob(spec, &bytes).await?;
+                merged.insert(
+                    path.clone(),
+                    ProposedFile {
+                        path: path.clone(),
+                        change: match beneath {
+                            Some(_) => ProposedChange::Modified,
+                            None => ProposedChange::Added,
+                        },
+                        sha256: Some(sha256.clone()),
+                        blob_sha: Some(blob_sha),
+                        size: Some(bytes.len() as u64),
+                    },
+                );
+            }
+            LocalChange::Deleted { path } => {
+                if !below.contains_key(path) {
+                    // Nothing below carries it, so there is nothing here to
+                    // retire: the layer simply stops proposing the path.
+                    merged.remove(path);
+                    continue;
+                }
+                merged.insert(
+                    path.clone(),
+                    ProposedFile {
+                        path: path.clone(),
+                        change: ProposedChange::Deleted,
+                        sha256: None,
+                        blob_sha: None,
+                        size: None,
+                    },
+                );
+            }
+        }
+    }
+
+    let mut out = CollectedChanges {
+        writes: Vec::new(),
+        files: Vec::new(),
+        added: Vec::new(),
+        updated: Vec::new(),
+        deleted: Vec::new(),
+        entries: ChangeEntries::default(),
+    };
+    for (path, file) in merged {
+        match file.change {
+            ProposedChange::Added | ProposedChange::Modified => {
+                let blob_sha = file
+                    .blob_sha
+                    .clone()
+                    .ok_or_else(|| unreplayable_layer(layer.number))?;
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(&path, sub),
+                    blob_sha: Some(blob_sha),
+                });
+                // Content is only worth reading back for the generated body's
+                // engram titles, and a kept entry's file may not be on disk at
+                // all (a layer above may have retired it since); an unreadable
+                // one simply falls back to its bare path.
+                if description.is_none() {
+                    let wt_path = checked_working_path(state_dir, domain_root, &path)?;
+                    let content = read_optional_file(&wt_path)?.unwrap_or_default();
+                    match file.change {
+                        ProposedChange::Added => out.entries.added.push((path.clone(), content)),
+                        _ => out.entries.updated.push((path.clone(), content)),
+                    }
+                }
+                match file.change {
+                    ProposedChange::Added => out.added.push(path.clone()),
+                    _ => out.updated.push(path.clone()),
+                }
+            }
+            ProposedChange::Deleted => {
+                out.writes.push(TreeWrite {
+                    path: to_repo_relative(&path, sub),
+                    blob_sha: None,
+                });
+                if description.is_none() {
+                    let base_content = state::read_base_file(state_dir, &path)?;
+                    out.entries.deleted.push((path.clone(), base_content));
+                }
+                out.deleted.push(path.clone());
+            }
+        }
+        out.files.push(file);
+    }
+
+    Ok(out)
+}
+
+/// Replays every open layer from `from_index` up onto `parent_head`,
+/// bottom-up, rebuilding each one's commit from its OWN recorded files and
+/// forcing its branch onto the result.
+///
+/// This is what makes a mid-chain change self-healing: an amend below (and, in
+/// the withdrawal repair, a hole cut out of the chain) leaves every layer
+/// above sitting on a commit that is no longer the chain, and each one is put
+/// back where it belongs without a human re-basing anything. A layer's content
+/// comes from its record rather than from the working tree, which holds the
+/// chain tip and could not tell one layer's work from another's.
+///
+/// It never touches a replayed layer's [`Proposal::author_login`], and that is
+/// the rule rather than an omission: a replay re-parents somebody else's
+/// proposal, it does not propose it, so a chain amended by a fourth person
+/// still names the three who shared its layers.
+///
+/// The heads of the layers it replays ARE its precondition, and one it does
+/// not check itself: [`ensure_cascade_ready`] probes every one of them in the
+/// caller's single upfront pass, so that a layer carrying a reviewer's
+/// commits refuses the whole operation before any write rather than being
+/// force-updated away halfway up. Calling this without that pass would
+/// overwrite work nothing can recover.
+///
+/// Two rules the replay follows. A deletion is written only when the path is
+/// actually present in the tip below that layer ([`tip_below_layer`]), so a
+/// retirement of something no longer there is dropped rather than replayed as
+/// a phantom change. And each layer's branch move follows the same
+/// interrupted-update protocol a share update does - the sha recorded and
+/// saved BEFORE the ref moves, promoted and cleared after - except the move is
+/// forced: a replayed layer's history is rewritten, not extended.
+async fn cascade_replays(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+    from_index: usize,
+    mut parent_head: String,
+) -> Result<(), RemoteError> {
+    let sub = spec.subpath.as_deref();
+    for index in from_index..state.proposals.len() {
+        if state.proposals[index].status != ProposalStatus::Open {
+            continue;
+        }
+        let layer = state.proposals[index].clone();
+        let below = tip_below_layer(state, index);
+
+        let mut writes = Vec::new();
+        for file in &layer.files {
+            match file.change {
+                ProposedChange::Added | ProposedChange::Modified => {
+                    // Guarded before the first write by `ensure_replayable`;
+                    // refusing here too costs nothing and beats a panic on a
+                    // caller that skipped the check.
+                    let blob_sha = file
+                        .blob_sha
+                        .clone()
+                        .ok_or_else(|| unreplayable_layer(layer.number))?;
+                    writes.push(TreeWrite {
+                        path: to_repo_relative(&file.path, sub),
+                        blob_sha: Some(blob_sha),
+                    });
+                }
+                ProposedChange::Deleted => {
+                    if below.contains_key(&file.path) {
+                        writes.push(TreeWrite {
+                            path: to_repo_relative(&file.path, sub),
+                            blob_sha: None,
+                        });
+                    }
+                }
+            }
+        }
+
+        let tree_sha = provider.create_tree(spec, &parent_head, &writes).await?;
+        let commit_sha = provider
+            .create_commit(
+                spec,
+                &layer.title,
+                &tree_sha,
+                std::slice::from_ref(&parent_head),
+            )
+            .await?;
+
+        state.proposals[index].pending_head_commit = Some(commit_sha.clone());
+        state.save(state_dir)?;
+
+        provider
+            .update_branch(spec, &layer.branch, &commit_sha, true)
+            .await?;
+
+        {
+            let record = &mut state.proposals[index];
+            record.head_commit = Some(commit_sha.clone());
+            record.pending_head_commit = None;
+            record.base_commit = Some(parent_head);
+            record.updated_at = Some(Utc::now());
+        }
+        state.save(state_dir)?;
+
+        parent_head = commit_sha;
+    }
+    Ok(())
+}
+
+/// What a chain repair did, carried back to the caller's report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct RepairOutcome {
+    /// Whether the repair touched the forge at all (a dissolve, a replay or a
+    /// recreate).
+    repaired: bool,
+    /// The NEW stack number a recreate allocated, when one ran.
+    restacked: Option<u64>,
+}
+
+/// Whether the recorded chain and the stack this machine believes in have
+/// come apart, without asking the forge anything.
+///
+/// Three shapes say so. Two are the residue of a layer leaving the chain
+/// outside a withdrawal - a settled gone branch ref, or a reviewer closing one
+/// layer of several - and a stack whose members are no longer a chain wedges
+/// every later `extend_stack` with the base-ref 422 and cannot be unwedged
+/// without dissolving first, so finding those cheaply matters. The third is a
+/// re-base that never finished, which needs no stack call at all:
+///
+/// - a stack number with fewer than two open layers under it, which is a
+///   number naming something that is not a chain any more;
+/// - an open layer whose recorded base is not the head of the open layer below
+///   it: a hole in between the two, or - where nothing left the chain at all -
+///   a cascade that died half-way and left that branch behind
+///   ([`first_misaligned_layer`], which is what [`repair_chain`] tells the two
+///   apart with);
+/// - a hole below the bottom open layer, which shows as that layer not yet
+///   standing on the trunk it now has to target.
+///
+/// Every test is a comparison of recorded fields, so this costs no call, and
+/// each one reads false again once [`repair_chain`] has done its work - a
+/// repaired chain must not re-repair itself on every later operation.
+///
+/// A chain carrying a merged layer with open work above it answers false
+/// whatever its shape: such a chain is not repairable at all until the merge
+/// is pulled in ([`merged_layer_blocking_repair`]), so the honest answer is
+/// "not for this function to fix" rather than "fine".
+fn stack_shape_broken(state: &OriginState) -> bool {
+    if state.stack_number.is_none() {
+        return false;
+    }
+    if merged_layer_blocking_repair(state).is_some() {
+        return false;
+    }
+    let open: Vec<&Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .collect();
+    let Some(bottom) = open.first() else {
+        return true;
+    };
+    if open.len() < 2 {
+        return true;
+    }
+    // A hole under the bottom survivor: only a repair puts that layer onto the
+    // trunk, so a recorded base still naming the vanished layer's head says
+    // the repair has not run. The trunk moving on under an intact chain is not
+    // this shape - there is no hole beneath the bottom layer then.
+    let hole_below = state
+        .proposals
+        .iter()
+        .take_while(|p| p.number != bottom.number)
+        .any(|p| p.status != ProposalStatus::Open);
+    if hole_below && bottom.base_commit.as_deref() != Some(state.base_commit.as_str()) {
+        return true;
+    }
+    open.windows(2)
+        .any(|pair| pair[1].base_commit != pair[0].head_commit)
+}
+
+/// The merged layer that makes this chain unrepairable, if it carries one.
+///
+/// A repair rebuilds every layer above a hole from the layers below it, and a
+/// merged layer's content is in neither place yet: it lives on the trunk, and
+/// only the next [`pull`] advances `base_commit` and the base snapshot onto
+/// it. Replaying over that would rebuild the survivors WITHOUT the merged
+/// files, which on the forge reads as those files being deleted - a corrupt
+/// review rather than a repaired chain. The way out is the pull that consumes
+/// it, which both arms of [`pull`] now perform.
+///
+/// What blocks is exactly the merged record with an OPEN layer still above it
+/// ([`under_an_open_layer`]), which is the whole lossy class and nothing more.
+/// Such a record is either below where the replay starts - the survivors are
+/// then rebuilt on a parent that predates the merge - or inside the range
+/// [`cascade_replays`] walks, where it is skipped as not-open and the layer
+/// above it is rebuilt without it.
+///
+/// A merged record with NO open layer above it is neither, and the invariant
+/// that says so is about the records a repair touches rather than about how
+/// far its walk runs (the walk may well run past such a record, in a chain
+/// like open, declined, open, merged): a replay only ever rebuilds OPEN
+/// records, and only ever onto the record below the one it is rebuilding, so
+/// a merged record with nothing open above it has no tree rebuilt on top of
+/// it. Retargets name only open records too, so it is never pointed anywhere
+/// either. A withdrawal below it repairs the chain without touching what
+/// merged.
+fn merged_layer_blocking_repair(state: &OriginState) -> Option<u64> {
+    under_an_open_layer(state)
+        .iter()
+        .find(|p| p.status == ProposalStatus::Merged)
+        .map(|p| p.number)
+}
+
+/// The refusal a chain carrying a merged layer earns, with the way out named:
+/// the merge has to be pulled in before the chain around it can be rebuilt.
+fn merged_layer_blocks_repair(number: u64) -> RemoteError {
+    RemoteError::Refused(format!(
+        "proposal #{number} has merged and this domain has not pulled it in yet, so the layers around it cannot be rebuilt without losing what it brought; pull this domain first, then try again"
+    ))
+}
+
+/// Repairs the open chain around every hole it records, in the one order the
+/// forge accepts: dissolve, replay, retarget, recreate.
+///
+/// A hole is a recorded layer that is no longer open - the layer a withdrawal
+/// just closed, or one settled out from under this machine. Every layer above
+/// a hole sits on a commit that is no longer the chain, so the first survivor
+/// above the LOWEST hole is replayed onto the layer below it (the trunk, for a
+/// hole at the bottom) and [`cascade_replays`] carries the rest of the chain
+/// up from there. Each survivor that directly follows a hole then has its pull
+/// request retargeted at the branch below it, since the branch it pointed at
+/// is going away.
+///
+/// A Merged record is a hole this cannot fill: the refusal
+/// ([`merged_layer_blocks_repair`]) comes before the first call, and the pull
+/// that consumes the merge is what unblocks it.
+///
+/// A chain with NO hole in it takes a shorter path, and taking it matters as
+/// much as the long one. Every member is still a member there; what came
+/// apart is only where a branch stands, which is what a cascade that died
+/// half-way leaves ([`first_misaligned_layer`]). The membership is intact, so
+/// there is nothing to dissolve and nothing to recreate: the layers from the
+/// break up are re-based and that is the repair. Run through the long path
+/// instead, such a chain would churn the stack number on every share it ever
+/// sees and never once move the branch that is actually stale.
+///
+/// Why the order is not negotiable: a stacked proposal cannot be retargeted at
+/// all (the forge answers 422), so the stack has to be dissolved before the
+/// first `update_proposal` base call; and a recreate can only succeed once
+/// every member's base ref points where the new chain says it does, so it
+/// comes after the retargets. A dissolve of a stack that is already gone is a
+/// 404 and means the work is done, not that it failed.
+///
+/// Every step is idempotent, because this runs again from the top whenever a
+/// previous attempt died halfway: re-dissolving 404s, a retarget that is
+/// already applied is a no-op, and a recreate over the survivors produces the
+/// same chain whatever a previous run got through. The caller clears
+/// [`crate::state::OriginState::repair_pending`] by letting this finish; a
+/// failure leaves it set and the next withdraw or share resumes.
+async fn repair_chain(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) -> Result<RepairOutcome, RemoteError> {
+    // A merged layer is not a hole this can close: refuse before anything is
+    // dissolved, replayed or retargeted.
+    if let Some(number) = merged_layer_blocking_repair(state) {
+        return Err(merged_layer_blocks_repair(number));
+    }
+
+    // A chain with no hole in it has nothing to dissolve and nothing to
+    // recreate: every member is still a member, and what came apart is only
+    // where the branches stand. That is a cascade that died half-way, and the
+    // whole repair is to re-base the layers above the break onto the head
+    // below it. Dissolving an intact membership would churn the stack number
+    // on every later share and still leave the stale branch where it was.
+    let intact = state
+        .proposals
+        .iter()
+        .all(|p| p.status == ProposalStatus::Open);
+    if intact && let Some((index, parent)) = first_misaligned_layer(state) {
+        if let Some(above) = ensure_cascade_ready(provider, spec, state, index).await? {
+            return Err(upper_layer_diverged(&above));
+        }
+        cascade_replays(provider, spec, state, state_dir, index, parent).await?;
+        state.repair_pending = false;
+        // This path never links anything: the membership was never dissolved,
+        // so there is nothing to recreate. That leaves one case it must not
+        // pass over in silence - a chain of two or more open layers with no
+        // recorded stack number is not grouped on the forge at all, and with
+        // the debt unrecorded nothing ever groups it (`chain_is_stacked`
+        // reads exactly this pair, and answers false, which drops the domain
+        // onto the unstacked flows for good). Record it, and the next
+        // operation's `retry_stack_link` pays it off - the same honest
+        // degradation the long path records when its recreate fails.
+        // `first_misaligned_layer` needs a layer below the break, so an
+        // intact chain that got here has at least two open layers by
+        // construction.
+        if state.stack_number.is_none() {
+            state.stack_link_pending = true;
+        }
+        state.save(state_dir)?;
+        return Ok(RepairOutcome {
+            repaired: true,
+            restacked: None,
+        });
+    }
+
+    // The plan is read off the recorded chain before a single call is made:
+    // where the replay starts, what it starts from, and which survivors have
+    // to be pointed at a new base branch.
+    let mut first_survivor: Option<usize> = None;
+    let mut parent_head: Option<String> = None;
+    let mut retargets: Vec<(u64, String)> = Vec::new();
+    {
+        let mut below: Option<&Proposal> = None;
+        let mut after_hole = false;
+        for (index, prop) in state.proposals.iter().enumerate() {
+            if prop.status != ProposalStatus::Open {
+                after_hole = true;
+                continue;
+            }
+            if after_hole {
+                if first_survivor.is_none() {
+                    first_survivor = Some(index);
+                    parent_head = below.and_then(|p| p.head_commit.clone());
+                }
+                retargets.push((
+                    prop.number,
+                    below
+                        .map(|p| p.branch.clone())
+                        .unwrap_or_else(|| spec.branch.clone()),
+                ));
+                after_hole = false;
+            }
+            below = Some(prop);
+        }
+    }
+
+    // Nothing is written until every layer the cascade replays is known to be
+    // replayable and known to be ours, so a chain that cannot be healed - or
+    // one carrying a reviewer's commits above the hole - is refused before the
+    // dissolve rather than halfway up.
+    if let Some(index) = first_survivor
+        && let Some(above) = ensure_cascade_ready(provider, spec, state, index).await?
+    {
+        return Err(upper_layer_diverged(&above));
+    }
+
+    let mut outcome = RepairOutcome::default();
+
+    if let Some(stack) = state.stack_number {
+        match provider.dissolve_stack(spec, stack).await {
+            Ok(()) => {}
+            // Already gone: an earlier attempt at this repair got this far, or
+            // the forge dropped the stack itself. Either way it is done.
+            Err(RemoteError::Api { status: 404, .. }) => {
+                tracing::debug!("stack {stack} was already dissolved");
+            }
+            Err(RemoteError::StacksUnsupported) => {
+                tracing::debug!("this forge no longer serves stacks; nothing to dissolve");
+            }
+            Err(e) => return Err(e),
+        }
+        state.stack_number = None;
+        outcome.repaired = true;
+        state.save(state_dir)?;
+    }
+
+    if let Some(index) = first_survivor {
+        let parent = parent_head.unwrap_or_else(|| state.base_commit.clone());
+        cascade_replays(provider, spec, state, state_dir, index, parent).await?;
+        outcome.repaired = true;
+    }
+
+    for (number, base) in &retargets {
+        provider
+            .update_proposal(spec, *number, None, None, Some(base))
+            .await?;
+        outcome.repaired = true;
+    }
+
+    // A layer this machine withdrew, and one the forge declined out from under
+    // it, both leave the chain for history here, once the survivors above them
+    // stand on their own again. Each keeps the status it settled with, the way
+    // a share's supersede step records a declined proposal: the chain is what
+    // is being repaired, and a hole that stayed behind in `proposals` would
+    // have the next repair walk it all over again.
+    let settled: Vec<Proposal> = state
+        .proposals
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.status,
+                ProposalStatus::Withdrawn | ProposalStatus::Declined
+            )
+        })
+        .cloned()
+        .collect();
+    if !settled.is_empty() {
+        state.proposals.retain(|p| {
+            !matches!(
+                p.status,
+                ProposalStatus::Withdrawn | ProposalStatus::Declined
+            )
+        });
+        for record in settled {
+            state.push_history(record);
+        }
+    }
+
+    let open: Vec<u64> = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect();
+    if open.len() >= 2 {
+        match provider.create_stack(spec, &open).await {
+            Ok(info) => {
+                state.stack_number = Some(info.number);
+                state.stack_link_pending = false;
+                outcome.restacked = Some(info.number);
+                outcome.repaired = true;
+            }
+            Err(e) => {
+                // The pull requests are all there and correctly based; only
+                // the grouping is missing, which is the degraded chain
+                // `stack_link_pending` records and the next operation retries.
+                tracing::debug!(
+                    "re-linking the repaired chain failed; it stays degraded until the next operation: {e}"
+                );
+                state.stack_number = None;
+                state.stack_link_pending = true;
+            }
+        }
+    } else {
+        // One layer is not a chain, so there is no stack to name.
+        state.stack_number = None;
+        state.stack_link_pending = false;
+    }
+
+    state.repair_pending = false;
+    state.save(state_dir)?;
+    Ok(outcome)
+}
+
+/// Finishes a repair a previous operation left half-done, and heals a chain
+/// that came apart without one, before the caller does any work of its own.
+///
+/// Two entry conditions, both cheap to test. [`OriginState::repair_pending`]
+/// says a withdrawal died between its dissolve and its recreate; the recorded
+/// chain is then re-read against the forge, since a layer this machine closed
+/// before dying is still recorded Open here, and one `proposal_state` per open
+/// layer settles that. [`stack_shape_broken`] says the chain and the stack
+/// disagree with no repair ever having been marked - the residue of a layer
+/// settled out of the chain by a share, which leaves a stack the forge will
+/// refuse to extend for as long as it stands.
+///
+/// A layer the forge reports closed while a repair is pending is recorded as
+/// [`ProposalStatus::Withdrawn`] rather than Declined: this machine closed it,
+/// in the withdrawal that never finished. A layer that merged in the meantime
+/// keeps its Merged status and stays for [`pull`] to consume - and blocks the
+/// repair until it has been ([`merged_layer_blocking_repair`]).
+///
+/// One consequence of where this is called from: both call sites sit behind
+/// the stacked path, so turning `github.stacks` off strands a pending repair
+/// exactly as it stands until the setting is turned back on. That is the
+/// intended trade - a repair is stack work, and a machine that has been told
+/// not to use stacks should not be making stack calls - but a chain left
+/// mid-repair stays mid-repair meanwhile.
+async fn finish_pending_repair(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    state: &mut OriginState,
+    state_dir: &Path,
+) -> Result<RepairOutcome, RemoteError> {
+    if !state.repair_pending && !stack_shape_broken(state) {
+        return Ok(RepairOutcome::default());
+    }
+
+    if state.repair_pending {
+        let open: Vec<u64> = state
+            .proposals
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Open)
+            .map(|p| p.number)
+            .collect();
+        let mut dirty = false;
+        for number in open {
+            let live = provider.proposal_state(spec, number).await?;
+            let status = match live {
+                ProposalState::Open => continue,
+                ProposalState::Merged => ProposalStatus::Merged,
+                ProposalState::Declined => ProposalStatus::Withdrawn,
+            };
+            if let Some(record) = state.proposals.iter_mut().find(|p| p.number == number) {
+                record.status = status;
+                record.pending_head_commit = None;
+                dirty = true;
+            }
+        }
+        if dirty {
+            state.save(state_dir)?;
+        }
+    }
+
+    repair_chain(provider, spec, state, state_dir).await
 }
 
 /// Withdraws a share proposal: closes its pull request on the forge (an Open
@@ -1282,15 +3677,32 @@ async fn update_open_proposal(
 /// to their pre-share content, and moves the record to history as
 /// [`ProposalStatus::Withdrawn`].
 ///
-/// Target: `proposal_number`, or the single Open proposal when `None`;
-/// no open proposal (or more than one, possible only in pre-living-proposal
-/// state) is [`RemoteError::NoWithdrawTarget`] listing every candidate, and a
-/// named number that is not among the open or declined records is
+/// Target: `proposal_number`, or the single Open proposal when `None`; on a
+/// stacked chain with no number the target is the TOP open layer, since that
+/// is the layer nothing is built on. No open proposal, or a multi-open chain
+/// this machine does not know as a stack (residue from before stacking), is
+/// [`RemoteError::NoWithdrawTarget`] listing every candidate, and a named
+/// number that is not among the open or declined records is
 /// [`RemoteError::ProposalNotFound`]. A close failure aborts the whole
 /// withdraw with the error and nothing else changed. Without `revert` the
 /// working tree is untouched; with it, files still matching what was proposed
 /// are restored (base-tree content for Modified/Deleted, deletion for Added)
-/// and diverged ones are skipped - newer work is never destroyed.
+/// and diverged ones are skipped - newer work is never destroyed. On a chain
+/// the pre-share content of a path a LOWER layer added is that layer's rather
+/// than the trunk's, so it is fetched back from the blob that layer's record
+/// names; a path nothing can speak for is named in
+/// [`WithdrawReport::skipped_reverts`] and left exactly as it stands.
+///
+/// Taking a layer out of a stacked chain is more than a close: the layers
+/// above it sit on a commit that is about to be nothing, and the forge refuses
+/// to retarget a proposal while it is stacked. So the chain is repaired around
+/// the hole, in [`repair_chain`]'s order - dissolve, replay the survivors onto
+/// the layer below the hole, retarget the first of them, recreate the stack
+/// when two or more layers survive - with
+/// [`crate::state::OriginState::repair_pending`] set from before the dissolve
+/// until after the recreate, so a process that dies mid-repair is finished by
+/// the next withdraw or share rather than leaving a wedged chain. The
+/// withdrawn layer's own branch is deleted LAST, once the repair is durable.
 ///
 /// Only the close is atomic: a failure later, inside the revert loop, leaves
 /// the pull request closed on the forge while the record is still locally
@@ -1298,6 +3710,9 @@ async fn update_open_proposal(
 /// needing repair - the next [`status`] or [`pull`] classifies the closed
 /// pull request and flips the record to Declined, and a retried withdraw then
 /// takes the Declined path (no second close, the remaining files reverted).
+///
+/// `stacks_allowed` carries `github.stacks` through to the stack repair a
+/// withdrawal of a stacked layer needs; a fallback withdrawal ignores it.
 pub async fn withdraw(
     provider: &dyn Provider,
     spec: &OriginSpec,
@@ -1305,12 +3720,33 @@ pub async fn withdraw(
     state_dir: &Path,
     proposal_number: Option<u64>,
     revert: bool,
+    stacks_allowed: bool,
 ) -> Result<WithdrawReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
+
+    // The same capability question a share asks, and the same cached answer:
+    // whether this origin's chains are stacks at all decides both how a target
+    // is resolved and whether a repair is owed.
+    let stacked_path =
+        stacks_available(provider, spec, &mut state, state_dir, stacks_allowed).await?;
+
+    // A repair a previous operation left half-done, or a chain that came apart
+    // without one, is finished before this withdrawal picks its own target:
+    // the target set itself changes when a settled layer leaves the chain.
+    let mut report = WithdrawReport::default();
+    if stacked_path {
+        let entry = finish_pending_repair(provider, spec, &mut state, state_dir).await?;
+        report.repaired = entry.repaired;
+        report.restacked = entry.restacked;
+        // A link still owed to the forge is settled here too (spec 9.2 names
+        // share, withdraw and status): the repair below dissolves and
+        // recreates, and it can only do that over a chain the forge holds.
+        retry_stack_link(provider, spec, &mut state, state_dir).await;
+    }
 
     let proposal = match proposal_number {
         Some(number) => state
@@ -1325,8 +3761,14 @@ pub async fn withdraw(
                 .iter()
                 .filter(|p| p.status == ProposalStatus::Open)
                 .collect();
+            let stacked_chain = stacked_path && chain_is_stacked(&state);
             match open.as_slice() {
                 [single] => (*single).clone(),
+                // On a stacked chain the default target is the TOP layer: it
+                // is the one nothing is built on, so withdrawing it costs no
+                // replay. A multi-open chain this machine does not know as a
+                // stack is the legacy shape, and there the caller has to say.
+                [.., top] if stacked_chain => (*top).clone(),
                 _ => {
                     return Err(RemoteError::NoWithdrawTarget {
                         open: open.iter().map(|p| p.number).collect(),
@@ -1345,63 +3787,105 @@ pub async fn withdraw(
         // A Merged record can genuinely stand here: `status` flips one to
         // Merged without consuming it, and only the next pull moves it to
         // history. Withdrawing a merged proposal is refused outright.
-        return Err(RemoteError::State(format!(
+        return Err(RemoteError::Refused(format!(
             "proposal #{} has already merged and cannot be withdrawn",
             proposal.number
         )));
     }
 
+    report.number = proposal.number;
+
+    // Where this layer sits, and what stands below it: both are read before a
+    // single call, because the repair moves the record out of the chain and
+    // the revert still needs the layers underneath it to restore from.
+    let index = state
+        .proposals
+        .iter()
+        .position(|p| p.number == proposal.number);
+    let below: Vec<Proposal> = match index {
+        Some(index) => state.proposals[..index]
+            .iter()
+            .filter(|p| p.status == ProposalStatus::Open)
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    let open_layers = state
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .count();
+    // A repair is owed when this layer really is part of a chain: a stack the
+    // forge holds, or a second open layer that would be left dangling.
+    let repair_owed = stacked_path
+        && proposal.status == ProposalStatus::Open
+        && chain_is_stacked(&state)
+        && (state.stack_number.is_some() || open_layers >= 2);
+
+    if let (true, Some(index)) = (repair_owed, index) {
+        // Nothing is written until every layer above this one can be replayed:
+        // a chain left half re-based is worse than one never touched. A merged
+        // layer this domain has not pulled in is the other refusal, and it
+        // belongs here rather than inside the repair, so the pull request is
+        // never closed for a repair that then cannot run.
+        ensure_replayable(&state, index + 1)?;
+        if let Some(number) = merged_layer_blocking_repair(&state) {
+            return Err(merged_layer_blocks_repair(number));
+        }
+        provider.close_proposal(spec, proposal.number).await?;
+        report.closed = true;
+        // From here the chain is knowingly inconsistent, and the flag says so
+        // until the recreate lands. The withdrawn record stays in the chain,
+        // marked, so the repair can see where the hole is; `repair_chain`
+        // settles it to history once the survivors stand on their own.
+        state.proposals[index].status = ProposalStatus::Withdrawn;
+        state.repair_pending = true;
+        state.save(state_dir)?;
+
+        let outcome = repair_chain(provider, spec, &mut state, state_dir).await?;
+        report.repaired |= outcome.repaired;
+        report.restacked = outcome.restacked.or(report.restacked);
+
+        if revert {
+            revert_layer_files(
+                provider,
+                spec,
+                domain_root,
+                state_dir,
+                &proposal,
+                &below,
+                &mut report,
+            )
+            .await?;
+        }
+
+        // The branch goes last, once the repaired chain is durable: a survivor
+        // replayed onto a branch that is already gone would have nothing to
+        // sit on if this ran earlier and the repair then failed.
+        let _ = provider.delete_branch(spec, &proposal.branch).await;
+        return Ok(report);
+    }
+
     // Close first: a failure here aborts with nothing else changed. A
     // Declined proposal is already closed on the forge, so only the branch
     // cleanup applies to it.
-    let closed = if proposal.status == ProposalStatus::Open {
+    if proposal.status == ProposalStatus::Open {
         provider.close_proposal(spec, proposal.number).await?;
-        true
-    } else {
-        false
-    };
+        report.closed = true;
+    }
     let _ = provider.delete_branch(spec, &proposal.branch).await;
 
-    let mut restored = Vec::new();
-    let mut deleted = Vec::new();
-    let mut skipped_diverged = Vec::new();
     if revert {
-        for pf in &proposal.files {
-            let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
-            let current = read_optional_file(&wt_path)?;
-            let current_sha = current.as_deref().map(state::sha256_hex);
-
-            let diverged = match pf.change {
-                ProposedChange::Added | ProposedChange::Modified => {
-                    current_sha.as_deref() != pf.sha256.as_deref()
-                }
-                ProposedChange::Deleted => current.is_some(),
-            };
-            if diverged {
-                skipped_diverged.push(pf.path.clone());
-                continue;
-            }
-
-            match pf.change {
-                ProposedChange::Added => {
-                    remove_working_file(&wt_path)?;
-                    deleted.push(pf.path.clone());
-                }
-                ProposedChange::Modified | ProposedChange::Deleted => {
-                    match state::read_base_file(state_dir, &pf.path)? {
-                        Some(bytes) => {
-                            write_working_file(&wt_path, &bytes)?;
-                            restored.push(pf.path.clone());
-                        }
-                        // No base copy to restore from (should not happen: a
-                        // Modified or Deleted change always had a base entry);
-                        // never destroy the local file over it, so this is left
-                        // alone like a genuine divergence.
-                        None => skipped_diverged.push(pf.path.clone()),
-                    }
-                }
-            }
-        }
+        revert_layer_files(
+            provider,
+            spec,
+            domain_root,
+            state_dir,
+            &proposal,
+            &below,
+            &mut report,
+        )
+        .await?;
     }
 
     state.proposals.retain(|p| p.number != proposal.number);
@@ -1410,13 +3894,131 @@ pub async fn withdraw(
     state.push_history(record);
     state.save(state_dir)?;
 
-    Ok(WithdrawReport {
-        number: proposal.number,
-        closed,
-        restored,
-        deleted,
-        skipped_diverged,
-    })
+    Ok(report)
+}
+
+/// Puts the working tree back the way it stood before `proposal` was shared,
+/// for every file the proposal itself changed and no other.
+///
+/// A file that diverged since sharing is never touched: the recorded digest is
+/// what says whether the local copy is still the one that was proposed, and
+/// anything else is newer work. What a restore reads from is the base
+/// snapshot - except where the trunk never carried the file at all, which is
+/// the shape a stacked chain makes possible: a layer below added the path and
+/// this layer modified or retired it, so the pre-share content is that lower
+/// layer's, and the only copy of it is the blob its record names. That blob is
+/// fetched by sha and CHECKED against the lower record's digest before it is
+/// written; a record with no blob sha, a fetch that fails and content that
+/// does not hash to what was recorded all leave the path exactly as it stands
+/// and name it in [`WithdrawReport::skipped_reverts`]. A withdrawal is never
+/// failed over a file that cannot be put back.
+async fn revert_layer_files(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    domain_root: &Path,
+    state_dir: &Path,
+    proposal: &Proposal,
+    below: &[Proposal],
+    report: &mut WithdrawReport,
+) -> Result<(), RemoteError> {
+    for pf in &proposal.files {
+        let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
+        let current = read_optional_file(&wt_path)?;
+        let current_sha = current.as_deref().map(state::sha256_hex);
+
+        let diverged = match pf.change {
+            ProposedChange::Added | ProposedChange::Modified => {
+                current_sha.as_deref() != pf.sha256.as_deref()
+            }
+            ProposedChange::Deleted => current.is_some(),
+        };
+        if diverged {
+            report.skipped_diverged.push(pf.path.clone());
+            continue;
+        }
+
+        match pf.change {
+            ProposedChange::Added => {
+                remove_working_file(&wt_path)?;
+                report.deleted.push(pf.path.clone());
+            }
+            ProposedChange::Modified | ProposedChange::Deleted => {
+                match state::read_base_file(state_dir, &pf.path)? {
+                    Some(bytes) => {
+                        write_working_file(&wt_path, &bytes)?;
+                        report.restored.push(pf.path.clone());
+                    }
+                    // The trunk has no copy. On a chain that means a layer
+                    // below owns the path, and its recorded blob is the
+                    // pre-share content; anywhere else there is simply nothing
+                    // to restore from and the file is left alone.
+                    None => match layer_below_content(provider, spec, below, &pf.path).await {
+                        Some(bytes) => {
+                            write_working_file(&wt_path, &bytes)?;
+                            report.restored.push(pf.path.clone());
+                        }
+                        None => report.skipped_reverts.push(pf.path.clone()),
+                    },
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The content the nearest layer below carries at `path`, fetched by blob sha
+/// and verified against that layer's recorded digest, or `None` when no layer
+/// below can speak for the path with content this function is willing to
+/// write.
+///
+/// Nearest first, since a higher layer's version is the one that stood
+/// directly beneath the withdrawn layer. Every way this can go wrong answers
+/// `None` rather than an error: a record from before blob shas existed, a
+/// record with no digest to check against, a blob the forge no longer has, and
+/// content that does not hash to what was recorded. The caller reports the
+/// path as unrestored, which is the honest outcome.
+async fn layer_below_content(
+    provider: &dyn Provider,
+    spec: &OriginSpec,
+    below: &[Proposal],
+    path: &str,
+) -> Option<Vec<u8>> {
+    for layer in below.iter().rev() {
+        let Some(file) = layer.files.iter().find(|f| f.path == path) else {
+            continue;
+        };
+        match file.change {
+            ProposedChange::Added | ProposedChange::Modified => {}
+            // This layer retired the path too, so it is not what stood below.
+            ProposedChange::Deleted => return None,
+        }
+        let (Some(blob_sha), Some(recorded)) = (file.blob_sha.as_deref(), file.sha256.as_deref())
+        else {
+            tracing::debug!(
+                "layer #{} records {path} without a blob to restore it from",
+                layer.number
+            );
+            return None;
+        };
+        match provider.blob(spec, blob_sha).await {
+            Ok(bytes) if state::sha256_hex(&bytes) == recorded => return Some(bytes),
+            Ok(_) => {
+                tracing::debug!(
+                    "the blob layer #{} records for {path} does not hash to its recorded digest",
+                    layer.number
+                );
+                return None;
+            }
+            Err(e) => {
+                tracing::debug!(
+                    "fetching layer #{}'s copy of {path} failed: {e}",
+                    layer.number
+                );
+                return None;
+            }
+        }
+    }
+    None
 }
 
 /// Resolves one recorded conflict at `path`: settles it per `resolution`,
@@ -1432,7 +4034,7 @@ pub fn resolve(
     resolution: Resolution<'_>,
 ) -> Result<ResolveReport, RemoteError> {
     let mut state = OriginState::load(state_dir)?.ok_or_else(|| {
-        RemoteError::State(
+        RemoteError::Refused(
             "this domain has no origin state; add the domain from its origin first".to_string(),
         )
     })?;
@@ -1472,7 +4074,14 @@ pub fn resolve(
 
 /// Handles the "nothing new upstream" outcome of a pull: refresh open
 /// proposals (a proposal can still be declined without the branch moving),
-/// persist any resulting change, and report up to date.
+/// consume any merged record, persist the result and report up to date.
+///
+/// The consumption is not an optimization. A merged record still sitting in
+/// the chain blocks every repair around it ([`merged_layer_blocking_repair`]),
+/// and the refusal's way out is "pull this domain first" - so a pull that
+/// finds nothing new upstream has to finish that record off too, or the advice
+/// names an operation that cannot clear it. No rebase is adopted here: the
+/// trunk never moved, so nothing above the merge was rebased onto it.
 ///
 /// `new_etag` is `Some` when this was reached from a moved branch that
 /// happened to equal the base commit (carrying a possibly-new etag to store)
@@ -1486,7 +4095,8 @@ async fn settle_up_to_date(
     new_etag: Option<Option<String>>,
 ) -> Result<PullReport, RemoteError> {
     let (transitions, touched) = refresh_proposals(provider, spec, &mut state).await?;
-    let mut dirty = touched;
+    let consumed = consume_merged(&mut state);
+    let mut dirty = touched || !consumed.is_empty();
     if let Some(etag) = new_etag
         && state.ref_etag != etag
     {
@@ -1496,6 +4106,11 @@ async fn settle_up_to_date(
     if dirty {
         state.last_checked = Some(Utc::now());
         state.save(state_dir)?;
+    }
+    // Best-effort branch cleanup once the state is durable, exactly as the
+    // moved-trunk arm does it.
+    for prop in &consumed {
+        let _ = provider.delete_branch(spec, &prop.branch).await;
     }
     Ok(PullReport {
         up_to_date: true,
@@ -1513,7 +4128,22 @@ async fn settle_up_to_date(
 /// materializes only upstream files with no local counterpart (never
 /// overwriting or deleting a local file that differs, which simply becomes a
 /// local change against the new base), replaces the base snapshot wholesale
-/// and keeps proposals and conflicts as they are.
+/// and keeps conflicts as they are.
+///
+/// Merged proposals are consumed here exactly as the other two arms of
+/// [`pull`] consume them, and for the same reason: a merged record left in the
+/// chain blocks every repair around it ([`merged_layer_blocking_repair`]), and
+/// that refusal's way out is "pull this domain first". An arm that pulls and
+/// leaves the record standing turns that advice into a loop - the base commit
+/// is gone upstream, so this is the arm this domain takes on every pull from
+/// here on, and nothing would ever clear it.
+///
+/// [`PullReport::merged`] stays empty and says nothing about this: it lists
+/// the paths a three-way text merge produced, and a re-baseline performs none
+/// (a local file that differs is left alone as a local change). The consumed
+/// proposal is reported where every other arm reports it, in
+/// [`PullReport::proposals`], which carries the transition
+/// [`refresh_proposals`] recorded for it before this arm was chosen.
 #[allow(clippy::too_many_arguments)]
 async fn rebaseline(
     provider: &dyn Provider,
@@ -1550,7 +4180,27 @@ async fn rebaseline(
     state.base_commit = head;
     state.ref_etag = new_etag;
     state.last_checked = Some(Utc::now());
+
+    // Consume merged proposals in memory and adopt whatever the forge did to
+    // the layers still standing above them, then persist the base replacement
+    // and the consumption together in one save, so a crash cannot leave a
+    // merged proposal half-consumed. The same order the moved-trunk arm uses.
+    let consumed = consume_merged(&mut state);
+    if !consumed.is_empty()
+        && state
+            .proposals
+            .iter()
+            .any(|p| p.status == ProposalStatus::Open)
+    {
+        adopt_rebased_layers(provider, spec, &mut state).await;
+    }
     state.save(state_dir)?;
+
+    // Best-effort branch cleanup once the state is durable; a branch lingering
+    // upstream harms nothing, so errors are ignored entirely.
+    for prop in &consumed {
+        let _ = provider.delete_branch(spec, &prop.branch).await;
+    }
 
     Ok(PullReport {
         up_to_date: false,
@@ -1816,7 +4466,7 @@ fn stamp(content: &[u8]) -> BaseStamp {
 /// the prefix stripping [`crate::archive::extract_tarball`] applies, so the
 /// compare and tarball paths agree on which files belong to the domain, and
 /// applies the same [`crate::changes::is_excluded_path`] rule that function
-/// does: a hidden or reserved upstream change is dropped here, before the caller ever
+/// does: a hidden or logged upstream change is dropped here, before the caller ever
 /// fetches a blob for it or stamps it into
 /// [`crate::state::OriginState::files`], so a compare-driven pull can never
 /// disagree with a tarball-driven one about which files are hidden.
@@ -2096,17 +4746,30 @@ fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
     if count == 1 { singular } else { plural }
 }
 
-/// Generates a proposal title from the change mix, by three simple,
+/// Generates a proposal title from the change mix, by four simple,
 /// deterministic rules:
 ///
 /// - only additions -> `"Share N new engram(s) from <domain>"`
 /// - only modifications -> `"Refine N engram(s) in <domain>"`
+/// - no real work at all, only refreshed listings ->
+///   `"Refresh N folder index(es) in <domain>"`
 /// - anything else (deletions alone, or any mix of two or three kinds) ->
 ///   `"Share updates from <domain>"`
 ///
+/// The counts are of real work; `indexes` is the generated directory listings
+/// riding along, and it only ever decides the title when there is nothing else
+/// to name. A share of two refreshed listings called "2 new engrams" would be
+/// the first thing a reviewer reads and a plain falsehood.
+///
 /// Used as the proposal title, and (unless the caller supplies their own
 /// title) the commit message too.
-fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &str) -> String {
+fn generate_title(
+    added: usize,
+    updated: usize,
+    deleted: usize,
+    indexes: usize,
+    domain_name: &str,
+) -> String {
     match (added > 0, updated > 0, deleted > 0) {
         (true, false, false) => format!(
             "Share {added} new {} from {domain_name}",
@@ -2115,6 +4778,10 @@ fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &st
         (false, true, false) => format!(
             "Refine {updated} {} in {domain_name}",
             pluralize(updated, "engram", "engrams")
+        ),
+        (false, false, false) if indexes > 0 => format!(
+            "Refresh {indexes} folder {} in {domain_name}",
+            pluralize(indexes, "index", "indexes")
         ),
         _ => format!("Share updates from {domain_name}"),
     }
@@ -2125,7 +4792,18 @@ fn generate_title(added: usize, updated: usize, deleted: usize, domain_name: &st
 /// with a zero-count clause omitted entirely, singular or plural chosen per
 /// count, and no Oxford comma before the final "and" (see
 /// [`join_clauses`]).
-fn generate_summary_line(added: usize, updated: usize, deleted: usize) -> String {
+///
+/// The counts are of real work, like [`generate_title`]'s. A share whose only
+/// content is refreshed folder listings says exactly that instead of summing to
+/// an empty sentence; a share that has real work in it lets the work speak and
+/// leaves the listings to the file sections below.
+fn generate_summary_line(added: usize, updated: usize, deleted: usize, indexes: usize) -> String {
+    if added == 0 && updated == 0 && deleted == 0 && indexes > 0 {
+        return format!(
+            "Refreshes {indexes} folder {}.",
+            pluralize(indexes, "index", "indexes")
+        );
+    }
     let mut clauses = Vec::new();
     if added > 0 {
         clauses.push(format!(

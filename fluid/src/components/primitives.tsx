@@ -298,7 +298,14 @@ export function IconButton({
 export type ChipVariant =
   "neutral" | "positive" | "caution" | "danger" | "retired" | "accent";
 
-const CHIP_VARIANTS: Record<ChipVariant, string> = {
+/**
+ * The one table of chip faces, exported because a second surface draws from it:
+ * the share dialog's change-kind badges are the same filled blocks at a
+ * different geometry, and a copy of these strings there would let a palette
+ * retune drift the two apart silently.
+ */
+// eslint-disable-next-line react-refresh/only-export-components
+export const CHIP_VARIANTS: Record<ChipVariant, string> = {
   neutral: "bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300",
   positive:
     "bg-emerald-100 text-emerald-800 dark:bg-emerald-950 dark:text-emerald-300",

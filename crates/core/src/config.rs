@@ -162,6 +162,51 @@ impl GlobalConfig {
             .unwrap_or(false)
     }
 
+    /// Whether shares may stack their proposals, from `github.stacks`. Absent
+    /// config or an absent key means yes (true): where the forge serves the
+    /// stacked pull request endpoints a share adds a layer, and setting the
+    /// key to `false` forces the single living proposal behavior everywhere.
+    pub fn github_stacks(&self) -> bool {
+        self.github.as_ref().and_then(|g| g.stacks).unwrap_or(true)
+    }
+
+    /// Whose GitHub identity a share runs under, from `github.share_identity`.
+    /// Absent config or an absent key means [`ShareIdentityMode::Instance`]:
+    /// the one connected instance token performs every read and every write,
+    /// which is the behavior an install has always had. Only the exact word
+    /// `personal` selects [`ShareIdentityMode::Personal`].
+    ///
+    /// Any other stored value also reads as `Instance`, and that tolerance is
+    /// deliberate: a config file is hand-editable, so a typo (or a spelling a
+    /// newer build writes) must not silently move an instance into or out of
+    /// the stricter mode. The settings registry is the asymmetric half of this
+    /// pair - it refuses anything but the two words on the way in, so a value
+    /// Crystalline itself wrote always reads back as what was set.
+    pub fn github_share_identity(&self) -> ShareIdentityMode {
+        match self
+            .github
+            .as_ref()
+            .and_then(|g| g.share_identity.as_deref())
+            .map(str::trim)
+        {
+            Some("personal") => ShareIdentityMode::Personal,
+            _ => ShareIdentityMode::Instance,
+        }
+    }
+
+    /// The Crystalline account whose connected GitHub identity an agent share
+    /// over HTTP MCP runs under in personal mode, from
+    /// `github.agent_identity`. Absent or empty means None: that transport has
+    /// no acting user of its own, so without a configured account its write
+    /// verbs are refused rather than falling back to the instance token.
+    pub fn github_agent_identity(&self) -> Option<&str> {
+        self.github
+            .as_ref()
+            .and_then(|g| g.agent_identity.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    }
+
     /// The configured salience-prior weight, or `None` to use the store default.
     pub fn salience_weight(&self) -> Option<f64> {
         self.search.as_ref().and_then(|s| s.salience_weight)
@@ -412,6 +457,23 @@ pub struct GitHubConfig {
     /// Absent means 300.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub poll_secs: Option<u64>,
+    /// Whether shares may use GitHub's stacked pull requests where the forge
+    /// serves them. Absent means yes; `false` forces the single living
+    /// proposal behavior everywhere. See the `configure` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stacks: Option<bool>,
+    /// Whose GitHub identity shares run under, `instance` or `personal`.
+    /// Absent means `instance`. Read through
+    /// [`GlobalConfig::github_share_identity`], which is tolerant of a value
+    /// it does not know; the settings registry refuses one on a write. See
+    /// the `configure` tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub share_identity: Option<String>,
+    /// The Crystalline account whose connected GitHub identity agent shares
+    /// over HTTP MCP run under in personal mode. Absent means those shares are
+    /// refused. Read through [`GlobalConfig::github_agent_identity`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
     /// The GitHub API base URL, for a GitHub Enterprise Server instance.
     /// Absent means `https://api.github.com`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -420,6 +482,32 @@ pub struct GitHubConfig {
     /// Needed only for a GitHub Enterprise Server deployment.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth_client_id: Option<String>,
+}
+
+/// How shares are credentialed: one instance token, or each person's own.
+///
+/// The value set of the `github.share_identity` setting, read from a config
+/// through [`GlobalConfig::github_share_identity`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShareIdentityMode {
+    /// The default and the pre-feature behavior: the one connected instance
+    /// token performs every read and every write against an origin.
+    Instance,
+    /// Reads stay on the instance token; every origin write runs on the
+    /// acting person's own connected GitHub identity, and a person without one
+    /// is refused rather than falling back.
+    Personal,
+}
+
+impl ShareIdentityMode {
+    /// The setting's own spelling of this mode, for display and for writing
+    /// the value back into a config.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShareIdentityMode::Instance => "instance",
+            ShareIdentityMode::Personal => "personal",
+        }
+    }
 }
 
 /// The `skills` block: whether this server serves the agent skills it ships.
@@ -1012,6 +1100,111 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn github_stacks_defaults_true_and_reads_the_key() {
+        let mut config = GlobalConfig::default();
+        assert!(
+            config.github_stacks(),
+            "absent github block means stacks allowed"
+        );
+        config.github = Some(GitHubConfig {
+            stacks: Some(false),
+            ..Default::default()
+        });
+        assert!(!config.github_stacks());
+        config.github = Some(GitHubConfig {
+            stacks: Some(true),
+            ..Default::default()
+        });
+        assert!(config.github_stacks());
+    }
+
+    /// Absent means the instance token does everything (today's behavior), and
+    /// only the exact word `personal` selects the split. Anything else - a
+    /// typo, or a spelling from a newer build - reads as `Instance`: a config
+    /// file is hand-edited, so a mistyped value must not silently move an
+    /// instance into or out of the stricter mode. The settings registry is
+    /// what refuses a bad value on the way in.
+    #[test]
+    fn github_share_identity_defaults_to_instance_and_tolerates_a_typo() {
+        let mut config = GlobalConfig::default();
+        assert_eq!(
+            config.github_share_identity(),
+            ShareIdentityMode::Instance,
+            "absent github block means the instance token shares"
+        );
+
+        config.github = Some(GitHubConfig {
+            share_identity: Some("personal".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(config.github_share_identity(), ShareIdentityMode::Personal);
+
+        config.github = Some(GitHubConfig {
+            share_identity: Some("instance".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(config.github_share_identity(), ShareIdentityMode::Instance);
+
+        for garbage in ["sideways", "Personal", "", "  ", "personnel"] {
+            config.github = Some(GitHubConfig {
+                share_identity: Some(garbage.to_string()),
+                ..Default::default()
+            });
+            assert_eq!(
+                config.github_share_identity(),
+                ShareIdentityMode::Instance,
+                "'{garbage}' must read as the safe default"
+            );
+        }
+    }
+
+    /// The configured agent account is trimmed, and an empty or blank value is
+    /// the same as an absent one: unset means an HTTP-MCP share has no identity
+    /// to run under and is refused rather than falling back to the instance.
+    #[test]
+    fn github_agent_identity_reads_the_key_and_treats_empty_as_unset() {
+        let mut config = GlobalConfig::default();
+        assert_eq!(config.github_agent_identity(), None);
+
+        config.github = Some(GitHubConfig {
+            agent_identity: Some("share-bot".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(config.github_agent_identity(), Some("share-bot"));
+
+        config.github = Some(GitHubConfig {
+            agent_identity: Some("  share-bot  ".to_string()),
+            ..Default::default()
+        });
+        assert_eq!(config.github_agent_identity(), Some("share-bot"));
+
+        for blank in ["", "   "] {
+            config.github = Some(GitHubConfig {
+                agent_identity: Some(blank.to_string()),
+                ..Default::default()
+            });
+            assert_eq!(config.github_agent_identity(), None);
+        }
+    }
+
+    /// The two share-identity keys are absent from a config that never set
+    /// them, so an install that never heard of personal mode round-trips to
+    /// exactly the pre-feature yaml.
+    #[test]
+    fn share_identity_keys_do_not_serialize_when_unset() {
+        let config = GlobalConfig {
+            github: Some(GitHubConfig {
+                enabled: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let yaml = serde_yaml_ng::to_string(&config).unwrap();
+        assert!(!yaml.contains("share_identity"), "{yaml}");
+        assert!(!yaml.contains("agent_identity"), "{yaml}");
+    }
 
     /// The tri-state parses from every spelling it can arrive in, and the two
     /// booleans survive a round trip as booleans, so an existing config that

@@ -48,11 +48,11 @@ pub use client::{
     scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
-pub use engine::{Engine, EngineError};
+pub use engine::{Engine, EngineError, ShareActor};
 pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
 pub use mcp::McpServer;
-pub use origin::{default_domain_folder, parse_origin_spec};
+pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
 pub use stub::{DegradedServer, StubStatus};

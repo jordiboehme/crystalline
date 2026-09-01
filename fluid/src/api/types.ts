@@ -78,9 +78,10 @@ export interface paths {
         /**
          * The capability probe a client calls before anything else: who it is, whether
          *     it is being served anonymously, whether this instance refuses content
-         *     mutations, whether it has any accounts at all, and which server version it
-         *     is talking to, so a mismatched UI can say so instead of failing later.
-         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
+         *     mutations, whether it has any accounts at all, whether this session may
+         *     drive the share surfaces, and which server version it is talking to, so a
+         *     mismatched UI can say so instead of failing later.
+         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
          */
         get: operations["get_me"];
         put?: never;
@@ -519,7 +520,7 @@ export interface paths {
         };
         /**
          * Where a team domain stands relative to its GitHub origin.
-         * @description Admin only. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`. An instance with no GitHub connection is reported, not refused: the report comes back from local state with `connection.connected` false.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`): this is the report every share surface is drawn from, so it is gated with the share verbs rather than with the plain admin reads. A pure read, served even on a read-only instance. Answers 404 for a domain with no origin - only a GitHub team domain has sync status - so a client can treat any 404 as `no sync card`. An instance with no GitHub connection is reported, not refused: the report comes back from local state with `connection.connected` false.
          */
         get: operations["get_domain_sync_status"];
         put?: never;
@@ -543,7 +544,7 @@ export interface paths {
         };
         /**
          * Preview what sharing this team domain would do.
-         * @description Admin only. Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Pulls the origin first, then reports the action a share would take (`create`, `update` with the proposal number and url, `stack` with the layer it would sit on, `amend` with the layer it would land on, `nothing_to_share`, `conflicts_pending`, `proposal_diverged`), the effective title and the changed files. A generated folder listing (`index.md`) is a change like any other here, because a share really carries it, but it is derived rather than written and is left out of the domain's `local_changes` count: a renderer counts these into one line rather than listing them beside the engrams. Each entry also carries `last_author`, the actor the file's own frontmatter records as having written it (`human:ada` for a person, an agent's own name for an agent) and null wherever there is nothing to read - a deleted file, one edited outside the engine. It is last-writer provenance rather than authorship, and it is what lets a client offer somebody their own changes first. Writes nothing to the origin; refused on a read-only instance because the freshness pull writes the working tree. Where this instance shares with personal GitHub identities, a caller who has connected none of their own still gets the plan - reading it needs nobody's personal credential - while `POST /domains/{domain}/sync/share` refuses until they connect.
          */
         get: operations["get_domain_share_changes"];
         put?: never;
@@ -563,7 +564,7 @@ export interface paths {
         };
         /**
          * One recorded conflict, with every side.
-         * @description Admin only. Reads the conflict the domain's origin state recorded under this id: the base and upstream sides kept beside it, plus the current local content. A side that exists but is not UTF-8 comes back null with `note` saying so. Entirely local - no GitHub connection is needed, and a read-only instance serves it.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Reads the conflict the domain's origin state recorded under this id: the base and upstream sides kept beside it, plus the current local content. A side that exists but is not UTF-8 comes back null with `note` saying so. Entirely local - no GitHub connection is needed, and a read-only instance serves it.
          */
         get: operations["get_domain_conflict"];
         put?: never;
@@ -585,7 +586,7 @@ export interface paths {
         put?: never;
         /**
          * Resolve one recorded conflict by id.
-         * @description Admin only. Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Settles the conflict by keeping the local side (`mine`), taking the team's (`theirs`) or writing merged content (`merged`, which requires `content`), then re-indexes the domain. Entirely local - no GitHub connection is needed - but it writes, so a read-only instance refuses it.
          */
         post: operations["resolve_domain_conflict"];
         delete?: never;
@@ -605,7 +606,7 @@ export interface paths {
         put?: never;
         /**
          * Withdraw one of a team domain's open proposals.
-         * @description Admin only. Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Closes the proposal's pull request, deletes its branch best-effort and records it as withdrawn. With `revert` true the shared files are restored from the origin as well, and files a reviewer amended on the proposal branch are left alone and reported under `skipped_diverged`. Refused on a read-only instance.
          */
         post: operations["withdraw_domain_proposal"];
         delete?: never;
@@ -625,7 +626,7 @@ export interface paths {
         put?: never;
         /**
          * Share a team domain's local changes as a proposal.
-         * @description Admin only. Opens a pull request against the domain's origin, or updates the one already open in place. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`). Opens a pull request against the domain's origin, stacks a new layer on the chain already open, or updates the one living proposal in place. With `proposal` in the body it amends that open layer instead, rebuilding the layers above it. Answers `nothing_to_share` when the team already has everything, `conflicts_pending` with the conflicts that need resolving first, and `proposal_diverged` when a reviewer moved the proposal branch and nothing was written. Refused on a read-only instance.
          */
         post: operations["share_domain"];
         delete?: never;
@@ -746,6 +747,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/me/github-identity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's own GitHub identity, and their device flow's poll.
+         * @description Editors and admins only - a viewer cannot share, so there is no identity of theirs to manage. A pure read, served even on a read-only instance. Also the device flow's poll: while one of this account's runs, `pending` carries the short code and its URL; once it ends, `pending` goes null and a failed flow's reason is reported in `error` on exactly one read, then cleared.
+         */
+        get: operations["get_my_github_identity"];
+        put?: never;
+        post?: never;
+        /**
+         * Forget the caller's own GitHub credential.
+         * @description Editors and admins only, and refused on a read-only instance. Idempotent: disconnecting an account that holds no credential succeeds and answers `connected: false` rather than 404. The instance connection is untouched.
+         */
+        delete: operations["disconnect_my_github_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/github-identity/connect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start a device-code sign-in for the caller's own identity.
+         * @description Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow; one made while another identity's sign-in is in flight is refused 409. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.
+         */
+        post: operations["connect_my_github_identity_device"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/github-identity/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Connect the caller's own identity with a personal access token.
+         * @description Editors and admins only, and refused on a read-only instance. The token is validated against GitHub before it is stored, and is never echoed: the answer is the same token-material-free status the GET returns. Replaces whatever this account had connected before.
+         */
+        put: operations["connect_my_github_identity_token"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/openapi.json": {
         parameters: {
             query?: never;
@@ -857,6 +922,26 @@ export interface paths {
          * @description Admin only, and refused on a read-only instance. The token is validated against GitHub before it is stored, and is never echoed: the answer is the same token-material-free status the GET returns. Connecting is the intent to use the feature, so this turns `github.enabled` on.
          */
         post: operations["connect_github_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Where every team domain on this instance stands, in counts.
+         * @description Admin only, or an editor when this instance shares with personal GitHub identities (`github.share_identity` = `personal`): this is what a share action reads before it draws itself, so it is gated with the share verbs rather than with the plain admin reads. One instance-wide answer to `does anything have something to share?`: the GitHub connection plus, per team domain, its repository, when it was last checked and the counts a share action needs - unshared local changes, open and declined proposals, waiting conflicts - and whether its chain of stacked proposals is healthy. A pure read, served even on a read-only instance. An instance with no GitHub connection is reported, not refused, and an instance with no team domain answers an empty list. Use `GET /domains/{domain}/sync` for one domain's full report.
+         */
+        get: operations["get_sync_summary"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1231,6 +1316,41 @@ export interface components {
              */
             type?: string | null;
         };
+        /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
+        GithubIdentityResponse: {
+            /**
+             * @description The account this identity belongs to: always the caller's own.
+             * @example ada
+             */
+            account: string;
+            /**
+             * @description Whether a personal credential is on file for that account.
+             * @example true
+             */
+            connected: boolean;
+            /**
+             * @description When the credential was stored, RFC 3339. The card's "connected since".
+             * @example 2026-08-29T09:12:44Z
+             */
+            connected_at?: string | null;
+            /**
+             * @description This account's device flow's failure (expired, denied), reported on
+             *     exactly one status read after the flow ends, then cleared.
+             */
+            error?: string | null;
+            /**
+             * @description The GitHub login it authenticated as, when connected.
+             * @example octo
+             */
+            login?: string | null;
+            pending?: null | components["schemas"]["GithubPendingView"];
+            /**
+             * @description keyring | file; null when disconnected. Never `environment`: the
+             *     environment supplies the machine's credential and never a personal one.
+             * @example keyring
+             */
+            token_store?: string | null;
+        };
         /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid. */
         GithubPendingView: {
             /**
@@ -1328,6 +1448,25 @@ export interface components {
         MeResponse: {
             /** @description Whether the request is being served as the anonymous viewer. */
             anonymous: boolean;
+            /**
+             * @description Whether this session may drive the share surfaces: the sync status of a
+             *     team domain, the share preview, the share, a withdrawal and a conflict.
+             *
+             *     Computed here rather than derived by a client from the role, because
+             *     the answer is not a property of the role alone: it is the role read
+             *     against `github.share_identity`, which is instance configuration a
+             *     browser cannot see. An admin may always; an editor may when this
+             *     instance shares as the acting person rather than as the machine; a
+             *     viewer and the anonymous reader never may.
+             *
+             *     It is a rendering signal, never the gate. Every share route still
+             *     refuses on its own, off this same predicate, so a stale or forged
+             *     `true` costs a 403 rather than access. What it
+             *     buys is a client that does not have to ask a domain's origin whether it
+             *     is allowed to ask: an editor on an instance-mode install draws no share
+             *     card and issues no request behind it.
+             */
+            can_share: boolean;
             /**
              * @description The CSRF token of the session this request arrived on, or null when it
              *     arrived on no session.
@@ -1545,13 +1684,31 @@ export interface components {
              */
             token?: string | null;
         };
-        /** @description The proposal's title and description. Both optional: with neither, the share carries a title the engine generates from the changes themselves. */
+        /** @description The proposal's title and description, optionally the open proposal to amend instead of stacking a new layer, and optionally the files to carry. All optional: with none of them, the share carries every unshared change under a title the engine generates from the changes themselves, and targets the layer it picks itself. */
         ShareBody: {
             /**
              * @description A longer description of what changed and why.
              * @example Sharper wording on the routing rules.
              */
             description?: string | null;
+            /**
+             * @description Share only these changed files, as domain-relative paths. Absent
+             *     shares every unshared change; the generated `index.md` of each chosen
+             *     file's folder rides along, and a path that is not among this domain's
+             *     unshared changes is refused by name.
+             * @example [
+             *       "notes/a.md"
+             *     ]
+             */
+            files?: string[] | null;
+            /**
+             * Format: int64
+             * @description An open proposal to amend, rather than letting the share pick its own
+             *     target. Absent is the ordinary share: a new layer on the chain, or an
+             *     update of the one living proposal off the stacked path.
+             * @example 4
+             */
+            proposal?: number | null;
             /**
              * @description The pull request title. Defaults to a generated summary.
              * @example Refine 2 engrams in kb
@@ -4089,7 +4246,11 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. */
+            /**
+             * @description The engine's own status report for this one domain, plus the mode it is synced in and this instance's GitHub connection. `local_changes` is the unshared-work count a client shows as pending, counting real work only: a refreshed folder listing (`index.md`) is derived from the engrams beside it and rides along with a share without ever being the reason for one. `owned_changes` counts how many of those changes THIS session's account last wrote, by the changed file's own `generated.by` line - last-writer provenance, never authorship - so a surface can say `2 of 5 unshared changes are yours`. It is null when the request carries no session account or the domain's origin state cannot be read, which is a different thing from zero; `probe_error` is set when the live check could not reach GitHub and the rest of the report came from local state alone; `connection.connected` is false when no credential is on file, which is why a disconnected instance still answers here instead of refusing. `merged_unconsumed` names, by number, the proposals a live check found merged upstream that this domain has not pulled in yet: they stand in neither proposal list, and the next sync consumes them. Each proposal record carries `author_login`, the GitHub login the share that wrote it acted as - null on records shared before this was recorded and whenever the acting credential has no login to name, so a client shows it where it is present and nothing where it is not.
+             *
+             *     Four keys say where the domain's chain of stacked proposals stands. `stack_number` is the chain's number on the forge, null when nothing is stacked. `stack_wedged` lists the declined layers still carrying open layers above them, empty when the chain is sound - a client surfaces those numbers, because a wedged chain cannot grow until one of them is withdrawn or reopened. `repair_pending` and `stack_link_pending` are the two debts a caller settles by sharing or by checking status again: a rebuild left half-done, and a chain whose layers all exist but are not grouped on the forge yet. All four are always present, quiet rather than absent off the stacked path, so one reader handles either path.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4110,10 +4271,16 @@ export interface operations {
                      *       "domain": "eng",
                      *       "last_checked": "2026-08-10T08:00:00Z",
                      *       "local_changes": 2,
+                     *       "merged_unconsumed": [],
                      *       "mode": "github",
                      *       "open_proposals": [],
+                     *       "owned_changes": 1,
                      *       "probe_error": null,
-                     *       "repo": "acme/knowledge"
+                     *       "repair_pending": false,
+                     *       "repo": "acme/knowledge",
+                     *       "stack_link_pending": false,
+                     *       "stack_number": 42,
+                     *       "stack_wedged": []
                      *     }
                      */
                     "application/json": Record<string, never>;
@@ -4128,7 +4295,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4242,26 +4409,12 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. */
+            /** @description The share plan: the action it would take, the title it would carry and one entry per changed file. Each action carries its own fields - `number` and `url` for an `update`, `top_number` and `top_title` for a `stack` (the open layer the new one would sit on), `number`, `url`, `title` and `layers_above` for an `amend` (the layer it lands on and how many layers the amend would rebuild), `count` for `conflicts_pending`, and nothing extra for a `create` or a `nothing_to_share`. */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    /**
-                     * @example {
-                     *       "action": "update",
-                     *       "changes": [
-                     *         {
-                     *           "kind": "modified",
-                     *           "path": "notes/a.md"
-                     *         }
-                     *       ],
-                     *       "effective_title": "Refine 2 engrams in kb",
-                     *       "number": 4,
-                     *       "url": "https://github.com/acme/knowledge/pull/4"
-                     *     }
-                     */
                     "application/json": Record<string, never>;
                 };
             };
@@ -4274,7 +4427,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4347,7 +4500,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4418,7 +4571,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4483,7 +4636,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own withdraw report: the number, whether a live pull request was closed, the `withdrawn` status the record now carries and the working-tree lists a revert produced. */
+            /** @description The engine's own withdraw report: the number, whether a live pull request was closed, the `withdrawn` status the record now carries and the working-tree lists a revert produced. `skipped_diverged` holds the paths whose local file moved on, `skipped_reverts` the paths whose pre-share content is nowhere to be had - two different reasons a revert left a file alone. `repaired` says the chain around the withdrawn layer was rebuilt, and `restacked` names the NEW stack number that rebuild allocated: null covers both `no repair happened` and `the survivors no longer make a chain`, so a client reads it together with `repaired` rather than alone. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4494,10 +4647,13 @@ export interface operations {
                      *       "closed": true,
                      *       "deleted": [],
                      *       "number": 4,
+                     *       "repaired": true,
+                     *       "restacked": 43,
                      *       "restored": [
                      *         "notes/a.md"
                      *       ],
                      *       "skipped_diverged": [],
+                     *       "skipped_reverts": [],
                      *       "status": "withdrawn"
                      *     }
                      */
@@ -4513,7 +4669,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4567,7 +4723,11 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance. */
+            /**
+             * @description The engine's own share outcome: `proposed` with the new proposal's number and url, `updated` carrying the proposal it refreshed, `nothing_to_share`, `conflicts_pending` with the conflicts, or `proposal_diverged` with guidance.
+             *
+             *     A `proposed` or `updated` outcome also names where the proposal sits in its chain: `stack_number` is the chain's number on the forge and `stack_position` is `[layer, open layers]` with a 1-based layer. Both are null off the stacked path - an unstacked forge, a lone proposal - rather than absent, so one reader handles either path. On the stacked path `stack_position` is always set while `stack_number` is null when the call that groups the chain on the forge has not landed yet, so a client keys off `stack_position` to decide whether it is looking at a layer at all and names the stack number only when it has one.
+             */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4583,6 +4743,11 @@ export interface operations {
                      *       "number": 4,
                      *       "outcome": "proposed",
                      *       "skipped_large": [],
+                     *       "stack_number": 42,
+                     *       "stack_position": [
+                     *         2,
+                     *         2
+                     *       ],
                      *       "summary": "Refine 2 engrams in kb",
                      *       "updated": [
                      *         "notes/a.md"
@@ -4602,7 +4767,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -4631,6 +4796,15 @@ export interface operations {
             };
             /** @description The body is not `application/json`. */
             415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The `proposal` named is not an open layer of this domain. The detail names the open layers with their positions in the chain, so a client can retry against a real number without a second call. */
+            422: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -5020,6 +5194,225 @@ export interface operations {
             };
         };
     };
+    get_my_github_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The identity. No token material. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account's name cannot address a credential (account names for sharing use lowercase letters, digits, dots, hyphens and underscores). The detail names the fix. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    disconnect_my_github_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The identity as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account's name cannot address a credential. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    connect_my_github_identity_device: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The flow started (or this account's was already running): `pending` carries the code to confirm. Poll `GET /me/github-identity` for the outcome. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Another identity's device sign-in is in flight. There is one flow at a time per instance; wait for it to finish and start again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account's name cannot address a credential, or GitHub refused to start the flow. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    connect_my_github_identity_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TokenBody"];
+            };
+        };
+        responses: {
+            /** @description The identity as it now stands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GithubIdentityResponse"];
+                };
+            };
+            /** @description The body is not JSON. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is a viewer, a cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is JSON but not a token, the token is empty, GitHub refused it, or this account's name cannot address a credential. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     get_openapi_document: {
         parameters: {
             query?: never;
@@ -5383,6 +5776,84 @@ export interface operations {
             };
             /** @description The body is JSON but not a token, the token is empty, GitHub refused it, or this machine's identity is fixed by `CRYSTALLINE_GITHUB_TOKEN` and no token may be stored here. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    get_sync_summary: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /**
+             * @description The connection block, one counted entry per team domain, and the domains whose own status read failed. `local_changes` is the unshared-work count a share action shows as pending, real work only: a refreshed folder listing (`index.md`) rides along with a share and never makes one worth offering. `owned_changes` is how many of that domain's changes this session's account last wrote, by the file's own `generated.by` line, or null when there is nobody to ask about - the pairing a picker row draws. `open_proposals`, `declined_proposals` and `conflicts` are counts here rather than the records the per-domain route returns. `errors` holds one entry per domain that could not be read at all, so a single broken domain never blanks the summary.
+             *
+             *     Three chain-health keys ride along, because a picker has to know which domains it can actually offer: `stack_wedged` names the declined layers still carrying open layers above them (empty when the chain is sound, and the one stack fact a picker must not hide, since a wedged chain cannot grow), and `repair_pending` and `stack_link_pending` say whether the chain is mid-repair or not yet grouped on the forge. Where a domain sits IN its chain - `stack_number` and `stack_position` - is detail rather than a decision, so it stays on `GET /domains/{domain}/sync` and out of this row.
+             */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "connection": {
+                     *         "connected": true,
+                     *         "token_store": "keychain",
+                     *         "user": "octo"
+                     *       },
+                     *       "domains": [
+                     *         {
+                     *           "branch": "main",
+                     *           "conflicts": 0,
+                     *           "declined_proposals": 0,
+                     *           "domain": "eng",
+                     *           "last_checked": "2026-08-10T08:00:00Z",
+                     *           "local_changes": 2,
+                     *           "mode": "github",
+                     *           "open_proposals": 1,
+                     *           "owned_changes": 1,
+                     *           "repair_pending": false,
+                     *           "repo": "acme/knowledge",
+                     *           "stack_link_pending": false,
+                     *           "stack_wedged": []
+                     *         }
+                     *       ],
+                     *       "errors": []
+                     *     }
+                     */
+                    "application/json": Record<string, never>;
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller may not share on this instance (an admin, or an editor when `github.share_identity` is `personal`), or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description GitHub is switched off on this instance, so no origin can be reached - the detail says where to turn it on. A missing connection is NOT refused here: the summary comes back with `connection.connected` false instead. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

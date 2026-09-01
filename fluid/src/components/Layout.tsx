@@ -26,10 +26,12 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  Share2,
   Stethoscope,
   Sun,
 } from "lucide-react";
 import {
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -47,6 +49,15 @@ import {
   useNavigate,
 } from "react-router";
 
+import {
+  GITHUB_STATUS_KEY,
+  SYNC_SUMMARY_KEY,
+  SYNC_SUMMARY_STALE_MS,
+  fetchGithubStatus,
+  fetchSyncStatus,
+  fetchSyncSummary,
+  syncStatusKey,
+} from "../api/admin";
 import { problemDetail } from "../api/client";
 import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { DomainSummary } from "../api/domains";
@@ -57,6 +68,7 @@ import {
   domainRoute,
   githubSettingsRoute,
   maintenanceRoute,
+  profileRoute,
   searchRoute,
   usersRoute,
 } from "../paths";
@@ -67,7 +79,10 @@ import { CreateDomainDialog } from "./CreateDomainDialog";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { DomainNav } from "./DomainNav";
 import { HelpOverlay } from "./HelpOverlay";
+import { ShareDialog } from "./ShareDialog";
+import { SharePickerDialog } from "./SharePickerDialog";
 import { ShatterGem } from "./ShatterGem";
+import { ownedPhrase, shareBadgeCount } from "./changes";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
 import { BUTTON, Chip, FOCUS_RING, IconButton, Tooltip } from "./primitives";
 
@@ -148,6 +163,237 @@ function subscribeWide(onChange: () => void): () => void {
   };
 }
 
+/**
+ * Whether the frame offers to share, what a share would go to, and why it
+ * will not.
+ *
+ * Sharing is the one act in this app that is about the whole instance and about
+ * one domain at the same time, so the answer is two answers: inside a team
+ * domain the domain being read is the answer, and everywhere else the question
+ * is which of them, which is the picker.
+ */
+interface ShareAction {
+  /** Whether the frame draws the action at all. */
+  visible: boolean;
+  /**
+   * The domain a share would go to, or null when which one is still to be
+   * decided - which is what opens the picker rather than the share dialog.
+   */
+  domain: string | null;
+  /** Whether there is anything to share right now. */
+  enabled: boolean;
+  /** Why it will not act, for the tooltip; null while it will. */
+  reason: string | null;
+  /**
+   * How much is waiting, for the badge on the face of the button: this
+   * session's own share of it where the server said, everything waiting
+   * otherwise. Null while there is nothing to draw a number for.
+   */
+  count: number | null;
+  /**
+   * What is waiting, said in words, for the tooltip of a button that WILL act -
+   * "2 of 5 unshared changes are yours". Null when the report carried no owned
+   * count, which leaves the tooltip exactly as it always read.
+   */
+  waiting: string | null;
+}
+
+/**
+ * What the action says while the read behind it is still out.
+ *
+ * Not "nothing to share": that is a verdict, and a verdict handed down before
+ * the answer arrives is one that may be about to be wrong.
+ */
+const LOOKING = "Looking for changes to share";
+
+/** The action as it is off: nothing offered, and nothing to explain. */
+const NO_SHARE: ShareAction = {
+  visible: false,
+  domain: null,
+  enabled: false,
+  reason: null,
+  count: null,
+  waiting: null,
+};
+
+/**
+ * How long a live origin probe the FRAME fires stays fresh, in milliseconds.
+ *
+ * The same window the summary carries, and deliberately the same number: both
+ * of these reads reach GitHub, both are mounted on every screen because the
+ * frame is, and one freshness policy for the frame's probes is easier to reason
+ * about than two. A screen that wants a fresher answer asks for one - the sync
+ * and proposals cards keep their own options on the same key, which react-query
+ * resolves per observer.
+ */
+const PROBE_STALE_MS = SYNC_SUMMARY_STALE_MS;
+
+/**
+ * The three reads behind the share action, and what they add up to.
+ *
+ * Called from the frame and from the top bar both, which costs one extra
+ * observer per query and not one extra request: react-query hands the second
+ * subscriber the first one's result, which is the same thing the proposals card
+ * does with the sync card's status. The alternative - deciding in the frame and
+ * passing the verdict down - would put the top bar's own face in the frame's
+ * hands for no gain, and the palette row needs the same verdict either way.
+ *
+ * Every read is gated on the one above it, so a session that is offered nothing
+ * asks for nothing: a non-admin never reads the connection, an instance with
+ * GitHub off never reads a status, and the instance-wide summary - which probes
+ * every origin at once - is only ever asked when the domain being read cannot
+ * answer for itself.
+ *
+ * The two reads that reach GitHub also step out of the app's refetch-on-focus
+ * default. That default is right for content somebody may have edited in
+ * another tab and wrong for a probe: coming back to a tab would fire a live
+ * origin check per team domain, each under that domain's origin lock, to
+ * refresh a button's face. The stale window above IS the freshness policy here,
+ * and focus must not be a way around it.
+ */
+function useShareAction(): ShareAction {
+  const { capabilities } = useAuth();
+  const admin = capabilities.canAdminister;
+  // Who the share surfaces are open to, which is not the same question as who
+  // administers the instance: `can_share` is an admin always and an editor
+  // where `github.share_identity` is `personal`, and it is the server's own
+  // verdict - the very predicate the share routes gate on - rather than a rule
+  // this side re-derives. The domain home already draws its share cards on it.
+  const sharer = capabilities.canShare;
+
+  // Under the settings screen's own key, so an admin who has been there pays
+  // nothing for it here. Admin-only, because the route is: an editor who may
+  // share cannot read the instance's GitHub settings and never asks.
+  const connection = useQuery({
+    queryKey: GITHUB_STATUS_KEY,
+    queryFn: fetchGithubStatus,
+    enabled: admin,
+  });
+  // Hidden while the answer is still out rather than drawn and withdrawn: a
+  // control that appears a beat late is better than one that appears and then
+  // admits it was never there. Read-only rules it out on its own - a share
+  // writes to the origin, and this instance refuses writes.
+  //
+  // The readiness half is asked of whichever source this session can reach.
+  // An admin has the settings probe and waits for it. An editor who may share
+  // has no such route, and `can_share` is already the answer it would give:
+  // the server only says yes where sharing is turned on and this session's
+  // role reaches it. The reads below carry their own connection verdict, and
+  // in personal mode the instance credential is not what an editor shares
+  // with anyway, so there is nothing here for a missing one to gate.
+  const visible =
+    sharer &&
+    !capabilities.readOnly &&
+    (!admin || connection.data?.enabled === true);
+
+  // `useMatch` rather than `useParams`, for the reason `DomainSidebar` spells
+  // out: inside a layout route the params are the layout's own, which are none.
+  const match = useMatch("/d/:domain/*");
+  const routeDomain = match?.params.domain ?? "";
+
+  // The card's own key and fetcher, and the same refusal to retry a decided
+  // answer. On the domain's home screen that costs nothing at all, because the
+  // sync and proposals cards are already asking; on every other screen under
+  // `/d/<domain>` - an engram, the editor, the tree - the frame is the only
+  // one asking, and this is a live origin probe. Hence the window and the
+  // focus rule below: the cards keep their own options on the same key, which
+  // react-query resolves per observer rather than per query.
+  const status = useQuery({
+    queryKey: syncStatusKey(routeDomain),
+    queryFn: () => fetchSyncStatus(routeDomain),
+    retry: false,
+    staleTime: PROBE_STALE_MS,
+    refetchOnWindowFocus: false,
+    enabled: visible && routeDomain !== "",
+  });
+  // A domain with no origin answers 404, and that is not a dead end: the
+  // question widens to the whole instance, which is the one somebody standing
+  // in a local domain and pressing Share would have meant anyway.
+  const instanceWide = routeDomain === "" || status.isError;
+
+  const summary = useQuery({
+    queryKey: SYNC_SUMMARY_KEY,
+    queryFn: fetchSyncSummary,
+    staleTime: PROBE_STALE_MS,
+    refetchOnWindowFocus: false,
+    // Not without a credential to read the origins with: the route reports a
+    // missing connection rather than refusing over it, so this would be a
+    // round trip whose every count is local state alone, to fill in a face
+    // that is already saying the one thing a reader can act on.
+    enabled: visible && instanceWide && connection.data?.connected !== false,
+  });
+
+  if (!visible) {
+    return NO_SHARE;
+  }
+  // Said before anything about what is waiting, because it is the one reason
+  // here that a reader can do something about, and because the counts behind
+  // the other reasons cannot be trusted without a credential to read them.
+  if (connection.data?.connected === false) {
+    return {
+      ...NO_SHARE,
+      visible: true,
+      reason: "Connect GitHub first",
+    };
+  }
+  if (!instanceWide) {
+    const total = status.data?.localChanges ?? 0;
+    const owned = status.data?.ownedChanges ?? null;
+    return {
+      visible: true,
+      domain: routeDomain,
+      enabled: total > 0,
+      reason:
+        total > 0
+          ? null
+          : status.data === undefined
+            ? LOOKING
+            : `Nothing to share in ${routeDomain}`,
+      count: total > 0 ? shareBadgeCount(owned, total) : null,
+      waiting: total > 0 ? ownedPhrase(owned, total, "unshared changes") : null,
+    };
+  }
+  const waiting = (summary.data?.domains ?? []).filter(
+    (entry) => entry.localChanges > 0,
+  );
+  const total = waiting.reduce((sum, entry) => sum + entry.localChanges, 0);
+  // The pairing is summed over the domains that ANSWERED with an owned count,
+  // both halves of it: a row that said nothing about ownership contributes to
+  // neither the numerator nor the denominator. Summing its changes into the
+  // denominator alone would say "2 of 8 are yours" about eight changes when
+  // three of them were never attributed to anybody - a claim the report never
+  // made. The badge keeps counting everything that waits (that is what the
+  // button acts on); only the sentence narrows to what is known.
+  const answered = waiting.filter((entry) => entry.ownedChanges !== null);
+  // Null when nothing answered: an instance whose report says nothing about
+  // ownership must not be summed into a confident zero.
+  const owned = answered.length
+    ? answered.reduce((sum, entry) => sum + (entry.ownedChanges ?? 0), 0)
+    : null;
+  const known = answered.reduce((sum, entry) => sum + entry.localChanges, 0);
+  return {
+    visible: true,
+    domain: null,
+    enabled: waiting.length > 0,
+    reason:
+      waiting.length > 0
+        ? null
+        : summary.isError
+          ? // A read that failed is not a read still out: retries have been
+            // spent and nothing else is coming, so LOOKING would be a
+            // permanent lie. The server's own sentence is better than a house
+            // one - the reachable case is GitHub switched off, which says so
+            // and says where to turn it on.
+            problemDetail(summary.error)
+          : summary.data === undefined
+            ? LOOKING
+            : "Nothing to share",
+    count: waiting.length > 0 ? shareBadgeCount(owned, total) : null,
+    waiting:
+      waiting.length > 0 ? ownedPhrase(owned, known, "unshared changes") : null,
+  };
+}
+
 export function Layout() {
   const { capabilities } = useAuth();
   const navigate = useNavigate();
@@ -158,7 +404,27 @@ export function Layout() {
   // Registering a domain is the frame's own act rather than any screen's: it
   // is what the sidebar lists, and the sidebar is on every screen.
   const [creatingDomain, setCreatingDomain] = useState(false);
+  // Sharing is the frame's for the same reason, and it is two states rather
+  // than one: the domain a share is aimed at, and the question of which domain
+  // that is. Both dialogs are mounted here, because both ways in - the top
+  // bar's button and the palette row - are the frame's.
+  const [shareDomain, setShareDomain] = useState<string | null>(null);
+  const [pickingShare, setPickingShare] = useState(false);
+  const share = useShareAction();
   const mainRef = useRef<HTMLElement | null>(null);
+
+  // Which of the two doors the one act opens: straight into the share dialog
+  // where the domain is already known, and into the picker where it is not.
+  const openShare = useCallback(
+    (domain: string | null) => {
+      if (domain === null) {
+        setPickingShare(true);
+      } else {
+        setShareDomain(domain);
+      }
+    },
+    [setPickingShare, setShareDomain],
+  );
 
   // A choice about the shape of the frame outlives the screen it was made on,
   // and outlives the session too: somebody who wants the reading surface as
@@ -209,8 +475,28 @@ export function Layout() {
         },
       });
     }
+    // Registered only while it would act. The palette has no disabled row and
+    // should not grow one: a row that opens a dialog to say there was nothing
+    // to do is a door that does not open, and the button in the top bar is
+    // where the reason belongs.
+    if (share.visible && share.enabled) {
+      frame.push({
+        id: "share-changes",
+        title: "Share changes",
+        run: () => {
+          openShare(share.domain);
+        },
+      });
+    }
     return frame;
-  }, [capabilities.canAdminister, navigate]);
+  }, [
+    capabilities.canAdminister,
+    navigate,
+    openShare,
+    share.domain,
+    share.enabled,
+    share.visible,
+  ]);
   useRegisterCommands(commands, "frame");
 
   useEffect(() => {
@@ -243,6 +529,7 @@ export function Layout() {
         onToggleNav={() => {
           setNavOpen((open) => !open);
         }}
+        onShare={openShare}
       />
       <div className="mx-auto flex w-full max-w-350 gap-6 px-4 py-6">
         {/*
@@ -291,6 +578,30 @@ export function Layout() {
           }}
         />
       )}
+      {/*
+        The same pair, for the same reason: the button and the palette row both
+        belong to the frame, and the picker hands straight over to the dialog
+        beside it rather than opening a second one over itself.
+      */}
+      {pickingShare && (
+        <SharePickerDialog
+          onPick={(domain) => {
+            setPickingShare(false);
+            setShareDomain(domain);
+          }}
+          onClose={() => {
+            setPickingShare(false);
+          }}
+        />
+      )}
+      {shareDomain !== null && (
+        <ShareDialog
+          domain={shareDomain}
+          onClose={() => {
+            setShareDomain(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -317,9 +628,12 @@ function RouteFocus({ target }: { target: RefObject<HTMLElement | null> }) {
 function TopBar({
   navOpen,
   onToggleNav,
+  onShare,
 }: {
   navOpen: boolean;
   onToggleNav: () => void;
+  /** Share the named domain, or open the picker when there is none. */
+  onShare: (domain: string | null) => void;
 }) {
   const { capabilities } = useAuth();
 
@@ -352,6 +666,8 @@ function TopBar({
 
         <SearchBox />
 
+        <ShareChanges onShare={onShare} />
+
         <MaintenanceLink />
 
         {capabilities.readOnly && (
@@ -364,6 +680,73 @@ function TopBar({
         <UserMenu />
       </div>
     </header>
+  );
+}
+
+/**
+ * Sharing what this instance has learned, from wherever the reader is.
+ *
+ * Beside the maintenance link and for the same reason it stands there: it is an
+ * act about the whole instance rather than about the screen in front of you,
+ * and the sidebar hands itself over to a domain's own navigation as soon as
+ * somebody opens one. It is a button rather than a link because it has a face
+ * for "not now", which no link has.
+ *
+ * That face is `aria-disabled` rather than `disabled`, and the difference is
+ * the whole point of drawing it: a disabled button takes no focus and emits no
+ * pointer events, so the tooltip saying WHY it will not act would be a label
+ * nobody could ever read. This one is reachable by pointer and by keyboard,
+ * says it will not act, and does not - the press is guarded as well as the
+ * face, because a control a pointer can reach is a control a pointer can press.
+ *
+ * The name is drawn where there is room for it and spoken either way, the way
+ * the link beside it does it: below the small breakpoint the word folds away
+ * and the glyph carries it, and the `aria-label` makes the two widths one
+ * control to anything that reads the page.
+ */
+function ShareChanges({
+  onShare,
+}: {
+  onShare: (domain: string | null) => void;
+}) {
+  const share = useShareAction();
+  if (!share.visible) {
+    return null;
+  }
+
+  return (
+    // Always a tooltip, and its label is the reason whenever there is one.
+    // Not a nicety: dropping the wrapper once the action came alive would
+    // unmount and rebuild the button under a reader who had just focused it,
+    // and below the small breakpoint the tooltip is also the only place the
+    // folded-away word is drawn for a pointer.
+    <Tooltip label={share.reason ?? share.waiting ?? "Share changes"}>
+      <button
+        type="button"
+        aria-label="Share changes"
+        aria-disabled={!share.enabled}
+        onClick={() => {
+          if (share.enabled) {
+            onShare(share.domain);
+          }
+        }}
+        className={`inline-flex h-8 shrink-0 items-center gap-1.5 rounded px-2 text-sm text-slate-600 hover:bg-slate-100 aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:text-slate-300 dark:hover:bg-slate-800 dark:aria-disabled:hover:bg-transparent ${FOCUS_RING}`}
+      >
+        <Share2 aria-hidden="true" size={16} strokeWidth={1.75} />
+        <span className="hidden sm:inline">Share</span>
+        {/*
+          How much is waiting, drawn rather than spoken: the label stays the
+          one control name a reader hears at either width, and the tooltip
+          above says the same number in words - with the pairing, where the
+          server sent one - so nothing here is only visible.
+        */}
+        {share.count !== null && (
+          <span aria-hidden="true" className="text-caption tabular-nums">
+            {share.count}
+          </span>
+        )}
+      </button>
+    </Tooltip>
   );
 }
 
@@ -552,6 +935,16 @@ function UserMenu() {
                 {user.name} ({capabilities.role})
               </DropdownMenu.Label>
               <DropdownMenu.Separator className="my-1 h-px bg-slate-200 dark:bg-slate-700" />
+              {/*
+                Ungated, unlike the two rows under it: this one is about the
+                account in the line above rather than about the instance, so
+                every signed-in session has one to open. A viewer's says why
+                there is no identity to connect there, which is an answer
+                rather than a door that will not open.
+              */}
+              <DropdownMenu.Item className={ITEM_CLASSES} asChild>
+                <Link to={profileRoute()}>Profile</Link>
+              </DropdownMenu.Item>
               {capabilities.canAdminister && (
                 <>
                   <DropdownMenu.Item className={ITEM_CLASSES} asChild>

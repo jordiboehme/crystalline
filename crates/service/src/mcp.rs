@@ -192,14 +192,22 @@
 //! [`resolved_overwrite`]) and a third condition beside the gate: a call that
 //! already passed `overwrite` answered the question before it was put.
 //!
-//! **A question is only put about a call that can run.** Both rounds that take
-//! an identifier resolve it before they ask - `delete_engram` through
+//! **The collaboration tools carry rounds of their own**, on the same three
+//! helpers: `share_changes` asks what it would publish before it publishes it,
+//! `withdraw_proposal` asks which proposal it would close, and
+//! `resolve_conflict` asks a mine-or-theirs question of its own shape when the
+//! caller named no resolution.
+//!
+//! **A question is only put about a call that can run.** Every round that takes
+//! a target resolves it before it asks - `delete_engram` through
 //! [`crate::engine::Engine::delete_preview`], the `evolve_ack` round through
-//! [`crate::engine::Engine::ack_preview`] - so a read-only server, a domain
-//! nobody registered and an identifier nobody has each fail in round one, and
-//! the question names what resolution found rather than what was typed. The
-//! collision round needs no such step: the write itself is what discovers the
-//! collision, and the question is built from the failure.
+//! [`crate::engine::Engine::ack_preview`], `share_changes` through
+//! [`crate::engine::Engine::origin_share_preview`] and `withdraw_proposal`
+//! through [`crate::engine::Engine::origin_withdraw_preview`] - so a read-only
+//! server, a domain nobody registered and a target nobody has each fail in
+//! round one, and the question names what resolution found rather than what was
+//! typed. The collision round needs no such step: the write itself is what
+//! discovers the collision, and the question is built from the failure.
 //!
 //! **An answer is not bound to the arguments it was asked about.** The client
 //! re-sends the original arguments beside the answer and nothing on this side
@@ -909,7 +917,9 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
-use crate::engine::{AckIntent, ConfigureAction, Engine, EngineError, ProvisionAction};
+use crate::engine::{
+    AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential, ProvisionAction, ShareActor,
+};
 use crate::params::*;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
@@ -1022,6 +1032,30 @@ impl McpServer {
     pub fn with_onboarded_harness(mut self, onboarded: bool) -> McpServer {
         self.harness_onboarded = onboarded;
         self
+    }
+
+    /// Who a write verb over this connection acts as, when this instance
+    /// shares with personal GitHub identities (`github.share_identity =
+    /// personal`). Inert in the default `instance` mode, where one credential
+    /// does everything.
+    ///
+    /// **The transport is the identity here, because it is the only thing
+    /// there is.** A stdio session is a process this machine's harness
+    /// started, so it is the machine owner in exactly the sense the CLI is -
+    /// the same local `owner` credential, connected once with `crystalline
+    /// connect github --personal`. An HTTP session carries no user auth at all
+    /// (there is nobody to be), so it acts as the account
+    /// `github.agent_identity` names, and refuses with a text naming that
+    /// setting when an admin has named none.
+    ///
+    /// Read per call rather than stored: the two constructors already record
+    /// the transport, and one more copy of it would be one more thing that can
+    /// disagree with them.
+    fn share_actor(&self) -> ShareActor {
+        match self.transport {
+            Transport::Stdio => ShareActor::Owner,
+            Transport::Http => ShareActor::HttpAgent,
+        }
     }
 }
 
@@ -1383,7 +1417,7 @@ impl McpServer {
     #[tool(
         name = "evolve_engrams",
         title = "Evolve engrams",
-        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
+        description = "Sweep one domain or every domain for the maintenance the knowledge needs and return a ranked work queue: a to-do list that walks you through tidying, cleaning up, auditing, reviewing or health-checking what has been taught. Detects temporal and lifecycle debt (an elapsed valid_to still marked stable, stale_after past due, long-unverified knowledge, a superseded engram with no successor relation and the half-finished converse, a retired engram still cited as current by live ones, and a team domain holding substantive work nobody has shared for over a week), structural gaps (unresolved [[links]], one-sided supersedes or summarizes pairs, orphans, an engram over the split budget, near-empty stubs) and redundancy (near-duplicate clusters, drifted tags). It detects by dates, links and graph shape only, never by meaning, so it cannot find or confirm a contradiction between what two engrams say. It also surfaces engrams people captured directly (through the Fluid web UI) that nobody reviewed yet, so what a person taught gets verified, tagged against the vocabulary and woven into the graph - those findings are judgment class. Attachments are swept too: a file a human added that no engram references, and a reference that points at no stored file, both come back as findings naming the attachment path. Read-only: it changes nothing itself. Each finding names the engram, the evidence and the exact next action with the tool that performs it, and a finding marked mechanical completes intent the archive already records while one marked judgment changes what the archive claims and needs a yes from the user first. Work the queue with the write tools and re-run the same scope to confirm it shrank. Call it when the user asks whether knowledge is still accurate, what needs attention or review, or to tidy, audit, consolidate or spring-clean a domain; after a large ingest lands many engrams at once; and when a search returns hits that disagree, since a half-finished retirement often explains the disagreement. Do not call it at session start, after routine captures or before ordinary recall - it is deliberate maintenance, on demand. When the user rules a finding intentional, acknowledge it (edit_engram set_frontmatter key evolve_ack, value like 'V101 lineage citation, keep') so it stops reappearing while its evidence holds; the sweep reports how many findings acknowledgments suppressed, and an acknowledgment whose evidence changed comes back marked stale. limit caps the queue (default 10), families narrows to one detector family, domains narrows the sweep, include_acknowledged returns the suppressed findings too.",
         annotations(read_only_hint = true, idempotent_hint = true, open_world_hint = false)
     )]
     async fn evolve_engrams(
@@ -1539,7 +1573,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. While a proposal is already open for the domain, calling this again UPDATES it in place - same proposal number, same URL, a fresh commit reviewers are notified about - it never opens a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, edit the engrams, share again to the same proposal. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (update proposal #N or open a new one), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1561,21 +1595,26 @@ impl McpServer {
                 None => {
                     let preview = self
                         .engine
-                        .origin_share_preview(&p.domain, p.title.as_deref())
+                        .origin_share_preview(
+                            &p.domain,
+                            p.title.as_deref(),
+                            p.proposal,
+                            // The question has to be about the share the
+                            // caller asked for, so the preview behind it
+                            // carries the same file selection: a question
+                            // naming files the share would not carry would
+                            // collect a yes for a share nobody planned.
+                            p.files.as_deref(),
+                            // The preview resolves the identity the confirmed
+                            // call would, so an instance that would refuse the
+                            // share refuses here instead of asking a question
+                            // it could not honour.
+                            self.share_actor(),
+                            PreviewCredential::ActingIdentity,
+                        )
                         .await
                         .map_err(to_error)?;
-                    // Only a share that would publish gets a question;
-                    // nothing_to_share, conflicts_pending and
-                    // proposal_diverged answer in round one, because
-                    // executing the share produces exactly those canonical
-                    // shapes with no publishing write - no commit, no branch
-                    // update, no proposal opened or patched. Stated that way
-                    // rather than as "no provider write": the pull the share
-                    // runs first can reconcile a proposal the forge already
-                    // closed, so a diverged answer may be preceded by
-                    // bookkeeping calls. Those record what the forge already
-                    // decided; they never publish this domain's changes.
-                    if matches!(preview["action"].as_str(), Some("create") | Some("update")) {
+                    if share_plan_needs_confirmation(preview["action"].as_str()) {
                         return Ok(confirm_question(share_question(&preview)).into());
                     }
                 }
@@ -1586,7 +1625,14 @@ impl McpServer {
             }
         }
         self.engine
-            .origin_share(&p.domain, p.title.as_deref(), p.description.as_deref())
+            .origin_share(
+                &p.domain,
+                p.title.as_deref(),
+                p.description.as_deref(),
+                p.proposal,
+                p.files.as_deref(),
+                self.share_actor(),
+            )
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1596,7 +1642,7 @@ impl McpServer {
     #[tool(
         name = "update_domain",
         title = "Update domain",
-        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then share_changes again to update the same proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Learn the team's latest knowledge: pulls what was merged upstream into the domain (or every shared domain), merging cleanly where possible and flagging real conflicts for resolve_conflict. The response carries each still-open proposal's review state and the reviewers' comments verbatim, so this is also how review feedback reaches you: read it, refine the engrams, then call share_changes with proposal set to the number the feedback is on, which amends that layer and re-bases the layers above it. On forges without stacks that same call updates the one open proposal in place. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1621,7 +1667,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP use the account github.agent_identity names; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -1642,7 +1688,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP use the account github.agent_identity names). resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1705,7 +1751,7 @@ impl McpServer {
             }
         };
         self.engine
-            .origin_resolve(&p.domain, &p.path, keep, content)
+            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor())
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1715,7 +1761,7 @@ impl McpServer {
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1726,15 +1772,40 @@ impl McpServer {
     async fn withdraw_proposal(
         &self,
         Parameters(p): Parameters<WithdrawProposalParams>,
-    ) -> Result<CallToolResult, ErrorData> {
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
-            return refuse(RemoteError::NotEnabled.to_string());
+            return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
+        }
+        let revert = p.revert.unwrap_or(false);
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    // The preview resolves the target the withdrawal itself
+                    // would, off local state and without a single provider
+                    // call, so a target that cannot be named is reported here
+                    // as the error it is rather than turned into a question
+                    // about a proposal that does not exist.
+                    let preview = self
+                        .engine
+                        .origin_withdraw_preview(&p.domain, p.proposal, revert, self.share_actor())
+                        .await
+                        .map_err(to_error)?;
+                    return Ok(confirm_question(withdraw_question(&preview)).into());
+                }
+                Some(false) => {
+                    return refuse(WITHDRAW_REFUSAL).map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
         }
         self.engine
-            .origin_withdraw(&p.domain, p.proposal, p.revert.unwrap_or(false))
+            .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor())
             .await
             .map_err(to_error)
             .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -2745,6 +2816,31 @@ fn delete_question(preview: &Value) -> String {
     format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
 }
 
+/// Whether a share plan has to be confirmed before it runs, given the plan's
+/// `action` word.
+///
+/// **This is a deny-list on purpose, and the direction is the whole point.**
+/// Exactly three plans answer in round one without asking - `nothing_to_share`,
+/// `conflicts_pending` and `proposal_diverged` - because executing the share
+/// produces exactly those canonical shapes with no publishing write: no
+/// commit, no branch update, no proposal opened or patched. Stated that way
+/// rather than as "no provider write": the pull the share runs first can
+/// reconcile a proposal the forge already closed, so a diverged answer may be
+/// preceded by bookkeeping calls. Those record what the forge already decided;
+/// they never publish this domain's changes.
+///
+/// Everything else asks, an unknown or absent word included. An allow-list
+/// would fail the wrong way: a new `PlannedAction` variant nobody wired in
+/// here would publish to the team without asking, which is the one mistake
+/// this gate exists to prevent. Failing safe costs at worst a question in
+/// front of a plan that had nothing to publish.
+fn share_plan_needs_confirmation(action: Option<&str>) -> bool {
+    !matches!(
+        action,
+        Some("nothing_to_share") | Some("conflicts_pending") | Some("proposal_diverged")
+    )
+}
+
 /// The sentence `share_changes` asks before it publishes, rendered from
 /// [`crate::engine::Engine::origin_share_preview`]'s plan: the action (update
 /// keeps the proposal's number and URL in front of the user), the effective
@@ -2760,6 +2856,31 @@ fn delete_question(preview: &Value) -> String {
 /// same value is both the commit message and the retitling PATCH the update
 /// sends. Labelling it `Title` would promise a retitle in the first case,
 /// which is the one a caller lands on by default.
+///
+/// **The two stacked plans split the same way.** A `stack` opens a pull
+/// request of its own, so it is titled and labelled `Title` like a create,
+/// and it names the layer it lands on because that is the whole difference
+/// between it and a lone proposal. An `amend` puts a fresh commit on a
+/// proposal that already exists, so it labels the value `Commit message` like
+/// an update, and it says how many layers above it will be re-based: the user
+/// is being asked about work they already put in front of reviewers, not only
+/// about the layer they named.
+///
+/// **Generated folder listings get one line at the end and no place in the
+/// list.** `index.md` files ride along with a share so the team repository
+/// stays browsable on the forge, and they are derived from the engrams beside
+/// them: counted among the changes they would crowd the real work out of the
+/// ten-file cap and say nothing in return. So they are summarized - "Also
+/// refreshes 3 folder indexes." - and a share carrying nothing else says that
+/// plainly instead of reading as a share of nothing.
+///
+/// **All four read as one instruction rather than four narrations.** Every
+/// leg opens with the imperative the create and update legs always used -
+/// "Open a new proposal", "Update open proposal #N", "Stack a new proposal on
+/// top of #N", "Amend proposal #N" - so the question a user is answering is
+/// the action they are authorizing, in the same voice each time. And both
+/// legs that name an existing proposal name it by title as well as by number:
+/// a bare "#9" is not something a person can recognize their own work in.
 fn share_question(preview: &Value) -> String {
     // `label` rides along with the action for exactly the reason above.
     let (action, label) = match preview["action"].as_str().unwrap_or_default() {
@@ -2771,13 +2892,36 @@ fn share_question(preview: &Value) -> String {
             ),
             "Commit message",
         ),
+        "stack" => (
+            format!(
+                "Stack a new proposal on top of #{} ({})",
+                preview["top_number"].as_u64().unwrap_or_default(),
+                preview["top_title"].as_str().unwrap_or_default()
+            ),
+            "Title",
+        ),
+        "amend" => (
+            format!(
+                "Amend proposal #{} ({}); {} layer(s) above will be re-based",
+                preview["number"].as_u64().unwrap_or_default(),
+                preview["title"].as_str().unwrap_or_default(),
+                preview["layers_above"].as_u64().unwrap_or_default()
+            ),
+            "Commit message",
+        ),
         _ => ("Open a new proposal".to_string(), "Title"),
     };
     let title = preview["effective_title"].as_str().unwrap_or_default();
     let empty = Vec::new();
-    let changes = preview["changes"].as_array().unwrap_or(&empty);
+    let all = preview["changes"].as_array().unwrap_or(&empty);
+    // The generated folder listings are counted, never listed. They travel with
+    // the share so the team repository stays browsable, and a person deciding
+    // whether to publish is deciding about the engrams: ten paths of derived
+    // churn ahead of them would push the real work off the end of the cap.
+    let indexes = all.iter().filter(|c| is_index_change(c)).count();
+    let changes: Vec<&Value> = all.iter().filter(|c| !is_index_change(c)).collect();
     let (mut added, mut updated, mut deleted) = (0usize, 0usize, 0usize);
-    for c in changes {
+    for c in &changes {
         match c["kind"].as_str() {
             Some("added") => added += 1,
             Some("modified") => updated += 1,
@@ -2796,22 +2940,75 @@ fn share_question(preview: &Value) -> String {
     } else {
         names.join(", ")
     };
-    format!(
-        "{action}? {label}: '{title}'. {added} added, {updated} modified, {deleted} deleted: {listed}. Reviewers see the result on GitHub."
-    )
+    let mut question = format!("{action}? {label}: '{title}'.");
+    if !changes.is_empty() {
+        question.push_str(&format!(
+            " {added} added, {updated} modified, {deleted} deleted: {listed}."
+        ));
+    }
+    if indexes > 0 {
+        let noun = if indexes == 1 { "index" } else { "indexes" };
+        // A share with nothing but listings in it is a real share somebody
+        // asked for, so the question says plainly what it would publish
+        // rather than reading as a share of nothing.
+        question.push_str(&if changes.is_empty() {
+            format!(" It refreshes {indexes} folder {noun} and nothing else.")
+        } else {
+            format!(" Also refreshes {indexes} folder {noun}.")
+        });
+    }
+    question.push_str(" Reviewers see the result on GitHub.");
+    question
+}
+
+/// Whether one entry of a share plan's `changes` array is a generated folder
+/// index rather than knowledge somebody wrote.
+///
+/// Read off the path's own filename, which is all the classification this
+/// needs: the plan carries no flag for it, and inventing one would put a
+/// presentation distinction into a wire schema that every other reader would
+/// then have to know about.
+fn is_index_change(change: &Value) -> bool {
+    change["path"]
+        .as_str()
+        .is_some_and(crystalline_core::is_index_path)
 }
 
 /// Trims `origin_status`'s per-domain proposal records to what a status
 /// glance needs: number, url, title, status, review_state, amended_upstream,
-/// feedback_count, updated_at. The bodies stay out on purpose - update_domain
-/// and the REST payload carry them - so status never bloats a session with
-/// comment text the agent did not ask for.
+/// feedback_count, updated_at, position. The bodies stay out on purpose -
+/// update_domain and the REST payload carry them - so status never bloats a
+/// session with comment text the agent did not ask for.
+///
+/// `position` is the layer's place in the open chain, 1-based from the bottom,
+/// read off the open list's own order (the engine builds it in chain order).
+/// It is what a reader keys off to know it is looking at a layer at all, so it
+/// is present on both arrays for one shape, and null on a declined proposal,
+/// which stands in no chain.
+///
+/// `author_login` joins them, and is the one key here that is omitted rather
+/// than nulled: a chain whose layers belong to different people is worth the
+/// line, while "nobody recorded" is a line that buys a reader nothing.
+///
+/// **The four domain-level stack keys are dropped while they are quiet**, and
+/// that is deliberately not what [`crate::origin::status_report_json`] does:
+/// the JSON surface emits all four always so one reader handles either path,
+/// while this one is a context budget. A `stack_number` of null, an empty
+/// `stack_wedged` and either debt flag false say nothing a caller can act on,
+/// so they say nothing at all. A null `stack_number` beside real positions is
+/// read off `stack_link_pending`: with the debt still owed it is the degraded
+/// chain - the layers exist and are simply not grouped on the forge yet - and
+/// with no debt it is a domain whose open records were never a chain at all,
+/// the unstacked forge or `github.stacks` turned off over leftover open
+/// proposals.
 fn lean_origin_status(mut value: Value) -> Value {
     if let Some(domains) = value.get_mut("domains").and_then(Value::as_array_mut) {
         for domain in domains {
             for key in ["open_proposals", "declined_proposals"] {
+                let in_the_chain = key == "open_proposals";
                 if let Some(entries) = domain.get_mut(key).and_then(Value::as_array_mut) {
-                    for entry in entries.iter_mut() {
+                    for (index, entry) in entries.iter_mut().enumerate() {
+                        let author = entry.get("author_login").cloned();
                         *entry = json!({
                             "number": entry["number"],
                             "url": entry["url"],
@@ -2827,17 +3024,101 @@ fn lean_origin_status(mut value: Value) -> Value {
                                 .map(Vec::len)
                                 .unwrap_or(0),
                             "updated_at": entry["updated_at"],
+                            "position": if in_the_chain {
+                                json!(index + 1)
+                            } else {
+                                Value::Null
+                            },
                         });
+                        // A tenth key only where there is somebody to name.
+                        if let Some(author) = author.filter(|a| !a.is_null())
+                            && let Some(object) = entry.as_object_mut()
+                        {
+                            object.insert("author_login".to_string(), author);
+                        }
                     }
                 }
             }
+            drop_quiet_stack_keys(domain);
         }
     }
     value
 }
 
+/// Removes the stack keys that carry no fact from one lean domain entry: a
+/// null `stack_number`, an empty `stack_wedged`, and `repair_pending` or
+/// `stack_link_pending` set false. Anything else stays, including a
+/// `stack_wedged` list, because a wedged layer is named by the number a
+/// caller withdraws or shares against.
+fn drop_quiet_stack_keys(domain: &mut Value) {
+    let Some(object) = domain.as_object_mut() else {
+        return;
+    };
+    if object.get("stack_number").is_some_and(Value::is_null) {
+        object.remove("stack_number");
+    }
+    if object
+        .get("stack_wedged")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        object.remove("stack_wedged");
+    }
+    for key in ["repair_pending", "stack_link_pending"] {
+        if object.get(key) == Some(&json!(false)) {
+            object.remove(key);
+        }
+    }
+}
+
 /// What an unconfirmed share tells the model, naming what did not happen.
 const SHARE_REFUSAL: &str = "The share was not confirmed, so nothing was shared. Call share_changes again if the user asks for it.";
+
+/// What an unconfirmed withdrawal tells the model, naming what is still true
+/// rather than what failed.
+const WITHDRAW_REFUSAL: &str = "The withdrawal was not confirmed, so the proposal is still open. Call withdraw_proposal again if the user asks for it.";
+
+/// The sentence `withdraw_proposal` asks before it closes anything, rendered
+/// from [`crate::engine::Engine::origin_withdraw_preview`]'s plan: the layer
+/// it would take out, the layers that move because of it, and the working-tree
+/// half of a `revert`.
+///
+/// **There is no deny-list beside this, and the difference from
+/// [`share_plan_needs_confirmation`] is the reason.** A share has three plans
+/// that publish nothing, so it has something to wave through; every withdrawal
+/// that resolves a target closes a proposal the team can see, and one that
+/// cannot resolve a target never reaches this renderer - it is the preview's
+/// error. So the gate here is the renderer itself: a plan shape this build
+/// does not recognize degrades to the thinner sentence it can render, and the
+/// round is still asked.
+///
+/// The cascade sentence is the one that earns its words. Withdrawing a layer
+/// that is not the top one re-bases every open layer above it, so saying yes
+/// moves work the user already put in front of reviewers, not only the
+/// proposal they named.
+///
+/// A declined target gets its own first sentence, because the ordinary one
+/// would be false: the forge closed that pull request already, and what the
+/// withdrawal does is clear the record this domain still keeps of it.
+fn withdraw_question(preview: &Value) -> String {
+    let number = preview["number"].as_u64().unwrap_or_default();
+    let title = preview["title"].as_str().unwrap_or_default();
+    let mut question = if preview["declined"] == json!(true) {
+        format!("Withdraws proposal #{number} ({title}) and clears its declined record.")
+    } else {
+        format!("Withdraws proposal #{number} ({title}) and closes its pull request on GitHub.")
+    };
+    let layers_above = preview["layers_above"].as_u64().unwrap_or_default();
+    if layers_above > 0 {
+        question.push_str(&format!(
+            " {layers_above} layer(s) above it will be re-based."
+        ));
+    }
+    if preview["reverting"] == json!(true) {
+        question.push_str(" The shared files are restored locally where a copy is reachable.");
+    }
+    question
+}
 
 /// The sentence a conflict asks when the caller named no resolution: the
 /// conflict's path and kind, then a bounded preview of both sides.
@@ -3032,7 +3313,11 @@ fn to_error(e: EngineError) -> ErrorData {
         | EngineError::Conflict(_)
         | EngineError::Invalid(_)
         | EngineError::ReadOnly
-        | EngineError::EnvTokenConnect => ErrorData::invalid_params(e.to_string(), None),
+        | EngineError::EnvTokenConnect
+        // The caller asked at the wrong moment rather than for the wrong
+        // thing, and the message says to try again once the other sign-in is
+        // done: actionable input-class guidance, like the two above it.
+        | EngineError::ConnectInProgress => ErrorData::invalid_params(e.to_string(), None),
         EngineError::Remote(remote) => remote_to_error(remote),
         EngineError::Io { .. } | EngineError::Internal(_) => {
             ErrorData::internal_error(e.to_string(), None)
@@ -3050,10 +3335,16 @@ fn to_error(e: EngineError) -> ErrorData {
 /// product copy, see `crystalline_remote::error`) is carried verbatim
 /// either way. Genuine input problems - collaboration turned off, no
 /// connection yet, an unreachable repository, a repository or subpath with
-/// no domain, unresolved conflicts blocking a share, or a proposal or
-/// conflict path that does not exist - stay `invalid_params`-shaped. This
-/// match is exhaustive over `RemoteError` so a new variant must be
-/// classified here rather than silently defaulting.
+/// no domain, unresolved conflicts blocking a share, a forge that does not
+/// stack proposals, a teaching refusal (`Refused`: a proposal number that
+/// names no open layer, a chain that has to be pulled or withdrawn first) or
+/// a proposal or conflict path that does not exist - stay
+/// `invalid_params`-shaped. A refusal in particular must never land in the
+/// server-error class: its whole content is the way out of the situation the
+/// caller put themselves in, and an "internal error" verdict in front of it
+/// tells the caller the opposite of what the message says. This match is
+/// exhaustive over `RemoteError` so a new variant must be classified here
+/// rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
     let message = e.to_string();
     match e {
@@ -3073,6 +3364,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::ConflictsPending { .. }
         | RemoteError::ProposalNotFound { .. }
         | RemoteError::NoWithdrawTarget { .. }
+        | RemoteError::StacksUnsupported
+        | RemoteError::Refused(_)
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }
@@ -3531,6 +3824,250 @@ mod tests {
         assert!(!create.contains("notes/f10.md"), "capped at ten: {create}");
     }
 
+    /// The confirm gate's direction, stated as the property rather than as a
+    /// list: the three non-publishing plans answer straight away, and
+    /// everything else asks - a word this build has never heard of included.
+    ///
+    /// That last case is the one worth a test. A future `PlannedAction`
+    /// variant reaches this function as a string nobody here matched on, and
+    /// an allow-list would let it publish to the team unasked. The unknown
+    /// words below stand in for it.
+    #[test]
+    fn the_share_confirm_gate_asks_about_anything_it_does_not_recognize() {
+        for quiet in ["nothing_to_share", "conflicts_pending", "proposal_diverged"] {
+            assert!(
+                !share_plan_needs_confirmation(Some(quiet)),
+                "{quiet} publishes nothing, so it answers in round one"
+            );
+        }
+        for asks in ["create", "update", "stack", "amend"] {
+            assert!(share_plan_needs_confirmation(Some(asks)), "{asks}");
+        }
+        // The fail-safe: a plan word from a later version, and no word at all.
+        for unknown in ["reparent", "split_layer", ""] {
+            assert!(
+                share_plan_needs_confirmation(Some(unknown)),
+                "an unrecognized plan must ask rather than publish: {unknown}"
+            );
+        }
+        assert!(
+            share_plan_needs_confirmation(None),
+            "and so must a plan carrying no action at all"
+        );
+    }
+
+    /// The two stacked plans the same question renders, in the same framing
+    /// the create and update legs use.
+    ///
+    /// A stack names the layer it lands on, because "on top of what" is the
+    /// only thing that distinguishes it from opening a lone proposal; an
+    /// amend names the cascade, because saying yes to it moves work the user
+    /// already put in front of reviewers.
+    #[test]
+    fn share_question_names_the_stack_and_amend_actions() {
+        let stacked = share_question(&json!({
+            "action": "stack", "top_number": 6, "top_title": "Refine alpha",
+            "effective_title": "Share 1 new engram from kb",
+            "changes": [{ "path": "notes/b.md", "kind": "added" }],
+        }));
+        assert!(
+            stacked.contains("Stack a new proposal on top of #6 (Refine alpha)"),
+            "{stacked}"
+        );
+        // A new layer really is titled on the forge, so it labels the value
+        // Title exactly as a create does.
+        assert!(
+            stacked.contains("Title: 'Share 1 new engram from kb'"),
+            "{stacked}"
+        );
+        assert!(
+            stacked.contains("1 added, 0 modified, 0 deleted: notes/b.md"),
+            "{stacked}"
+        );
+
+        let amended = share_question(&json!({
+            "action": "amend", "number": 9, "url": "https://github.test/pulls/9",
+            "title": "Refine beta", "layers_above": 1,
+            "effective_title": "Answer the review on layer 2",
+            "changes": [{ "path": "notes/a.md", "kind": "modified" }],
+        }));
+        assert!(
+            amended.contains("Amend proposal #9 (Refine beta); 1 layer(s) above will be re-based"),
+            "{amended}"
+        );
+        // An amend is a fresh commit on an existing proposal, so the label is
+        // the update leg's, never a promise to retitle.
+        assert!(
+            amended.contains("Commit message: 'Answer the review on layer 2'"),
+            "{amended}"
+        );
+        assert!(!amended.contains("Title: '"), "{amended}");
+    }
+
+    /// The generated folder listings, in the three shapes the question can
+    /// meet them: none at all, some beside real work, and a share that is
+    /// nothing but listings.
+    ///
+    /// The middle one is the whole point of the split. The listings are
+    /// counted and never named, so a sweep that refreshed forty of them still
+    /// shows the person the engrams they are actually publishing.
+    #[test]
+    fn the_share_question_gives_folder_listings_one_line_and_no_place_in_the_list() {
+        let none = share_question(&json!({
+            "action": "create", "effective_title": "Share 1 new engram from kb",
+            "changes": [{ "path": "notes/a.md", "kind": "added" }],
+        }));
+        assert!(
+            !none.contains("folder index"),
+            "nothing to say, so nothing said: {none}"
+        );
+        assert!(none.contains("1 added, 0 modified, 0 deleted: notes/a.md"));
+
+        let mixed = share_question(&json!({
+            "action": "create", "effective_title": "Share 1 new engram from kb",
+            "changes": [
+                { "path": "index.md", "kind": "modified" },
+                { "path": "notes/a.md", "kind": "added" },
+                { "path": "notes/index.md", "kind": "modified" },
+            ],
+        }));
+        assert!(
+            mixed.contains("1 added, 0 modified, 0 deleted: notes/a.md"),
+            "the listings are counted out of the mix: {mixed}"
+        );
+        assert!(!mixed.contains("notes/index.md"), "{mixed}");
+        assert!(
+            mixed.contains("Also refreshes 2 folder indexes."),
+            "{mixed}"
+        );
+
+        let one = share_question(&json!({
+            "action": "create", "effective_title": "Share 1 new engram from kb",
+            "changes": [
+                { "path": "notes/a.md", "kind": "added" },
+                { "path": "index.md", "kind": "modified" },
+            ],
+        }));
+        assert!(one.contains("Also refreshes 1 folder index."), "{one}");
+
+        let only = share_question(&json!({
+            "action": "create", "effective_title": "Refresh the listings in kb",
+            "changes": [
+                { "path": "index.md", "kind": "modified" },
+                { "path": "notes/index.md", "kind": "modified" },
+            ],
+        }));
+        assert!(
+            only.contains("It refreshes 2 folder indexes and nothing else."),
+            "an index-only share says what it does: {only}"
+        );
+        assert!(
+            !only.contains("0 added, 0 modified, 0 deleted"),
+            "and never as a share of nothing: {only}"
+        );
+        assert!(
+            only.contains("Reviewers see the result on GitHub."),
+            "{only}"
+        );
+    }
+
+    /// The withdrawal question, in its three shapes: the plain top layer, a
+    /// layer carrying open work above it, and a withdrawal that also restores
+    /// the shared files locally.
+    ///
+    /// The cascade sentence is the one worth pinning. Saying yes to a
+    /// non-top layer moves every layer above it onto a new base, so the user
+    /// is agreeing to more than the proposal they named, and the question has
+    /// to say so before they do.
+    #[test]
+    fn the_withdraw_question_names_the_proposal_the_cascade_and_the_revert() {
+        let top = withdraw_question(&json!({
+            "number": 7, "title": "Refine alpha",
+            "url": "https://github.test/pulls/7",
+            "layers_above": 0, "only_layer": true, "reverting": false,
+        }));
+        assert_eq!(
+            top,
+            "Withdraws proposal #7 (Refine alpha) and closes its pull request on GitHub."
+        );
+
+        let middle = withdraw_question(&json!({
+            "number": 5, "title": "Share the glossary",
+            "url": "https://github.test/pulls/5",
+            "layers_above": 2, "only_layer": false, "reverting": false,
+        }));
+        assert!(
+            middle.contains("Withdraws proposal #5 (Share the glossary)"),
+            "{middle}"
+        );
+        assert!(
+            middle.contains("2 layer(s) above it will be re-based."),
+            "a withdrawal that moves other layers says so: {middle}"
+        );
+
+        let reverting = withdraw_question(&json!({
+            "number": 5, "title": "Share the glossary",
+            "url": "https://github.test/pulls/5",
+            "layers_above": 0, "only_layer": true, "reverting": true,
+        }));
+        assert!(
+            reverting.contains("The shared files are restored locally where a copy is reachable."),
+            "a revert changes the working tree, so it is named: {reverting}"
+        );
+        assert!(
+            !reverting.contains("layer(s) above"),
+            "nothing stands above it: {reverting}"
+        );
+    }
+
+    /// A declined target is asked about in its own words: nothing is closed on
+    /// the forge, because the forge closed it already - what goes away is the
+    /// record this domain still keeps.
+    #[test]
+    fn the_withdraw_question_says_what_a_declined_record_actually_costs() {
+        let declined = withdraw_question(&json!({
+            "number": 3, "title": "Share the glossary",
+            "url": "https://github.test/pulls/3",
+            "declined": true,
+            "layers_above": 0, "only_layer": false, "reverting": false,
+        }));
+        assert_eq!(
+            declined,
+            "Withdraws proposal #3 (Share the glossary) and clears its declined record."
+        );
+        assert!(
+            !declined.contains("closes its pull request"),
+            "the forge closed it already: {declined}"
+        );
+
+        // A revert still restores files, whichever kind of record it is.
+        let reverting = withdraw_question(&json!({
+            "number": 3, "title": "Share the glossary", "declined": true,
+            "layers_above": 0, "only_layer": false, "reverting": true,
+        }));
+        assert!(
+            reverting.contains("The shared files are restored locally where a copy is reachable."),
+            "{reverting}"
+        );
+    }
+
+    /// The fail-safe half: a preview shape this build does not recognize is
+    /// still rendered into a question rather than waved through.
+    ///
+    /// Unlike `share_changes` there is no quiet plan to let past - every
+    /// resolvable withdrawal closes something on the forge - so the gate is
+    /// the renderer itself: missing fields degrade to a thinner sentence, and
+    /// the round is still asked.
+    #[test]
+    fn the_withdraw_question_degrades_rather_than_skipping_the_round() {
+        let bare = withdraw_question(&json!({}));
+        assert!(bare.starts_with("Withdraws proposal #"), "{bare}");
+        assert!(
+            bare.contains("closes its pull request on GitHub."),
+            "{bare}"
+        );
+    }
+
     #[test]
     fn transient_remote_errors_map_to_the_internal_error_class() {
         let cases = [
@@ -3574,6 +4111,15 @@ mod tests {
             },
             RemoteError::ConflictsPending { count: 2 },
             RemoteError::ProposalNotFound { number: 7 },
+            RemoteError::StacksUnsupported,
+            // A teaching refusal is a client mistake with the way out
+            // attached: the caller named a proposal that is not an open
+            // layer. Classing it as a server fault would tell them the
+            // opposite of what its own text says.
+            RemoteError::Refused(
+                "proposal #9 is not an open layer of this domain; open layers: #3 (layer 1)"
+                    .to_string(),
+            ),
             RemoteError::ConflictNotFound {
                 path: "notes/a.md".to_string(),
                 open: vec![],
@@ -3690,8 +4236,8 @@ mod tests {
     /// to supply the missing key rather than leave the two arrays different
     /// shapes.
     #[test]
-    fn lean_origin_status_trims_both_proposal_arrays_to_the_eight_keys() {
-        const LEAN_KEYS: [&str; 8] = [
+    fn lean_origin_status_trims_both_proposal_arrays_to_the_nine_keys() {
+        const LEAN_KEYS: [&str; 9] = [
             "number",
             "url",
             "title",
@@ -3700,12 +4246,17 @@ mod tests {
             "amended_upstream",
             "feedback_count",
             "updated_at",
+            "position",
         ];
 
         let leaned = lean_origin_status(json!({
             "domains": [{
                 "domain": "kb",
                 "repo": "team/knowledge",
+                "stack_number": Value::Null,
+                "stack_wedged": [],
+                "repair_pending": false,
+                "stack_link_pending": false,
                 "open_proposals": [{
                     "number": 7,
                     "url": "https://example.invalid/pull/7",
@@ -3775,6 +4326,121 @@ mod tests {
             json!(false),
             "a declined proposal the engine never decorated defaults to false"
         );
+
+        // The chain position is the open list's own order, 1-based from the
+        // bottom, so a caller reads "which layer is this" without a second
+        // call. A declined proposal stands in no chain, so it carries the key
+        // (one shape for both arrays) with nothing in it.
+        assert_eq!(open["position"], json!(1));
+        assert_eq!(declined["position"], Value::Null);
+
+        // A domain with nothing stacked says nothing about stacks: the four
+        // keys the engine always emits are dropped when they are quiet, which
+        // is where this trim differs from `origin::status_report_json` on
+        // purpose.
+        let domain = domain.as_object().unwrap();
+        for key in [
+            "stack_number",
+            "stack_wedged",
+            "repair_pending",
+            "stack_link_pending",
+        ] {
+            assert!(
+                !domain.contains_key(key),
+                "{key} is dropped while it is quiet: {domain:?}"
+            );
+        }
+    }
+
+    /// Who shared a layer is worth a line only when there is somebody to name.
+    ///
+    /// A mixed-author chain is what the key exists for, so it survives the
+    /// trim; a null one says nothing a caller can act on, so it is dropped
+    /// rather than spent - the same budget rule the quiet stack keys follow.
+    #[test]
+    fn lean_origin_status_keeps_an_author_and_drops_a_null_one() {
+        let leaned = lean_origin_status(json!({
+            "domains": [{
+                "domain": "kb",
+                "open_proposals": [
+                    {
+                        "number": 7,
+                        "status": "Open",
+                        "feedback": [],
+                        "author_login": "alice",
+                    },
+                    { "number": 8, "status": "Open", "feedback": [], "author_login": null },
+                    // A record from before proposals named their author at all.
+                    { "number": 9, "status": "Open", "feedback": [] },
+                ],
+            }],
+        }));
+
+        let open = &leaned["domains"][0]["open_proposals"];
+        assert_eq!(open[0]["author_login"], "alice");
+        for index in [1, 2] {
+            assert!(
+                open[index].get("author_login").is_none(),
+                "an unnamed author costs no key: {}",
+                open[index]
+            );
+        }
+    }
+
+    /// The other half of the stack trim: a domain that really is stacked
+    /// keeps every key that carries a fact, and every open layer numbers
+    /// itself bottom-up.
+    ///
+    /// `stack_number` null beside a real position is the degraded chain, not
+    /// an unstacked domain - the layers exist and are simply not grouped yet -
+    /// so it drops out here while `stack_link_pending` stays to carry the
+    /// debt. A reader keys off `position`, never off a stack number it may
+    /// not have.
+    #[test]
+    fn lean_origin_status_keeps_the_stack_keys_that_carry_a_fact() {
+        let leaned = lean_origin_status(json!({
+            "domains": [{
+                "domain": "kb",
+                "stack_number": 42,
+                "stack_wedged": [4],
+                "repair_pending": true,
+                "stack_link_pending": false,
+                "open_proposals": [
+                    { "number": 7, "feedback": [], "status": "Open" },
+                    { "number": 8, "feedback": [], "status": "Open" },
+                ],
+            }, {
+                "domain": "degraded",
+                "stack_number": Value::Null,
+                "stack_wedged": [],
+                "repair_pending": false,
+                "stack_link_pending": true,
+                "open_proposals": [{ "number": 11, "feedback": [], "status": "Open" }],
+            }],
+        }));
+
+        let stacked = &leaned["domains"][0];
+        assert_eq!(stacked["stack_number"], json!(42));
+        assert_eq!(stacked["stack_wedged"], json!([4]));
+        assert_eq!(stacked["repair_pending"], json!(true));
+        assert!(
+            stacked
+                .as_object()
+                .unwrap()
+                .get("stack_link_pending")
+                .is_none(),
+            "a paid link says nothing: {stacked}"
+        );
+        assert_eq!(stacked["open_proposals"][0]["position"], json!(1));
+        assert_eq!(stacked["open_proposals"][1]["position"], json!(2));
+
+        let degraded = &leaned["domains"][1];
+        assert!(
+            degraded.as_object().unwrap().get("stack_number").is_none(),
+            "an unlinked chain names no stack number: {degraded}"
+        );
+        assert_eq!(degraded["stack_link_pending"], json!(true));
+        assert_eq!(degraded["open_proposals"][0]["position"], json!(1));
     }
 
     /// A payload with no `domains` array, and one whose entries carry no

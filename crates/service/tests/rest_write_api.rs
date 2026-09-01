@@ -1991,6 +1991,30 @@ fn write_ops() -> Vec<WriteOp> {
             body: None,
             admin_only: true,
         },
+        // The self-service identity surface: the one settings-shaped write
+        // group an editor may drive, because the credential it manages is the
+        // caller's own rather than the instance's. A viewer is still refused
+        // by the matrix's viewer leg, as everywhere else.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/me/github-identity/token",
+            body: Some(serde_json::json!({"token": "matrix-personal-pat"})),
+            admin_only: false,
+        },
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/me/github-identity/connect",
+            body: None,
+            admin_only: false,
+        },
+        // Last of the three, so the delete has something to forget on its
+        // allowed leg; every leg is state-tolerant either way.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/github-identity",
+            body: None,
+            admin_only: false,
+        },
     ]
 }
 

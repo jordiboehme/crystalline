@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader, ReadBuf};
 
 use crate::daemon::{open_store, resolve_db};
-use crate::engine::{CLI_ACTOR, Engine, open_standalone};
+use crate::engine::{CLI_ACTOR, Engine, ShareActor, open_standalone};
 use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
 use crate::mcp::McpServer;
 use crate::overlay;
@@ -1186,10 +1186,16 @@ pub async fn origin_status(
 /// origin: over the daemon when one owns the index, else against a directly
 /// opened store. `want_embeddings` is `false` in the standalone fallback: a
 /// share never touches the working tree, so there is nothing new to embed.
+///
+/// The standalone path shares as [`ShareActor::Owner`], as the three write
+/// verbs below do: a CLI invocation has no account behind it, so the machine
+/// owner is who it is, not a placeholder for one.
 pub async fn origin_share(
     domain: &str,
     title: Option<&str>,
     description: Option<&str>,
+    proposal: Option<u64>,
+    files: Option<&[String]>,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
@@ -1197,7 +1203,8 @@ pub async fn origin_share(
     if use_daemon(db, config_path)
         && let Some(data) = ctl_if_running(json!({
             "v": 1, "cmd": "origin_share", "domain": domain,
-            "title": title, "description": description,
+            "title": title, "description": description, "proposal": proposal,
+            "files": files,
         }))
         .await?
     {
@@ -1206,7 +1213,16 @@ pub async fn origin_share(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_share(domain, title, description).await?)
+    Ok(engine
+        .origin_share(
+            domain,
+            title,
+            description,
+            proposal,
+            files,
+            ShareActor::Owner,
+        )
+        .await?)
 }
 
 /// Withdraw a share proposal for one team domain: over the daemon when one
@@ -1231,7 +1247,9 @@ pub async fn origin_withdraw(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_withdraw(domain, proposal, revert).await?)
+    Ok(engine
+        .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
+        .await?)
 }
 
 /// Resolve one recorded conflict for a team domain: over the daemon when one
@@ -1263,7 +1281,9 @@ pub async fn origin_resolve(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_resolve(domain, path, keep, content).await?)
+    Ok(engine
+        .origin_resolve(domain, path, keep, content, ShareActor::Owner)
+        .await?)
 }
 
 /// Show, set or reset an agent-adjustable setting from the [`crate::settings`]

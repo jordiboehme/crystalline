@@ -183,6 +183,44 @@ describe("registering a domain", () => {
     });
   });
 
+  it("a cached disconnected answer never gates a local registration", async () => {
+    // The regression the browser smoke caught: the top bar's share readiness
+    // probe fills the GitHub-status cache on every screen, and on a
+    // disconnected instance the dialog read that cached answer as a reason to
+    // disable "Create domain" even for a local domain. Reproduced here through
+    // the dialog itself: team mode fetches the disconnected answer into the
+    // shared cache, and switching back to local must leave the submit alive.
+    const created = vi.fn(() => ({ domain: "notes", root: "/srv/kb/notes" }));
+    serveAs("admin", {
+      "/settings/github": () => githubStatus(false),
+      "/domains": (_path, init) =>
+        init?.method === "POST" ? created() : domainsResponse(),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "GitHub team" }),
+    );
+    await within(dialog).findByRole("link", {
+      name: "Connect GitHub in settings",
+    });
+    await userEvent.click(
+      within(dialog).getByRole("radio", { name: "Local folder" }),
+    );
+    await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
+    const submit = within(dialog).getByRole("button", {
+      name: "Create domain",
+    });
+    await waitFor(() => {
+      expect(submit).toBeEnabled();
+    });
+    await userEvent.click(submit);
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+  });
+
   it("creates a virtual domain", async () => {
     const created = vi.fn(() => ({ domain: "scratch", root: null }));
     serveAs("admin", {
@@ -434,15 +472,20 @@ describe("registering a domain", () => {
     serveAs("admin", { "/settings/github": () => githubStatus(true) });
     renderApp("/users");
 
+    // Counted from where the dialog opens rather than from zero: the frame
+    // asks the same question once for every admin session, to decide whether
+    // to offer its share action, and this is about the dialog adding a probe
+    // of its own.
     const dialog = await openFromSidebar();
+    const before = settingsCalls().length;
     // Local, and then the other mode that has no repository either: the probe
     // belongs to team mode alone, and an instance's GitHub connection is not
-    // something to go asking about because a dialog opened.
+    // something to go asking about again because a dialog opened.
     await userEvent.type(within(dialog).getByLabelText("Name"), "scratch");
     await userEvent.click(
       within(dialog).getByRole("radio", { name: "Virtual" }),
     );
 
-    expect(settingsCalls()).toHaveLength(0);
+    expect(settingsCalls()).toHaveLength(before);
   });
 });

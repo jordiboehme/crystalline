@@ -23,10 +23,12 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use crystalline_remote::ops::{
-    PlannedAction, ProposeOutcome, PullReport, Resolution, SubscribeReport, propose,
-    propose_preview, pull, resolve, status, subscribe, withdraw,
+    OriginStatusReport, PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions,
+    SubscribeReport, propose, propose_preview, pull, resolve, status, subscribe, withdraw,
 };
-use crystalline_remote::provider::{Feedback, OriginSpec, ProposalState, Provider};
+use crystalline_remote::provider::{
+    Feedback, OriginSpec, ProposalRequest, ProposalState, Provider,
+};
 use crystalline_remote::state::{
     BaseStamp, FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange,
     ProposedFile, read_conflict_files,
@@ -154,8 +156,7 @@ async fn shared_once(mock: &MockProvider) -> (Subscribed, crystalline_remote::op
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -164,6 +165,21 @@ async fn shared_once(mock: &MockProvider) -> (Subscribed, crystalline_remote::op
         other => panic!("expected Proposed, got {other:?}"),
     };
     (sub, report)
+}
+
+/// Writes a recorded author onto saved proposals, standing in for shares that
+/// went out on other people's credentials before this test's own call.
+fn set_authors(state_dir: &Path, authors: &[(u64, &str)]) {
+    let mut st = load_state(state_dir);
+    for (number, login) in authors {
+        let record = st
+            .proposals
+            .iter_mut()
+            .find(|p| p.number == *number)
+            .expect("the proposal to attribute is recorded");
+        record.author_login = Some((*login).to_string());
+    }
+    st.save(state_dir).unwrap();
 }
 
 /// Overwrites the saved base commit, the corruption scenario 11 needs to force
@@ -189,6 +205,8 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
             path: path.to_string(),
             change: ProposedChange::Added,
             sha256,
+            blob_sha: None,
+            size: None,
         }],
         head_commit: None,
         pending_head_commit: None,
@@ -196,6 +214,7 @@ fn seed_proposal(state_dir: &Path, number: u64, path: &str, sha256: Option<Strin
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     st.save(state_dir).unwrap();
 }
@@ -772,7 +791,7 @@ async fn scenario_10_declined_proposal_without_movement() {
     assert!(st.history.is_empty());
 
     // Status surfaces it as a declined proposal.
-    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(status_report.declined_proposals.len(), 1);
@@ -838,10 +857,78 @@ async fn scenario_11_missing_base_commit_re_baselines() {
     );
 
     // Subsequent status reports a.md as a local change against the new base.
-    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(status_report.local_changes, 1);
+}
+
+/// A re-baselining pull consumes the merged layer it finds, like every other
+/// arm of `pull`.
+///
+/// This was the one arm that did not, and the gap had teeth: a merged record
+/// still sitting in the chain blocks every repair around it, and that
+/// refusal's way out is "pull this domain first". A domain whose base commit
+/// is gone upstream takes THIS arm on every pull it will ever make, so the
+/// advice named an operation that could not clear the record - the chain
+/// stayed wedged for good.
+#[tokio::test]
+async fn a_re_baselining_pull_consumes_the_merge_it_finds() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // The middle layer merged upstream while the trunk this domain records
+    // was rewritten out of existence.
+    mock.set_proposal_state(layers[1].number, ProposalState::Merged);
+    let mut state = load_state(&sub.state_dir);
+    state.base_commit = "ghost-commit".to_string();
+    state.save(&sub.state_dir).unwrap();
+    mock.gc_commit("ghost-commit");
+    let moved = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    mock.set_branch("main", &moved);
+
+    let before = mock.calls().len();
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    let delta = mock.calls().split_off(before);
+
+    assert!(report.re_baselined, "{report:?}");
+    assert!(
+        report
+            .proposals
+            .contains(&(layers[1].number, ProposalStatus::Merged)),
+        "the pull reports where it reports every other consumption: {report:?}"
+    );
+    assert!(
+        report.merged.is_empty(),
+        "and says nothing in the three-way-merge field, which a re-baseline \
+         never fills: {report:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        !state.proposals.iter().any(|p| p.number == layers[1].number),
+        "the merged layer left the chain: {:?}",
+        state.proposals
+    );
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number && p.status == ProposalStatus::Merged),
+        "and landed in history: {:?}",
+        state.history
+    );
+    assert!(
+        delta.contains(&format!("delete_branch:{}", layers[1].branch)),
+        "its branch is cleaned up after the state is durable: {delta:?}"
+    );
+    assert_eq!(state.base_commit, moved, "on the new trunk");
 }
 
 // Scenario 12: an oversized upstream file is skipped with a warning, never
@@ -896,7 +983,7 @@ async fn scenario_13_status_offline_and_online() {
     let (sub, _) = subscribe_at(&mock, &c1).await;
 
     // Offline: no probe, behind is unknown.
-    let offline = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let offline = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(offline.behind, None);
@@ -905,9 +992,15 @@ async fn scenario_13_status_offline_and_online() {
     assert_eq!(offline.base_commit, c1);
 
     // Online, branch unmoved: not behind.
-    let online_unmoved = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let online_unmoved = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(online_unmoved.behind, Some(false));
 
     // Move the branch, then probe again: now behind.
@@ -920,9 +1013,15 @@ async fn scenario_13_status_offline_and_online() {
     );
     mock.set_branch("main", &c2);
 
-    let online_moved = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let online_moved = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(online_moved.behind, Some(true));
 
     // A status probe that found the branch moved must not poison the stored
@@ -1051,8 +1150,7 @@ async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
         &sub.domain_root,
         "Brand Team",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1127,16 +1225,24 @@ async fn scenario_15_propose_happy_path_creates_pr_and_records_proposal() {
                 path: "notes/added.md".to_string(),
                 change: ProposedChange::Added,
                 sha256: Some(sha256_hex(b"brand new\n")),
+                // The mock provider hands back the content's own sha256 as
+                // its blob sha, so the two match here by construction.
+                blob_sha: Some(sha256_hex(b"brand new\n")),
+                size: Some(b"brand new\n".len() as u64),
             },
             ProposedFile {
                 path: "notes/edit.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"after\n")),
+                blob_sha: Some(sha256_hex(b"after\n")),
+                size: Some(b"after\n".len() as u64),
             },
             ProposedFile {
                 path: "notes/gone.md".to_string(),
                 change: ProposedChange::Deleted,
                 sha256: None,
+                blob_sha: None,
+                size: None,
             },
         ]
     );
@@ -1191,8 +1297,7 @@ async fn scenario_16_propose_with_conflicts_pending_refuses_without_provider_wri
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap_err();
@@ -1226,8 +1331,7 @@ async fn scenario_18_propose_with_no_local_changes_is_nothing_to_share() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1274,8 +1378,7 @@ async fn scenario_17_propose_freshness_pulls_first_then_proposes_on_new_base() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1324,8 +1427,7 @@ async fn scenario_19_propose_full_circle_merged_verbatim_is_consumed_by_pull() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1379,8 +1481,7 @@ async fn scenario_20_propose_amended_merge_upstream_wins_silently() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1426,6 +1527,7 @@ async fn scenario_20_withdraw_open_closes_the_pr_and_keeps_files() {
         &sub.domain_root,
         &sub.state_dir,
         None,
+        false,
         false,
     )
     .await
@@ -1473,8 +1575,7 @@ async fn scenario_20_withdraw_revert_restores_undiverged_files() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1495,6 +1596,7 @@ async fn scenario_20_withdraw_revert_restores_undiverged_files() {
         &sub.state_dir,
         Some(report.number),
         true,
+        false,
     )
     .await
     .unwrap();
@@ -1530,6 +1632,7 @@ async fn scenario_20_withdraw_declined_skips_the_close() {
         &sub.state_dir,
         Some(first.number),
         false,
+        false,
     )
     .await
     .unwrap();
@@ -1564,14 +1667,21 @@ async fn scenario_20_withdraw_refuses_a_merged_proposal() {
         &sub.state_dir,
         Some(first.number),
         false,
+        false,
     )
     .await
     .unwrap_err();
     match err {
-        crystalline_remote::RemoteError::State(msg) => {
+        // A refusal, not a corrupt state: the proposal is exactly where the
+        // record says it is, the caller simply cannot withdraw it any more.
+        crystalline_remote::RemoteError::Refused(msg) => {
             assert!(msg.contains("already merged"), "{msg}");
+            assert!(
+                msg.starts_with(&format!("proposal #{}", first.number)),
+                "the refusal reaches the caller unprefixed: {msg}"
+            );
         }
-        other => panic!("expected State, got {other:?}"),
+        other => panic!("expected Refused, got {other:?}"),
     }
     let st = load_state(&sub.state_dir);
     assert_eq!(st.proposals.len(), 1, "the record is untouched");
@@ -1584,9 +1694,17 @@ async fn scenario_20_withdraw_close_failure_aborts_untouched() {
     let (sub, first) = shared_once(&mock).await;
     mock.fail_close_proposal(first.number);
 
-    let err = withdraw(&mock, &spec(), &sub.domain_root, &sub.state_dir, None, true)
-        .await
-        .unwrap_err();
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        true,
+        false,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -1621,6 +1739,7 @@ async fn scenario_20_withdraw_targeting_names_candidates() {
         &sub.state_dir,
         None,
         false,
+        false,
     )
     .await
     .unwrap_err();
@@ -1638,6 +1757,7 @@ async fn scenario_20_withdraw_targeting_names_candidates() {
         &sub.domain_root,
         &sub.state_dir,
         Some(99),
+        false,
         false,
     )
     .await
@@ -1692,16 +1812,22 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
                 path: "notes/keep.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"shared keep v2\n")),
+                blob_sha: None,
+                size: None,
             },
             ProposedFile {
                 path: "notes/diverge.md".to_string(),
                 change: ProposedChange::Modified,
                 sha256: Some(sha256_hex(b"shared diverge v2\n")),
+                blob_sha: None,
+                size: None,
             },
             ProposedFile {
                 path: "notes/added.md".to_string(),
                 change: ProposedChange::Added,
                 sha256: Some(sha256_hex(b"newly added\n")),
+                blob_sha: None,
+                size: None,
             },
         ],
         head_commit: None,
@@ -1710,6 +1836,7 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
         review_state: None,
         feedback: Vec::new(),
         updated_at: None,
+        author_login: None,
     });
     state.save(&sub.state_dir).unwrap();
 
@@ -1726,6 +1853,7 @@ async fn scenario_21_withdraw_restores_verbatim_deletes_added_skips_diverged() {
         &sub.state_dir,
         Some(9),
         true,
+        false,
     )
     .await
     .unwrap();
@@ -1926,8 +2054,7 @@ async fn scenario_23_generated_title_pluralizes_additions_only() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -1958,8 +2085,7 @@ async fn scenario_23_generated_title_singular_modification_only() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2001,8 +2127,7 @@ async fn scenario_23_generated_summary_joins_three_plural_clauses_without_an_oxf
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2037,8 +2162,14 @@ async fn scenario_23_caller_supplied_title_and_description_are_used_verbatim() {
         &sub.domain_root,
         "brand",
         &sub.state_dir,
-        Some("My own title"),
-        Some("My own description, written by hand."),
+        ShareOptions {
+            title: Some("My own title"),
+            description: Some("My own description, written by hand."),
+            proposal: None,
+            stacks_allowed: false,
+            author_login: None,
+            files: None,
+        },
     )
     .await
     .unwrap();
@@ -2107,7 +2238,7 @@ async fn scenario_24_hidden_upstream_paths_never_extract_status_or_share_clean()
 
     // Status: the hidden paths this domain never tracked cannot show up as
     // local changes, since the base snapshot never claimed them either.
-    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None)
+    let status_report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
         .await
         .unwrap();
     assert_eq!(
@@ -2125,8 +2256,7 @@ async fn scenario_24_hidden_upstream_paths_never_extract_status_or_share_clean()
         &sub.domain_root,
         "team-knowledge",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2632,8 +2762,7 @@ async fn scenario_27_consecutive_shares_update_one_proposal() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2664,7 +2793,7 @@ async fn scenario_27_consecutive_shares_update_one_proposal() {
     );
     assert!(
         calls.contains(&format!(
-            "update_branch:{}:{head_after_update}",
+            "update_branch:{}:{head_after_update}:force=false",
             first.branch
         )),
         "{calls:?}"
@@ -2725,8 +2854,7 @@ async fn scenario_28_share_update_after_upstream_advance_makes_a_merge_commit() 
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2778,8 +2906,7 @@ async fn scenario_29_diverged_branch_refuses_with_no_writes() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2832,8 +2959,7 @@ async fn scenario_30_declined_proposal_is_superseded_on_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2873,8 +2999,7 @@ async fn scenario_31_gone_ref_with_open_pr_treats_as_declined_and_creates_new() 
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2908,8 +3033,7 @@ async fn scenario_32_migration_none_head_commit_adopts_live_head() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2942,8 +3066,7 @@ async fn an_interrupted_update_heals_on_the_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap_err();
@@ -2972,7 +3095,7 @@ async fn an_interrupted_update_heals_on_the_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -2987,8 +3110,7 @@ async fn an_interrupted_update_heals_on_the_next_share() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3024,8 +3146,7 @@ async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap_err();
@@ -3042,7 +3163,7 @@ async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3057,8 +3178,7 @@ async fn a_foreign_head_still_refuses_after_an_interrupted_update() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3105,8 +3225,7 @@ async fn scenario_34_nothing_to_share_leaves_the_open_proposal_untouched() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3121,8 +3240,7 @@ async fn scenario_34_nothing_to_share_leaves_the_open_proposal_untouched() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3153,7 +3271,7 @@ async fn scenario_35_preview_reports_update_for_an_open_proposal_without_writing
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3193,7 +3311,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3208,7 +3326,14 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        Some("My title"),
+        ShareOptions {
+            title: Some("My title"),
+            description: None,
+            proposal: None,
+            stacks_allowed: false,
+            author_login: None,
+            files: None,
+        },
     )
     .await
     .unwrap();
@@ -3222,8 +3347,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3240,7 +3364,7 @@ async fn scenario_35_preview_reports_create_nothing_and_diverged() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3273,7 +3397,7 @@ async fn scenario_35_preview_still_pulls_first() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3320,7 +3444,7 @@ async fn scenario_35_preview_reports_conflicts_pending() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3346,7 +3470,7 @@ async fn scenario_35_preview_of_a_declined_record_creates_without_cleanup() {
         &sub.domain_root,
         "eng",
         &sub.state_dir,
-        None,
+        ShareOptions::default(),
     )
     .await
     .unwrap();
@@ -3444,9 +3568,15 @@ async fn scenario_37_status_flips_a_merged_elsewhere_proposal_without_consuming(
     // Merged on GitHub: gone from the open list, and the single GET says merged.
     mock.set_proposal_state(first.number, ProposalState::Merged);
 
-    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert!(
         report.open_proposals.is_empty(),
         "the merged proposal left the open list"
@@ -3478,9 +3608,15 @@ async fn scenario_37_status_flags_an_amended_branch() {
     let amended = mock.add_commit(commit_files(&[("MANIFEST.md", b"# amended")]), None);
     mock.set_branch(&first.branch, &amended);
 
-    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .unwrap();
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .unwrap();
     assert_eq!(report.amended_upstream, vec![first.number]);
     assert_eq!(report.open_proposals.len(), 1, "still open, just amended");
     // Exactly one live list call answers both questions this status asks.
@@ -3499,11 +3635,4759 @@ async fn scenario_37_status_list_failure_degrades_to_local_state() {
     let (sub, first) = shared_once(&mock).await;
     mock.fail_open_proposals();
 
-    let report = status(&spec(), &sub.domain_root, &sub.state_dir, Some(&mock))
-        .await
-        .expect("a list failure never fails status");
+    let report = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .expect("a list failure never fails status");
     assert_eq!(report.open_proposals[0].number, first.number);
     assert!(report.amended_upstream.is_empty());
     let st = load_state(&sub.state_dir);
     assert_eq!(st.proposals[0].status, ProposalStatus::Open, "unchanged");
+}
+
+// The stack rules, as the 2026-08-27 spike found them on a live repository:
+// bottom-to-top chains only, a closed member stays a member, a stacked
+// proposal cannot be retargeted and a dissolve takes the stack away
+// outright. This test drives the mock forge directly rather than an
+// operation, because the mock is what every later stack scenario stands on.
+
+/// Asserts `err` is an API failure carrying `status`, whose message contains
+/// `needle` (empty to check the status alone).
+fn assert_api(err: &crystalline_remote::RemoteError, status: u16, needle: &str) {
+    match err {
+        crystalline_remote::RemoteError::Api {
+            status: got,
+            message,
+        } => {
+            assert_eq!(*got, status, "{err:?}");
+            assert!(
+                message.contains(needle),
+                "{message:?} does not carry {needle:?}"
+            );
+        }
+        other => panic!("expected an Api {status}, got {other:?}"),
+    }
+}
+
+/// Opens one layer through the ordinary create path: a commit on top of
+/// `base_branch`'s head, a branch pointing at it and a proposal targeting
+/// `base_branch`. Returns the new proposal's number.
+async fn stacked_layer(mock: &MockProvider, branch: &str, base_branch: &str) -> u64 {
+    let parent = mock
+        .branch_commit(base_branch)
+        .unwrap_or_else(|| panic!("no branch {base_branch}"));
+    let path = format!("{branch}.md");
+    let commit = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# team"), (path.as_str(), b"layer")]),
+        Some(&parent),
+    );
+    mock.create_branch(&spec(), branch, &commit).await.unwrap();
+    mock.create_proposal(
+        &spec(),
+        &ProposalRequest {
+            title: format!("share {branch}"),
+            body: "one layer".to_string(),
+            branch: branch.to_string(),
+            base_branch: base_branch.to_string(),
+        },
+    )
+    .await
+    .unwrap()
+    .number
+}
+
+#[tokio::test]
+async fn the_mock_forge_models_the_spiked_stack_rules() {
+    let mock = MockProvider::new();
+    // Before `enable_stacks` the mock is a forge without the preview: all
+    // four verbs answer the way the trait defaults do.
+    for err in [
+        mock.list_stacks(&spec(), None).await.unwrap_err(),
+        mock.create_stack(&spec(), &[1, 2]).await.unwrap_err(),
+        mock.extend_stack(&spec(), 1, &[2]).await.unwrap_err(),
+        mock.dissolve_stack(&spec(), 1).await.unwrap_err(),
+    ] {
+        assert!(
+            matches!(err, crystalline_remote::RemoteError::StacksUnsupported),
+            "{err:?}"
+        );
+    }
+    mock.enable_stacks();
+
+    let root = mock.add_commit(commit_files(&[("MANIFEST.md", b"# team")]), None);
+    mock.set_branch("main", &root);
+    let p1 = stacked_layer(&mock, "layer-a", "main").await;
+    let p2 = stacked_layer(&mock, "layer-b", "layer-a").await;
+    assert_eq!((p1, p2), (1, 2));
+
+    // A chain runs bottom to top: reversed, the second member's base ref is
+    // not the first member's head ref.
+    let err = mock.create_stack(&spec(), &[p2, p1]).await.unwrap_err();
+    assert_api(&err, 422, "must form a stack");
+
+    let stack = mock.create_stack(&spec(), &[p1, p2]).await.unwrap();
+    assert_eq!(
+        stack.number, 3,
+        "stack numbers come off the same counter as proposals"
+    );
+    assert!(stack.open);
+    assert_eq!(
+        stack.members.iter().map(|m| m.number).collect::<Vec<_>>(),
+        vec![p1, p2]
+    );
+    assert_eq!(stack.members[0].state, "open");
+    assert_eq!(
+        stack.members[1].head_sha,
+        mock.branch_commit("layer-b").unwrap(),
+        "a member's head is read live off its branch"
+    );
+
+    // A member of a live stack cannot be retargeted: unstack first.
+    let err = mock
+        .update_proposal(&spec(), p2, None, None, Some("main"))
+        .await
+        .unwrap_err();
+    assert_api(&err, 422, "part of a stack");
+
+    // Extending appends on top of the current top member.
+    let p3 = stacked_layer(&mock, "layer-c", "layer-b").await;
+    let stack = mock
+        .extend_stack(&spec(), stack.number, &[p3])
+        .await
+        .unwrap();
+    assert_eq!(stack.members.len(), 3);
+    assert_eq!(stack.members[2].number, p3);
+
+    // A layer branched off trunk does not line up with that top.
+    let stray = stacked_layer(&mock, "stray", "main").await;
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[stray])
+        .await
+        .unwrap_err();
+    assert_api(&err, 422, "must form a stack");
+
+    // The conflict injector answers before any validation, and is spent per
+    // call, so a caller's retry path can be driven without a real race.
+    let p4 = stacked_layer(&mock, "layer-d", "layer-c").await;
+    mock.fail_extend_stack_with_conflicts(1);
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[p4])
+        .await
+        .unwrap_err();
+    assert_api(&err, 409, "");
+    let stack = mock
+        .extend_stack(&spec(), stack.number, &[p4])
+        .await
+        .unwrap();
+    assert_eq!(stack.members.len(), 4, "the second attempt went through");
+
+    // Closing a member never touches the registry: it stays a member,
+    // reported closed, and one open member keeps the stack open.
+    mock.close_proposal(&spec(), p4).await.unwrap();
+    let stack = mock.stack(stack.number).expect("the stack is still there");
+    assert_eq!(stack.members.len(), 4);
+    assert_eq!(stack.members[3].state, "closed");
+    assert!(stack.open);
+
+    // A closed top blocks the extend, even for a layer branched off it.
+    let p5 = stacked_layer(&mock, "layer-e", "layer-d").await;
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[p5])
+        .await
+        .unwrap_err();
+    assert_api(&err, 422, "must form a stack");
+
+    // Listing answers the whole registry, or one proposal's stack.
+    assert_eq!(mock.list_stacks(&spec(), None).await.unwrap().len(), 1);
+    assert_eq!(
+        mock.list_stacks(&spec(), Some(p3)).await.unwrap()[0].number,
+        stack.number
+    );
+    assert!(
+        mock.list_stacks(&spec(), Some(stray))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Dissolve takes the entry away outright, and the retarget the stack
+    // refused a moment ago then goes through.
+    mock.dissolve_stack(&spec(), stack.number).await.unwrap();
+    assert!(mock.stack(stack.number).is_none());
+    assert!(mock.stacks().is_empty());
+
+    // Extending what is no longer in the registry is a 404, not a chain
+    // complaint: there is no stack left to line a layer up against.
+    let err = mock
+        .extend_stack(&spec(), stack.number, &[p3])
+        .await
+        .unwrap_err();
+    assert_api(&err, 404, "no stack");
+
+    mock.update_proposal(&spec(), p2, None, None, Some("main"))
+        .await
+        .expect("unstack first, then retarget");
+
+    // The hard create injector, and healing it again.
+    mock.update_proposal(&spec(), p2, None, None, Some("layer-a"))
+        .await
+        .unwrap();
+    mock.fail_create_stack();
+    let err = mock.create_stack(&spec(), &[p1, p2]).await.unwrap_err();
+    assert!(
+        matches!(err, crystalline_remote::RemoteError::Api { .. }),
+        "{err:?}"
+    );
+    mock.heal_create_stack();
+    let again = mock.create_stack(&spec(), &[p1, p2]).await.unwrap();
+    assert!(
+        again.number > stack.number,
+        "a fresh number off the shared counter"
+    );
+
+    // One open member keeps a stack open; with the last one closed the stack
+    // itself reads shut, while the registry entry stays put.
+    mock.close_proposal(&spec(), p1).await.unwrap();
+    let half = mock.stack(again.number).expect("still registered");
+    assert!(half.open, "p2 is still open, so the stack is");
+    mock.close_proposal(&spec(), p2).await.unwrap();
+    let shut = mock.stack(again.number).expect("still registered");
+    assert_eq!(shut.members.len(), 2, "closing never unstacks a member");
+    assert!(!shut.open, "no open member left, so the stack reads closed");
+
+    // Every stack call is recorded, in the colon-separated shape the rest of
+    // the lifecycle assertions read.
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("create_stack:[{p1},{p2}]")),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("extend_stack:{}:[{p3}]", stack.number)),
+        "{calls:?}"
+    );
+    assert!(
+        calls.contains(&format!("dissolve_stack:{}", stack.number)),
+        "{calls:?}"
+    );
+    assert!(calls.contains(&"list_stacks".to_string()), "{calls:?}");
+    assert!(calls.contains(&format!("list_stacks:{p3}")), "{calls:?}");
+}
+
+// The cached stacks probe: whether this origin's forge serves stacks at all is
+// asked once per origin and remembered, and the `github.stacks` config gate
+// short-circuits it before a single call leaves the machine.
+
+#[tokio::test]
+async fn the_probe_runs_once_and_caches_the_verdict() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // A forge without `enable_stacks`: the probe answers StacksUnsupported and
+    // the share takes the ordinary living-proposal path.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(outcome, ProposeOutcome::Proposed(_)),
+        "a forge without stacks still shares: {outcome:?}"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        Some(false),
+        "the verdict is cached in origin state"
+    );
+    assert_eq!(
+        mock.calls().iter().filter(|c| *c == "list_stacks").count(),
+        1,
+        "exactly one probe: {:?}",
+        mock.calls()
+    );
+
+    // A second share reads the cache instead of probing again.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        mock.calls().iter().filter(|c| *c == "list_stacks").count(),
+        1,
+        "still one probe after a second share: {:?}",
+        mock.calls()
+    );
+}
+
+#[tokio::test]
+async fn config_off_never_probes() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: false,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("list_stacks")),
+        "github.stacks off never asks the forge: {:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        None,
+        "the config gate leaves the cache untouched"
+    );
+}
+
+// The stacked share: while a chain is open, every share opens a NEW proposal
+// layered on top of it rather than rewriting the one below. These scenarios
+// drive `propose` end to end against the stack-serving mock forge.
+
+/// Shares with stacking allowed, the call every stacked scenario makes.
+async fn stacked_share(mock: &MockProvider, sub: &Subscribed) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect("a stacked share should succeed")
+}
+
+/// The report of a share that opened a proposal, or a panic naming what came
+/// back instead.
+fn proposed(outcome: ProposeOutcome) -> crystalline_remote::ops::ProposeReport {
+    match outcome {
+        ProposeOutcome::Proposed(report) => report,
+        other => panic!("expected Proposed, got {other:?}"),
+    }
+}
+
+/// Subscribes a single-file domain against a stack-serving forge and shares
+/// one local edit, the bottom layer every stacked scenario builds on.
+async fn stacked_bottom_layer(
+    mock: &MockProvider,
+) -> (Subscribed, crystalline_remote::ops::ProposeReport) {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let report = proposed(stacked_share(mock, &sub).await);
+    (sub, report)
+}
+
+#[tokio::test]
+async fn a_second_share_stacks_a_new_proposal_on_the_open_one() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // The bottom layer is an ordinary create: there was no chain to stack on.
+    assert_eq!(first.stack_number, None);
+    assert_eq!(first.stack_position, None);
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 1);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    assert_ne!(second.number, first.number, "a new proposal, not an update");
+    let state = load_state(&sub.state_dir);
+    let stack = state.stack_number.expect("the chain is linked");
+    assert_eq!(second.stack_number, Some(stack));
+    assert_eq!(second.stack_position, Some((2, 2)));
+    assert_eq!(state.proposals.len(), 2);
+    assert_eq!(
+        state.stacks_available,
+        Some(true),
+        "the probe's verdict is cached"
+    );
+
+    // The new pull request targets the layer below it, and its commit has
+    // exactly one parent: that layer's head, never a two-parent merge.
+    let request = mock
+        .proposal_request(second.number)
+        .expect("the second layer was opened through the provider");
+    assert_eq!(request.base_branch, first.branch);
+    let top_head = mock.branch_commit(&first.branch).expect("the layer's head");
+    let layer_head = mock.branch_commit(&second.branch).expect("the new head");
+    assert_eq!(mock.commit_parents(&layer_head), Some(vec![top_head]));
+
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!(
+            "create_stack:[{},{}]",
+            first.number, second.number
+        )),
+        "{calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_third_share_extends_the_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let stack = second.stack_number.expect("the chain is linked");
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(&mock, &sub).await);
+
+    assert_eq!(third.stack_number, Some(stack), "the same stack number");
+    assert_eq!(third.stack_position, Some((3, 3)));
+    let calls = mock.calls();
+    assert!(
+        calls.contains(&format!("extend_stack:{stack}:[{}]", third.number)),
+        "{calls:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals.len(), 3);
+    assert_eq!(state.stack_number, Some(stack));
+    assert!(!state.stack_link_pending);
+}
+
+#[tokio::test]
+async fn a_failed_stack_link_degrades_and_heals_on_the_next_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    // The pull request exists; only the linking call failed.
+    assert_eq!(second.stack_number, None);
+    assert_eq!(second.stack_position, Some((2, 2)));
+    let state = load_state(&sub.state_dir);
+    assert!(state.stack_link_pending, "the chain is degraded, not wrong");
+    assert_eq!(state.stack_number, None);
+    assert_eq!(state.proposals.len(), 2);
+
+    mock.heal_create_stack();
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(&mock, &sub).await);
+
+    let delta = mock.calls().split_off(before);
+    let retried = format!("create_stack:[{},{}]", first.number, second.number);
+    let retry_at = delta
+        .iter()
+        .position(|c| *c == retried)
+        .unwrap_or_else(|| panic!("no retried link in {delta:?}"));
+    let stack = third.stack_number.expect("the retry linked the chain");
+    let extend_at = delta
+        .iter()
+        .position(|c| *c == format!("extend_stack:{stack}:[{}]", third.number))
+        .unwrap_or_else(|| panic!("no extend in {delta:?}"));
+    assert!(
+        retry_at < extend_at,
+        "the owed link is settled before the new layer's own: {delta:?}"
+    );
+    let first_write = delta
+        .iter()
+        .position(|c| c.starts_with("create_blob"))
+        .unwrap_or_else(|| panic!("no share write in {delta:?}"));
+    assert!(
+        retry_at < first_write,
+        "the retry comes before any new share work: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the flag is cleared");
+    assert_eq!(state.stack_number, Some(stack));
+    assert_eq!(state.proposals.len(), 3);
+}
+
+#[tokio::test]
+async fn divergence_on_the_top_layer_refuses_the_stacked_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // A reviewer pushes onto the TOP layer's branch.
+    let foreign = mock.add_commit(commit_files(&[("MANIFEST.md", b"# reviewer")]), None);
+    mock.set_branch(&second.branch, &foreign);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+    match outcome {
+        ProposeOutcome::ProposalDiverged { number, branch, .. } => {
+            assert_eq!(number, second.number, "the TOP layer, not the bottom");
+            assert_ne!(number, first.number);
+            assert_eq!(branch, second.branch);
+        }
+        other => panic!("expected ProposalDiverged, got {other:?}"),
+    }
+    assert_eq!(
+        load_state(&sub.state_dir).proposals.len(),
+        2,
+        "nothing was stacked"
+    );
+}
+
+#[tokio::test]
+async fn preview_names_the_stack_action() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let top_title = load_state(&sub.state_dir).proposals[0].title.clone();
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        plan.action,
+        PlannedAction::StackOnTop {
+            top_number: first.number,
+            top_title,
+        }
+    );
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_multi_open_state_keeps_the_living_proposal_flow() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Two open records with no stack behind them: residue from before
+    // stacking existed, which the living-proposal flow still owns.
+    for number in [41u64, 42] {
+        seed_proposal(&sub.state_dir, number, "notes/a.md", None);
+        let branch = format!("crystalline/share-{number}");
+        mock.register_proposal_branch(number, &branch);
+        mock.set_branch(&branch, &c1);
+        mock.set_proposal_state(number, ProposalState::Open);
+    }
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, None);
+    assert!(!state.stack_link_pending);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let outcome = stacked_share(&mock, &sub).await;
+    match outcome {
+        ProposeOutcome::Updated(report) => {
+            assert_eq!(report.number, 41, "the oldest layer, updated in place");
+            assert_eq!(report.stack_number, None);
+            assert_eq!(report.stack_position, None);
+        }
+        other => panic!("expected Updated, got {other:?}"),
+    }
+    // The capability probe still runs (it is a property of the origin), but
+    // no stack is ever created, extended or dissolved over legacy residue.
+    let calls = mock.calls();
+    assert!(
+        !calls.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")),
+        "{calls:?}"
+    );
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 2);
+}
+
+#[tokio::test]
+async fn a_failing_probe_falls_back_without_caching_a_verdict() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_list_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+
+    let outcome = stacked_share(&mock, &sub).await;
+    assert!(
+        matches!(outcome, ProposeOutcome::Proposed(_)),
+        "a broken probe never fails the share: {outcome:?}"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        None,
+        "a transport failure is not a verdict worth remembering"
+    );
+
+    // The next share asks again rather than trusting a cache it never wrote.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    stacked_share(&mock, &sub).await;
+    assert_eq!(
+        mock.calls().iter().filter(|c| *c == "list_stacks").count(),
+        2,
+        "{:?}",
+        mock.calls()
+    );
+}
+
+// A layer records its delta against the chain tip - the trunk snapshot with
+// every open layer's own files laid over it - not against the trunk. Without
+// that, every layer re-proposes what the layers below it already carry, a
+// share with nothing new opens an empty layer, and a delete of a file only a
+// lower layer holds is invisible.
+
+#[tokio::test]
+async fn a_zero_delta_share_on_an_open_chain_is_nothing_to_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    // Nothing was touched since the layer went up: the working tree IS the
+    // chain tip, so there is no second layer to open.
+    let before = mock.calls().len();
+    let outcome = stacked_share(&mock, &sub).await;
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "expected NothingToShare, got {outcome:?}"
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).proposals.len(),
+        1,
+        "no empty layer was opened"
+    );
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")
+            || c.starts_with("create_proposal")),
+        "{delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_layer_records_only_its_own_delta_against_the_tip() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // The bottom layer's own change to notes/a.md is part of the tip now, so
+    // it is not this layer's work and never appears in it.
+    assert_eq!(second.added, vec!["notes/b.md".to_string()]);
+    assert!(second.updated.is_empty(), "{:?}", second.updated);
+    assert!(second.deleted.is_empty(), "{:?}", second.deleted);
+
+    let state = load_state(&sub.state_dir);
+    let files = &state.proposals[1].files;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].path, "notes/b.md");
+    assert_eq!(files[0].change, ProposedChange::Added);
+    assert_eq!(
+        files[0].size,
+        Some(b"beta\n".len() as u64),
+        "the size travels with the record so the tip stamp is exact"
+    );
+}
+
+#[tokio::test]
+async fn a_layer_can_delete_a_file_the_layer_below_added() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The bottom layer adds a file the trunk has never seen.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+    let first_head = mock.branch_commit(&first.branch).expect("the layer's head");
+    assert!(
+        mock.commit_tree(&first_head)
+            .unwrap()
+            .contains_key("notes/b.md")
+    );
+
+    // Retiring it again is a change against the tip, invisible against the
+    // trunk: the trunk never carried the file at all.
+    std::fs::remove_file(sub.domain_root.join("notes/b.md")).unwrap();
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    assert_eq!(second.deleted, vec!["notes/b.md".to_string()]);
+    assert!(second.added.is_empty(), "{:?}", second.added);
+    assert!(second.updated.is_empty(), "{:?}", second.updated);
+
+    let state = load_state(&sub.state_dir);
+    let files = &state.proposals[1].files;
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert_eq!(files[0].change, ProposedChange::Deleted);
+
+    // The layer's own tree drops the file the layer below it added, so the
+    // diff a reviewer reads is exactly that deletion.
+    let second_head = mock.branch_commit(&second.branch).expect("the new head");
+    assert!(
+        !mock
+            .commit_tree(&second_head)
+            .unwrap()
+            .contains_key("notes/b.md"),
+        "the layer's tree still carries the retired file"
+    );
+    assert_eq!(mock.commit_parents(&second_head), Some(vec![first_head]));
+}
+
+#[tokio::test]
+async fn preview_stacks_on_the_surviving_layer_when_the_top_ref_is_gone() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    let top_title = load_state(&sub.state_dir).proposals[0].title.clone();
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // The top layer's branch is gone: a real share settles that record and
+    // stacks onto the layer below, so a preview has to say the same.
+    mock.delete_branch(&spec(), &second.branch).await.unwrap();
+
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        plan.action,
+        PlannedAction::StackOnTop {
+            top_number: first.number,
+            top_title,
+        }
+    );
+    // The settled layer's files leave the tip with it, so its content reads
+    // as this share's work again - the same list a real share would carry.
+    let mut paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["notes/c.md"], "{paths:?}");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn preview_of_a_diverged_top_still_measures_against_the_tip() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // A reviewer moves the top layer's branch: the share would refuse, but
+    // the change list it reports is still the chain's own delta, not the
+    // whole chain re-read against the trunk.
+    let foreign = mock.add_commit(commit_files(&[("MANIFEST.md", b"# reviewer")]), None);
+    mock.set_branch(&second.branch, &foreign);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        matches!(plan.action, PlannedAction::ProposalDiverged { .. }),
+        "{:?}",
+        plan.action
+    );
+    let mut paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec!["notes/c.md"],
+        "the layers below already carry the rest: {paths:?}"
+    );
+}
+
+// Amending a named layer: the share lands on that layer's own branch instead
+// of opening a new one, and every layer above it is replayed onto the amended
+// head so the chain heals itself.
+
+/// Shares with an explicit layer to amend, the call every amend scenario
+/// makes.
+async fn amend_share(mock: &MockProvider, sub: &Subscribed, number: u64) -> ProposeOutcome {
+    amend_share_as(mock, sub, number, None).await
+}
+
+/// The same amend, run as a named GitHub login: the acting identity a personal
+/// share resolves, handed to ops as opaque metadata.
+async fn amend_share_as(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    number: u64,
+    author_login: Option<&str>,
+) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(number),
+            stacks_allowed: true,
+            author_login,
+            files: None,
+        },
+    )
+    .await
+    .expect("an amend should succeed")
+}
+
+/// The report of a share that updated a proposal, or a panic naming what came
+/// back instead.
+fn updated(outcome: ProposeOutcome) -> crystalline_remote::ops::ProposeReport {
+    match outcome {
+        ProposeOutcome::Updated(report) => report,
+        other => panic!("expected Updated, got {other:?}"),
+    }
+}
+
+/// A three-layer chain over one subscribed domain: `notes/a.md` refined by the
+/// bottom layer, `notes/b.md` added by the middle one and `notes/c.md` by the
+/// top one. Returns the layers bottom first.
+async fn stacked_three_layers(
+    mock: &MockProvider,
+) -> (Subscribed, Vec<crystalline_remote::ops::ProposeReport>) {
+    let (sub, first) = stacked_bottom_layer(mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(mock, &sub).await);
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(mock, &sub).await);
+    (sub, vec![first, second, third])
+}
+
+#[tokio::test]
+async fn amending_the_bottom_layer_cascades_force_replays_above() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let (first, second, third) = (&layers[0], &layers[1], &layers[2]);
+    let old_bottom_head = mock.branch_commit(&first.branch).expect("the bottom head");
+    // A mixed-author chain, the shape spec section 9 exists for: three layers
+    // shared by three people, amended by a fourth.
+    set_authors(
+        &sub.state_dir,
+        &[
+            (first.number, "alice"),
+            (second.number, "bob"),
+            (third.number, "carol"),
+        ],
+    );
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    let report = updated(amend_share_as(&mock, &sub, first.number, Some("dave")).await);
+    assert_eq!(report.number, first.number, "the named layer, amended");
+    assert_eq!(
+        report.stack_position,
+        Some((1, 3)),
+        "the amended layer's own position"
+    );
+
+    let delta = mock.calls().split_off(before);
+    let new_bottom = mock.branch_commit(&first.branch).expect("the new head");
+    let new_middle = mock.branch_commit(&second.branch).expect("the new head");
+    let new_top = mock.branch_commit(&third.branch).expect("the new head");
+
+    // The amended layer moves fast-forward; every layer above it is re-based
+    // and forced.
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_bottom}:force=false",
+            first.branch
+        )),
+        "{delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_middle}:force=true",
+            second.branch
+        )),
+        "{delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            third.branch
+        )),
+        "{delta:?}"
+    );
+
+    // The chain stays linear, every layer re-parented onto the one below it.
+    assert_eq!(
+        mock.commit_parents(&new_bottom),
+        Some(vec![old_bottom_head])
+    );
+    assert_eq!(
+        mock.commit_parents(&new_middle),
+        Some(vec![new_bottom.clone()])
+    );
+    assert_eq!(
+        mock.commit_parents(&new_top),
+        Some(vec![new_middle.clone()])
+    );
+
+    // Trees are snapshots, so the top carries every layer's file - with the
+    // amended content - while each layer's own tree carries only its own work.
+    let bottom_tree = mock.commit_tree(&new_bottom).expect("the amended tree");
+    assert_eq!(
+        bottom_tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v3\n".as_slice())
+    );
+    assert!(
+        !bottom_tree.contains_key("notes/b.md") && !bottom_tree.contains_key("notes/c.md"),
+        "the amended layer swallowed the layers above it: {:?}",
+        bottom_tree.keys().collect::<Vec<_>>()
+    );
+    let top_tree = mock.commit_tree(&new_top).expect("the replayed tree");
+    assert_eq!(
+        top_tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v3\n".as_slice())
+    );
+    assert_eq!(
+        top_tree.get("notes/b.md").map(Vec::as_slice),
+        Some(b"beta\n".as_slice())
+    );
+    assert_eq!(
+        top_tree.get("notes/c.md").map(Vec::as_slice),
+        Some(b"gamma\n".as_slice()),
+        "a replayed layer's own content is untouched"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals.len(), 3);
+    for (record, head) in state
+        .proposals
+        .iter()
+        .zip([&new_bottom, &new_middle, &new_top])
+    {
+        assert_eq!(record.status, ProposalStatus::Open);
+        assert_eq!(record.head_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            record.pending_head_commit, None,
+            "every layer's push finished"
+        );
+    }
+
+    // The amender's token rewrote the bottom layer, so that layer is theirs
+    // now. The layers above were replayed, not re-authored: a cascade moves a
+    // commit onto a new parent and says nothing about who proposed it.
+    let authors: Vec<Option<&str>> = state
+        .proposals
+        .iter()
+        .map(|p| p.author_login.as_deref())
+        .collect();
+    assert_eq!(
+        authors,
+        vec![Some("dave"), Some("bob"), Some("carol")],
+        "only the amended layer is re-attributed"
+    );
+
+    // An amend changes no base ref, so the stack's membership holds and no
+    // stack call is made at all.
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")),
+        "{delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn amending_a_stacked_layer_never_writes_a_merge_commit() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+
+    // The trunk moves on under the open chain.
+    let trunk = load_state(&sub.state_dir).base_commit;
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/upstream.md", b"news\n"),
+        ]),
+        Some(&trunk),
+    );
+    mock.set_branch("main", &c2);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let report = updated(amend_share(&mock, &sub, first.number).await);
+    assert_eq!(report.number, first.number);
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.base_commit, c2, "the amend pulled the trunk in first");
+    let new_bottom = mock.branch_commit(&first.branch).expect("the new head");
+    assert_eq!(
+        mock.commit_parents(&new_bottom).map(|p| p.len()),
+        Some(1),
+        "a stacked layer is always a single-parent commit"
+    );
+    // The advanced trunk arrives through the tree the layer is built on, not
+    // through a merge commit.
+    let tree = mock.commit_tree(&new_bottom).expect("the amended tree");
+    assert!(
+        tree.contains_key("notes/upstream.md"),
+        "{:?}",
+        tree.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v3\n".as_slice())
+    );
+}
+
+#[tokio::test]
+async fn amend_refuses_a_number_that_is_not_an_open_layer() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(999),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect_err("999 is not an open layer");
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(message.contains("999"), "{message}");
+            assert!(
+                message.contains(&format!("#{} (layer 1)", first.number)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("#{} (layer 2)", second.number)),
+                "{message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a refused amend writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn amend_preview_counts_the_layers_above() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let middle = &layers[1];
+
+    // A preview needs work to describe: an amend carrying nothing new is
+    // NothingToShare, exactly as a stacking share is.
+    write(&sub.domain_root.join("notes/b.md"), b"beta v2\n");
+    let before = mock.calls().len();
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(middle.number),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        plan.action,
+        PlannedAction::Amend {
+            number: middle.number,
+            url: middle.url.clone(),
+            title: load_state(&sub.state_dir).proposals[1].title.clone(),
+            layers_above: 1,
+        }
+    );
+    let paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    assert_eq!(paths, vec!["notes/b.md"], "{paths:?}");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a preview writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_file_replays_only_where_it_exists_below() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The bottom layer adds a file the trunk never had; the layer above
+    // retires it again.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/x.md"), b"ex\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+    std::fs::remove_file(sub.domain_root.join("notes/x.md")).unwrap();
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    // A retirement of a path nothing below ever carried, crafted by hand: the
+    // replay has to drop it rather than write a deletion into the tree.
+    {
+        let mut state = load_state(&sub.state_dir);
+        state.proposals[1].files.push(ProposedFile {
+            path: "notes/ghost.md".to_string(),
+            change: ProposedChange::Deleted,
+            sha256: None,
+            blob_sha: None,
+            size: None,
+        });
+        state.save(&sub.state_dir).unwrap();
+    }
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    updated(amend_share(&mock, &sub, first.number).await);
+    let delta = mock.calls().split_off(before);
+
+    // Two trees: the amended layer's own and the one replay above it.
+    let trees: Vec<&str> = delta
+        .iter()
+        .filter_map(|c| c.strip_prefix("create_tree:"))
+        .collect();
+    assert_eq!(trees.len(), 2, "{delta:?}");
+    let writes = mock.tree_writes(trees[1]).expect("the replayed tree");
+    assert!(
+        writes
+            .iter()
+            .any(|(path, blob)| path == "notes/x.md" && blob.is_none()),
+        "a retirement of a file the layer below still adds is replayed: {writes:?}"
+    );
+    assert!(
+        !writes.iter().any(|(path, _)| path == "notes/ghost.md"),
+        "a retirement of a path nothing below carries is dropped: {writes:?}"
+    );
+
+    // And it lands: the amended layer still adds the file, the layer above
+    // still retires it.
+    let bottom = mock.branch_commit(&first.branch).expect("the new head");
+    let top = mock.branch_commit(&second.branch).expect("the new head");
+    assert!(
+        mock.commit_tree(&bottom)
+            .expect("the amended tree")
+            .contains_key("notes/x.md"),
+        "the amended layer lost the file it adds"
+    );
+    assert!(
+        !mock
+            .commit_tree(&top)
+            .expect("the replayed tree")
+            .contains_key("notes/x.md")
+    );
+}
+
+// A record written before blob shas were kept (pre-0.17.0) can still be
+// amended: the file it no longer names a blob for is re-read from the working
+// tree and uploaded again, unless a layer above owns that same path - there
+// the working tree holds the layer above's content, and re-reading it would
+// quietly put that content into this layer.
+//
+// Which of the two helpers below a test uses decides which path it drives,
+// and the distinction is easy to lose: a record stripped of its size reads as
+// this share's own fresh work and takes the ordinary create path, so only
+// `forget_blob_shas_keeping_size` reaches the kept-entry re-read.
+
+/// Strips the blob sha and size off every file the layer at `index` records,
+/// leaving the record in the pre-0.17.0 shape.
+fn forget_blob_shas(state_dir: &Path, index: usize) {
+    let mut state = load_state(state_dir);
+    for file in state.proposals[index].files.iter_mut() {
+        file.blob_sha = None;
+        file.size = None;
+    }
+    state.save(state_dir).unwrap();
+}
+
+/// [`forget_blob_shas`] with the recorded size left alone, which is what it
+/// takes to reach the kept-entry re-read at all.
+///
+/// A record that loses its size too stops matching the chain tip it is
+/// measured against - the tip falls back to the trunk's size, and
+/// `detect_local_changes` calls a size mismatch a change before it ever
+/// hashes - so the path reads as this share's own FRESH work and the
+/// kept-entry branch is never entered. Keeping the size is therefore not a
+/// convenience here; it is the difference between testing the re-read and
+/// testing the ordinary create.
+fn forget_blob_shas_keeping_size(state_dir: &Path, index: usize) {
+    let mut state = load_state(state_dir);
+    for file in state.proposals[index].files.iter_mut() {
+        file.blob_sha = None;
+    }
+    state.save(state_dir).unwrap();
+}
+
+#[tokio::test]
+async fn amending_a_legacy_layer_re_uploads_what_its_record_lost() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    forget_blob_shas_keeping_size(&sub.state_dir, 0);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let report = updated(amend_share(&mock, &sub, first.number).await);
+    assert_eq!(report.number, first.number);
+
+    // The file the record could no longer name a blob for was re-read from
+    // the working tree and uploaded again. This is the kept-entry branch,
+    // not the fresh-change one: notes/a.md still matches the stamp its own
+    // layer records, so this share detects nothing there and the blob can
+    // only have come from the re-read.
+    let delta = mock.calls().split_off(before);
+    assert!(
+        delta.contains(&format!("create_blob:{}", sha256_hex(b"alpha v2\n"))),
+        "{delta:?}"
+    );
+
+    // And the amend is an ordinary stacked one: one parent, no merge commit,
+    // both files in the tree.
+    let head = mock.branch_commit(&first.branch).expect("the new head");
+    assert_eq!(mock.commit_parents(&head).map(|p| p.len()), Some(1));
+    let tree = mock.commit_tree(&head).expect("the amended tree");
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v2\n".as_slice())
+    );
+    assert_eq!(
+        tree.get("notes/b.md").map(Vec::as_slice),
+        Some(b"beta\n".as_slice())
+    );
+
+    let state = load_state(&sub.state_dir);
+    let kept = state.proposals[0]
+        .files
+        .iter()
+        .find(|f| f.path == "notes/a.md")
+        .expect("the layer still carries its own file");
+    assert_eq!(
+        kept.blob_sha.as_deref(),
+        Some(sha256_hex(b"alpha v2\n").as_str()),
+        "the record adopted the blob the re-read uploaded: {kept:?}"
+    );
+    assert_eq!(
+        kept.size,
+        Some(b"alpha v2\n".len() as u64),
+        "and the size the rebuild pass wrote back: {kept:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_legacy_layer_a_layer_above_overwrote_refuses_before_any_write() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // The layer above refines the very file the bottom layer carries.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+    forget_blob_shas(&sub.state_dir, 0);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(first.number),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect_err("the working tree cannot speak for this layer's copy");
+    match &err {
+        // A refusal, not a State error: the caller asked for something this
+        // chain cannot honor, and the message names the way out.
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(
+                message.contains(&format!("layer #{}", first.number)),
+                "{message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a refused amend writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_on_a_later_kept_entry_leaves_no_orphan_blob_behind() {
+    // Two legacy entries: the first has everything it needs to be re-read and
+    // uploaded, the second is owned by the layer above and refuses. Every
+    // kept entry is judged before the first upload, so the refusal costs the
+    // repository nothing - no blob for the first entry goes up and is then
+    // stranded by the second entry's refusal.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/z.md", b"zeta\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/z.md"), b"zeta v2\n");
+    let first = proposed(stacked_share(&mock, &sub).await);
+
+    // The layer above takes over one of the two paths, which is what makes
+    // that entry unrebuildable from the working tree.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+
+    // Only the blob sha is dropped: an entry that also lost its size reads as
+    // a fresh change again and never reaches the kept-entry path at all.
+    // The record's file order decides which entry that path reaches first, and
+    // the point here is a refusal on a LATER entry, so the owned path is
+    // pinned to the end rather than left to detection order.
+    let mut state = load_state(&sub.state_dir);
+    for file in state.proposals[0].files.iter_mut() {
+        file.blob_sha = None;
+    }
+    state.proposals[0]
+        .files
+        .sort_by_key(|f| f.path == "notes/a.md");
+    state.save(&sub.state_dir).unwrap();
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0]
+            .files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>(),
+        vec!["notes/z.md".to_string(), "notes/a.md".to_string()]
+    );
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(first.number),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect_err("the layer above owns notes/a.md");
+    assert!(
+        matches!(err, crystalline_remote::RemoteError::Refused(_)),
+        "{err:?}"
+    );
+
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_blob")),
+        "notes/z.md's blob must not go up ahead of notes/a.md's refusal: {delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a refused amend writes nothing: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn amend_preview_reports_a_diverged_layer_rather_than_promising_an_amend() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+
+    // A reviewer pushes onto the layer the share would amend.
+    let foreign = mock.add_commit(commit_files(&[("MANIFEST.md", b"# reviewer")]), None);
+    mock.set_branch(&first.branch, &foreign);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(first.number),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    match plan.action {
+        PlannedAction::ProposalDiverged {
+            number, ref branch, ..
+        } => {
+            assert_eq!(number, first.number, "the named layer, not the top");
+            assert_eq!(*branch, first.branch);
+        }
+        ref other => panic!("expected ProposalDiverged, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn amend_preview_refuses_over_an_unreplayable_layer_above() {
+    // The cascade an amend runs replays every layer above it, and a layer
+    // whose record predates blob shas cannot be replayed. The share refuses
+    // over that before its first write, so the preview refuses in the same
+    // words rather than promising an Amend that would then be turned down.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    forget_blob_shas(&sub.state_dir, 1);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let options = || ShareOptions {
+        title: None,
+        description: None,
+        proposal: Some(first.number),
+        stacks_allowed: true,
+        author_login: None,
+        files: None,
+    };
+    let err = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .expect_err("the layer above cannot be replayed");
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(
+                message.contains(&format!("layer #{}", second.number)),
+                "{message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+
+    // And the share raises the very same refusal, which is the point: the
+    // preview's answer is the share's answer.
+    let shared = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        options(),
+    )
+    .await
+    .expect_err("the share refuses too");
+    assert_eq!(format!("{shared}"), format!("{err}"));
+}
+
+// The stacked withdrawal: taking one layer out of an open chain closes its
+// pull request, repairs the stack around the hole it leaves (dissolve, replay,
+// retarget, recreate) and excises its content from every layer above it. The
+// repair is interruption-safe: `repair_pending` marks it from the first
+// forge-visible step, and the next withdraw or share finishes what a dying
+// process left behind.
+
+/// Withdraws with stacking allowed, the call every repair scenario makes.
+async fn stacked_withdraw(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    number: Option<u64>,
+    revert: bool,
+) -> crystalline_remote::ops::WithdrawReport {
+    withdraw(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        number,
+        revert,
+        true,
+    )
+    .await
+    .expect("a stacked withdraw should succeed")
+}
+
+/// The numbers of the open layers in saved state, bottom first.
+fn open_numbers(state_dir: &Path) -> Vec<u64> {
+    load_state(state_dir)
+        .proposals
+        .iter()
+        .filter(|p| p.status == ProposalStatus::Open)
+        .map(|p| p.number)
+        .collect()
+}
+
+/// The index of `call` in a recorded delta, or a panic naming the delta.
+fn call_at(delta: &[String], call: &str) -> usize {
+    delta
+        .iter()
+        .position(|c| c == call)
+        .unwrap_or_else(|| panic!("no {call} in {delta:?}"))
+}
+
+#[tokio::test]
+async fn withdrawing_the_top_layer_repairs_the_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(report.number, layers[2].number);
+    assert!(report.closed);
+    let close_at = call_at(&delta, &format!("close_proposal:{}", layers[2].number));
+    let dissolve_at = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let create_at = call_at(
+        &delta,
+        &format!("create_stack:[{},{}]", layers[0].number, layers[1].number),
+    );
+    let delete_at = call_at(&delta, &format!("delete_branch:{}", layers[2].branch));
+    assert!(close_at < dissolve_at, "{delta:?}");
+    assert!(dissolve_at < create_at, "{delta:?}");
+    assert!(
+        create_at < delete_at,
+        "the withdrawn branch goes last: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    let new_stack = state.stack_number.expect("the survivors are re-linked");
+    assert_ne!(new_stack, old_stack, "a recreate allocates a fresh number");
+    assert!(report.repaired);
+    assert_eq!(report.restacked, Some(new_stack));
+    assert!(!state.repair_pending);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number]
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_a_middle_layer_excises_its_content() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+    let bottom_head = mock
+        .branch_commit(&layers[0].branch)
+        .expect("the bottom head");
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    let delta = mock.calls().split_off(before);
+    assert!(report.repaired);
+
+    // The top layer was replayed onto the layer below the hole, so its tree
+    // carries the bottom layer's work and its own, and nothing of the layer
+    // that left.
+    let new_top = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the replayed head");
+    assert_eq!(mock.commit_parents(&new_top), Some(vec![bottom_head]));
+    let tree = mock.commit_tree(&new_top).expect("the replayed tree");
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha v2\n".as_slice())
+    );
+    assert_eq!(
+        tree.get("notes/c.md").map(Vec::as_slice),
+        Some(b"gamma\n".as_slice())
+    );
+    assert!(
+        !tree.contains_key("notes/b.md"),
+        "the withdrawn layer's file rode along: {:?}",
+        tree.keys().collect::<Vec<_>>()
+    );
+
+    // The survivor above the hole now targets the branch below it, and the
+    // retarget waits for the dissolve: a stacked proposal cannot be retargeted.
+    let dissolve_at = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let retarget_at = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    assert!(dissolve_at < retarget_at, "{delta:?}");
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{}]",
+            layers[0].number, layers[2].number
+        )),
+        "{delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert_eq!(
+        state
+            .proposals
+            .iter()
+            .map(|p| p.number)
+            .collect::<Vec<u64>>(),
+        vec![layers[0].number, layers[2].number]
+    );
+}
+
+#[tokio::test]
+async fn withdrawing_the_bottom_layer_retargets_onto_the_trunk() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let base = load_state(&sub.state_dir).base_commit;
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(first.number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    // The survivor is replayed straight onto the trunk and targets it too.
+    let new_head = mock
+        .branch_commit(&second.branch)
+        .expect("the replayed head");
+    assert_eq!(mock.commit_parents(&new_head), Some(vec![base]));
+    assert!(
+        delta.contains(&format!("update_proposal_base:{}:main", second.number)),
+        "{delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")),
+        "one survivor is no stack: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, None);
+    assert_eq!(report.restacked, None);
+    assert!(report.repaired);
+    assert!(!state.repair_pending);
+    assert_eq!(open_numbers(&sub.state_dir), vec![second.number]);
+}
+
+#[tokio::test]
+async fn an_interrupted_repair_resumes_on_the_next_withdraw() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A withdrawal of the middle layer died right after the dissolve: the pull
+    // request is closed and the stack is gone upstream, while local state
+    // still records the layer as open and the repair as pending.
+    Provider::close_proposal(&mock, &spec(), layers[1].number)
+        .await
+        .unwrap();
+    Provider::dissolve_stack(&mock, &spec(), old_stack)
+        .await
+        .unwrap();
+    let mut state = load_state(&sub.state_dir);
+    state.repair_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+    let delta = mock.calls().split_off(before);
+    assert_eq!(report.number, layers[2].number);
+
+    // The interrupted repair finished before the new withdrawal's own close.
+    let retarget_at = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    let close_at = call_at(&delta, &format!("close_proposal:{}", layers[2].number));
+    assert!(retarget_at < close_at, "{delta:?}");
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert_eq!(open_numbers(&sub.state_dir), vec![layers[0].number]);
+    assert_eq!(state.stack_number, None);
+    assert!(
+        state.history.iter().any(|p| p.number == layers[1].number
+            && matches!(
+                p.status,
+                ProposalStatus::Withdrawn | ProposalStatus::Declined
+            )),
+        "the layer the repair settled: {:?}",
+        state.history
+    );
+}
+
+#[tokio::test]
+async fn stacked_withdraw_with_no_number_takes_the_top() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, None, false).await;
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(
+        report.number, second.number,
+        "the top layer, not the bottom"
+    );
+    assert!(delta.contains(&format!("close_proposal:{}", second.number)));
+    assert!(
+        !delta.contains(&format!("close_proposal:{}", first.number)),
+        "{delta:?}"
+    );
+    assert_eq!(open_numbers(&sub.state_dir), vec![first.number]);
+}
+
+#[tokio::test]
+async fn withdraw_revert_still_only_touches_the_withdrawn_layers_files() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+
+    let report = stacked_withdraw(&mock, &sub, Some(second.number), true).await;
+
+    assert_eq!(report.deleted, vec!["notes/b.md".to_string()]);
+    assert!(report.restored.is_empty(), "{:?}", report.restored);
+    assert!(
+        !sub.domain_root.join("notes/b.md").exists(),
+        "the withdrawn layer's own file is gone"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/a.md")),
+        b"alpha v2\n",
+        "the layer below keeps its work"
+    );
+}
+
+#[tokio::test]
+async fn a_settled_top_layer_leaves_no_wedged_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer closes the top layer and deletes its branch. The share below
+    // settles that record, and the stack it leaves behind holds a closed
+    // member, which the forge refuses to extend forever.
+    Provider::delete_branch(&mock, &spec(), &second.branch)
+        .await
+        .unwrap();
+    mock.set_proposal_state(second.number, ProposalState::Declined);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/c.md"), b"gamma\n");
+    let third = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "the wedged stack is dissolved: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("create_stack:[{},{}]", first.number, third.number)),
+        "{delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "no owed link is left behind");
+    assert!(!state.repair_pending);
+    let stack = state.stack_number.expect("the healed chain is linked");
+    assert_ne!(stack, old_stack);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![first.number, third.number]
+    );
+}
+
+#[tokio::test]
+async fn an_owed_stack_link_extends_the_stack_that_already_exists() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A repair got as far as recreating the stack over the two bottom layers
+    // and then died: the top layer's membership is still owed.
+    Provider::dissolve_stack(&mock, &spec(), old_stack)
+        .await
+        .unwrap();
+    let recreated = Provider::create_stack(&mock, &spec(), &[layers[0].number, layers[1].number])
+        .await
+        .unwrap();
+    let mut state = load_state(&sub.state_dir);
+    state.stack_number = Some(recreated.number);
+    state.stack_link_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let _fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!(
+            "extend_stack:{}:[{}]",
+            recreated.number, layers[2].number
+        )),
+        "the owed member is added to the existing stack: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending);
+    assert_eq!(state.stack_number, Some(recreated.number));
+}
+
+/// A two-layer chain whose bottom layer adds a file the trunk never carried
+/// and whose top layer retires it again, the shape a revert can only undo from
+/// the lower layer's recorded blob.
+async fn chain_retiring_a_lower_file(
+    mock: &MockProvider,
+) -> (Subscribed, Vec<crystalline_remote::ops::ProposeReport>) {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/new.md"), b"fresh\n");
+    let first = proposed(stacked_share(mock, &sub).await);
+    std::fs::remove_file(sub.domain_root.join("notes/new.md")).unwrap();
+    let second = proposed(stacked_share(mock, &sub).await);
+    (sub, vec![first, second])
+}
+
+#[tokio::test]
+async fn a_revert_restores_a_file_only_the_layer_below_ever_carried() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = chain_retiring_a_lower_file(&mock).await;
+
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), true).await;
+
+    assert_eq!(report.restored, vec!["notes/new.md".to_string()]);
+    assert!(
+        report.skipped_reverts.is_empty(),
+        "{:?}",
+        report.skipped_reverts
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/new.md")),
+        b"fresh\n",
+        "restored from the lower layer's recorded blob"
+    );
+}
+
+#[tokio::test]
+async fn a_revert_skips_a_file_no_recorded_blob_can_restore() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = chain_retiring_a_lower_file(&mock).await;
+    // The lower layer's record predates blob shas, so there is nothing left to
+    // fetch the retired file's content from.
+    forget_blob_shas(&sub.state_dir, 0);
+
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), true).await;
+
+    assert_eq!(report.skipped_reverts, vec!["notes/new.md".to_string()]);
+    assert!(report.restored.is_empty(), "{:?}", report.restored);
+    assert!(
+        !sub.domain_root.join("notes/new.md").exists(),
+        "nothing was invented for the file"
+    );
+}
+
+#[tokio::test]
+async fn a_repaired_chain_is_not_repaired_again_on_the_next_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    let stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the survivors were re-linked");
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        !delta.iter().any(|c| c.starts_with("dissolve_stack")),
+        "a healthy chain is left alone: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("extend_stack:{stack}:[{}]", fourth.number)),
+        "{delta:?}"
+    );
+    assert_eq!(fourth.stack_number, Some(stack));
+}
+
+#[tokio::test]
+async fn a_merged_layer_mid_chain_refuses_the_repair_until_it_is_pulled() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A status poll flips the middle layer to Merged without advancing the
+    // base commit: its content is on the trunk, and nothing local knows it
+    // yet. Replaying the top onto the bottom here would rebuild it without
+    // the merged files, which reads as a deletion on the forge.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[1].status = ProposalStatus::Merged;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(layers[2].number),
+        false,
+        true,
+    )
+    .await
+    .expect_err("a chain with a merged layer cannot be repaired yet");
+    let delta = mock.calls().split_off(before);
+
+    match err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(
+                message.contains(&format!("#{}", layers[1].number)),
+                "the refusal names the merged layer: {message}"
+            );
+            assert!(
+                message.contains("pull"),
+                "the refusal names the way out: {message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)
+            || c.starts_with("dissolve_stack")
+            || c.starts_with("create_stack")),
+        "a refused withdrawal writes nothing: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert_eq!(state.proposals.len(), 3, "the chain is left as it stands");
+}
+
+#[tokio::test]
+async fn a_declined_bottom_layer_heals_the_chain_on_the_next_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+    let trunk = load_state(&sub.state_dir).base_commit;
+
+    // A reviewer closes the BOTTOM layer. Everything above it now sits on a
+    // branch that is going nowhere, and the stack holds a closed member.
+    mock.set_proposal_state(layers[0].number, ProposalState::Declined);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    // The survivors were replayed onto the trunk, so the closed layer's own
+    // work is excised from every tree above it.
+    let new_middle = mock
+        .branch_commit(&layers[1].branch)
+        .expect("the replayed head");
+    assert_eq!(mock.commit_parents(&new_middle), Some(vec![trunk]));
+    let tree = mock.commit_tree(&new_middle).expect("the replayed tree");
+    assert_eq!(
+        tree.get("notes/a.md").map(Vec::as_slice),
+        Some(b"alpha\n".as_slice()),
+        "the declined layer's refinement is gone"
+    );
+    assert_eq!(
+        tree.get("notes/b.md").map(Vec::as_slice),
+        Some(b"beta\n".as_slice())
+    );
+
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "{delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("update_proposal_base:{}:main", layers[1].number)),
+        "the new bottom targets the trunk: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{}]",
+            layers[1].number, layers[2].number
+        )),
+        "{delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.repair_pending);
+    assert!(!state.stack_link_pending);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[1].number, layers[2].number, fourth.number]
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[0].number),
+        "the closed layer left the chain: {:?}",
+        state.history
+    );
+}
+
+#[tokio::test]
+async fn a_repair_settles_a_declined_layer_the_way_it_settles_a_withdrawn_one() {
+    // A share supersedes a declined proposal on its way past it, but a
+    // withdrawal never goes through that step: the repair is what closes the
+    // chain around both holes, so it moves both records to history rather than
+    // leaving the declined one behind for the next repair to walk again.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A reviewer closes the middle layer, and this machine withdraws the
+    // bottom one: two holes at once, of two different kinds.
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert_eq!(load_state(&sub.state_dir).proposals.len(), 3);
+
+    stacked_withdraw(&mock, &sub, Some(layers[0].number), false).await;
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(open_numbers(&sub.state_dir), vec![layers[2].number]);
+    assert!(
+        state
+            .proposals
+            .iter()
+            .all(|p| p.status == ProposalStatus::Open),
+        "the repair left no settled record in the chain: {:?}",
+        state.proposals
+    );
+    let declined = state
+        .history
+        .iter()
+        .find(|p| p.number == layers[1].number)
+        .expect("the declined layer went to history");
+    assert_eq!(
+        declined.status,
+        ProposalStatus::Declined,
+        "it keeps the status it settled with"
+    );
+    let withdrawn = state
+        .history
+        .iter()
+        .find(|p| p.number == layers[0].number)
+        .expect("the withdrawn layer went to history");
+    assert_eq!(withdrawn.status, ProposalStatus::Withdrawn);
+}
+
+#[tokio::test]
+async fn legacy_multi_open_withdraw_still_names_its_candidates() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Two open records with no stack behind them: residue from before
+    // stacking, where naming the top would mean something this machine
+    // cannot deliver.
+    for number in [41u64, 42] {
+        seed_proposal(&sub.state_dir, number, "notes/a.md", None);
+        let branch = format!("crystalline/share-{number}");
+        mock.register_proposal_branch(number, &branch);
+        mock.set_branch(&branch, &c1);
+        mock.set_proposal_state(number, ProposalState::Open);
+    }
+
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+        true,
+    )
+    .await
+    .expect_err("a legacy multi-open state has no default target");
+    match err {
+        crystalline_remote::RemoteError::NoWithdrawTarget { open, declined } => {
+            assert_eq!(open, vec![41, 42]);
+            assert!(declined.is_empty(), "{declined:?}");
+        }
+        other => panic!("expected NoWithdrawTarget, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn withdraw_settles_an_owed_stack_link_before_closing() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "the chain is degraded to begin with"
+    );
+
+    mock.heal_create_stack();
+    let before = mock.calls().len();
+    stacked_withdraw(&mock, &sub, Some(second.number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    let link_at = call_at(
+        &delta,
+        &format!("create_stack:[{},{}]", first.number, second.number),
+    );
+    let close_at = call_at(&delta, &format!("close_proposal:{}", second.number));
+    assert!(
+        link_at < close_at,
+        "the owed link is settled before the withdrawal's own work: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the debt is cleared");
+    assert_eq!(state.stack_number, None, "one survivor is no chain");
+    assert_eq!(open_numbers(&sub.state_dir), vec![first.number]);
+}
+
+// A merge upstream is the one event that moves a whole chain without anyone
+// asking this machine: GitHub rebases every layer above the merged one onto
+// the new trunk. These scenarios drive the pull that adopts that rebase, the
+// amendment it must NOT swallow, and the four stack fields a status carries.
+
+/// A status against the stack-serving mock: online, with stacking allowed.
+async fn stacked_status(mock: &MockProvider, sub: &Subscribed) -> OriginStatusReport {
+    status(&spec(), &sub.domain_root, &sub.state_dir, Some(mock), true)
+        .await
+        .expect("a status should succeed")
+}
+
+/// Marks `layer` merged on the mock forge, moves the trunk onto a commit
+/// carrying its file and returns the new trunk commit: the shape GitHub leaves
+/// behind when it merges the bottom of a two-layer chain.
+async fn merge_the_bottom(mock: &MockProvider, sub: &Subscribed, number: u64) -> String {
+    let trunk = load_state(&sub.state_dir).base_commit;
+    mock.set_proposal_state(number, ProposalState::Merged);
+    let merged = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v2\n"),
+        ]),
+        Some(&trunk),
+    );
+    mock.set_branch("main", &merged);
+    merged
+}
+
+#[tokio::test]
+async fn merging_the_bottom_adopts_githubs_rebase_of_the_layer_above() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_top = mock.branch_commit(&second.branch).expect("the top head");
+
+    // The forge merges the bottom layer and rebases the one above onto the new
+    // trunk: a fresh commit with the very same tree and a new parent.
+    let merged = merge_the_bottom(&mock, &sub, first.number).await;
+    let same_tree = mock.commit_tree(&old_top).expect("the top layer's tree");
+    let rebased = mock.add_commit(same_tree, Some(&merged));
+    mock.set_branch(&second.branch, &rebased);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.history.iter().any(|p| p.number == first.number),
+        "the merged layer was consumed: {:?}",
+        state.history
+    );
+    let top = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the layer above is still open");
+    assert_eq!(
+        top.head_commit.as_deref(),
+        Some(rebased.as_str()),
+        "the rebase was adopted rather than read as an amendment"
+    );
+    assert_eq!(
+        top.base_commit.as_deref(),
+        Some(merged.as_str()),
+        "the survivor stands on the new trunk"
+    );
+
+    let report = stacked_status(&mock, &sub).await;
+    assert!(
+        report.amended_upstream.is_empty(),
+        "nobody amended anything: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_real_amendment_during_rebase_is_still_flagged() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_top = mock.branch_commit(&second.branch).expect("the top head");
+
+    // Same shape, except the new head also changes the layer's OWN file: that
+    // is a reviewer's amendment riding along, not a rebase.
+    let merged = merge_the_bottom(&mock, &sub, first.number).await;
+    let mut tree = mock.commit_tree(&old_top).expect("the top layer's tree");
+    tree.insert("notes/b.md".to_string(), b"beta, reviewed\n".to_vec());
+    let amended = mock.add_commit(tree, Some(&merged));
+    mock.set_branch(&second.branch, &amended);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    let top = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the layer above is still open");
+    assert_eq!(
+        top.head_commit.as_deref(),
+        Some(old_top.as_str()),
+        "a head that touches the layer's own file is never adopted"
+    );
+
+    let report = stacked_status(&mock, &sub).await;
+    assert_eq!(report.amended_upstream, vec![second.number]);
+}
+
+#[tokio::test]
+async fn a_rebase_that_moves_only_unowned_files_is_still_adopted() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    let old_top = mock.branch_commit(&second.branch).expect("the top head");
+
+    // The reviewer merged the bottom layer with a wording change of their own,
+    // so the rebase really does move the top layer's tree - in the BOTTOM
+    // layer's file, which the top layer does not own. Adoption turns on whose
+    // files moved, never on whether anything moved at all.
+    let trunk = load_state(&sub.state_dir).base_commit;
+    mock.set_proposal_state(first.number, ProposalState::Merged);
+    let merged = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v3\n"),
+        ]),
+        Some(&trunk),
+    );
+    mock.set_branch("main", &merged);
+    let mut tree = mock.commit_tree(&old_top).expect("the top layer's tree");
+    tree.insert("notes/a.md".to_string(), b"alpha v3\n".to_vec());
+    let rebased = mock.add_commit(tree, Some(&merged));
+    mock.set_branch(&second.branch, &rebased);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let moved = Provider::compare(&mock, &spec(), &old_top, &rebased)
+        .await
+        .unwrap();
+    assert_eq!(
+        moved
+            .files
+            .iter()
+            .map(|c| c.path.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["notes/a.md"],
+        "the two heads really do differ, in a file the top layer never touched"
+    );
+
+    let state = load_state(&sub.state_dir);
+    let top = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the layer above is still open");
+    assert_eq!(
+        top.head_commit.as_deref(),
+        Some(rebased.as_str()),
+        "a non-empty diff over unowned paths is still a rebase"
+    );
+
+    let report = stacked_status(&mock, &sub).await;
+    assert!(
+        report.amended_upstream.is_empty(),
+        "nobody amended anything: {report:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_decline_mid_chain_reads_as_wedged() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer closes the MIDDLE layer: the top is stacked on a branch that
+    // is going nowhere, which is what wedged names.
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let report = stacked_status(&mock, &sub).await;
+    assert_eq!(report.stack_wedged, vec![layers[1].number]);
+    assert_eq!(report.stack_number, Some(old_stack));
+    assert!(!report.repair_pending);
+    assert!(!report.stack_link_pending);
+    assert_eq!(report.declined_proposals.len(), 1);
+    assert_eq!(report.open_proposals.len(), 2);
+
+    // The next share repairs the chain before it stacks anything onto it.
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    let dissolve_at = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let retarget_at = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    let branch_at = delta
+        .iter()
+        .position(|c| c.starts_with(&format!("create_branch:{}:", fourth.branch)))
+        .unwrap_or_else(|| panic!("no branch for the new layer in {delta:?}"));
+    assert!(dissolve_at < retarget_at, "{delta:?}");
+    assert!(
+        dissolve_at < branch_at,
+        "the repair runs before the new layer is built: {delta:?}"
+    );
+
+    let healed = stacked_status(&mock, &sub).await;
+    assert!(healed.stack_wedged.is_empty(), "{healed:?}");
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number, fourth.number]
+    );
+    assert!(
+        load_state(&sub.state_dir)
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number),
+        "the declined layer left the chain"
+    );
+}
+
+#[tokio::test]
+async fn status_reports_link_pending_and_heals_it_with_a_probe() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "the chain is degraded to begin with"
+    );
+
+    // Offline the debt can only be reported, never settled.
+    let offline = status(&spec(), &sub.domain_root, &sub.state_dir, None, true)
+        .await
+        .unwrap();
+    assert!(offline.stack_link_pending);
+    assert_eq!(offline.stack_number, None);
+
+    mock.heal_create_stack();
+    let report = stacked_status(&mock, &sub).await;
+    assert!(
+        !report.stack_link_pending,
+        "the probe settled the owed link: {report:?}"
+    );
+    let stack = report.stack_number.expect("the chain is linked now");
+    assert!(
+        mock.calls().contains(&format!(
+            "create_stack:[{},{}]",
+            first.number, second.number
+        )),
+        "{:?}",
+        mock.calls()
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, Some(stack));
+    assert!(!state.stack_link_pending);
+}
+
+/// Settling an owed link is a forge WRITE, so it is the caller's to permit: a
+/// status that says no reports the debt exactly as it stands and makes no
+/// stack call at all - not the settlement, not even the capability probe in
+/// front of it - and the debt is still there afterwards for a caller that says
+/// yes to pay off. The permission is the only difference between the two runs
+/// below, which is what makes this a pin on the flag rather than on the
+/// weather.
+#[tokio::test]
+async fn a_status_refused_the_permission_reports_the_owed_link_and_writes_nothing() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    mock.fail_create_stack();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "the chain is degraded to begin with"
+    );
+    mock.heal_create_stack();
+
+    let before = mock.calls().len();
+    let refused = status(
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(&mock),
+        false,
+    )
+    .await
+    .expect("a status should succeed");
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("list_stacks")),
+        "no stack call was permitted: {delta:?}"
+    );
+    assert!(
+        refused.stack_link_pending,
+        "the debt is reported, not settled: {refused:?}"
+    );
+    assert!(
+        load_state(&sub.state_dir).stack_link_pending,
+        "and it is still owed on disk"
+    );
+
+    // The same call with the permission granted pays it off, on the same
+    // provider and the same debt.
+    let settled = stacked_status(&mock, &sub).await;
+    assert!(!settled.stack_link_pending, "{settled:?}");
+    assert!(
+        mock.calls().contains(&format!(
+            "create_stack:[{},{}]",
+            first.number, second.number
+        )),
+        "{:?}",
+        mock.calls()
+    );
+}
+
+#[tokio::test]
+async fn merging_the_top_consumes_the_whole_chain_in_one_pull() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    for layer in &layers {
+        mock.set_proposal_state(layer.number, ProposalState::Merged);
+    }
+    // Merging the top merges everything under it, so the trunk lands on the
+    // top layer's own head, carrying all three files.
+    let top_head = mock.branch_commit(&layers[2].branch).expect("the top head");
+    mock.set_branch("main", &top_head);
+
+    pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.proposals.is_empty(),
+        "every layer was consumed: {:?}",
+        state.proposals
+    );
+    for layer in &layers {
+        assert!(
+            state.history.iter().any(|p| p.number == layer.number),
+            "layer #{} reached history: {:?}",
+            layer.number,
+            state.history
+        );
+    }
+    assert_eq!(
+        state.stack_number, None,
+        "the last open layer left the chain"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/a.md")), b"alpha v2\n");
+    assert_eq!(read(&sub.domain_root.join("notes/b.md")), b"beta\n");
+    assert_eq!(read(&sub.domain_root.join("notes/c.md")), b"gamma\n");
+}
+
+#[tokio::test]
+async fn a_merged_top_no_longer_blocks_repairing_the_chain_below_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A status poll flipped the TOP layer to Merged without consuming it.
+    // Nothing sits above it, so no survivor is replayed and no tree can lose
+    // what the merge brought: the withdrawal below it goes through.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[2].status = ProposalStatus::Merged;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[1].number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    assert!(report.closed);
+    assert!(report.repaired);
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "{delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| c.starts_with("create_tree")),
+        "no layer above the hole is replayed: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(open_numbers(&sub.state_dir), vec![layers[0].number]);
+    assert!(
+        state
+            .proposals
+            .iter()
+            .any(|p| p.number == layers[2].number && p.status == ProposalStatus::Merged),
+        "the merged layer stays for the next pull to consume: {:?}",
+        state.proposals
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[1].number),
+        "the withdrawn layer reached history"
+    );
+    assert!(!state.repair_pending);
+}
+
+#[tokio::test]
+async fn an_up_to_date_pull_still_consumes_a_merged_layer() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A status poll flipped the top layer to Merged. The trunk has not moved,
+    // so the pull the merged-layer refusal advises takes the up-to-date arm -
+    // and it has to consume the record there too, or the advice never clears.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[2].status = ProposalStatus::Merged;
+    state.save(&sub.state_dir).unwrap();
+    mock.set_proposal_state(layers[2].number, ProposalState::Merged);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(report.up_to_date, "the trunk never moved");
+
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.proposals.iter().all(|p| p.number != layers[2].number),
+        "the merged layer was consumed: {:?}",
+        state.proposals
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[2].number),
+        "it reached history"
+    );
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number]
+    );
+}
+
+// The fallback pin: stacking is an optional capability, so the two ways of
+// not having it - a forge that answers the probe with a 404, and an install
+// with `github.stacks` off - must land on the 0.16.0 living-proposal
+// lifecycle exactly as it was: one proposal updated in place, the merge-commit
+// rule intact, `withdraw` with no target resolving the single open one. The
+// only cost stacking is allowed to add on those paths is the one probe the
+// capability question itself costs, and on the config-off path not even that.
+
+/// Shares with `github.stacks` set to `allowed` and no title overrides, the
+/// call both fallback scenarios make.
+async fn share_with_stacks(mock: &MockProvider, sub: &Subscribed, allowed: bool) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: allowed,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect("a share should succeed whether or not the forge serves stacks")
+}
+
+/// Every stack verb the mock recorded: the probe and the three linking calls.
+fn stack_calls(mock: &MockProvider) -> Vec<String> {
+    mock.calls()
+        .into_iter()
+        .filter(|c| {
+            c.starts_with("list_stacks")
+                || c.starts_with("create_stack")
+                || c.starts_with("extend_stack")
+                || c.starts_with("dissolve_stack")
+        })
+        .collect()
+}
+
+/// How many capability probes left the machine: `list_stacks` with no
+/// argument, the bare listing `stacks_available` asks for.
+fn probe_count(mock: &MockProvider) -> usize {
+    mock.calls().iter().filter(|c| *c == "list_stacks").count()
+}
+
+/// The whole 0.16.0 share lifecycle over one domain: a first share opens a
+/// proposal, upstream advances, a second share updates that same proposal in
+/// place with a two-parent merge commit, and an untargeted `withdraw` closes
+/// it. Asserts the shape; the caller adds the call-level expectations that
+/// tell its scenario apart.
+async fn assert_living_proposal_lifecycle(mock: &MockProvider, allowed: bool) -> Subscribed {
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(share_with_stacks(mock, &sub, allowed).await);
+    assert_eq!(first.stack_number, None, "nothing was stacked");
+    assert_eq!(first.stack_position, None);
+    let head_after_create = mock.branch_commit(&first.branch).expect("the branch head");
+
+    // Upstream advances between the shares, so the update commit owes two
+    // parents: the merge-base rule the living proposal has always followed.
+    let old_base = load_state(&sub.state_dir).base_commit.clone();
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/upstream.md", b"from the team\n"),
+        ]),
+        Some(&old_base),
+    );
+    mock.set_branch("main", &c2);
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let updated = match share_with_stacks(mock, &sub, allowed).await {
+        ProposeOutcome::Updated(report) => report,
+        other => panic!("a second share must update the open proposal, got {other:?}"),
+    };
+    assert_eq!(updated.number, first.number, "the same proposal");
+    assert_eq!(updated.url, first.url);
+    assert_eq!(updated.branch, first.branch);
+    assert_eq!(updated.stack_number, None);
+
+    let head_after_update = mock.branch_commit(&first.branch).expect("the new head");
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        mock.commit_parents(&head_after_update).unwrap(),
+        vec![head_after_create, state.base_commit.clone()],
+        "branch head first, then the advanced base"
+    );
+    assert_eq!(
+        state.proposals.len(),
+        1,
+        "one living proposal, never a chain"
+    );
+    assert_eq!(state.stack_number, None);
+    assert!(!state.stack_link_pending);
+    assert!(!state.repair_pending);
+
+    // No target: the single open proposal is the only thing it could mean.
+    let report = withdraw(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        None,
+        false,
+        allowed,
+    )
+    .await
+    .expect("withdrawing the one open proposal");
+    assert_eq!(report.number, first.number);
+    assert!(report.closed);
+    assert!(!report.repaired, "there is no stack to repair");
+    assert_eq!(report.restacked, None);
+
+    let state = load_state(&sub.state_dir);
+    assert!(state.proposals.is_empty(), "{:?}", state.proposals);
+    assert_eq!(state.history[0].number, first.number);
+    assert_eq!(state.history[0].status, ProposalStatus::Withdrawn);
+    sub
+}
+
+#[tokio::test]
+async fn a_404_probing_forge_keeps_the_living_proposal_lifecycle() {
+    // A forge with no stacks endpoint, with `github.stacks` on throughout:
+    // the capability answer is no, and every share and the withdrawal take
+    // the flows they took before stacking existed.
+    let mock = MockProvider::new();
+    let sub = assert_living_proposal_lifecycle(&mock, true).await;
+
+    assert_eq!(
+        stack_calls(&mock),
+        vec!["list_stacks".to_string()],
+        "one probe and no other stack verb, ever: {:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        Some(false),
+        "the no answer is cached, so the probe is never repeated"
+    );
+}
+
+#[tokio::test]
+async fn config_off_is_byte_for_byte_the_old_flow_even_where_stacks_exist() {
+    // The same lifecycle against a forge that does serve stacks, with the
+    // config off: the question is never asked, so the answer cannot matter.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = assert_living_proposal_lifecycle(&mock, false).await;
+
+    assert!(
+        stack_calls(&mock).is_empty(),
+        "github.stacks off spends no stack call at all: {:?}",
+        mock.calls()
+    );
+    assert_eq!(
+        load_state(&sub.state_dir).stacks_available,
+        None,
+        "the config gate leaves the cache unwritten, so turning it on later still asks"
+    );
+}
+
+#[tokio::test]
+async fn stacks_available_cache_survives_and_subscribe_forgets_it() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // A first share against a forge without stacks caches the no.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(share_with_stacks(&mock, &sub, true).await);
+    assert_eq!(load_state(&sub.state_dir).stacks_available, Some(false));
+    assert_eq!(probe_count(&mock), 1);
+
+    // The forge grows stacks afterwards. The cached verdict wins: an origin
+    // is asked once, and this share is still a fallback update in place.
+    mock.enable_stacks();
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    match share_with_stacks(&mock, &sub, true).await {
+        ProposeOutcome::Updated(report) => assert_eq!(report.number, first.number),
+        other => panic!("the cached no must keep the fallback flow, got {other:?}"),
+    }
+    assert_eq!(probe_count(&mock), 1, "no second probe: {:?}", mock.calls());
+    assert_eq!(load_state(&sub.state_dir).stacks_available, Some(false));
+    assert!(
+        !mock.calls().iter().any(|c| c.starts_with("create_stack")),
+        "nothing was stacked: {:?}",
+        mock.calls()
+    );
+
+    // Subscribing the domain again is a fresh origin state, and a fresh state
+    // remembers nothing: the next share asks the forge and finds stacks.
+    let (fresh, _) = subscribe_at(&mock, &c1).await;
+    write(&fresh.domain_root.join("notes/a.md"), b"alpha rewritten\n");
+    let bottom = proposed(share_with_stacks(&mock, &fresh, true).await);
+    assert_eq!(
+        load_state(&fresh.state_dir).stacks_available,
+        Some(true),
+        "the fresh subscription probed for itself"
+    );
+    assert_eq!(probe_count(&mock), 2, "exactly one probe per origin state");
+
+    // And with a yes recorded, the next share stacks a layer instead of
+    // rewriting the one below it.
+    write(&fresh.domain_root.join("notes/c.md"), b"gamma\n");
+    let layer = proposed(share_with_stacks(&mock, &fresh, true).await);
+    assert_ne!(layer.number, bottom.number, "a new layer, not an update");
+    assert_eq!(layer.stack_position, Some((2, 2)));
+    assert!(
+        mock.calls().iter().any(|c| {
+            c.starts_with(&format!(
+                "create_stack:[{},{}]",
+                bottom.number, layer.number
+            ))
+        }),
+        "{:?}",
+        mock.calls()
+    );
+    assert_eq!(probe_count(&mock), 2, "the yes is cached too");
+}
+
+// Interruption and safety around the cascade: a chain whose re-base died
+// half-way heals without churning the stack, a stack the forge no longer
+// matches is rebuilt rather than retried forever, and no replay ever runs
+// over commits a reviewer put on an upper branch.
+
+/// Breaks the chain the way a cascade that died half-way does: the bottom
+/// layer's branch and record move to a fresh commit and nothing above it
+/// follows, so the middle layer's recorded base is no longer the head below
+/// it. Returns the new bottom head.
+async fn half_cascaded_chain(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    layers: &[crystalline_remote::ops::ProposeReport],
+) -> String {
+    let old_bottom = mock
+        .branch_commit(&layers[0].branch)
+        .expect("the bottom head");
+    let amended = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v3\n"),
+        ]),
+        Some(&old_bottom),
+    );
+    mock.set_branch(&layers[0].branch, &amended);
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[0].head_commit = Some(amended.clone());
+    state.save(&sub.state_dir).unwrap();
+    amended
+}
+
+#[tokio::test]
+async fn a_half_cascaded_chain_re_bases_without_churning_the_stack() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+    let amended = half_cascaded_chain(&mock, &sub, &layers).await;
+
+    // The next share finds the chain broken and re-bases it before adding to
+    // it. Membership never changed, so nothing is dissolved or recreated.
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    let new_middle = mock.branch_commit(&layers[1].branch).expect("the new head");
+    let new_top = mock.branch_commit(&layers[2].branch).expect("the new head");
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_middle}:force=true",
+            layers[1].branch
+        )),
+        "the stale layer is re-based: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            layers[2].branch
+        )),
+        "and the chain above it follows: {delta:?}"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_middle),
+        Some(vec![amended.clone()]),
+        "the re-based layer sits on the amended head"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_top),
+        Some(vec![new_middle.clone()])
+    );
+
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("dissolve_stack") || c.starts_with("create_stack")),
+        "an intact membership is never dissolved and recreated: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("extend_stack:{stack}:[{}]", fourth.number)),
+        "the new layer joins the stack that was already there: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.stack_number, Some(stack), "the same stack, no churn");
+    assert_eq!(state.proposals[1].base_commit.as_deref(), Some(&*amended));
+    assert_eq!(
+        state.proposals[2].base_commit,
+        state.proposals[1].head_commit
+    );
+    assert_eq!(
+        state.proposals[3].base_commit,
+        state.proposals[2].head_commit
+    );
+
+    // And the healed chain stays healed: a second share re-bases nothing.
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/e.md"), b"epsilon\n");
+    let _fifth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+    assert!(
+        !delta.iter().any(|c| c.contains(":force=true")),
+        "a repaired chain does not re-repair itself: {delta:?}"
+    );
+}
+
+/// The intact heal never links anything - membership was never dissolved, so
+/// there is nothing to recreate - which leaves one thing it must not pass over
+/// in silence: a chain of open layers with no stack number is not grouped on
+/// the forge at all, and a debt nobody records is a debt nobody pays. The heal
+/// records it, and the very next step of the same operation settles it.
+///
+/// Without that, `chain_is_stacked` reads the same pair (no number, no owed
+/// link) and answers false, which drops the domain onto the unstacked flows
+/// for good.
+#[tokio::test]
+async fn an_intact_heal_of_an_ungrouped_chain_records_the_owed_link() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    half_cascaded_chain(&mock, &sub, &layers).await;
+
+    // Intact and misaligned, and nothing groups it: the residue of a create
+    // that failed, which leaves the number unset. `repair_pending` is what
+    // carries this into the heal at all - the shape test does not fire
+    // without a stack number to disagree with.
+    let mut state = load_state(&sub.state_dir);
+    state.stack_number = None;
+    state.stack_link_pending = false;
+    state.repair_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    let report = stacked_withdraw(&mock, &sub, Some(layers[2].number), false).await;
+    let delta = mock.calls().split_off(before);
+
+    let linked = format!(
+        "create_stack:[{},{},{}]",
+        layers[0].number, layers[1].number, layers[2].number
+    );
+    let link_at = call_at(&delta, &linked);
+    let close_at = call_at(&delta, &format!("close_proposal:{}", layers[2].number));
+    assert!(
+        link_at < close_at,
+        "the healed chain is grouped before this withdrawal does its own work: {delta:?}"
+    );
+
+    // And the debt is gone by the end: the withdrawal's own repair recreates
+    // over the two survivors, and nothing is left owed.
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the debt was paid, not carried");
+    assert!(state.stack_number.is_some(), "the survivors are grouped");
+    assert!(!state.repair_pending);
+    assert!(report.repaired);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number]
+    );
+}
+
+/// Runs an amend of the bottom layer whose cascade died before it moved a
+/// single layer above it: the amended layer is committed, pushed and RECORDED,
+/// and every layer over it still stands exactly where it stood. Returns the
+/// amended bottom head.
+///
+/// The forge and the upper records are rolled back afterwards rather than the
+/// cascade being failed mid-flight, which is the same shape with one fewer
+/// moving part. What makes this state hard to leave is not where the branches
+/// are, it is that the amended content is already recorded: re-detecting the
+/// very same edit yields no delta at all.
+async fn amend_with_the_cascade_interrupted(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    layers: &[crystalline_remote::ops::ProposeReport],
+) -> String {
+    let before = load_state(&sub.state_dir);
+    updated(amend_share(mock, sub, layers[0].number).await);
+
+    let mut state = load_state(&sub.state_dir);
+    for index in 1..state.proposals.len() {
+        state.proposals[index] = before.proposals[index].clone();
+        let head = state.proposals[index]
+            .head_commit
+            .clone()
+            .expect("every layer was pushed when it was opened");
+        mock.set_branch(&state.proposals[index].branch, &head);
+    }
+    state.save(&sub.state_dir).unwrap();
+    mock.branch_commit(&layers[0].branch)
+        .expect("the amended bottom head")
+}
+
+#[tokio::test]
+async fn retrying_an_interrupted_amend_heals_the_chain_before_it_answers() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let amended = amend_with_the_cascade_interrupted(&mock, &sub, &layers).await;
+
+    // The retry: the same verb, the same number, the same working tree. The
+    // amended content is recorded already, so there is nothing new to share -
+    // and the chain above is still where the dead cascade left it. The heal
+    // runs before the named layer is even resolved, so the retry is what puts
+    // the chain back together rather than reporting over a broken one.
+    let before = mock.calls().len();
+    let outcome = amend_share(&mock, &sub, layers[0].number).await;
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "the amended content is recorded, so nothing to share is the honest answer: {outcome:?}"
+    );
+
+    let new_middle = mock
+        .branch_commit(&layers[1].branch)
+        .expect("the re-based head");
+    let new_top = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the re-based head");
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_middle}:force=true",
+            layers[1].branch
+        )),
+        "the stale layer was re-based: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            layers[2].branch
+        )),
+        "and the chain above it followed: {delta:?}"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_middle),
+        Some(vec![amended.clone()]),
+        "the re-based layer sits on the amended head"
+    );
+    assert_eq!(
+        mock.commit_parents(&new_top),
+        Some(vec![new_middle.clone()])
+    );
+    assert_eq!(
+        mock.branch_commit(&layers[0].branch).as_deref(),
+        Some(&*amended),
+        "the amended layer itself was not written again"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[1].base_commit.as_deref(), Some(&*amended));
+    assert_eq!(
+        state.proposals[2].base_commit,
+        state.proposals[1].head_commit
+    );
+    assert_eq!(
+        state.stack_number,
+        Some(stack),
+        "an intact membership is never churned"
+    );
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("dissolve_stack") || c.starts_with("create_stack")),
+        "nothing left the chain, so nothing is dissolved or recreated: {delta:?}"
+    );
+
+    // And the healed chain stays healed: a third try re-bases nothing.
+    let before = mock.calls().len();
+    let outcome = amend_share(&mock, &sub, layers[0].number).await;
+    let delta = mock.calls().split_off(before);
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "a healed chain does not heal itself again: {delta:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_amend_over_a_hole_repairs_the_chain_before_its_own_writes() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer closes the MIDDLE layer: a hole with open work above it, the
+    // other shape a repair exists for.
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let before = mock.calls().len();
+    let report = updated(amend_share(&mock, &sub, layers[0].number).await);
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(report.number, layers[0].number, "the named layer, amended");
+    assert_eq!(
+        report.stack_position,
+        Some((1, 2)),
+        "the hole left the chain before the amend counted it"
+    );
+
+    // The repair ran whole, in its own order, and all of it before the amend's
+    // own push.
+    let amended_head = mock
+        .branch_commit(&layers[0].branch)
+        .expect("the amended head");
+    let amend_push = call_at(
+        &delta,
+        &format!(
+            "update_branch:{}:{amended_head}:force=false",
+            layers[0].branch
+        ),
+    );
+    let dissolve = call_at(&delta, &format!("dissolve_stack:{old_stack}"));
+    let retarget = call_at(
+        &delta,
+        &format!(
+            "update_proposal_base:{}:{}",
+            layers[2].number, layers[0].branch
+        ),
+    );
+    let restack = call_at(
+        &delta,
+        &format!("create_stack:[{},{}]", layers[0].number, layers[2].number),
+    );
+    assert!(
+        dissolve < retarget && retarget < restack,
+        "the repair keeps the one order the forge accepts: {delta:?}"
+    );
+    assert!(
+        restack < amend_push,
+        "and the whole repair precedes the amend's own writes: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number]
+    );
+    assert!(
+        state.history.iter().any(|p| p.number == layers[1].number),
+        "the closed layer left the chain: {:?}",
+        state.history
+    );
+    assert!(!state.repair_pending);
+    assert_eq!(
+        state.proposals[1].base_commit, state.proposals[0].head_commit,
+        "the survivor stands on the amended layer"
+    );
+}
+
+#[tokio::test]
+async fn an_amend_over_a_hole_names_the_layer_the_repair_left() {
+    // The hazard healing first creates: a repair settles what left the chain
+    // into history, so an index resolved BEFORE it names a different record
+    // after it. Amending the top layer over a hole is where that shows - it is
+    // the third record in the chain the share was handed and the second in the
+    // one the repair leaves - and reading the stale index would name the wrong
+    // layer or run off the end of the vec.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/c.md"), b"gamma v2\n");
+    let report = updated(amend_share(&mock, &sub, layers[2].number).await);
+
+    assert_eq!(
+        report.number, layers[2].number,
+        "the layer the number names"
+    );
+    assert_eq!(report.stack_position, Some((2, 2)));
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number]
+    );
+
+    let head = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the amended head");
+    let tree = mock.commit_tree(&head).expect("the amended tree");
+    assert_eq!(
+        tree.get("notes/c.md").map(Vec::as_slice),
+        Some(b"gamma v2\n".as_slice()),
+        "the amend landed on the top layer's own work"
+    );
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        state.proposals[0].head_commit, state.proposals[1].base_commit,
+        "and the layer below it was left where the repair put it"
+    );
+}
+
+#[tokio::test]
+async fn an_amend_refusal_lists_the_layers_the_repair_left_open() {
+    // A number that names nothing is refused with what IS open - and after the
+    // heal, that list is the chain the repair left rather than the one the
+    // share was handed. Which also means a refused amend is no longer
+    // write-free where a repair was owed: the heal is the chain's, not this
+    // share's, and it stands whether or not the number turns out to be real.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    mock.set_proposal_state(layers[1].number, ProposalState::Declined);
+
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let before = mock.calls().len();
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(999),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect_err("999 is not an open layer");
+    let delta = mock.calls().split_off(before);
+
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(message.contains("999"), "{message}");
+            assert!(
+                message.contains(&format!("#{} (layer 1)", layers[0].number)),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("#{} (layer 2)", layers[2].number)),
+                "the survivor took the position the hole vacated: {message}"
+            );
+            assert!(
+                !message.contains(&format!("#{}", layers[1].number)),
+                "the settled layer is no layer of this chain: {message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    assert!(
+        delta.iter().any(|c| c.starts_with("dissolve_stack")),
+        "the chain was healed even though the number was not real: {delta:?}"
+    );
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number]
+    );
+    assert!(!load_state(&sub.state_dir).repair_pending);
+}
+
+/// Builds the wedge itself: a three-layer chain whose middle layer merged
+/// while the trunk this domain records was rewritten out of existence, with a
+/// repair owed on top. Returns the layers.
+///
+/// The owed repair is what makes an operation enter the repair machinery at
+/// all - a merge-wedged chain reads as shape-fine by design.
+async fn merge_wedged_chain(
+    mock: &MockProvider,
+) -> (Subscribed, Vec<crystalline_remote::ops::ProposeReport>) {
+    let (sub, layers) = stacked_three_layers(mock).await;
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[1].status = ProposalStatus::Merged;
+    state.repair_pending = true;
+    state.base_commit = "ghost-commit".to_string();
+    state.save(&sub.state_dir).unwrap();
+    mock.gc_commit("ghost-commit");
+    let moved = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    mock.set_branch("main", &moved);
+    (sub, layers)
+}
+
+/// A withdrawal over a chain carrying a merge this domain has not taken in is
+/// refused, naming the layer and the way out.
+///
+/// The merged layer's content sits on the trunk and nowhere the chain can see,
+/// so rebuilding the survivors around it would read as deleting what it
+/// brought. The withdraw path is where this is still met: it does not pull
+/// first, while a share does - and every arm of that pull, the re-baselining
+/// one included, consumes the record (the test below this one).
+#[tokio::test]
+async fn a_withdrawal_on_a_merge_wedged_chain_still_refuses_pull_first() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = merge_wedged_chain(&mock).await;
+
+    let before = mock.calls().len();
+    let err = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(layers[2].number),
+        false,
+        true,
+    )
+    .await
+    .expect_err("the merge has to be pulled in before this chain is rebuilt");
+    let delta = mock.calls().split_off(before);
+
+    match &err {
+        crystalline_remote::RemoteError::Refused(message) => {
+            assert!(
+                message.contains(&format!("#{}", layers[1].number)),
+                "the refusal names the merged layer: {message}"
+            );
+            assert!(
+                message.contains("pull"),
+                "the refusal names the way out: {message}"
+            );
+        }
+        other => panic!("expected a Refused error, got {other:?}"),
+    }
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)
+            || c.starts_with("dissolve_stack")
+            || c.starts_with("create_stack")),
+        "the pull-first refusal wins before a single repair write: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(
+        state.repair_pending,
+        "and the repair stays owed until the pull clears the way"
+    );
+    assert_eq!(state.proposals.len(), 3, "the chain is left as it stands");
+}
+
+/// The share path cannot meet an unconsumed merge at all: every share pulls
+/// first, and every arm of that pull consumes the record - the re-baselining
+/// arm included, which is the arm a domain whose base commit is gone takes
+/// every time. So the same chain that refuses a withdrawal above lets an
+/// amend through, on a chain the pull left two layers deep.
+///
+/// This is what makes the refusal's own advice - "pull this domain first" -
+/// true rather than a loop.
+#[tokio::test]
+async fn an_amend_over_a_merge_wedged_chain_pulls_the_merge_in_and_proceeds() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = merge_wedged_chain(&mock).await;
+
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let report = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: Some(layers[0].number),
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect("the pull in front of the share takes the merge in");
+    assert!(
+        matches!(
+            report,
+            ProposeOutcome::Updated(ref r) if r.number == layers[0].number
+        ),
+        "the named layer is amended: {report:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[2].number],
+        "the merged layer is out of the chain"
+    );
+    assert!(
+        state
+            .history
+            .iter()
+            .any(|p| p.number == layers[1].number && p.status == ProposalStatus::Merged),
+        "and in history: {:?}",
+        state.history
+    );
+    assert!(!state.repair_pending, "the repair the pull unblocked ran");
+}
+
+#[tokio::test]
+async fn a_fallback_amend_runs_no_repair_machinery() {
+    // Off the stacked path the number can only name the one living proposal,
+    // and the amend IS the ordinary in-place update. No repair entry sits on
+    // that path at all, so a repair recorded pending is left exactly where it
+    // stands - the same trade both stacked call sites make.
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(share_with_stacks(&mock, &sub, false).await);
+
+    let mut state = load_state(&sub.state_dir);
+    state.repair_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let before = mock.calls().len();
+    let report = updated(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions {
+                title: None,
+                description: None,
+                proposal: Some(first.number),
+                stacks_allowed: false,
+                author_login: None,
+                files: None,
+            },
+        )
+        .await
+        .expect("a fallback amend is the ordinary update"),
+    );
+    let delta = mock.calls().split_off(before);
+
+    assert_eq!(
+        report.number, first.number,
+        "the one living proposal, updated in place"
+    );
+    assert_eq!(report.stack_number, None);
+    assert_eq!(report.stack_position, None);
+    assert!(
+        !delta.iter().any(|c| c.starts_with("list_stacks")
+            || c.starts_with("create_stack")
+            || c.starts_with("extend_stack")
+            || c.starts_with("dissolve_stack")),
+        "a fallback amend spends no stack call at all: {delta:?}"
+    );
+    assert!(
+        !delta.iter().any(|c| c.contains(":force=true")),
+        "and re-bases nothing: {delta:?}"
+    );
+    assert!(
+        load_state(&sub.state_dir).repair_pending,
+        "the pending repair is stranded rather than run off the stacked path"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_commit_above_refuses_the_amend_before_any_write() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+
+    // A reviewer pushes onto the TOP layer's branch. Amending the bottom
+    // layer would replay over that commit and lose it.
+    let top_head = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the top layer's head");
+    let foreign = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v2\n"),
+            ("notes/b.md", b"beta\n"),
+            ("notes/c.md", b"gamma reviewed\n"),
+        ]),
+        Some(&top_head),
+    );
+    mock.set_branch(&layers[2].branch, &foreign);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let outcome = amend_share(&mock, &sub, layers[0].number).await;
+    let delta = mock.calls().split_off(before);
+
+    match outcome {
+        ProposeOutcome::ProposalDiverged { number, .. } => assert_eq!(
+            number, layers[2].number,
+            "the refusal names the layer a reviewer touched"
+        ),
+        other => panic!("expected the upper layer to refuse the amend, got {other:?}"),
+    }
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "nothing was written before the refusal: {delta:?}"
+    );
+    assert_eq!(
+        mock.branch_commit(&layers[2].branch).as_deref(),
+        Some(&*foreign),
+        "the reviewer's commit still stands"
+    );
+}
+
+#[tokio::test]
+async fn a_reviewer_commit_above_refuses_the_repair_too() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    half_cascaded_chain(&mock, &sub, &layers).await;
+
+    let top_head = mock
+        .branch_commit(&layers[2].branch)
+        .expect("the top layer's head");
+    let foreign = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha v2\n"),
+            ("notes/b.md", b"beta\n"),
+            ("notes/c.md", b"gamma reviewed\n"),
+        ]),
+        Some(&top_head),
+    );
+    mock.set_branch(&layers[2].branch, &foreign);
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let err = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: None,
+        },
+    )
+    .await
+    .expect_err("the repair must refuse rather than overwrite a reviewer");
+    let delta = mock.calls().split_off(before);
+
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("#{}", layers[2].number)),
+        "the refusal names the layer a reviewer touched: {message}"
+    );
+    assert!(
+        !delta.iter().any(|c| is_write_call(c)),
+        "nothing was written before the refusal: {delta:?}"
+    );
+    assert!(
+        !delta
+            .iter()
+            .any(|c| c.starts_with("dissolve_stack") || c.starts_with("create_stack")),
+        "and the stack was left alone: {delta:?}"
+    );
+    assert_eq!(
+        mock.branch_commit(&layers[2].branch).as_deref(),
+        Some(&*foreign),
+        "the reviewer's commit still stands"
+    );
+}
+
+#[tokio::test]
+async fn a_settled_top_member_rebuilds_the_stack_instead_of_wedging_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // A reviewer declines the TOP layer and a pull records that. The stack
+    // still holds it as its top member, which the forge refuses to extend
+    // for as long as it stands.
+    mock.set_proposal_state(layers[2].number, ProposalState::Declined);
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[2].status = ProposalStatus::Declined;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!("extend_stack:{old_stack}:[{}]", fourth.number)),
+        "the extend is tried once: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!("dissolve_stack:{old_stack}")),
+        "the stack the forge no longer matches is dissolved: {delta:?}"
+    );
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{},{}]",
+            layers[0].number, layers[1].number, fourth.number
+        )),
+        "and recreated over the open chain: {delta:?}"
+    );
+
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "no owed link is left behind");
+    let stack = state.stack_number.expect("the rebuilt chain is linked");
+    assert_ne!(stack, old_stack);
+    assert_eq!(fourth.stack_number, Some(stack));
+    assert_eq!(
+        open_numbers(&sub.state_dir),
+        vec![layers[0].number, layers[1].number, fourth.number],
+        "the new layer landed"
+    );
+}
+
+#[tokio::test]
+async fn an_owed_link_to_a_dissolved_stack_recreates_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    let old_stack = load_state(&sub.state_dir)
+        .stack_number
+        .expect("the chain is linked");
+
+    // Somebody dissolved the stack on the website, and this machine still
+    // owes it a member: the extend can only ever 404 from here.
+    Provider::dissolve_stack(&mock, &spec(), old_stack)
+        .await
+        .unwrap();
+    let mut state = load_state(&sub.state_dir);
+    state.stack_link_pending = true;
+    state.save(&sub.state_dir).unwrap();
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let delta = mock.calls().split_off(before);
+
+    assert!(
+        delta.contains(&format!(
+            "create_stack:[{},{},{}]",
+            layers[0].number, layers[1].number, layers[2].number
+        )),
+        "the owed link rebuilds the stack it can no longer extend: {delta:?}"
+    );
+    let state = load_state(&sub.state_dir);
+    assert!(!state.stack_link_pending, "the debt is settled");
+    let stack = state.stack_number.expect("the rebuilt chain is linked");
+    assert_ne!(stack, old_stack);
+    assert_eq!(fourth.stack_number, Some(stack));
+    assert!(
+        delta.contains(&format!("extend_stack:{stack}:[{}]", fourth.number)),
+        "and the new layer joins the rebuilt stack: {delta:?}"
+    );
+}
+
+// --- generated folder indexes ------------------------------------------------
+//
+// A generated `index.md` travels with a domain so a team repository stays
+// browsable on the forge, and the local generator stays the single authority on
+// what it says. The five tests below pin both halves of that: an index is
+// detected, shared and stamped like any other file, and a pull records the
+// origin's copy without ever writing it over the local one - which is also what
+// makes an index structurally incapable of raising a conflict.
+
+#[tokio::test]
+async fn a_generated_index_is_detected_and_shared_like_any_other_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+
+    let outcome = propose(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    let report = proposed(outcome);
+
+    let mut added = report.added.clone();
+    added.sort();
+    assert_eq!(
+        added,
+        vec![
+            "index.md".to_string(),
+            "notes/added.md".to_string(),
+            "notes/index.md".to_string(),
+        ],
+        "both listings ride along with the engram"
+    );
+
+    // The commit really carries them, under the domain's subpath.
+    let branch_commit = mock.branch_commit(&report.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(
+        tree.get("knowledge/index.md"),
+        Some(&b"# Contents\n".to_vec())
+    );
+    assert_eq!(
+        tree.get("knowledge/notes/index.md"),
+        Some(&b"# Contents\n".to_vec())
+    );
+
+    // And each one is recorded as an ordinary layer entry, blob and size and
+    // all, so a withdrawal can excise it like anything else.
+    let st = load_state(&sub.state_dir);
+    let recorded = st.proposals[0]
+        .files
+        .iter()
+        .find(|f| f.path == "notes/index.md")
+        .expect("the nested listing is a recorded file");
+    assert_eq!(recorded.change, ProposedChange::Added);
+    assert_eq!(recorded.blob_sha, Some(sha256_hex(b"# Contents\n")));
+    assert_eq!(recorded.size, Some(b"# Contents\n".len() as u64));
+}
+
+#[tokio::test]
+async fn a_pull_stamps_the_origins_index_without_writing_it_to_disk() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n\n* [A](notes/a.md)\n"),
+            ("notes/a.md", b"alpha\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The local generator rewrote the listing; upstream someone else's
+    // generator wrote a different one.
+    let locally_generated = b"# Contents\n\n* [A](notes/a.md)\n* [B](notes/b.md)\n";
+    write(&sub.domain_root.join("index.md"), locally_generated);
+    let upstream_index = b"# Contents\n\n* [A](notes/a.md)\n* [C](notes/c.md)\n";
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", upstream_index),
+            ("notes/a.md", b"alpha revised\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.applied,
+        vec!["notes/a.md".to_string()],
+        "the engram is applied and the listing is not"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("index.md")),
+        locally_generated,
+        "the local generator stays the authority on disk"
+    );
+
+    // The stamp advances all the same, so the next share carries the delta.
+    let st = load_state(&sub.state_dir);
+    assert_eq!(
+        st.files.get("index.md").map(|s| s.sha256.clone()),
+        Some(sha256_hex(upstream_index)),
+        "the origin's copy is what the base snapshot records"
+    );
+    assert_eq!(
+        crystalline_remote::state::read_base_file(&sub.state_dir, "index.md").unwrap(),
+        Some(upstream_index.to_vec())
+    );
+
+    // Which is exactly what makes the listing the next thing to share.
+    let after = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.local_changes, 0,
+        "a listing on its own is not work to share"
+    );
+}
+
+#[tokio::test]
+async fn a_diverging_origin_index_never_records_a_conflict() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n\n* [A](a.md)\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // Both sides rewrote the very same line, which for any ordinary file is
+    // the textbook same-line conflict.
+    write(
+        &sub.domain_root.join("index.md"),
+        b"# Contents\n\n* [A](a.md) - local\n",
+    );
+    let c2 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("index.md", b"# Contents\n\n* [A](a.md) - upstream\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    assert!(
+        report.conflicts.is_empty(),
+        "a derived file is nothing to choose sides over: {:?}",
+        report.conflicts
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+    assert_eq!(
+        read(&sub.domain_root.join("index.md")),
+        b"# Contents\n\n* [A](a.md) - local\n"
+    );
+}
+
+#[tokio::test]
+async fn an_index_only_share_still_opens_a_proposal() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+
+    // Nothing a status would call work to share, and an explicit share still
+    // proceeds: somebody asked for the repository to be browsable.
+    let standing = status(&spec, &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(standing.local_changes, 0);
+
+    let plan = propose_preview(
+        &mock,
+        &spec,
+        &sub.domain_root,
+        "Brand Team",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.action, PlannedAction::Create);
+    assert_eq!(plan.changes.substantive_count(), 0);
+    assert_eq!(plan.changes.index_count(), 1);
+    // The generated title says what the share is, never "1 new engram".
+    assert_eq!(plan.effective_title, "Refresh 1 folder index in Brand Team");
+
+    let report = proposed(
+        propose(
+            &mock,
+            &spec,
+            &sub.domain_root,
+            "Brand Team",
+            &sub.state_dir,
+            ShareOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    assert_eq!(report.added, vec!["index.md".to_string()]);
+    assert_eq!(report.summary, "Refreshes 1 folder index.");
+    assert_eq!(
+        mock.proposal_request(1).unwrap().title,
+        "Refresh 1 folder index in Brand Team"
+    );
+}
+
+#[tokio::test]
+async fn a_shares_title_names_the_engrams_and_never_the_listings_beside_them() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let c1 = mock.add_commit(
+        sub_commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/keep.md", b"keep\n")]),
+        None,
+    );
+    let sub = subscribe_named(&mock, &spec, &c1, "Brand Team").await;
+
+    write(&sub.domain_root.join("notes/added.md"), b"brand new\n");
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+
+    let report = proposed(
+        propose(
+            &mock,
+            &spec,
+            &sub.domain_root,
+            "Brand Team",
+            &sub.state_dir,
+            ShareOptions::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    // One engram travelled, and three files did. The title and the summary are
+    // about the engram; the listings are in the commit and in the body's file
+    // sections, where completeness is what a reviewer wants.
+    assert_eq!(report.added.len(), 3);
+    assert_eq!(report.summary, "Shares 1 new engram.");
+    assert_eq!(
+        mock.proposal_request(1).unwrap().title,
+        "Share 1 new engram from Brand Team"
+    );
+    assert!(
+        mock.proposal_request(1).unwrap().body.contains("index.md"),
+        "the body still records every file the commit carries"
+    );
+}
+
+#[tokio::test]
+async fn a_status_counts_real_work_and_leaves_index_refreshes_out() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    write(&sub.domain_root.join("index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+
+    let report = status(&spec(), &sub.domain_root, &sub.state_dir, None, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.local_changes, 1,
+        "one engram is the work; two listings are not"
+    );
+
+    // The share plan still names all three, so nothing is hidden from the
+    // person deciding.
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(plan.changes.changes.len(), 3);
+    assert_eq!(plan.changes.substantive_count(), 1);
+    assert_eq!(plan.changes.index_count(), 2);
+}
+
+#[tokio::test]
+async fn a_generated_index_replays_with_its_layer_like_any_other_file() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // The top layer carries an engram and the folder listing that came with
+    // it, so its record holds an index entry a replay has to rebuild from.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# Contents\n");
+    let second = proposed(stacked_share(&mock, &sub).await);
+    assert!(
+        second.added.contains(&"notes/index.md".to_string()),
+        "{:?}",
+        second.added
+    );
+
+    // Amending the layer below replays the one above from its own record,
+    // which is where an index entry has to survive: the working tree cannot
+    // speak for one layer's copy of a file, and a listing rebuilt from nothing
+    // would read on the forge as the layer deleting it.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    updated(amend_share(&mock, &sub, first.number).await);
+
+    let state = load_state(&sub.state_dir);
+    let replayed = state
+        .proposals
+        .iter()
+        .find(|p| p.number == second.number)
+        .expect("the top layer is still in the chain");
+    let entry = replayed
+        .files
+        .iter()
+        .find(|f| f.path == "notes/index.md")
+        .expect("the listing is still a recorded file on the replayed layer");
+    assert_eq!(entry.change, ProposedChange::Added);
+    assert_eq!(entry.blob_sha, Some(sha256_hex(b"# Contents\n")));
+    assert_eq!(entry.size, Some(b"# Contents\n".len() as u64));
+
+    // And the rebuilt commit really carries it, beside the engram it lists.
+    let head = mock
+        .branch_commit(&second.branch)
+        .expect("the replayed layer's head");
+    let tree = mock.commit_tree(&head).expect("the replayed tree");
+    assert_eq!(
+        tree.get("notes/index.md"),
+        Some(&b"# Contents\n".to_vec()),
+        "the listing rides the replay"
+    );
+    assert_eq!(tree.get("notes/b.md"), Some(&b"beta\n".to_vec()));
+    assert_eq!(
+        tree.get("notes/a.md"),
+        Some(&b"alpha v3\n".to_vec()),
+        "on top of the amended layer below it"
+    );
+}
+
+#[tokio::test]
+async fn a_layer_with_no_recorded_head_does_not_silence_the_repair_above_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, layers) = stacked_three_layers(&mock).await;
+    write(&sub.domain_root.join("notes/d.md"), b"delta\n");
+    let fourth = proposed(stacked_share(&mock, &sub).await);
+    let layers = [
+        layers[0].clone(),
+        layers[1].clone(),
+        layers[2].clone(),
+        fourth,
+    ];
+
+    // Two things are wrong with the recorded chain, and only one of them is
+    // fixable. The second layer carries no head commit at all - a record
+    // written before the field existed, or one an interrupted push left blank -
+    // so nothing can say where the layer above it belongs. Higher up, a cascade
+    // died half-way and left the top layer standing on a commit that is no
+    // longer its parent's head. The unreadable pair must not hide the fixable
+    // one: the walk skips what it cannot read and keeps going.
+    let mut state = load_state(&sub.state_dir);
+    state.proposals[1].head_commit = None;
+    state.proposals[3].base_commit = Some("a commit nothing points at".to_string());
+    state.save(&sub.state_dir).unwrap();
+    let third_head = state.proposals[2]
+        .head_commit
+        .clone()
+        .expect("the third layer's head");
+
+    let before = mock.calls().len();
+    write(&sub.domain_root.join("notes/e.md"), b"epsilon\n");
+    stacked_share(&mock, &sub).await;
+    let delta = mock.calls().split_off(before);
+
+    // The top layer was re-based onto the layer below it, forced the way every
+    // replay is.
+    let top = &layers[3];
+    let new_top = mock.branch_commit(&top.branch).expect("the replayed head");
+    assert!(
+        delta.contains(&format!(
+            "update_branch:{}:{new_top}:force=true",
+            top.branch
+        )),
+        "the misaligned layer above the unreadable one was replayed: {delta:?}"
+    );
+    let healed = load_state(&sub.state_dir);
+    assert_eq!(
+        healed.proposals[3].base_commit,
+        Some(third_head),
+        "and its record now stands on the layer below it"
+    );
+    assert!(!healed.repair_pending, "the repair finished");
+}
+
+// Who shared a proposal: recorded on the record a share creates or rewrites,
+// carried as opaque metadata on `ShareOptions` so `ops` never resolves an
+// identity of its own.
+
+/// A stacked share as a named login, the call a mixed-author chain is built
+/// out of.
+async fn stacked_share_as(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    author_login: Option<&str>,
+) -> ProposeOutcome {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login,
+            files: None,
+        },
+    )
+    .await
+    .expect("a stacked share should succeed")
+}
+
+#[tokio::test]
+async fn every_share_path_records_the_login_it_acted_as() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"alpha\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The create path: the bottom layer stands on nothing, and is alice's.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    let first = proposed(stacked_share_as(&mock, &sub, Some("alice")).await);
+
+    // The stacking path: a second layer, shared by somebody else.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let second = proposed(stacked_share_as(&mock, &sub, Some("bob")).await);
+
+    let state = load_state(&sub.state_dir);
+    assert_eq!(state.proposals[0].number, first.number);
+    assert_eq!(state.proposals[0].author_login.as_deref(), Some("alice"));
+    assert_eq!(state.proposals[1].number, second.number);
+    assert_eq!(
+        state.proposals[1].author_login.as_deref(),
+        Some("bob"),
+        "the new layer is the acting login's, and alice's stays hers"
+    );
+}
+
+#[tokio::test]
+async fn a_share_with_no_login_to_name_records_none() {
+    let mock = MockProvider::new();
+    let (sub, _) = shared_once(&mock).await;
+
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0].author_login,
+        None,
+        "an instance whose credential carries no login (an env token) names nobody"
+    );
+}
+
+#[tokio::test]
+async fn updating_the_living_proposal_re_attributes_it_only_when_a_login_is_known() {
+    let mock = MockProvider::new();
+    let (sub, first) = shared_once(&mock).await;
+    set_authors(&sub.state_dir, &[(first.number, "alice")]);
+
+    // An update by bob is bob's work on bob's credential: the record follows.
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v3\n");
+    let report = updated(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions {
+                title: None,
+                description: None,
+                proposal: None,
+                stacks_allowed: false,
+                author_login: Some("bob"),
+                files: None,
+            },
+        )
+        .await
+        .expect("the open proposal is updated"),
+    );
+    assert_eq!(report.number, first.number);
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0]
+            .author_login
+            .as_deref(),
+        Some("bob")
+    );
+
+    // An update with no login to name leaves the recorded author alone rather
+    // than erasing it: unknown is not "nobody".
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v4\n");
+    propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .expect("the open proposal is updated again");
+    assert_eq!(
+        load_state(&sub.state_dir).proposals[0]
+            .author_login
+            .as_deref(),
+        Some("bob"),
+        "an unknown login never overwrites a recorded one"
+    );
+}
+
+/// The boundary this whole crate is on the right side of: `ops` orchestrates a
+/// share, a withdrawal and a pull without ever learning WHO is doing it. The
+/// acting identity is resolved one layer up, in the service engine, which hands
+/// `ops` a provider already built from the right credential; nothing here takes
+/// an actor, an account or a token identity.
+///
+/// A source scan rather than a type-level proof, and blunt on purpose: the
+/// boundary is the point, so a rename that slips past this string list is a
+/// deliberate act someone will have to review.
+#[test]
+fn ops_signatures_carry_no_identity_types() {
+    let ops = include_str!("../src/ops.rs");
+    for name in ["ShareActor", "TokenIdentity", "Caller"] {
+        assert!(!ops.contains(name), "{name} leaked into ops.rs");
+    }
+}
+
+// File-scoped shares: a share may carry a chosen subset of the detected delta
+// instead of all of it. The selection is filtered in after detection and
+// before anything is planned or collected, so every path a share takes -
+// a create, a stacked layer, an amend, a preview - sees the same shortened
+// change list.
+
+/// A domain with two folders, each holding an engram and a generated folder
+/// listing, and a local edit to every one of them. The starting point for the
+/// selection scenarios: whatever is chosen, something in another folder is
+/// left behind.
+async fn two_folders_all_edited(mock: &MockProvider) -> Subscribed {
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"alpha\n"),
+            ("notes/index.md", b"# notes\n"),
+            ("guides/g.md", b"guide\n"),
+            ("guides/index.md", b"# guides\n"),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(mock, &c1).await;
+    write(&sub.domain_root.join("notes/a.md"), b"alpha v2\n");
+    write(&sub.domain_root.join("notes/index.md"), b"# notes, again\n");
+    write(&sub.domain_root.join("guides/g.md"), b"guide v2\n");
+    write(
+        &sub.domain_root.join("guides/index.md"),
+        b"# guides, again\n",
+    );
+    sub
+}
+
+/// Shares `sub` carrying exactly `files`, on the stacked path.
+async fn share_files(
+    mock: &MockProvider,
+    sub: &Subscribed,
+    files: &[String],
+) -> Result<ProposeOutcome, crystalline_remote::error::RemoteError> {
+    propose(
+        mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            title: None,
+            description: None,
+            proposal: None,
+            stacks_allowed: true,
+            author_login: None,
+            files: Some(files),
+        },
+    )
+    .await
+}
+
+/// The paths one recorded proposal proposes, sorted.
+fn recorded_paths(state_dir: &Path, number: u64) -> Vec<String> {
+    let st = load_state(state_dir);
+    let record = st
+        .proposals
+        .iter()
+        .find(|p| p.number == number)
+        .expect("the proposal is recorded");
+    let mut paths: Vec<String> = record.files.iter().map(|f| f.path.clone()).collect();
+    paths.sort();
+    paths
+}
+
+#[tokio::test]
+async fn a_share_of_chosen_files_carries_them_and_their_folders_listing() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let first = proposed(
+        share_files(&mock, &sub, &["notes/a.md".to_string()])
+            .await
+            .expect("a share of one file should succeed"),
+    );
+
+    // Exactly the chosen file and the listing of the folder it lives in: the
+    // other folder's engram and its listing stay behind.
+    assert_eq!(
+        recorded_paths(&sub.state_dir, first.number),
+        vec!["notes/a.md".to_string(), "notes/index.md".to_string()]
+    );
+    let branch_commit = mock.branch_commit(&first.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert_eq!(tree.get("notes/a.md"), Some(&b"alpha v2\n".to_vec()));
+    assert_eq!(
+        tree.get("guides/g.md"),
+        Some(&b"guide\n".to_vec()),
+        "an unselected file keeps the origin's content in the proposed tree"
+    );
+    assert_eq!(
+        tree.get("guides/index.md"),
+        Some(&b"# guides\n".to_vec()),
+        "another folder's listing does not ride along"
+    );
+
+    // What was left out is simply still unshared: the next share carries it.
+    let second = proposed(
+        propose(
+            &mock,
+            &spec(),
+            &sub.domain_root,
+            "eng",
+            &sub.state_dir,
+            ShareOptions {
+                stacks_allowed: true,
+                ..ShareOptions::default()
+            },
+        )
+        .await
+        .expect("the rest is still there to share"),
+    );
+    assert_eq!(
+        recorded_paths(&sub.state_dir, second.number),
+        vec!["guides/g.md".to_string(), "guides/index.md".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn a_share_naming_a_file_that_is_not_a_change_refuses_naming_it() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let err = share_files(
+        &mock,
+        &sub,
+        &[
+            "notes/a.md".to_string(),
+            "notes/ghost.md".to_string(),
+            "elsewhere/other.md".to_string(),
+        ],
+    )
+    .await
+    .expect_err("a path that is not a change refuses the share");
+    let message = err.to_string();
+    assert!(
+        message.contains("notes/ghost.md") && message.contains("elsewhere/other.md"),
+        "every unknown path is named: {message}"
+    );
+    assert!(
+        message.contains("unshared changes"),
+        "the refusal says what the paths were measured against: {message}"
+    );
+    assert!(
+        message.contains("share preview"),
+        "and points at the surface that lists the real paths - a status report \
+         carries only a count: {message}"
+    );
+
+    // Refused before a single provider write: nothing was opened, nothing was
+    // pushed, and the domain still has everything to share.
+    let writes: Vec<String> = mock
+        .calls()
+        .into_iter()
+        .filter(|c| is_write_call(c))
+        .collect();
+    assert!(writes.is_empty(), "{writes:?}");
+    assert!(load_state(&sub.state_dir).proposals.is_empty());
+}
+
+#[tokio::test]
+async fn a_share_whose_selection_is_empty_has_nothing_to_share() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let outcome = share_files(&mock, &sub, &[])
+        .await
+        .expect("an empty selection is an answer, not an error");
+    assert!(
+        matches!(outcome, ProposeOutcome::NothingToShare { .. }),
+        "{outcome:?}"
+    );
+    assert!(load_state(&sub.state_dir).proposals.is_empty());
+}
+
+#[tokio::test]
+async fn an_amend_with_a_selection_carries_only_the_chosen_fresh_work() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, first) = stacked_bottom_layer(&mock).await;
+
+    // Two pieces of fresh work standing on the layer, one of them chosen.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    write(&sub.domain_root.join("guides/g.md"), b"guide\n");
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            proposal: Some(first.number),
+            stacks_allowed: true,
+            files: Some(&["notes/b.md".to_string()]),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("an amend carrying one file should succeed");
+    let report = updated(outcome);
+    assert_eq!(report.number, first.number);
+
+    assert_eq!(
+        recorded_paths(&sub.state_dir, first.number),
+        vec!["notes/a.md".to_string(), "notes/b.md".to_string()],
+        "the layer's own work plus the chosen fresh file, and nothing else"
+    );
+    let branch_commit = mock.branch_commit(&first.branch).unwrap();
+    let tree = mock.commit_tree(&branch_commit).unwrap();
+    assert!(
+        !tree.contains_key("guides/g.md"),
+        "the unchosen fresh file stays out of the amended layer"
+    );
+}
+
+#[tokio::test]
+async fn a_preview_plans_the_selection_rather_than_the_whole_delta() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let sub = two_folders_all_edited(&mock).await;
+
+    let chosen = ["guides/g.md".to_string()];
+    let plan = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            stacks_allowed: true,
+            files: Some(&chosen),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("a preview of a selection should plan it");
+
+    assert!(
+        matches!(plan.action, PlannedAction::Create),
+        "{:?}",
+        plan.action
+    );
+    let mut paths: Vec<&str> = plan.changes.changes.iter().map(|c| c.path()).collect();
+    paths.sort();
+    assert_eq!(paths, vec!["guides/g.md", "guides/index.md"]);
+
+    // And an empty one plans nothing at all, the same answer the share gives.
+    let nothing = propose_preview(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            stacks_allowed: true,
+            files: Some(&[]),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("an empty selection previews as nothing to share");
+    assert!(
+        matches!(nothing.action, PlannedAction::NothingToShare),
+        "{:?}",
+        nothing.action
+    );
 }

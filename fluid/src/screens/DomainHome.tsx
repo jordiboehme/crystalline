@@ -223,13 +223,17 @@ export default function DomainHome() {
       </header>
 
       {/*
-        Admin only, because the endpoints behind it are: a viewer's screen must
-        knock on nothing it would be refused. The card draws nothing at all on
-        a domain with no origin, which is most of them, so this is the whole of
-        the gate the screen owns - and an unregistered domain never reaches
-        here, the not-found branch above returns first.
+        Only for a session that may share, because the endpoints behind it are
+        gated the same way: a screen must knock on nothing it would be refused.
+        Which accounts those are is the server's answer rather than this side's
+        arithmetic - an admin always, an editor on an instance that shares as
+        the acting person - because the setting that decides it is not
+        something a browser can see. The card draws nothing at all on a domain
+        with no origin, which is most of them, so this is the whole of the gate
+        the screen owns; an unregistered domain never reaches here, the
+        not-found branch above returns first.
       */}
-      {capabilities.canAdminister && <SyncCard domain={domain} />}
+      {capabilities.canShare && <SyncCard domain={domain} />}
       {/*
         The same gate, and the same query behind it: the card beside this one
         says how many proposals there are and this one says which they are, off
@@ -237,7 +241,7 @@ export default function DomainHome() {
         an empty list on a team domain between proposals - sharing starts in
         its header, and that is exactly the moment somebody reaches for it.
       */}
-      {capabilities.canAdminister && <ProposalsCard domain={domain} />}
+      {capabilities.canShare && <ProposalsCard domain={domain} />}
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">

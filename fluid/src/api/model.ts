@@ -63,6 +63,10 @@ export type SaveManifestBody = components["schemas"]["SaveManifestBody"];
 export type GithubStatusResponse =
   components["schemas"]["GithubStatusResponse"];
 
+/** What `GET /me/github-identity` and every identity verb answer with. */
+export type GithubIdentityResponse =
+  components["schemas"]["GithubIdentityResponse"];
+
 /** What an archive preview and an archive import both answer with. */
 export type ArchiveReport = components["schemas"]["ArchiveReport"];
 

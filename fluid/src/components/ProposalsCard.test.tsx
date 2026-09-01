@@ -76,6 +76,62 @@ function syncResponse(overrides: Record<string, unknown> = {}) {
     ],
     declined_proposals: [],
     conflicts: [],
+    stack_number: null,
+    stack_wedged: [],
+    repair_pending: false,
+    stack_link_pending: false,
+    ...overrides,
+  };
+}
+
+/** One open layer, in chain order wherever it is put in the list. */
+function openProposal(number: number, title: string) {
+  return {
+    number,
+    url: `https://github.com/acme/knowledge/pull/${String(number)}`,
+    title,
+    status: "Open",
+    review_state: null,
+    amended_upstream: false,
+    feedback: [],
+    updated_at: null,
+  };
+}
+
+/** Two open layers, bottom first, the way the report orders a chain. */
+function stackedProposals() {
+  return [
+    openProposal(4, "Refine 2 engrams in eng"),
+    openProposal(7, "One more pass on the routing"),
+  ];
+}
+
+/**
+ * The connection block of an instance that shares as whoever is acting rather
+ * than as the machine. The owner slot rides along on the real report; the
+ * browser reads the SESSION's identity instead, off `/me/github-identity`.
+ */
+function personalConnection(overrides: Record<string, unknown> = {}) {
+  return {
+    connected: true,
+    user: "octo",
+    token_store: "keychain",
+    share_identity: "personal",
+    owner_identity: { account: "owner", connected: false, user: null },
+    ...overrides,
+  };
+}
+
+/** The session's own identity, in the wire shape the profile surface sends. */
+function identityPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    account: "ada",
+    connected: false,
+    login: null,
+    connected_at: null,
+    token_store: null,
+    pending: null,
+    error: null,
     ...overrides,
   };
 }
@@ -148,6 +204,21 @@ function sentBody(path: string, method: string): unknown {
     throw new Error(`the ${method} to ${path} carried no JSON body`);
   }
   return JSON.parse(body) as unknown;
+}
+
+/**
+ * The face a row's rail node wears, as its classes.
+ *
+ * The rail is decorative to the letter - `aria-hidden`, no text - so there is
+ * nothing to query it by except its shape: the node is the middle of the three
+ * spans that make up one row's piece of it.
+ */
+function railNode(row: HTMLElement): string {
+  const node = row.querySelector('[aria-hidden="true"] > span:nth-child(2)');
+  if (node === null) {
+    throw new Error("the row drew no rail node");
+  }
+  return node.className;
 }
 
 /** The card itself, once the status behind it has landed. */
@@ -285,6 +356,230 @@ describe("the proposals card", () => {
     // one more open piece of work.
     expect(within(card).getByText("declined")).toBeVisible();
     expect(within(card).getByText("open")).toBeVisible();
+  });
+
+  it("draws the chain top down, with the trunk at the foot of the rail", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // Top down, the way a stack is drawn everywhere else: the newest layer is
+    // the one somebody just shared and the one their next share sits on, and
+    // it reads first. The report still orders the chain bottom first, and the
+    // positions say which is which either way.
+    const rows = within(card).getAllByRole("listitem");
+    expect(rows[0]).toHaveTextContent("One more pass on the routing");
+    expect(rows[0]).toHaveTextContent("layer 2 of 2");
+    expect(rows[1]).toHaveTextContent("Refine 2 engrams in eng");
+    expect(rows[1]).toHaveTextContent("layer 1 of 2");
+    // And what the whole chain stands on, at the foot of the rail: the
+    // tracked branch, which is where merging the top of it lands.
+    expect(rows[2]).toHaveTextContent("main");
+    // The foot is not a layer and does not wear a layer's face: an open layer
+    // is filled in the accent, the trunk is the hollow node. Drawn apart
+    // rather than only named apart, so the rail reads as a chain standing on
+    // a branch instead of three of the same thing.
+    expect(railNode(rows[0] as HTMLElement)).toContain("bg-accent-600");
+    expect(railNode(rows[2] as HTMLElement)).not.toContain("bg-accent-600");
+    expect(railNode(rows[2] as HTMLElement)).toContain("border-slate-400");
+    // The chain itself, named once rather than per row.
+    expect(within(card).getByText("stack #42")).toBeVisible();
+  });
+
+  it("names the trunk origin when the report did not say which branch", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ open_proposals: stackedProposals(), branch: null }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The foot of the rail is where the chain lands, and it is worth drawing
+    // even when the report carried no branch name to put on it.
+    const rows = within(card).getAllByRole("listitem");
+    expect(rows[rows.length - 1]).toHaveTextContent("origin");
+  });
+
+  it("marks the wedged layer on its own row, under one banner", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+          // The bottom layer is the one the chain is stuck behind.
+          stack_wedged: [4],
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The badge goes on the row it is about, so a reader looking at the chain
+    // sees which layer is holding it up rather than matching a number in a
+    // sentence against a list.
+    const rows = within(card).getAllByRole("listitem");
+    expect(rows[1]).toHaveTextContent("Refine 2 engrams in eng");
+    expect(within(rows[1] as HTMLElement).getByText("wedged")).toBeVisible();
+    expect(within(rows[0] as HTMLElement).queryByText("wedged")).toBeNull();
+    // And the guidance stays once, above the rail: it says which two verbs
+    // settle it, which is not something a badge can carry.
+    expect(
+      within(card).getByText(
+        "Stack wedged by #4 - withdraw it or share again to repair the chain.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("says nothing about layers when only one proposal is open", async () => {
+    serve({ "/domains/eng/sync": () => syncResponse({ stack_number: 42 }) });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // A lone proposal stands in no chain a reader needs told about: no
+    // "layer 1 of 1" noise, and no stack to name either.
+    expect(within(card).queryByText(/layer 1 of 1/i)).toBeNull();
+    expect(within(card).queryByText(/^stack #/)).toBeNull();
+  });
+
+  it("says the link is pending rather than naming a stack it has no number for", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          // Every layer exists; the call that groups them on the forge has
+          // not landed yet.
+          stack_number: null,
+          stack_link_pending: true,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The positions are real, so they are drawn.
+    expect(within(card).getByText("layer 2 of 2")).toBeVisible();
+    // The number is not, so nothing anywhere says "stack #".
+    expect(within(card).queryByText(/stack #/)).toBeNull();
+    expect(within(card).getByText(/stack link pending/i)).toBeVisible();
+  });
+
+  it("names the declined layer a wedged chain is stuck behind", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+          stack_wedged: [3],
+          repair_pending: true,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The number is what a reader acts on, and the sentence says which two
+    // verbs act on it: a wedged chain cannot grow until one of them runs.
+    expect(
+      within(card).getByText(
+        "Stack wedged by #3 - withdraw it or share again to repair the chain.",
+      ),
+    ).toBeVisible();
+    // And the debt the next write settles by itself.
+    expect(
+      within(card).getByText(
+        "Repair pending - the next share or withdraw finishes it.",
+      ),
+    ).toBeVisible();
+  });
+
+  it("warns before withdrawing a layer that is carrying others", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The bottom layer, at the foot of the rail: closing it rebuilds
+    // everything above it, which is work already in front of reviewers.
+    const buttons = within(card).getAllByRole("button", { name: "Withdraw" });
+    await userEvent.click(buttons[buttons.length - 1] as HTMLElement);
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+    expect(
+      within(dialog).getByText("Closes #4 and re-bases 1 layer above it."),
+    ).toBeVisible();
+  });
+
+  it("says nothing about re-basing when the top layer is the one going", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: stackedProposals(),
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // The top layer, at the head of the rail.
+    const buttons = within(card).getAllByRole("button", { name: "Withdraw" });
+    await userEvent.click(buttons[0] as HTMLElement);
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+    // Nothing sits on the top layer, so nothing is re-based and nothing is
+    // warned about.
+    expect(within(dialog).queryByText(/re-bases/i)).toBeNull();
+  });
+
+  it("says which files a revert could not put back", async () => {
+    serve({
+      "/domains/eng/sync/proposals/4/withdraw": (_path, init) =>
+        init?.method === "POST"
+          ? {
+              number: 4,
+              closed: true,
+              status: "withdrawn",
+              restored: ["notes/a.md"],
+              deleted: [],
+              skipped_diverged: [],
+              // No reachable copy of what this looked like before the share.
+              skipped_reverts: ["notes/c.md"],
+            }
+          : null,
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+    await userEvent.click(
+      within(dialog).getByLabelText("Restore shared files"),
+    );
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Withdraw proposal" }),
+    );
+
+    // The dialog closes on a withdraw that landed, so what it could not do
+    // lands on the row rather than under a panel nothing can read.
+    expect(await within(card).findByRole("status")).toHaveTextContent(
+      "Could not restore: notes/c.md",
+    );
   });
 
   it("withdraws through the confirm dialog, with the revert checkbox", async () => {
@@ -496,5 +791,103 @@ describe("the proposals card", () => {
       ).toBe(false);
     });
     expect(screen.queryByRole("region", { name: "Proposals" })).toBeNull();
+  });
+
+  it("names who shared each layer, where the report says", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({
+          open_proposals: [
+            {
+              ...openProposal(4, "Refine 2 engrams in eng"),
+              author_login: "octo",
+            },
+            // Shared before the login was recorded, or by a credential with no
+            // login to name: the row simply says nothing about it.
+            openProposal(7, "One more pass on the routing"),
+          ],
+          stack_number: 42,
+        }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    // A chain can carry layers by different people, so each row says whose it
+    // is - and exactly one of these two rows has an answer to give.
+    expect(within(card).getByText("@octo")).toBeVisible();
+    expect(within(card).getAllByText(/^@/)).toHaveLength(1);
+  });
+
+  it("offers to connect an identity instead of withdrawing, where a write goes out as you", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () => identityPayload(),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+
+    // Closing a proposal is a write on the forge like a share is, so it needs
+    // the same credential - and offers the same way of getting one.
+    const connect = await within(dialog).findByRole("link", {
+      name: "Connect GitHub to share",
+    });
+    expect(connect).toHaveAttribute("href", "/profile");
+    expect(
+      within(dialog).queryByRole("button", { name: "Withdraw proposal" }),
+    ).toBeNull();
+  });
+
+  it("names the identity a withdraw would go out on", async () => {
+    serve({
+      "/domains/eng/sync": () =>
+        syncResponse({ connection: personalConnection() }),
+      "/me/github-identity": () =>
+        identityPayload({ connected: true, login: "octo" }),
+    });
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+
+    expect(
+      await within(dialog).findByText("Sharing as @octo"),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByRole("button", { name: "Withdraw proposal" }),
+    ).toBeEnabled();
+  });
+
+  it("asks nothing about your identity when the instance shares as itself", async () => {
+    serve();
+
+    renderApp("/d/eng");
+    const card = await proposalsCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Withdraw" }),
+    );
+    const dialog = await screen.findByRole("dialog", { name: /withdraw/i });
+
+    // The default mode draws the dialog it always drew, and asks nothing about
+    // a credential that is not in play.
+    expect(
+      within(dialog).getByRole("button", { name: "Withdraw proposal" }),
+    ).toBeEnabled();
+    expect(within(dialog).queryByText(/sharing as/i)).toBeNull();
+    expect(
+      requested().filter((path) => path.startsWith("/me/github-identity")),
+    ).toEqual([]);
   });
 });

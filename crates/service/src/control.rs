@@ -5,7 +5,7 @@
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
 //! sessions, tool, configure, origin_add, origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
-//! shutdown. This is the operator channel plus the `tool` command, which
+//! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
 //! returns raw engine JSON; an MCP client's data operations still go over the
 //! MCP handshake.
@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::daemon::Shared;
-use crate::engine::ConfigureAction;
+use crate::engine::{ConfigureAction, ShareActor};
 
 /// The protocol version carried on every ctl envelope.
 pub const CTL_VERSION: u64 = 1;
@@ -260,6 +260,28 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
+        // A credential the CLI just deleted from this machine's store, so this
+        // daemon stops serving the deleted token out of its process cache.
+        // `account` absent or null is this machine's own credential; a string
+        // is one person's. Nothing is deleted here - the delete already
+        // happened in the process that sent this - and nothing is refused on a
+        // read-only instance, since dropping a cached secret is not a mutation
+        // this instance serves.
+        "forget_credential" => {
+            let account = match optional_account(req, "account") {
+                Ok(account) => account,
+                Err(message) => return (envelope_err(message), false),
+            };
+            match shared.engine.forget_cached_credential(account.as_deref()) {
+                Ok(()) => (
+                    envelope_ok(json!({
+                        "forgotten": account.as_deref().unwrap_or("instance"),
+                    })),
+                    false,
+                ),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {
             let domain = req.get("domain").and_then(Value::as_str);
@@ -278,12 +300,35 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             }
         }
         // Propose one domain's local changes as a pull request against its
-        // origin.
+        // origin. The control socket is the machine owner's own channel - a
+        // CLI process that already holds this machine's state directory - so
+        // it acts as `ShareActor::Owner`, here and in the two write verbs
+        // below. That is the final answer for this transport, not a
+        // placeholder waiting for a session.
         "origin_share" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
             let title = req.get("title").and_then(Value::as_str);
             let description = req.get("description").and_then(Value::as_str);
-            match shared.engine.origin_share(domain, title, description).await {
+            let proposal = match optional_number(req, "proposal") {
+                Ok(proposal) => proposal,
+                Err(message) => return (envelope_err(message), false),
+            };
+            let files = match optional_string_list(req, "files") {
+                Ok(files) => files,
+                Err(message) => return (envelope_err(message), false),
+            };
+            match shared
+                .engine
+                .origin_share(
+                    domain,
+                    title,
+                    description,
+                    proposal,
+                    files.as_deref(),
+                    ShareActor::Owner,
+                )
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -292,11 +337,14 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // optionally restore the shared files, record it withdrawn.
         "origin_withdraw" => {
             let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
-            let proposal = req.get("proposal").and_then(Value::as_u64);
+            let proposal = match optional_number(req, "proposal") {
+                Ok(proposal) => proposal,
+                Err(message) => return (envelope_err(message), false),
+            };
             let revert = req.get("revert").and_then(Value::as_bool).unwrap_or(false);
             match shared
                 .engine
-                .origin_withdraw(domain, proposal, revert)
+                .origin_withdraw(domain, proposal, revert, ShareActor::Owner)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -319,7 +367,7 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
             };
             match shared
                 .engine
-                .origin_resolve(domain, path, keep, content.as_deref())
+                .origin_resolve(domain, path, keep, content.as_deref(), ShareActor::Owner)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),
@@ -401,10 +449,207 @@ async fn maybe_embed(shared: &Arc<Shared>, embed: bool, data: &mut Value) {
     }
 }
 
+/// An optional proposal number from the envelope: absent or null is `None`,
+/// a whole non-negative number is that number, and anything else is a
+/// refusal naming the key.
+///
+/// Deliberately not `and_then(Value::as_u64)`, which reads a negative, a
+/// fraction or a string as absence. For `origin_share` that silent downgrade
+/// would turn "amend layer #6" into "stack a new layer", which opens a
+/// proposal the caller never asked for; for `origin_withdraw` it turns
+/// "withdraw layer #6" into "withdraw the top layer", which closes a proposal
+/// the caller never named. A refusal the caller can read is the only safe
+/// answer to a value we cannot interpret.
+fn optional_number(req: &Value, key: &str) -> Result<Option<u64>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("invalid {key}: expected a proposal number, got {value}")),
+    }
+}
+
+/// The account a credential verb addresses: absent or null is this machine's
+/// own credential, a string is one person's.
+///
+/// A value that is neither refuses. The absent case means "the machine's", so
+/// a number or an object read leniently would not merely be ignored - it would
+/// forget a different credential from the one the caller named, and answer ok.
+fn optional_account(req: &Value, key: &str) -> Result<Option<String>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) => Ok(Some(name.clone())),
+        Some(other) => Err(format!(
+            "invalid {key}: expected an account name, got {other}"
+        )),
+    }
+}
+
+/// The file selection a share carries, when the caller named one.
+///
+/// Absent and an empty array are different answers, so an absent key stays
+/// `None` - the whole delta - rather than becoming a selection of nothing.
+///
+/// An element that is not a string refuses the whole request instead of being
+/// dropped. Dropping it would share a DIFFERENT set of files from the one that
+/// was asked for and report success for it, which is the one outcome a
+/// selection exists to prevent; and the drop is invisible, because the layer
+/// below only ever sees the paths that survived. A path that IS a string and
+/// names nothing is a separate matter, and already answered there: the share
+/// refuses it by name.
+fn optional_string_list(req: &Value, key: &str) -> Result<Option<Vec<String>>, String> {
+    match req.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.as_str().map(str::to_string).ok_or_else(|| {
+                    format!("invalid {key}: expected an array of paths, got {item} in it")
+                })
+            })
+            .collect::<Result<Vec<String>, String>>()
+            .map(Some),
+        Some(value) => Err(format!(
+            "invalid {key}: expected an array of paths, got {value}"
+        )),
+    }
+}
+
 fn envelope_ok(data: Value) -> Value {
     json!({ "v": CTL_VERSION, "ok": true, "data": data })
 }
 
 fn envelope_err(message: impl Into<String>) -> Value {
     json!({ "v": CTL_VERSION, "ok": false, "error": message.into() })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `origin_share`'s amend target is the parameter this guards: absent
+    /// means "stack a new layer", a number means "amend that layer", and a
+    /// value that is neither must refuse rather than quietly become the
+    /// first of those and open a proposal nobody asked for. `origin_withdraw`
+    /// reads the same key with the same stakes: absent means "the top layer",
+    /// so an unreadable value there would close a layer nobody named.
+    #[test]
+    fn an_optional_number_refuses_a_present_but_unreadable_value() {
+        assert_eq!(optional_number(&json!({}), "proposal"), Ok(None));
+        assert_eq!(
+            optional_number(&json!({ "proposal": Value::Null }), "proposal"),
+            Ok(None)
+        );
+        assert_eq!(
+            optional_number(&json!({ "proposal": 6 }), "proposal"),
+            Ok(Some(6))
+        );
+
+        for bad in [json!(-1), json!(1.5), json!("6"), json!([6]), json!(true)] {
+            let refused = optional_number(&json!({ "proposal": bad }), "proposal")
+                .expect_err("a value that is not a proposal number is refused");
+            assert!(refused.starts_with("invalid proposal:"), "{refused}");
+            let envelope = envelope_err(refused);
+            assert_eq!(envelope["ok"], false);
+            assert!(
+                envelope["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("expected a proposal number"),
+                "{envelope}"
+            );
+        }
+    }
+
+    /// Which credential a forget addresses: absent is the machine's own, so a
+    /// value read leniently would forget a different one from the one named
+    /// and report success for it.
+    #[test]
+    fn a_credential_verb_refuses_an_account_that_is_not_a_name() {
+        assert_eq!(optional_account(&json!({}), "account"), Ok(None));
+        assert_eq!(
+            optional_account(&json!({ "account": Value::Null }), "account"),
+            Ok(None),
+            "absent and null are both this machine's own"
+        );
+        assert_eq!(
+            optional_account(&json!({ "account": "alice" }), "account"),
+            Ok(Some("alice".to_string()))
+        );
+
+        for bad in [json!(7), json!(true), json!(["alice"]), json!({})] {
+            let refused = optional_account(&json!({ "account": bad }), "account")
+                .expect_err("a value that is not an account name is refused");
+            assert!(refused.starts_with("invalid account:"), "{refused}");
+        }
+    }
+
+    /// A share's file selection decides what the team is asked to review, so
+    /// an element the reader cannot make a path of refuses the request rather
+    /// than being dropped: a dropped element shares a different set of files
+    /// from the one asked for and calls it success.
+    #[test]
+    fn a_file_selection_refuses_an_element_that_is_not_a_path() {
+        assert_eq!(optional_string_list(&json!({}), "files"), Ok(None));
+        assert_eq!(
+            optional_string_list(&json!({ "files": Value::Null }), "files"),
+            Ok(None),
+            "absent and null both mean the whole delta"
+        );
+        assert_eq!(
+            optional_string_list(&json!({ "files": [] }), "files"),
+            Ok(Some(Vec::new())),
+            "an empty array is a selection of nothing, not the whole delta"
+        );
+        assert_eq!(
+            optional_string_list(&json!({ "files": ["notes/a.md", "notes/b.md"] }), "files"),
+            Ok(Some(vec![
+                "notes/a.md".to_string(),
+                "notes/b.md".to_string()
+            ]))
+        );
+
+        for bad in [
+            json!(["notes/a.md", 7]),
+            json!(["notes/a.md", null]),
+            json!([["notes/a.md"]]),
+            json!({ "path": "notes/a.md" }),
+            json!("notes/a.md"),
+        ] {
+            let refused = optional_string_list(&json!({ "files": bad }), "files")
+                .expect_err("a selection that is not a list of paths is refused");
+            assert!(refused.starts_with("invalid files:"), "{refused}");
+            assert!(refused.contains("expected an array of paths"), "{refused}");
+        }
+    }
+
+    /// Both origin arms that carry an amend or withdraw target read it
+    /// through the guard rather than through `as_u64`, so neither can
+    /// silently downgrade an unreadable value to "no target given".
+    #[test]
+    fn both_origin_arms_read_their_proposal_through_the_guard() {
+        let source = include_str!("control.rs");
+        for arm in ["\"origin_share\" =>", "\"origin_withdraw\" =>"] {
+            let start = source.find(arm).unwrap_or_else(|| panic!("no {arm} arm"));
+            let rest = &source[start + arm.len()..];
+            // Up to the next arm at the same indentation, which is where this
+            // one's body ends. That eight-space prefix is the assumption this
+            // slice rests on: these arms sit two levels in, inside `match`
+            // inside `handle`. Reindent them (another nesting level, a helper
+            // function around them) and the slice runs past the arm into its
+            // neighbours, where a stray `optional_number` would keep this
+            // test green over an arm that no longer calls it - so move this
+            // pattern with the code rather than leaving it to match by luck.
+            let body = &rest[..rest.find("\n        \"").unwrap_or(rest.len())];
+            assert!(
+                body.contains("optional_number(req, \"proposal\")"),
+                "{arm} must read its proposal through optional_number"
+            );
+            assert!(
+                !body.contains("get(\"proposal\").and_then(Value::as_u64)"),
+                "{arm} must not read its proposal as a bare as_u64"
+            );
+        }
+    }
 }

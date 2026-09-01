@@ -44,6 +44,25 @@ pub fn is_reserved_path(rel: &str) -> bool {
     rel.rsplit('/').next().is_some_and(is_reserved_file)
 }
 
+/// Whether a bare filename is the generated directory index, `index.md`.
+///
+/// The narrower half of [`is_reserved_file`], and it exists because the two
+/// reserved names are not the same kind of thing. The index is generated: every
+/// side that holds the files can rebuild it from them, so it can travel with a
+/// domain and converge on whoever generated it last. The log is written, never
+/// derived, and travelling would only make it collide. Callers that treat the
+/// index as ordinary content ask this rather than negating the reserved test in
+/// their own words.
+pub fn is_index_file(name: &str) -> bool {
+    name == INDEX_FILE
+}
+
+/// Whether a forward-slashed, domain-relative path ends in the generated
+/// directory index, at the root or at any level below it.
+pub fn is_index_path(rel: &str) -> bool {
+    rel.rsplit('/').next().is_some_and(is_index_file)
+}
+
 /// One line of a generated index: a link, its display title and an optional
 /// description clause.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +182,18 @@ mod tests {
         assert!(is_reserved_path("a/b/index.md"));
         assert!(!is_reserved_path("index.md/notes.md"));
         assert!(!is_reserved_path("runbooks/logs.md"));
+    }
+
+    #[test]
+    fn the_index_test_is_the_narrower_half_of_the_reserved_one() {
+        assert!(is_index_file("index.md"));
+        assert!(!is_index_file("log.md"));
+        assert!(!is_index_file("Index.md"));
+
+        assert!(is_index_path("index.md"));
+        assert!(is_index_path("a/b/index.md"));
+        assert!(!is_index_path("runbooks/log.md"));
+        assert!(!is_index_path("index.md/notes.md"));
     }
 
     #[test]

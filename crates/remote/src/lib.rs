@@ -35,6 +35,8 @@ pub use ops::{
 };
 pub use provider::{
     ChangeKind, CompareResult, Feedback, HeadProbe, OpenProposalRef, OriginSpec, ProposalHandle,
-    ProposalRequest, ProposalState, Provider, TreeWrite, UpstreamChange,
+    ProposalRequest, ProposalState, Provider, StackInfo, StackMember, TreeWrite, UpstreamChange,
 };
-pub use token::{StoredToken, TokenStore};
+pub use token::{
+    MAX_IDENTITY_NAME_BYTES, StoredToken, TokenIdentity, TokenStore, valid_identity_name,
+};

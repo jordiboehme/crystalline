@@ -57,6 +57,13 @@ function capabilitiesOf(me: MeResponse | undefined): Capabilities {
     role,
     canWrite: !readOnly && (role === "editor" || role === "admin"),
     canAdminister: role === "admin",
+    // The server's answer, and the old rule where there is none. Whether an
+    // editor may share depends on `github.share_identity`, which is instance
+    // configuration rather than anything the role says, so this side asks
+    // instead of deriving - and a probe from a server that predates the field
+    // falls back to what was true then, which keeps that instance's screens
+    // exactly as they were.
+    canShare: me?.can_share ?? role === "admin",
     needsSetup: me?.needs_setup ?? false,
     serverVersion: me?.version ?? "",
   };

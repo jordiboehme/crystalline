@@ -11,10 +11,11 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     AuthConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting,
-    IdentityConfig, IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, SkillsConfig,
-    SkillsServe,
+    IdentityConfig, IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode,
+    SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
+use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
 
 use crate::overlay::EnvOverlay;
 
@@ -125,6 +126,33 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_enabled,
             clear: clear_enabled,
             effective: enabled_effective,
+        },
+        SettingSpec {
+            key: "github.stacks",
+            doc: "Stack a new proposal on the open one when sharing again, where the forge serves stacked pull requests (default true); false keeps a single proposal per domain, updated in place",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            apply: set_stacks,
+            clear: clear_stacks,
+            effective: stacks_effective,
+        },
+        SettingSpec {
+            key: "github.share_identity",
+            doc: "Whose GitHub identity shares run under: instance (default) uses the one connected token for everything; personal requires each person to connect their own GitHub identity for sharing, while pulling stays on the instance token",
+            kind: SettingKind::String,
+            startup_effective: false,
+            apply: set_share_identity,
+            clear: clear_share_identity,
+            effective: share_identity_effective,
+        },
+        SettingSpec {
+            key: "github.agent_identity",
+            doc: "The crystalline account whose connected GitHub identity agent shares over HTTP MCP run under when share_identity is personal; unset means those shares are refused",
+            kind: SettingKind::String,
+            startup_effective: false,
+            apply: set_agent_identity,
+            clear: clear_agent_identity,
+            effective: agent_identity_effective,
         },
         SettingSpec {
             key: "github.poll_secs",
@@ -504,6 +532,122 @@ fn clear_enabled(config: &mut GlobalConfig) {
 fn enabled_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.github.as_ref().and_then(|g| g.enabled).is_none();
     (config.github_enabled().to_string(), is_default)
+}
+
+// --- github.stacks ------------------------------------------------------------
+
+fn set_stacks(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "github.stacks must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .github
+        .get_or_insert_with(GitHubConfig::default)
+        .stacks = Some(parsed);
+    Ok(())
+}
+
+fn clear_stacks(config: &mut GlobalConfig) {
+    if let Some(g) = config.github.as_mut() {
+        g.stacks = None;
+    }
+    drop_github_if_empty(config);
+}
+
+/// Unlike every other GitHub toggle this one defaults ON, so the effective
+/// value an unset key shows is `true`.
+fn stacks_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.github.as_ref().and_then(|g| g.stacks).is_none();
+    (config.github_stacks().to_string(), is_default)
+}
+
+// --- github.share_identity ----------------------------------------------------
+
+/// The strict half of the share-identity pair. Only the two words this
+/// registry knows are ever stored, so
+/// [`GlobalConfig::github_share_identity`] - which tolerates anything else by
+/// reading it as `instance`, because a config file is hand-editable - always
+/// reads back exactly what was set here.
+fn set_share_identity(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let mode = match value.trim() {
+        "instance" => ShareIdentityMode::Instance,
+        "personal" => ShareIdentityMode::Personal,
+        _ => {
+            return Err(SettingsError(format!(
+                "github.share_identity must be instance or personal, got '{value}'"
+            )));
+        }
+    };
+    config
+        .github
+        .get_or_insert_with(GitHubConfig::default)
+        .share_identity = Some(mode.as_str().to_string());
+    Ok(())
+}
+
+fn clear_share_identity(config: &mut GlobalConfig) {
+    if let Some(g) = config.github.as_mut() {
+        g.share_identity = None;
+    }
+    drop_github_if_empty(config);
+}
+
+fn share_identity_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config
+        .github
+        .as_ref()
+        .and_then(|g| g.share_identity.as_deref())
+        .is_none();
+    (
+        config.github_share_identity().as_str().to_string(),
+        is_default,
+    )
+}
+
+// --- github.agent_identity ----------------------------------------------------
+
+/// The value names a Crystalline account whose credential the token store
+/// addresses by name, so it is held to that store's own predicate -
+/// [`valid_identity_name`], the allowlist `[a-z0-9._-]` up to
+/// [`MAX_IDENTITY_NAME_BYTES`] - rather than to "anything without whitespace",
+/// and by CALLING it rather than mirroring it: a mirror would drift, and the
+/// drift would show up as a setting that saves and then cannot be resolved. An
+/// empty value clears the setting instead of storing a name nothing can
+/// resolve: the REST admin API sets without an unset verb, so the empty string
+/// has to be the way back there (`configure` also carries Unset;
+/// `set_allowed_hosts` is the same trade).
+fn set_agent_identity(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        clear_agent_identity(config);
+        return Ok(());
+    }
+    if !valid_identity_name(trimmed) {
+        return Err(SettingsError(format!(
+            "github.agent_identity must be a crystalline account name of at most {MAX_IDENTITY_NAME_BYTES} bytes, drawn from lowercase letters, digits, '.', '_' and '-'"
+        )));
+    }
+    config
+        .github
+        .get_or_insert_with(GitHubConfig::default)
+        .agent_identity = Some(trimmed.to_string());
+    Ok(())
+}
+
+fn clear_agent_identity(config: &mut GlobalConfig) {
+    if let Some(g) = config.github.as_mut() {
+        g.agent_identity = None;
+    }
+    drop_github_if_empty(config);
+}
+
+fn agent_identity_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.github_agent_identity() {
+        Some(name) => (name.to_string(), false),
+        None => (String::new(), true),
+    }
 }
 
 // --- github.poll_secs ----------------------------------------------------------
@@ -1188,12 +1332,15 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_twenty_one_keys_in_order() {
+    fn registry_lists_exactly_the_twenty_four_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
                 "domains_root",
                 "github.enabled",
+                "github.stacks",
+                "github.share_identity",
+                "github.agent_identity",
                 "github.poll_secs",
                 "github.api_url",
                 "github.oauth_client_id",
@@ -1226,6 +1373,15 @@ mod tests {
             vec![
                 ("domains_root", "CRYSTALLINE_DOMAINS_ROOT".to_string()),
                 ("github.enabled", "CRYSTALLINE_GITHUB_ENABLED".to_string()),
+                ("github.stacks", "CRYSTALLINE_GITHUB_STACKS".to_string()),
+                (
+                    "github.share_identity",
+                    "CRYSTALLINE_GITHUB_SHARE_IDENTITY".to_string()
+                ),
+                (
+                    "github.agent_identity",
+                    "CRYSTALLINE_GITHUB_AGENT_IDENTITY".to_string()
+                ),
                 (
                     "github.poll_secs",
                     "CRYSTALLINE_GITHUB_POLL_SECS".to_string()
@@ -1463,6 +1619,160 @@ mod tests {
         assert!(err.to_string().contains("yes"));
     }
 
+    /// `github.stacks` is the one collaboration toggle that defaults ON, so
+    /// the round trip a test has to pin is the way back: setting it false has
+    /// to survive, and clearing it has to land back on true rather than on
+    /// the bool default.
+    #[test]
+    fn apply_github_stacks_round_trips_and_defaults_on() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.github_stacks(), "stacking is the default");
+
+        apply(&mut cfg, "github.stacks", "false").unwrap();
+        assert!(!cfg.github_stacks());
+        assert_eq!(cfg.github.as_ref().unwrap().stacks, Some(false));
+
+        apply(&mut cfg, "github.stacks", "true").unwrap();
+        assert!(cfg.github_stacks());
+
+        unset(&mut cfg, "github.stacks").unwrap();
+        assert!(cfg.github_stacks(), "back to the on default");
+        assert!(cfg.github.is_none(), "and the emptied block goes with it");
+    }
+
+    #[test]
+    fn apply_github_stacks_rejects_non_bool() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "github.stacks", "sometimes").unwrap_err();
+        assert!(err.to_string().contains("github.stacks"), "{err}");
+        assert!(err.to_string().contains("sometimes"), "{err}");
+        assert!(cfg.github.is_none(), "a rejected value must not be written");
+    }
+
+    /// The registry is the strict half of the share-identity pair: it stores
+    /// only the two words it knows, so a value Crystalline wrote always reads
+    /// back as what was set.
+    #[test]
+    fn apply_github_share_identity_round_trips_and_defaults_to_instance() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(
+            cfg.github_share_identity(),
+            ShareIdentityMode::Instance,
+            "the instance token shares until someone says otherwise"
+        );
+
+        apply(&mut cfg, "github.share_identity", "personal").unwrap();
+        assert_eq!(cfg.github_share_identity(), ShareIdentityMode::Personal);
+        assert_eq!(
+            cfg.github.as_ref().unwrap().share_identity.as_deref(),
+            Some("personal")
+        );
+
+        apply(&mut cfg, "github.share_identity", "instance").unwrap();
+        assert_eq!(cfg.github_share_identity(), ShareIdentityMode::Instance);
+
+        unset(&mut cfg, "github.share_identity").unwrap();
+        assert_eq!(cfg.github_share_identity(), ShareIdentityMode::Instance);
+        assert!(cfg.github.is_none(), "and the emptied block goes with it");
+    }
+
+    /// The accessor tolerates a hand-edited typo by falling back to
+    /// `instance`; a write through the registry does not, and the refusal
+    /// names both accepted words so the fix is in the message.
+    #[test]
+    fn apply_github_share_identity_rejects_anything_but_the_two_words() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "github.share_identity", "sideways").unwrap_err();
+        assert!(err.to_string().contains("github.share_identity"), "{err}");
+        assert!(err.to_string().contains("instance"), "{err}");
+        assert!(err.to_string().contains("personal"), "{err}");
+        assert!(err.to_string().contains("sideways"), "{err}");
+        assert!(cfg.github.is_none(), "a rejected value must not be written");
+    }
+
+    #[test]
+    fn apply_github_agent_identity_round_trips_and_empty_clears_it() {
+        let mut cfg = GlobalConfig::default();
+        assert_eq!(cfg.github_agent_identity(), None);
+
+        apply(&mut cfg, "github.agent_identity", "share-bot").unwrap();
+        assert_eq!(cfg.github_agent_identity(), Some("share-bot"));
+
+        // No unset verb reaches every surface, so the empty string is how an
+        // agent identity is taken away again.
+        apply(&mut cfg, "github.agent_identity", "").unwrap();
+        assert_eq!(cfg.github_agent_identity(), None);
+        assert!(cfg.github.is_none(), "and the emptied block goes with it");
+
+        apply(&mut cfg, "github.agent_identity", "  share-bot  ").unwrap();
+        assert_eq!(
+            cfg.github_agent_identity(),
+            Some("share-bot"),
+            "the stored value is trimmed"
+        );
+
+        unset(&mut cfg, "github.agent_identity").unwrap();
+        assert_eq!(cfg.github_agent_identity(), None);
+        assert!(cfg.github.is_none());
+    }
+
+    /// The value names an account whose credential is addressed by name, so
+    /// it is held to the same allowlist the token store applies rather than to
+    /// "anything without spaces".
+    #[test]
+    fn apply_github_agent_identity_rejects_a_name_outside_the_account_class() {
+        for bad in [
+            "Share-Bot",
+            "share bot",
+            "team/bot",
+            "bot:ghes.example",
+            "bot\\name",
+            &"b".repeat(MAX_IDENTITY_NAME_BYTES + 1),
+        ] {
+            let mut cfg = GlobalConfig::default();
+            let err = apply(&mut cfg, "github.agent_identity", bad).unwrap_err();
+            assert!(
+                err.to_string().contains("github.agent_identity"),
+                "{bad}: {err}"
+            );
+            assert!(cfg.github.is_none(), "a rejected value must not be written");
+        }
+    }
+
+    /// The cross-crate agreement this setting rests on: `github.agent_identity`
+    /// names an account the token store will have to address, so the setting
+    /// accepts a value if and only if
+    /// [`crystalline_remote::valid_identity_name`] does. One predicate decides
+    /// the character class AND the ceiling; a value that saves here and then
+    /// cannot be resolved there is the failure this pins shut.
+    #[test]
+    fn the_agent_identity_class_is_the_token_stores_own_predicate() {
+        let names = [
+            "bot",
+            "share-bot",
+            "share_bot.2",
+            "Share-Bot",
+            "share bot",
+            "team/bot",
+            "bot:ghes.example",
+            "bot\\name",
+            "bot\u{1f}name",
+            "",
+            "   ",
+            &"b".repeat(MAX_IDENTITY_NAME_BYTES),
+            &"b".repeat(MAX_IDENTITY_NAME_BYTES + 1),
+        ];
+        for name in names {
+            let mut cfg = GlobalConfig::default();
+            let accepted = apply(&mut cfg, "github.agent_identity", name).is_ok();
+            // The empty value is the documented way to clear the setting, so it
+            // is accepted here while the predicate rejects it; every other value
+            // must agree exactly.
+            let expected = valid_identity_name(name.trim()) || name.trim().is_empty();
+            assert_eq!(accepted, expected, "{name:?}");
+        }
+    }
+
     #[test]
     fn apply_github_poll_secs_happy_path() {
         let mut cfg = GlobalConfig::default();
@@ -1601,12 +1911,15 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 21);
+        assert_eq!(views.len(), 24);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
                 "domains_root",
                 "github.enabled",
+                "github.stacks",
+                "github.share_identity",
+                "github.agent_identity",
                 "github.poll_secs",
                 "github.api_url",
                 "github.oauth_client_id",
@@ -1642,79 +1955,95 @@ mod tests {
         assert_eq!(enabled.source, SettingSource::Config);
         assert!(!enabled.doc.is_empty());
 
-        let poll_secs = &views[2];
+        // The one GitHub setting whose unset default is on.
+        let stacks = &views[2];
+        assert_eq!(stacks.value, "true");
+        assert_eq!(stacks.source, SettingSource::Default);
+
+        // The default mode is the pre-feature one: the instance token shares.
+        let share_identity = &views[3];
+        assert_eq!(share_identity.value, "instance");
+        assert_eq!(share_identity.source, SettingSource::Default);
+
+        // No agent identity is configured out of the box, so an HTTP-MCP share
+        // in personal mode has nothing to run under until someone names one.
+        let agent_identity = &views[4];
+        assert_eq!(agent_identity.value, "");
+        assert_eq!(agent_identity.source, SettingSource::Default);
+
+        let poll_secs = &views[5];
         assert_eq!(poll_secs.value, "300");
         assert_eq!(poll_secs.source, SettingSource::Default);
 
-        let api_url = &views[3];
+        let api_url = &views[6];
         assert_eq!(api_url.value, "https://api.github.com");
         assert_eq!(api_url.source, SettingSource::Default);
 
-        let oauth = &views[4];
+        let oauth = &views[7];
         assert_eq!(oauth.value, crystalline_remote::GITHUB_CLIENT_ID);
         assert_eq!(oauth.source, SettingSource::Default);
 
-        let read_only = &views[5];
+        let read_only = &views[8];
         assert_eq!(read_only.value, "false");
         assert_eq!(read_only.source, SettingSource::Default);
 
         // The endpoint is on by default, so the effective value nobody set is the
         // loopback address the daemon will actually bind.
-        let http = &views[6];
+        let http = &views[9];
         assert_eq!(http.value, "127.0.0.1:7411");
         assert_eq!(http.source, SettingSource::Default);
 
         // Both HTTP-surface toggles default to on, so an unconfigured install
         // gets the web UI and the JSON API on that endpoint.
-        let ui = &views[7];
+        let ui = &views[10];
         assert_eq!(ui.value, "true");
         assert_eq!(ui.source, SettingSource::Default);
 
-        let api = &views[8];
+        let api = &views[11];
         assert_eq!(api.value, "true");
         assert_eq!(api.source, SettingSource::Default);
 
-        let allowed_hosts = &views[9];
+        let allowed_hosts = &views[12];
         assert_eq!(allowed_hosts.value, "");
         assert_eq!(allowed_hosts.source, SettingSource::Default);
 
-        let response_format = &views[10];
+        let response_format = &views[13];
         assert_eq!(response_format.value, "toon");
         assert_eq!(response_format.source, SettingSource::Default);
 
-        let skills_serve = &views[11];
+        let skills_serve = &views[14];
         assert_eq!(skills_serve.value, "auto");
         assert_eq!(skills_serve.source, SettingSource::Default);
 
-        let backend = &views[12];
+        let backend = &views[15];
         assert_eq!(backend.value, "turso");
         assert_eq!(backend.source, SettingSource::Default);
 
-        let url = &views[13];
+        let url = &views[16];
         assert_eq!(url.value, "");
         assert_eq!(url.source, SettingSource::Default);
 
-        let salience_weight = &views[14];
+        let salience_weight = &views[17];
         assert_eq!(salience_weight.value, "0.15");
         assert_eq!(salience_weight.source, SettingSource::Default);
 
-        let retired_weight = &views[15];
+        let retired_weight = &views[18];
         assert_eq!(retired_weight.value, "0.6");
         assert_eq!(retired_weight.source, SettingSource::Default);
 
-        let index_files = &views[16];
+        let index_files = &views[19];
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let identity_actor = &views[17];
+        let identity_actor = &views[20];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[18];
+        let trusted_header = &views[21];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[19];
+        let anonymous = &views[22];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }

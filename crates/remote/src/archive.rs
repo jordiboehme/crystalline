@@ -113,12 +113,14 @@ pub fn extract_tarball(bytes: &[u8], subpath: Option<&str>) -> Result<ExtractedF
         }
 
         // A hidden path (a dot-file or anything under a dot-directory, the
-        // domain config file excepted) and an OKF reserved filename are never
+        // domain config file excepted) and the OKF activity log are never
         // extracted: neither must land in the working tree or the base
         // snapshot, since `crate::changes::detect_local_changes` skips the
         // same paths on its own walk. Extracting one here regardless would
         // stamp a path into `OriginState::files` that the local change walk
-        // can never see again, later read back as a spurious deletion.
+        // can never see again, later read back as a spurious deletion. A
+        // generated directory index is not excluded and comes down like any
+        // other file - see `crate::changes::is_excluded_path`.
         if crate::changes::is_excluded_path(rel) {
             continue;
         }

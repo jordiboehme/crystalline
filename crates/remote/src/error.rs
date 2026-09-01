@@ -131,6 +131,26 @@ pub enum RemoteError {
     #[error("The repository history changed underneath this domain; re-baselining automatically.")]
     BaseUnavailable,
 
+    /// A stack operation was attempted against a provider that does not serve
+    /// stacked pull requests. Every provider answers this by default: only a
+    /// forge that actually stacks proposals overrides the stack verbs.
+    #[error(
+        "This forge does not serve stacked pull requests; shares use a single living proposal instead."
+    )]
+    StacksUnsupported,
+
+    /// A teaching refusal: the caller asked for something the current state
+    /// cannot honor, and the message names the way out (which proposal numbers
+    /// are actually open, what to withdraw or merge first, what to pull
+    /// before retrying). The caller's own request is at fault, never this
+    /// machine and never the saved state, so the message travels with no
+    /// prefix of any kind and every mapper classes this on the caller-fault
+    /// side: a wrong proposal number must not read as a corrupt origin or as a
+    /// server error, or the guidance is buried under a verdict that
+    /// contradicts it.
+    #[error("{0}")]
+    Refused(String),
+
     /// The GitHub API answered in a shape this client did not expect, with no
     /// more specific variant to map it to.
     #[error("GitHub returned an unexpected answer (status {status}): {message}")]
@@ -209,6 +229,17 @@ mod tests {
             RemoteError::NotEnabled.to_string(),
             "GitHub collaboration is not enabled. Set github.enabled to true with the configure tool or crystalline config set github.enabled true."
         );
+    }
+
+    /// A refusal renders bare. The whole point of the variant is that the
+    /// teaching text reaches the caller with nothing in front of it: a
+    /// framing clause like "the origin state is corrupt" would blame this
+    /// machine for what the request asked for, and the reader would stop
+    /// at the verdict instead of following the way out.
+    #[test]
+    fn refused_renders_its_message_with_no_prefix() {
+        let text = "proposal #9 is not an open layer of this domain; open layers: #3 (layer 1)";
+        assert_eq!(RemoteError::Refused(text.to_string()).to_string(), text);
     }
 
     #[test]
@@ -379,6 +410,14 @@ mod tests {
     }
 
     #[test]
+    fn stacks_unsupported_says_what_happens_instead() {
+        assert_eq!(
+            RemoteError::StacksUnsupported.to_string(),
+            "This forge does not serve stacked pull requests; shares use a single living proposal instead."
+        );
+    }
+
+    #[test]
     fn api_error_carries_status_and_message() {
         let err = RemoteError::Api {
             status: 502,
@@ -448,6 +487,8 @@ mod tests {
             }
             .to_string(),
             RemoteError::BaseUnavailable.to_string(),
+            RemoteError::StacksUnsupported.to_string(),
+            RemoteError::Refused("withdraw the proposal and share again".to_string()).to_string(),
             RemoteError::Api {
                 status: 500,
                 message: "boom".to_string(),

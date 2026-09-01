@@ -13,6 +13,11 @@
  * count every sidebar and card draws. A withdraw that only closed a pull
  * request leaves all of that alone, which is why the receipt is read rather
  * than the request's own flag trusted.
+ *
+ * A layer with open layers on top of it is the one case where withdrawing does
+ * something to work other than its own: the chain is rebuilt around the hole,
+ * which re-bases every layer above. That is said before the press rather than
+ * discovered from the review threads afterwards.
  */
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -25,22 +30,37 @@ import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
 import { DOMAINS_QUERY_KEY } from "../api/domains";
 import { domainEngramsRoot } from "../api/engrams";
+import { plural } from "../format";
+import { ConnectToShare, SharingAs } from "./ShareIdentityAction";
 import { BUTTON } from "./primitives";
+import { useShareIdentity } from "./useShareIdentity";
 import type { WithdrawProposalDialogProps } from "./WithdrawProposalDialog";
 
 export default function WithdrawProposalDialogBody({
   domain,
   proposal,
+  layersAbove,
   onClose,
+  onNotice,
   onProblem,
 }: WithdrawProposalDialogProps): ReactElement {
   const queryClient = useQueryClient();
   const [revert, setRevert] = useState(false);
+  // Closing a proposal is a write on the forge exactly as a share is, so it
+  // goes out on the same credential and is refused for want of the same one.
+  // Read off the status the card behind this dialog already holds.
+  const identity = useShareIdentity(domain);
 
   const withdraw = useMutation({
     mutationFn: () => withdrawProposal(domain, proposal.number, revert),
     onSuccess: (receipt) => {
       onClose();
+      // The one thing a withdraw can fail at while succeeding: a file whose
+      // pre-share content is nowhere to be had cannot be put back, and
+      // somebody has to be told which ones rather than finding a gap later.
+      if (receipt.skippedReverts.length > 0) {
+        onNotice(`Could not restore: ${receipt.skippedReverts.join(", ")}`);
+      }
       // Always: this proposal is not open any more, and the card that lists it
       // and the card that counts it both read this one status.
       void queryClient.invalidateQueries({ queryKey: syncStatusKey(domain) });
@@ -84,6 +104,12 @@ export default function WithdrawProposalDialogBody({
             Closes the proposal on the origin and records it as withdrawn. The
             review stays readable there.
           </Dialog.Description>
+          {layersAbove > 0 && (
+            <p className="mt-2 rounded bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:bg-amber-950 dark:text-amber-200">
+              Closes #{String(proposal.number)} and re-bases{" "}
+              {plural(layersAbove, "layer", "layers")} above it.
+            </p>
+          )}
           <label className="mt-3 flex items-center gap-2 text-sm">
             <input
               type="checkbox"
@@ -94,7 +120,10 @@ export default function WithdrawProposalDialogBody({
             />
             Restore shared files
           </label>
-          <div className="mt-3 flex justify-end gap-2">
+          <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
+            {identity.sharingAs !== null && (
+              <SharingAs login={identity.sharingAs} />
+            )}
             <button
               type="button"
               onClick={onClose}
@@ -103,17 +132,24 @@ export default function WithdrawProposalDialogBody({
               Cancel
             </button>
             {/* Destructive: this closes a thread other people are reading,
-                and on the revert path it rewrites files on disk. */}
-            <button
-              type="button"
-              disabled={withdraw.isPending}
-              onClick={() => {
-                withdraw.mutate();
-              }}
-              className={BUTTON.destructive}
-            >
-              Withdraw proposal
-            </button>
+                and on the revert path it rewrites files on disk. Where the
+                engine would refuse this session's write for want of an
+                identity, the way to get one takes its place - everything
+                above it is a read, and stays. */}
+            {identity.mustConnect ? (
+              <ConnectToShare />
+            ) : (
+              <button
+                type="button"
+                disabled={withdraw.isPending || identity.asking}
+                onClick={() => {
+                  withdraw.mutate();
+                }}
+                className={BUTTON.destructive}
+              >
+                Withdraw proposal
+              </button>
+            )}
           </div>
         </Dialog.Content>
       </Dialog.Portal>

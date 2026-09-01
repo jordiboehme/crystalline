@@ -11,20 +11,29 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  MY_GITHUB_IDENTITY_KEY,
+  SYNC_SUMMARY_KEY,
   archiveDownloadUrl,
+  connectMyGithubIdentityToken,
   createDomain,
   disconnectGithub,
+  disconnectMyGithubIdentity,
   fetchConflict,
   fetchGithubStatus,
+  fetchMyGithubIdentity,
   fetchShareChanges,
   fetchSyncStatus,
+  fetchSyncSummary,
   importArchive,
   previewArchive,
   readGithubStatus,
+  readMyGithubIdentity,
+  readStackPlacement,
   resolveConflict,
   shareDomain,
   sharePlanKey,
   startGithubConnect,
+  startMyGithubIdentityDevice,
   submitGithubToken,
   syncDomain,
   syncStatusKey,
@@ -179,6 +188,138 @@ describe("the admin client layer", () => {
     });
   });
 
+  it("reads my own GitHub identity out of its wire spelling", async () => {
+    apiMock.mockResolvedValueOnce({
+      account: "ada",
+      connected: false,
+      login: null,
+      connected_at: null,
+      token_store: null,
+      pending: {
+        user_code: "ABCD-1234",
+        verification_url: "https://github.example/device",
+        expires_in_secs: 900,
+      },
+      error: null,
+    });
+    const identity = await fetchMyGithubIdentity();
+
+    // The caller's own, so no path segment names it: the session does.
+    expect(apiMock).toHaveBeenLastCalledWith("/me/github-identity");
+    expect(identity).toEqual({
+      account: "ada",
+      connected: false,
+      login: null,
+      connectedAt: null,
+      tokenStore: null,
+      pending: {
+        userCode: "ABCD-1234",
+        verificationUrl: "https://github.example/device",
+        expiresInSecs: 900,
+      },
+      error: null,
+    });
+  });
+
+  it("reads a connected identity, and a report that left fields out", () => {
+    expect(
+      readMyGithubIdentity({
+        account: "ada",
+        connected: true,
+        login: "octo",
+        connected_at: "2026-08-29T09:12:44Z",
+        token_store: "keyring",
+        pending: null,
+        error: "the code expired before it was confirmed",
+      }),
+    ).toEqual({
+      account: "ada",
+      connected: true,
+      login: "octo",
+      connectedAt: "2026-08-29T09:12:44Z",
+      tokenStore: "keyring",
+      pending: null,
+      error: "the code expired before it was confirmed",
+    });
+
+    // This one is the card's poll as well as its read, so a field that is
+    // briefly missing leaves the card saying "not connected" rather than
+    // throwing inside a render. Nonsense reads the same way.
+    const bare = {
+      account: "",
+      connected: false,
+      login: null,
+      connectedAt: null,
+      tokenStore: null,
+      pending: null,
+      error: null,
+    };
+    expect(readMyGithubIdentity({})).toEqual(bare);
+    expect(readMyGithubIdentity("nonsense")).toEqual(bare);
+    // A code with nowhere to type it is not something to put in front of
+    // somebody, so half a pending block is no pending block.
+    expect(
+      readMyGithubIdentity({ pending: { user_code: "ABCD-1234" } }).pending,
+    ).toBeNull();
+  });
+
+  it("starts my own device flow on its own route, and files it outside the domain family", async () => {
+    apiMock.mockResolvedValueOnce({
+      account: "ada",
+      connected: false,
+      pending: {
+        user_code: "ABCD-1234",
+        verification_url: "https://github.example/device",
+        expires_in_secs: 900,
+      },
+    });
+    const identity = await startMyGithubIdentityDevice();
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/me/github-identity/connect",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(identity.pending?.userCode).toBe("ABCD-1234");
+    // A personal identity is nobody's domain content, so no bulk domain
+    // invalidation reaches it.
+    expect(MY_GITHUB_IDENTITY_KEY).toEqual(["me-github-identity"]);
+    expect(MY_GITHUB_IDENTITY_KEY[0]).not.toBe(syncStatusKey("eng")[0]);
+  });
+
+  it("puts my token and keeps no copy of it", async () => {
+    apiMock.mockResolvedValueOnce({
+      account: "ada",
+      connected: true,
+      login: "octo",
+      connected_at: "2026-08-29T09:12:44Z",
+      token_store: "keyring",
+    });
+    const identity = await connectMyGithubIdentityToken("ghp_secret");
+
+    // PUT rather than POST: this replaces the caller's one identity, so
+    // re-pasting a token is the same request twice with the same result.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/me/github-identity/token",
+      expect.objectContaining({
+        method: "PUT",
+        body: JSON.stringify({ token: "ghp_secret" }),
+      }),
+    );
+    expect(JSON.stringify(identity)).not.toContain("ghp_secret");
+  });
+
+  it("forgets my own credential with a DELETE", async () => {
+    apiMock.mockResolvedValueOnce({ account: "ada", connected: false });
+    const identity = await disconnectMyGithubIdentity();
+
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/me/github-identity",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(identity.connected).toBe(false);
+    expect(identity.login).toBeNull();
+  });
+
   it("registers a domain and reads where it landed", async () => {
     apiMock.mockResolvedValueOnce({
       domain: "notes",
@@ -232,6 +373,9 @@ describe("the admin client layer", () => {
       branch: "main",
       lastChecked: "2026-08-10T08:00:00Z",
       localChanges: 2,
+      // The report said nothing about whose work it is, which is not the same
+      // as saying none of it is this account's.
+      ownedChanges: null,
       openProposals: 2,
       // Nothing declined and nothing conflicting is nothing to count: a report
       // that leaves the keys out says zero rather than "unknown".
@@ -261,6 +405,9 @@ describe("the admin client layer", () => {
           amendedUpstream: false,
           feedback: [],
           updatedAt: null,
+          // Nobody is named for a record shared before the login was
+          // recorded, rather than a login invented for it.
+          authorLogin: null,
         },
         {
           number: 9,
@@ -271,11 +418,63 @@ describe("the admin client layer", () => {
           amendedUpstream: false,
           feedback: [],
           updatedAt: null,
+          authorLogin: null,
         },
       ],
       conflictList: [],
+      // The identity key the connection block carries on an instance that has
+      // one: a report with no block says nothing about it rather than
+      // defaulting to a mode nobody set.
+      shareIdentity: null,
+      // The four chain keys the route always sends, read out of a report that
+      // sent none of them: nothing is stacked, nothing is wedged and neither
+      // debt is outstanding. Quiet defaults rather than holes, because every
+      // one of them is drawn as a badge or a banner when it is set.
+      stackNumber: null,
+      stackWedged: [],
+      repairPending: false,
+      stackLinkPending: false,
     });
     expect(syncStatusKey("eng")).toEqual(["domains", "eng", "sync"]);
+  });
+
+  it("reads where the domain's chain of stacked proposals stands", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [{ number: 7 }, { number: 9 }],
+      stack_number: 42,
+      // A declined layer still carrying open layers above it, by number: that
+      // number is what a reader withdraws or shares against.
+      stack_wedged: [3, "nonsense"],
+      repair_pending: true,
+      stack_link_pending: true,
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.stackNumber).toBe(42);
+    // Only the numbers: a wedged entry that is not one is nothing a screen can
+    // address a proposal by.
+    expect(status.stackWedged).toEqual([3]);
+    expect(status.repairPending).toBe(true);
+    expect(status.stackLinkPending).toBe(true);
+  });
+
+  it("reads a chain whose linking call has not landed as pending, not as stack null", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [{ number: 7 }, { number: 9 }],
+      // Every layer exists; they are simply not grouped on the forge yet.
+      stack_number: null,
+      stack_wedged: [],
+      repair_pending: false,
+      stack_link_pending: true,
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.stackNumber).toBeNull();
+    expect(status.stackLinkPending).toBe(true);
   });
 
   it("reads the mode and the connection the sync report carries", async () => {
@@ -293,6 +492,123 @@ describe("the admin client layer", () => {
 
     expect(status.mode).toBe("github");
     expect(status.connected).toBe(true);
+  });
+
+  it("reads how much of the waiting work is this session's own", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      local_changes: 5,
+      owned_changes: 2,
+      open_proposals: [],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.localChanges).toBe(5);
+    expect(status.ownedChanges).toBe(2);
+
+    // Zero is an answer and stays one; a non-number is not an answer at all,
+    // and folding it to zero would tell a reader none of the waiting work is
+    // theirs on the word of a report that never said so.
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      local_changes: 5,
+      owned_changes: 0,
+      open_proposals: [],
+    });
+    expect((await fetchSyncStatus("eng")).ownedChanges).toBe(0);
+
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      local_changes: 5,
+      owned_changes: "two",
+      open_proposals: [],
+    });
+    expect((await fetchSyncStatus("eng")).ownedChanges).toBeNull();
+  });
+
+  it("reads the owned count on a summary row the same way", async () => {
+    apiMock.mockResolvedValueOnce({
+      domains: [
+        { domain: "eng", local_changes: 5, owned_changes: 2 },
+        { domain: "ops", local_changes: 3 },
+      ],
+    });
+    const summary = await fetchSyncSummary();
+
+    expect(summary.domains.map((entry) => entry.ownedChanges)).toEqual([
+      2,
+      null,
+    ]);
+  });
+
+  it("reads which identity this instance shares as", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [],
+      connection: {
+        connected: true,
+        user: "octo",
+        token_store: "keychain",
+        share_identity: "personal",
+        // The MACHINE owner's slot rides along in personal mode and is
+        // deliberately not read: a share made here goes out as the SESSION's
+        // identity. An unread key must not disturb the keys that are read.
+        owner_identity: { account: "owner", connected: false, user: null },
+      },
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.shareIdentity).toBe("personal");
+    expect(status).not.toHaveProperty("ownerIdentity");
+  });
+
+  it("reads an instance-mode report as the mode it names", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "eng",
+      repo: "acme/kb",
+      open_proposals: [],
+      // The default mode, where there is no personal slot in play at all: the
+      // block carries the mode and nothing else.
+      connection: { connected: true, share_identity: "instance" },
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.shareIdentity).toBe("instance");
+  });
+
+  it("reads an identity key of nonsense as no answer rather than as a mode", async () => {
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      connection: { share_identity: 7, owner_identity: "nonsense" },
+    });
+    const status = await fetchSyncStatus("eng");
+
+    // Only a word is a mode: a screen that read this as `personal` would swap
+    // a working button for a connect link on an instance that never asked for
+    // one.
+    expect(status.shareIdentity).toBeNull();
+  });
+
+  it("reads the login a proposal was shared as, where the record names one", async () => {
+    apiMock.mockResolvedValueOnce({
+      repo: "acme/kb",
+      open_proposals: [
+        { number: 7, author_login: "octo" },
+        // Shared before this was recorded, and a record that carries a
+        // non-string where the login goes: both are "nobody named".
+        { number: 9 },
+        { number: 11, author_login: 42 },
+      ],
+    });
+    const status = await fetchSyncStatus("eng");
+
+    expect(status.proposals.map((proposal) => proposal.authorLogin)).toEqual([
+      "octo",
+      null,
+      null,
+    ]);
   });
 
   it("reads an instance with no credential on file as not connected", async () => {
@@ -455,12 +771,121 @@ describe("the admin client layer", () => {
     expect(status.conflicts).toBe(2);
   });
 
+  it("reads the instance-wide summary, and files it outside the domain family", async () => {
+    apiMock.mockResolvedValueOnce({
+      connection: { connected: true, user: "octo", token_store: "keychain" },
+      domains: [
+        {
+          domain: "eng",
+          mode: "github",
+          repo: "acme/kb",
+          branch: "main",
+          last_checked: "2026-08-10T08:00:00Z",
+          local_changes: 2,
+          open_proposals: 1,
+          declined_proposals: 0,
+          conflicts: 0,
+        },
+        // No name is no domain to share into, so it never becomes a row: the
+        // name is the handle every screen reading this addresses a share by.
+        { local_changes: 5 },
+      ],
+      errors: [],
+    });
+    const summary = await fetchSyncSummary();
+
+    expect(apiMock).toHaveBeenLastCalledWith("/sync");
+    // Only what a share action needs. The entry carries a repository, a branch
+    // and a last-checked instant too, and none of them is read here: the card
+    // that draws those reads the per-domain report.
+    expect(summary).toEqual({
+      connected: true,
+      domains: [
+        {
+          domain: "eng",
+          localChanges: 2,
+          ownedChanges: null,
+          openProposals: 1,
+          declinedProposals: 0,
+          conflicts: 0,
+          // Chain health rides along with the row, because a picker has to
+          // know which domains it can actually offer; where a domain sits IN
+          // its chain stays on the per-domain report.
+          stackWedged: [],
+          repairPending: false,
+          stackLinkPending: false,
+        },
+      ],
+    });
+    // And the key it is cached under, deliberately outside the `["domains"]`
+    // family: reading this route probes GitHub, so a bulk domain invalidation
+    // must never reach it.
+    expect(SYNC_SUMMARY_KEY).toEqual(["sync-summary"]);
+    expect(SYNC_SUMMARY_KEY[0]).not.toBe(syncStatusKey("eng")[0]);
+  });
+
+  it("reads a summary that counted nothing as zero, and no block as no answer", async () => {
+    apiMock.mockResolvedValueOnce({ domains: [{ domain: "eng" }] });
+    const summary = await fetchSyncSummary();
+
+    // A count the report left out is none rather than a hole, and a report
+    // with no connection block says nothing about the credential rather than
+    // telling somebody to connect what is already connected.
+    expect(summary.connected).toBeNull();
+    expect(summary.domains).toEqual([
+      {
+        domain: "eng",
+        localChanges: 0,
+        ownedChanges: null,
+        openProposals: 0,
+        declinedProposals: 0,
+        conflicts: 0,
+        stackWedged: [],
+        repairPending: false,
+        stackLinkPending: false,
+      },
+    ]);
+  });
+
+  it("reads a summary row's chain health, so a picker can badge it", async () => {
+    apiMock.mockResolvedValueOnce({
+      domains: [
+        {
+          domain: "eng",
+          local_changes: 2,
+          stack_wedged: [3],
+          repair_pending: true,
+          stack_link_pending: false,
+        },
+      ],
+    });
+    const summary = await fetchSyncSummary();
+
+    expect(summary.domains[0]?.stackWedged).toEqual([3]);
+    expect(summary.domains[0]?.repairPending).toBe(true);
+    expect(summary.domains[0]?.stackLinkPending).toBe(false);
+  });
+
+  it("reads an instance with no credential on file as not connected", async () => {
+    // The summary reports a missing connection rather than refusing over it,
+    // so `false` is an answer a share action has to be able to act on.
+    apiMock.mockResolvedValueOnce({
+      connection: { connected: false },
+      domains: [],
+    });
+
+    expect((await fetchSyncSummary()).connected).toBe(false);
+  });
+
   it("reads what a share would do, defaults included", async () => {
     apiMock.mockResolvedValueOnce({
       action: "update",
       effective_title: "Refine 2 engrams in kb",
       changes: [
-        { path: "notes/a.md", kind: "modified" },
+        { path: "notes/a.md", kind: "modified", last_author: "human:ada" },
+        // A change nobody is named for: an engram edited outside the engine,
+        // or an older server that names nobody at all.
+        { path: "notes/b.md", kind: "modified" },
         // A change with no path is not a file anybody can be shown.
         { kind: "modified" },
       ],
@@ -473,11 +898,18 @@ describe("the admin client layer", () => {
     expect(plan).toEqual({
       action: "update",
       effectiveTitle: "Refine 2 engrams in kb",
-      changes: [{ path: "notes/a.md", kind: "modified" }],
+      changes: [
+        { path: "notes/a.md", kind: "modified", lastAuthor: "human:ada" },
+        { path: "notes/b.md", kind: "modified", lastAuthor: null },
+      ],
       number: 4,
       url: "https://github.example/acme/kb/pull/4",
       // An update carries no conflict count, and none is invented for it.
       count: null,
+      // Nor any of the three fields the two stacked plans carry.
+      topNumber: null,
+      topTitle: null,
+      layersAbove: null,
     });
     // And the key it is cached under, which is deliberately not one of the
     // `["domains", ...]` keys every other read of a domain is filed under:
@@ -502,6 +934,36 @@ describe("the admin client layer", () => {
     expect(plan.action).toBe("conflicts_pending");
   });
 
+  it("reads the layer a stack would sit on, and the layers an amend rebuilds", async () => {
+    apiMock.mockResolvedValueOnce({
+      action: "stack",
+      effective_title: "Refine 1 engram in kb",
+      changes: [],
+      top_number: 4,
+      top_title: "Refine 2 engrams in kb",
+    });
+    const stack = await fetchShareChanges("eng");
+
+    expect(stack.action).toBe("stack");
+    expect(stack.topNumber).toBe(4);
+    expect(stack.topTitle).toBe("Refine 2 engrams in kb");
+
+    apiMock.mockResolvedValueOnce({
+      action: "amend",
+      effective_title: "Refine 1 engram in kb",
+      changes: [],
+      number: 4,
+      url: "https://github.example/acme/kb/pull/4",
+      layers_above: 2,
+    });
+    const amend = await fetchShareChanges("eng");
+
+    // How much work the amend would rebuild, which is the whole difference
+    // between amending the top layer and amending one under it.
+    expect(amend.number).toBe(4);
+    expect(amend.layersAbove).toBe(2);
+  });
+
   it("shares a domain with the title and description it was given", async () => {
     apiMock.mockResolvedValueOnce({ outcome: "proposed", number: 4 });
     await shareDomain("team eng", { title: "From the UI" });
@@ -515,6 +977,45 @@ describe("the admin client layer", () => {
     );
   });
 
+  it("names the open layer to amend on the share body", async () => {
+    apiMock.mockResolvedValueOnce({
+      outcome: "updated",
+      proposal: { number: 4 },
+    });
+    await shareDomain("eng", { proposal: 4 });
+
+    // The one field that turns a share from "stack a new layer" into "amend
+    // this one", and it travels only when somebody chose a layer.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/eng/sync/share",
+      expect.objectContaining({ body: JSON.stringify({ proposal: 4 }) }),
+    );
+  });
+
+  it("reads where a shared proposal sits in its chain, position first", () => {
+    // The position is the gate and the number is named only when there is one:
+    // a chain whose linking call failed carries real positions with a null
+    // number, and "stack #null" would be worse than saying nothing.
+    expect(
+      readStackPlacement({ stack_number: 42, stack_position: [2, 3] }),
+    ).toEqual({ stackNumber: 42, stackPosition: [2, 3] });
+    expect(
+      readStackPlacement({ stack_number: null, stack_position: [2, 3] }),
+    ).toEqual({ stackNumber: null, stackPosition: [2, 3] });
+    // Off the stacked path both are null rather than absent, and a position
+    // that is not a pair of numbers is no position at all.
+    expect(
+      readStackPlacement({ stack_number: null, stack_position: null }),
+    ).toEqual({ stackNumber: null, stackPosition: null });
+    expect(
+      readStackPlacement({ stack_position: [2] }).stackPosition,
+    ).toBeNull();
+    expect(readStackPlacement("nonsense")).toEqual({
+      stackNumber: null,
+      stackPosition: null,
+    });
+  });
+
   it("withdraws a proposal by number, with the revert flag on the body", async () => {
     apiMock.mockResolvedValueOnce({
       number: 4,
@@ -523,6 +1024,12 @@ describe("the admin client layer", () => {
       restored: ["notes/a.md"],
       deleted: [],
       skipped_diverged: ["notes/b.md"],
+      // The second reason a revert leaves a file alone: no reachable copy of
+      // what it looked like before the share.
+      skipped_reverts: ["notes/c.md"],
+      repaired: true,
+      // The rebuild allocated a new number; the old one never comes back.
+      restacked: 43,
     });
     const receipt = await withdrawProposal("eng", 4, true);
 
@@ -543,7 +1050,26 @@ describe("the admin client layer", () => {
       restored: ["notes/a.md"],
       deleted: [],
       skippedDiverged: ["notes/b.md"],
+      skippedReverts: ["notes/c.md"],
+      repaired: true,
+      restacked: 43,
     });
+  });
+
+  it("reads a repair that found too few survivors to be a stack", async () => {
+    apiMock.mockResolvedValueOnce({
+      number: 4,
+      closed: true,
+      repaired: true,
+      // Null covers both "no repair happened" and "the survivors no longer
+      // make a chain", so it is read together with `repaired` rather than
+      // alone.
+      restacked: null,
+    });
+    const receipt = await withdrawProposal("eng", 4, false);
+
+    expect(receipt.repaired).toBe(true);
+    expect(receipt.restacked).toBeNull();
   });
 
   it("reads a withdraw that moved nothing as having moved nothing", async () => {
@@ -559,6 +1085,9 @@ describe("the admin client layer", () => {
       restored: [],
       deleted: [],
       skippedDiverged: [],
+      skippedReverts: [],
+      repaired: false,
+      restacked: null,
     });
   });
 

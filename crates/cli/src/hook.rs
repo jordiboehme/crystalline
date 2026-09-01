@@ -34,6 +34,14 @@
 //! sweeps state files older than a week, so a long-lived install never
 //! accumulates one file per session forever.
 //!
+//! A session that earns the nudge also looks, once, at what every registered
+//! team domain owes its origin: the local delta against the recorded base
+//! snapshot, computed offline exactly as `origin status` computes it, with no
+//! forge call and no daemon. When a domain holds substantive unshared work a
+//! third paragraph rides along asking for it to be proposed. Real work only - a
+//! regenerated folder listing never earns a line - and every failure of that
+//! read is silence rather than a broken hook.
+//!
 //! One more file lives beside those, `maintenance.json`, and it is
 //! per-machine rather than per-session: the throttle record
 //! [`crystalline_service::maintenance`] keeps, saying which domains a human
@@ -74,6 +82,23 @@ pub const NUDGE_REASON: &str = "Review this conversation for durable learnings b
 /// it names the tool, restates the two authority classes and carries the
 /// human-authored contract.
 pub const EVOLVE_NUDGE_REASON: &str = "Also due now: knowledge maintenance. Call the crystalline evolve_engrams tool and work the queue it returns: apply mechanical findings directly and summarize once at the end; propose judgment findings one at a time and wait for a yes. Engrams captured by a person are judgment class - never rewrite a human's words without asking.";
+
+/// The ride-along sharing ask, appended to [`NUDGE_REASON`] on the sessions
+/// where a team domain holds work the team has not seen.
+///
+/// The tail of the line only: what is waiting and where is counted per session
+/// and named in front of it by [`share_line`]. Wording is load-bearing the same
+/// way the maintenance paragraph's is - it names the tool, says why the team
+/// needs it and carries the propose-and-wait contract, because sharing
+/// publishes somebody's work to a repository under review and is never done
+/// unasked.
+///
+/// Number-neutral on purpose: [`share_line`] agrees with itself in number and
+/// then hands off to this constant, which refers back to the whole delta as
+/// "that work" rather than to the changes as a countable set. One sentence
+/// therefore follows "1 change ... is not yet shared" and "4 changes ... are
+/// not yet shared" equally, with no second variant to keep in step.
+pub const SHARE_NUDGE_REASON: &str = "If that work is done, propose sharing it with share_changes so the domain owner can review it and the team's archive stays current - and wait for a yes.";
 
 /// How long a machine may go without a consolidation sweep before the ask
 /// arms itself: one week. Measured from the last recorded sweep, or from
@@ -346,22 +371,99 @@ fn registered_pending<'a>(
         .collect()
 }
 
+/// What every registered team domain holds that the team has not seen:
+/// `(substantive changes, the domains holding them)`, in registration order.
+///
+/// Offline and forge-free, per registered team domain: the local delta against
+/// the recorded base snapshot, exactly what `origin status` computes without a
+/// probe ([`crystalline_service::unshared_work`]). Substantive changes only, so
+/// a domain whose only difference is a regenerated folder listing is silent -
+/// there is nothing there worth asking a person about.
+///
+/// Every failure is silence for that one domain: a domain with no origin, one
+/// with no recorded state (never connected, or connected and never pulled), one
+/// with no filesystem root and one whose tree cannot be walked all contribute
+/// nothing. A hook must never be the reason a harness's turn breaks, and a
+/// count nobody can read is not a reason to speak.
+///
+/// `origins_dir` is `<state_dir>/origins`, taken as an argument rather than
+/// read here so the whole function stays testable against a fixture rather than
+/// against the developer's own machine.
+fn unshared_team_work<'a>(
+    domains: impl IntoIterator<Item = (&'a String, &'a crystalline_core::config::DomainEntry)>,
+    origins_dir: &Path,
+) -> (usize, Vec<String>) {
+    let mut changes = 0usize;
+    let mut names = Vec::new();
+    for (name, entry) in domains {
+        if entry.origin.is_none() {
+            continue;
+        }
+        let Some(root) = entry.file_path() else {
+            continue;
+        };
+        let Some(work) = crystalline_service::unshared_work(&root, &origins_dir.join(name)) else {
+            continue;
+        };
+        if work.count() == 0 {
+            continue;
+        }
+        changes += work.count();
+        names.push(name.clone());
+    }
+    (changes, names)
+}
+
+/// The sharing paragraph for a session holding `changes` unshared changes
+/// across `domains`, or `None` when there is nothing to ask about.
+///
+/// One domain is named, because naming it is what lets the agent act without
+/// asking which; several are counted, because a list of names would push the
+/// one instruction out of sight. The counts agree with themselves in number, so
+/// a single change never reads as "1 changes".
+fn share_line(changes: usize, domains: &[String]) -> Option<String> {
+    if changes == 0 || domains.is_empty() {
+        return None;
+    }
+    let what = if changes == 1 {
+        "1 change".to_string()
+    } else {
+        format!("{changes} changes")
+    };
+    let verb = if changes == 1 { "is" } else { "are" };
+    let where_ = if domains.len() == 1 {
+        format!("in the team domain {}", domains[0])
+    } else {
+        format!("across {} team domains", domains.len())
+    };
+    Some(format!(
+        "Also: {what} {where_} {verb} not yet shared. {SHARE_NUDGE_REASON}"
+    ))
+}
+
 /// The full reason string this handler prints, composed from the capture
-/// nudge and, when [`evolve_ask`] said the sweep is due, the maintenance
+/// nudge and, when they are due, the maintenance paragraph and the sharing
 /// paragraph. The pending domains are named only when there are any: an ask
 /// raised by the weekly arm alone has nothing to point at.
-fn nudge_reason(evolve: Option<&[String]>) -> String {
-    let Some(domains) = evolve else {
-        return NUDGE_REASON.to_string();
-    };
-    if domains.is_empty() {
-        format!("{NUDGE_REASON} {EVOLVE_NUDGE_REASON}")
-    } else {
-        format!(
-            "{NUDGE_REASON} {EVOLVE_NUDGE_REASON} Focus domains: {}.",
-            domains.join(", ")
-        )
+///
+/// The two ride-alongs are independent of each other and of nothing else: both
+/// require the capture nudge to have been earned, neither requires the other,
+/// and they always land in this order so a reader meets the same paragraph in
+/// the same place every time.
+fn nudge_reason(evolve: Option<&[String]>, share: Option<&str>) -> String {
+    let mut reason = NUDGE_REASON.to_string();
+    if let Some(domains) = evolve {
+        reason.push(' ');
+        reason.push_str(EVOLVE_NUDGE_REASON);
+        if !domains.is_empty() {
+            reason.push_str(&format!(" Focus domains: {}.", domains.join(", ")));
+        }
     }
+    if let Some(line) = share {
+        reason.push(' ');
+        reason.push_str(line);
+    }
+    reason
 }
 
 /// Run the `hook stop` command: read the payload from stdin, decide, persist
@@ -475,11 +577,27 @@ pub fn run_stop() {
         maintenance::record_nudge(now);
     }
 
+    // The second ride-along, and the same rule: only a call that already earned
+    // the capture nudge ever asks, so a team domain full of unshared work can
+    // never be the reason this handler breaks its silence. Read here rather
+    // than in [`decide`] because it costs a walk of every team domain's working
+    // tree - offline, but not free - and a session that is not being nudged
+    // must not pay for it.
+    let share = match (decision, config::origins_state_dir()) {
+        (StopDecision::Nudge, Ok(origins_dir)) => {
+            let (changes, domains) = unshared_team_work(&loaded.effective.domains, &origins_dir);
+            share_line(changes, &domains)
+        }
+        _ => None,
+    };
+
     sweep_stale_state();
 
     if decision == StopDecision::Nudge {
-        let payload =
-            serde_json::json!({ "decision": "block", "reason": nudge_reason(evolve.as_deref()) });
+        let payload = serde_json::json!({
+            "decision": "block",
+            "reason": nudge_reason(evolve.as_deref(), share.as_deref()),
+        });
         if let Ok(line) = serde_json::to_string(&payload) {
             println!("{line}");
         }
@@ -1002,7 +1120,7 @@ mod tests {
 
     #[test]
     fn the_reason_names_the_focus_domains() {
-        let focused = nudge_reason(Some(&["playground".to_string(), "ops".to_string()]));
+        let focused = nudge_reason(Some(&["playground".to_string(), "ops".to_string()]), None);
         assert!(
             focused.starts_with(NUDGE_REASON),
             "the capture nudge stays first and whole: {focused}"
@@ -1013,7 +1131,7 @@ mod tests {
             "the pending domains are named: {focused}"
         );
 
-        let weekly_only = nudge_reason(Some(&[]));
+        let weekly_only = nudge_reason(Some(&[]), None);
         assert!(weekly_only.contains(EVOLVE_NUDGE_REASON));
         assert!(
             !weekly_only.contains("Focus domains"),
@@ -1021,10 +1139,165 @@ mod tests {
         );
 
         assert_eq!(
-            nudge_reason(None),
+            nudge_reason(None, None),
             NUDGE_REASON,
             "no ask means the capture nudge alone, byte for byte"
         );
+    }
+
+    // --- the sharing ride-along ------------------------------------------------
+
+    #[test]
+    fn the_share_line_names_the_one_domain_and_counts_the_rest() {
+        let one = share_line(3, &["eng".to_string()]).expect("three changes are worth asking for");
+        assert_eq!(
+            one,
+            format!(
+                "Also: 3 changes in the team domain eng are not yet shared. {SHARE_NUDGE_REASON}"
+            )
+        );
+        assert!(
+            one.contains("share_changes") && one.contains("wait for a yes"),
+            "the ask names the tool and the contract: {one}"
+        );
+
+        let single = share_line(1, &["eng".to_string()]).unwrap();
+        assert!(
+            single.contains("1 change in the team domain eng is not yet shared"),
+            "one change reads as one change: {single}"
+        );
+
+        let many = share_line(7, &["eng".to_string(), "ops".to_string()]).unwrap();
+        assert!(
+            many.contains("7 changes across 2 team domains are not yet shared"),
+            "several domains are counted rather than listed: {many}"
+        );
+    }
+
+    #[test]
+    fn the_share_line_is_silent_with_nothing_waiting() {
+        assert_eq!(
+            share_line(0, &[]),
+            None,
+            "a clean tree - or one holding only regenerated listings - asks for nothing"
+        );
+        assert_eq!(
+            share_line(0, &["eng".to_string()]),
+            None,
+            "a domain with no substantive change is not a reason to speak"
+        );
+        assert_eq!(
+            share_line(4, &[]),
+            None,
+            "and neither is a count from nowhere"
+        );
+    }
+
+    #[test]
+    fn the_reason_carries_the_share_line_beside_the_other_two() {
+        let line = share_line(2, &["eng".to_string()]).unwrap();
+
+        let share_only = nudge_reason(None, Some(&line));
+        assert!(
+            share_only.starts_with(NUDGE_REASON),
+            "the capture nudge still comes first: {share_only}"
+        );
+        assert!(
+            !share_only.contains(EVOLVE_NUDGE_REASON),
+            "sharing is independent of maintenance: {share_only}"
+        );
+        assert!(share_only.ends_with(&line), "{share_only}");
+
+        let both = nudge_reason(Some(&["ops".to_string()]), Some(&line));
+        assert!(both.contains(EVOLVE_NUDGE_REASON), "{both}");
+        assert!(
+            both.find(EVOLVE_NUDGE_REASON) < both.find(&line),
+            "the paragraphs always land in the same order: {both}"
+        );
+
+        assert!(
+            !nudge_reason(None, None).contains("not yet shared"),
+            "a session with nothing unshared says nothing about sharing"
+        );
+    }
+
+    /// An engram body, so a written file is a substantive change.
+    const ENGRAM: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - t\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\nBody.\n";
+
+    /// A domain root under `dir` holding `files`, registered as a team domain
+    /// when `connected` - which also records an empty base snapshot under
+    /// `origins`, so everything in the root reads as unshared work.
+    fn team_domain(
+        dir: &Path,
+        origins: &Path,
+        name: &str,
+        connected: bool,
+        files: &[(&str, &str)],
+    ) -> crystalline_core::config::DomainEntry {
+        let root = dir.join(name);
+        std::fs::create_dir_all(&root).unwrap();
+        for (file, body) in files {
+            std::fs::write(root.join(file), body).unwrap();
+        }
+        let mut entry = crystalline_core::config::DomainEntry::file(&root);
+        if connected {
+            entry.origin = Some(crystalline_core::config::OriginConfig {
+                repo: format!("acme/{name}"),
+                branch: None,
+                path: None,
+                poll_secs: None,
+            });
+            crystalline_remote::state::OriginState::new(format!("acme/{name}"), "main".to_string())
+                .save(&origins.join(name))
+                .unwrap();
+        }
+        entry
+    }
+
+    /// The offline read behind the line: real work in a connected domain is
+    /// counted, and three shapes stay quiet - a domain with no origin, one
+    /// whose only change is a regenerated listing, and one whose origin state
+    /// was never recorded.
+    #[test]
+    fn unshared_team_work_counts_real_work_in_connected_domains_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let origins = dir.path().join("origins");
+        let mut domains = std::collections::BTreeMap::new();
+        for (name, connected, files) in [
+            // Two engrams the team has not seen.
+            ("eng", true, vec![("alpha.md", ENGRAM), ("beta.md", ENGRAM)]),
+            // Nothing but a regenerated listing: never a reason to share.
+            ("ops", true, vec![("index.md", "# ops\n\n- alpha\n")]),
+            // A local domain, which owes nothing to anybody.
+            ("notes", false, vec![("alpha.md", ENGRAM)]),
+            // Connected in config but never pulled, so nothing is known.
+            ("unpulled", false, vec![("alpha.md", ENGRAM)]),
+        ] {
+            domains.insert(
+                name.to_string(),
+                team_domain(dir.path(), &origins, name, connected, &files),
+            );
+        }
+        // The last one carries an origin with no recorded state beside it.
+        domains.get_mut("unpulled").unwrap().origin.replace(
+            crystalline_core::config::OriginConfig {
+                repo: "acme/unpulled".to_string(),
+                branch: None,
+                path: None,
+                poll_secs: None,
+            },
+        );
+
+        let (changes, named) = unshared_team_work(&domains, &origins);
+        assert_eq!(changes, 2, "only eng's two engrams count");
+        assert_eq!(
+            named,
+            vec!["eng".to_string()],
+            "and only eng is worth naming"
+        );
+
+        let (none, nobody) = unshared_team_work(&std::collections::BTreeMap::new(), &origins);
+        assert_eq!((none, nobody), (0, Vec::new()), "no domains, no ask");
     }
 
     // --- sweep -----------------------------------------------------------------

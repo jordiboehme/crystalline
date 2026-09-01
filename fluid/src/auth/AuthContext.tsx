@@ -30,6 +30,19 @@ export interface Capabilities {
   /** Whether this session may administer accounts. */
   canAdminister: boolean;
   /**
+   * Whether this session may reach the share surfaces: a team domain's sync
+   * status, the share preview and share, a withdrawal and a conflict.
+   *
+   * The server's own answer rather than this side's arithmetic, because the
+   * rule is not a property of the role alone: an admin always may, an editor
+   * may on an instance that shares as the acting person rather than as the
+   * machine, and that setting is not something a browser can see. A probe that
+   * does not carry it - an older server - is read as the rule that has always
+   * held, admin only, so nothing changes under a client that is ahead of its
+   * instance.
+   */
+  canShare: boolean;
+  /**
    * The instance holds no accounts at all, so first-run setup is still open
    * and the login screen asks for a first admin instead of credentials.
    */

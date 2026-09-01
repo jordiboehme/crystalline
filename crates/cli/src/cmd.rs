@@ -443,7 +443,10 @@ pub(crate) fn print_origin_add(repo: &str, data: &serde_json::Value, json: bool)
 /// "nothing to share" line when the team already has everything the domain
 /// knows, the refusal when a reviewer amended the proposal's branch, or
 /// (when conflicts are still pending) every conflicting path plus a pointer
-/// at `origin resolve`.
+/// at `origin resolve`. A proposal that stands in a chain of two or more open
+/// layers also says where it sits, through [`stack_line`]; a share that also
+/// carried refreshed folder listings says so in one line of its own, through
+/// [`print_change_counts`].
 pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -456,10 +459,10 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             if let Some(summary) = data["summary"].as_str() {
                 println!("  {summary}");
             }
-            let added = data["added"].as_array().map(Vec::len).unwrap_or(0);
-            let updated = data["updated"].as_array().map(Vec::len).unwrap_or(0);
-            let deleted = data["deleted"].as_array().map(Vec::len).unwrap_or(0);
-            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_change_counts(data);
+            if let Some(line) = stack_line(data) {
+                println!("  {line}");
+            }
             print_skipped_large(&data["skipped_large"]);
         }
         "updated" => {
@@ -472,10 +475,10 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
             if let Some(summary) = prop["summary"].as_str() {
                 println!("  {summary}");
             }
-            let added = prop["added"].as_array().map(Vec::len).unwrap_or(0);
-            let updated = prop["updated"].as_array().map(Vec::len).unwrap_or(0);
-            let deleted = prop["deleted"].as_array().map(Vec::len).unwrap_or(0);
-            println!("  {added} added, {updated} updated, {deleted} deleted");
+            print_change_counts(prop);
+            if let Some(line) = stack_line(prop) {
+                println!("  {line}");
+            }
             print_skipped_large(&prop["skipped_large"]);
         }
         "proposal_diverged" => {
@@ -507,6 +510,68 @@ pub(crate) fn print_origin_share(domain: &str, data: &serde_json::Value, json: b
     }
 }
 
+/// Where a shared proposal sits in its chain, or `None` when there is no
+/// chain worth naming.
+///
+/// `stack_position` is what decides that, never `stack_number`: a chain whose
+/// linking call failed carries real positions with a null number, and saying
+/// "stack #null" would be worse than saying nothing about the number at all.
+/// So the position is the gate and the number is named only when there is
+/// one, with `(stack link pending)` standing in otherwise - the same debt
+/// `origin status` reports until a share or a probing status settles it.
+///
+/// A chain of one open layer is not a chain a reader needs told about, so a
+/// lone proposal renders exactly as it always did: no "layer 1 of 1" noise.
+fn stack_line(proposal: &serde_json::Value) -> Option<String> {
+    let number = proposal["number"].as_u64()?;
+    let position = proposal["stack_position"].as_array()?;
+    let layer = position.first()?.as_u64()?;
+    let open = position.get(1)?.as_u64()?;
+    if open < 2 {
+        return None;
+    }
+    Some(match proposal["stack_number"].as_u64() {
+        Some(stack) => format!("proposal #{number}, layer {layer} of {open} on stack #{stack}"),
+        None => format!("proposal #{number}, layer {layer} of {open} (stack link pending)"),
+    })
+}
+
+/// Print a shared proposal's change mix: one line of counts for the work
+/// somebody wrote, and one quiet line for the folder listings that rode along
+/// with it.
+///
+/// The listings are `index.md` files, generated from the engrams beside them so
+/// the team repository stays browsable on the forge. They travel with a share
+/// and they say nothing on their own, so counting them among the engrams would
+/// inflate every number a reader uses to recognize their own work. The second
+/// line is skipped entirely when there are none, which is most shares.
+fn print_change_counts(proposal: &serde_json::Value) {
+    let (added, added_indexes) = split_indexes(&proposal["added"]);
+    let (updated, updated_indexes) = split_indexes(&proposal["updated"]);
+    let (deleted, deleted_indexes) = split_indexes(&proposal["deleted"]);
+    println!("  {added} added, {updated} updated, {deleted} deleted");
+    let indexes = added_indexes + updated_indexes + deleted_indexes;
+    if indexes > 0 {
+        let noun = if indexes == 1 { "index" } else { "indexes" };
+        println!("  also refreshes {indexes} folder {noun}");
+    }
+}
+
+/// How many of a path list are real work and how many are generated folder
+/// listings, classified by filename since that is what a listing is.
+fn split_indexes(paths: &serde_json::Value) -> (usize, usize) {
+    let empty = Vec::new();
+    let mut work = 0usize;
+    let mut indexes = 0usize;
+    for path in paths.as_array().unwrap_or(&empty) {
+        match path.as_str() {
+            Some(path) if crystalline_core::is_index_path(path) => indexes += 1,
+            _ => work += 1,
+        }
+    }
+    (work, indexes)
+}
+
 fn print_skipped_large(skipped_large: &serde_json::Value) {
     let empty = Vec::new();
     for s in skipped_large.as_array().unwrap_or(&empty) {
@@ -518,8 +583,11 @@ fn print_skipped_large(skipped_large: &serde_json::Value) {
     }
 }
 
-/// Print `origin withdraw`'s result: what was closed, what was restored and
-/// what was left alone because it diverged since sharing.
+/// Print `origin withdraw`'s result: what was closed, what was restored,
+/// what was left alone because it diverged since sharing, what no revert
+/// could bring back, and what became of the chain the withdrawn layer stood
+/// in - repaired under a new stack number, or dissolved when too few layers
+/// survived to be a stack at all.
 pub(crate) fn print_origin_withdraw(data: &serde_json::Value, json: bool) {
     if json {
         println!("{data}");
@@ -543,6 +611,21 @@ pub(crate) fn print_origin_withdraw(data: &serde_json::Value, json: bool) {
             "left alone (diverged since sharing): {}",
             p.as_str().unwrap_or("")
         );
+    }
+    for p in data["skipped_reverts"].as_array().unwrap_or(&empty) {
+        println!(
+            "could not restore (no reachable copy): {}",
+            p.as_str().unwrap_or("")
+        );
+    }
+    // A repair either recreated the stack under a new number (stack numbers
+    // come off the same sequence as pull request numbers, so the old one
+    // never comes back) or found too few survivors to be a stack at all.
+    if data["repaired"].as_bool().unwrap_or(false) {
+        match data["restacked"].as_u64() {
+            Some(stack) => println!("stack repaired; now stack #{stack}"),
+            None => println!("stack dissolved"),
+        }
     }
 }
 
@@ -1365,6 +1448,51 @@ fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool
 
 // --- connect github ------------------------------------------------------------
 
+/// The credential `connect github` addresses: this machine's own by default,
+/// the machine owner's personal identity under `--personal`, or the account
+/// `--as` names (admin use, for a bot identity remote agents share as).
+///
+/// `--as` is normalized here - trimmed and lowercased - because that is the
+/// shape every other layer mints an account name in: the auth store folds a
+/// login name exactly this way before storing it, so `--as Bot` and `--as bot`
+/// have to address the one credential that account's own Fluid connect would.
+/// The token store's allowlist is the belt to that braces, and a name that
+/// still fails it is taught HERE, naming the class a name may be drawn from,
+/// rather than surfacing the store's generic refusal at the end of a sign-in.
+///
+/// The rejected name is quoted through `escape_debug`: it failed the allowlist,
+/// so unlike everywhere else an identity name is interpolated it may carry a
+/// control byte or a terminal escape, and this message is printed to a
+/// terminal.
+pub(crate) fn connect_identity(
+    personal: bool,
+    account: Option<&str>,
+) -> Result<crystalline_remote::TokenIdentity> {
+    use crystalline_remote::TokenIdentity;
+
+    if !personal {
+        // clap holds `--as` to `--personal`, so there is no named account to
+        // lose here: this is the machine credential, exactly as before.
+        return Ok(TokenIdentity::Instance);
+    }
+    let Some(account) = account else {
+        return Ok(TokenIdentity::Personal(
+            crystalline_service::engine::OWNER_IDENTITY_NAME.to_string(),
+        ));
+    };
+    let name = account.trim().to_lowercase();
+    if !crystalline_remote::valid_identity_name(&name) {
+        bail!(
+            "'{}' cannot name a personal GitHub identity: an account name may hold only \
+             lowercase letters, digits, '.', '_' and '-', and at most {} bytes. Use the \
+             account name Crystalline knows this person by.",
+            account.escape_debug(),
+            crystalline_remote::MAX_IDENTITY_NAME_BYTES
+        );
+    }
+    Ok(TokenIdentity::Personal(name))
+}
+
 /// `crystalline connect github`: sign this machine in to GitHub, always
 /// in-process (no daemon involved - signing in is this machine's identity,
 /// not content, so there is nothing for a daemon to route). A personal
@@ -1372,17 +1500,47 @@ fn print_import_report(r: &crystalline_core::import::ImportReport, dry_run: bool
 /// device flow, printing the short code and verification url unmissably
 /// before waiting on it to be confirmed. Works whether or not team domains
 /// are turned on yet; prints a one-line hint to turn them on when they are
-/// currently off. Refuses up front when `CRYSTALLINE_GITHUB_TOKEN` is set:
-/// this machine's identity is already fixed by the environment, so there is
-/// nothing for an interactive sign-in to change.
+/// currently off.
+///
+/// `identity` decides which credential is written: this machine's, or one
+/// person's personal one (see [`connect_identity`]). The two are separate
+/// credentials in the same store, so connecting a personal identity never
+/// disturbs the machine's - and `CRYSTALLINE_GITHUB_TOKEN` only refuses the
+/// machine's, since that variable fixes the MACHINE's identity and an instance
+/// that sets it is exactly the kind that shares personally.
+///
+/// `disconnect` forgets the addressed credential instead of connecting one,
+/// and is allowed even while `CRYSTALLINE_GITHUB_TOKEN` is set: that variable
+/// fixes which identity this machine ACTS as, while a disconnect deletes what
+/// is stored, and deleting a stored credential the environment is currently
+/// shadowing is a perfectly meaningful thing to want (it is how a machine stops
+/// holding a token it no longer uses). The environment is untouched either way;
+/// unsetting the variable is what changes who this machine is.
+///
+/// A daemon that already resolved that credential holds it in a
+/// process-lifetime cache and never re-reads a deleted one, so a disconnect
+/// here is told to it over the control socket ([`notify_daemon_forgot`]) - a
+/// credential is forgotten because somebody wants it to stop working, and
+/// "stops working at the next restart" is the wrong answer to that. No daemon
+/// running is nothing to tell; a daemon that could not be told is said out
+/// loud rather than left to be discovered.
+///
+/// `token_store_dir` forces the credential to a plain file under that
+/// directory instead of the OS keychain, mirroring
+/// [`crystalline_service::engine::Engine::with_token_store_dir`]. Test-only:
+/// production passes `None` and a real connect writes through the keychain.
 pub async fn connect_github(
     token: Option<&str>,
     host: Option<&str>,
+    identity: &crystalline_remote::TokenIdentity,
+    disconnect: bool,
     config_override: Option<&Path>,
+    token_store_dir: Option<&Path>,
     json: bool,
 ) -> Result<()> {
+    let instance = *identity == crystalline_remote::TokenIdentity::Instance;
     let loaded = load(config_override)?;
-    if loaded.overlay.github_token().is_some() {
+    if instance && !disconnect && loaded.overlay.github_token().is_some() {
         bail!(
             "this machine's GitHub identity comes from CRYSTALLINE_GITHUB_TOKEN; unset it to sign in interactively"
         );
@@ -1393,6 +1551,40 @@ pub async fn connect_github(
         .or_else(|| cfg.github.as_ref().and_then(|g| g.api_url.clone()));
     let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
     let token_host = bare_host(&auth_base);
+    let state_dir = match token_store_dir {
+        Some(dir) => dir.to_path_buf(),
+        None => config::origins_state_dir()
+            .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?,
+    };
+
+    if disconnect {
+        match token_store_dir {
+            // The seam's own disconnect: the file beside the connect it
+            // undoes, and no keychain touched on the way.
+            Some(dir) => forget_file_credential(identity, dir),
+            None => forget_credential(identity, token_host.as_deref(), &state_dir),
+        }
+        let told = notify_daemon_forgot(identity).await;
+        if json {
+            let mut report = serde_json::json!({
+                "disconnected": identity_label(identity),
+                "daemon": told.as_str(),
+            });
+            if let DaemonNotice::Refused(e) = &told {
+                report["daemon_error"] = serde_json::json!(e);
+            }
+            println!("{report}");
+        } else {
+            println!("Disconnected {}.", identity_phrase(identity));
+            if let DaemonNotice::Refused(e) = &told {
+                println!(
+                    "A running daemon could not be told ({e}); restart it so it stops sharing with the credential this just deleted."
+                );
+            }
+        }
+        return Ok(());
+    }
+
     let client_id = cfg
         .github
         .as_ref()
@@ -1409,9 +1601,7 @@ pub async fn connect_github(
         None => device_flow_sign_in(&auth_base, &client_id, api_url.as_deref()).await?,
     };
 
-    let state_dir = config::origins_state_dir()
-        .map_err(|e| anyhow!("could not resolve the state directory: {e}"))?;
-    // One keychain write, no read: `save_resolving` writes straight through
+    // One keychain write, no read: `save_resolving_for` writes straight through
     // and lands in the file store only if the keychain write itself fails.
     let stored = crystalline_remote::StoredToken {
         access_token,
@@ -1421,20 +1611,44 @@ pub async fn connect_github(
         user: login.clone(),
         created_at: chrono::Utc::now(),
     };
-    let store =
-        crystalline_remote::TokenStore::save_resolving(token_host.as_deref(), &state_dir, &stored)
-            .map_err(|e| anyhow!("{e}"))?;
+    let store = match token_store_dir {
+        Some(dir) => {
+            let store = crystalline_remote::TokenStore::file_fallback_for(identity, dir)
+                .map_err(|e| anyhow!("{e}"))?;
+            store.save(&stored).map_err(|e| anyhow!("{e}"))?;
+            store
+        }
+        None => crystalline_remote::TokenStore::save_resolving_for(
+            identity,
+            token_host.as_deref(),
+            &state_dir,
+            &stored,
+        )
+        .map_err(|e| anyhow!("{e}"))?,
+    };
 
+    // A personal connect that lands on an instance-mode installation is a
+    // credential nothing will use yet, so the mode is named where it is
+    // actionable. `github.enabled` is left to the instance connect to hint at:
+    // turning collaboration on is an instance-wide decision, not something a
+    // person connecting their own identity is making.
+    let personal_mode = matches!(
+        cfg.github_share_identity(),
+        crystalline_core::config::ShareIdentityMode::Personal
+    );
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "connected": login,
-                "token_store": store.kind(),
-                "github_enabled": cfg.github_enabled(),
-            })
-        );
-    } else {
+        let mut report = serde_json::json!({
+            "connected": login,
+            "token_store": store.kind(),
+            "github_enabled": cfg.github_enabled(),
+        });
+        if !instance {
+            report["identity"] = serde_json::json!("personal");
+            report["account"] = serde_json::json!(identity_label(identity));
+            report["share_identity"] = serde_json::json!(cfg.github_share_identity().as_str());
+        }
+        println!("{report}");
+    } else if instance {
         println!(
             "Connected to GitHub as {login} ({} token store).",
             store.kind()
@@ -1442,8 +1656,161 @@ pub async fn connect_github(
         if !cfg.github_enabled() {
             println!("Run: crystalline config set github.enabled true to turn on team domains");
         }
+    } else {
+        println!(
+            "Connected {} as {login} ({} token store).",
+            identity_phrase(identity),
+            store.kind()
+        );
+        if !personal_mode {
+            println!(
+                "Run: crystalline config set github.share_identity personal to share with personal identities"
+            );
+        }
     }
     Ok(())
+}
+
+/// Deletes `identity`'s credential wherever this machine keeps it: the backend
+/// the store resolves to, plus the file fallback beside it. Both are attempted
+/// and every failure is swallowed with a debug log, because this runs from
+/// paths that must not fail for it - a disconnect that already found nothing,
+/// and the sweep behind `users disable`/`users remove`.
+///
+/// Both backends rather than just the resolved one: the file fallback is
+/// written whenever the keychain was unusable at connect time, and a machine
+/// whose keychain works again would otherwise resolve to the keychain and leave
+/// a real token behind on disk.
+pub(crate) fn forget_credential(
+    identity: &crystalline_remote::TokenIdentity,
+    host: Option<&str>,
+    state_dir: &Path,
+) {
+    match crystalline_remote::TokenStore::resolve_and_load_for(identity, host, state_dir) {
+        Ok((store, _token)) => {
+            if let Err(e) = store.delete() {
+                tracing::debug!("could not forget the {} credential: {e}", store.kind());
+            }
+        }
+        Err(e) => tracing::debug!("could not resolve the credential to forget: {e}"),
+    }
+    match crystalline_remote::TokenStore::file_fallback_for(identity, state_dir) {
+        Ok(store) => {
+            if let Err(e) = store.delete() {
+                tracing::debug!("could not forget the file credential: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("could not resolve the file credential to forget: {e}"),
+    }
+}
+
+/// The directory `CRYSTALLINE_TEST_TOKEN_STORE_DIR` names, when it names one.
+///
+/// The test-only seam behind [`connect_github`]'s `token_store_dir`, needed
+/// because the CLI's own end-to-end tests drive a real child process: an
+/// in-process builder override like the engine's cannot cross that boundary,
+/// and a `connect` that reached the OS keychain would write to the
+/// developer's own login keychain and stop for its dialog. Named `TEST` for
+/// the same reason `CRYSTALLINE_TEST_POSTGRES_URL` is: it is not a knob an
+/// install is meant to set, and nothing documents it as one.
+///
+/// Redirecting where a token is written is not a privilege escalation: a
+/// process that can set this can already set `CRYSTALLINE_GITHUB_TOKEN` and
+/// decide which credential this machine acts as outright.
+pub(crate) fn test_token_store_dir() -> Option<PathBuf> {
+    std::env::var_os("CRYSTALLINE_TEST_TOKEN_STORE_DIR").map(PathBuf::from)
+}
+
+/// Deletes `identity`'s credential from the file store under `dir` and touches
+/// nothing else. The disconnect half of the token-store seam
+/// ([`connect_github`]'s `token_store_dir`): a test must not reach the
+/// developer's own keychain even to ask it whether it holds something.
+fn forget_file_credential(identity: &crystalline_remote::TokenIdentity, dir: &Path) {
+    match crystalline_remote::TokenStore::file_fallback_for(identity, dir) {
+        Ok(store) => {
+            if let Err(e) = store.delete() {
+                tracing::debug!("could not forget the file credential: {e}");
+            }
+        }
+        Err(e) => tracing::debug!("could not resolve the file credential to forget: {e}"),
+    }
+}
+
+/// What telling a running daemon about a forgotten credential came to.
+///
+/// Three states rather than two, because two of them are only the same answer
+/// to a person. "Nothing holds the credential now" covers both a daemon that
+/// took the message and no daemon at all, and that is what the human line
+/// says by staying quiet - but a machine field named for one of them and set
+/// on both would assert something that did not happen.
+pub(crate) enum DaemonNotice {
+    /// A daemon was running and dropped its cached copy.
+    Notified,
+    /// No daemon was running, so nothing was holding a copy to drop.
+    NotRunning,
+    /// A daemon is running and did not take the message: it goes on holding a
+    /// credential this machine no longer has until it restarts.
+    Refused(String),
+}
+
+impl DaemonNotice {
+    /// The machine-readable word for this outcome.
+    fn as_str(&self) -> &'static str {
+        match self {
+            DaemonNotice::Notified => "notified",
+            DaemonNotice::NotRunning => "not_running",
+            DaemonNotice::Refused(_) => "refused",
+        }
+    }
+}
+
+/// Tells a running daemon that this machine just forgot `identity`'s
+/// credential, so it drops the copy its process cache is holding.
+///
+/// Best effort in every direction: the credential is already gone from the
+/// store by the time this runs, and nothing here can put it back or fail the
+/// command that deleted it.
+pub(crate) async fn notify_daemon_forgot(
+    identity: &crystalline_remote::TokenIdentity,
+) -> DaemonNotice {
+    let account = match identity {
+        crystalline_remote::TokenIdentity::Instance => serde_json::Value::Null,
+        crystalline_remote::TokenIdentity::Personal(name) => serde_json::json!(name),
+    };
+    match crystalline_service::client::ctl_if_running(serde_json::json!({
+        "cmd": "forget_credential",
+        "account": account,
+    }))
+    .await
+    {
+        Ok(Some(_)) => DaemonNotice::Notified,
+        Ok(None) => DaemonNotice::NotRunning,
+        Err(e) => DaemonNotice::Refused(e.to_string()),
+    }
+}
+
+/// The account name a credential is addressed by, for machine output:
+/// `"instance"` for this machine's own, the account name for a personal one.
+fn identity_label(identity: &crystalline_remote::TokenIdentity) -> String {
+    match identity {
+        crystalline_remote::TokenIdentity::Instance => "instance".to_string(),
+        crystalline_remote::TokenIdentity::Personal(name) => name.clone(),
+    }
+}
+
+/// The same, in words, for the line a person reads.
+fn identity_phrase(identity: &crystalline_remote::TokenIdentity) -> String {
+    match identity {
+        crystalline_remote::TokenIdentity::Instance => "this machine's GitHub identity".to_string(),
+        crystalline_remote::TokenIdentity::Personal(name)
+            if name == crystalline_service::engine::OWNER_IDENTITY_NAME =>
+        {
+            "your personal GitHub identity".to_string()
+        }
+        crystalline_remote::TokenIdentity::Personal(name) => {
+            format!("the personal GitHub identity for '{name}'")
+        }
+    }
 }
 
 /// Runs the OAuth device flow to completion: prints the user code and
@@ -1697,6 +2064,110 @@ fn print_report(r: &crystalline_index::SyncReport) {
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod connect_identity_tests {
+    use super::connect_identity;
+    use crystalline_remote::{TokenIdentity, TokenStore};
+    use crystalline_service::engine::OWNER_IDENTITY_NAME;
+
+    /// No `--personal` is the machine credential, exactly as before this flag
+    /// existed: the one an install that never hears of personal identities
+    /// keeps writing.
+    #[test]
+    fn without_the_flag_the_machine_credential_is_addressed() {
+        assert_eq!(
+            connect_identity(false, None).unwrap(),
+            TokenIdentity::Instance
+        );
+    }
+
+    /// `--personal` alone is the machine owner, under the one fixed local name
+    /// the engine resolves an owner share against - taken from the engine's own
+    /// constant rather than re-typed here, so the two can never drift.
+    #[test]
+    fn personal_alone_addresses_the_owner_slot() {
+        assert_eq!(
+            connect_identity(true, None).unwrap(),
+            TokenIdentity::Personal(OWNER_IDENTITY_NAME.to_string())
+        );
+    }
+
+    /// `--as` is normalized before it addresses anything: the auth store folds
+    /// a login name to trimmed lowercase, so `--as Bot` has to reach the same
+    /// credential the account 'bot' connects for itself in Fluid.
+    #[test]
+    fn an_account_name_is_trimmed_and_lowercased_before_it_addresses_a_credential() {
+        assert_eq!(
+            connect_identity(true, Some("  Release-Bot.1  ")).unwrap(),
+            TokenIdentity::Personal("release-bot.1".to_string())
+        );
+    }
+
+    /// A name that still cannot address a credential after normalization is
+    /// taught in the CLI's own words, naming the class a name may be drawn
+    /// from - not handed the token store's generic refusal.
+    #[test]
+    fn a_name_the_allowlist_refuses_is_taught_rather_than_passed_through() {
+        let err = connect_identity(true, Some("Ann+Lee"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Ann+Lee"), "{err}");
+        assert!(err.contains("lowercase letters, digits"), "{err}");
+        assert!(
+            !err.contains("is not a usable account name"),
+            "the token store's generic refusal must not be what a caller sees: {err}"
+        );
+
+        // A control byte in the name reaches a terminal, so it is escaped
+        // rather than printed.
+        let err = connect_identity(true, Some("bo\u{1b}[31mt"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("\\u{1b}"), "{err}");
+        assert!(!err.contains('\u{1b}'), "{err}");
+    }
+
+    /// The credential a personal connect writes is a file of its own beside the
+    /// machine's, never the machine's: this pins the addressing end to end
+    /// through the same derivation `save_resolving_for` uses internally, which
+    /// is as far as a test can follow it without writing to the developer's
+    /// real keychain.
+    #[test]
+    fn the_owner_credential_is_a_separate_file_from_the_machines() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner =
+            TokenStore::file_fallback_for(&connect_identity(true, None).unwrap(), dir.path())
+                .unwrap();
+        let bot = TokenStore::file_fallback_for(
+            &connect_identity(true, Some("BOT")).unwrap(),
+            dir.path(),
+        )
+        .unwrap();
+        let machine =
+            TokenStore::file_fallback_for(&connect_identity(false, None).unwrap(), dir.path())
+                .unwrap();
+        let path = |store: &TokenStore| match store {
+            TokenStore::File { path } => path.clone(),
+            other => panic!("a file fallback is a file: {other:?}"),
+        };
+        assert!(
+            path(&owner).ends_with("github-token-personal-owner.json"),
+            "{:?}",
+            path(&owner)
+        );
+        assert!(
+            path(&bot).ends_with("github-token-personal-bot.json"),
+            "{:?}",
+            path(&bot)
+        );
+        assert!(
+            path(&machine).ends_with("github-token.json"),
+            "{:?}",
+            path(&machine)
+        );
     }
 }
 

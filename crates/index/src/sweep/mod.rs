@@ -9,7 +9,7 @@
 //!
 //! - `V0xx` **temporal and lifecycle** - a validity window that closed, a
 //!   staleness date that elapsed, a replacement that landed without the
-//!   retirement being finished;
+//!   retirement being finished, work that has sat unshared past its window;
 //! - `V1xx` **structural integrity** - unresolved references, one-sided
 //!   reciprocal relations, orphans, stubs, oversized engrams;
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
@@ -165,6 +165,13 @@ pub const SPECULATIVE_STATUSES: [&str; 4] = ["draft", "proposed", "idea", "poc"]
 /// structural files; being unlinked is their normal shape.
 pub const ORPHAN_EXEMPT_TYPES: [&str; 2] = ["manifest", "schema"];
 
+/// How long substantive work may sit unshared in a team domain before `V009`
+/// asks for it, in days since the oldest changed file was written. A week: long
+/// enough that a change made in the middle of a task is not chased the same
+/// afternoon, short enough that the team's copy never drifts a sprint behind
+/// what one machine knows.
+pub const SHARE_STALE_DAYS: i64 = 7;
+
 /// The reciprocal relation pairs `V103` checks, forward first. A resolved
 /// forward edge without its converse is a half-wired relation.
 pub const RECIPROCAL_PAIRS: [(&str, &str); 2] = [
@@ -262,7 +269,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 19] = [
+pub const RULES: [RuleInfo; 20] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -318,6 +325,13 @@ pub const RULES: [RuleInfo; 19] = [
         base: 60,
         summary: "attachment changed since analysis",
         instruction: "The attachment changed after this engram captured it. Re-read it, update the engram to match what it now shows, set analyzed_hash to the current hash and record a verified entry. Propose wording changes and wait for a yes.",
+    },
+    RuleInfo {
+        id: "V009",
+        family: Family::Temporal,
+        base: 40,
+        summary: "unshared work aging",
+        instruction: "Knowledge written here has not reached the team's copy. Propose sharing it with share_changes (the CLI verb is `crystalline origin share`) so the domain owner can review it and the team's archive stays current, and wait for a yes. Sharing publishes somebody's work under review, so it is never done unasked. A generated folder listing never counts as a reason to share.",
     },
     RuleInfo {
         id: "V101",
@@ -698,6 +712,8 @@ pub struct SweepOptions {
     pub minhash_bands: usize,
     /// See [`MINHASH_BAND_ROWS`].
     pub minhash_rows: usize,
+    /// See [`SHARE_STALE_DAYS`].
+    pub share_stale_days: i64,
 }
 
 impl Default for SweepOptions {
@@ -714,8 +730,29 @@ impl Default for SweepOptions {
             minhash_hashes: MINHASH_HASHES,
             minhash_bands: MINHASH_BANDS,
             minhash_rows: MINHASH_BAND_ROWS,
+            share_stale_days: SHARE_STALE_DAYS,
         }
     }
+}
+
+/// What a domain owes its team origin, assembled by the caller because it is
+/// the one sweep fact that lives in the working tree rather than in the index.
+///
+/// A domain with no origin has none of this ([`SweepInput::share`] stays
+/// `None`) and `V009` never speaks about it: there is nowhere to share to, so
+/// unshared is not a state it can be in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareFacts {
+    /// How many SUBSTANTIVE changes stand between the working tree and the
+    /// base snapshot - knowledge somebody wrote, never a regenerated folder
+    /// listing. The assembler applies that filter, so a delta made only of
+    /// listings arrives here as zero and `V009` stays quiet on it.
+    pub unshared: usize,
+    /// The date the oldest of those changes was last written, from the file's
+    /// own mtime. `None` when no changed file has one to read - a delta made
+    /// only of deletions, or a tree this process could not stat - and the rule
+    /// then stays quiet rather than guessing an age.
+    pub oldest_change: Option<NaiveDate>,
 }
 
 /// One domain's assembled sweep input.
@@ -750,6 +787,11 @@ pub struct SweepInput {
     /// compare this list against what the engrams reference and claim, in both
     /// directions.
     pub attachments: Vec<AttachmentRow>,
+    /// What this domain owes its team origin, or `None` for a domain with no
+    /// origin (and for one whose origin state could not be read, which is the
+    /// same thing as far as a detector is concerned: nothing is known to be
+    /// unshared).
+    pub share: Option<ShareFacts>,
     /// Return the findings acknowledgments suppressed anyway, each marked
     /// [`Finding::acknowledged`] with the scope and note that silenced it. An
     /// audit view: the queue a run hands out drops them.
@@ -772,6 +814,7 @@ impl SweepInput {
             tag_aliases: Vec::new(),
             known_domains: Vec::new(),
             attachments: Vec::new(),
+            share: None,
             include_acknowledged: false,
             options: SweepOptions::default(),
         }
@@ -1317,6 +1360,57 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
     }
 
     detect_aging(input, report);
+    detect_unshared(input, report);
+}
+
+/// `V009`: substantive work that has sat unshared in a team domain past
+/// [`SweepOptions::share_stale_days`].
+///
+/// A domain-level finding, because the subject is the delta rather than any one
+/// engram in it, and judgment class for the plainest of reasons: sharing
+/// publishes somebody's work to a team under review, so it is proposed and
+/// agreed rather than done.
+///
+/// Three ways it stays quiet, each a real state rather than a defensive check:
+/// a domain with no origin carries no [`SweepInput::share`] at all; a delta made
+/// only of regenerated folder listings arrives with `unshared` zero, because the
+/// assembler counts substantive changes only; and a delta whose age cannot be
+/// read carries no `oldest_change`, and an age this rule cannot establish is one
+/// it will not assert.
+///
+/// A fourth silence comes from the caller rather than from here, and is stated
+/// so nobody hunts for it as a bug: the service assembles `share` only after it
+/// has engrams for the domain in hand, so a team domain with nothing indexed
+/// yet - freshly connected, mid-reindex, or every engram unparseable - never
+/// reaches this rule at all. That is the wanted behaviour rather than a gap. A
+/// domain the archive cannot yet read is a domain whose delta nobody has
+/// reviewed, and a nudge to publish it would be a nudge made in the dark.
+fn detect_unshared(input: &SweepInput, report: &mut SweepReport) {
+    let Some(share) = input.share else {
+        return;
+    };
+    if share.unshared == 0 {
+        return;
+    }
+    let Some(oldest) = share.oldest_change else {
+        return;
+    };
+    let age = (input.today - oldest).num_days();
+    if age < input.options.share_stale_days {
+        return;
+    }
+    let changes = share.unshared;
+    report
+        .findings
+        .push(Finding::about_domain("V009", &input.domain).with(
+            Class::Judgment,
+            format!("{changes} change(s) have been unshared for {age} days"),
+            format!(
+                "{changes} substantive local change(s); oldest change {oldest}; today={}; threshold {} days",
+                input.today, input.options.share_stale_days
+            ),
+            format!("share_changes domain={}", input.domain),
+        ));
 }
 
 /// `V003`, which needs the whole domain in hand before it can pick the oldest.
