@@ -236,7 +236,7 @@ impl SessionMint {
 /// A freshly issued (or rotated) MCP token. The `token` is the only copy in
 /// existence that is not hashed - it goes to the client once, in the issuance
 /// response, and is never written down here.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct IssuedMcpToken {
     /// The row id, used to revoke or rotate this token later.
     pub id: i64,
@@ -244,6 +244,20 @@ pub struct IssuedMcpToken {
     pub token: String,
     /// The caller-chosen label, echoed back so the response is self-describing.
     pub label: String,
+}
+
+/// Hand-written rather than derived so `id` and `label` still print (a later
+/// task's `tracing::debug!(?issued)` or a failed `assert_eq!` needs those to
+/// be useful) while `token` - the only unhashed copy of a live credential -
+/// never reaches a log line.
+impl std::fmt::Debug for IssuedMcpToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedMcpToken")
+            .field("id", &self.id)
+            .field("token", &"cmt_[redacted]")
+            .field("label", &self.label)
+            .finish()
+    }
 }
 
 /// One row of an account's MCP token list, for a management UI or CLI. Never
@@ -1363,34 +1377,52 @@ impl AuthStore {
     ///
     /// Errors if the account does not exist, so a mistyped name is reported
     /// rather than silently minting an orphaned row.
+    ///
+    /// The existence check and the insert are one `BEGIN IMMEDIATE`
+    /// transaction, exactly as [`AuthStore::create_session`] does it and for
+    /// the same reason: without it, a `remove_user` running in the CLI could
+    /// delete the account between the two and leave this token stranded, to be
+    /// inherited by the next account to claim the name (`mcp_tokens` carries no
+    /// foreign key, so nothing else would stop the insert from landing).
     pub async fn issue_mcp_token(&self, user: &str, label: &str) -> Result<IssuedMcpToken> {
         let user = normalize_name(user)?;
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
-        let exists = self
-            .query_first(
-                "SELECT 1 FROM users WHERE name = ?1",
-                vec![Value::Text(user.clone())],
-            )
-            .await?;
-        if exists.is_none() {
-            bail!("no such user: '{user}'");
-        }
-        self.conn
-            .execute(
-                "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
-                 VALUES (?1, ?2, ?3, ?4)",
-                vec![
-                    Value::Text(user.clone()),
-                    Value::Text(hash),
-                    Value::Text(label.to_string()),
-                    Value::Text(created_at),
-                ],
-            )
+        self.begin_immediate()
             .await
             .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
+        let result = async {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(user.clone())],
+                )
+                .await?;
+            if exists.is_none() {
+                bail!("no such user: '{user}'");
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(user.clone()),
+                        Value::Text(hash),
+                        Value::Text(label.to_string()),
+                        Value::Text(created_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        // Read after commit, still under `self.guard` and on this connection,
+        // so nothing else on this connection can insert between the commit
+        // above and this read - same reasoning `rotate_mcp_token` relies on.
         let id = self.conn.last_insert_rowid();
         Ok(IssuedMcpToken {
             id,
@@ -1404,9 +1436,25 @@ impl AuthStore {
     /// or disabled-account token - the three are deliberately indistinguishable,
     /// same as [`AuthStore::verify_password`]. Stamps `last_used` on a hit, so
     /// [`AuthStore::list_mcp_tokens`] can show when a token was last presented.
+    ///
+    /// Also prunes any orphaned `mcp_tokens` row - one whose account no longer
+    /// exists - on every call, the same defense in depth
+    /// [`AuthStore::session_user`] applies to sessions. `mcp_tokens` carries no
+    /// foreign key, and [`AuthStore::issue_mcp_token`]'s transaction is what is
+    /// supposed to stop a stranded row from ever being written; this is the
+    /// belt to that transaction's suspenders, for a row written before this
+    /// existed or reached by any other path.
     pub async fn mcp_token_user(&self, token: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
         let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM mcp_tokens
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.user)",
+                (),
+            )
+            .await
+            .context("pruning orphaned mcp tokens")?;
         let Some(row) = self
             .query_first(
                 &format!(
@@ -1504,6 +1552,10 @@ impl AuthStore {
         self.begin_immediate()
             .await
             .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
+        // Captured by the closure below and read after `finish` commits, the
+        // same `ensure_session` shape this file already uses for a
+        // transaction whose caller needs more out of it than `Result<()>`.
+        let mut label = String::new();
         let result = async {
             let row = self
                 .query_first(
@@ -1514,7 +1566,7 @@ impl AuthStore {
             let Some(row) = row else {
                 bail!("no such mcp token '{id}' for user '{user}'");
             };
-            let label = cell_text(&row, 0).unwrap_or_default();
+            label = cell_text(&row, 0).unwrap_or_default();
             self.conn
                 .execute(
                     "DELETE FROM mcp_tokens WHERE id = ?1",
@@ -1535,22 +1587,12 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
-            Ok(label)
+            Ok(())
         }
         .await;
-        let label = match result {
-            Ok(label) => {
-                self.conn
-                    .execute("COMMIT", ())
-                    .await
-                    .context("committing an auth database transaction")?;
-                label
-            }
-            Err(e) => {
-                let _ = self.conn.execute("ROLLBACK", ()).await;
-                return Err(e);
-            }
-        };
+        self.finish(result).await?;
+        // Read after commit, still under `self.guard` and on this connection:
+        // see `issue_mcp_token`'s matching comment.
         let id = self.conn.last_insert_rowid();
         Ok(IssuedMcpToken { id, token, label })
     }
@@ -3329,10 +3371,40 @@ mod tests {
         assert_eq!(issued.token.len(), 4 + 64);
         let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
         assert_eq!(user.name, "ada");
-        // the store never keeps the plaintext
         let listed = store.list_mcp_tokens("ada").await.unwrap();
         assert_eq!(listed.len(), 1);
         assert!(listed[0].last_used.is_some());
+
+        // The store never keeps the plaintext - proved, not just commented.
+        // Read the raw column via the store's own connection (tests are a
+        // descendant module, so the private field and helper are reachable)
+        // and check it against an independently computed sha256, the same
+        // property `token_hash` is supposed to have.
+        let row = store
+            .query_first(
+                "SELECT token_hash FROM mcp_tokens WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_hash = cell_text(&row, 0).unwrap();
+        assert_eq!(stored_hash.len(), 64, "a sha256 hex digest is 64 chars");
+        assert!(
+            stored_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "the stored value must be hex, not the token itself"
+        );
+        assert_ne!(stored_hash, issued.token);
+        assert!(!stored_hash.contains(issued.token.as_str()));
+        assert!(!issued.token.contains(stored_hash.as_str()));
+        let mut hasher = Sha256::new();
+        hasher.update(issued.token.as_bytes());
+        let expected = crystalline_index::hex_lower(&hasher.finalize());
+        assert_eq!(
+            stored_hash, expected,
+            "the column holds sha256 of the whole token, prefix included"
+        );
+
         assert!(store.revoke_mcp_token("ada", issued.id).await.unwrap());
         assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
     }
@@ -3350,6 +3422,57 @@ mod tests {
         let issued = store.issue_mcp_token("ada", "t").await.unwrap();
         store.set_disabled("ada", true).await.unwrap();
         assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+
+        // Disabled without deletion: the row must still be there, and
+        // re-enabling must hand the very same token back rather than force a
+        // re-issue.
+        let listed = store.list_mcp_tokens("ada").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "disabling an account must not delete its mcp tokens"
+        );
+        store.set_disabled("ada", false).await.unwrap();
+        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
+        assert_eq!(user.name, "ada");
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_mcp_token_row_cannot_resolve_and_gets_pruned() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
+
+        // Simulate the stranded-row scenario `issue_mcp_token`'s own
+        // transaction now prevents live: an account vanishing by a path other
+        // than `remove_user`'s sweep, leaving an `mcp_tokens` row with no
+        // matching account (the table carries no foreign key). A row written
+        // before this defense existed, or reached some other way, must still
+        // fail closed rather than resolve for whoever next claims the name.
+        store
+            .conn
+            .execute("DELETE FROM users WHERE name = 'ada'", ())
+            .await
+            .unwrap();
+
+        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+
+        let remaining = store
+            .query_first("SELECT COUNT(*) FROM mcp_tokens", vec![])
+            .await
+            .unwrap()
+            .unwrap();
+        let count = match remaining.get_value(0) {
+            Ok(Value::Integer(n)) => n,
+            other => panic!("unexpected COUNT(*) result: {other:?}"),
+        };
+        assert_eq!(
+            count, 0,
+            "mcp_token_user must prune the orphaned row, not just refuse it"
+        );
     }
 
     #[tokio::test]
