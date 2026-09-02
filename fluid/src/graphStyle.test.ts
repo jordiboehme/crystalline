@@ -96,7 +96,7 @@ describe("the graph stylesheet", () => {
     // crossing an arrow stays readable without the arrow shouting back.
     const sheet = graphStylesheet(false);
     const node = styleFor(sheet, "node");
-    expect(node["font-size"]).toBeLessThanOrEqual(11);
+    expect(node["font-size"]).toBeLessThanOrEqual(9);
     expect(node["text-outline-width"]).toBeGreaterThanOrEqual(2);
 
     const edge = styleFor(sheet, "edge");

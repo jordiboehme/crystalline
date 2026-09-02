@@ -59,7 +59,7 @@ export function graphStylesheet(dark: boolean): StylesheetJson {
         "background-color": dark ? "#64748b" : "#94a3b8",
         label: "data(label)",
         color: ink,
-        "font-size": 11,
+        "font-size": 9,
         "text-valign": "bottom",
         "text-margin-y": 5,
         "text-wrap": "ellipsis",
@@ -109,7 +109,7 @@ export function graphStylesheet(dark: boolean): StylesheetJson {
       style: {
         label: "data(label)",
         color: muted,
-        "font-size": 10,
+        "font-size": 8,
         "text-outline-color": surface,
         "text-outline-width": 2,
         "text-rotation": "none",
