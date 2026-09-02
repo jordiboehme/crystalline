@@ -6,6 +6,7 @@
 //! are public, so the status is built directly with no lock, socket or
 //! environment involved; the same duplex pattern as `tests/mcp_instructions.rs`.
 
+use crystalline_service::mcp::newest_legacy_handshake_version;
 use crystalline_service::{DegradedServer, StubStatus};
 use rmcp::model::{CallToolRequestParams, ClientInfo, ProtocolVersion};
 use rmcp::service::RunningService;
@@ -120,7 +121,7 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
         .as_ref()
         .map(|i| i.protocol_version.clone())
         .expect("the server answered initialize");
-    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
+    assert_eq!(answered, newest_legacy_handshake_version());
     drop(client);
     drop(server);
 }
@@ -147,7 +148,7 @@ async fn the_degraded_server_answers_an_era_handshake_like_the_healthy_one() {
         .as_ref()
         .map(|i| i.protocol_version.clone())
         .expect("the server answered initialize");
-    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
+    assert_eq!(answered, newest_legacy_handshake_version());
     drop(client);
     drop(server);
 }

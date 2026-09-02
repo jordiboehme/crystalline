@@ -874,8 +874,9 @@ async fn a_modern_request_over_http_is_served_statelessly_with_its_hints() {
 ///
 /// A **bare** probe over HTTP is still the `422` `tests/http_stream.rs` pins:
 /// it carries no `_meta`, so it is classified legacy and takes the session
-/// branch. The era changes nothing about that, and the stdio bridge's
-/// normalization is what closes it there.
+/// branch. Over stdio the same probe is answered `-32602` by rmcp itself
+/// (since 3.1.4, rust-sdk #1157); nothing on our side rewrites it any more, so
+/// the two transports differ only in the shape of the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_over_http_answers_the_routing_block() {
     let h = Harness::new().await;
@@ -1004,14 +1005,10 @@ async fn a_handshake_declaring_the_era_is_served_as_a_legacy_session() {
         head_of(&raw)
     );
     let answer = payload(&raw);
-    let newest_handshake = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
-        .iter()
-        .map(|v| v.as_str())
-        .rfind(|v| *v < ERA)
-        .expect("we serve at least one revision with a handshake");
+    let newest_handshake = crystalline_service::mcp::newest_legacy_handshake_version();
     assert_eq!(
         answer["result"]["protocolVersion"],
-        json!(newest_handshake),
+        json!(newest_handshake.as_str()),
         "the era has no handshake, so one is answered with the newest that has: {answer}"
     );
     assert!(
@@ -1025,7 +1022,8 @@ async fn a_handshake_declaring_the_era_is_served_as_a_legacy_session() {
     assert!(served.starts_with("HTTP/1.1 200 OK"));
     assert!(payload(&served)["result"]["tools"].is_array());
 
-    // A legacy-shaped follow-up asks for the session branch there is none of.
+    // A legacy-shaped follow-up asks for the session branch without
+    // presenting the session it was just given.
     let bare = post(
         addr,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#,

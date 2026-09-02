@@ -205,8 +205,8 @@ pub async fn run_mcp(
     // answered the `server/discover` probe itself the answer went out in
     // milliseconds regardless of how slow the daemon was. Forwarding means the
     // probe is answered by whoever ends up serving, so its reply now waits out
-    // daemon acquisition or embedded startup. That matters
-    // because branch three of the stdio rule is "any other error, **or does not
+    // daemon acquisition or embedded startup. That matters because branch
+    // three of the stdio rule is "any other error, **or does not
     // respond within a reasonable timeout**: the server is legacy", and that
     // verdict is cacheable for the server process's lifetime. Measured on this
     // machine, cold: see the transcripts in the migration ledger. A transport
@@ -1713,7 +1713,12 @@ mod tests {
             "and it names both missing keys: {answer}"
         );
         drop(write);
-        let _ = server.await;
+        assert!(
+            server.await.unwrap().is_err(),
+            "the bare probe still ends the session with ExpectedInitializeRequest \
+             after the error is sent; a future rmcp that carried on instead would \
+             be a lifecycle change worth noticing"
+        );
 
         // 2. The conforming probe: our handler runs.
         let (client_io, server_io) = tokio::io::duplex(1 << 16);
@@ -1784,9 +1789,11 @@ mod tests {
             answers.insert(v["id"].clone(), v);
         }
         let handshake = &answers[&serde_json::json!(1)];
-        assert!(
-            handshake["result"]["protocolVersion"].is_string(),
-            "the legacy handshake still succeeds: {handshake}"
+        assert_eq!(
+            handshake["result"]["protocolVersion"],
+            serde_json::json!(crate::mcp::newest_legacy_handshake_version().as_str()),
+            "the legacy handshake still succeeds, at the revision rmcp negotiates \
+             for one: {handshake}"
         );
         let refused = &answers[&serde_json::json!(2)];
         assert_eq!(

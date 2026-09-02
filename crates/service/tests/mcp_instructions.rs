@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::mcp::McpServer;
+use crystalline_service::mcp::{McpServer, newest_legacy_handshake_version};
 use rmcp::RoleClient;
 use rmcp::model::{ClientInfo, Implementation, ProtocolVersion};
 use rmcp::service::RunningService;
@@ -540,26 +540,16 @@ async fn a_handshake_naming_the_era_is_answered_with_the_newest_handshake_revisi
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     assert_eq!(
         h.negotiate(ProtocolVersion::V_2026_07_28).await,
-        newest_handshake_revision(),
+        newest_legacy_handshake_version(),
         "the era has no handshake, so one is answered with the newest that has"
     );
 }
 
-/// The newest revision we advertise that still carries an `initialize`
-/// handshake, read off the advertised set rather than written as a literal so
-/// a revision added or dropped moves it.
-fn newest_handshake_revision() -> ProtocolVersion {
-    crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
-        .iter()
-        .rfind(|v| v.as_str() < "2026-07-28")
-        .expect("we serve at least one revision with a handshake")
-        .clone()
-}
-
-/// Every revision we advertise that has a handshake is echoed back verbatim,
-/// oldest included, and the one that has none is answered with the newest that
-/// does. Driven off the advertised set so a revision added without a decision
-/// about the echo fails here.
+/// Every revision we advertise is answered with a revision that has a
+/// handshake: one that has its own is echoed back verbatim, oldest included,
+/// and one that has none is answered with the newest that does. Driven off the
+/// advertised set so a revision added without a decision about the echo fails
+/// here.
 ///
 /// 2024-11-05 is the bottom-end pin: it is served today, keeping it costs one
 /// array element because rmcp branches nowhere between it and 2025-11-25
@@ -567,13 +557,13 @@ fn newest_handshake_revision() -> ProtocolVersion {
 /// revision is a deprecation with a release note rather than a side effect of a
 /// dependency bump.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_handshake_revision_we_serve_is_echoed_verbatim() {
+async fn every_revision_we_serve_is_answered_with_a_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     for version in crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS {
         let expected = if version.as_str() < "2026-07-28" {
             version.clone()
         } else {
-            newest_handshake_revision()
+            newest_legacy_handshake_version()
         };
         assert_eq!(
             h.negotiate(version.clone()).await,
@@ -606,7 +596,7 @@ async fn an_unknown_protocol_version_string_is_answered_with_the_newest_handshak
     for garbage in ["2027-01-01", "banana"] {
         assert_eq!(
             h.negotiate(protocol_version(garbage)).await,
-            ProtocolVersion::V_2025_11_25,
+            newest_legacy_handshake_version(),
             "{garbage} is not a revision anybody serves"
         );
     }

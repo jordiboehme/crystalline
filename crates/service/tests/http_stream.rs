@@ -191,11 +191,8 @@ fn init_body(version: &str) -> String {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_revision_we_serve_is_handshaken_as_legacy_and_gets_a_session() {
     let addr = spawn_router().await;
-    let newest_handshake = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
-        .iter()
-        .map(|v| v.as_str())
-        .rfind(|v| *v < "2026-07-28")
-        .expect("we serve at least one revision with a handshake");
+    let newest_handshake = crystalline_service::mcp::newest_legacy_handshake_version();
+    let newest_handshake = newest_handshake.as_str();
     for version in crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS {
         let version = version.as_str();
         let response = post(addr, &init_body(version), None).await;
