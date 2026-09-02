@@ -538,7 +538,7 @@ Not yet - the MCP transport over HTTP is unauthenticated regardless of bind addr
 
 **Where does my knowledge actually live?**
 
-In your domain folders, as plain markdown you can read, edit and back up with anything. Everything Crystalline derives from it is disposable: the search index lives in the state directory and `crystalline reindex --full` rebuilds it from the files at any time. The config file, the index and the model cache live in the platform config, state and cache directories (`~/.config/crystalline`, `~/.local/state/crystalline` and `~/.cache/crystalline` on Linux and macOS).
+In your domain folders, as plain markdown you can read, edit and back up with anything. By default those folders sit under `~/Documents/Crystalline`, one per domain, which is where a domain lands when nobody names a path; a folder you registered yourself lives where you put it, and the `domains_root` setting moves the default. Everything Crystalline derives from it is disposable: the search index lives in the state directory and `crystalline reindex --full` rebuilds it from the files at any time. The config file, the index and the model cache live in the platform config, state and cache directories (`~/.config/crystalline`, `~/.local/state/crystalline` and `~/.cache/crystalline` on Linux and macOS).
 
 **Do I need git to share knowledge with a team?**
 
