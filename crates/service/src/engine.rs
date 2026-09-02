@@ -9755,6 +9755,7 @@ impl Engine {
                     "user_code": p.user_code,
                     "verification_url": p.verification_url,
                     "expires_in_secs": p.expires_in_secs,
+                    "next_steps": p.next_steps,
                 })
             })
     }
@@ -9786,6 +9787,20 @@ impl Engine {
         landed
     }
 
+    /// The stored guidance for `identity`'s pending flow, read without
+    /// taking anything. Called BEFORE [`Engine::take_finished_pending_for`]
+    /// on the same identity: that call clears the slot the guidance lives
+    /// on, so a caller that wants both the outcome and the guidance it
+    /// landed with has to read this one first.
+    fn pending_next_steps_for(&self, identity: &TokenIdentity) -> Option<String> {
+        self.pending_connect
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|p| p.identity == *identity)
+            .map(|p| p.next_steps.clone())
+    }
+
     /// Drops a pending flow belonging to `identity`, leaving another
     /// identity's alone. What a connect that settles the same credential by
     /// another route (a pasted token) and a disconnect both do: the flow in
@@ -9803,9 +9818,12 @@ impl Engine {
     /// user reports `pending_connect`; one that landed since the last call
     /// is reported here exactly once and the slot is cleared - a successful
     /// sign-in folds into `connected`/`user`, while an expired or declined
-    /// one surfaces as an error (its message is already actionable) instead
-    /// of being silently swallowed.
+    /// one reports `connected: false` with `error` and `next_steps` (the
+    /// guidance the flow started with, see [`Engine::pending_next_steps_for`])
+    /// telling the caller to connect again and click Authorize this time,
+    /// rather than surfacing a bare error a model has nothing to act on.
     async fn configure_connection_block(&self) -> Result<Value> {
+        let landed_guidance = self.pending_next_steps_for(&TokenIdentity::Instance);
         if let Some(outcome) = self.take_finished_pending() {
             return match outcome {
                 Ok(_user) => {
@@ -9813,7 +9831,14 @@ impl Engine {
                     github["pending_connect"] = Value::Null;
                     Ok(github)
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => Ok(json!({
+                    "connected": false,
+                    "user": Value::Null,
+                    "token_store": Value::Null,
+                    "pending_connect": Value::Null,
+                    "error": e.to_string(),
+                    "next_steps": retry_guidance(&e, landed_guidance.as_deref().unwrap_or_default()),
+                })),
             };
         }
         if let Some(view) = self.pending_view() {
@@ -10096,6 +10121,7 @@ impl Engine {
             .start_device_flow(&auth_base, &client_id)
             .await?;
 
+        let next_steps = crystalline_remote::github::auth::confirmation_guidance(&auth_base);
         let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
             Arc::new(std::sync::Mutex::new(None));
         let pending = PendingConnect {
@@ -10103,6 +10129,7 @@ impl Engine {
             user_code: start.user_code.clone(),
             verification_url: start.verification_url.clone(),
             expires_in_secs: start.expires_in_secs,
+            next_steps: next_steps.clone(),
             outcome: outcome_slot.clone(),
         };
         let view = json!({
@@ -10110,6 +10137,7 @@ impl Engine {
             "user_code": pending.user_code,
             "verification_url": pending.verification_url,
             "expires_in_secs": pending.expires_in_secs,
+            "next_steps": pending.next_steps,
         });
         *self.pending_connect.lock().unwrap() = Some(pending);
 
@@ -10466,6 +10494,24 @@ pub struct GithubIdentity {
     pub error: Option<String>,
 }
 
+/// What to tell the caller after a device flow lands as a failure: retry
+/// wording that names the reason distinctly for an expired code versus a
+/// declined one where the outcome can tell them apart, falling back to a
+/// generic reason otherwise, followed by `landed_guidance` (the same
+/// confirmation guidance the flow started with, so the authorized-apps url
+/// and the Authorize reminder are never phrased twice).
+fn retry_guidance(e: &RemoteError, landed_guidance: &str) -> String {
+    let reason = match e {
+        RemoteError::AuthExpired => "the code expired before it was authorized",
+        RemoteError::Api { status: 403, .. } => "the sign-in was declined on GitHub",
+        _ => "the sign-in did not complete",
+    };
+    format!(
+        "{reason}. Call configure with connect \"github\" again to start a new sign-in, and \
+         this time click Authorize on the page after the code. {landed_guidance}"
+    )
+}
+
 /// One in-flight GitHub device-flow sign-in, held by
 /// [`Engine::pending_connect`] so a second `configure` connect call while
 /// one is running reports the same code instead of starting another. The
@@ -10488,6 +10534,12 @@ struct PendingConnect {
     verification_url: String,
     /// How many seconds from when the flow started it stops being valid.
     expires_in_secs: u64,
+    /// What to do after the code is entered and how to tell whether it
+    /// landed, computed once at flow start from that flow's own auth base
+    /// (see [`crystalline_remote::github::auth::confirmation_guidance`]) so
+    /// a GHES sign-in and a github.com one each carry their own applications
+    /// url. Read back by every surface that reports this pending flow.
+    next_steps: String,
     /// `None` while still waiting on the user; set once by the background
     /// task that runs the flow to completion, to either the signed-in login
     /// or the error that ended the flow (expired, declined, offline).

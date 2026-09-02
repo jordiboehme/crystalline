@@ -1825,20 +1825,32 @@ async fn device_flow_sign_in(
     let start = crystalline_remote::github::auth::start_device_flow(auth_base, client_id)
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    print_device_code(&start);
+    print_device_code(&start, auth_base);
 
     let ticker = tokio::spawn(async {
+        let mut ticks: u32 = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             eprint!(".");
             let _ = std::io::Write::flush(&mut std::io::stderr());
+            ticks += 1;
+            // A minute of dots and still nothing: the most common reason is
+            // the person entered the code and closed the tab without
+            // clicking Authorize, so say so once rather than dotting forever.
+            if ticks == 60 {
+                eprintln!();
+                eprintln!(
+                    "Still waiting - did the page after the code show an Authorize button? The sign-in lands when it is clicked."
+                );
+                eprint!("Waiting for confirmation");
+            }
         }
     });
     let poll =
         crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
     ticker.abort();
     eprintln!();
-    let access_token = poll.map_err(|e| anyhow!("{e}"))?;
+    let access_token = poll.map_err(|e| device_flow_error(auth_base, e))?;
 
     let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
         .await
@@ -1847,14 +1859,55 @@ async fn device_flow_sign_in(
 }
 
 /// Prints the device flow's user code and verification url unmissably: this
-/// is the moment a non-engineer copies a code into a browser.
-fn print_device_code(start: &crystalline_remote::DeviceFlowStart) {
+/// is the moment a non-engineer copies a code into a browser. The line under
+/// the box is the confirmation guidance's first sentence - what to do next,
+/// not just where to type the code - so the same warning that trips people
+/// up (closing the tab instead of clicking Authorize) is in view up front.
+fn print_device_code(start: &crystalline_remote::DeviceFlowStart, auth_base: &str) {
     eprintln!();
     eprintln!("================================================");
     eprintln!("  Go to: {}", start.verification_url);
     eprintln!("  Enter this code: {}", start.user_code);
     eprintln!("================================================");
+    eprintln!(
+        "{}",
+        first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
+            auth_base
+        ))
+    );
     eprint!("Waiting for confirmation");
+}
+
+/// The first sentence of `text`, period included - `confirmation_guidance`'s
+/// opening sentence is the one line of it that fits under the code box; the
+/// rest (the applications url, the enterprise policy note) is repeated in
+/// full elsewhere rather than crammed in here.
+fn first_sentence(text: &str) -> &str {
+    match text.find(". ") {
+        Some(period) => &text[..=period],
+        None => text,
+    }
+}
+
+/// Maps a `run_device_flow` outcome to the error `crystalline connect
+/// github` prints. `RemoteError::AuthExpired` means the device code expired
+/// before the browser side finished - GitHub's own reason for that says
+/// nothing about Authorize, so this says it: what happened, the Authorize
+/// reminder repeated, and where to check whether an earlier attempt already
+/// landed. Every other error passes through unchanged; a declined sign-in,
+/// offline and the rest already carry their own actionable message.
+fn device_flow_error(auth_base: &str, e: crystalline_remote::RemoteError) -> anyhow::Error {
+    if matches!(e, crystalline_remote::RemoteError::AuthExpired) {
+        anyhow!(
+            "The code expired before it was authorized. {} Check {} to see whether an earlier attempt already landed.",
+            first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
+                auth_base
+            )),
+            crystalline_remote::github::auth::authorized_apps_url(auth_base)
+        )
+    } else {
+        anyhow!("{e}")
+    }
 }
 
 /// The bare host `TokenStore::save_resolving` and `resolve_and_load` address,
@@ -2168,6 +2221,55 @@ mod connect_identity_tests {
             "{:?}",
             path(&machine)
         );
+    }
+}
+
+#[cfg(test)]
+mod device_flow_error_tests {
+    use super::device_flow_error;
+
+    /// The one mapped case: an expired code gets the Authorize reminder and
+    /// the applications url, not GitHub's bare "device_code expired".
+    #[test]
+    fn auth_expired_repeats_the_authorize_sentence_and_the_applications_url() {
+        let err = device_flow_error(
+            "https://github.com",
+            crystalline_remote::RemoteError::AuthExpired,
+        )
+        .to_string();
+        assert!(err.contains("expired"), "{err}");
+        assert!(err.contains("Authorize"), "{err}");
+        assert!(
+            err.contains("https://github.com/settings/connections/applications"),
+            "{err}"
+        );
+    }
+
+    /// A GHES auth base carries through to the applications url in the
+    /// mapped message, same as everywhere else this is derived.
+    #[test]
+    fn auth_expired_derives_the_applications_url_from_a_ghes_auth_base() {
+        let err = device_flow_error(
+            "https://github.example.com",
+            crystalline_remote::RemoteError::AuthExpired,
+        )
+        .to_string();
+        assert!(
+            err.contains("https://github.example.com/settings/connections/applications"),
+            "{err}"
+        );
+    }
+
+    /// Every other error passes through unchanged - it already carries its
+    /// own actionable message.
+    #[test]
+    fn every_other_error_passes_through_unchanged() {
+        let err = device_flow_error(
+            "https://github.com",
+            crystalline_remote::RemoteError::Offline,
+        )
+        .to_string();
+        assert_eq!(err, crystalline_remote::RemoteError::Offline.to_string());
     }
 }
 

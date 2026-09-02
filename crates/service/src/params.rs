@@ -419,9 +419,11 @@ pub struct ConfigureParams {
     #[serde(default, deserialize_with = "null_as_default")]
     pub unset: Vec<String>,
     /// Pass "github" to link a GitHub account: starts a short code to
-    /// confirm at github.com/login/device, or reports an already-pending
-    /// one. Omit when `token` is supplied. Works whether or not
-    /// github.enabled is on yet; enabling is only needed for team domains.
+    /// confirm at github.com/login/device, then click Authorize on the page
+    /// that follows; the result carries next_steps to relay verbatim, and
+    /// calling configure again reports whether the sign-in landed. Omit
+    /// when `token` is supplied. Works whether or not github.enabled is on
+    /// yet; enabling is only needed for team domains.
     #[serde(default)]
     pub connect: Option<String>,
     /// A GitHub personal access token, connecting immediately instead of the

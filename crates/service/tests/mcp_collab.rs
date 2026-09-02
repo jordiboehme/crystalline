@@ -1000,8 +1000,78 @@ async fn device_flow_start_reports_github_enabled_and_a_note_when_enabled() {
     );
 }
 
+/// The pending view tells the caller what to do after the code is entered
+/// and where to check it landed - not just where to type the code - so a
+/// model relaying the result has the whole story, not half of it.
 #[tokio::test]
-async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears() {
+async fn device_flow_pending_view_carries_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None).await.unwrap();
+    let next_steps = result["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
+    assert!(
+        next_steps.contains("https://github.com/settings/connections/applications"),
+        "{next_steps}"
+    );
+}
+
+/// A second `configure` call while the same flow is still pending reports
+/// the same code (see the double-click behavior above) and, with it, the
+/// same guidance - it is stored once at flow start, not recomputed.
+#[tokio::test]
+async fn a_second_call_while_pending_carries_the_same_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let first = eng.start_device_connect(None).await.unwrap();
+    let second = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        first["github"]["pending_connect"]["next_steps"],
+        second["github"]["pending_connect"]["next_steps"]
+    );
+}
+
+/// A GitHub Enterprise Server host derives its own applications url, not
+/// github.com's - the device flow talks to the GHES host directly.
+#[tokio::test]
+async fn a_ghes_host_yields_the_ghes_applications_url_in_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng
+        .start_device_connect(Some("github.example.com"))
+        .await
+        .unwrap();
+    let next_steps = result["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(
+        next_steps.contains("https://github.example.com/settings/connections/applications"),
+        "{next_steps}"
+    );
+}
+
+#[tokio::test]
+async fn device_flow_failure_is_reported_once_with_next_steps_then_the_slot_clears() {
     let tmp = tempfile::tempdir().unwrap();
     let auth = fake_auth(
         Ok(device_flow_start()),
@@ -1013,17 +1083,33 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
     eng.start_device_connect(None).await.unwrap();
     auth.run_gate.notify_one();
 
-    let landed_err = wait_until(|| async { eng.configure_snapshot().await.err() }).await;
+    // A landed failure is a report, not a bare error: connected: false with
+    // both the reason and actionable next_steps, so a model relaying the
+    // result has something to tell the person rather than a dead end.
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (!snap["github"]["error"].is_null()).then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["connected"], json!(false));
+    assert_eq!(
+        landed["github"]["error"],
+        json!("The GitHub connection has expired or was revoked. Use configure to sign in again.")
+    );
+    let next_steps = landed["github"]["next_steps"].as_str().unwrap();
+    assert!(next_steps.contains("expired"), "{next_steps}");
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
     assert!(
-        matches!(landed_err, EngineError::Remote(RemoteError::AuthExpired)),
-        "{landed_err}"
+        next_steps.contains("settings/connections/applications"),
+        "{next_steps}"
     );
 
     // Reported once: the slot is now clear and a plain snapshot no longer
-    // errors, reporting the ordinary (never-connected) state.
+    // carries an error, reporting the ordinary (never-connected) state.
     let after = eng.configure_snapshot().await.unwrap();
     assert_eq!(after["github"]["connected"], json!(false));
     assert!(after["github"]["pending_connect"].is_null());
+    assert!(after["github"]["error"].is_null());
 }
 
 /// The gate sits ABOVE the pending drain, so on a disabled instance a bare
