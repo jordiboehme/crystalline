@@ -298,9 +298,9 @@ fn is_write_tool(name: &str) -> bool {
 /// `instructions` to `server/discover`, restricts `tools/list_changed` to
 /// subscribers and requires caching hints on six operations; all four are
 /// implemented here - see [`McpServer::list_tools`], [`McpServer::discover`],
-/// [`McpServer::listen`] and [`CacheHinted`] - and so is the stdio bridge's
-/// half, where a bare `server/discover` probe is normalized and forwarded
-/// rather than answered `-32601` (`crate::client`). A fifth obligation,
+/// [`McpServer::listen`] and [`CacheHinted`]. The stdio bridge holds up its
+/// half by forwarding a `server/discover` probe verbatim instead of answering
+/// it (`crate::client`), so rmcp classifies it. A fifth obligation,
 /// `ping`'s removal, is rmcp's: it answers `method_not_found` to any peer that
 /// is not on the legacy lifecycle (`handler/server.rs:112-118`), and we
 /// implement no `ping`. `tests/mcp_modern_era.rs` is what a client at this
@@ -321,10 +321,8 @@ pub const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
 ];
 
 /// The newest revision we serve: what a client asking for one we do not serve
-/// is answered with over stdio, and the version the stdio bridge injects into a
-/// bare `server/discover` probe (`crate::client`). Reads the last element, so
-/// the ordering of [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than
-/// cosmetic.
+/// is answered with over stdio. Reads the last element, so the ordering of
+/// [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than cosmetic.
 pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
     SERVED_PROTOCOL_VERSIONS
         .last()

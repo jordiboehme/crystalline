@@ -125,12 +125,14 @@ async fn a_client_asking_for_an_unserved_protocol_version_is_answered_with_ours(
     drop(server);
 }
 
-/// The degraded server echoes 2026-07-28 to a client that asks for it, exactly
-/// as the healthy one does: a client cannot learn a different answer from a
-/// failed start than it would have got from a healthy one, which is the whole
-/// reason `supported_protocol_versions` is shared rather than duplicated.
+/// The degraded server answers a handshake naming 2026-07-28 exactly as the
+/// healthy one does - with the newest revision that still has a handshake,
+/// rmcp 3.2.0's `negotiate_protocol_version` rule. A client cannot learn a
+/// different answer from a failed start than it would have got from a healthy
+/// one, which is the whole reason `supported_protocol_versions` is shared
+/// rather than duplicated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_degraded_server_serves_the_era_too() {
+async fn the_degraded_server_answers_an_era_handshake_like_the_healthy_one() {
     let (client_io, server_io) = tokio::io::duplex(1 << 16);
     let server_task = tokio::spawn(async move {
         rmcp::serve_server(DegradedServer::new(mcpb_skew_status()), server_io).await
@@ -145,7 +147,7 @@ async fn the_degraded_server_serves_the_era_too() {
         .as_ref()
         .map(|i| i.protocol_version.clone())
         .expect("the server answered initialize");
-    assert_eq!(answered, ProtocolVersion::V_2026_07_28);
+    assert_eq!(answered, ProtocolVersion::V_2025_11_25);
     drop(client);
     drop(server);
 }

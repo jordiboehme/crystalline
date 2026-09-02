@@ -969,21 +969,20 @@ async fn the_http_subscription_stream_acknowledges_first_and_stays_silent() {
 /// **What a legacy-shaped handshake naming the era gets, recorded because it
 /// is the one shape the era leaves ragged.**
 ///
-/// Before this task an HTTP `initialize` declaring 2026-07-28 was refused
-/// `-32022`, because we did not serve the revision. Now it is served and
-/// echoed - and it gets **no session id**, because `is_legacy_request` routed
-/// it statelessly from the version in its own body (`tower.rs:358-408`,
-/// `:1727`) before any handler ran. A client that goes on to speak the era's
-/// request shape works; a client that sends a bare follow-up is asking for the
-/// session branch, has no session to present, and gets rmcp's
-/// `422 Unexpected message, expect initialize request`.
+/// A client using `initialize` while declaring 2026-07-28 is contradicting
+/// itself: the handshake is deleted from that schema. rmcp 3.2.0 resolves the
+/// contradiction in favour of the message actually sent - `is_legacy_request`
+/// (`tower.rs:359-416`) routes any `InitializeRequest` through the session
+/// branch before it looks at a version, and `negotiate_protocol_version`
+/// (`service/server.rs:479`) answers with the newest revision that still has a
+/// handshake. So the peer is served, as a legacy peer, with a session.
 ///
-/// That is the era's session model rather than a wedge this task introduced:
-/// the handshake is deleted from the 2026-07-28 schema, so a client using it
-/// while declaring that revision is contradicting itself. Pinned here so the
-/// behaviour is known rather than discovered.
+/// The era itself is unaffected and is reached the way the specification
+/// provides for: an inline request carrying the SEP-2575 `_meta`, stateless,
+/// on the same endpoint. Both halves are pinned below, so the behaviour is
+/// known rather than discovered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handshake_declaring_the_era_is_served_and_gets_no_session() {
+async fn a_handshake_declaring_the_era_is_served_as_a_legacy_session() {
     let h = Harness::new().await;
     let addr = h.http().await;
 
@@ -1005,10 +1004,19 @@ async fn a_handshake_declaring_the_era_is_served_and_gets_no_session() {
         head_of(&raw)
     );
     let answer = payload(&raw);
-    assert_eq!(answer["result"]["protocolVersion"], json!(ERA), "{answer}");
+    let newest_handshake = crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS
+        .iter()
+        .map(|v| v.as_str())
+        .rfind(|v| *v < ERA)
+        .expect("we serve at least one revision with a handshake");
+    assert_eq!(
+        answer["result"]["protocolVersion"],
+        json!(newest_handshake),
+        "the era has no handshake, so one is answered with the newest that has: {answer}"
+    );
     assert!(
-        !has_session_header(&raw),
-        "a modern peer is sessionless:\n{}",
+        has_session_header(&raw),
+        "an initialize is legacy whatever it names, so it gets a session:\n{}",
         head_of(&raw)
     );
 
