@@ -31,21 +31,24 @@ Crystalline is the other half: the crystalline intelligence an agent accumulates
 The difference it makes, in one exchange:
 
 ```text
-Yesterday
-  You:    The retry queue silently drops jobs older than 24h. That cost us an hour.
-  Agent:  Worth keeping. Captured "Retry queue gotcha" into engineering (#payments #gotcha).
+Moving day
+  You:    Here's the washing machine's manual as a PDF. Learn it - I am
+          never reading 60 pages about laundry.
+  Agent:  Learned it. Captured programs, error codes and maintenance
+          into home (#appliances), manual attached.
 
-Today, a fresh session
-  You:    Why is the payments queue losing jobs again?
-  Agent:  Recalled from engineering: the retry queue drops jobs older than 24h,
-          captured yesterday. Check the stuck jobs' age before anything else.
+Eight months later, a fresh session
+  You:    The machine is blinking E18 and the display is in Italian??
+  Agent:  Recalled from home: E18 is a blocked drain pump filter.
+          Front panel, bottom right, quarter turn - towel down first,
+          about a liter of water comes out.
 ```
 
 Crystalline is a single Rust binary: a CLI for people, an MCP server for agents and a local search index on top of plain markdown files.
 
 The name is borrowed from psychology: crystallized intelligence is the knowledge a mind accumulates through experience, the counterpart of fluid, in-the-moment reasoning. Models have the fluid kind in abundance; Crystalline gives them the other half.
 
-[Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [FAQ](#faq)
+[Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [Handbook](#handbook) · [FAQ](#faq)
 
 ## Why Crystalline
 
@@ -456,6 +459,13 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals |
+
+## Handbook
+
+The Crystalline Handbook is the book-length guide to Crystalline and Fluid: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from.
+
+- Read it online: https://jordiboehme.github.io/crystalline/
+- Download: [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf), [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub) and a single-file [Markdown](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.md) edition
 
 ## Virtual domains
 
