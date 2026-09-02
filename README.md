@@ -462,7 +462,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 
 ## Handbook
 
-The Crystalline Handbook is the book-length guide to Crystalline and Fluid: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from. It covers Crystalline 0.18.0 and lives in its own repository.
+The Crystalline Handbook is the book-length guide to Crystalline and Fluid: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from.
 
 - Read it online: https://jordiboehme.github.io/crystalline/
 - Download: [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf), [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub) and a single-file [Markdown](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.md) edition
