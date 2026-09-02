@@ -48,7 +48,7 @@ Crystalline is a single Rust binary: a CLI for people, an MCP server for agents 
 
 The name is borrowed from psychology: crystallized intelligence is the knowledge a mind accumulates through experience, the counterpart of fluid, in-the-moment reasoning. Models have the fluid kind in abundance; Crystalline gives them the other half.
 
-[Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [FAQ](#faq)
+[Why Crystalline](#why-crystalline) · [How it works](#how-it-works) · [Get started](#get-started) · [Session onboarding](#session-onboarding) · [The learning loop](#the-learning-loop) · [Teach and learn](#teach-and-learn) · [Skills](#skills) · [Share with a team](#share-knowledge-with-a-team) · [Deployment](#deployment) · [Handbook](#handbook) · [FAQ](#faq)
 
 ## Why Crystalline
 
@@ -459,6 +459,13 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals |
+
+## Handbook
+
+The Crystalline Handbook is the book-length guide to Crystalline and Fluid: the idea, the system, installation and the full working loop, written to be read in an evening or to run a training from. It covers Crystalline 0.18.0 and lives in its own repository.
+
+- Read it online: https://jordiboehme.github.io/crystalline/
+- Download: [PDF](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.pdf), [EPUB](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.epub) and a single-file [Markdown](https://raw.githubusercontent.com/jordiboehme/crystalline/handbook-downloads/crystalline-handbook.md) edition
 
 ## Virtual domains
 
