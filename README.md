@@ -31,14 +31,17 @@ Crystalline is the other half: the crystalline intelligence an agent accumulates
 The difference it makes, in one exchange:
 
 ```text
-Yesterday
-  You:    The retry queue silently drops jobs older than 24h. That cost us an hour.
-  Agent:  Worth keeping. Captured "Retry queue gotcha" into engineering (#payments #gotcha).
+Moving day
+  You:    Here's the washing machine's manual as a PDF. Learn it - I am
+          never reading 60 pages about laundry.
+  Agent:  Learned it. Captured programs, error codes and maintenance
+          into home (#appliances), manual attached.
 
-Today, a fresh session
-  You:    Why is the payments queue losing jobs again?
-  Agent:  Recalled from engineering: the retry queue drops jobs older than 24h,
-          captured yesterday. Check the stuck jobs' age before anything else.
+Eight months later, a fresh session
+  You:    The machine is blinking E18 and the display is in Italian??
+  Agent:  Recalled from home: E18 is a blocked drain pump filter.
+          Front panel, bottom right, quarter turn - towel down first,
+          about a liter of water comes out.
 ```
 
 Crystalline is a single Rust binary: a CLI for people, an MCP server for agents and a local search index on top of plain markdown files.
