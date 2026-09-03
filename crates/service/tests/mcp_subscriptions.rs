@@ -641,6 +641,23 @@ async fn a_modern_client_that_never_subscribed_is_told_nothing() {
     );
 }
 
+/// Polls the registry until it holds exactly `expected` sinks, failing with
+/// `what` after 5s. Both edges of a subscription's life are asynchronous with
+/// the client's view of them (the acknowledgment precedes registration, and
+/// cancellation is a notification), so the tests wait for the state instead
+/// of trusting a window.
+async fn wait_for_subscribers(h: &Harness, expected: usize, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while h.engine.list_subscribers().len() != expected {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{what}: expected {expected} registered sink(s) after 5s, found {}",
+            h.engine.list_subscribers().len()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// A subscription that ended leaves nothing behind that a later flip would
 /// try to write to. `SubscriptionSink` holds a `Peer` and a child cancellation
 /// token (`service/server.rs:139-144`), so a registry that kept dead entries
@@ -656,20 +673,19 @@ async fn a_dropped_subscription_is_unregistered_rather_than_written_to() {
         .listen(SubscriptionFilter::builder().tools_list_changed().build())
         .await
         .expect("subscriptions/listen is served on the modern lifecycle");
-    assert_eq!(
-        h.engine.list_subscribers().len(),
-        1,
-        "the open stream is registered"
-    );
+    // Registration is not synchronous with the client's return either: rmcp
+    // sends the subscription acknowledgment in `SubscriptionContext::establish`
+    // BEFORE the handler that registers the sink runs, so `listen` resolving
+    // on the client only proves the acknowledgment arrived. Under full-suite
+    // load the immediate assertion read 0 (2026-09-02); wait for the state.
+    wait_for_subscribers(&h, 1, "the open stream is registered").await;
 
     drop(subscription);
     // Cancellation travels to the server as a notification, so the
-    // unregistration is not synchronous with the drop.
-    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(
-        h.engine.list_subscribers().is_empty(),
-        "the ended stream left no sink behind"
-    );
+    // unregistration is not synchronous with the drop. Poll for the state
+    // instead of trusting one fixed window: under full-suite load a fixed
+    // 200ms lost this race (locally and on the windows CI leg, 2026-08-31).
+    wait_for_subscribers(&h, 0, "the ended stream left a sink behind").await;
 
     // And the flip still works with nobody listening.
     flip_github_enabled(client.peer()).await;
