@@ -67,6 +67,34 @@ pub fn auth_base(api_url: Option<&str>) -> String {
     }
 }
 
+/// The page where a signed-in user sees and revokes the OAuth app
+/// authorizations the device flow creates - the place to check that a
+/// sign-in landed, as opposed to the personal access tokens page, which
+/// never lists it. Derived from the auth base so a GitHub Enterprise
+/// Server host gets its own.
+pub fn authorized_apps_url(auth_base: &str) -> String {
+    format!(
+        "{}/settings/connections/applications",
+        auth_base.trim_end_matches('/')
+    )
+}
+
+/// What to do after the code is entered, and how to tell whether it worked,
+/// in words a person or a model can act on without guessing. Reused by
+/// every surface that reports a pending sign-in so they never drift apart.
+pub fn confirmation_guidance(auth_base: &str) -> String {
+    format!(
+        "Open the verification URL in a browser that is signed in to GitHub, enter the code, \
+         then click Authorize on the page that follows - the sign-in stays pending until \
+         Authorize is clicked, and closing the tab after entering the code is not enough. Once \
+         authorized, the app is listed under {} (Authorized OAuth Apps); it never appears under \
+         personal access tokens. An enterprise-managed account can only authorize OAuth apps \
+         its enterprise allows - if the browser shows a policy error instead of Authorize, an \
+         enterprise admin has to allow the app first.",
+        authorized_apps_url(auth_base)
+    )
+}
+
 /// The outcome of starting a device flow sign-in: everything the caller
 /// needs to show the user a code and verification url, and to keep polling
 /// for the token.
@@ -473,5 +501,36 @@ mod tests {
             auth_base(Some("https://github.acme.example/api/v3/")),
             "https://github.acme.example"
         );
+    }
+
+    #[test]
+    fn authorized_apps_url_points_at_the_applications_page_for_github_com() {
+        assert_eq!(
+            authorized_apps_url("https://github.com"),
+            "https://github.com/settings/connections/applications"
+        );
+    }
+
+    #[test]
+    fn authorized_apps_url_derives_from_a_ghes_auth_base() {
+        assert_eq!(
+            authorized_apps_url("https://github.example.com"),
+            "https://github.example.com/settings/connections/applications"
+        );
+    }
+
+    #[test]
+    fn authorized_apps_url_tolerates_a_trailing_slash_on_the_base() {
+        assert_eq!(
+            authorized_apps_url("https://github.com/"),
+            "https://github.com/settings/connections/applications"
+        );
+    }
+
+    #[test]
+    fn confirmation_guidance_contains_the_derived_url_and_the_word_authorize() {
+        let guidance = confirmation_guidance("https://github.com");
+        assert!(guidance.contains("https://github.com/settings/connections/applications"));
+        assert!(guidance.contains("Authorize"));
     }
 }

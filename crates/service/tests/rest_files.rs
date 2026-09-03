@@ -93,6 +93,7 @@ async fn serve(opts: Options) -> Fixture {
         auth: Some(AuthConfig {
             trusted_header: None,
             anonymous: Some(opts.anonymous),
+            mcp: None,
             max_users: None,
         }),
         ..GlobalConfig::default()

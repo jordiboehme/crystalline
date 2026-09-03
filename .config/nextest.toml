@@ -46,3 +46,13 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = 'package(crystalline) & binary(service) | package(crystalline-index) & test(embed::remote)'
 slow-timeout = { period = "120s", terminate-after = 10 }
+
+# The iteration profile: `cargo nextest run --profile quick -p <crate>`
+# skips the tests that dominate wall time in the index suite - the
+# real-embedding and remote-embed families - so a task's inner loop stays
+# tight. The default profile still runs everything; the battery always uses
+# the default. Refine this filter from a full run's slow report when the
+# names drift.
+[profile.quick]
+slow-timeout = { period = "120s", terminate-after = 2 }
+default-filter = 'not (package(crystalline-index) & (test(embed) | test(model)))'

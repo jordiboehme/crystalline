@@ -61,6 +61,7 @@ async fn instance(opts: &Options) -> (Arc<Engine>, Arc<AuthStore>, tempfile::Tem
         auth: Some(AuthConfig {
             trusted_header: None,
             anonymous: Some(opts.anonymous),
+            mcp: None,
             max_users: None,
         }),
         service: Some(ServiceConfig {

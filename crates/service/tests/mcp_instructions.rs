@@ -22,7 +22,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
-use crystalline_service::mcp::McpServer;
+use crystalline_service::mcp::{McpServer, newest_legacy_handshake_version};
 use rmcp::RoleClient;
 use rmcp::model::{ClientInfo, Implementation, ProtocolVersion};
 use rmcp::service::RunningService;
@@ -521,41 +521,54 @@ async fn the_skills_serve_setting_decides_in_both_directions() {
     }
 }
 
-/// **A handshake naming 2026-07-28 is now echoed, not downgraded.**
+/// **A handshake naming 2026-07-28 is answered with the newest revision that
+/// still has a handshake, and that is upstream's rule rather than ours.**
 ///
-/// This assertion was the program's opening red and it read the other way for
-/// eight commits: while the era carried obligations this server had not
-/// implemented, echoing it back would have been a false claim. All of them are
-/// implemented, the revision is advertised, and a client asking for it through
-/// a handshake gets it - which is also how a client opts into the modern
-/// lifecycle without opening with `server/discover`. **Rebaselined
-/// deliberately** rather than adjusted to keep a test green.
+/// The assertion read the other way while we were on rmcp 3.1.2, which echoed
+/// any advertised revision back: a client could opt into the modern lifecycle
+/// through `initialize` instead of opening with `server/discover`. rmcp 3.2.0
+/// closed that path in `negotiate_protocol_version` (`service/server.rs:479`):
+/// a requested revision is echoed only when it is a legacy one, otherwise the
+/// server's newest legacy revision is returned. The reasoning is the one this
+/// file already applies to an unknown version string - `initialize` is deleted
+/// from the 2026-07-28 schema, so a peer that sent one is speaking the legacy
+/// lifecycle whatever it names - and the era is now reached only the way the
+/// specification provides for: `server/discover` and inline requests carrying
+/// the SEP-2575 `_meta`, which `tests/mcp_modern_era.rs` covers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_client_asking_for_the_era_through_a_handshake_is_answered_with_it() {
+async fn a_handshake_naming_the_era_is_answered_with_the_newest_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     assert_eq!(
         h.negotiate(ProtocolVersion::V_2026_07_28).await,
-        ProtocolVersion::V_2026_07_28
+        newest_legacy_handshake_version(),
+        "the era has no handshake, so one is answered with the newest that has"
     );
 }
 
-/// Every revision we advertise is echoed back verbatim, oldest and newest
-/// included, driven off the advertised set so a revision added without a
-/// decision about the echo fails here.
+/// Every revision we advertise is answered with a revision that has a
+/// handshake: one that has its own is echoed back verbatim, oldest included,
+/// and one that has none is answered with the newest that does. Driven off the
+/// advertised set so a revision added without a decision about the echo fails
+/// here.
 ///
 /// 2024-11-05 is the bottom-end pin: it is served today, keeping it costs one
 /// array element because rmcp branches nowhere between it and 2025-11-25
-/// (`uses_legacy_lifecycle`, rmcp 3.1.2 `service.rs:196-202`, a single `<`
-/// against 2026-07-28), and dropping a revision is a deprecation with a release
-/// note rather than a side effect of a dependency bump.
+/// (`uses_legacy_lifecycle`, a single `<` against 2026-07-28), and dropping a
+/// revision is a deprecation with a release note rather than a side effect of a
+/// dependency bump.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_revision_we_serve_is_echoed_verbatim() {
+async fn every_revision_we_serve_is_answered_with_a_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     for version in crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS {
+        let expected = if version.as_str() < "2026-07-28" {
+            version.clone()
+        } else {
+            newest_legacy_handshake_version()
+        };
         assert_eq!(
             h.negotiate(version.clone()).await,
-            *version,
-            "{version} is one we serve, so it comes back unchanged"
+            expected,
+            "{version} over an initialize handshake"
         );
     }
 }
@@ -566,22 +579,24 @@ async fn every_revision_we_serve_is_echoed_verbatim() {
 /// no session routing to wedge, and a hard refusal would regress the day a
 /// harness bumps its version string ahead of us.
 ///
-/// **What it is answered with is a decision this task took, and it is not the
-/// newest revision we serve.** A client that sent an `initialize` is speaking
-/// the legacy lifecycle, so it is answered the newest revision that still has
-/// one; 2026-07-28 deletes the handshake, and rmcp keys `ping`'s removal and
-/// the modern dispatch on the negotiated version, so downgrading a client onto
-/// the era would take `ping` away from a client that never asked for the era.
-/// A peer reaches the modern lifecycle only by asking - see
-/// `a_client_asking_for_the_era_through_a_handshake_is_answered_with_it` and
-/// `tests/mcp_modern_era.rs`.
+/// **What it is answered with is not the newest revision we serve.** A client
+/// that sent an `initialize` is speaking the legacy lifecycle, so it is
+/// answered the newest revision that still has one; 2026-07-28 deletes the
+/// handshake, and rmcp keys `ping`'s removal and the modern dispatch on the
+/// negotiated version, so downgrading a client onto the era would take `ping`
+/// away from a client that never asked for the era. Since rmcp 3.2.0 this is
+/// upstream's rule as well as ours, and it applies to every revision without a
+/// handshake rather than only to an unknown one - see
+/// `a_handshake_naming_the_era_is_answered_with_the_newest_handshake_revision`.
+/// A peer reaches the modern lifecycle through `server/discover` and inline
+/// requests instead - `tests/mcp_modern_era.rs`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unknown_protocol_version_string_is_answered_with_the_newest_handshake_revision() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
     for garbage in ["2027-01-01", "banana"] {
         assert_eq!(
             h.negotiate(protocol_version(garbage)).await,
-            ProtocolVersion::V_2025_11_25,
+            newest_legacy_handshake_version(),
             "{garbage} is not a revision anybody serves"
         );
     }

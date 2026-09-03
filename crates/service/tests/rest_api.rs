@@ -50,6 +50,7 @@ async fn build_engine_with(
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
             anonymous: Some(opts.anonymous),
+            mcp: None,
             max_users: opts.max_users,
         }),
         ..GlobalConfig::default()

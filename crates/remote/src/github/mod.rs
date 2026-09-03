@@ -165,7 +165,25 @@ impl GitHubProvider {
             });
         }
 
+        // The body is consumed exactly once, so it is read into a string
+        // before anything decides what the answer means: the organization
+        // policy check below needs GitHub's message, and so does the plain
+        // `Api` mapping it falls through to.
+        let sso_header = header(&response, "x-github-sso");
         let message = error_message(response).await;
+
+        if status == StatusCode::FORBIDDEN
+            && let Some(policy) =
+                organization_policy_error(&self.api_url, repo, sso_header.as_deref(), &message)
+        {
+            return Err(policy);
+        }
+
+        tracing::debug!(
+            status = status.as_u16(),
+            message = %message,
+            "GitHub answered with an error this client has no specific mapping for"
+        );
         Err(RemoteError::Api {
             status: status.as_u16(),
             message,
@@ -708,6 +726,95 @@ fn split_repo(repo: &str) -> Result<(&str, &str), RemoteError> {
         status: 0,
         message: format!("'{repo}' is not an owner/name GitHub repository"),
     })
+}
+
+/// The lowercased marker GitHub's SAML refusal body carries: "Resource
+/// protected by organization SAML enforcement. You must grant your OAuth
+/// token access to this organization."
+const SAML_ENFORCEMENT_MARKER: &str = "saml enforcement";
+
+/// The lowercased marker GitHub's OAuth App restriction body carries:
+/// "Although you appear to have the correct authorization credentials, the
+/// `<org>` organization has enabled OAuth App access restrictions, meaning
+/// that data access to third-parties is limited."
+const OAUTH_RESTRICTION_MARKER: &str = "oauth app access restrictions";
+
+/// The org placeholder used when neither the SSO url nor the repository in
+/// scope names one, so the message still reads as a sentence.
+const UNNAMED_ORG: &str = "this";
+
+/// Classifies a 403 as one of the two organization-policy refusals, or as
+/// nothing in particular.
+///
+/// Both are 403s that the collaborator advice is wrong for: the token is
+/// fine and the account's repository access is beside the point. Single
+/// sign-on is the one the person clears alone, by authorizing the app for
+/// the organization; an OAuth App restriction needs an organization owner.
+/// Anything else stays a plain [`RemoteError::Api`] carrying GitHub's own
+/// words.
+fn organization_policy_error(
+    api_url: &str,
+    repo: Option<&str>,
+    sso_header: Option<&str>,
+    message: &str,
+) -> Option<RemoteError> {
+    let lowered = message.to_lowercase();
+    // `X-GitHub-SSO: partial-results; organizations=...` is a different
+    // answer - some results were served and some were filtered - so only
+    // the `required` form counts as a refusal on its own.
+    let sso_required = sso_header.is_some_and(|value| {
+        value
+            .trim_start()
+            .to_ascii_lowercase()
+            .starts_with("required")
+    });
+
+    if sso_required || lowered.contains(SAML_ENFORCEMENT_MARKER) {
+        let header_url = sso_header.and_then(sso_url);
+        let org = header_url
+            .as_deref()
+            .and_then(org_from_sso_url)
+            .or_else(|| repo.and_then(repo_owner))
+            .unwrap_or_else(|| UNNAMED_ORG.to_string());
+        let url = header_url
+            .unwrap_or_else(|| auth::authorized_apps_url(&auth::auth_base(Some(api_url))));
+        return Some(RemoteError::SsoAuthorizationRequired { org, url });
+    }
+
+    if lowered.contains(OAUTH_RESTRICTION_MARKER) {
+        return Some(RemoteError::OauthAppRestricted {
+            org: repo
+                .and_then(repo_owner)
+                .unwrap_or_else(|| UNNAMED_ORG.to_string()),
+        });
+    }
+
+    None
+}
+
+/// Pulls the `url=` value out of an `X-GitHub-SSO` header. GitHub sends
+/// `required; url=https://github.com/orgs/<org>/sso?authorization_request=...`;
+/// the value ends at the next parameter separator or whitespace.
+fn sso_url(header_value: &str) -> Option<String> {
+    let (_, rest) = header_value.split_once("url=")?;
+    let url = rest
+        .split(|c: char| c == ';' || c.is_whitespace())
+        .next()?
+        .trim();
+    (!url.is_empty()).then(|| url.to_string())
+}
+
+/// Reads the organization out of an SSO url path, `/orgs/<org>/sso`.
+fn org_from_sso_url(url: &str) -> Option<String> {
+    let (_, rest) = url.split_once("/orgs/")?;
+    let org = rest.split(['/', '?', '#']).next()?;
+    (!org.is_empty()).then(|| org.to_string())
+}
+
+/// The owner half of an `owner/name` repository, when there is one.
+fn repo_owner(repo: &str) -> Option<String> {
+    let owner = repo.split('/').next()?.trim();
+    (!owner.is_empty()).then(|| owner.to_string())
 }
 
 /// Reads a response header as a plain string, if present and valid UTF-8.

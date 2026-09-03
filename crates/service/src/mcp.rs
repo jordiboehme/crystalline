@@ -298,9 +298,9 @@ fn is_write_tool(name: &str) -> bool {
 /// `instructions` to `server/discover`, restricts `tools/list_changed` to
 /// subscribers and requires caching hints on six operations; all four are
 /// implemented here - see [`McpServer::list_tools`], [`McpServer::discover`],
-/// [`McpServer::listen`] and [`CacheHinted`] - and so is the stdio bridge's
-/// half, where a bare `server/discover` probe is normalized and forwarded
-/// rather than answered `-32601` (`crate::client`). A fifth obligation,
+/// [`McpServer::listen`] and [`CacheHinted`]. The stdio path has no probe
+/// handling of its own - every client line is forwarded verbatim
+/// (`crate::client`) and rmcp classifies and answers it. A fifth obligation,
 /// `ping`'s removal, is rmcp's: it answers `method_not_found` to any peer that
 /// is not on the legacy lifecycle (`handler/server.rs:112-118`), and we
 /// implement no `ping`. `tests/mcp_modern_era.rs` is what a client at this
@@ -320,11 +320,12 @@ pub const SERVED_PROTOCOL_VERSIONS: &[ProtocolVersion] = &[
     ProtocolVersion::V_2026_07_28,
 ];
 
-/// The newest revision we serve: what a client asking for one we do not serve
-/// is answered with over stdio, and the version the stdio bridge injects into a
-/// bare `server/discover` probe (`crate::client`). Reads the last element, so
-/// the ordering of [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than
-/// cosmetic.
+/// The newest revision we serve. Reads the last element, so the ordering of
+/// [`SERVED_PROTOCOL_VERSIONS`] is load bearing rather than cosmetic.
+///
+/// **Not the downgrade target.** A client asking over stdio for a revision we
+/// do not serve is answered [`newest_legacy_handshake_version`], which is a
+/// different value and for a reason spelled out there.
 pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
     SERVED_PROTOCOL_VERSIONS
         .last()
@@ -346,10 +347,18 @@ pub(crate) fn newest_served_protocol_version() -> ProtocolVersion {
 /// dispatch on the peer's **negotiated** version (`handler/server.rs:112-118`,
 /// `:246-260`, `uses_legacy_lifecycle` at `service.rs:196-202`), so a client
 /// downgraded onto the era would lose `ping` without ever having asked for the
-/// era. Capping the downgrade means a peer reaches the modern lifecycle only
-/// by asking for it - by opening with `server/discover`, or by naming
-/// 2026-07-28 in its own handshake, both of which are still echoed verbatim.
-pub(crate) fn newest_legacy_handshake_version() -> ProtocolVersion {
+/// era.
+///
+/// **Since rmcp 3.2.0 this cap is upstream's rule too, and it binds every
+/// handshake rather than only an unserved one.** `negotiate_protocol_version`
+/// (`service/server.rs:479`) echoes a requested revision only when it is a
+/// legacy one the server supports, and otherwise answers with the newest
+/// legacy revision - so an `initialize` naming 2026-07-28 is answered this
+/// value however the handler replies. A peer therefore reaches the modern
+/// lifecycle only the way the specification provides for: by opening with
+/// `server/discover`, or by carrying the SEP-2575 `_meta` on an inline
+/// request. Naming the era in a handshake is not one of the routes.
+pub fn newest_legacy_handshake_version() -> ProtocolVersion {
     SERVED_PROTOCOL_VERSIONS
         .iter()
         .rfind(|version| **version < ProtocolVersion::V_2026_07_28)
@@ -2279,19 +2288,22 @@ impl ServerHandler for McpServer {
         context.peer.set_peer_info(request);
 
         let mut info = self.arrival_info();
-        // Echo what the client asked for when we serve it - 2026-07-28
-        // included, which is how a client asks for the modern lifecycle
-        // through a handshake - and downgrade to the newest revision that
-        // still has a handshake otherwise. The fallback is read from our own
-        // list rather than left at `ServerInfo::default()`'s
+        // **We supply the downgrade target; rmcp decides the echo.** Whatever
+        // this handler returns is post-processed by rmcp's
+        // `negotiate_protocol_version` (`service/server.rs:479`) on every
+        // transport - stdio at `service/server.rs:653`, HTTP at
+        // `tower.rs:321` - which echoes the requested revision itself when it
+        // is a legacy one we support and otherwise adopts this value, or the
+        // newest legacy revision we advertise if this value is not legacy. So
+        // an echoing branch here would be inert: it can only ever hand rmcp a
+        // value it discards. What is left is the one thing rmcp reads, and it
+        // has to stay legacy for rmcp to take it.
+        //
+        // Read from our own list rather than left at `ServerInfo::default()`'s
         // `ProtocolVersion::LATEST`, so an rmcp whose LATEST moves cannot make
-        // us answer with a revision we do not serve, and it is capped below
-        // the era for the reasons on [`newest_legacy_handshake_version`].
-        info.protocol_version = if served {
-            requested
-        } else {
-            newest_legacy_handshake_version()
-        };
+        // us offer a revision we do not serve, and capped below the era for
+        // the reasons on [`newest_legacy_handshake_version`].
+        info.protocol_version = newest_legacy_handshake_version();
         Ok(info)
     }
 
@@ -3342,9 +3354,11 @@ fn to_error(e: EngineError) -> ErrorData {
 /// `invalid_params`-shaped. A refusal in particular must never land in the
 /// server-error class: its whole content is the way out of the situation the
 /// caller put themselves in, and an "internal error" verdict in front of it
-/// tells the caller the opposite of what the message says. This match is
-/// exhaustive over `RemoteError` so a new variant must be classified here
-/// rather than silently defaulting.
+/// tells the caller the opposite of what the message says. The two
+/// organization-policy refusals sit in that same class for the same reason:
+/// nothing is broken here, and the message names the page that clears it.
+/// This match is exhaustive over `RemoteError` so a new variant must be
+/// classified here rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
     let message = e.to_string();
     match e {
@@ -3366,6 +3380,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
         | RemoteError::Refused(_)
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }

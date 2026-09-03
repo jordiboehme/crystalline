@@ -86,6 +86,7 @@ async fn serve(opts: Options) -> Fixture {
         auth: Some(AuthConfig {
             trusted_header: None,
             anonymous: Some(false),
+            mcp: None,
             max_users: None,
         }),
         github: opts.github.then(|| GitHubConfig {
