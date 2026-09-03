@@ -848,6 +848,12 @@ fn is_personal_token_missing(e: &EngineError) -> bool {
 /// instruction is to reconnect their own identity rather than to run the
 /// machine-wide connect. Every other error passes through: an offline machine
 /// or a rate limit is the same event whoever was acting.
+///
+/// The collaborator rewrite is deliberately keyed to `Api { status: 403 }`
+/// alone. An organization-policy refusal ([`RemoteError::SsoAuthorizationRequired`],
+/// [`RemoteError::OauthAppRestricted`]) is also a 403 upstream, but the
+/// provider has already turned it into the accurate instruction, and adding
+/// a collaborator would not clear either of them.
 fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteError {
     let Some(login) = login else {
         return e;
@@ -13597,6 +13603,35 @@ mod share_actor_tests {
         assert_eq!(
             err.to_string(),
             "your GitHub account @alice needs write access to team/knowledge - ask a maintainer to add you as a collaborator."
+        );
+    }
+
+    /// The two organization-policy refusals are 403s upstream too, but the
+    /// provider has already said what actually has to happen, and adding a
+    /// collaborator clears neither. They reach the caller word for word.
+    #[test]
+    fn organization_policy_refusals_survive_personal_mode_unchanged() {
+        let sso = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+        };
+        let expected = sso.to_string();
+        let enriched = enrich_write_error(sso, Some("alice"), "acme/knowledge");
+        assert_eq!(enriched.to_string(), expected);
+        assert!(
+            !enriched.to_string().contains("ask a maintainer"),
+            "{enriched}"
+        );
+
+        let restricted = RemoteError::OauthAppRestricted {
+            org: "acme".to_string(),
+        };
+        let expected = restricted.to_string();
+        let enriched = enrich_write_error(restricted, Some("alice"), "acme/knowledge");
+        assert_eq!(enriched.to_string(), expected);
+        assert!(
+            !enriched.to_string().contains("ask a maintainer"),
+            "{enriched}"
         );
     }
 

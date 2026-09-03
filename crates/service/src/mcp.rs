@@ -3354,9 +3354,11 @@ fn to_error(e: EngineError) -> ErrorData {
 /// `invalid_params`-shaped. A refusal in particular must never land in the
 /// server-error class: its whole content is the way out of the situation the
 /// caller put themselves in, and an "internal error" verdict in front of it
-/// tells the caller the opposite of what the message says. This match is
-/// exhaustive over `RemoteError` so a new variant must be classified here
-/// rather than silently defaulting.
+/// tells the caller the opposite of what the message says. The two
+/// organization-policy refusals sit in that same class for the same reason:
+/// nothing is broken here, and the message names the page that clears it.
+/// This match is exhaustive over `RemoteError` so a new variant must be
+/// classified here rather than silently defaulting.
 fn remote_to_error(e: RemoteError) -> ErrorData {
     let message = e.to_string();
     match e {
@@ -3378,6 +3380,8 @@ fn remote_to_error(e: RemoteError) -> ErrorData {
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
         | RemoteError::Refused(_)
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. }
         | RemoteError::ConflictNotFound { .. } => ErrorData::invalid_params(message, None),
     }
 }

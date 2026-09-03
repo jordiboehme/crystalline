@@ -496,8 +496,10 @@ impl From<anyhow::Error> for ApiError {
 /// or environmental variants are never the caller's mistake and stay 500,
 /// genuine input problems become 422 - a teaching refusal (`Refused`) among
 /// them, since its message is the way out of a situation the request itself
-/// created and a 500 would file it as a server fault - and a repository or
-/// proposal that does not exist becomes a 404.
+/// created and a 500 would file it as a server fault, and an organization
+/// policy refusal (single sign-on, OAuth app restrictions) beside it, which
+/// names the page that clears it - and a repository or proposal that does not
+/// exist becomes a 404.
 fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> ApiError {
     use crystalline_remote::RemoteError;
     match e {
@@ -519,6 +521,8 @@ fn remote_to_api_error(e: crystalline_remote::RemoteError, detail: String) -> Ap
         | RemoteError::NoWithdrawTarget { .. }
         | RemoteError::StacksUnsupported
         | RemoteError::Refused(_)
+        | RemoteError::SsoAuthorizationRequired { .. }
+        | RemoteError::OauthAppRestricted { .. }
         | RemoteError::ConflictsPending { .. } => unprocessable_error(detail),
     }
 }
