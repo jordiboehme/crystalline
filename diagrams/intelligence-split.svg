@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 400" width="720" height="400" role="img" aria-labelledby="split-title split-desc">
+  <title id="split-title">Fluid and crystalline intelligence</title>
+  <desc id="split-desc">Two halves. Left, fluid intelligence: reasons in the moment, keeps nothing; a model and a person are both fluid minds. Right, crystalline intelligence: accumulates and keeps; engrams in domains, plain markdown on disk. A vertical seam between them is Fluid, the web UI, where they meet. Teach and capture flow left to right; recall flows right to left.</desc>
+
+  <defs>
+    <marker id="crys-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c5eb5"/>
+    </marker>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="0.5" y="0.5" width="719" height="399" rx="12" ry="12"
+        fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+
+  <g font-family="Avenir Next, Segoe UI, system-ui, sans-serif"
+     stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- The seam: Fluid, the web UI, running the full height between the halves -->
+    <rect x="340" y="40" width="40" height="320" rx="10" ry="10"
+          fill="#70a4b2" fill-opacity="0.12" stroke="#70a4b2" stroke-width="1.5"/>
+
+    <!-- Node: FLUID INTELLIGENCE -->
+    <g>
+      <rect x="40" y="70" width="260" height="260" rx="10" ry="10"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <text x="170" y="108" text-anchor="middle" font-size="16" font-weight="600" fill="#6c5eb5">FLUID</text>
+      <text x="170" y="134" text-anchor="middle" font-size="14" fill="#1f2328">reasons in the moment,</text>
+      <text x="170" y="154" text-anchor="middle" font-size="14" fill="#1f2328">keeps nothing</text>
+
+      <rect x="66" y="196" width="96" height="36" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="114" y="219" text-anchor="middle" font-size="14" fill="#1f2328">a model</text>
+
+      <rect x="178" y="196" width="96" height="36" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="226" y="219" text-anchor="middle" font-size="14" fill="#1f2328">a person</text>
+
+      <text x="170" y="270" text-anchor="middle" font-size="14" fill="#57606a">both fluid minds</text>
+    </g>
+
+    <!-- Node: CRYSTALLINE INTELLIGENCE -->
+    <g>
+      <rect x="420" y="70" width="260" height="260" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="550" y="108" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">CRYSTALLINE</text>
+      <text x="550" y="134" text-anchor="middle" font-size="14" fill="#1f2328">accumulates and keeps</text>
+      <text x="550" y="154" text-anchor="middle" font-size="14" fill="#1f2328">what the company taught</text>
+
+      <rect x="466" y="196" width="168" height="36" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="550" y="219" text-anchor="middle" font-size="14" fill="#1f2328">engrams in domains</text>
+
+      <text x="550" y="270" text-anchor="middle" font-size="14" fill="#57606a">plain markdown on disk</text>
+    </g>
+
+    <!-- Flows across the seam -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 300 118 L 420 118"/>
+      <path d="M 420 296 L 300 296"/>
+    </g>
+    <text x="360" y="104" text-anchor="middle" font-size="12" fill="#57606a">teach, capture</text>
+    <text x="360" y="320" text-anchor="middle" font-size="12" fill="#57606a">recall</text>
+
+    <!-- The knot on the seam: where they meet -->
+    <g>
+      <rect x="284" y="176" width="152" height="52" rx="10" ry="10"
+            fill="#ffffff" stroke="#70a4b2" stroke-width="1.5"/>
+      <text x="360" y="198" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">Fluid, the web UI</text>
+      <text x="360" y="217" text-anchor="middle" font-size="12" fill="#57606a">where they meet</text>
+    </g>
+  </g>
+</svg>

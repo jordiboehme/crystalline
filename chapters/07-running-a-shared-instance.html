@@ -1,0 +1,1166 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>7&nbsp; Running a shared instance – The Crystalline Handbook</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+/* CSS for syntax highlighting */
+html { -webkit-text-size-adjust: 100%; }
+pre > code.sourceCode { white-space: pre; position: relative; }
+pre > code.sourceCode > span { display: inline-block; line-height: 1.25; }
+pre > code.sourceCode > span:empty { height: 1.2em; }
+.sourceCode { overflow: visible; }
+code.sourceCode > span { color: inherit; text-decoration: inherit; }
+div.sourceCode { margin: 1em 0; }
+pre.sourceCode { margin: 0; }
+@media screen {
+div.sourceCode { overflow: auto; }
+}
+@media print {
+pre > code.sourceCode { white-space: pre-wrap; }
+pre > code.sourceCode > span { text-indent: -5em; padding-left: 5em; }
+}
+pre.numberSource code
+  { counter-reset: source-line 0; }
+pre.numberSource code > span
+  { position: relative; left: -4em; counter-increment: source-line; }
+pre.numberSource code > span > a:first-child::before
+  { content: counter(source-line);
+    position: relative; left: -1em; text-align: right; vertical-align: baseline;
+    border: none; display: inline-block;
+    -webkit-touch-callout: none; -webkit-user-select: none;
+    -khtml-user-select: none; -moz-user-select: none;
+    -ms-user-select: none; user-select: none;
+    padding: 0 4px; width: 4em;
+  }
+pre.numberSource { margin-left: 3em;  padding-left: 4px; }
+div.sourceCode
+  {   }
+@media screen {
+pre > code.sourceCode > span > a:first-child::before { text-decoration: underline; }
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../chapters/08-onboarding-an-agent.html" rel="next">
+<link href="../chapters/06-installing-locally.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-3f4b516b42e41f10d42c94ac6f0f385a.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-b533e07af1a3426c031ee7c4325fca86.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-3f4b516b42e41f10d42c94ac6f0f385a.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-d71c82e44bc5b7f0a5da5f26d4942d95.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-6bd06683cdcbb1f16b24fdc2c809928c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-d71c82e44bc5b7f0a5da5f26d4942d95.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "sidebar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "start",
+  "type": "textbox",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+</head>
+
+<body class="nav-sidebar floating quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../chapters/06-installing-locally.html">Getting Started</a></li><li class="breadcrumb-item"><a href="../chapters/07-running-a-shared-instance.html"><span class="chapter-number">7</span>&nbsp; <span class="chapter-title">Running a shared instance</span></a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+    <div class="sidebar-title mb-0 py-0">
+      <a href="../">The Crystalline Handbook</a> 
+        <div class="sidebar-tools-main tools-wide">
+    <a href="../crystalline-handbook.md" title="Markdown edition" class="quarto-navigation-tool px-1" aria-label="Markdown edition"><i class="bi bi-markdown"></i></a>
+    <div class="dropdown">
+      <a href="" title="Download" id="quarto-navigation-tool-dropdown-0" class="quarto-navigation-tool dropdown-toggle px-1" data-bs-toggle="dropdown" aria-expanded="false" role="link" aria-label="Download"><i class="bi bi-download"></i></a>
+      <ul class="dropdown-menu" aria-labelledby="quarto-navigation-tool-dropdown-0">
+          <li>
+            <a class="dropdown-item sidebar-tools-main-item" href="../The-Crystalline-Handbook.pdf">
+              <i class="bi bi-file-pdf pe-1"></i>
+            Download PDF
+            </a>
+          </li>
+          <li>
+            <a class="dropdown-item sidebar-tools-main-item" href="../The-Crystalline-Handbook.epub">
+              <i class="bi bi-journal pe-1"></i>
+            Download ePub
+            </a>
+          </li>
+      </ul>
+    </div>
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+    </div>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Preface</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/00-colophon.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Colophon</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/00-prologue.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Prologue: Waking up</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">The Idea</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/01-what-is-crystalline.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">1</span>&nbsp; <span class="chapter-title">What is Crystalline?</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/02-fluid-and-crystalline-intelligence.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">2</span>&nbsp; <span class="chapter-title">Fluid and crystalline intelligence</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/03-the-lifecycle.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">3</span>&nbsp; <span class="chapter-title">The lifecycle: learn, evolve, remember</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">The System</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/04-what-crystalline-provides.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">4</span>&nbsp; <span class="chapter-title">What Crystalline provides</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/05-terminology.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">5</span>&nbsp; <span class="chapter-title">Terminology</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/06-installing-locally.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">6</span>&nbsp; <span class="chapter-title">Installing locally</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/07-running-a-shared-instance.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text"><span class="chapter-number">7</span>&nbsp; <span class="chapter-title">Running a shared instance</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Working with Crystalline</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/08-onboarding-an-agent.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">8</span>&nbsp; <span class="chapter-title">Onboarding an agent</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/09-teaching.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">9</span>&nbsp; <span class="chapter-title">Teaching</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/10-ingesting-knowledge-at-scale.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">10</span>&nbsp; <span class="chapter-title">Ingesting knowledge at scale</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/11-finding.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">11</span>&nbsp; <span class="chapter-title">Finding</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/12-evolving.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Evolving</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/13-sharing-with-a-team.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">13</span>&nbsp; <span class="chapter-title">Sharing with a team</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/14-identity-and-access.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">14</span>&nbsp; <span class="chapter-title">Identity and access</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/15-equipping-the-agent.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">15</span>&nbsp; <span class="chapter-title">Equipping the agent</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/16-where-to-go-from-here.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">16</span>&nbsp; <span class="chapter-title">Where to go from here</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Appendices</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/90-glossary.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Glossary</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/91-questions-and-answers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Questions and answers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/99-back-cover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Back cover</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#when-to-move-off-localhost" id="toc-when-to-move-off-localhost" class="nav-link active" data-scroll-target="#when-to-move-off-localhost"><span class="header-section-number">7.1</span> When to move off localhost</a></li>
+  <li><a href="#the-shapes-it-takes" id="toc-the-shapes-it-takes" class="nav-link" data-scroll-target="#the-shapes-it-takes"><span class="header-section-number">7.2</span> The shapes it takes</a></li>
+  <li><a href="#accounts-and-roles" id="toc-accounts-and-roles" class="nav-link" data-scroll-target="#accounts-and-roles"><span class="header-section-number">7.3</span> Accounts and roles</a></li>
+  <li><a href="#single-sign-on" id="toc-single-sign-on" class="nav-link" data-scroll-target="#single-sign-on"><span class="header-section-number">7.4</span> Single sign-on</a></li>
+  <li><a href="#trusted-header-mode" id="toc-trusted-header-mode" class="nav-link" data-scroll-target="#trusted-header-mode"><span class="header-section-number">7.5</span> Trusted-header mode</a></li>
+  <li><a href="#agent-authentication" id="toc-agent-authentication" class="nav-link" data-scroll-target="#agent-authentication"><span class="header-section-number">7.6</span> Agent authentication</a></li>
+  <li><a href="#private-domains" id="toc-private-domains" class="nav-link" data-scroll-target="#private-domains"><span class="header-section-number">7.7</span> Private domains</a></li>
+  </ul>
+</nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content">
+
+
+<header id="title-block-header" class="quarto-title-block default"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../chapters/06-installing-locally.html">Getting Started</a></li><li class="breadcrumb-item"><a href="../chapters/07-running-a-shared-instance.html"><span class="chapter-number">7</span>&nbsp; <span class="chapter-title">Running a shared instance</span></a></li></ol></nav>
+<div class="quarto-title">
+<h1 class="title"><span id="sec-shared-instance" class="quarto-section-identifier"><span class="chapter-number">7</span>&nbsp; <span class="chapter-title">Running a shared instance</span></span></h1>
+</div>
+
+
+
+<div class="quarto-title-meta">
+
+    
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<p>The moment to leave localhost is the moment two people want to correct the same engram. Up to then a laptop is the right size: one person, one agent, one folder, nothing to operate. Past it, every fact the team learns is being taught twice and drifting once, and the fix is the oldest one in computing. Put it on a server, give everyone a login and let one instance be the one the whole team teaches.</p>
+<!-- TODO-0.18.0: the chapter preview names agent authentication and private domains | source: plans/2026-08-31-sso-private-domains-spec.md sections 5 and 6 -->
+<p>The questions arrive in a fixed order, and the chapter follows it: where the instance runs; who may sign in, and how, the question chapter 4 handed here; how an agent on somebody’s laptop proves who it acts for; and how one person keeps a domain to a smaller circle.</p>
+<section id="when-to-move-off-localhost" class="level2" data-number="7.1">
+<h2 data-number="7.1" class="anchored" data-anchor-id="when-to-move-off-localhost"><span class="header-section-number">7.1</span> When to move off localhost</h2>
+<p>Chapter 1 settled where Crystalline runs: on a machine of yours, never on a hosted service. This chapter is about which machine. Three signals, any one of which is enough. Somebody who never opens a terminal wants to read what the agents learned and fix a fact without asking. An agent runs somewhere that is not a laptop, a hosted runner or a bot with a task, and needs to recall and capture like everyone else. Or the same engram has been corrected on two laptops in two directions.</p>
+<p>A shared instance differs from a team domain, chapter 13’s subject, where a folder lives in a GitHub repository, each person runs their own instance and knowledge travels between them as proposals the team reviews. A shared instance is one daemon everyone connects to: one index, one Fluid, one set of accounts, one folder of files on one disk. The two compose, and a mature team usually has both.</p>
+</section>
+<section id="the-shapes-it-takes" class="level2" data-number="7.2">
+<h2 data-number="7.2" class="anchored" data-anchor-id="the-shapes-it-takes"><span class="header-section-number">7.2</span> The shapes it takes</h2>
+<!-- TODO-0.18.0: the picture, its caption and its alt text assert agent tokens and an identity provider beside Fluid | source: plans/2026-08-31-sso-private-domains-spec.md sections 2 and 6; plans/2026-09-01-identity-program-plan.md resolved decision 1 -->
+<p>The full guide is docs/deployment.md in the repository, one scenario per section with a diagram each; this chapter summarizes. The shapes reduce to one picture (<a href="#fig-team-server" class="quarto-xref">Figure&nbsp;<span>7.1</span></a>): the daemon on a server, teammates’ agents reaching it over MCP on HTTP instead of a local pipe, browsers reaching Fluid on the same port, and, where the team configures them, a proxy in front and an identity provider beside it.</p>
+<div id="fig-team-server" class="quarto-float quarto-figure quarto-figure-center anchored" alt="A panel labelled one shared instance holds the MCP server, Fluid and the search index over plain markdown files. Teammates' agents and browsers enter from the left through a dashed proxy box marked TLS, where configured; on the right a dashed identity provider box is joined to Fluid by an arrow labelled sign in.">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-team-server-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="../diagrams/team-server.svg" class="img-fluid figure-img" alt="A panel labelled one shared instance holds the MCP server, Fluid and the search index over plain markdown files. Teammates' agents and browsers enter from the left through a dashed proxy box marked TLS, where configured; on the right a dashed identity provider box is joined to Fluid by an arrow labelled sign in.">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-team-server-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;7.1: One shared instance: agents connect over MCP with a token, people through Fluid with an account, with a proxy in front and an identity provider beside it where the team configures them.
+</figcaption>
+</figure>
+</div>
+<p>The team server is a container. The published image binds <code>0.0.0.0:7411</code> inside it, keeps the knowledge as a bind mount so the files stay exactly the markdown they were, and puts the index on a volume:</p>
+<div class="code-copy-outer-scaffold"><div class="sourceCode" id="cb1"><pre class="sourceCode sh code-with-copy"><code class="sourceCode bash"><span id="cb1-1"><a href="#cb1-1" aria-hidden="true" tabindex="-1"></a><span class="ex">docker</span> run <span class="at">-d</span> <span class="dt">\</span></span>
+<span id="cb1-2"><a href="#cb1-2" aria-hidden="true" tabindex="-1"></a>  <span class="at">--name</span> crystalline <span class="dt">\</span></span>
+<span id="cb1-3"><a href="#cb1-3" aria-hidden="true" tabindex="-1"></a>  <span class="at">-p</span> 7411:7411 <span class="dt">\</span></span>
+<span id="cb1-4"><a href="#cb1-4" aria-hidden="true" tabindex="-1"></a>  <span class="at">-v</span> <span class="st">"</span><span class="va">$(</span><span class="bu">pwd</span><span class="va">)</span><span class="st">/knowledge:/knowledge"</span> <span class="dt">\</span></span>
+<span id="cb1-5"><a href="#cb1-5" aria-hidden="true" tabindex="-1"></a>  <span class="at">-v</span> crystalline-data:/data <span class="dt">\</span></span>
+<span id="cb1-6"><a href="#cb1-6" aria-hidden="true" tabindex="-1"></a>  ghcr.io/jordiboehme/crystalline:latest</span></code></pre></div><button title="Copy to Clipboard" class="code-copy-button"><i class="bi"></i></button></div>
+<p>The <code>with-model</code> tag bakes the embedding model in, for a host with no egress. The same shape without a container is the <code>.deb</code>’s systemd unit: put <code>CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411</code> in <code>/etc/default/crystalline</code> and run <code>sudo systemctl enable --now crystalline</code>. A scale-out variant serves Fluid from an nginx tier in front of the daemon, and a read-only shape, <code>--read-only</code>, serves knowledge curated as a reviewed repository: the writing tools vanish from what an agent is offered while the index keeps following every pull.</p>
+<p>Whatever shape you pick, a few things follow you into it. An agent reaching the daemon by a hostname needs that name in <code>CRYSTALLINE_SERVICE_ALLOWED_HOSTS</code>, since the MCP transport checks the <code>Host</code> header against a loopback-only allow-list to block DNS rebinding. Serve it over TLS anywhere but localhost, since the session cookie is marked <code>Secure</code> off loopback and a browser on plain <code>http://team.lan</code> will not keep it. And a proxy in front must forward <code>Host</code> verbatim, pass the WebSocket upgrade through for co-editing and accept 10 MiB request bodies, as the daemon does.</p>
+</section>
+<section id="accounts-and-roles" class="level2" data-number="7.3">
+<h2 data-number="7.3" class="anchored" data-anchor-id="accounts-and-roles"><span class="header-section-number">7.3</span> Accounts and roles</h2>
+<p>Nothing is readable until an account exists. A fresh instance greets the first browser with the create-first-admin form from chapter 6, with one difference: a daemon bound to anything but loopback cannot trust a visitor by where they connected from, so it prints a one-time setup token as it starts and the form asks for it. Read it in <code>docker logs crystalline</code>, or <code>journalctl -u crystalline</code> under systemd; a restarted daemon prints a fresh one. The terminal route needs no token: <code>crystalline users add ada --role admin</code> writes the accounts database directly, and a running daemon picks the account up on its next lookup.</p>
+<p>Three roles, each containing the one before: a viewer searches, reads and browses; an editor also writes and edits engrams; an admin also manages domains and users, from <code>crystalline users</code> or from Fluid. Accounts live in a small database beside the index, never inside it, so <code>reindex --full</code> cannot take them along; on the container it sits on the <code>/data</code> volume and no rebuild restores it, so back the volume up.</p>
+<!-- TODO-0.18.0: admin removal is the deprovisioning story; SCIM and SAML are out of scope | source: plans/2026-08-31-sso-private-domains-spec.md sections 4 and 8 -->
+<p>When somebody leaves, an admin disables or deletes the account, and deleting sweeps whatever the account had connected. That is the whole deprovisioning story; there is no directory sync and no SAML.</p>
+</section>
+<section id="single-sign-on" class="level2" data-number="7.4">
+<h2 data-number="7.4" class="anchored" data-anchor-id="single-sign-on"><span class="header-section-number">7.4</span> Single sign-on</h2>
+<!-- TODO-0.18.0: generic OIDC with a three-key configuration, a login button beside local login, mixed instances allowed | source: plans/2026-08-31-sso-private-domains-spec.md section 2; plans/2026-09-01-identity-program-plan.md resolved decision 2 -->
+<p>Local accounts are right for a team of nine. Inside a company that already has an identity provider, people should sign in with the login they already have, and Crystalline talks to the provider through one generic integration, OpenID Connect, with no adapter per vendor. The configuration is three keys, <code>auth.oidc.issuer</code>, <code>auth.oidc.client_id</code> and <code>auth.oidc.client_secret</code>, plus a label for the button and the scopes if the defaults do not suit; discovery, PKCE and key rotation are the integration’s job. Fluid’s login page then shows “Sign in with” the label beside the local form (<a href="#fig-sso-login" class="quarto-xref">Figure&nbsp;<span>7.2</span></a>), and both keep working, so an instance can run mixed: local accounts for bots and the break-glass admin, everybody else through the provider.</p>
+<div id="fig-sso-login" class="quarto-float quarto-figure quarto-figure-center anchored">
+<figure class="quarto-float quarto-float-fig figure">
+<div aria-describedby="fig-sso-login-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+<img src="../assets/screenshots/fluid-sso-login.png" class="img-fluid figure-img">
+</div>
+<figcaption class="quarto-float-caption-bottom quarto-float-caption quarto-float-fig" id="fig-sso-login-caption-0ceaefa1-69ba-4598-a22c-09a6ac19f8ca">
+Figure&nbsp;7.2: Signing in through the instance’s identity provider.
+</figcaption>
+</figure>
+</div>
+<!-- TODO-0.18.0: first sign-in creates the account; the durable key is (issuer, sub); renames follow; linking is explicit, never by email; authorization stays app-side | source: plans/2026-08-31-sso-private-domains-spec.md section 4; plans/2026-09-01-identity-program-plan.md tasks 16-17 -->
+<p>The first successful sign-in creates the account, named from the provider’s preferred username and made unique if it collides, at the role <code>auth.oidc.default_role</code> says, viewer unless you change it. What the account is keyed on is what most such integrations get wrong: the durable key is the pair of issuer and subject, the provider’s own stable identifier, never the username, the email or the display name. Those are presentation; rename yourself at the provider and you land in the same account with a new label. And there is no silent linking: signing in through the provider with an email that matches an existing local account gets you a fresh account, never the existing one, and linking the two is an explicit act by the signed-in local user or by an admin. The provider authenticates and Crystalline authorizes; a group at the provider does not become a role here.</p>
+<!-- TODO-0.18.0: the Entra issuer must be the tenant-specific v2.0 URL; the common template is refused; sub is pairwise per app registration | source: plans/2026-08-31-sso-private-domains-spec.md sections 2 and 4; plans/2026-09-01-identity-program-plan.md task 14 -->
+<div class="callout callout-style-default callout-warning callout-titled" title="Entra ID: use the tenant-specific issuer">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Warning</span>Entra ID: use the tenant-specific issuer
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Microsoft Entra publishes a tenant-independent discovery document whose issuer field carries the literal text <code>{tenantid}</code>, and an issuer check against that template fails for every token. Crystalline refuses that value at configuration time and names the fix: the issuer must be your tenant’s own <code>https://login.microsoftonline.com/&lt;your-tenant-id&gt;/v2.0</code>. Prefer a certificate credential over a client secret where the deployment allows it. And know that Entra’s subject identifier is pairwise per app registration, so re-registering the application breaks every link between provider identities and Crystalline accounts, and an admin has to re-link them.</p>
+</div>
+</div>
+</section>
+<section id="trusted-header-mode" class="level2" data-number="7.5">
+<h2 data-number="7.5" class="anchored" data-anchor-id="trusted-header-mode"><span class="header-section-number">7.5</span> Trusted-header mode</h2>
+<p>Some deployments already have a proxy that authenticates everybody and names the arrival in a request header, and Crystalline can consume that. <code>auth.trusted_header</code> names a single custom header, <code>remote-user</code> say, and an account it names is created at viewer role the first time it is seen.</p>
+<!-- TODO-0.18.0: auth.proxy_headers consumes the standard Remote-* quartet; groups are parsed and not used; the two header modes are mutually exclusive | source: plans/2026-08-31-sso-private-domains-spec.md section 3; plans/2026-09-01-identity-program-plan.md task 18 -->
+<p>A second form, <code>auth.proxy_headers</code>, takes the standard set that forward-auth proxies emit, <code>Remote-User</code>, <code>Remote-Name</code>, <code>Remote-Email</code> and <code>Remote-Groups</code>, using the first for identity, the next two as presentation and reading the groups without acting on them. Pick one form or the other; a daemon configured with both refuses to start. Both are off by default, and a header that arrives while the mode is off buys the sender nothing.</p>
+<p>Now the warning, which the documentation does not soften, so neither does this page. Header mode trusts the proxy completely, because a header is a line of text anyone can add to a request. It is safe only when Crystalline is unreachable except through the proxy, and the proxy strips any client-supplied copy of those headers before setting its own. A daemon reachable on its port directly is an instance where anybody can be anybody. If you cannot say with confidence that the only path to the port runs through the proxy, use single sign-on instead. And create the first admin before the proxy goes in front: a request carrying forwarding headers is never counted as local, so the setup form behind a proxy asks for a token that a loopback-bound daemon never printed.</p>
+</section>
+<section id="agent-authentication" class="level2" data-number="7.6">
+<h2 data-number="7.6" class="anchored" data-anchor-id="agent-authentication"><span class="header-section-number">7.6</span> Agent authentication</h2>
+<!-- TODO-0.18.0: with auth.mcp on, every HTTP agent connection authenticates; the unauthenticated one is refused at the door with teaching text; no degraded tier; the open tier exists only when auth is off and sees only non-private domains | source: plans/2026-08-31-sso-private-domains-spec.md section 6; plans/2026-09-01-identity-program-plan.md global constraints, resolved decision 1, tasks 4 and 11 -->
+<p>On a laptop the MCP endpoint is open, on loopback, to whatever local process reaches it, and that is the right trade for one person. On a shared instance turn on <code>auth.mcp</code>, and from then on every agent that connects over HTTP identifies itself, exactly as a person does. There is no half-way tier: a connection without credentials is refused before any session opens, with a message naming how to get one; HAL refused Dave with less courtesy. The open tier exists only on an instance that leaves the setting off, and sees only the domains everyone sees. An agent that could search a shared instance anonymously would be a colleague with no name on the commit.</p>
+<!-- TODO-0.18.0: per-user MCP tokens issued in Fluid under profile > Agent access or with crystalline users mcp-token, shown once, sent as a bearer header in the harness registration, stored hashed, revoked or rotated immediately, issuable by every account including viewers | source: plans/2026-09-01-identity-program-plan.md resolved decision 1, tasks 6 and 7 -->
+<p>The credential is a token that belongs to a person. Each user issues their own in Fluid, under the Agent access card on their profile, or an admin mints one for any account with <code>crystalline users mcp-token &lt;name&gt;</code>; either way it is shown once, and the instance keeps only a hash. It travels as an <code>Authorization: Bearer</code> header on the server’s entry in the harness’s MCP registration, never expires on its own and stops working the instant it is revoked or rotated, because every request looks it up. Every account may issue one, viewers included, and that is safe because of what the token means.</p>
+<!-- TODO-0.18.0: an authenticated agent acts as its user: that user's visibility, role and share identity, with the account named in the write provenance; stdio and the CLI on the server are the machine owner and see everything | source: plans/2026-08-31-sso-private-domains-spec.md section 6; plans/2026-09-01-identity-program-plan.md task 5 -->
+<p>What it means is that the agent is its user. It sees what that person sees, writes where that person may write, shares under that person’s identity when a team domain is involved, and the engrams it captures record which client acted for which account. A viewer’s agent is therefore read-only with nothing further to configure, and a leaked token names one person, whose one token is revoked. One caller needs no token: the CLI and a stdio session on the server itself are the machine’s owner and see everything, which is the honest statement of what a filesystem already permits.</p>
+</section>
+<section id="private-domains" class="level2" data-number="7.7">
+<h2 data-number="7.7" class="anchored" data-anchor-id="private-domains"><span class="header-section-number">7.7</span> Private domains</h2>
+<blockquote class="blockquote">
+<p>The first rule of a private domain is: you do not talk about the private domain. The second rule of a private domain is: the instance DOES NOT talk about the private domain.</p>
+<p>- with sincere apologies to Chuck Palahniuk</p>
+</blockquote>
+<!-- TODO-0.18.0: a domain is visible to every user by default; private restricts it to owner, instance admins and invited members at viewer, editor or manager level; only the owner or an admin changes visibility, transfers or deletes | source: plans/2026-08-31-sso-private-domains-spec.md section 5 -->
+<p>By default whoever may sign in sees every domain. Some knowledge belongs to a smaller circle, the founders’ notes on a funding round or one person’s working knowledge on a company-wide instance, and a domain can be made private. It is then visible to its owner, to the instance’s admins and to whoever the owner invites, each member at one of three levels: a viewer reads and searches, an editor also writes and a manager also runs the membership. The owner is one person, and only the owner or an admin changes the domain’s visibility, transfers it or deletes it. Transfer is how a private domain survives its owner leaving.</p>
+<!-- TODO-0.18.0: instance admins always see and administer every domain; private domains protect from other users, not from whoever operates the machine; the toggle carries that caption | source: plans/2026-08-31-sso-private-domains-spec.md section 5; plans/2026-09-01-identity-program-plan.md task 13 -->
+<p>Two truths belong here, and the second is printed on the toggle itself so nobody discovers it later. Instance admins see and administer every domain, private ones included. And a private domain protects its contents from the instance’s other users, not from whoever operates the machine, because the engrams are files on that machine’s disk, with no encryption at rest. If the threat is the operator, the answer is a different machine.</p>
+<!-- TODO-0.18.0: visibility is enforced on every read surface; a hidden domain reads as absent, never as forbidden; writes need editor or better; members are managed from a Members card or with crystalline domain members; agents inherit visibility and never administer it | source: plans/2026-08-31-sso-private-domains-spec.md sections 6 and 7; plans/2026-09-01-identity-program-plan.md tasks 9, 10, 12 and 13 -->
+<p>Visibility follows the caller onto every surface: search, reading, <code>build_context</code>, the routing briefing, the graph, the maintenance sweep, exports and Fluid’s domain list all show a private domain only to those who may see it. To everyone else it does not exist, literally: a search or a read against a domain you may not see answers exactly as it would for one that was never registered, because a “forbidden” would already say something. That is the second rule. Writes check the membership level rather than the instance role, so an instance editor invited as a viewer is told, when they try, that editor access is what the domain requires. Members are managed from a Members card in the domain’s settings, or on the server with <code>crystalline domain members &lt;domain&gt; add &lt;user&gt; --level editor</code> and its <code>list</code> and <code>remove</code> siblings. Agents inherit all of this from their user and administer none of it; there is no tool for changing membership, on purpose. Membership records live in the accounts database beside the index, so a wipe and resync of the index leaves every permission where it was.</p>
+<!-- TODO-0.18.0: the Tyrell vignette rests on single sign-on, per-user agent tokens and a private domain with membership levels | source: plans/2026-08-31-sso-private-domains-spec.md sections 2, 5 and 6; plans/2026-09-01-identity-program-plan.md resolved decision 1 -->
+<div class="callout callout-style-default callout-note callout-titled" title="In practice">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>In practice
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Tyrell moves in June, after the second time Ripley and Deckard corrected the same engram in two directions. Ripley runs the container on the team’s server, behind the TLS proxy that fronts everything else, the first admin created before the proxy went in. She points <code>auth.oidc.issuer</code> at the company’s identity provider, everybody signs in on Monday with the login they already have, and she promotes the engineers to editor. Then she turns on <code>auth.mcp</code>. Deckard’s agent, pointed at the server over HTTP, is refused at once with a message saying where to get a token; he issues one on his profile, pastes it into his harness registration, and the next session opens with a briefing that names <code>engineering</code> and <code>clients</code>, learned by everyone, recalled by his.</p>
+<p>Dallas, who runs the company, keeps a <code>board</code> domain for the funding round. He makes it private and invites Ripley as a manager and Lambert as a viewer. Deckard’s agent, asked about the round, searches every domain it can see and reports that nothing is known; Ripley’s, acting as Ripley, finds the notes at once; Lambert’s, trying to capture a fact into <code>board</code>, is told that her membership is viewer and proposes writing to <code>clients</code> instead. One team, one instance, one folder of files on one disk, and every action in it with a name attached.</p>
+</div>
+</div>
+<p>Somebody has to be the one who runs the server, and the rest of the team gets to forget it exists. That is the whole point of a shared instance: one place everybody teaches, and one login that says who did.</p>
+<!-- TODO-0.18.0: the summary restates single sign-on, agent tokens, the no-degraded-tier rule and private domains | source: plans/2026-08-31-sso-private-domains-spec.md sections 2 to 6; plans/2026-09-01-identity-program-plan.md resolved decision 1 -->
+<div class="callout callout-style-default callout-note callout-titled" title="In brief">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>In brief
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Move off localhost when a team wants to teach one knowledge base: run the container, the systemd unit or the read-only shape from docs/deployment.md, serve it over TLS, and create the first admin with the setup token the daemon prints or with <code>crystalline users add</code>. Accounts come in three roles, viewer, editor and admin, created locally or on first sign-in through any OpenID Connect provider, keyed on issuer and subject and never linked by email; trusted-header mode is safe only when the proxy is the only path in. With <code>auth.mcp</code> on, every agent over HTTP authenticates with a per-user token and acts as that user, with no unauthenticated tier beside it. A private domain is visible to its owner, the instance’s admins and invited members on every surface, and it protects from other users, never from whoever operates the machine.</p>
+</div>
+</div>
+
+
+</section>
+
+</main> <!-- /main -->
+<!-- The colophon's icon notes: fit the squares of icons to the paragraphs
+     beside them. theme/crystalline.scss sizes each square to three lines
+     without this. Every note gets the same square, the tallest paragraph's,
+     and the loop repeats until the text stops reflowing under the change. -->
+<script>
+(function () {
+  function fit() {
+    var notes = Array.prototype.slice.call(document.querySelectorAll(".icon-note"));
+    var pairs = [];
+    notes.forEach(function (note) {
+      var tile = note.querySelector("p:first-child");
+      var text = note.querySelector("p:last-child");
+      if (tile && text && tile !== text) pairs.push([tile, text]);
+    });
+    if (!pairs.length) return;
+    pairs.forEach(function (p) { p[0].style.height = p[0].style.width = ""; });
+    // On a narrow screen a wider square narrows the text, which grows
+    // taller, which widens the square: cap it at a third of the note.
+    var cap = Math.round(notes[0].getBoundingClientRect().width / 3);
+    var last = 0;
+    for (var i = 0; i < 6; i++) {
+      var h = 0;
+      pairs.forEach(function (p) {
+        h = Math.max(h, Math.round(p[1].getBoundingClientRect().height));
+      });
+      h = Math.min(h, cap);
+      if (h === last) break;
+      pairs.forEach(function (p) { p[0].style.height = p[0].style.width = h + "px"; });
+      last = h;
+    }
+  }
+  window.addEventListener("load", fit);
+  window.addEventListener("resize", fit);
+})();
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../chapters/06-installing-locally.html" class="pagination-link" aria-label="Installing locally">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text"><span class="chapter-number">6</span>&nbsp; <span class="chapter-title">Installing locally</span></span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../chapters/08-onboarding-an-agent.html" class="pagination-link" aria-label="Onboarding an agent">
+        <span class="nav-page-text"><span class="chapter-number">8</span>&nbsp; <span class="chapter-title">Onboarding an agent</span></span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+</body></html>

@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 424" width="720" height="424" role="img" aria-labelledby="lifecycle-title lifecycle-desc">
+  <title id="lifecycle-title">The Crystalline lifecycle</title>
+  <desc id="lifecycle-desc">A clockwise loop of three stages. Learn: onboarded, captures while working. Evolve: the sweep tends what was captured. Remember: recall routes the next task. The loop turns session by session.</desc>
+
+  <defs>
+    <marker id="crys-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c5eb5"/>
+    </marker>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="0.5" y="0.5" width="719" height="423" rx="12" ry="12"
+        fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+
+  <g font-family="Avenir Next, Segoe UI, system-ui, sans-serif"
+     stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- Flow: clockwise, learn to evolve to remember and back -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 440 136 Q 505 205 540 298"/>
+      <path d="M 438 358 Q 360 412 286 358"/>
+      <path d="M 180 302 Q 215 205 278 140"/>
+    </g>
+
+    <!-- Node: LEARN -->
+    <g>
+      <rect x="250" y="46" width="220" height="92" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="360" y="78" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">LEARN</text>
+      <text x="360" y="101" text-anchor="middle" font-size="14" fill="#1f2328">onboarded, captures</text>
+      <text x="360" y="120" text-anchor="middle" font-size="14" fill="#1f2328">while working</text>
+    </g>
+
+    <!-- Node: EVOLVE -->
+    <g>
+      <rect x="440" y="304" width="220" height="92" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="550" y="336" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">EVOLVE</text>
+      <text x="550" y="359" text-anchor="middle" font-size="14" fill="#1f2328">the sweep tends</text>
+      <text x="550" y="378" text-anchor="middle" font-size="14" fill="#1f2328">what was captured</text>
+    </g>
+
+    <!-- Node: REMEMBER -->
+    <g>
+      <rect x="60" y="304" width="220" height="92" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="170" y="336" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">REMEMBER</text>
+      <text x="170" y="359" text-anchor="middle" font-size="14" fill="#1f2328">recall routes</text>
+      <text x="170" y="378" text-anchor="middle" font-size="14" fill="#1f2328">the next task</text>
+    </g>
+
+    <!-- Centre: what the loop adds up to -->
+    <g>
+      <rect x="278" y="218" width="164" height="44" rx="10" ry="10"
+            fill="#70a4b2" fill-opacity="0.12" stroke="#70a4b2" stroke-width="1.5"/>
+      <text x="360" y="245" text-anchor="middle" font-size="14" fill="#57606a">session by session</text>
+    </g>
+  </g>
+</svg>

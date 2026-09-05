@@ -1,0 +1,1110 @@
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" lang="en" xml:lang="en"><head>
+
+<meta charset="utf-8">
+<meta name="generator" content="quarto-1.10.18">
+
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+
+
+<title>12&nbsp; Evolving – The Crystalline Handbook</title>
+<style>
+/* Default styles provided by pandoc.
+** See https://pandoc.org/MANUAL.html#variables-for-html for config info.
+*/
+span.smallcaps{font-variant: small-caps;}
+div.columns{display: flex; gap: 1.5em;}
+div.column{flex: auto;}
+@media screen {
+div.columns{gap: min(4vw, 1.5em);}
+div.column{overflow-x: auto;}
+}
+div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+ul.task-list{list-style: none;}
+ul.task-list li input[type="checkbox"] {
+  width: 0.8em;
+  margin: 0 0.8em 0.2em -1em; /* quarto-specific, see https://github.com/quarto-dev/quarto-cli/issues/4556 */ 
+  vertical-align: middle;
+}
+</style>
+
+
+<script src="../site_libs/quarto-nav/quarto-nav.js"></script>
+<script src="../site_libs/quarto-nav/headroom.min.js"></script>
+<script src="../site_libs/clipboard/clipboard.min.js"></script>
+<script src="../site_libs/quarto-search/autocomplete.umd.js"></script>
+<script src="../site_libs/quarto-search/fuse.min.js"></script>
+<script src="../site_libs/quarto-search/quarto-search.js"></script>
+<meta name="quarto:offset" content="../">
+<link href="../chapters/13-sharing-with-a-team.html" rel="next">
+<link href="../chapters/11-finding.html" rel="prev">
+<script src="../site_libs/quarto-html/quarto.js" type="module"></script>
+<script src="../site_libs/quarto-html/tabsets/tabsets.js" type="module"></script>
+<script src="../site_libs/quarto-html/popper.min.js"></script>
+<script src="../site_libs/quarto-html/tippy.umd.min.js"></script>
+<script src="../site_libs/quarto-html/anchor.min.js"></script>
+<link href="../site_libs/quarto-html/tippy.css" rel="stylesheet">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-3f4b516b42e41f10d42c94ac6f0f385a.css" rel="stylesheet" class="quarto-color-scheme" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-dark-b533e07af1a3426c031ee7c4325fca86.css" rel="stylesheet" class="quarto-color-scheme quarto-color-alternate" id="quarto-text-highlighting-styles">
+<link href="../site_libs/quarto-html/quarto-syntax-highlighting-3f4b516b42e41f10d42c94ac6f0f385a.css" rel="stylesheet" class="quarto-color-scheme-extra" id="quarto-text-highlighting-styles">
+<script src="../site_libs/bootstrap/bootstrap.min.js"></script>
+<link href="../site_libs/bootstrap/bootstrap-icons.css" rel="stylesheet">
+<link href="../site_libs/bootstrap/bootstrap-d71c82e44bc5b7f0a5da5f26d4942d95.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme" id="quarto-bootstrap" data-mode="light">
+<link href="../site_libs/bootstrap/bootstrap-dark-6bd06683cdcbb1f16b24fdc2c809928c.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme quarto-color-alternate" id="quarto-bootstrap" data-mode="dark">
+<link href="../site_libs/bootstrap/bootstrap-d71c82e44bc5b7f0a5da5f26d4942d95.min.css" rel="stylesheet" append-hash="true" class="quarto-color-scheme-extra" id="quarto-bootstrap" data-mode="light">
+<script id="quarto-search-options" type="application/json">{
+  "location": "sidebar",
+  "copy-button": false,
+  "collapse-after": 3,
+  "panel-placement": "start",
+  "type": "textbox",
+  "limit": 50,
+  "keyboard-shortcut": [
+    "f",
+    "/",
+    "s"
+  ],
+  "show-item-context": false,
+  "language": {
+    "search-no-results-text": "No results",
+    "search-matching-documents-text": "matching documents",
+    "search-copy-link-title": "Copy link to search",
+    "search-hide-matches-text": "Hide additional matches",
+    "search-more-match-text": "more match in this document",
+    "search-more-matches-text": "more matches in this document",
+    "search-clear-button-title": "Clear",
+    "search-text-placeholder": "",
+    "search-detached-cancel-button-title": "Cancel",
+    "search-submit-button-title": "Submit",
+    "search-label": "Search"
+  }
+}</script>
+
+
+</head>
+
+<body class="nav-sidebar floating quarto-light"><script id="quarto-html-before-body" type="application/javascript">
+    const toggleBodyColorMode = (bsSheetEl) => {
+      const mode = bsSheetEl.getAttribute("data-mode");
+      const bodyEl = window.document.querySelector("body");
+      if (mode === "dark") {
+        bodyEl.classList.add("quarto-dark");
+        bodyEl.classList.remove("quarto-light");
+      } else {
+        bodyEl.classList.add("quarto-light");
+        bodyEl.classList.remove("quarto-dark");
+      }
+    }
+    const toggleBodyColorPrimary = () => {
+      const bsSheetEl = window.document.querySelector("link#quarto-bootstrap:not([rel=disabled-stylesheet])");
+      if (bsSheetEl) {
+        toggleBodyColorMode(bsSheetEl);
+      }
+    }
+    const setColorSchemeToggle = (alternate) => {
+      const toggles = window.document.querySelectorAll('.quarto-color-scheme-toggle');
+      for (let i=0; i < toggles.length; i++) {
+        const toggle = toggles[i];
+        if (toggle) {
+          if (alternate) {
+            toggle.classList.add("alternate");
+          } else {
+            toggle.classList.remove("alternate");
+          }
+        }
+      }
+    };
+    const toggleColorMode = (alternate) => {
+      // Switch the stylesheets
+      const primaryStylesheets = window.document.querySelectorAll('link.quarto-color-scheme:not(.quarto-color-alternate)');
+      const alternateStylesheets = window.document.querySelectorAll('link.quarto-color-scheme.quarto-color-alternate');
+      manageTransitions('#quarto-margin-sidebar .nav-link', false);
+      if (alternate) {
+        // note: dark is layered on light, we don't disable primary!
+        enableStylesheet(alternateStylesheets);
+        for (const sheetNode of alternateStylesheets) {
+          if (sheetNode.id === "quarto-bootstrap") {
+            toggleBodyColorMode(sheetNode);
+          }
+        }
+      } else {
+        disableStylesheet(alternateStylesheets);
+        enableStylesheet(primaryStylesheets)
+        toggleBodyColorPrimary();
+      }
+      manageTransitions('#quarto-margin-sidebar .nav-link', true);
+      // Switch the toggles
+      setColorSchemeToggle(alternate)
+      // Hack to workaround the fact that safari doesn't
+      // properly recolor the scrollbar when toggling (#1455)
+      if (navigator.userAgent.indexOf('Safari') > 0 && navigator.userAgent.indexOf('Chrome') == -1) {
+        manageTransitions("body", false);
+        window.scrollTo(0, 1);
+        setTimeout(() => {
+          window.scrollTo(0, 0);
+          manageTransitions("body", true);
+        }, 40);
+      }
+    }
+    const disableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        stylesheet.rel = 'disabled-stylesheet';
+      }
+    }
+    const enableStylesheet = (stylesheets) => {
+      for (let i=0; i < stylesheets.length; i++) {
+        const stylesheet = stylesheets[i];
+        if(stylesheet.rel !== 'stylesheet') { // for Chrome, which will still FOUC without this check
+          stylesheet.rel = 'stylesheet';
+        }
+      }
+    }
+    const manageTransitions = (selector, allowTransitions) => {
+      const els = window.document.querySelectorAll(selector);
+      for (let i=0; i < els.length; i++) {
+        const el = els[i];
+        if (allowTransitions) {
+          el.classList.remove('notransition');
+        } else {
+          el.classList.add('notransition');
+        }
+      }
+    }
+    const isFileUrl = () => {
+      return window.location.protocol === 'file:';
+    }
+    const hasAlternateSentinel = () => {
+      let styleSentinel = getColorSchemeSentinel();
+      if (styleSentinel !== null) {
+        return styleSentinel === "alternate";
+      } else {
+        return false;
+      }
+    }
+    const setStyleSentinel = (alternate) => {
+      const value = alternate ? "alternate" : "default";
+      if (!isFileUrl()) {
+        window.localStorage.setItem("quarto-color-scheme", value);
+      } else {
+        localAlternateSentinel = value;
+      }
+    }
+    const getColorSchemeSentinel = () => {
+      if (!isFileUrl()) {
+        const storageValue = window.localStorage.getItem("quarto-color-scheme");
+        return storageValue != null ? storageValue : localAlternateSentinel;
+      } else {
+        return localAlternateSentinel;
+      }
+    }
+    const toggleGiscusIfUsed = (isAlternate, darkModeDefault) => {
+      const baseTheme = document.querySelector('#giscus-base-theme')?.value ?? 'light';
+      const alternateTheme = document.querySelector('#giscus-alt-theme')?.value ?? 'dark';
+      let newTheme = '';
+      if(authorPrefersDark) {
+        newTheme = isAlternate ? baseTheme : alternateTheme;
+      } else {
+        newTheme = isAlternate ? alternateTheme : baseTheme;
+      }
+      const changeGiscusTheme = () => {
+        // From: https://github.com/giscus/giscus/issues/336
+        const sendMessage = (message) => {
+          const iframe = document.querySelector('iframe.giscus-frame');
+          if (!iframe) return;
+          iframe.contentWindow.postMessage({ giscus: message }, 'https://giscus.app');
+        }
+        sendMessage({
+          setConfig: {
+            theme: newTheme
+          }
+        });
+      }
+      const isGiscussLoaded = window.document.querySelector('iframe.giscus-frame') !== null;
+      if (isGiscussLoaded) {
+        changeGiscusTheme();
+      }
+    };
+    const authorPrefersDark = false;
+    const darkModeDefault = authorPrefersDark;
+      document.querySelector('link#quarto-text-highlighting-styles.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+      document.querySelector('link#quarto-bootstrap.quarto-color-scheme-extra').rel = 'disabled-stylesheet';
+    let localAlternateSentinel = darkModeDefault ? 'alternate' : 'default';
+    // Dark / light mode switch
+    window.quartoToggleColorScheme = () => {
+      // Read the current dark / light value
+      let toAlternate = !hasAlternateSentinel();
+      toggleColorMode(toAlternate);
+      setStyleSentinel(toAlternate);
+      toggleGiscusIfUsed(toAlternate, darkModeDefault);
+      window.dispatchEvent(new Event('resize'));
+    };
+    // Switch to dark mode if need be
+    if (hasAlternateSentinel()) {
+      toggleColorMode(true);
+    } else {
+      toggleColorMode(false);
+    }
+  </script>
+
+<div id="quarto-search-results"></div>
+  <header id="quarto-header" class="headroom fixed-top">
+  <nav class="quarto-secondary-nav">
+    <div class="container-fluid d-flex">
+      <button type="button" class="quarto-btn-toggle btn" data-bs-toggle="collapse" role="button" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">
+        <i class="bi bi-layout-text-sidebar-reverse"></i>
+      </button>
+        <nav class="quarto-page-breadcrumbs" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../chapters/08-onboarding-an-agent.html">Working with Crystalline</a></li><li class="breadcrumb-item"><a href="../chapters/12-evolving.html"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Evolving</span></a></li></ol></nav>
+        <a class="flex-grow-1" role="navigation" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item" aria-controls="quarto-sidebar" aria-expanded="false" aria-label="Toggle sidebar navigation" onclick="if (window.quartoToggleHeadroom) { window.quartoToggleHeadroom(); }">      
+        </a>
+      <button type="button" class="btn quarto-search-button" aria-label="Search" onclick="window.quartoOpenSearch();">
+        <i class="bi bi-search"></i>
+      </button>
+    </div>
+  </nav>
+</header>
+<!-- content -->
+<div id="quarto-content" class="quarto-container page-columns page-rows-contents page-layout-article">
+<!-- sidebar -->
+  <nav id="quarto-sidebar" class="sidebar collapse collapse-horizontal quarto-sidebar-collapse-item sidebar-navigation floating overflow-auto">
+    <div class="pt-lg-2 mt-2 text-left sidebar-header">
+    <div class="sidebar-title mb-0 py-0">
+      <a href="../">The Crystalline Handbook</a> 
+        <div class="sidebar-tools-main tools-wide">
+    <a href="../crystalline-handbook.md" title="Markdown edition" class="quarto-navigation-tool px-1" aria-label="Markdown edition"><i class="bi bi-markdown"></i></a>
+    <div class="dropdown">
+      <a href="" title="Download" id="quarto-navigation-tool-dropdown-0" class="quarto-navigation-tool dropdown-toggle px-1" data-bs-toggle="dropdown" aria-expanded="false" role="link" aria-label="Download"><i class="bi bi-download"></i></a>
+      <ul class="dropdown-menu" aria-labelledby="quarto-navigation-tool-dropdown-0">
+          <li>
+            <a class="dropdown-item sidebar-tools-main-item" href="../The-Crystalline-Handbook.pdf">
+              <i class="bi bi-file-pdf pe-1"></i>
+            Download PDF
+            </a>
+          </li>
+          <li>
+            <a class="dropdown-item sidebar-tools-main-item" href="../The-Crystalline-Handbook.epub">
+              <i class="bi bi-journal pe-1"></i>
+            Download ePub
+            </a>
+          </li>
+      </ul>
+    </div>
+  <a href="" class="quarto-color-scheme-toggle quarto-navigation-tool  px-1" onclick="window.quartoToggleColorScheme(); return false;" title="Toggle dark mode"><i class="bi"></i></a>
+</div>
+    </div>
+      </div>
+        <div class="mt-2 flex-shrink-0 align-items-center">
+        <div class="sidebar-search">
+        <div id="quarto-search" class="" title="Search"></div>
+        </div>
+        </div>
+    <div class="sidebar-menu-container"> 
+    <ul class="list-unstyled mt-1">
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../index.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Preface</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/00-colophon.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Colophon</span></a>
+  </div>
+</li>
+        <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/00-prologue.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Prologue: Waking up</span></a>
+  </div>
+</li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true">
+ <span class="menu-text">The Idea</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-1" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-1" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/01-what-is-crystalline.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">1</span>&nbsp; <span class="chapter-title">What is Crystalline?</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/02-fluid-and-crystalline-intelligence.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">2</span>&nbsp; <span class="chapter-title">Fluid and crystalline intelligence</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/03-the-lifecycle.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">3</span>&nbsp; <span class="chapter-title">The lifecycle: learn, evolve, remember</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true">
+ <span class="menu-text">The System</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-2" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-2" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/04-what-crystalline-provides.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">4</span>&nbsp; <span class="chapter-title">What Crystalline provides</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/05-terminology.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">5</span>&nbsp; <span class="chapter-title">Terminology</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true">
+ <span class="menu-text">Getting Started</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-3" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-3" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/06-installing-locally.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">6</span>&nbsp; <span class="chapter-title">Installing locally</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/07-running-a-shared-instance.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">7</span>&nbsp; <span class="chapter-title">Running a shared instance</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true">
+ <span class="menu-text">Working with Crystalline</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-4" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-4" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/08-onboarding-an-agent.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">8</span>&nbsp; <span class="chapter-title">Onboarding an agent</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/09-teaching.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">9</span>&nbsp; <span class="chapter-title">Teaching</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/10-ingesting-knowledge-at-scale.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">10</span>&nbsp; <span class="chapter-title">Ingesting knowledge at scale</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/11-finding.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">11</span>&nbsp; <span class="chapter-title">Finding</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/12-evolving.html" class="sidebar-item-text sidebar-link active">
+ <span class="menu-text"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Evolving</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/13-sharing-with-a-team.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">13</span>&nbsp; <span class="chapter-title">Sharing with a team</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/14-identity-and-access.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">14</span>&nbsp; <span class="chapter-title">Identity and access</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/15-equipping-the-agent.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">15</span>&nbsp; <span class="chapter-title">Equipping the agent</span></span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/16-where-to-go-from-here.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text"><span class="chapter-number">16</span>&nbsp; <span class="chapter-title">Where to go from here</span></span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+        <li class="sidebar-item sidebar-item-section">
+      <div class="sidebar-item-container"> 
+            <a class="sidebar-item-text sidebar-link text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true">
+ <span class="menu-text">Appendices</span></a>
+          <a class="sidebar-item-toggle text-start" data-bs-toggle="collapse" data-bs-target="#quarto-sidebar-section-5" role="navigation" aria-expanded="true" aria-label="Toggle section">
+            <i class="bi bi-chevron-right ms-2"></i>
+          </a> 
+      </div>
+      <ul id="quarto-sidebar-section-5" class="collapse list-unstyled sidebar-section depth1 show">  
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/90-glossary.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Glossary</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/91-questions-and-answers.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Questions and answers</span></a>
+  </div>
+</li>
+          <li class="sidebar-item">
+  <div class="sidebar-item-container"> 
+  <a href="../chapters/99-back-cover.html" class="sidebar-item-text sidebar-link">
+ <span class="menu-text">Back cover</span></a>
+  </div>
+</li>
+      </ul>
+  </li>
+    </ul>
+    </div>
+</nav>
+<div id="quarto-sidebar-glass" class="quarto-sidebar-collapse-item" data-bs-toggle="collapse" data-bs-target=".quarto-sidebar-collapse-item"></div>
+<!-- margin-sidebar -->
+    <div id="quarto-margin-sidebar" class="sidebar margin-sidebar">
+        <nav id="TOC" role="doc-toc" class="toc-active">
+    <h2 id="toc-title">Table of contents</h2>
+   
+  <ul>
+  <li><a href="#why-knowledge-needs-tending" id="toc-why-knowledge-needs-tending" class="nav-link active" data-scroll-target="#why-knowledge-needs-tending"><span class="header-section-number">12.1</span> Why knowledge needs tending</a></li>
+  <li><a href="#the-sweep" id="toc-the-sweep" class="nav-link" data-scroll-target="#the-sweep"><span class="header-section-number">12.2</span> The sweep</a></li>
+  <li><a href="#mechanical-and-judgment" id="toc-mechanical-and-judgment" class="nav-link" data-scroll-target="#mechanical-and-judgment"><span class="header-section-number">12.3</span> Mechanical and judgment</a></li>
+  <li><a href="#the-page-for-people" id="toc-the-page-for-people" class="nav-link" data-scroll-target="#the-page-for-people"><span class="header-section-number">12.4</span> The page for people</a></li>
+  <li><a href="#retiring-done-right" id="toc-retiring-done-right" class="nav-link" data-scroll-target="#retiring-done-right"><span class="header-section-number">12.5</span> Retiring done right</a></li>
+  <li><a href="#verification-and-acknowledgments" id="toc-verification-and-acknowledgments" class="nav-link" data-scroll-target="#verification-and-acknowledgments"><span class="header-section-number">12.6</span> Verification and acknowledgments</a></li>
+  <li><a href="#when-to-sweep" id="toc-when-to-sweep" class="nav-link" data-scroll-target="#when-to-sweep"><span class="header-section-number">12.7</span> When to sweep</a></li>
+  </ul>
+</nav>
+    </div>
+<!-- main -->
+<main class="content" id="quarto-document-content">
+
+
+<header id="title-block-header" class="quarto-title-block default"><nav class="quarto-page-breadcrumbs quarto-title-breadcrumbs d-none d-lg-block" aria-label="breadcrumb"><ol class="breadcrumb"><li class="breadcrumb-item"><a href="../chapters/08-onboarding-an-agent.html">Working with Crystalline</a></li><li class="breadcrumb-item"><a href="../chapters/12-evolving.html"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Evolving</span></a></li></ol></nav>
+<div class="quarto-title">
+<h1 class="title"><span id="sec-evolving" class="quarto-section-identifier"><span class="chapter-number">12</span>&nbsp; <span class="chapter-title">Evolving</span></span></h1>
+</div>
+
+
+
+<div class="quarto-title-meta">
+
+    
+  
+    
+  </div>
+  
+
+
+</header>
+
+
+<p>When a colleague gets something wrong, you do not fire them. You say what was wrong, you point at the page that explains it, and the next time is better. Every team keeps its people’s knowledge honest that way, and it works because no one expects what a person learned in March to hold forever. Information lives. The cutoff changes, the vendor rewrites its terms, the customer’s CTO who decided in the room is replaced by one who reads. What you taught the agent in chapter 9 and handed it in chapter 10 was never set in stone. It was set in files, which is better, because a file can be corrected.</p>
+<p>Evolving is the beat that does the correcting. Chapter 3 walked it once around; this chapter works it at the pace of a real archive.</p>
+<section id="why-knowledge-needs-tending" class="level2" data-number="12.1">
+<h2 data-number="12.1" class="anchored" data-anchor-id="why-knowledge-needs-tending"><span class="header-section-number">12.1</span> Why knowledge needs tending</h2>
+<p>Nothing in an archive goes wrong dramatically. A validity window ends on a Tuesday and the engram still says stable on Wednesday. A review date on a runbook that names a person comes and goes. A replacement lands in one session and the session ends before the old engram was flipped. Somebody types a correction into Fluid on a Friday and nobody looks at it again.</p>
+<p>Then the structural kind: a link that points at a title nobody captured, a live engram citing one that has retired, a <code>supersedes</code> written on one side only, an engram nothing links to, one that grew past the point where it should have split, one that never grew past its frontmatter, a reference to an attachment whose file is gone, a file in <code>assets/</code> that no engram claims. And the redundant kind: two engrams saying nearly the same thing, two titles a link cannot tell apart, one tag spelled two ways. None of it is a mistake anyone made. It is what happens to knowledge when time passes, and it is what a colleague six months in will confidently repeat if nobody tends it.</p>
+</section>
+<section id="the-sweep" class="level2" data-number="12.2">
+<h2 data-number="12.2" class="anchored" data-anchor-id="the-sweep"><span class="header-section-number">12.2</span> The sweep</h2>
+<p>The agent asks for it with <code>evolve_engrams</code>, or you ask from a terminal with <code>crystalline evolve</code> to see what the agent would see. What comes back is a ranked queue and nothing else; the sweep is read-only, and the standing reminder at the bottom of every run says so. The queue is written for the agent to work: each finding names the engram, the evidence it fired on and the one action that clears it, with the tool that performs it. The three families are the paragraphs above in order, temporal, structure and redundancy; a run narrows to one family, one rule, one domain or a minimum priority, and <code>--today</code> evaluates the date rules as of a fixed day so a run reproduces. Tyrell’s <code>engineering</code> domain, the first Monday in October:</p>
+<pre class="text"><code>Sweep of engineering as of 2026-10-05
+41 engrams scanned, 3 findings (showing 3, page 1)
+temporal 1, structure 1, redundancy 1
+
+1. [85] V001 JUDGMENT
+   Broker migration freeze  crystalline://engineering/broker-migration-freeze
+   validity window ended 2026-09-30 but the status is still stable
+   evidence: valid_to=2026-09-30; today=2026-10-05; status=stable; inbound refs 1
+   fix: set_frontmatter valid_to=&lt;later date&gt; or status=superseded
+
+2. [50] V102 MECHANICAL
+   Retry queue drain procedure  crystalline://engineering/runbooks/retry-queue-drain-procedure
+   unresolved reference [[Edge health check]]
+   evidence: rel_type=depends_on; nothing titled `Edge health check` in engineering; nearest is `Edge health checks`
+   fix: [[Edge health check]] -&gt; [[Edge health checks]]
+
+3. [30] V203 JUDGMENT
+   crystalline://engineering
+   2 tag spellings look like one tag (plural variants)
+   evidence: #runbook used 2 time(s); #runbooks used 9 time(s)
+   fix: crystalline tags merge runbook runbooks</code></pre>
+<p>The number in brackets is the priority, how much the archive gains from clearing this one first; a finding on an engram that many others link to, or that carries a salience, is lifted, because a wrong hub does more damage than a wrong leaf. The word beside the rule id decides who acts.</p>
+</section>
+<section id="mechanical-and-judgment" class="level2" data-number="12.3">
+<h2 data-number="12.3" class="anchored" data-anchor-id="mechanical-and-judgment"><span class="header-section-number">12.3</span> Mechanical and judgment</h2>
+<p>A <em>mechanical</em> finding completes intent the archive already records. The link in item 2 points at a title that differs from a real one by a letter, and fixing it invents nothing, so the agent does the mechanical findings in one pass and reports once at the end, the way you would fix a colleague’s typo without a meeting about it.</p>
+<p>A <em>judgment</em> finding would change what the archive claims, and that wants a yes first. Item 1 asks whether the migration freeze ended or was extended, which only a person who was there can say. The agent brings it to you as a proposal with the evidence and its own reading of it, and writes only when you say yes:</p>
+<pre class="text"><code>Agent:  The broker migration freeze ran to 30 September and the
+        migration landed on the 12th. I read this as ended rather than
+        extended: retire it, close the window on the 30th, and carry
+        the "no payments deploys during a broker cutover" lesson into
+        the deploy runbook? (y / n)</code></pre>
+<p>Some judgment findings carry a rule of their own. An engram a person captured directly in Fluid is judgment class whatever else is true of it: the agent verifies the claim, aligns the tags and wires relations both ways, but proposes any change to the wording and waits, because the words are the human’s (<a href="09-teaching.html" class="quarto-xref"><span>Chapter 9</span></a>). And tag drift, item 3, comes back as a command rather than an edit, since folding a tag is a bulk rewrite the agent never does on its own: it hands you <code>crystalline tags merge runbook runbooks</code> and leaves it there. The merge rewrites the tag everywhere and records the fold under <code>## Tag Aliases</code> in the manifest, so the old spelling keeps finding what it always found and the sweep never raises the pair again.</p>
+<p>Then ask again. The second run re-derives the queue from scratch, nothing about the first was stored, so what is left is only what is still true. At Tyrell the three become one, the tag merge that waits for a terminal, and it is waiting on a person rather than on the archive. That shrinking number is the feedback loop.</p>
+<!-- TODO-0.18.0: a sweep on an overlay-mode domain covers the base plus the invoking actor's own drafts, so a draft's findings are the author's alone | source: plans/2026-08-29-overlay-domains-spec.md section 9; plans/2026-09-01-overlay-program-plan.md task 7 -->
+<p>In a domain that reviews changes before they land, chapter 13’s overlay mode, a sweep covers the reviewed folder plus the sweeper’s own drafts, so the problems in a draft are its author’s to see and nobody else’s, while a finding on the shared truth shows for everyone.</p>
+</section>
+<section id="the-page-for-people" class="level2" data-number="12.4">
+<h2 data-number="12.4" class="anchored" data-anchor-id="the-page-for-people"><span class="header-section-number">12.4</span> The page for people</h2>
+<p>Fluid’s maintenance page shows the same queue to a person (<a href="03-the-lifecycle.html#fig-maintenance" class="quarto-xref">Figure&nbsp;<span>3.2</span></a>): the stale dates, the half-finished retirements, the unreviewed human captures, ranked the same way, every finding a link to the engram it fired on. It is there for your curiosity and for a sense of how the knowledge is doing, and it is a report rather than a workbench, on purpose. The queue’s consumer is the agent, so no button on the page edits an engram. The work a finding names is the agent’s, done in the engram itself. What you do on the page is watch the list shrink. Its three buttons are about the queue rather than the knowledge: acknowledge a finding as intentional, take that back and delete an orphaned attachment. What an acknowledgment silences is never hidden: a toggle draws the silenced rows muted.</p>
+</section>
+<section id="retiring-done-right" class="level2" data-number="12.5">
+<h2 data-number="12.5" class="anchored" data-anchor-id="retiring-done-right"><span class="header-section-number">12.5</span> Retiring done right</h2>
+<p>The sweep finds retirements that were never finished, so it is worth being precise about finishing one, starting with the question chapter 3 asked: does the new fact make the old one false going forward? If the old fact was never quite true, a cutoff measured from the wrong event, it is corrected where it stands. If it was true and stopped being, the rule went away with the broker, it is superseded. Correction is a sharper measurement. Supersession is the world changing.</p>
+<p>Supersession has four steps. The replacement is written as its own engram, <code>status: stable</code>, with <code>- supersedes [[Old title]]</code> among its relations. The old engram’s status is set to <code>superseded</code> and its <code>valid_to</code> to the real date the fact stopped holding, never a guess and never a placeholder, each an <code>edit_engram</code> call with <code>set_frontmatter</code>, one lifecycle field by name. The old engram gets <code>- superseded_by [[New title]]</code>, so the graph reads the same from both ends. And any lesson worth keeping moves forward into the live engram as an observation, unbounded, because the lesson is still true even though the fact is not. Skip the second step and the sweep raises a half-finished retirement; skip the third and it raises a one-sided pair. Do all four and the sweep has nothing to say.</p>
+<p>Not every retirement has a successor. A practice that was simply abandoned gets the status that fits, <code>deprecated</code> for do-not-do-this-again, <code>archived</code> for kept-for-the-record, <code>legacy</code> for still-true-of-the-old-installation, the window closed when the date is known and the lesson carried into a live engram.</p>
+<p>The old engram does not fade out of the photograph the way Marty’s siblings did. It stays in every search, dated, softly below the current one, and the next time somebody asks why an old dashboard still says twenty-four hours it is the whole answer, with the date the answer changed.</p>
+<div class="callout callout-style-default callout-note callout-titled" title="In practice">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>In practice
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>In October Weyland-Yutani replaces its CTO. Vickers, who skimmed decks and decided in the room, leaves for a board seat, and Bishop, who reads everything sent in advance and decides nothing live, takes the chair. After the first meeting with him Deckard hands his agent the notes the way he handed it the first three: learn how this one decides. The agent derives the new pattern, materials in advance and a decision by email a day later, and then does something Deckard did not ask for. It recognizes that “Weyland-Yutani CTO: one-pagers, decides live” was true and has stopped being, and proposes a supersession rather than an edit: a new engram for Bishop’s pattern with <code>supersedes</code> pointing back, the old one flipped to <code>superseded</code> with a <code>valid_to</code> of the day Vickers left, and one lesson carried forward, unbounded: the pattern belongs to the person, so learn the new decision-maker before the first meeting. Deckard says yes. The Q2 notes stay attached to the retired engram, still its provenance.</p>
+<p>A month later the sweep raises the settlement-batch engram in <code>clients</code>, which carries a <code>relates_to</code> of its own back to the Vickers engram: a live reference to retired knowledge. The agent proposes repointing it at the Bishop engram. Deckard says no: the batch was scoped in one of Vickers’ meetings, and the citation is history rather than guidance. The agent acknowledges the finding on the engram with a note, “lineage citation, keep”, and the sweep stops raising it while the citation and the retirement both stand.</p>
+</div>
+</div>
+</section>
+<section id="verification-and-acknowledgments" class="level2" data-number="12.6">
+<h2 data-number="12.6" class="anchored" data-anchor-id="verification-and-acknowledgments"><span class="header-section-number">12.6</span> Verification and acknowledgments</h2>
+<p>Some findings are answered with a field rather than an edit, and telling the two fields apart keeps the archive honest. A re-check that finds a fact still true is recorded with <code>verified</code>: <code>edit_engram</code> with <code>set_frontmatter</code> and that key stamps who checked and when. It never removes; there is one entry per verifier, refreshed each time that person re-checks. A <code>stale_after</code> pushed to a later date says the same thing with a deadline attached, and the sweep prefers one, since an old engram with no review date and no verification is one it will start asking about on age alone.</p>
+<p>An acknowledgment says something different: this finding is intentional. The key <code>evolve_ack</code> with a value naming the rule and an optional note, <code>V101 lineage citation, keep</code>, records that the person ruled on it. The server records what evidence the finding fired on, so the acknowledgment holds exactly as long as that evidence does and comes back marked stale when the evidence changes. Every run reports how many findings acknowledgments suppressed, <code>include_acknowledged</code> shows them with the note on each, and the value <code>remove V101</code> takes one back. Acknowledge only what the person actually ruled on. The sweep is only as trustworthy as the decisions it was told to respect.</p>
+</section>
+<section id="when-to-sweep" class="level2" data-number="12.7">
+<h2 data-number="12.7" class="anchored" data-anchor-id="when-to-sweep"><span class="header-section-number">12.7</span> When to sweep</h2>
+<p>The sweep is event-driven maintenance, never a session-start ritual. The events that call for it are a large ingest that lands a dozen engrams at once and two search hits that disagree when a half-finished retirement is the likely reason. The third is the calendar: the turn of a month, the first session being the playbook’s suggestion. The reminder at the end of a session helps with the last: when maintenance is due, chapter 8’s stop hook adds a paragraph asking the agent to call <code>evolve_engrams</code> and work the queue, mechanical findings directly, judgment findings one at a time with a yes.</p>
+<div class="callout callout-style-default callout-tip callout-titled" title="Under the hood">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Tip</span>Under the hood
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>The sweep reads dates, links and graph shape, and chapter 3 was honest about what that excludes. The rule for old, never-verified knowledge is capped per run, oldest first, so an archive that has never been swept is asked about in instalments. And an acknowledgment lives in the engram’s own frontmatter, beside the scope the server recorded for it, so it travels with the file and survives a rebuild of the index, which stores nothing about a sweep between runs.</p>
+</div>
+</div>
+<p>A colleague who is corrected gets better. A colleague who is never corrected gets confident. The sweep is how you keep telling the difference.</p>
+<div class="callout callout-style-default callout-note callout-titled" title="In brief">
+<div class="callout-header d-flex align-content-center">
+<div class="callout-icon-container">
+<i class="callout-icon"></i>
+</div>
+<div class="callout-title-container flex-fill">
+<span class="screen-reader-only">Note</span>In brief
+</div>
+</div>
+<div class="callout-body-container callout-body">
+<p>Knowledge drifts rather than breaks: windows lapse, review dates pass, replacements land without the retirement being finished, captures go unreviewed, links dangle, tags fork. The sweep, <code>crystalline evolve</code> or <code>evolve_engrams</code>, returns a read-only ranked queue in three families, each finding naming the engram, the evidence and the one action; the agent completes mechanical findings in a pass and proposes judgment findings one at a time, and Fluid’s maintenance page shows a person the same queue, for a look at the state of things rather than for working it. Retire by superseding: a new engram with <code>supersedes</code>, the old one set to <code>superseded</code> with a real <code>valid_to</code> and a <code>superseded_by</code>, and the lesson carried forward; correct in place only when the old fact was never true. A re-check is a <code>verified</code> stamp or a later <code>stale_after</code>; an intentional finding is an <code>evolve_ack</code> naming the rule, which holds while its evidence holds. Sweep after an ingest, when hits disagree and on a cadence, and stop when the number stops falling.</p>
+</div>
+</div>
+
+
+</section>
+
+</main> <!-- /main -->
+<!-- The colophon's icon notes: fit the squares of icons to the paragraphs
+     beside them. theme/crystalline.scss sizes each square to three lines
+     without this. Every note gets the same square, the tallest paragraph's,
+     and the loop repeats until the text stops reflowing under the change. -->
+<script>
+(function () {
+  function fit() {
+    var notes = Array.prototype.slice.call(document.querySelectorAll(".icon-note"));
+    var pairs = [];
+    notes.forEach(function (note) {
+      var tile = note.querySelector("p:first-child");
+      var text = note.querySelector("p:last-child");
+      if (tile && text && tile !== text) pairs.push([tile, text]);
+    });
+    if (!pairs.length) return;
+    pairs.forEach(function (p) { p[0].style.height = p[0].style.width = ""; });
+    // On a narrow screen a wider square narrows the text, which grows
+    // taller, which widens the square: cap it at a third of the note.
+    var cap = Math.round(notes[0].getBoundingClientRect().width / 3);
+    var last = 0;
+    for (var i = 0; i < 6; i++) {
+      var h = 0;
+      pairs.forEach(function (p) {
+        h = Math.max(h, Math.round(p[1].getBoundingClientRect().height));
+      });
+      h = Math.min(h, cap);
+      if (h === last) break;
+      pairs.forEach(function (p) { p[0].style.height = p[0].style.width = h + "px"; });
+      last = h;
+    }
+  }
+  window.addEventListener("load", fit);
+  window.addEventListener("resize", fit);
+})();
+</script>
+<script id="quarto-html-after-body" type="application/javascript">
+  window.document.addEventListener("DOMContentLoaded", function (event) {
+    // Ensure there is a toggle, if there isn't float one in the top right
+    if (window.document.querySelector('.quarto-color-scheme-toggle') === null) {
+      const a = window.document.createElement('a');
+      a.classList.add('top-right');
+      a.classList.add('quarto-color-scheme-toggle');
+      a.href = "";
+      a.onclick = function() { try { window.quartoToggleColorScheme(); } catch {} return false; };
+      const i = window.document.createElement("i");
+      i.classList.add('bi');
+      a.appendChild(i);
+      window.document.body.appendChild(a);
+    }
+    setColorSchemeToggle(hasAlternateSentinel())
+    const icon = "";
+    const anchorJS = new window.AnchorJS();
+    anchorJS.options = {
+      placement: 'right',
+      icon: icon
+    };
+    anchorJS.add('.anchored');
+    const isCodeAnnotation = (el) => {
+      for (const clz of el.classList) {
+        if (clz.startsWith('code-annotation-')) {                     
+          return true;
+        }
+      }
+      return false;
+    }
+    const onCopySuccess = function(e) {
+      // button target
+      const button = e.trigger;
+      // don't keep focus
+      button.blur();
+      // flash "checked"
+      button.classList.add('code-copy-button-checked');
+      var currentTitle = button.getAttribute("title");
+      button.setAttribute("title", "Copied!");
+      let tooltip;
+      if (window.bootstrap) {
+        button.setAttribute("data-bs-toggle", "tooltip");
+        button.setAttribute("data-bs-placement", "left");
+        button.setAttribute("data-bs-title", "Copied!");
+        tooltip = new bootstrap.Tooltip(button, 
+          { trigger: "manual", 
+            customClass: "code-copy-button-tooltip",
+            offset: [0, -8]});
+        tooltip.show();    
+      }
+      setTimeout(function() {
+        if (tooltip) {
+          tooltip.hide();
+          button.removeAttribute("data-bs-title");
+          button.removeAttribute("data-bs-toggle");
+          button.removeAttribute("data-bs-placement");
+        }
+        button.setAttribute("title", currentTitle);
+        button.classList.remove('code-copy-button-checked');
+      }, 1000);
+      // clear code selection
+      e.clearSelection();
+    }
+    const getTextToCopy = function(trigger) {
+      const outerScaffold = trigger.parentElement.cloneNode(true);
+      const codeEl = outerScaffold.querySelector('code');
+      for (const childEl of codeEl.children) {
+        if (isCodeAnnotation(childEl)) {
+          childEl.remove();
+        }
+      }
+      return codeEl.innerText;
+    }
+    const clipboard = new window.ClipboardJS('.code-copy-button:not([data-in-quarto-modal])', {
+      text: getTextToCopy
+    });
+    clipboard.on('success', onCopySuccess);
+    if (window.document.getElementById('quarto-embedded-source-code-modal')) {
+      const clipboardModal = new window.ClipboardJS('.code-copy-button[data-in-quarto-modal]', {
+        text: getTextToCopy,
+        container: window.document.getElementById('quarto-embedded-source-code-modal')
+      });
+      clipboardModal.on('success', onCopySuccess);
+    }
+      var localhostRegex = new RegExp(/^(?:http|https):\/\/localhost\:?[0-9]*\//);
+      var mailtoRegex = new RegExp(/^mailto:/);
+        var filterRegex = new RegExp('/' + window.location.host + '/');
+      var isInternal = (href) => {
+          return filterRegex.test(href) || localhostRegex.test(href) || mailtoRegex.test(href);
+      }
+      // Inspect non-navigation links and adorn them if external
+     var links = window.document.querySelectorAll('a[href]:not(.nav-link):not(.navbar-brand):not(.toc-action):not(.sidebar-link):not(.sidebar-item-toggle):not(.pagination-link):not(.no-external):not([aria-hidden]):not(.dropdown-item):not(.quarto-navigation-tool):not(.about-link)');
+      for (var i=0; i<links.length; i++) {
+        const link = links[i];
+        if (!isInternal(link.href)) {
+          // undo the damage that might have been done by quarto-nav.js in the case of
+          // links that we want to consider external
+          if (link.dataset.originalHref !== undefined) {
+            link.href = link.dataset.originalHref;
+          }
+        }
+      }
+    function tippyHover(el, contentFn, onTriggerFn, onUntriggerFn) {
+      const config = {
+        allowHTML: true,
+        maxWidth: 500,
+        delay: 100,
+        arrow: false,
+        appendTo: function(el) {
+            return el.parentElement;
+        },
+        interactive: true,
+        interactiveBorder: 10,
+        theme: 'quarto',
+        placement: 'bottom-start',
+      };
+      if (contentFn) {
+        config.content = contentFn;
+      }
+      if (onTriggerFn) {
+        config.onTrigger = onTriggerFn;
+      }
+      if (onUntriggerFn) {
+        config.onUntrigger = onUntriggerFn;
+      }
+      window.tippy(el, config); 
+    }
+    const noterefs = window.document.querySelectorAll('a[role="doc-noteref"]');
+    for (var i=0; i<noterefs.length; i++) {
+      const ref = noterefs[i];
+      tippyHover(ref, function() {
+        // use id or data attribute instead here
+        let href = ref.getAttribute('data-footnote-href') || ref.getAttribute('href');
+        try { href = new URL(href).hash; } catch {}
+        const id = href.replace(/^#\/?/, "");
+        const note = window.document.getElementById(id);
+        if (note) {
+          return note.innerHTML;
+        } else {
+          return "";
+        }
+      });
+    }
+    const xrefs = window.document.querySelectorAll('a.quarto-xref');
+    const processXRef = (id, note) => {
+      // Strip column container classes
+      const stripColumnClz = (el) => {
+        el.classList.remove("page-full", "page-columns");
+        if (el.children) {
+          for (const child of el.children) {
+            stripColumnClz(child);
+          }
+        }
+      }
+      stripColumnClz(note)
+      if (id === null || id.startsWith('sec-')) {
+        // Special case sections, only their first couple elements
+        const container = document.createElement("div");
+        if (note.children && note.children.length > 2) {
+          container.appendChild(note.children[0].cloneNode(true));
+          for (let i = 1; i < note.children.length; i++) {
+            const child = note.children[i];
+            if (child.tagName === "P" && child.innerText === "") {
+              continue;
+            } else {
+              container.appendChild(child.cloneNode(true));
+              break;
+            }
+          }
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(container);
+          }
+          return container.innerHTML
+        } else {
+          if (window.Quarto?.typesetMath) {
+            window.Quarto.typesetMath(note);
+          }
+          return note.innerHTML;
+        }
+      } else {
+        // Remove any anchor links if they are present
+        const anchorLink = note.querySelector('a.anchorjs-link');
+        if (anchorLink) {
+          anchorLink.remove();
+        }
+        if (window.Quarto?.typesetMath) {
+          window.Quarto.typesetMath(note);
+        }
+        if (note.classList.contains("callout")) {
+          return note.outerHTML;
+        } else {
+          return note.innerHTML;
+        }
+      }
+    }
+    for (var i=0; i<xrefs.length; i++) {
+      const xref = xrefs[i];
+      tippyHover(xref, undefined, function(instance) {
+        instance.disable();
+        let url = xref.getAttribute('href');
+        let hash = undefined; 
+        if (url.startsWith('#')) {
+          hash = url;
+        } else {
+          try { hash = new URL(url).hash; } catch {}
+        }
+        if (hash) {
+          const id = hash.replace(/^#\/?/, "");
+          const note = window.document.getElementById(id);
+          if (note !== null) {
+            try {
+              const html = processXRef(id, note.cloneNode(true));
+              instance.setContent(html);
+            } finally {
+              instance.enable();
+              instance.show();
+            }
+          } else {
+            // See if we can fetch this
+            fetch(url.split('#')[0])
+            .then(res => res.text())
+            .then(html => {
+              const parser = new DOMParser();
+              const htmlDoc = parser.parseFromString(html, "text/html");
+              const note = htmlDoc.getElementById(id);
+              if (note !== null) {
+                const html = processXRef(id, note);
+                instance.setContent(html);
+              } 
+            }).finally(() => {
+              instance.enable();
+              instance.show();
+            });
+          }
+        } else {
+          // See if we can fetch a full url (with no hash to target)
+          // This is a special case and we should probably do some content thinning / targeting
+          fetch(url)
+          .then(res => res.text())
+          .then(html => {
+            const parser = new DOMParser();
+            const htmlDoc = parser.parseFromString(html, "text/html");
+            const note = htmlDoc.querySelector('main.content');
+            if (note !== null) {
+              // This should only happen for chapter cross references
+              // (since there is no id in the URL)
+              // remove the first header
+              if (note.children.length > 0 && note.children[0].tagName === "HEADER") {
+                note.children[0].remove();
+              }
+              const html = processXRef(null, note);
+              instance.setContent(html);
+            } 
+          }).finally(() => {
+            instance.enable();
+            instance.show();
+          });
+        }
+      }, function(instance) {
+      });
+    }
+        let selectedAnnoteEl;
+        const selectorForAnnotation = ( cell, annotation) => {
+          let cellAttr = 'data-code-cell="' + cell + '"';
+          let lineAttr = 'data-code-annotation="' +  annotation + '"';
+          const selector = 'span[' + cellAttr + '][' + lineAttr + ']';
+          return selector;
+        }
+        const selectCodeLines = (annoteEl) => {
+          const doc = window.document;
+          const targetCell = annoteEl.getAttribute("data-target-cell");
+          const targetAnnotation = annoteEl.getAttribute("data-target-annotation");
+          const annoteSpan = window.document.querySelector(selectorForAnnotation(targetCell, targetAnnotation));
+          const lines = annoteSpan.getAttribute("data-code-lines").split(",");
+          const lineIds = lines.map((line) => {
+            return targetCell + "-" + line;
+          })
+          let top = null;
+          let height = null;
+          let parent = null;
+          if (lineIds.length > 0) {
+              //compute the position of the single el (top and bottom and make a div)
+              const el = window.document.getElementById(lineIds[0]);
+              top = el.offsetTop;
+              height = el.offsetHeight;
+              parent = el.parentElement.parentElement;
+            if (lineIds.length > 1) {
+              const lastEl = window.document.getElementById(lineIds[lineIds.length - 1]);
+              const bottom = lastEl.offsetTop + lastEl.offsetHeight;
+              height = bottom - top;
+            }
+            if (top !== null && height !== null && parent !== null) {
+              // cook up a div (if necessary) and position it 
+              let div = window.document.getElementById("code-annotation-line-highlight");
+              if (div === null) {
+                div = window.document.createElement("div");
+                div.setAttribute("id", "code-annotation-line-highlight");
+                div.style.position = 'absolute';
+                parent.appendChild(div);
+              }
+              div.style.top = top - 2 + "px";
+              div.style.height = height + 4 + "px";
+              div.style.left = 0;
+              let gutterDiv = window.document.getElementById("code-annotation-line-highlight-gutter");
+              if (gutterDiv === null) {
+                gutterDiv = window.document.createElement("div");
+                gutterDiv.setAttribute("id", "code-annotation-line-highlight-gutter");
+                gutterDiv.style.position = 'absolute';
+                const codeCell = window.document.getElementById(targetCell);
+                const gutter = codeCell.querySelector('.code-annotation-gutter');
+                gutter.appendChild(gutterDiv);
+              }
+              gutterDiv.style.top = top - 2 + "px";
+              gutterDiv.style.height = height + 4 + "px";
+            }
+            selectedAnnoteEl = annoteEl;
+          }
+        };
+        const unselectCodeLines = () => {
+          const elementsIds = ["code-annotation-line-highlight", "code-annotation-line-highlight-gutter"];
+          elementsIds.forEach((elId) => {
+            const div = window.document.getElementById(elId);
+            if (div) {
+              div.remove();
+            }
+          });
+          selectedAnnoteEl = undefined;
+        };
+          // Handle positioning of the toggle
+      window.addEventListener(
+        "resize",
+        throttle(() => {
+          elRect = undefined;
+          if (selectedAnnoteEl) {
+            selectCodeLines(selectedAnnoteEl);
+          }
+        }, 10)
+      );
+      function throttle(fn, ms) {
+      let throttle = false;
+      let timer;
+        return (...args) => {
+          if(!throttle) { // first call gets through
+              fn.apply(this, args);
+              throttle = true;
+          } else { // all the others get throttled
+              if(timer) clearTimeout(timer); // cancel #2
+              timer = setTimeout(() => {
+                fn.apply(this, args);
+                timer = throttle = false;
+              }, ms);
+          }
+        };
+      }
+        // Attach click handler to the DT
+        const annoteDls = window.document.querySelectorAll('dt[data-target-cell]');
+        for (const annoteDlNode of annoteDls) {
+          annoteDlNode.addEventListener('click', (event) => {
+            const clickedEl = event.target;
+            if (clickedEl !== selectedAnnoteEl) {
+              unselectCodeLines();
+              const activeEl = window.document.querySelector('dt[data-target-cell].code-annotation-active');
+              if (activeEl) {
+                activeEl.classList.remove('code-annotation-active');
+              }
+              selectCodeLines(clickedEl);
+              clickedEl.classList.add('code-annotation-active');
+            } else {
+              // Unselect the line
+              unselectCodeLines();
+              clickedEl.classList.remove('code-annotation-active');
+            }
+          });
+        }
+    const findCites = (el) => {
+      const parentEl = el.parentElement;
+      if (parentEl) {
+        const cites = parentEl.dataset.cites;
+        if (cites) {
+          return {
+            el,
+            cites: cites.split(' ')
+          };
+        } else {
+          return findCites(el.parentElement)
+        }
+      } else {
+        return undefined;
+      }
+    };
+    var bibliorefs = window.document.querySelectorAll('a[role="doc-biblioref"]');
+    for (var i=0; i<bibliorefs.length; i++) {
+      const ref = bibliorefs[i];
+      const citeInfo = findCites(ref);
+      if (citeInfo) {
+        tippyHover(citeInfo.el, function() {
+          var popup = window.document.createElement('div');
+          citeInfo.cites.forEach(function(cite) {
+            var citeDiv = window.document.createElement('div');
+            citeDiv.classList.add('hanging-indent');
+            citeDiv.classList.add('csl-entry');
+            var biblioDiv = window.document.getElementById('ref-' + cite);
+            if (biblioDiv) {
+              citeDiv.innerHTML = biblioDiv.innerHTML;
+            }
+            popup.appendChild(citeDiv);
+          });
+          return popup.innerHTML;
+        });
+      }
+    }
+  });
+  </script>
+<nav class="page-navigation">
+  <div class="nav-page nav-page-previous">
+      <a href="../chapters/11-finding.html" class="pagination-link" aria-label="Finding">
+        <i class="bi bi-arrow-left-short"></i> <span class="nav-page-text"><span class="chapter-number">11</span>&nbsp; <span class="chapter-title">Finding</span></span>
+      </a>          
+  </div>
+  <div class="nav-page nav-page-next">
+      <a href="../chapters/13-sharing-with-a-team.html" class="pagination-link" aria-label="Sharing with a team">
+        <span class="nav-page-text"><span class="chapter-number">13</span>&nbsp; <span class="chapter-title">Sharing with a team</span></span> <i class="bi bi-arrow-right-short"></i>
+      </a>
+  </div>
+</nav>
+</div> <!-- /content -->
+
+
+
+
+</body></html>

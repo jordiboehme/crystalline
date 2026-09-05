@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 470" width="720" height="470" role="img" aria-labelledby="sharing-title sharing-desc">
+  <title id="sharing-title">One shared instance in overlay mode</title>
+  <desc id="sharing-desc">The shared-instance panel from chapter 7, now holding a stack of private overlays, one per actor, above the domain folder, which is labelled always equals reviewed truth and changed only by pull. Agents and people enter from the left and write into the overlays; a double-headed arrow between the overlays and the folder says a read is the folder plus your own drafts. On the right the team repository on GitHub receives a share from the overlays as a pull request, and an arrow labelled merged, pulled returns from the repository into the folder.</desc>
+
+  <!-- TODO-0.18.0: the labels assert per-actor private overlays above a folder that changes only by pull, reads of the folder plus one's own drafts, and shares as exact drafts | source: plans/2026-08-29-overlay-domains-spec.md sections 2, 5 and 7 -->
+
+  <defs>
+    <marker id="crys-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c5eb5"/>
+    </marker>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="0.5" y="0.5" width="719" height="469" rx="12" ry="12"
+        fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+
+  <g font-family="Avenir Next, Segoe UI, system-ui, sans-serif"
+     stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- The shared instance: one daemon on the team's server, in overlay mode -->
+    <g>
+      <rect x="272" y="40" width="300" height="330" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="422" y="70" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">ONE SHARED INSTANCE</text>
+      <text x="422" y="90" text-anchor="middle" font-size="14" fill="#57606a">the daemon; the domain in overlay mode</text>
+    </g>
+
+    <!-- The private overlays, stacked: one layer per actor -->
+    <g>
+      <rect x="308" y="112" width="244" height="100" rx="8" ry="8"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <rect x="300" y="124" width="244" height="100" rx="8" ry="8"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <rect x="292" y="136" width="244" height="100" rx="8" ry="8"
+            fill="#ffffff" stroke="none"/>
+      <rect x="292" y="136" width="244" height="100" rx="8" ry="8"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <text x="414" y="162" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">private overlays</text>
+      <text x="414" y="181" text-anchor="middle" font-size="12" fill="#57606a">one layer per actor: your drafts</text>
+      <text x="414" y="200" text-anchor="middle" font-size="12" fill="#57606a">invisible to everyone else</text>
+      <text x="414" y="219" text-anchor="middle" font-size="12" fill="#57606a">the owner sees counts, never content</text>
+    </g>
+
+    <!-- A read is the folder plus your own drafts -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-start="url(#crys-arrow)" marker-end="url(#crys-arrow)">
+      <path d="M 340 237 L 340 395"/>
+    </g>
+    <text x="356" y="306" font-size="12" fill="#57606a">a read: the folder</text>
+    <text x="356" y="322" font-size="12" fill="#57606a">plus your own drafts</text>
+
+    <!-- Base: the domain folder, reviewed truth -->
+    <g>
+      <rect x="272" y="396" width="300" height="56" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="422" y="420" text-anchor="middle" font-size="14" font-weight="600" fill="#352879">the domain folder, on disk</text>
+      <text x="422" y="439" text-anchor="middle" font-size="12" fill="#57606a">equals reviewed truth; changed only by pull</text>
+    </g>
+
+    <!-- Who writes, and how -->
+    <g>
+      <rect x="24" y="112" width="120" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="84" y="138" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">agents</text>
+      <text x="84" y="157" text-anchor="middle" font-size="12" fill="#57606a">MCP, as their user</text>
+
+      <rect x="24" y="196" width="120" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="84" y="222" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">people</text>
+      <text x="84" y="241" text-anchor="middle" font-size="12" fill="#57606a">browser, signed in</text>
+    </g>
+
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 144 142 L 292 150"/>
+      <path d="M 144 226 L 292 222"/>
+    </g>
+    <text x="218" y="178" text-anchor="middle" font-size="12" fill="#57606a">every write lands</text>
+    <text x="218" y="194" text-anchor="middle" font-size="12" fill="#57606a">in the writer's draft</text>
+
+    <!-- The team repository on GitHub: proposals out, merged pulls back -->
+    <g>
+      <rect x="584" y="140" width="112" height="72" rx="8" ry="8"
+            fill="#70a4b2" fill-opacity="0.12" stroke="#70a4b2" stroke-width="1.5"/>
+      <text x="640" y="164" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">team repo</text>
+      <text x="640" y="182" text-anchor="middle" font-size="12" fill="#57606a">on GitHub</text>
+      <text x="640" y="198" text-anchor="middle" font-size="12" fill="#57606a">a person reviews</text>
+    </g>
+
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 552 176 L 584 176"/>
+    </g>
+    <text x="640" y="114" text-anchor="middle" font-size="12" fill="#57606a">share:</text>
+    <text x="640" y="130" text-anchor="middle" font-size="12" fill="#57606a">a pull request</text>
+
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 640 212 L 640 424 L 572 424"/>
+    </g>
+    <text x="648" y="312" font-size="12" fill="#57606a">merged,</text>
+    <text x="648" y="328" font-size="12" fill="#57606a">pulled</text>
+  </g>
+</svg>
