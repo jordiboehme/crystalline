@@ -353,6 +353,24 @@ describe("the admin client layer", () => {
     expect(receipt).toEqual({ filesKept: true, roomsClosed: 2 });
   });
 
+  it("carries the purge confirmation when one was collected", async () => {
+    apiMock.mockResolvedValueOnce({
+      domain: "mind",
+      files_kept: false,
+      rooms_closed: 0,
+    });
+    const receipt = await unregisterDomain("mind", true);
+
+    // The server refuses a virtual domain's removal without this, because the
+    // engrams are the database's and go with it. The flag is the confirmation
+    // this app already collected, on the wire.
+    expect(apiMock).toHaveBeenLastCalledWith(
+      "/domains/mind?purge=true",
+      expect.objectContaining({ method: "DELETE" }),
+    );
+    expect(receipt).toEqual({ filesKept: false, roomsClosed: 0 });
+  });
+
   it("counts a sync report's lists as well as its numbers", async () => {
     apiMock.mockResolvedValueOnce({
       domain: "eng",

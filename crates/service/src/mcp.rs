@@ -1969,9 +1969,16 @@ impl McpServer {
         Parameters(p): Parameters<AddDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
-        // Registering a domain changes what this instance is, so it is gated
-        // before anything is validated: an agent that may not create one is
-        // told so rather than told its arguments were wrong.
+        // Read-only first, matching `configure` and `remove_domain`: on an
+        // instance where nobody may register a domain, "this instance is
+        // read-only" is the more useful of the two true answers, and it is the
+        // one that does not depend on who is asking.
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        // Then the role: registering a domain changes what this instance is, so
+        // it is gated before anything is validated - an agent that may not
+        // create one is told so rather than told its arguments were wrong.
         if let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
             return refuse(refusal);
         }
@@ -2063,20 +2070,24 @@ impl McpServer {
             return Err(to_error(EngineError::ReadOnly));
         }
         let scope = self.scope_of(&ctx);
-        // The preview carries the gate: a domain this caller may not see is
-        // refused as an unregistered one, a caller who may see it and may not
-        // end it is told who can, and an environment-defined domain raises its
-        // conflict here. All three come before the question, for the reason
+        // The preview raises every refusal the removal itself would raise, in
+        // the same order: a domain this caller may not see is refused as an
+        // unregistered one, a caller who may see it and may not end it is told
+        // who can, an environment-defined domain raises its conflict, and a
+        // virtual domain holding engrams is refused until `purge` says the loss
+        // was intended. All of them come before the question, for the reason
         // `delete_engram` states: never ask about an action that would refuse
-        // anyway. `Engine::unregister_domain` re-checks the same gate under
-        // its own lock, which is where the decision actually has to hold.
-        let preview = match self.engine.domain_remove_preview(&p.domain, &scope).await {
+        // anyway. `Engine::unregister_domain` decides all four again inside the
+        // domain-admin lock, which is where they actually have to hold, so this
+        // round is advisory and the engine is the authority.
+        let preview = match self
+            .engine
+            .domain_remove_preview(&p.domain, &scope, p.purge)
+            .await
+        {
             Ok(preview) => preview,
             Err(e) => return refusal_or_error(e),
         };
-        if preview["kind"] == json!("virtual") && !p.purge {
-            return refuse(purge_refusal(&p.domain)).map(CallToolResponse::from);
-        }
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
                 None => {
@@ -2093,7 +2104,11 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        match self.engine.unregister_domain(&p.domain, &scope).await {
+        match self
+            .engine
+            .unregister_domain(&p.domain, &scope, p.purge)
+            .await
+        {
             Ok(report) => ok(report).map(CallToolResponse::from),
             Err(e) => refusal_or_error(e),
         }
@@ -3517,20 +3532,6 @@ fn delete_question(preview: &Value) -> String {
 /// user what to ask for.
 const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it and its settings - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
 
-/// What `remove_domain` says when a virtual domain is named without `purge`.
-///
-/// The one kind of domain where unregistering is destructive, and the refusal
-/// has to say so in the words an agent will relay: the rows ARE the knowledge,
-/// nothing on disk survives, and the way through is a deliberate second call.
-fn purge_refusal(domain: &str) -> String {
-    format!(
-        "Domain '{domain}' is a virtual domain: its engrams live in the database, so unregistering \
-         it DELETES that knowledge and nothing on disk is left to re-adopt. Export or share what is \
-         worth keeping first, then call remove_domain again with purge: true to confirm the loss. \
-         A file domain needs no purge: its files are never touched."
-    )
-}
-
 /// The sentence `remove_domain` asks before it acts, rendered from
 /// [`crate::engine::Engine::domain_remove_preview`].
 ///
@@ -3550,11 +3551,22 @@ fn remove_domain_question(preview: &Value) -> String {
         // rather than an empty one; saying so beats claiming a count.
         None => String::new(),
     };
-    let consequence = if kind == "virtual" {
-        "Its engrams live in the database, so they are deleted with it and this cannot be undone."
-    } else {
-        "Its files stay on disk exactly as they are, so adding the folder again re-adopts them; \
-         the registration and the search index rows go."
+    let consequence = match kind {
+        "virtual" => {
+            "Its engrams live in the database, so they are deleted with it and this cannot be \
+             undone."
+        }
+        // Never "add the folder again": that registers a plain local domain and
+        // drops the origin, the base commit and the team connection.
+        "team" => {
+            "Its local folder stays on disk exactly as it is and the GitHub repository is never \
+             touched, so nothing is removed for the rest of the team; reconnecting it is \
+             add_domain with the repository, not with the folder."
+        }
+        _ => {
+            "Its files stay on disk exactly as they are, so adding the folder again re-adopts \
+             them; the registration and the search index rows go."
+        }
     };
     format!("Unregister the {kind} domain '{domain}'{held}? {consequence}")
 }
@@ -4055,12 +4067,17 @@ fn refuse(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
 /// only about something the caller can already see, and its whole content is
 /// teaching text naming who can - the skills tell an agent to relay exactly
 /// that rather than retry - so it goes back as a tool error the client renders,
-/// for the reason [`refuse`] states. Everything else keeps [`to_error`]'s
+/// for the reason [`refuse`] states. [`EngineError::ConfirmationRequired`] is
+/// there for the same reason and a stronger one: its whole content is the flag
+/// that would let the call through, so a model that cannot read it cannot
+/// complete the task it was given. Everything else keeps [`to_error`]'s
 /// protocol shape, and the not-found in particular must: its bytes are what a
 /// hidden domain is answered with, and the two have to stay identical.
 fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
     match e {
-        EngineError::Forbidden(text) => refuse(text).map(CallToolResponse::from),
+        EngineError::Forbidden(text) | EngineError::ConfirmationRequired(text) => {
+            refuse(text).map(CallToolResponse::from)
+        }
         other => Err(to_error(other)),
     }
 }
@@ -4078,6 +4095,7 @@ fn to_error(e: EngineError) -> ErrorData {
         // message says who is: input-class guidance, like the read-only
         // refusal above it.
         | EngineError::Forbidden(_)
+        | EngineError::ConfirmationRequired(_)
         | EngineError::EnvTokenConnect
         // The caller asked at the wrong moment rather than for the wrong
         // thing, and the message says to try again once the other sign-in is
@@ -4207,6 +4225,57 @@ mod tests {
     /// key it was asked for. Everything else that is an answer is a no, and
     /// only the genuine absence of an answer is [`None`], because that is what
     /// opens round one.
+    /// The removal question knows three kinds, and the half that differs by
+    /// kind is the RECOVERY rather than the wording.
+    ///
+    /// The team case is the one worth a test of its own: re-adding a team
+    /// domain's folder registers a plain local domain and drops the origin, so
+    /// a question that offered that recovery would be telling somebody the
+    /// wrong thing inside a destructive confirmation. It rendered as "file"
+    /// before, which is exactly the mistake this pins.
+    #[test]
+    fn the_removal_question_speaks_for_all_three_kinds() {
+        let question = |kind: &str, engrams: Value| {
+            remove_domain_question(&json!({
+                "domain": "kb",
+                "kind": kind,
+                "engrams": engrams,
+                "files_kept": kind != "virtual",
+            }))
+        };
+
+        let file = question("file", json!(4));
+        assert!(file.contains("file domain 'kb'"), "{file}");
+        assert!(file.contains("holding 4 engrams"), "{file}");
+        assert!(file.contains("adding the folder again"), "{file}");
+
+        let team = question("team", json!(1));
+        assert!(team.contains("team domain 'kb'"), "{team}");
+        assert!(team.contains("holding 1 engram"), "{team}");
+        assert!(
+            team.contains("repository is never touched"),
+            "the team's copy is safe, and the question says so: {team}"
+        );
+        assert!(
+            team.contains("with the repository, not with the folder"),
+            "and it names the recovery that actually restores a team domain: {team}"
+        );
+        assert!(
+            !team.contains("adding the folder again re-adopts"),
+            "never the local recovery, which would drop the origin: {team}"
+        );
+
+        let virt = question("virtual", json!(2));
+        assert!(virt.contains("virtual domain 'kb'"), "{virt}");
+        assert!(virt.contains("cannot be undone"), "{virt}");
+
+        // A domain the index has no row for says how much is at stake by
+        // saying nothing, rather than claiming a count of zero.
+        let unknown = question("file", Value::Null);
+        assert!(unknown.contains("domain 'kb'?"), "{unknown}");
+        assert!(!unknown.contains("holding"), "{unknown}");
+    }
+
     #[test]
     fn confirmed_says_yes_to_one_shape_and_no_to_every_other() {
         let yes = [json!({ "action": "accept", "content": { "confirm": true } })];

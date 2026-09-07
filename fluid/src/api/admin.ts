@@ -334,12 +334,23 @@ export interface UnregisterReceipt {
   roomsClosed: number;
 }
 
-/** Unregister a domain. Files on disk are never touched. */
+/**
+ * Unregister a domain. Files on disk are never touched.
+ *
+ * `purge` confirms the one case where something IS deleted: a virtual domain's
+ * engrams live in the database and go with it, and the server refuses that
+ * removal (409) unless the request says the loss was intended. The rule is the
+ * engine's rather than this client's - the same route now serves a private
+ * domain's owner, not only an admin - so this passes what the confirmation
+ * collected instead of deciding anything.
+ */
 export async function unregisterDomain(
   name: string,
+  purge = false,
 ): Promise<UnregisterReceipt> {
+  const query = purge ? "?purge=true" : "";
   const report = asObject(
-    await api<unknown>(`/domains/${encodeSegment(name)}`, {
+    await api<unknown>(`/domains/${encodeSegment(name)}${query}`, {
       method: "DELETE",
     }),
   );

@@ -15,7 +15,7 @@ use serde_json::{Map, Value};
 
 use super::auth::Identity;
 use super::{
-    ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only,
+    ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
     require_domain_read, require_domain_write,
 };
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
@@ -433,6 +433,24 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
     }
 }
 
+/// The query string `DELETE /domains/{domain}` takes.
+///
+/// One flag, and it exists because this route's principal set widened: it used
+/// to be admin-only, and the whole "a virtual domain's engrams go with it"
+/// story could be left to whichever client drew the confirmation. A private
+/// domain's owner reaches it now, so the rule lives in the engine and this is
+/// how a client says the loss was confirmed. Inert on a file or team domain,
+/// whose files a removal never touches.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RemoveQuery {
+    /// Confirm that a virtual domain's engrams are to be deleted with it.
+    /// Required for a virtual domain that holds any; ignored otherwise.
+    #[serde(default)]
+    #[param(example = true)]
+    purge: bool,
+}
+
 /// `DELETE /domains/{domain}` - unregister a domain: the registration and the
 /// index rows go, the files do not.
 ///
@@ -462,11 +480,15 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
                    go; a file domain's files stay exactly where they are \
                    (re-adding the folder adopts them again), which is what \
                    `files_kept` reports. A virtual domain has no files, so \
-                   `files_kept` is false and its knowledge is gone - a client \
-                   must confirm that difference in words. Any open \
-                   co-editing rooms in the domain are saved and closed first; \
-                   `rooms_closed` counts them.",
-    params(("domain" = String, Path, description = "The registered domain.")),
+                   `files_kept` is false and its engrams are DELETED with it: \
+                   that case is refused 409 unless the request carries \
+                   `?purge=true`, so a client confirms the loss in words \
+                   before it sends. Any open co-editing rooms in the domain \
+                   are saved and closed first; `rooms_closed` counts them.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        RemoveQuery,
+    ),
     responses(
         (
             status = 200,
@@ -506,7 +528,9 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
         (
             status = 409,
             description = "The domain is defined by an environment variable, \
-                           which owns it: unset the variable instead.",
+                           which owns it (unset the variable instead), or it \
+                           is a virtual domain holding engrams and the \
+                           request did not carry `purge=true`.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -516,6 +540,7 @@ pub async fn remove(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
+    ApiQuery(query): ApiQuery<RemoveQuery>,
 ) -> Result<Json<Value>, ApiError> {
     // The role check this route used to make is gone: who may end a domain is
     // the engine's rule now, so this surface and MCP cannot answer it
@@ -526,7 +551,7 @@ pub async fn remove(
     refuse_read_only(&state)?;
     let report = state
         .engine
-        .unregister_domain(&domain, &identity.scope())
+        .unregister_domain(&domain, &identity.scope(), query.purge)
         .await
         .map_err(|e| {
             match e {

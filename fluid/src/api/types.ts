@@ -263,7 +263,7 @@ export interface paths {
         post?: never;
         /**
          * Unregister a domain. Files on disk are never touched.
-         * @description An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
+         * @description An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its engrams are DELETED with it: that case is refused 409 unless the request carries `?purge=true`, so a client confirms the loss in words before it sends. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
          */
         delete: operations["unregister_domain"];
         options?: never;
@@ -3204,7 +3204,14 @@ export interface operations {
     };
     unregister_domain: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Confirm that a virtual domain's engrams are to be deleted with it.
+                 *     Required for a virtual domain that holds any; ignored otherwise.
+                 * @example true
+                 */
+                purge?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The registered domain. */
@@ -3259,7 +3266,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The domain is defined by an environment variable, which owns it: unset the variable instead. */
+            /** @description The domain is defined by an environment variable, which owns it (unset the variable instead), or it is a virtual domain holding engrams and the request did not carry `purge=true`. */
             409: {
                 headers: {
                     [name: string]: unknown;

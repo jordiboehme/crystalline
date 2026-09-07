@@ -168,7 +168,10 @@ export default function DomainHome() {
   useRegisterCommands(commands);
 
   const unregister = useMutation({
-    mutationFn: () => unregisterDomain(domain),
+    // A virtual domain's engrams are deleted with it and the server refuses to
+    // guess that the loss was intended, so the second press is what carries
+    // `purge`: this dialog is the confirmation the flag stands for.
+    mutationFn: () => unregisterDomain(domain, summary?.kind === "virtual"),
     onSuccess: () => {
       // The listing is what every sidebar, card and switcher draws from, and
       // the domain this screen is about is no longer in it.
@@ -569,7 +572,7 @@ function UnregisterDomain({
           </button>
           <span className="text-sm text-slate-500 dark:text-slate-400">
             {kind === "virtual"
-              ? "This domain's engrams live in the database and will be removed from search; download the archive first if you need a copy."
+              ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
               : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
           </span>
         </>

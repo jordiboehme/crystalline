@@ -4216,9 +4216,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 21 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 22 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 21 are visible and on the read-only one where
+/// read-write server where all 22 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.
@@ -4726,6 +4726,26 @@ async fn remove_domain_refuses_a_virtual_domain_without_purge() {
         report["files_kept"],
         json!(false),
         "a virtual domain has no files to keep: {report}"
+    );
+
+    // The whole justification for requiring `purge` is that the rows ARE the
+    // knowledge, so the loss has to be a pinned fact rather than a claim the
+    // refusal text makes. Re-registered under the same name, the domain is
+    // empty: nothing survived the removal to be re-adopted, which is exactly
+    // what a file domain would have done.
+    call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mind", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    let found = call(peer, "search_engrams", json!({ "query": "Nowhere else" }))
+        .await
+        .unwrap();
+    assert!(
+        !found.to_string().contains("Only Copy"),
+        "the purged engrams are gone: {found}"
     );
 }
 

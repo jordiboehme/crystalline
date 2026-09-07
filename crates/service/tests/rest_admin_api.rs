@@ -1710,10 +1710,29 @@ async fn unregister_answers_with_files_kept_and_the_domain_vanishes() {
         .await
         .unwrap();
     assert_eq!(made.status(), 201);
-    let gone = as_session(
+    // And because those rows are the knowledge, the route refuses to delete
+    // them on a request that did not say so. A freshly registered virtual
+    // domain already holds its scaffolded MANIFEST, which is why even this one
+    // is refused: "holds engrams" is the test, and a virtual domain always
+    // does.
+    let unconfirmed = as_session(
         fx.addr,
         reqwest::Method::DELETE,
         "/api/v1/domains/ephemeral",
+        &admin,
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(unconfirmed.status(), 409);
+    assert!(
+        unconfirmed.text().await.unwrap().contains("purge"),
+        "the refusal names the flag that would let it through"
+    );
+    let gone = as_session(
+        fx.addr,
+        reqwest::Method::DELETE,
+        "/api/v1/domains/ephemeral?purge=true",
         &admin,
     )
     .send()

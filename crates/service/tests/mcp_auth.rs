@@ -2447,7 +2447,9 @@ async fn removing_a_hidden_domain_answers_exactly_as_removing_an_absent_one() {
         payload_of(raw)["error"]["message"]
             .as_str()
             .unwrap_or_default()
-            .replace("lab", "nowhere")
+            // The quoted name only: a bare substring swap would silently
+            // mangle the comparison the day a fixture domain contains "lab".
+            .replace("'lab'", "'nowhere'")
     };
     assert_eq!(
         message(&hidden),
@@ -2578,4 +2580,116 @@ async fn the_open_tier_still_creates_domains_and_configures() {
         configured.contains("\\\"value\\\":\\\"0.2\\\""),
         "and still changes settings:\n{configured}"
     );
+}
+
+/// **A team domain is unregistered locally and nothing of the team's is
+/// touched.**
+///
+/// The kind whose description makes the loudest promise: the local folder stays
+/// (so `files_kept` is true and the markdown is still there), the origin state
+/// this instance keeps is left alone, and the GitHub repository is never
+/// reached at all - nothing here resolves a provider, which is also what keeps
+/// this test offline. The question says "team" rather than "file", because
+/// re-adding the folder would register a plain local domain and drop the team
+/// connection, and telling somebody that inside a destructive confirmation is
+/// telling them the wrong recovery.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_team_domain_is_unregistered_and_its_repository_is_untouched() {
+    let ctx = mcp_team_ctx().await;
+    let note = ctx.path("lab", "lab-note.md");
+    let before = std::fs::read_to_string(&note).unwrap();
+    let origin_before = ctx
+        .engine
+        .domain_has_origin("lab")
+        .expect("the fixture's lab carries an origin");
+    assert!(origin_before, "the fixture must make this a team domain");
+
+    let preview = ctx
+        .engine
+        .domain_remove_preview("lab", &crystalline_service::Scope::Unrestricted, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        preview["kind"],
+        serde_json::json!("team"),
+        "a domain carrying an origin is its own kind: {preview}"
+    );
+
+    let owner = ctx.token_for("owner").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&owner)).await;
+    let removed = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        removed.contains("unregistered"),
+        "the owner's removal lands:\n{removed}"
+    );
+    assert!(
+        payload_of(&removed)["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("\"files_kept\":true"),
+        "a team domain's files are kept:\n{removed}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&note).unwrap(),
+        before,
+        "the local folder is left byte-identical: a removal deletes no file, and \
+         a team domain's is the one somebody would re-connect from"
+    );
+    assert!(
+        ctx.path("lab", "MANIFEST.md").exists(),
+        "manifest included, so the folder is still a domain to re-connect"
+    );
+}
+
+/// **A virtual domain holding engrams is not removed without `purge`, whichever
+/// surface asks**, and the refusal names the flag.
+///
+/// The rule lives in the engine rather than in one handler, because this route
+/// is reachable by a private domain's owner now, not only by an admin: a
+/// virtual domain's engrams are the rows, so the confirmation cannot be left to
+/// whichever client happens to be asking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_domain_needs_purge_over_mcp_and_the_refusal_names_it() {
+    let ctx = mcp_ctx(true).await;
+    let boss = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+    session
+        .call_tool(
+            "add_domain",
+            serde_json::json!({ "domain": "mind", "virtual": true }),
+        )
+        .await;
+    session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({ "domain": "mind", "title": "Only Copy", "content": "Nowhere else" }),
+        )
+        .await;
+
+    let refused = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "mind" }))
+        .await;
+    assert!(
+        refused.contains("purge"),
+        "the refusal names the flag:\n{refused}"
+    );
+    refusal_is_readable(&refused, "a virtual domain's purge refusal");
+    assert!(
+        still_registered(&ctx, "mind").await,
+        "and nothing was removed"
+    );
+
+    let removed = session
+        .call_tool(
+            "remove_domain",
+            serde_json::json!({ "domain": "mind", "purge": true }),
+        )
+        .await;
+    assert!(
+        removed.contains("unregistered"),
+        "with purge it lands:\n{removed}"
+    );
+    assert!(!still_registered(&ctx, "mind").await);
 }

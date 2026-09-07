@@ -755,8 +755,42 @@ describe("the domain screen", () => {
     // Nothing stays on disk here, so nothing here says it does: the engrams
     // are the database's, and the way to keep a copy is named.
     expect(within(body).getByText(/live in the database/i)).toBeVisible();
+    expect(within(body).getByText(/cannot be undone/i)).toBeVisible();
     expect(within(body).getByText(/download the archive first/i)).toBeVisible();
     expect(within(body).queryByText(/files stay on disk/i)).toBeNull();
+  });
+
+  it("sends the purge confirmation for a virtual domain and not for a file one", async () => {
+    const deletes: string[] = [];
+    const removed = (path: string) => {
+      deletes.push(path);
+      return { files_kept: false, rooms_closed: 0 };
+    };
+    serve(
+      {
+        "/domains": () => listingOf("virtual"),
+        "/domains/eng": (path, init) =>
+          init?.method === "DELETE" ? removed(path) : domainsResponse(),
+        "/activity": () => ({ timeframe: "7d", items: [] }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await userEvent.click(
+      await within(body).findByRole("button", { name: "Unregister domain" }),
+    );
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Confirm unregister" }),
+    );
+
+    // The second press IS the confirmation the server asks for, so it travels
+    // with the request rather than being re-collected server-side.
+    await waitFor(() => {
+      expect(deletes.length).toBe(1);
+    });
+    expect(deletes[0]).toContain("purge=true");
   });
 });
 

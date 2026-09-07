@@ -472,7 +472,15 @@ impl From<EngineError> for ApiError {
             // "the request is fine, the resource is busy", and a client that
             // reads 409 knows to retry once the sign-in in flight is done,
             // where a 422 would read as "your request was wrong".
-            EngineError::ConnectInProgress => ApiError::conflict(detail),
+            // And a third: the request is well formed and the caller is
+            // allowed to make it, but the resource is in a state - a virtual
+            // domain holding engrams - that this request would destroy without
+            // saying so. 409 is what a client re-sends with the flag; 403 would
+            // read as an authorization problem and 422 as a malformed request,
+            // and it is neither.
+            EngineError::ConnectInProgress | EngineError::ConfirmationRequired(_) => {
+                ApiError::conflict(detail)
+            }
             EngineError::Ambiguous(_)
             | EngineError::Conflict(_)
             | EngineError::Invalid(_)

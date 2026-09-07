@@ -1515,3 +1515,72 @@ async fn a_shared_domain_stays_admin_only_over_rest() {
     let removed = boss.delete("/api/v1/domains/open").await;
     assert_eq!(removed.status(), 200, "an admin removes it");
 }
+
+/// **A virtual domain's engrams are not deleted over the JSON API without an
+/// explicit `purge`.**
+///
+/// This route used to be admin-only, and the whole confirmation story sat in
+/// the client. It is reachable by a private domain's owner now - a non-admin
+/// principal - so the rule moved into the engine, where every surface reads it:
+/// a virtual domain holding engrams is refused until the request says `purge`,
+/// because its rows ARE the knowledge and there is no folder left to re-adopt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_domain_needs_purge_over_rest() {
+    let ctx = RestCtx::two_domains().await;
+    let boss = ctx.as_user("boss").await;
+    let created = boss
+        .post_json(
+            "/api/v1/domains",
+            json!({ "mode": "virtual", "name": "mind" }),
+        )
+        .await;
+    assert_eq!(created.status(), 201, "the virtual domain is registered");
+    // Owned by a plain instance editor, which is the principal this route only
+    // started serving in this change.
+    ctx.make_private("mind", "owner").await;
+    let owner = ctx.as_user("owner").await;
+    let written = owner
+        .post_json(
+            "/api/v1/domains/mind/engrams",
+            json!({ "title": "Only Copy", "content": "# Only Copy\n\nNowhere else.\n" }),
+        )
+        .await;
+    assert_eq!(written.status(), 201, "and it holds an engram");
+
+    let refused = owner.delete("/api/v1/domains/mind").await;
+    let status = refused.status();
+    let detail = refused.text().await.unwrap();
+    assert_eq!(
+        status, 409,
+        "a virtual domain is a conflict, not a 403: {detail}"
+    );
+    assert!(
+        detail.contains("purge"),
+        "the refusal names the flag: {detail}"
+    );
+    let still: serde_json::Value = owner.get_json("/api/v1/domains").await;
+    assert!(
+        still.to_string().contains("mind"),
+        "and nothing was removed: {still}"
+    );
+
+    let removed = owner.delete("/api/v1/domains/mind?purge=true").await;
+    let status = removed.status();
+    let body = removed.text().await.unwrap();
+    assert_eq!(status, 200, "with purge it lands: {body}");
+    assert!(body.contains("\"files_kept\":false"), "{body}");
+}
+
+/// A file domain is never affected by `purge`: its files are not deleted by a
+/// removal at all, so there is nothing to confirm and the flag is inert.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_file_domain_needs_no_purge_over_rest() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    let owner = ctx.as_user("owner").await;
+    let removed = owner.delete("/api/v1/domains/lab").await;
+    let status = removed.status();
+    let body = removed.text().await.unwrap();
+    assert_eq!(status, 200, "no purge is asked for: {body}");
+    assert!(body.contains("\"files_kept\":true"), "{body}");
+}
