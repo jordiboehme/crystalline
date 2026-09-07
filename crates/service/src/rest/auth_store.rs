@@ -5538,4 +5538,50 @@ mod tests {
         assert_eq!(untouched.display, "Ada L");
         assert_eq!(untouched.email.as_deref(), Some("new@example.test"));
     }
+
+    /// Two first sign-ins for one subject leave one account and one link.
+    ///
+    /// The property the single transaction buys: the loser's account insert
+    /// rolls back with its refused link, rather than staying behind as an
+    /// orphan nobody can sign into. An implementation that created the account
+    /// and linked it in two calls would pass every other test here and leave
+    /// `ada-2` behind on this one.
+    #[tokio::test]
+    async fn two_first_sign_ins_for_one_subject_leave_one_account_and_one_link() {
+        let (_dir, store) = store().await;
+        let provision = || {
+            store.provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                Some("Ada"),
+                None,
+                Role::Viewer,
+                100,
+            )
+        };
+        let outcomes = {
+            let (first, second) = tokio::join!(provision(), provision());
+            [first, second]
+        };
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "exactly one of the two races provisions"
+        );
+        let refusal = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .expect("the loser is refused");
+        assert!(
+            format!("{refusal:#}").contains("already linked"),
+            "{refusal:#}"
+        );
+        assert_eq!(
+            store.list_users().await.unwrap().len(),
+            1,
+            "the loser left no orphan account behind"
+        );
+        assert_eq!(store.identity_links("ada").await.unwrap().len(), 1);
+    }
 }
