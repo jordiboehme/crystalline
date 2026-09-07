@@ -35,7 +35,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
@@ -52,7 +52,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use super::auth::Identity;
 use super::auth_store::{Role, User};
-use super::{ApiError, ProblemDetail, RestState};
+use super::{ApiError, ApiQuery, ProblemDetail, RestState};
 
 /// The route that starts a sign-in, relative to the `/api/v1` mount.
 pub const LOGIN_PATH: &str = "/auth/oidc/login";
@@ -694,7 +694,7 @@ pub async fn login(
     identity: Identity,
     jar: CookieJar,
     headers: HeaderMap,
-    Query(query): Query<LoginQuery>,
+    ApiQuery(query): ApiQuery<LoginQuery>,
 ) -> Result<Response, ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
     // Link intent is an authenticated act: it says "add this provider identity
@@ -843,7 +843,7 @@ pub async fn callback(
     State(state): State<RestState>,
     jar: CookieJar,
     headers: HeaderMap,
-    Query(query): Query<CallbackQuery>,
+    ApiQuery(query): ApiQuery<CallbackQuery>,
 ) -> Result<Response, ApiError> {
     // Read before removing: `CookieJar::remove` takes the cookie out of this
     // jar's own view as well as sending the deletion, so the value has to be
