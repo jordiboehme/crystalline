@@ -25,11 +25,26 @@
 //! and the honest cases (an expired token, a disabled colleague) are better
 //! served by the teaching text, which names where a working token comes from.
 //! `tests/mcp_auth.rs` asserts the refusals are byte-identical.
+//!
+//! # Why a session is bound to the identity that opened it
+//!
+//! A transport session is a bag of protocol state keyed by an `Mcp-Session-Id`
+//! the server minted, and rmcp routes by that id alone. Authenticating each
+//! request on its own is therefore not enough: two accounts that both hold
+//! valid tokens could share one session, and every later task that scopes an
+//! operation by the identity this gate injects would be reading one caller's
+//! name against another caller's session state. So the gate records the
+//! identity a session was created under and checks it on every request that
+//! carries one. A mismatch is a `403` naming a session-identity mismatch and
+//! nothing else: the request is never re-routed, never silently accepted, and
+//! the answer never says whose session it is. Requests carrying no session id
+//! are stateless and untouched by this.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use axum::extract::Request;
@@ -73,6 +88,61 @@ const MCP_AUTH_UNAVAILABLE: &str = "The account store could not be read, so \
 this request could not be authenticated. This is a server-side fault rather \
 than a problem with your token; retry, and tell the operator if it persists.";
 
+/// What a caller is told when its token is good but the session it named was
+/// opened by somebody else. It says that much and no more: naming the owner
+/// would turn a session id into a way of enumerating who is connected.
+pub const MCP_SESSION_IDENTITY_MISMATCH: &str = "This session belongs to a \
+different identity. Open your own session rather than reusing one another \
+account started: drop the 'Mcp-Session-Id' header and handshake again with \
+your own MCP token.";
+
+/// The header rmcp mints a session under and routes every later request of that
+/// session by.
+const MCP_SESSION_ID: &str = "mcp-session-id";
+
+/// Which identity opened which session, for the life of this process.
+///
+/// Kept here rather than in rmcp's session manager so the whole identity
+/// decision is one place: the manager's job is protocol state, and a binding it
+/// held would be a second rule to keep in step with this one. Entries are
+/// created when the transport hands back a new session id and dropped when a
+/// session is terminated, so the map tracks the manager's own sessions rather
+/// than growing past them.
+#[derive(Default)]
+struct SessionOwners(Mutex<HashMap<String, String>>);
+
+impl SessionOwners {
+    /// The account that opened `session`, if this process minted it. `None`
+    /// means no claim is on record - an id from a previous process, or one
+    /// nothing ever issued - and the transport answers those itself.
+    fn owner(&self, session: &str) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+    }
+
+    /// Record the identity a freshly minted session belongs to. Idempotent: a
+    /// response that echoes an existing id can only have passed the mismatch
+    /// check, so it rewrites the same name.
+    fn claim(&self, session: String, name: String) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(session, name);
+    }
+
+    /// Forget a terminated session, so the map does not outlive the transport's
+    /// own.
+    fn release(&self, session: &str) {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session);
+    }
+}
+
 /// The MCP transport with the door in front of it. `auth: None` is the gate
 /// off, in which case `call` is the inner service's own `call` with one clone
 /// in between.
@@ -84,6 +154,9 @@ than a problem with your token; retry, and tell the operator if it persists.";
 pub struct McpGate<S> {
     inner: S,
     auth: Option<Arc<AuthStore>>,
+    /// Shared across every clone, because the mount sites clone the gate and a
+    /// session opened through one path is reused through another.
+    sessions: Arc<SessionOwners>,
 }
 
 impl<S> McpGate<S> {
@@ -91,7 +164,11 @@ impl<S> McpGate<S> {
     /// resolves that once, when the HTTP surface starts, like every other
     /// `auth.*` key.
     pub fn new(inner: S, auth: Option<Arc<AuthStore>>) -> McpGate<S> {
-        McpGate { inner, auth }
+        McpGate {
+            inner,
+            auth,
+            sessions: Arc::new(SessionOwners::default()),
+        }
     }
 }
 
@@ -128,6 +205,36 @@ fn refusal() -> Response {
         axum::http::StatusCode::UNAUTHORIZED,
         [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
         axum::Json(serde_json::json!({ "error": MCP_AUTH_REQUIRED })),
+    )
+        .into_response()
+}
+
+/// The session a request names, if it names one.
+fn session_of(request: &Request) -> Option<String> {
+    request
+        .headers()
+        .get(MCP_SESSION_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// The session a response minted, which rmcp sets only when it created one.
+fn minted_session(response: &Response) -> Option<String> {
+    response
+        .headers()
+        .get(MCP_SESSION_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+/// A good token pointed at somebody else's session. `403` rather than `401`,
+/// because nothing is wrong with the credential and re-authenticating would not
+/// help, and with no `WWW-Authenticate`, so no client retries with a fresh
+/// token it does not need.
+fn session_mismatch() -> Response {
+    (
+        axum::http::StatusCode::FORBIDDEN,
+        axum::Json(serde_json::json!({ "error": MCP_SESSION_IDENTITY_MISMATCH })),
     )
         .into_response()
 }
@@ -170,6 +277,7 @@ where
             // The gate is off: the legacy open tier, untouched.
             return Box::pin(async move { Ok(inner.call(request).await?.into_response()) });
         };
+        let sessions = self.sessions.clone();
         Box::pin(async move {
             let Some(token) = presented_token(&request) else {
                 return Ok(refusal());
@@ -178,11 +286,36 @@ where
             // in Fluid can show when an agent last connected.
             match auth.mcp_token_user(&token).await {
                 Ok(Some(user)) => {
+                    let named = session_of(&request);
+                    // A revoked or rotated token never reaches here at all: it
+                    // stops resolving, and the `Ok(None)` arm below refuses it
+                    // with the ordinary 401 whether or not it names a session.
+                    if let Some(session) = &named
+                        && let Some(owner) = sessions.owner(session)
+                        && owner != user.name
+                    {
+                        return Ok(session_mismatch());
+                    }
+                    let terminating = request.method() == axum::http::Method::DELETE;
+                    let name = user.name.clone();
                     request.extensions_mut().insert(McpIdentity {
                         admin: matches!(user.role, Role::Admin),
                         name: user.name,
                     });
-                    Ok(inner.call(request).await?.into_response())
+                    let response = inner.call(request).await?.into_response();
+                    if let Some(session) = minted_session(&response) {
+                        sessions.claim(session, name);
+                    }
+                    // A terminated session's id can be minted again by nothing,
+                    // but the claim would outlive the transport's own state, so
+                    // it goes when the transport says the session is gone.
+                    if terminating
+                        && response.status().is_success()
+                        && let Some(session) = &named
+                    {
+                        sessions.release(session);
+                    }
+                    Ok(response)
                 }
                 Ok(None) => Ok(refusal()),
                 Err(error) => {

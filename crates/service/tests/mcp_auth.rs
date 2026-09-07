@@ -13,6 +13,11 @@
 //! wrong scheme, a token that never existed, a revoked one, one belonging to a
 //! disabled account - so the response can never be read as an oracle telling an
 //! attacker which half of a guess was right.
+//!
+//! Authenticating each request on its own is not the whole of it, though: a
+//! session is protocol state rmcp routes by an id, so the gate also binds each
+//! session to the identity that opened it and refuses anyone else who names it.
+//! Two accounts that both hold valid tokens are still two accounts.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -125,6 +130,89 @@ async fn post_initialize(
         request = request.header("authorization", value);
     }
     request.send().await.unwrap()
+}
+
+/// The revision whose requests carry their own `_meta` and route statelessly,
+/// with no session in the picture at all.
+const ERA: &str = "2026-07-28";
+
+/// A modern-era `tools/list`: the era's two required `_meta` keys in the body
+/// and the SEP-2243 standard headers beside them, which is the shape that
+/// reaches the transport without ever touching a session.
+async fn post_stateless_tools_list(addr: &std::net::SocketAddr, token: &str) -> reqwest::Response {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 7,
+        "method": "tools/list",
+        "params": {
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": ERA,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "mcp-auth-test",
+                    "version": "0.0.0"
+                },
+            }
+        }
+    })
+    .to_string();
+    reqwest::Client::new()
+        .post(format!("http://{addr}/"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-protocol-version", ERA)
+        .header("mcp-method", "tools/list")
+        .header("authorization", format!("Bearer {token}"))
+        .body(body)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The `notifications/initialized` a client sends straight after a successful
+/// handshake, on the session the handshake minted.
+async fn post_on_session(
+    addr: &std::net::SocketAddr,
+    session: &str,
+    token: &str,
+) -> reqwest::Response {
+    reqwest::Client::new()
+        .post(format!("http://{addr}/"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("mcp-session-id", session)
+        .header("authorization", format!("Bearer {token}"))
+        .body(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+        .send()
+        .await
+        .unwrap()
+}
+
+/// The session id a successful handshake minted.
+fn minted_session(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get("mcp-session-id")
+        .expect("a legacy handshake mints a session")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Two accounts, each with a live token.
+async fn two_agents(store: &AuthStore) -> (String, String) {
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    store
+        .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    (
+        store.issue_mcp_token("ada", "agent").await.unwrap().token,
+        store.issue_mcp_token("bob", "agent").await.unwrap().token,
+    )
 }
 
 /// The same, with a well-formed `Bearer` presentation of `token`.
@@ -257,5 +345,124 @@ async fn the_health_probe_and_the_json_api_keep_their_own_rules() {
     assert!(
         !api.headers().contains_key("www-authenticate"),
         "the JSON API must not be answered by the MCP gate"
+    );
+}
+
+/// A session belongs to the account that opened it. Ada may go on using hers;
+/// Bob, whose own token is perfectly good, may not borrow it - and the refusal
+/// says only that the session is someone else's, never whose.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_is_bound_to_the_identity_that_opened_it() {
+    let (addr, _guard, store) = serve_with_mcp_auth(true).await;
+    let (ada, bob) = two_agents(&store).await;
+
+    let handshake = post_initialize_with_token(&addr, Some(&ada)).await;
+    assert_eq!(handshake.status(), 200);
+    let session = minted_session(&handshake);
+    drop(handshake);
+
+    let mine = post_on_session(&addr, &session, &ada).await;
+    assert!(
+        mine.status().is_success(),
+        "the account that opened the session keeps using it: {}",
+        mine.status()
+    );
+
+    let borrowed = post_on_session(&addr, &session, &bob).await;
+    assert_eq!(
+        borrowed.status(),
+        403,
+        "another identity's valid token does not open someone else's session"
+    );
+    assert!(
+        !borrowed.headers().contains_key("www-authenticate"),
+        "nothing is wrong with the credential, so this is not a challenge"
+    );
+    let body: serde_json::Value = borrowed.json().await.unwrap();
+    let text = body["error"].as_str().unwrap();
+    assert_eq!(
+        text,
+        crystalline_service::MCP_SESSION_IDENTITY_MISMATCH,
+        "the mismatch has its own body, distinct from the 401 teaching text"
+    );
+    assert!(
+        !text.contains("ada"),
+        "the refusal must not name the session's owner: {text}"
+    );
+
+    // Ending the session gives the claim up with it, so the gate's record
+    // never outlives the transport's own state. Ada's own DELETE is
+    // authenticated and matches, so it goes through; what is left afterwards is
+    // an id nothing stands behind, which the transport itself refuses.
+    let ended = reqwest::Client::new()
+        .delete(format!("http://{addr}/"))
+        .header("mcp-session-id", &session)
+        .header("authorization", format!("Bearer {ada}"))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        ended.status().is_success(),
+        "the owner may end her own session: {}",
+        ended.status()
+    );
+    let stale = post_on_session(&addr, &session, &bob).await;
+    assert_ne!(
+        stale.status(),
+        403,
+        "with the session gone there is no claim left to violate"
+    );
+}
+
+/// The binding is about sessions and nothing else: a modern-era request carries
+/// its own `_meta`, routes statelessly and names no session, so any
+/// authenticated identity is served on it whoever else is connected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stateless_request_from_another_identity_is_untouched_by_the_binding() {
+    let (addr, _guard, store) = serve_with_mcp_auth(true).await;
+    let (ada, bob) = two_agents(&store).await;
+
+    let handshake = post_initialize_with_token(&addr, Some(&ada)).await;
+    assert_eq!(handshake.status(), 200);
+    drop(handshake);
+
+    let stateless = post_stateless_tools_list(&addr, &bob).await;
+    assert_eq!(
+        stateless.status(),
+        200,
+        "a session-less request is not bound to anyone"
+    );
+}
+
+/// A revoked token stops working on the session it opened, and it is refused as
+/// an authentication failure rather than as a mismatch: the token no longer
+/// resolves at all, so the ordinary 401 path answers it before the binding is
+/// ever consulted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_revoked_token_is_refused_on_the_session_it_opened() {
+    let (addr, _guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
+
+    let handshake = post_initialize_with_token(&addr, Some(&issued.token)).await;
+    assert_eq!(handshake.status(), 200);
+    let session = minted_session(&handshake);
+    drop(handshake);
+
+    assert!(store.revoke_mcp_token("ada", issued.id).await.unwrap());
+    let refused = post_on_session(&addr, &session, &issued.token).await;
+    assert_eq!(
+        refused.status(),
+        401,
+        "a revoked token is an authentication failure, not a mismatch"
+    );
+    assert_eq!(refused.headers()["www-authenticate"], "Bearer");
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        body["error"].as_str().unwrap().contains("Agent access"),
+        "the ordinary teaching text answers it"
     );
 }
