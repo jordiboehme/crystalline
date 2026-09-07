@@ -1898,8 +1898,14 @@ fn first_sentence(text: &str) -> &str {
 /// offline and the rest already carry their own actionable message.
 fn device_flow_error(auth_base: &str, e: crystalline_remote::RemoteError) -> anyhow::Error {
     if matches!(e, crystalline_remote::RemoteError::AuthExpired) {
+        // "Next time:" frames the repeated Authorize sentence as advice for
+        // the retry rather than an instruction to act on a code that no
+        // longer exists - the sentence itself is reused verbatim from
+        // `confirmation_guidance` (via `first_sentence`) rather than
+        // reworded here, so there is still exactly one place that wording
+        // lives.
         anyhow!(
-            "The code expired before it was authorized. {} Check {} to see whether an earlier attempt already landed.",
+            "The code expired before it was authorized. Next time: {} Check {} to see whether an earlier attempt already landed.",
             first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
                 auth_base
             )),
@@ -2220,6 +2226,24 @@ mod connect_identity_tests {
             path(&machine).ends_with("github-token.json"),
             "{:?}",
             path(&machine)
+        );
+    }
+}
+
+#[cfg(test)]
+mod first_sentence_tests {
+    use super::first_sentence;
+
+    #[test]
+    fn the_period_is_included_and_nothing_after_it() {
+        assert_eq!(first_sentence("One. Two. Three."), "One.");
+    }
+
+    #[test]
+    fn text_with_no_period_space_comes_back_whole() {
+        assert_eq!(
+            first_sentence("No sentence break here"),
+            "No sentence break here"
         );
     }
 }

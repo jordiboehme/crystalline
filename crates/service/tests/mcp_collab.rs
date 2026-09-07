@@ -1039,6 +1039,17 @@ async fn a_second_call_while_pending_carries_the_same_next_steps() {
 
     let first = eng.start_device_connect(None).await.unwrap();
     let second = eng.configure_snapshot().await.unwrap();
+    let first_next_steps = first["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    // Pinned on substance, not just equal to the second call's value: two
+    // absent keys would also be equal, and would still pass a bare
+    // `assert_eq!` between the two views.
+    assert!(first_next_steps.contains("Authorize"), "{first_next_steps}");
+    assert!(
+        first_next_steps.contains("https://github.com/settings/connections/applications"),
+        "{first_next_steps}"
+    );
     assert_eq!(
         first["github"]["pending_connect"]["next_steps"],
         second["github"]["pending_connect"]["next_steps"]
@@ -1083,9 +1094,11 @@ async fn device_flow_failure_is_reported_once_with_next_steps_then_the_slot_clea
     eng.start_device_connect(None).await.unwrap();
     auth.run_gate.notify_one();
 
-    // A landed failure is a report, not a bare error: connected: false with
-    // both the reason and actionable next_steps, so a model relaying the
-    // result has something to tell the person rather than a dead end.
+    // A landed failure is a report, not a bare error: the real credential
+    // state (here, never connected, so connected: false) with both the
+    // reason and actionable next_steps beside it, so a model relaying the
+    // result has something to tell the person rather than a dead end. See
+    // the sibling test below for the already-connected case.
     let landed = wait_until(|| async {
         let snap = eng.configure_snapshot().await.unwrap();
         (!snap["github"]["error"].is_null()).then_some(snap)
@@ -1110,6 +1123,50 @@ async fn device_flow_failure_is_reported_once_with_next_steps_then_the_slot_clea
     assert_eq!(after["github"]["connected"], json!(false));
     assert!(after["github"]["pending_connect"].is_null());
     assert!(after["github"]["error"].is_null());
+}
+
+/// A landed failure is built from the same credential read as a successful
+/// one - the working token is not thrown away just because a re-connect
+/// attempt on top of it expired. Without this, an instance that is already
+/// connected would see `connected: false` for one call (a lie) and then
+/// `connected: true` again on the next, purely because the slot cleared.
+#[tokio::test]
+async fn a_landed_failure_reports_the_real_credential_state_beside_the_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    // A working credential is already on file...
+    let connected = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(connected["github"]["connected"], json!(true));
+
+    // ...then a re-connect's device flow expires.
+    eng.start_device_connect(None).await.unwrap();
+    auth.run_gate.notify_one();
+
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (!snap["github"]["error"].is_null()).then_some(snap)
+    })
+    .await;
+    assert_eq!(
+        landed["github"]["connected"],
+        json!(true),
+        "the stored credential must not be reported lost: {landed}"
+    );
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+    assert_eq!(landed["github"]["token_store"], json!("file"));
+    assert_eq!(
+        landed["github"]["error"],
+        json!("The GitHub connection has expired or was revoked. Use configure to sign in again.")
+    );
+    assert!(landed["github"]["pending_connect"].is_null());
+    let next_steps = landed["github"]["next_steps"].as_str().unwrap();
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
 }
 
 /// The gate sits ABOVE the pending drain, so on a disabled instance a bare

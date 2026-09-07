@@ -82,6 +82,13 @@ pub fn authorized_apps_url(auth_base: &str) -> String {
 /// What to do after the code is entered, and how to tell whether it worked,
 /// in words a person or a model can act on without guessing. Reused by
 /// every surface that reports a pending sign-in so they never drift apart.
+///
+/// Three places cannot call this and restate the rule by hand instead,
+/// since they are not Rust: `crates/cli/src/cmd.rs`'s 60-dot ticker nudge,
+/// and the "Onboarding a colleague" section of
+/// `skills/crystalline-collaboration/SKILL.md` and the closing paragraph of
+/// `skills/crystalline-intelligence/SKILL.md`. If this sentence's wording
+/// changes, check those three too.
 pub fn confirmation_guidance(auth_base: &str) -> String {
     format!(
         "Open the verification URL in a browser that is signed in to GitHub, enter the code, \

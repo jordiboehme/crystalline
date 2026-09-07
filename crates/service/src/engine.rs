@@ -9824,11 +9824,20 @@ impl Engine {
     /// user reports `pending_connect`; one that landed since the last call
     /// is reported here exactly once and the slot is cleared - a successful
     /// sign-in folds into `connected`/`user`, while an expired or declined
-    /// one reports `connected: false` with `error` and `next_steps` (the
+    /// one is built from [`Engine::origin_connection_json`] the same way the
+    /// success case is, so a re-connect attempt on an instance that already
+    /// has a working credential still reports `connected: true` and that
+    /// credential's `user`/`token_store` - with `error` and `next_steps` (the
     /// guidance the flow started with, see [`Engine::pending_next_steps_for`])
-    /// telling the caller to connect again and click Authorize this time,
-    /// rather than surfacing a bare error a model has nothing to act on.
+    /// added beside them, telling the caller to connect again and click
+    /// Authorize this time, rather than surfacing a bare error a model has
+    /// nothing to act on.
     async fn configure_connection_block(&self) -> Result<Value> {
+        // Read before `take_finished_pending` below, which clears the very
+        // slot this comes from: an outcome cannot land without a
+        // `PendingConnect` first existing for the same identity, so the
+        // `unwrap_or_default` a few lines down is unreachable in practice -
+        // kept only so a landed outcome can never itself fail this call.
         let landed_guidance = self.pending_next_steps_for(&TokenIdentity::Instance);
         if let Some(outcome) = self.take_finished_pending() {
             return match outcome {
@@ -9837,14 +9846,16 @@ impl Engine {
                     github["pending_connect"] = Value::Null;
                     Ok(github)
                 }
-                Err(e) => Ok(json!({
-                    "connected": false,
-                    "user": Value::Null,
-                    "token_store": Value::Null,
-                    "pending_connect": Value::Null,
-                    "error": e.to_string(),
-                    "next_steps": retry_guidance(&e, landed_guidance.as_deref().unwrap_or_default()),
-                })),
+                Err(e) => {
+                    let mut github = self.origin_connection_json().await?;
+                    github["pending_connect"] = Value::Null;
+                    github["error"] = json!(e.to_string());
+                    github["next_steps"] = json!(Self::retry_guidance(
+                        &e,
+                        landed_guidance.as_deref().unwrap_or_default()
+                    ));
+                    Ok(github)
+                }
             };
         }
         if let Some(view) = self.pending_view() {
@@ -9858,6 +9869,39 @@ impl Engine {
         let mut github = self.origin_connection_json().await?;
         github["pending_connect"] = Value::Null;
         Ok(github)
+    }
+
+    /// What to tell the caller after a device flow lands as a failure: retry
+    /// wording that names the reason distinctly for an expired code versus a
+    /// declined one where the outcome can tell them apart, falling back to a
+    /// generic reason otherwise, followed by `landed_guidance` (the same
+    /// confirmation guidance the flow started with, so the authorized-apps
+    /// url and the Authorize reminder are never phrased twice). Its only
+    /// caller is [`Engine::configure_connection_block`] right above; kept as
+    /// an associated function (it needs no `self`) rather than a free one so
+    /// it stays beside that caller.
+    fn retry_guidance(e: &RemoteError, landed_guidance: &str) -> String {
+        let reason = match e {
+            RemoteError::AuthExpired => "the code expired before it was authorized",
+            // `poll_device_flow_once` (crates/remote/src/github/auth.rs) maps
+            // GitHub's `access_denied` to exactly this status and message; a
+            // 403 from elsewhere in the same background task
+            // (validate_token, an enterprise SAML/token restriction) is a 403
+            // too, so the message is matched as well as the status rather
+            // than assuming every 403 here is a declined device-flow
+            // confirmation.
+            RemoteError::Api {
+                status: 403,
+                message,
+            } if message.as_str() == "the sign-in was declined on GitHub" => {
+                "the sign-in was declined on GitHub"
+            }
+            _ => "the sign-in did not complete",
+        };
+        format!(
+            "{reason}. Call configure with connect \"github\" again to start a new sign-in, \
+             and this time click Authorize on the page after the code. {landed_guidance}"
+        )
     }
 
     /// The token-store host this connect targets: `github.api_url`'s bare
@@ -10498,24 +10542,6 @@ pub struct GithubIdentity {
     pub pending: Option<GithubPending>,
     /// The once-reported failure of this account's last device flow.
     pub error: Option<String>,
-}
-
-/// What to tell the caller after a device flow lands as a failure: retry
-/// wording that names the reason distinctly for an expired code versus a
-/// declined one where the outcome can tell them apart, falling back to a
-/// generic reason otherwise, followed by `landed_guidance` (the same
-/// confirmation guidance the flow started with, so the authorized-apps url
-/// and the Authorize reminder are never phrased twice).
-fn retry_guidance(e: &RemoteError, landed_guidance: &str) -> String {
-    let reason = match e {
-        RemoteError::AuthExpired => "the code expired before it was authorized",
-        RemoteError::Api { status: 403, .. } => "the sign-in was declined on GitHub",
-        _ => "the sign-in did not complete",
-    };
-    format!(
-        "{reason}. Call configure with connect \"github\" again to start a new sign-in, and \
-         this time click Authorize on the page after the code. {landed_guidance}"
-    )
 }
 
 /// One in-flight GitHub device-flow sign-in, held by
