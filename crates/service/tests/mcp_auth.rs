@@ -640,7 +640,7 @@ impl McpTestSession {
     /// `notifications/initialized` a client owes the session before its first
     /// call.
     async fn open(addr: &std::net::SocketAddr, token: Option<&str>) -> McpTestSession {
-        let handshake = raw_post(addr, &initialize_body(), None, token).await;
+        let handshake = raw_post(addr, &initialize_body(), &[], token).await;
         assert!(
             handshake.starts_with("HTTP/1.1 200 "),
             "the handshake must be served:\n{handshake}"
@@ -649,7 +649,7 @@ impl McpTestSession {
         let ready = raw_post(
             addr,
             r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
-            Some(&session),
+            &[("Mcp-Session-Id", session.as_str())],
             token,
         )
         .await;
@@ -676,7 +676,7 @@ impl McpTestSession {
         raw_post(
             &self.addr,
             &body,
-            Some(&self.session),
+            &[("Mcp-Session-Id", self.session.as_str())],
             self.token.as_deref(),
         )
         .await
@@ -685,11 +685,13 @@ impl McpTestSession {
 
 /// Send one raw HTTP/1.1 POST and read back whatever arrives within a bounded
 /// window (see [`McpTestSession`] for why the window is bounded rather than a
-/// read to EOF).
+/// read to EOF). `headers` carries whatever the shape under test needs beside
+/// the fixed ones - a session id for the legacy path, the era's standard
+/// headers for a stateless one.
 async fn raw_post(
     addr: &std::net::SocketAddr,
     body: &str,
-    session: Option<&str>,
+    headers: &[(&str, &str)],
     token: Option<&str>,
 ) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -701,8 +703,8 @@ async fn raw_post(
          Accept: application/json, text/event-stream\r\n\
          Connection: close\r\n"
         .to_string();
-    if let Some(session) = session {
-        request.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(token) = token {
         request.push_str(&format!("Authorization: Bearer {token}\r\n"));
@@ -825,5 +827,78 @@ async fn a_personal_share_by_an_authenticated_agent_resolves_that_accounts_crede
     assert!(
         !answer.contains("no agent identity is configured"),
         "an authenticated session is never the configured agent identity:\n{answer}"
+    );
+}
+
+/// **The account reaches a stateless modern-era call too**, where there is no
+/// session in the picture at all.
+///
+/// A 2026-07-28 peer carries its own `_meta` per request and never handshakes,
+/// so it routes through the transport's stateless branch and the identity has
+/// to survive a different injection site (rmcp 3.2.0
+/// `transport/streamable_http_server/tower.rs:1974`, against `:1775` for the
+/// session POST the test above drives). This is the path a modern harness
+/// actually takes, so the claim is pinned by the transport rather than by
+/// source reading.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authenticated_modern_era_call_carries_the_account_with_no_session() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 9,
+        "method": "tools/call",
+        "params": {
+            "name": "write_engram",
+            "arguments": {
+                "domain": "eng",
+                "title": "Stateless Trace",
+                "content": "- [fact] traced",
+            },
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": ERA,
+                "io.modelcontextprotocol/clientCapabilities": {},
+                "io.modelcontextprotocol/clientInfo": {
+                    "name": "mcp-auth-test",
+                    "version": "0.0.0"
+                },
+            },
+        },
+    })
+    .to_string();
+    let answer = raw_post(
+        &addr,
+        &body,
+        // The SEP-2243 standard headers rmcp requires of any client declaring
+        // this revision (`validate_standard_headers`).
+        &[
+            ("MCP-Protocol-Version", ERA),
+            ("Mcp-Method", "tools/call"),
+            ("Mcp-Name", "write_engram"),
+        ],
+        Some(&token),
+    )
+    .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the write must be served, not refused:\n{answer}"
+    );
+    let head = answer.split("\r\n\r\n").next().unwrap_or(&answer);
+    assert!(
+        !head.to_ascii_lowercase().contains("mcp-session-id"),
+        "the modern era routes statelessly, so there is no session to hang an \
+         identity on:\n{head}"
+    );
+
+    let written =
+        std::fs::read_to_string(guard.path().join("eng").join("stateless-trace.md")).unwrap();
+    assert!(
+        written.contains("for-ada"),
+        "the account reaches a call that never opened a session: {written}"
     );
 }

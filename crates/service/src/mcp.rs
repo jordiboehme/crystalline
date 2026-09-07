@@ -989,7 +989,7 @@ fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
 /// `None` in exactly two cases, both of which keep their legacy actor: stdio,
 /// where there are no HTTP parts at all, and auth-off HTTP, where the gate is a
 /// pass-through and inserts nothing.
-fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
+pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
     let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
     let identity = parts.extensions.get::<crate::mcp_gate::McpIdentity>()?;
     Some(identity.name.clone())
