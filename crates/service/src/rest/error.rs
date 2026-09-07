@@ -572,6 +572,29 @@ mod tests {
         );
     }
 
+    /// An organization policy refusal is 422 on this surface, beside a
+    /// teaching refusal and for the same reason: the token works, nothing on
+    /// this instance is broken, and the message names the GitHub page that
+    /// clears it. A 500 would file it as a server fault and tell the caller
+    /// to wait out a failure they are meant to go and fix.
+    #[test]
+    fn organization_policy_refusals_are_unprocessable_not_server_faults() {
+        for e in [
+            crystalline_remote::RemoteError::SsoAuthorizationRequired {
+                org: "acme".to_string(),
+                url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+            },
+            crystalline_remote::RemoteError::OauthAppRestricted {
+                org: "acme".to_string(),
+            },
+        ] {
+            let detail = e.to_string();
+            let api = remote_to_api_error(e, detail.clone());
+            assert_eq!(api.status, StatusCode::UNPROCESSABLE_ENTITY, "{detail}");
+            assert_eq!(api.detail, detail);
+        }
+    }
+
     /// The write-endpoint refinement: a read-only instance answers 403, matching
     /// the /auth/me read_only flag a client already branches on. MCP keeps its own
     /// classification; this is the HTTP projection only.

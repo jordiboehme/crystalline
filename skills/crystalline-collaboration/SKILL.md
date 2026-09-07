@@ -41,7 +41,7 @@ An agent reaching the instance over HTTP shares as the account `github.agent_ide
 
 A personal identity needs write access to the repository the domain tracks, because proposals are branches in that same repository and never forks. A share that fails saying the GitHub account needs write access means exactly that: ask a maintainer to add the person as a collaborator instead of retrying. Once several people share into one domain, the layers of a stack can belong to different people - `origin_status` carries each proposal's author where one was recorded - so say whose layer it is before you amend or withdraw one that is not yours.
 
-An organization-policy refusal is a different failure wearing the same status code, and it names the exact GitHub page and who has to act: single sign-on (the person authorizes the Crystalline app for that organization at the url in the message and retries, alone) or OAuth app access restrictions (an organization owner approves the app, or the person requests it). Relay that text as written and follow it; never answer either one by suggesting a collaborator be added or the GitHub identity be reconnected, because neither clears it.
+An organization-policy refusal is a different failure wearing the same status code, and it names the exact GitHub page and who has to act: single sign-on, which the person clears alone by authorizing the Crystalline app for that organization at the url in the message, or OAuth app access restrictions, which an organization owner approves at the person's request. Relay that text as written and follow it. Never answer either one by suggesting a collaborator be added or the GitHub identity be reconnected, because neither clears it.
 
 ## Forges that do not stack
 

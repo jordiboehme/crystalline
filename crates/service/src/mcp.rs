@@ -4140,6 +4140,17 @@ mod tests {
                 path: "notes/a.md".to_string(),
                 open: vec![],
             },
+            // An organization policy refusal is nobody's server fault: the
+            // token works, and the message names the GitHub page that clears
+            // it. An internal-error verdict in front of that would tell the
+            // caller to wait out a failure they are meant to go and fix.
+            RemoteError::SsoAuthorizationRequired {
+                org: "acme".to_string(),
+                url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+            },
+            RemoteError::OauthAppRestricted {
+                org: "acme".to_string(),
+            },
         ];
         for e in cases {
             let message = e.to_string();

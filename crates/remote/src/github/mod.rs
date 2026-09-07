@@ -794,13 +794,16 @@ fn organization_policy_error(
 
 /// Pulls the `url=` value out of an `X-GitHub-SSO` header. GitHub sends
 /// `required; url=https://github.com/orgs/<org>/sso?authorization_request=...`;
-/// the value ends at the next parameter separator or whitespace.
+/// the value ends at the next parameter separator or whitespace. A quoted
+/// value is a legitimate way to write a header parameter, so the quotes come
+/// off rather than travelling into the url the person is told to open.
 fn sso_url(header_value: &str) -> Option<String> {
     let (_, rest) = header_value.split_once("url=")?;
     let url = rest
         .split(|c: char| c == ';' || c.is_whitespace())
         .next()?
-        .trim();
+        .trim()
+        .trim_matches('"');
     (!url.is_empty()).then(|| url.to_string())
 }
 
@@ -1002,5 +1005,115 @@ fn build_feedback(
     Feedback {
         review_state,
         items,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// GitHub.com's REST base, which `auth_base` maps to `https://github.com`
+    /// and `authorized_apps_url` to the page below.
+    const API: &str = "https://api.github.com";
+
+    /// The applications page every fallback lands on for [`API`].
+    const APPS_PAGE: &str = "https://github.com/settings/connections/applications";
+
+    /// GitHub's SAML refusal body, verbatim.
+    const SAML_BODY: &str = "Resource protected by organization SAML enforcement. \
+         You must grant your OAuth token access to this organization.";
+
+    /// GitHub's OAuth App restriction body, verbatim apart from the org name.
+    const OAUTH_RESTRICTION_BODY: &str = "Although you appear to have the correct authorization credentials, the `acme` \
+         organization has enabled OAuth App access restrictions, meaning that data access \
+         to third-parties is limited.";
+
+    /// `X-GitHub-SSO: partial-results; organizations=...` is GitHub reporting
+    /// that some organizations were filtered OUT of an answer it did serve,
+    /// not that this request was refused. Only the `required` form is a
+    /// refusal, so this header on its own must classify nothing: relaxing the
+    /// check to `sso_header.is_some()` would turn every partially served list
+    /// into a single sign-on error naming an organization the caller never
+    /// asked about.
+    #[test]
+    fn a_partial_results_sso_header_is_not_a_refusal() {
+        let classified = organization_policy_error(
+            API,
+            Some("acme/brand-knowledge"),
+            Some("partial-results; organizations=21955855,20582480"),
+            "Not Found",
+        );
+        assert!(classified.is_none(), "{classified:?}");
+    }
+
+    /// A 403 with neither marker nor header stays unclassified, so the caller
+    /// falls through to the plain `Api` error carrying GitHub's own words.
+    #[test]
+    fn an_unrelated_403_body_classifies_nothing() {
+        let classified = organization_policy_error(
+            API,
+            Some("acme/brand-knowledge"),
+            None,
+            "Resource not accessible by personal access token",
+        );
+        assert!(classified.is_none(), "{classified:?}");
+    }
+
+    /// Endpoints with no repository in scope (`current_user`) pass `None`,
+    /// and GitHub does not always name the organization either. The message
+    /// still has to read as a sentence, so both variants fall back to the
+    /// literal `this` rather than rendering an empty name.
+    #[test]
+    fn an_unnamed_organization_falls_back_to_the_literal_this() {
+        match organization_policy_error(API, None, None, SAML_BODY) {
+            Some(RemoteError::SsoAuthorizationRequired { org, url }) => {
+                assert_eq!(org, UNNAMED_ORG);
+                assert_eq!(url, APPS_PAGE);
+            }
+            other => panic!("expected SsoAuthorizationRequired, got {other:?}"),
+        }
+        match organization_policy_error(API, None, None, OAUTH_RESTRICTION_BODY) {
+            Some(RemoteError::OauthAppRestricted { org }) => assert_eq!(org, UNNAMED_ORG),
+            other => panic!("expected OauthAppRestricted, got {other:?}"),
+        }
+    }
+
+    /// The header is a trigger on its own, and it does not have to carry a
+    /// url: a bare `required` still refuses, with the organization read off
+    /// the repository and the applications page standing in for the url
+    /// GitHub did not send.
+    #[test]
+    fn a_required_header_with_no_url_still_refuses_and_names_the_apps_page() {
+        match organization_policy_error(API, Some("acme/brand-knowledge"), Some("required"), "") {
+            Some(RemoteError::SsoAuthorizationRequired { org, url }) => {
+                assert_eq!(org, "acme");
+                assert_eq!(url, APPS_PAGE);
+            }
+            other => panic!("expected SsoAuthorizationRequired, got {other:?}"),
+        }
+    }
+
+    /// A header parameter may legitimately arrive quoted. GitHub sends this
+    /// one bare, but a quoted value must not reach the message with its
+    /// quotes still attached, where it would break the link the person is
+    /// meant to open.
+    #[test]
+    fn a_quoted_header_url_is_unquoted() {
+        assert_eq!(
+            sso_url("required; url=\"https://github.com/orgs/acme/sso?authorization_request=abc\"")
+                .as_deref(),
+            Some("https://github.com/orgs/acme/sso?authorization_request=abc")
+        );
+    }
+
+    /// The organization comes off the url path, whatever rides behind it.
+    #[test]
+    fn the_org_is_read_from_the_sso_url_path() {
+        assert_eq!(
+            org_from_sso_url("https://github.com/orgs/acme-enterprise/sso?authorization_request=x")
+                .as_deref(),
+            Some("acme-enterprise")
+        );
+        assert_eq!(org_from_sso_url("https://github.com/settings"), None);
     }
 }
