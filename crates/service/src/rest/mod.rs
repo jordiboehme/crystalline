@@ -36,7 +36,7 @@ pub use error::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
     if_none_match_matches, precondition_failed,
 };
-pub use oidc::{OidcClaims, OidcClient, OidcSettings, STATE_COOKIE as OIDC_STATE_COOKIE};
+pub use oidc::{OidcClaims, OidcClient, OidcSettings};
 
 use crate::engine::Engine;
 use crate::scope::{DomainAccess, DomainRight};

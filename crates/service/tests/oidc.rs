@@ -123,6 +123,12 @@ struct IdpState {
     /// The authorization requests seen, whole query strings, so a test can
     /// assert what actually went out.
     authorize_queries: Mutex<Vec<String>>,
+    /// How many times the discovery handler has been entered. Counted before
+    /// it blocks, so a test can watch two requests arrive at once.
+    discovery_entries: AtomicUsize,
+    /// While this holds a receiver, the discovery handler waits for it to go
+    /// true before answering: a provider that has gone dark, on demand.
+    discovery_gate: Mutex<Option<tokio::sync::watch::Receiver<bool>>>,
 }
 
 impl IdpState {
@@ -199,6 +205,18 @@ impl FakeIdp {
         *self.state.user.lock().unwrap() = user;
     }
 
+    /// Stop answering discovery until [`FakeIdp::release_discovery`] is
+    /// called. The sender is kept here so the gate outlives the setup call.
+    fn block_discovery(&self) -> tokio::sync::watch::Sender<bool> {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        *self.state.discovery_gate.lock().unwrap() = Some(rx);
+        tx
+    }
+
+    fn discovery_entries(&self) -> usize {
+        self.state.discovery_entries.load(Ordering::SeqCst)
+    }
+
     fn last_authorize_query(&self) -> String {
         self.state
             .authorize_queries
@@ -211,6 +229,15 @@ impl FakeIdp {
 }
 
 async fn idp_discovery(State(state): State<Arc<IdpState>>) -> Json<serde_json::Value> {
+    state.discovery_entries.fetch_add(1, Ordering::SeqCst);
+    let gate = state.discovery_gate.lock().unwrap().clone();
+    if let Some(mut gate) = gate {
+        while !*gate.borrow_and_update() {
+            gate.changed()
+                .await
+                .expect("the gate's sender outlives the test");
+        }
+    }
     let issuer = state.issuer.lock().unwrap().clone();
     Json(serde_json::json!({
         "issuer": issuer,
@@ -855,4 +882,40 @@ async fn link_intent_without_a_session_is_refused() {
     assert_eq!(refused.status(), 401);
     let detail = refused.text().await.unwrap();
     assert!(detail.contains("sign in first"), "{detail}");
+}
+
+/// Discovery is fetched with no lock held, so a provider that has gone quiet
+/// does not turn concurrent sign-ins into a queue.
+///
+/// `/auth/oidc/login` is public and unauthenticated and the outbound timeout is
+/// ten seconds, so serializing the first fetch would let anyone make every
+/// waiting sign-in wait for every earlier one. The assertion is direct: with
+/// the provider's discovery endpoint blocked, two logins both reach it before
+/// either is answered.
+#[tokio::test]
+async fn a_slow_provider_does_not_serialize_concurrent_sign_ins() {
+    let idp = FakeIdp::start().await;
+    let gate = idp.block_discovery();
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    let login_url = ctx.url("/auth/oidc/login");
+    let logins = async { tokio::join!(ctx.get(&login_url, &[]), ctx.get(&login_url, &[])) };
+    let watcher = async {
+        let both_arrived = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while idp.discovery_entries() < 2 {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        gate.send(true).unwrap();
+        both_arrived
+    };
+    let ((first, second), both_arrived) = tokio::join!(logins, watcher);
+
+    assert!(
+        both_arrived.is_ok(),
+        "the second sign-in never reached discovery: the first one was holding a lock across it"
+    );
+    assert_eq!(first.status(), 302);
+    assert_eq!(second.status(), 302);
 }

@@ -428,19 +428,30 @@ impl OidcClient {
     }
 
     /// The provider metadata, fetching and caching it on first use.
+    ///
+    /// The fetch happens with NO lock held, and the lock is taken only to
+    /// store the result. Two concurrent first sign-ins therefore both fetch
+    /// and one result is discarded, which is the deliberate side of the
+    /// trade: holding the write lock across the call would serialize every
+    /// waiting request behind it, so a provider that has gone dark would turn
+    /// ten simultaneous sign-ins on this public route into ten sequential
+    /// timeouts rather than ten concurrent ones. A duplicate fetch costs one
+    /// extra request; serialization costs the whole login surface.
     async fn metadata(&self) -> Result<CoreProviderMetadata, ApiError> {
         if let Some(cached) = self.metadata.read().await.clone() {
-            return Ok(cached);
-        }
-        let mut slot = self.metadata.write().await;
-        // Another request may have won the race while this one waited.
-        if let Some(cached) = slot.clone() {
             return Ok(cached);
         }
         let fetched =
             CoreProviderMetadata::discover_async(self.settings.issuer.clone(), &self.http)
                 .await
                 .map_err(|err| provider_failure("discovery", err))?;
+        let mut slot = self.metadata.write().await;
+        // Another request may have landed its own fetch while this one ran.
+        // Keep theirs: both are the same document, and the cached one may
+        // already be the refreshed-keys copy `refresh_keys` wrote.
+        if let Some(cached) = slot.clone() {
+            return Ok(cached);
+        }
         *slot = Some(fetched.clone());
         Ok(fetched)
     }
