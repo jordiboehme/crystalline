@@ -263,7 +263,7 @@ export interface paths {
         post?: never;
         /**
          * Unregister a domain. Files on disk are never touched.
-         * @description Admin only. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
+         * @description An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
          */
         delete: operations["unregister_domain"];
         options?: never;
@@ -3241,7 +3241,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may see the domain and may not end it (an instance admin can, and so can a private domain's owner), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -3250,7 +3250,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description No such domain. */
+            /** @description No such domain, or one this caller may not see. */
             404: {
                 headers: {
                     [name: string]: unknown;
