@@ -760,7 +760,7 @@ describe("the domain screen", () => {
     expect(within(body).queryByText(/files stay on disk/i)).toBeNull();
   });
 
-  it("sends the purge confirmation for a virtual domain and not for a file one", async () => {
+  it("sends the purge confirmation for a virtual domain", async () => {
     const deletes: string[] = [];
     const removed = (path: string) => {
       deletes.push(path);
@@ -791,6 +791,39 @@ describe("the domain screen", () => {
       expect(deletes.length).toBe(1);
     });
     expect(deletes[0]).toContain("purge=true");
+  });
+
+  it("sends no purge confirmation for a file domain", async () => {
+    const deletes: string[] = [];
+    const removed = (path: string) => {
+      deletes.push(path);
+      return { files_kept: true, rooms_closed: 0 };
+    };
+    serve(
+      {
+        "/domains": () => listingOf("file"),
+        "/domains/eng": (path, init) =>
+          init?.method === "DELETE" ? removed(path) : domainsResponse(),
+        "/activity": () => ({ timeframe: "7d", items: [] }),
+      },
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const body = await screenBody();
+    await userEvent.click(
+      await within(body).findByRole("button", { name: "Unregister domain" }),
+    );
+    await userEvent.click(
+      within(body).getByRole("button", { name: "Confirm unregister" }),
+    );
+
+    // Nothing is deleted here, so nothing is confirmed: a file domain's
+    // markdown survives the removal and the flag would be meaningless.
+    await waitFor(() => {
+      expect(deletes.length).toBe(1);
+    });
+    expect(deletes[0]).not.toContain("purge");
   });
 });
 
