@@ -776,7 +776,7 @@ pub struct ServiceConfig {
     /// The HTTP setting: a bool, or a `host:port` string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpSetting>,
-    /// Serve the content API read-only: the four content-mutating tools are
+    /// Serve the content API read-only: the five content-mutating tools are
     /// hidden from the MCP surface and refused by the engine, while sync,
     /// reindex, watching and embedding still follow external file changes.
     /// Absent means read-write.

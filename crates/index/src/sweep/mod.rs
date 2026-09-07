@@ -1422,9 +1422,11 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 ///
 /// **One quiet condition, and it is the archive's own record.** A retired
 /// engram that declares a resolved `split_into` has already been through this:
-/// somebody moved the surviving facts out, and what is left is the part that
-/// expired on purpose. Reporting it again would fight the split that the rule
-/// asks for. Retirement with a successor is deliberately NOT a quiet condition:
+/// it was split, so what remains is what somebody chose to leave behind.
+/// Reporting it again would fight the split the rule asks for. What the check
+/// establishes is that the decision was made, not that it was made about every
+/// bullet - a second still-valid fact stranded by a partial split stays quiet
+/// here, and that is the price of not flooding every clean retirement. Retirement with a successor is deliberately NOT a quiet condition:
 /// a successor that failed to carry the facts forward is exactly the case this
 /// rule exists to catch.
 ///

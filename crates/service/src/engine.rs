@@ -604,7 +604,7 @@ pub struct Engine {
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
     model_id: String,
     chunk_params: ChunkParams,
-    // When true the four content-mutating methods refuse early with
+    // When true the content-mutating methods refuse early with
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
@@ -3405,13 +3405,21 @@ impl Engine {
     /// minimum so a split can never quietly empty an engram. Only then does the
     /// new engram get written, and only then the source edited.
     ///
-    /// **The two writes land together or not at all.** The new engram goes
-    /// first, because the failure that leaves the knowledge in two places is
-    /// survivable and the one that leaves it in none is not. The source edit
-    /// then carries the checksum of the text this call planned against, so a
+    /// **The new engram goes first, and a failed source edit takes it back
+    /// out.** First because the failure that leaves the knowledge in two places
+    /// is survivable and the one that leaves it in none is not. The source edit
+    /// carries the checksum of the text this call planned against, so a
     /// concurrent edit refuses it rather than dropping somebody's work; when it
     /// refuses, the new engram is deleted again and the caller gets the
     /// conflict with the archive exactly as it was.
+    ///
+    /// One residue, stated rather than papered over, the same way
+    /// [`Engine::retire_engram_as`] states its own: the source edit writes the
+    /// file and then reindexes it, so a failure between those two leaves the
+    /// source edited on disk with a `split_into` naming an engram this call has
+    /// just deleted. Nothing here rolls that back. It is a dangling link rather
+    /// than lost knowledge - the bullets are in the source, where they started
+    /// - and the evolve sweep raises it as `V102` on the next run.
     ///
     /// **What the new engram inherits, and what it does not.** The moved
     /// content, the source's tags and the source's `type` carry over, because
@@ -3561,10 +3569,15 @@ impl Engine {
             )));
         }
 
+        // The counts report what moved, not what was asked for: a line named
+        // twice moves once, and the receipt says so.
+        let mut lines: Vec<usize> = p.observations.clone();
+        lines.sort_unstable();
+        lines.dedup();
         Ok(SplitPlan {
             moved: moved.join("\n").trim_matches('\n').to_string(),
             remaining,
-            observations: p.observations.len(),
+            observations: lines.len(),
             sections: p.sections.len(),
         })
     }
@@ -12283,7 +12296,7 @@ struct SplitPlan {
     moved: String,
     /// The source with those lines gone, frontmatter and all.
     remaining: String,
-    /// How many observation bullets the caller selected.
+    /// How many distinct observation bullets moved.
     observations: usize,
     /// How many sections the caller selected.
     sections: usize,

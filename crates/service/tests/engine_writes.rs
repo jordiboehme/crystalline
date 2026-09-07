@@ -1103,3 +1103,75 @@ async fn split_works_on_a_virtual_domain_too() {
             .contains("- split_into [[Register Location]]")
     );
 }
+
+/// The rollback: the new engram lands, the source edit fails, and the new
+/// engram is taken back out so the archive is exactly as it was.
+///
+/// The failure is made deterministic without a race: every engram write goes to
+/// a sibling temp file and is renamed into place, so taking write permission
+/// off the domain's root directory - while leaving the `history/` subfolder the
+/// new engram is filed in writable - lets the whole plan, the new engram and
+/// its reindex through and stops exactly one thing, the write back to the
+/// source. Unix only, since that is where a directory mode refuses a write to
+/// the user who owns it.
+#[cfg(unix)]
+#[tokio::test]
+async fn split_takes_the_new_engram_back_out_when_the_source_edit_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+    let root = tmp.path().join("eng");
+    std::fs::create_dir_all(root.join("history")).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: Some("history".to_string()),
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("the source cannot be written");
+
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(root.join("coolant-bundle.md")).unwrap(),
+        BUNDLE,
+        "the source never changed: {err}"
+    );
+    assert!(
+        !root.join("history/purge-procedure.md").exists(),
+        "the new engram was taken back out"
+    );
+    assert!(
+        engine.engram_text("eng", "purge-procedure").await.is_err(),
+        "and its index rows went with it"
+    );
+}
+
+#[tokio::test]
+async fn split_counts_a_line_named_twice_once() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Pump Rating".to_string(),
+            folder: None,
+            observations: vec![lines[0], lines[0]],
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        receipt["moved_observations"], 1,
+        "the receipt counts what moved"
+    );
+}

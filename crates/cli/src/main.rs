@@ -279,7 +279,7 @@ enum Command {
         /// Run as a background daemon (quiet output).
         #[arg(long)]
         daemon: bool,
-        /// Serve the content API read-only: the four content-mutating tools are
+        /// Serve the content API read-only: the five content-mutating tools are
         /// hidden and refused, while sync, watching and embedding still run.
         /// Overrides service.read_only when set; the mode is fixed for the
         /// daemon's lifetime.

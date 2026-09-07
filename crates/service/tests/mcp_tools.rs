@@ -742,12 +742,13 @@ async fn read_only_hides_the_write_gated_tools() {
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
 
-    // The five write-gated tools (four content-mutating plus add_domain, which
+    // The six write-gated tools (five content-mutating plus add_domain, which
     // creates domains) are absent from the surface.
     for hidden in [
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "add_domain",
     ] {

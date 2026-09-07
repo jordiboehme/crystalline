@@ -548,8 +548,9 @@ register rule still hold. Split those out first, then retire the rest.
 
 *The agent reads the engram to see which line each observation sits on, then
 makes one `split_engram` call: the source, a title for the new engram and the
-lines that move.* The call writes the new engram and edits the old one, and
-either both land or neither does:
+lines that move.* Everything the call can refuse it refuses before it writes a
+byte, and if the edit to the old note fails after the new engram has landed, the
+new engram is taken back out again:
 
 ```markdown
 ---

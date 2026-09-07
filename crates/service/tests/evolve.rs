@@ -335,6 +335,10 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(by_rule("V201")["permalink"], "dup-a");
     assert_eq!(by_rule("V202")["permalink"], "deploy-checklist");
     assert_eq!(by_rule("V105")["permalink"], "huge-doc");
+    // The retired engram whose one observation turns up in no live engram of
+    // the domain: `- [context] the successor was never captured`.
+    assert_eq!(by_rule("V010")["permalink"], "retired-thing");
+    assert_eq!(by_rule("V010")["class"], "judgment");
 
     // V006 reads the `generated.by` actor the engine put on the facts, so this
     // is what catches the fact assembly dropping write provenance: the rule
