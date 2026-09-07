@@ -2152,6 +2152,20 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Viewer,
             read_only_exempt: true,
         },
+        // The self-service identity-link surface, on the same settlement as
+        // the tokens above: every account may give up its own link, and an
+        // identity link is account state rather than knowledge, so a
+        // read-only instance serves it. The issuer is one no fixture account
+        // holds a link at, so every allowed leg answers 404 - past
+        // authorization, which is what this matrix asserts, and removing
+        // nothing.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/identity-links/https%3A%2F%2Fnobody.example",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
     ]
 }
 
@@ -2346,6 +2360,12 @@ fn canonicalize(path: &str) -> String {
             None => String::new(),
         };
         return format!("/api/v1/me/mcp-tokens/{{id}}{tail}");
+    }
+    // The identity-link route takes an issuer url percent-encoded into one
+    // segment, which no per-segment name could match: it is spelled out here
+    // for the same reason the token ids above are.
+    if path.starts_with("/api/v1/me/identity-links/") {
+        return "/api/v1/me/identity-links/{issuer}".to_string();
     }
     path.split('/')
         .map(|segment| match segment {
