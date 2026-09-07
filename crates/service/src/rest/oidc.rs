@@ -1627,11 +1627,13 @@ impl OidcClaims {
     /// those: a claim the ID token carried is never replaced, and the issuer
     /// and subject are not read at all. Returns the names of the fields
     /// filled, for the log.
+    ///
+    /// Userinfo is the second boundary a provider's strings enter through, so
+    /// it reads them through the same [`presentation_text`] the ID token's
+    /// claims do. A provider that keeps its presentation claims out of the
+    /// token is not a provider whose strings are trusted any further.
     fn fill_missing_from_userinfo(&mut self, info: &CoreUserInfoClaims) -> Vec<&'static str> {
-        let text = |value: &str| {
-            let value = value.trim();
-            (!value.is_empty()).then(|| value.to_string())
-        };
+        let text = |value: &str| presentation_text(value);
         let mut filled = Vec::new();
         if self.preferred_username.is_none()
             && let Some(value) = info

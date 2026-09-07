@@ -1656,3 +1656,44 @@ async fn control_characters_never_reach_a_stored_name() {
         );
     }
 }
+
+/// The same, on the other boundary claims enter through: a provider that
+/// keeps the presentation claims out of the ID token and serves them from
+/// userinfo instead cannot write invisible characters into a stored name
+/// either.
+///
+/// Worth its own test rather than a case in the sibling above, because the
+/// two boundaries are two pieces of code: the ID token's claims and
+/// userinfo's fill each map the provider's strings into `OidcClaims`, and a
+/// fix applied to one of them leaves the other exactly as it was.
+#[tokio::test]
+async fn control_characters_never_reach_a_stored_name_through_userinfo() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.keep_presentation_claims_out_of_the_id_token();
+    idp.set_user(IdpUser {
+        subject: "sub-5".to_string(),
+        preferred_username: Some("ada\u{202e}nimda".to_string()),
+        name: Some("Ada\u{202e}ecalevoL\u{7}".to_string()),
+        email: Some("ada\u{200f}@example.test".to_string()),
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert_eq!(
+        idp.userinfo_hits(),
+        1,
+        "the claims this asserts on came from userinfo, not from the token"
+    );
+
+    let user = ctx
+        .user("adanimda")
+        .await
+        .expect("the derived name drops the override");
+    assert_eq!(user.display, "AdaecalevoL");
+    assert_eq!(user.email.as_deref(), Some("ada@example.test"));
+    for stored in [user.name.as_str(), user.display.as_str()] {
+        assert!(
+            !stored.chars().any(|ch| ch.is_control() || ch == '\u{202e}'),
+            "{stored:?} still carries a character that is not text"
+        );
+    }
+}
