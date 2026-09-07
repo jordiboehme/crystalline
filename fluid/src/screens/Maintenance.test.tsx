@@ -499,6 +499,53 @@ describe("the maintenance screen", () => {
     expect(lastSweep()).toContain("domains=ops");
   });
 
+  it("marks the queue busy while the re-scoped sweep is still running", async () => {
+    let asked = 0;
+    let land: (() => void) | null = null;
+    await open({
+      "/evolve": () => {
+        asked += 1;
+        if (asked === 1) {
+          return evolvePayload();
+        }
+        // The second sweep is held open, which is the window this is about:
+        // the heaviest read the API has, with a filter already reading as
+        // chosen above rows that answer a different question.
+        return new Promise((resolve) => {
+          land = () => {
+            resolve(evolvePayload());
+          };
+        });
+      },
+    });
+    await section(/^Temporal/);
+
+    await userEvent.selectOptions(domainFilter(), "ops");
+
+    // The previous answer stays drawn - the controls have to stay under the
+    // reader's hand - and says out loud that it is not the answer yet.
+    await waitFor(() => {
+      expect(screen.getByText(/engrams swept/)).toHaveAttribute(
+        "aria-busy",
+        "true",
+      );
+    });
+    expect(
+      defined(screen.getByText("The old way").closest("[aria-busy]")),
+    ).toHaveAttribute("aria-busy", "true");
+
+    await act(async () => {
+      land?.();
+      await Promise.resolve();
+    });
+    await waitFor(() => {
+      expect(screen.getByText(/engrams swept/)).toHaveAttribute(
+        "aria-busy",
+        "false",
+      );
+    });
+  });
+
   it("offers every registered domain, not only the ones on the page", async () => {
     await open();
     await section(/^Temporal/);

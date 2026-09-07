@@ -64,6 +64,7 @@ import { useId, useState } from "react";
 import { Link } from "react-router";
 
 import { problemDetail } from "../api/client";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type {
   EvolveAction,
   EvolveFamily,
@@ -82,7 +83,6 @@ import {
   fetchEvolveQueue,
   unacknowledgeFinding,
 } from "../api/evolve";
-import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import { deleteAttachment } from "../api/files";
 import { useAuth } from "../auth/AuthContext";
 import { Skeleton } from "../components/Skeleton";
@@ -139,6 +139,8 @@ export default function Maintenance() {
   // same two values, so a cache entry can never stand for a different sweep
   // than the one it holds.
   const scopedDomains = domain === EVERY_DOMAIN ? [] : [domain];
+  // Whether either filter is set, which decides what the page claims was swept.
+  const scoped = scopedDomains.length > 0 || families.length > 0;
   const sweep = useQuery({
     queryKey: evolveKey(scopedDomains, showAcknowledged, families),
     queryFn: () =>
@@ -160,6 +162,12 @@ export default function Maintenance() {
   const resweep = async () => {
     await queryClient.invalidateQueries({ queryKey: EVOLVE_KEY_ROOT });
   };
+
+  // The answer on screen is the previous scope's while a new one is on its
+  // way: `placeholderData` holds it across the key change, which keeps the
+  // controls under the reader's hand and would otherwise leave the rows
+  // reading as the answer to a filter that has not been asked yet.
+  const stale = sweep.isPlaceholderData && sweep.isFetching;
 
   const queue = sweep.data;
   // Every row that came back, drawn as it came: the sweep was already scoped,
@@ -186,9 +194,16 @@ export default function Maintenance() {
             Maintenance - what the knowledge needs next
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            A sweep of every registered domain, ranked. Reading it changes
-            nothing: a finding names what to go and read, and the work mostly
-            happens there.
+            {/*
+              What was actually swept, since the filters below narrow the
+              request rather than the page: "every registered domain" is a
+              claim, and it stops being true the moment one of them is set.
+            */}
+            {scoped
+              ? "A sweep of what the filter names"
+              : "A sweep of every registered domain"}
+            , ranked. Reading it changes nothing: a finding names what to go and
+            read, and the work mostly happens there.
           </p>
         </div>
         {/*
@@ -247,7 +262,7 @@ export default function Maintenance() {
               );
             }}
           />
-          <Tally queue={queue} />
+          <Tally queue={queue} busy={stale} />
         </div>
       )}
 
@@ -274,23 +289,39 @@ export default function Maintenance() {
         </p>
       )}
 
-      {queue && findings.length === 0 && (
-        <Nothing
-          scanned={queue.engramsScanned}
-          scoped={domain}
-          families={families}
-        />
-      )}
+      {/*
+        Marked busy, and dimmed to say so without words, while a sweep started
+        by a filter is still running. `placeholderData` holds the previous
+        answer across a key change, which is right for the acknowledged toggle
+        - the same question, one subset wider - and wrong for a scope change,
+        where what is drawn is a different question's answer under a filter
+        that already reads as chosen. Left drawn rather than replaced by a
+        skeleton, because this is the heaviest read the API has and a reader
+        watching rows they can still see is better served than one watching an
+        empty page.
+      */}
+      <div
+        aria-busy={stale}
+        className={`flex flex-col gap-6 ${stale ? "opacity-50" : ""}`}
+      >
+        {queue && findings.length === 0 && (
+          <Nothing
+            scanned={queue.engramsScanned}
+            scoped={domain}
+            families={families}
+          />
+        )}
 
-      {groups.map((group) => (
-        <FamilySection
-          key={group.key}
-          group={group}
-          actions={actions}
-          canWrite={capabilities.canWrite}
-          onChanged={resweep}
-        />
-      ))}
+        {groups.map((group) => (
+          <FamilySection
+            key={group.key}
+            group={group}
+            actions={actions}
+            canWrite={capabilities.canWrite}
+            onChanged={resweep}
+          />
+        ))}
+      </div>
 
       {queue && queue.acknowledged.total > 0 && (
         <Acknowledged
@@ -368,7 +399,7 @@ function FamilyFilter({
  * page is not all of it, which is when the shape of everything waiting is most
  * worth saying.
  */
-function Tally({ queue }: { queue: EvolveQueue }) {
+function Tally({ queue, busy }: { queue: EvolveQueue; busy: boolean }) {
   // What arrived, which is the page rather than the result.
   const fetched = queue.queue.length;
   const breakdown = queue.families
@@ -379,7 +410,10 @@ function Tally({ queue }: { queue: EvolveQueue }) {
     ? `${String(fetched)} of ${plural(queue.total, "finding", "findings")}`
     : plural(queue.total, "finding", "findings");
   return (
-    <p className="text-caption text-slate-500 tabular-nums dark:text-slate-400">
+    <p
+      aria-busy={busy}
+      className={`text-caption text-slate-500 tabular-nums dark:text-slate-400 ${busy ? "opacity-50" : ""}`}
+    >
       {plural(queue.engramsScanned, "engram", "engrams")} swept, {page}
       {breakdown === ""
         ? "."
