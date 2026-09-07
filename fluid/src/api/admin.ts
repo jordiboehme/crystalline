@@ -280,6 +280,8 @@ export type DomainMode = "local" | "virtual" | "github";
 /**
  * A domain to register. Every field but `mode` belongs to one of the modes:
  * a local or virtual domain is named, a team domain names a repository.
+ * `private` applies to every mode alike: it registers the domain private and
+ * owned by the creating account instead of shared with the whole instance.
  */
 export interface CreateDomainBody {
   mode: DomainMode;
@@ -287,6 +289,7 @@ export interface CreateDomainBody {
   repo?: string;
   branch?: string;
   path?: string;
+  private?: boolean;
 }
 
 /** What a registration reports back: the name it took, and where it landed. */

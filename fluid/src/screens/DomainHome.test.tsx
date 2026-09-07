@@ -197,6 +197,15 @@ function serve(
       "/domains/eng/tree": treeResponse,
       "/domains/eng/engrams": engramsResponse,
       "/vocabulary": vocabularyResponse,
+      // `MembersCard` reads this unconditionally, the way the tree and the
+      // engram listing are read unconditionally: a shared domain, which
+      // `eng` is unless a test says otherwise, so the card draws its plain
+      // "shared" state and nothing else on this screen changes shape.
+      "/domains/eng/members": () => ({
+        owner: null,
+        visibility: "shared",
+        members: [],
+      }),
       ...routes,
     }),
   );
@@ -262,6 +271,36 @@ describe("the domain screen", () => {
       name: /Alpha/,
     });
     expect(row).toHaveAttribute("href", "/d/eng/e/alpha");
+  });
+
+  it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
+    serve({
+      "/domains/eng/members": () => ({
+        owner: "ada",
+        visibility: "private",
+        members: [],
+      }),
+    });
+
+    renderApp("/d/eng");
+
+    // A sibling of the heading rather than inside it, off the same read
+    // `MembersCard` makes below - `GET /domains` itself names no domain's
+    // visibility - so the heading's own accessible name stays exactly "eng".
+    const heading = await screen.findByRole("heading", { name: "eng" });
+    expect(heading).toBeVisible();
+    await waitFor(() => {
+      expect(heading.parentElement).toHaveTextContent("private");
+    });
+  });
+
+  it("wears no private badge when the domain is shared", async () => {
+    serve();
+
+    renderApp("/d/eng");
+
+    expect(await screen.findByRole("heading", { name: "eng" })).toBeVisible();
+    expect(screen.queryByText("private")).toBeNull();
   });
 
   it("says a manifest with no prose at all is there without quoting nothing", async () => {

@@ -104,3 +104,21 @@ export type IssueMcpTokenBody = components["schemas"]["IssueBody"];
  * here and nowhere else, ever.
  */
 export type IssuedMcpToken = components["schemas"]["IssuedTokenResponse"];
+
+/** What `GET /domains/{domain}/members` answers with: who owns and is invited into a domain. */
+export type MembersResponse = components["schemas"]["MembersResponse"];
+
+/** One membership row: who, at what level, added by whom and when. */
+export type DomainMember = components["schemas"]["DomainMember"];
+
+/** What a member may do on one private domain: `viewer`, `editor` or `manager`. */
+export type MemberLevel = components["schemas"]["MemberLevel"];
+
+/** What `PUT /domains/{domain}/members/{principal}` takes. */
+export type MemberBody = components["schemas"]["MemberBody"];
+
+/** What `PUT /domains/{domain}/owner` takes. */
+export type OwnerBody = components["schemas"]["OwnerBody"];
+
+/** What `PUT /domains/{domain}/visibility` takes. */
+export type VisibilityBody = components["schemas"]["VisibilityBody"];

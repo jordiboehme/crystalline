@@ -183,6 +183,115 @@ describe("registering a domain", () => {
     });
   });
 
+  it("checks Private and registers the domain private, owned by the creating account", async () => {
+    const created = vi.fn(() => ({ domain: "notes", root: "/srv/kb/notes" }));
+    serveAs("admin", {
+      "/domains": (_path, init) =>
+        init?.method === "POST" ? created() : domainsResponse(),
+      "/domains/notes/manifest": () => ({
+        domain: "notes",
+        markdown: "# notes",
+      }),
+      "/domains/notes/tree": () => ({
+        domain: "notes",
+        path: "/",
+        folders: [],
+        engrams: [],
+      }),
+      "/domains/notes/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/domains/notes/members": () => ({
+        owner: "root",
+        visibility: "private",
+        members: [],
+      }),
+      "/vocabulary": () => ({
+        domain: "notes",
+        tags: [],
+        categories: [],
+        relation_types: [],
+      }),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
+    await userEvent.click(within(dialog).getByLabelText("Private"));
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Create domain" }),
+    );
+
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains", "POST")).toEqual({
+      mode: "local",
+      name: "notes",
+      private: true,
+    });
+    expect(
+      await screen.findByRole("heading", { level: 1, name: "notes" }),
+    ).toBeVisible();
+  });
+
+  it("leaves Private unchecked by default, so a plain create carries no field for it", async () => {
+    const created = vi.fn(() => ({ domain: "notes", root: "/srv/kb/notes" }));
+    serveAs("admin", {
+      "/domains": (_path, init) =>
+        init?.method === "POST" ? created() : domainsResponse(),
+      "/domains/notes/manifest": () => ({
+        domain: "notes",
+        markdown: "# notes",
+      }),
+      "/domains/notes/tree": () => ({
+        domain: "notes",
+        path: "/",
+        folders: [],
+        engrams: [],
+      }),
+      "/domains/notes/engrams": () => ({
+        mode: "text",
+        total: 0,
+        page: 1,
+        limit: 50,
+        count: 0,
+        hits: [],
+      }),
+      "/domains/notes/members": () => ({
+        owner: null,
+        visibility: "shared",
+        members: [],
+      }),
+      "/vocabulary": () => ({
+        domain: "notes",
+        tags: [],
+        categories: [],
+        relation_types: [],
+      }),
+    });
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+    await userEvent.type(within(dialog).getByLabelText("Name"), "notes");
+    await userEvent.click(
+      within(dialog).getByRole("button", { name: "Create domain" }),
+    );
+
+    await waitFor(() => {
+      expect(created).toHaveBeenCalled();
+    });
+    expect(sentBody("/domains", "POST")).toEqual({
+      mode: "local",
+      name: "notes",
+    });
+  });
+
   it("a cached disconnected answer never gates a local registration", async () => {
     // The regression the browser smoke caught: the top bar's share readiness
     // probe fills the GitHub-status cache on every screen, and on a

@@ -33,6 +33,7 @@ import {
   fetchDomainEngrams,
   hasFilters,
 } from "../api/engrams";
+import { fetchMembers, membersKey } from "../api/members";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
@@ -42,6 +43,7 @@ import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
+import { MembersCard } from "../components/MembersCard";
 import { ProposalsCard } from "../components/ProposalsCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
@@ -99,6 +101,16 @@ export default function DomainHome() {
   const tags = useQuery({
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
+  });
+  // The same read `MembersCard` makes below, cached under the same key: this
+  // is a cache hit rather than a second request, and what it buys here is
+  // the one fact worth wearing beside the domain's own name - a badge the
+  // engine's own listing cannot carry yet, since `GET /domains` names no
+  // domain's visibility (see the members read for why the card, not this
+  // header, is the source of truth for everything else).
+  const members = useQuery({
+    queryKey: membersKey(domain),
+    queryFn: () => fetchMembers(domain),
   });
 
   // A domain nobody registered is a wrong address, not an empty shelf. The
@@ -208,7 +220,24 @@ export default function DomainHome() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <h1 className="text-display">{domain}</h1>
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-display">{domain}</h1>
+          {/*
+            A sibling of the heading rather than inside it: the heading's own
+            accessible name stays exactly the domain's name, and the badge is
+            a separate piece of content beside it rather than text silently
+            appended to what a screen reader announces as the page's title.
+            `GET /domains` names no domain's visibility, so this rides on
+            `MembersCard`'s own read (cached under the same key, so this
+            costs nothing extra) rather than on the listing every other chip
+            here draws from. A domain nobody has made private answers
+            "shared" and draws nothing, the same way a kind-less domain draws
+            no chip either.
+          */}
+          {members.data?.visibility === "private" && (
+            <Chip variant="accent">private</Chip>
+          )}
+        </div>
         {summary && (
           <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
             {summary.engrams !== null && (
@@ -242,6 +271,17 @@ export default function DomainHome() {
         its header, and that is exactly the moment somebody reaches for it.
       */}
       {capabilities.canShare && <ProposalsCard domain={domain} />}
+
+      {/*
+        No capability gate here: `GET /members` is served to any account that
+        may see the domain at all, and the card itself decides what it may
+        offer from what that read says (its own row, the owner, the admin
+        flag) rather than from an instance-wide capability. It draws nothing
+        while the read is in flight or was refused - see its own module
+        doc - so an editor on a domain nobody ever made private sees nothing
+        here at all.
+      */}
+      <MembersCard domain={domain} />
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">
