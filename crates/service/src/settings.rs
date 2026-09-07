@@ -308,7 +308,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "database.url",
-            doc: "The Postgres connection URL (or a file-path override for the embedded backend); a credential when it carries a password, so it is only ever shown as (set) and never echoed back (applies at the next daemon start)",
+            doc: "The Postgres connection URL (or a file-path override for the embedded backend); it may carry a password, so it is always treated as a secret: whatever it holds, a file path included, is only ever shown as (set) and never echoed back (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
             secret: true,
