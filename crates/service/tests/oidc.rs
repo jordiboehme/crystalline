@@ -1294,14 +1294,18 @@ async fn a_wrong_audience_and_an_expired_token_are_refused() {
 /// cookie's deletion, and nothing on this route should be served from a cache.
 /// Both legs drive an error tail, since the success path always carried
 /// `no-store` and would pin nothing: the protocol refusal before the seam,
-/// and the identity refusal after it.
+/// and the identity refusal after it (an identity another account holds).
 #[tokio::test]
 async fn every_callback_answer_is_uncacheable() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
-    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+    // The identity's own first sign-on provisions `ada.lovelace` and links it,
+    // so a second account's attempt to link the same identity is the refusal
+    // past the seam.
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    ctx.create_local_user("grace", "grace@example.test", Role::Editor)
         .await;
-    let session = ctx.local_login("ada").await;
+    let session = ctx.local_login("grace").await;
 
     let cache_control = |response: &reqwest::Response| {
         response
