@@ -52,10 +52,20 @@
   :root,
   [data-theme="light"] {
     color-scheme: light;
+    /*
+     * CodeMirror's highlight style is one static rule set for both schemes
+     * (see `editor/setup.ts`), not a `dark:` utility, so a token color that
+     * needs to differ per scheme has nowhere else to read that from. This
+     * custom property is that scheme switch: it tracks the same value
+     * `.hljs-string` uses below, per scheme, so the editor's string color and
+     * the reading view's stay the same color for the same text.
+     */
+    --color-code-string: #45388c;
   }
 
   [data-theme="dark"] {
     color-scheme: dark;
+    --color-code-string: #b9afe6;
   }
 
   body {
@@ -163,11 +173,18 @@
     color: #93c5fd;
   }
 
+  /*
+   * Fuchsia rather than the purple-300 the light-mode violet would suggest:
+   * that stop sat only 14.0 CIE76 units from the string color below (both
+   * pale lavenders, indistinguishable at 13px mono), which fuchsia clears to
+   * 24.6 without colliding with keyword red or attr yellow. See
+   * `theme/tokens.test.ts`'s hue-separation test.
+   */
   [data-theme="dark"] .hljs-title,
   [data-theme="dark"] .hljs-class .hljs-title,
   [data-theme="dark"] .hljs-type,
   [data-theme="dark"] .hljs-built_in {
-    color: #d8b4fe;
+    color: #f0abfc;
   }
 
   [data-theme="dark"] .hljs-attr,

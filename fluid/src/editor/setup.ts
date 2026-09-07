@@ -160,10 +160,15 @@ const editorHighlight = HighlightStyle.define([
   { tag: tags.url, color: "var(--color-sky-700)" },
   { tag: tags.comment, color: "var(--color-slate-500)" },
   { tag: tags.keyword, color: "var(--color-sky-700)" },
-  // The accent, not a stock swatch: strings read the same color here as
-  // `.hljs-string` does in the rendered view, so a fenced code block does
-  // not change hue when the same text moves from editing to reading.
-  { tag: tags.string, color: "var(--color-accent-700)" },
+  // The accent, not a stock swatch - and scheme-aware despite this style
+  // having no `dark` argument to switch on (unlike `editorTheme` below):
+  // `--color-code-string` (index.css) resolves to the same value
+  // `.hljs-string` uses per `data-theme`, so a fenced code block does not
+  // change hue when the same text moves from editing to reading, in either
+  // scheme. A flat `var(--color-accent-700)` here was a dark-mode
+  // regression - 2.11:1 on the editor's own slate-950 background - because
+  // this style paints identically under both `data-theme` values.
+  { tag: tags.string, color: "var(--color-code-string)" },
   { tag: tags.number, color: "var(--color-amber-700)" },
   { tag: tags.meta, color: "var(--color-slate-500)" },
   { tag: tags.processingInstruction, color: "var(--color-slate-400)" },
