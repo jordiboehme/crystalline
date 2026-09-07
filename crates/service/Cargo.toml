@@ -26,6 +26,12 @@ postgres = ["crystalline-index/postgres"]
 # and tolerates its absence, so a clone without node still builds and tests
 # green with this on - the embed is then simply empty.
 fluid-ui = ["dep:rust-embed"]
+# The one test seam in the engine, and nothing else. Off by default, so a
+# released binary carries neither the arming method nor the branch that reads
+# it; turned on for this package's own test builds by the self dev-dependency
+# below, which is how an integration test - a separate crate - reaches something
+# `cfg(test)` alone would hide from it.
+testing = []
 
 [dependencies]
 crystalline-core = { workspace = true }
@@ -101,6 +107,10 @@ libc = { workspace = true }
 windows-sys = { workspace = true }
 
 [dev-dependencies]
+# This package, with its test seam on: an integration test is its own crate, so
+# `cfg(test)` inside the library does not cover it. Cargo unifies the feature
+# for the test build only - `cargo build --release` of the CLI never sees it.
+crystalline-service = { path = ".", features = ["testing"] }
 tempfile = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's

@@ -629,7 +629,11 @@ pub struct Engine {
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
     // The one test seam in this file: when armed, the next source edit fails on
-    // its far side, once. See `Engine::fail_next_source_edit`.
+    // its far side, once. See `Engine::fail_next_source_edit`. Compiled only
+    // into a test build (`cfg(test)` for this crate's unit tests, the `testing`
+    // feature for its integration tests), so a released binary carries neither
+    // the flag nor the branches that read it.
+    #[cfg(any(test, feature = "testing"))]
     fail_next_source_edit: std::sync::atomic::AtomicBool,
     // The effective `skills.serve` value, snapshotted while this engine is
     // built and never re-read. See `Engine::skills_serve` for why it is frozen
@@ -1129,6 +1133,7 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            #[cfg(any(test, feature = "testing"))]
             fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             skills_serve,
             instance_id: String::new(),
@@ -1181,10 +1186,26 @@ impl Engine {
     /// branches that read it are one relaxed swap each, one per storage kind. It
     /// is consumed by the next source edit on any domain rather than by the next
     /// split, so arm it immediately before the call under test.
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "testing"))]
     pub fn fail_next_source_edit(&self) {
         self.fail_next_source_edit
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the seam above is armed, consuming the arming. Constant `false`
+    /// outside a test build, where the flag does not exist: the two source-edit
+    /// branches then compile to what they would have been without a seam at
+    /// all.
+    fn take_armed_failure(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_source_edit
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
     }
 
     /// Install the co-editing registry, so a removal can close the rooms of the
@@ -4305,10 +4326,7 @@ impl Engine {
                 // either happens or does not, so a refusal here leaves the
                 // source's bytes untouched.
                 write_file(&abs, &edited).map_err(SourceEditFailure::before)?;
-                if self
-                    .fail_next_source_edit
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
+                if self.take_armed_failure() {
                     return Err(SourceEditFailure::after(EngineError::Internal(
                         "reindex failed (test seam)".to_string(),
                     )));
@@ -4342,10 +4360,7 @@ impl Engine {
                 // The seam, on this arm: a token nothing can match, so the
                 // store raises its own compare-and-swap conflict and rolls the
                 // transaction back. See `Engine::fail_next_source_edit`.
-                let expected = if self
-                    .fail_next_source_edit
-                    .swap(false, std::sync::atomic::Ordering::Relaxed)
-                {
+                let expected = if self.take_armed_failure() {
                     "0".repeat(64)
                 } else {
                     expected
