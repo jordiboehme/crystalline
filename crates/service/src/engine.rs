@@ -1294,6 +1294,26 @@ impl Engine {
         })
     }
 
+    /// What `scope` may do on one domain when the request is a write: the
+    /// domain answer capped by the instance role, which is the rule the JSON
+    /// API has always applied and the one the MCP write gate reads here.
+    ///
+    /// Same two special cases [`Engine::domain_right`] carries, for the same
+    /// reasons: no resolver installed is the machine owner, and a resolver that
+    /// cannot answer is an error rather than a permissive default.
+    pub async fn write_right(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+    ) -> Result<crate::scope::DomainRight> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(crate::scope::DomainRight::Own);
+        };
+        access.write_right(scope, domain).await.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
     /// Refuse a domain this caller may not see, and say nothing about one that
     /// is merely unregistered.
     ///

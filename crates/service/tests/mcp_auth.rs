@@ -1617,6 +1617,47 @@ async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
         "a viewer's agent is refused, and told what it holds:\n{refused}"
     );
 
+    // And the invitation does not lift it. A domain invitation widens what an
+    // account may reach, never what its instance role lets it do, so a viewer
+    // invited into a private domain as its editor reads it and writes nothing -
+    // the answer the JSON API gives the same person's browser
+    // (`an_instance_viewer_invited_as_an_editor_still_cannot_write` in
+    // rest_visibility.rs), and the one this surface owed it.
+    ctx.add_member(
+        "lab",
+        "looker",
+        crystalline_service::rest::MemberLevel::Editor,
+    )
+    .await;
+    let session = McpTestSession::open(&ctx.addr, Some(&viewer)).await;
+    let invited = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({ "domain": "lab", "title": "Nope", "content": "x" }),
+        )
+        .await;
+    assert!(
+        invited.contains("viewer"),
+        "an instance viewer with an editor membership is still refused:\n{invited}"
+    );
+    assert!(
+        !ctx.path("lab", "nope.md").exists(),
+        "and nothing was written"
+    );
+    // The invitation is real, though: the same account reads the domain it may
+    // not write, so what refused the write was the instance role and not the
+    // domain being invisible.
+    let read = session
+        .call_tool(
+            "read_engram",
+            serde_json::json!({ "identifier": "lab-note", "domain": "lab" }),
+        )
+        .await;
+    assert!(
+        read.contains("Lab Note"),
+        "the invited viewer still reads the domain:\n{read}"
+    );
+
     // An admin resolves to owner on every domain, private ones included.
     let admin = ctx.token_for("boss").await;
     let session = McpTestSession::open(&ctx.addr, Some(&admin)).await;

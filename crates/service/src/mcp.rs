@@ -1290,6 +1290,14 @@ impl McpServer {
     ///    the caller holds, because "forbidden" on a domain they can see and
     ///    read is otherwise indistinguishable from a bug.
     ///
+    /// The right read here is [`Engine::write_right`], the domain answer capped
+    /// by the instance role, and it is the same call the JSON API's write gate
+    /// makes. An instance viewer invited into a private domain as an editor is
+    /// therefore refused here exactly as their browser is refused there: an
+    /// invitation widens what an account may reach, never what its instance
+    /// role lets it do. Reading the uncapped `domain_right` here instead is
+    /// what let one person's agent write what that same person could not.
+    ///
     /// **The domain gated is the one the call named, and that is the whole of
     /// it.** An identifier cannot move a write to another domain: the absolute
     /// `crystalline://` form is refused outright when its domain is not the
@@ -1334,12 +1342,12 @@ impl McpServer {
         }
         let right = self
             .engine
-            .domain_right(scope, domain)
+            .write_right(scope, domain)
             .await
             .map_err(to_error)?;
         if right < DomainRight::Write {
             return Ok(Some(format!(
-                "your membership on '{domain}' is {}, and editor access is required to change it",
+                "your access to '{domain}' is {}, and editor access is required to change it",
                 member_level_word(right)
             )));
         }

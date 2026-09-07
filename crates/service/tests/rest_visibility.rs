@@ -463,6 +463,61 @@ async fn membership_level_gates_writes_not_instance_role() {
     assert_eq!(now.status(), 201, "{:?}", now.text().await);
 }
 
+/// The same rule stated from the other side, and pinned on the surface whose
+/// twin over MCP used to disagree with it: an account that is only an instance
+/// VIEWER, invited into a private domain as its EDITOR, reads that domain and
+/// writes nothing.
+///
+/// The invitation is what lets them reach the domain at all; the instance role
+/// is what says whether reaching it is enough to change it. Both gates run, in
+/// that order, and `DomainAccess::write_right` is now the one place either
+/// surface reads the combined answer from - see
+/// `an_instance_viewers_agent_is_refused_and_an_admins_is_not` in mcp_auth.rs
+/// for the MCP half of this pair.
+#[tokio::test]
+async fn an_instance_viewer_invited_as_an_editor_still_cannot_write() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.auth
+        .add_user("looker", "looker", None, Role::Viewer, "s3cret")
+        .await
+        .unwrap();
+    ctx.add_member("lab", "looker", MemberLevel::Editor).await;
+
+    let looker = ctx.as_user("looker").await;
+    let read = looker
+        .get_json("/api/v1/domains/lab/engrams/secret")
+        .await
+        .to_string();
+    assert!(
+        read.contains("Secret"),
+        "the invitation is real and the domain reads: {read}"
+    );
+
+    let refused = looker
+        .post_json(
+            "/api/v1/domains/lab/engrams",
+            json!({"title": "Fresh", "content": "# Fresh\n"}),
+        )
+        .await;
+    assert_eq!(
+        refused.status(),
+        403,
+        "an instance viewer writes nothing, whatever it was invited as"
+    );
+
+    // And the cap is the instance role rather than the domain: the same
+    // account is refused on the shared domain too, where it holds no
+    // membership at all.
+    let shared = looker
+        .post_json(
+            "/api/v1/domains/open/engrams",
+            json!({"title": "Fresh", "content": "# Fresh\n"}),
+        )
+        .await;
+    assert_eq!(shared.status(), 403);
+}
+
 /// A move writes at both ends, so it is gated at both: out of a domain and
 /// into one. The destination rides in the body rather than the path, which
 /// changes nothing - naming a domain is not a way to learn that it exists.

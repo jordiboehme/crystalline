@@ -904,9 +904,14 @@ pub(super) async fn require_domain_write(
     let scope = identity.scope();
     state.engine.require_domain(domain, &scope).await?;
     let caller = identity.require_editor()?;
+    // The capped right rather than the bare domain answer, so this gate and the
+    // MCP one are one rule with one spelling (`DomainAccess::write_right`).
+    // `require_editor` above already refuses every account the cap would catch,
+    // so nothing here changes what this route answers; what it buys is that the
+    // rule cannot drift apart from the other surface's copy of it again.
     let right = state
         .access
-        .right(&scope, domain)
+        .write_right(&scope, domain)
         .await
         // Never a fallback: a write that cannot learn what its caller may do
         // refuses rather than proceeding on an assumption.

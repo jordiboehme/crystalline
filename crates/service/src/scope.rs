@@ -152,6 +152,24 @@ fn decide(
     }
 }
 
+/// The most a principal's instance role lets it do on any domain at all.
+///
+/// The other half of [`DomainAccess::write_right`]: [`decide`] answers what the
+/// domain grants, this answers what the instance permits, and a write gate
+/// takes the lesser of the two. Spelled as a total match rather than a
+/// comparison against one role so adding a role has to answer this question.
+fn instance_cap(principal: &Principal) -> DomainRight {
+    match principal {
+        Principal::Unrestricted => DomainRight::Own,
+        Principal::Anonymous => DomainRight::Read,
+        Principal::Account { role, .. } => match role {
+            Role::Viewer => DomainRight::Read,
+            Role::Editor => DomainRight::Write,
+            Role::Admin => DomainRight::Own,
+        },
+    }
+}
+
 /// Resolves a [`Scope`] against the membership records in the auth database.
 ///
 /// Held by the engine (behind a `OnceLock`, installed when the HTTP surface
@@ -192,16 +210,51 @@ impl DomainAccess {
 
     /// What `scope` may do on `domain`.
     pub async fn right(&self, scope: &Scope, domain: &str) -> Result<DomainRight> {
+        Ok(self.resolved_right(scope, domain).await?.1)
+    }
+
+    /// What `scope` may do on `domain` **when the request is a write**: the
+    /// domain answer, capped by what the instance role lets this account do
+    /// anywhere.
+    ///
+    /// One rule, one spelling, both surfaces. A domain invitation widens what
+    /// an account may *reach*, never what its instance role lets it *do*, so an
+    /// instance viewer invited into a private domain as an editor reads it and
+    /// writes nothing - the answer the JSON API has always given (through
+    /// `Identity::require_editor`, which still runs there and still answers
+    /// first) and, since this method exists, the answer the MCP write gate
+    /// gives too. Before it, the same person's agent wrote over MCP what their
+    /// browser was refused, which is two rules for one question.
+    ///
+    /// The cap is a floor on nothing: it can only lower the answer. The machine
+    /// owner is [`DomainRight::Own`] before any of it, an anonymous caller caps
+    /// at [`DomainRight::Read`] (the MCP open tier is carved out by its own
+    /// surface, on the setting that creates it, before this is ever called),
+    /// and an admin caps at `Own`, which is what [`decide`] already gave them.
+    pub async fn write_right(&self, scope: &Scope, domain: &str) -> Result<DomainRight> {
+        let (principal, right) = self.resolved_right(scope, domain).await?;
+        let cap = instance_cap(&principal);
+        Ok(if right < cap { right } else { cap })
+    }
+
+    /// The policy answer for one scope on one domain, with the principal it was
+    /// decided for. Both public answers are this one, read differently.
+    async fn resolved_right(
+        &self,
+        scope: &Scope,
+        domain: &str,
+    ) -> Result<(Principal, DomainRight)> {
         let principal = self.principal(scope).await?;
         if matches!(principal, Principal::Unrestricted) {
-            return Ok(DomainRight::Own);
+            return Ok((principal, DomainRight::Own));
         }
         let acl = self.auth.domain_visibility(domain).await?;
         let level = match (&acl, &principal) {
             (Some(_), Principal::Account { name, .. }) => self.level_of(name, domain).await?,
             _ => None,
         };
-        Ok(decide(&principal, acl.as_ref(), level))
+        let right = decide(&principal, acl.as_ref(), level);
+        Ok((principal, right))
     }
 
     /// The private domains `scope` may not read.
