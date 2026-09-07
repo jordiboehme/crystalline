@@ -1995,6 +1995,13 @@ pub struct VisibilityBody {
 /// Making a domain shared again forgets its membership list: there is no
 /// half-private state where the rows survive an opening, and re-closing the
 /// domain starts from the owner alone.
+///
+/// Privatizing a domain that is already private is a no-op, answered `204` like
+/// the change itself: the owner it has and every membership row survive
+/// untouched. A `PUT` states a visibility, and this one already holds; handing
+/// the domain to somebody else is `PUT /domains/{domain}/owner`, which is a
+/// verb of its own so that a retried request cannot do it by accident. See
+/// [`AuthStore::set_domain_visibility`].
 #[utoipa::path(
     put,
     path = "/api/v1/domains/{domain}/visibility",
@@ -2009,7 +2016,10 @@ pub struct VisibilityBody {
                    403.\n\nMaking a domain SHARED again is served to the \
                    domain's own owner as well as to an admin: they already see \
                    everything in it, and opening what they closed takes \
-                   nothing from anybody.\n\nA manager may do neither. It may \
+                   nothing from anybody.\n\nPrivatizing a domain that is \
+                   already private changes nothing: it keeps the owner and the \
+                   members it has, and does not become the caller's. Transfer \
+                   ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may \
                    invite people and change their levels; deciding who holds \
                    the domain is not one domain's administration to \
                    settle.\n\nMaking a domain shared again forgets its \
@@ -2017,7 +2027,13 @@ pub struct VisibilityBody {
     params(("domain" = String, Path, description = "The registered domain.")),
     request_body = VisibilityBody,
     responses(
-        (status = 204, description = "The visibility is now what was asked for."),
+        (
+            status = 204,
+            description = "The visibility is now what was asked for. Answered \
+                           for a domain that already held it too: privatizing \
+                           an already-private domain changes nothing at all, \
+                           its owner and its members included.",
+        ),
         (
             status = 401,
             description = "No identity, or an anonymous one.",

@@ -649,6 +649,27 @@ pub struct DomainAcl {
     pub owner: String,
 }
 
+/// What [`AuthStore::set_domain_visibility`] did, for a caller that has to say
+/// so.
+///
+/// Two answers rather than a bare `()`, because "it was already private" and
+/// "it is private now" are the same end state reached from different places and
+/// a person deserves to be told which one they are looking at - especially
+/// since the second one names an owner the caller chose and the first one names
+/// the owner it already had.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VisibilityWrite {
+    /// The visibility record was written: the domain is now what was asked for.
+    Written,
+    /// The domain was already private and was left exactly as it stood, with
+    /// the owner named here and every membership row intact.
+    AlreadyPrivate {
+        /// The owner it already has, which is not necessarily the account the
+        /// caller named.
+        owner: String,
+    },
+}
+
 /// One membership row: who was invited to a private domain, at what level, by
 /// whom and when.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
@@ -3158,12 +3179,23 @@ impl AuthStore {
     ///
     /// Turning privacy off on a domain that was never private is a no-op
     /// rather than an error - the caller asked for a state that already holds.
+    ///
+    /// **Privatizing an already-private domain is a no-op too, and that is the
+    /// half that matters.** Writing the row again would delete the acl row and
+    /// insert one naming the CALLER, so a retried request, a stale client or a
+    /// script would hand the domain to whoever asked last and drop its previous
+    /// owner - who holds no membership row by construction - to no access at
+    /// all, with nothing said to either of them. A `PUT` states a visibility;
+    /// changing an owner is [`AuthStore::transfer_domain`]'s job, and it is a
+    /// verb of its own for exactly this reason. So the record is read first and
+    /// left exactly as it stands, owner and members included, and the answer
+    /// says it was already private so a caller can say so too.
     pub async fn set_domain_visibility(
         &self,
         domain: &str,
         private: bool,
         owner: &str,
-    ) -> Result<()> {
+    ) -> Result<VisibilityWrite> {
         let domain = normalize_domain(domain)?;
         let owner = normalize_account_name(owner)?;
         let now = chrono::Utc::now().to_rfc3339();
@@ -3181,7 +3213,10 @@ impl AuthStore {
                     )
                     .await
                     .with_context(|| format!("making domain '{domain}' shared"))?;
-                return Ok(());
+                return Ok(VisibilityWrite::Written);
+            }
+            if let Some(acl) = self.acl_of(&domain).await? {
+                return Ok(VisibilityWrite::AlreadyPrivate { owner: acl.owner });
             }
             self.require_live_user(&owner).await?;
             // Delete then insert rather than an upsert clause: two plain
@@ -3220,7 +3255,7 @@ impl AuthStore {
                 )
                 .await
                 .with_context(|| format!("making domain '{domain}' private"))?;
-            Ok(())
+            Ok(VisibilityWrite::Written)
         }
         .await;
         self.finish(result).await

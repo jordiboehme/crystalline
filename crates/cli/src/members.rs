@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crystalline_service::rest::{AuthStore, DomainMember, MemberLevel};
+use crystalline_service::rest::{AuthStore, DomainMember, MemberLevel, VisibilityWrite};
 
 use crate::{MembersCommand, VisibilityArg};
 
@@ -236,13 +236,42 @@ pub async fn visibility(
                 );
             };
             let owner = require_account(&store, &owner).await?;
-            store.set_domain_visibility(&domain, true, &owner).await?;
+            // A domain that is already private is left exactly as it stands,
+            // owner and members included: this verb states a visibility, and
+            // handing a domain on is `crystalline domain transfer`. Saying so
+            // matters most here, because the owner reported back is the one it
+            // already had rather than the one just asked for.
+            let owner = match store.set_domain_visibility(&domain, true, &owner).await? {
+                VisibilityWrite::Written => owner,
+                VisibilityWrite::AlreadyPrivate { owner: held } => {
+                    if json {
+                        crate::print_value(
+                            &serde_json::json!({
+                                "domain": domain,
+                                "visibility": "private",
+                                "owner": held,
+                                "changed": false,
+                            }),
+                            true,
+                        );
+                    } else {
+                        println!(
+                            "Domain '{domain}' was already private, owned by '{held}'. \
+                             Nothing changed: its members are as they were. Hand it to \
+                             somebody else with `crystalline domain transfer {domain} \
+                             <account>`."
+                        );
+                    }
+                    return Ok(());
+                }
+            };
             if json {
                 crate::print_value(
                     &serde_json::json!({
                         "domain": domain,
                         "visibility": "private",
                         "owner": owner,
+                        "changed": true,
                     }),
                     true,
                 );

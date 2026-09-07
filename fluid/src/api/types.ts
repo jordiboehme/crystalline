@@ -809,6 +809,8 @@ export interface paths {
          *
          *     Making a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.
          *
+         *     Privatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.
+         *
          *     A manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.
          *
          *     Making a domain shared again forgets its membership list.
@@ -6169,7 +6171,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The visibility is now what was asked for. */
+            /** @description The visibility is now what was asked for. Answered for a domain that already held it too: privatizing an already-private domain changes nothing at all, its owner and its members included. */
             204: {
                 headers: {
                     [name: string]: unknown;

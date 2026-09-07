@@ -171,6 +171,40 @@ fn the_membership_lifecycle_round_trips() {
     assert!(listed.contains("is shared"), "{listed}");
 }
 
+/// Closing a domain that is already closed changes nothing, and says so.
+///
+/// The write used to replace the acl row, so a second `visibility ... private`
+/// handed the domain to whoever the second call named and dropped the previous
+/// owner - who holds no membership row by construction - to no access at all.
+/// This verb states a visibility; `domain transfer` is the one that changes an
+/// owner, and the line points at it.
+#[test]
+fn closing_an_already_private_domain_changes_nothing() {
+    let fx = Fixture::new();
+    fx.domain(&["visibility", "eng", "private", "--owner", "ada"]);
+    fx.domain(&["members", "eng", "add", "bob", "--level", "editor"]);
+
+    let again = fx.domain(&["visibility", "eng", "private", "--owner", "bob"]);
+    assert!(
+        again.contains("already private") && again.contains("'ada'"),
+        "the line says nothing changed and names the owner it kept: {again}"
+    );
+    assert!(
+        again.contains("domain transfer eng"),
+        "and names the verb that does change one: {again}"
+    );
+
+    let listed = fx.domain(&["members", "eng", "list"]);
+    assert!(
+        listed.contains("owned by 'ada'"),
+        "the owner is untouched: {listed}"
+    );
+    assert!(
+        listed.contains("bob") && listed.contains("editor"),
+        "and so is the membership list: {listed}"
+    );
+}
+
 /// The refusals, all of which have to happen before anything is written: a
 /// domain nobody registered, an account nobody has, a missing owner and the
 /// owner that is not a membership row.

@@ -661,6 +661,54 @@ async fn the_evolve_queue_names_no_hidden_domain() {
     assert_eq!(ghost.status(), 404);
 }
 
+/// **Privatizing a domain that is already private changes nothing.**
+///
+/// The write used to delete the acl row and insert one naming the caller, so an
+/// admin who repeated the request - a retry, a stale client, a script that
+/// closes a list of domains - became the owner, and the previous owner, who
+/// holds no membership row by construction, dropped to no access at all with
+/// nothing said to either of them. A `PUT` states a visibility; handing a
+/// domain on is the owner route's job.
+#[tokio::test]
+async fn privatizing_an_already_private_domain_keeps_its_owner_and_members() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Editor).await;
+
+    let boss = ctx.as_user("boss").await;
+    let again = boss
+        .put_json("/api/v1/domains/lab/visibility", json!({"private": true}))
+        .await;
+    assert_eq!(
+        again.status(),
+        204,
+        "the state asked for already holds, so this is a no-op and not an error"
+    );
+
+    assert_eq!(
+        ctx.auth
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .expect("lab is still private")
+            .owner,
+        "owner",
+        "the admin who asked did not become the owner"
+    );
+    assert_eq!(
+        ctx.auth.memberships_of("mem").await.unwrap(),
+        vec![("lab".to_string(), MemberLevel::Editor)],
+        "and nobody was evicted"
+    );
+
+    // The owner still owns it in the sense that matters: they can open it.
+    let owner = ctx.as_user("owner").await;
+    let opened = owner
+        .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
+        .await;
+    assert_eq!(opened.status(), 204, "{:?}", opened.text().await);
+}
+
 /// The two directions of the visibility verb are two different decisions.
 ///
 /// CLOSING a shared domain is the instance's: it hands the domain to whoever
