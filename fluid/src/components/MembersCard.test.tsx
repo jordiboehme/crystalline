@@ -320,6 +320,78 @@ describe("the members card", () => {
     ).toBeNull();
   });
 
+  it("invites an account at the level chosen in the form", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private", members: [] }),
+        "/domains/eng/members/newmem": (_path, init) => {
+          if (init?.method === "PUT") {
+            return undefined;
+          }
+          throw new ApiProblem(405, "method not allowed", "unexpected method");
+        },
+      },
+      "ada",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    await userEvent.type(within(card).getByLabelText("Account"), "newmem");
+    await userEvent.selectOptions(
+      within(card).getByRole("combobox", { name: "Level" }),
+      "editor",
+    );
+    await userEvent.click(within(card).getByRole("button", { name: "Invite" }));
+
+    await waitFor(() => {
+      expect(sentBody("/domains/eng/members/newmem", "PUT")).toEqual({
+        level: "editor",
+      });
+    });
+    // The form clears once the invite lands, ready for the next one.
+    await waitFor(() => {
+      expect(within(card).getByLabelText("Account")).toHaveValue("");
+    });
+  });
+
+  it("changes a member's level from its row", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({
+            owner: "ada",
+            visibility: "private",
+            members: [memberFixture({ principal: "mem", level: "editor" })],
+          }),
+        "/domains/eng/members/mem": (_path, init) => {
+          if (init?.method === "PUT") {
+            return undefined;
+          }
+          throw new ApiProblem(405, "method not allowed", "unexpected method");
+        },
+      },
+      "ada",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    await userEvent.selectOptions(
+      within(card).getByRole("combobox", { name: "Level for mem" }),
+      "manager",
+    );
+
+    await waitFor(() => {
+      expect(sentBody("/domains/eng/members/mem", "PUT")).toEqual({
+        level: "manager",
+      });
+    });
+  });
+
   it("renders the server's own refusal rather than pretending the row changed", async () => {
     serve(
       {
