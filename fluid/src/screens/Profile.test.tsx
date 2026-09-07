@@ -13,11 +13,15 @@
  * The agent access half pins the opposite direction: that the card is offered
  * to a viewer exactly as it is to an editor and never gated by an instance's
  * read-only setting, that a freshly issued or rotated secret is shown exactly
- * once and gone from the DOM the moment its dialog is dismissed, and that the
- * listing never carries the secret at all.
+ * once and gone from the DOM the moment its dialog is dismissed, that the
+ * listing never carries the secret at all, that every one of its four failure
+ * surfaces shows the server's own words, that a revoke abandoned by Escape or
+ * Keep hands focus back to the row's own Revoke button, and that a failed
+ * issue is never retried into a second, unseen token.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -31,6 +35,8 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
+import { Tooltips } from "../components/primitives";
+import { AgentAccessCard } from "./Profile";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -551,5 +557,217 @@ describe("the agent access card", () => {
     expect(
       screen.getByRole("button", { name: "Revoke laptop" }),
     ).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when issuing a token is refused", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": (_path, init) => {
+        if (init?.method === "POST") {
+          throw new ApiProblem(
+            422,
+            "unprocessable entity",
+            "you already hold the maximum number of tokens",
+          );
+        }
+        return [];
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+
+    expect(
+      await screen.findByText(/you already hold the maximum/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's own words when rotating a token is refused", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 4,
+          label: "laptop",
+          created_at: "2026-08-01T00:00:00Z",
+          last_used: null,
+        },
+      ],
+      "/me/mcp-tokens/4/rotate": () => {
+        throw new ApiProblem(
+          404,
+          "not found",
+          "no such MCP token: it may already have been revoked",
+        );
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Rotate laptop" }),
+    );
+
+    expect(await screen.findByText(/no such mcp token/i)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's own words when revoking a token is refused", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 6,
+          label: "laptop",
+          created_at: "2026-08-01T00:00:00Z",
+          last_used: null,
+        },
+      ],
+      "/me/mcp-tokens/6": (_path, init) => {
+        if (init?.method === "DELETE") {
+          throw new ApiProblem(
+            404,
+            "not found",
+            "no such MCP token: it may already have been revoked",
+          );
+        }
+        return undefined;
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke laptop" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke laptop" }),
+    );
+
+    expect(await screen.findByText(/no such mcp token/i)).toBeInTheDocument();
+    // Refused, so the row nothing happened to is still there.
+    expect(screen.getByText("laptop")).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when the listing itself fails", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => {
+        throw new ApiProblem(
+          500,
+          "internal error",
+          "the account store could not be read",
+        );
+      },
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/the account store could not be read/i),
+    ).toBeInTheDocument();
+  });
+
+  it("returns focus to the row's own Revoke button after Escape and after Keep", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 7,
+          label: "laptop",
+          created_at: "2026-08-01T00:00:00Z",
+          last_used: null,
+        },
+      ],
+    });
+    renderApp("/profile");
+
+    const trigger = await screen.findByRole("button", {
+      name: "Revoke laptop",
+    });
+
+    await userEvent.click(trigger);
+    expect(
+      screen.getByRole("button", { name: "Confirm revoke laptop" }),
+    ).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("button", { name: "Confirm revoke laptop" }),
+    ).not.toBeInTheDocument();
+    // The trigger is rendered unconditionally for exactly this: its ref stays
+    // live while confirming, so abandoning has something real to focus.
+    expect(trigger).toHaveFocus();
+
+    await userEvent.click(trigger);
+    await userEvent.click(screen.getByRole("button", { name: "Keep" }));
+    expect(trigger).toHaveFocus();
+  });
+
+  /**
+   * The client's default retries once, after roughly a second, for anything
+   * that is not a 4xx - real time, since testing-library's waiter does not
+   * recognise vitest's fake clock. `retry: false` on `issue` is what keeps a
+   * dropped connection from minting a second, unseen token; this fails
+   * without it.
+   */
+  it("does not retry a failed issue, so a dropped connection never mints a second token", async () => {
+    const attempts = vi.fn();
+    serveAs("editor", {
+      "/me/mcp-tokens": (_path, init) => {
+        if (init?.method === "POST") {
+          attempts();
+          throw new ApiProblem(
+            0,
+            "network error",
+            "could not reach the server: it may be down",
+          );
+        }
+        return [];
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+
+    expect(
+      await screen.findByText(/could not reach the server/i),
+    ).toBeInTheDocument();
+    expect(attempts).toHaveBeenCalledTimes(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(attempts).toHaveBeenCalledTimes(1);
+  }, 8000);
+
+  it("never lets the issued secret become a value React Query itself retains", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/me/mcp-tokens": (_path, init) => {
+          if (init?.method === "POST") {
+            return { id: 11, label: "laptop", token: "cmt_deadbeef" };
+          }
+          return [];
+        },
+      }),
+    );
+    const client = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <Tooltips>
+          <AgentAccessCard />
+        </Tooltips>
+      </QueryClientProvider>,
+    );
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+    await screen.findByRole("dialog", { name: "laptop" });
+
+    // The mutation cache is inspected directly - not the DOM - because the
+    // point is what React Query itself retains, which the screen could not
+    // reveal either way.
+    expect(JSON.stringify(client.getMutationCache().getAll())).not.toContain(
+      "cmt_deadbeef",
+    );
   });
 });

@@ -519,7 +519,13 @@ const COPY_CONFIRMED_FOR_MS = 2000;
  * number with nothing to hold. Dismissing the dialog clears `reveal`, which is
  * what takes the token out of the DOM for good.
  */
-function AgentAccessCard() {
+// Exported, unlike every other card in this file, so a test can mount it
+// under a `QueryClient` of its own and inspect that client's
+// `MutationCache` directly - the only way to pin that the secret returned by
+// `issue`/`rotate` above never becomes the value React Query retains (see
+// their `mutationFn` comments). Nothing here needs router or auth context, so
+// the export costs nothing beyond this one seam.
+export function AgentAccessCard() {
   const queryClient = useQueryClient();
   const labelField = useId();
   const [label, setLabel] = useState("");
@@ -535,6 +541,13 @@ function AgentAccessCard() {
     queryClient.invalidateQueries({ queryKey: MCP_TOKENS_KEY });
 
   const issue = useMutation({
+    // Never retried: the client default inherits `retry: 1` for anything but
+    // a 4xx, which is right for a query and wrong here - a POST that reached
+    // the server and committed, then failed on the way back (a dropped
+    // connection, or a 2xx whose body could not be read), would otherwise be
+    // sent again and mint a second token whose secret nobody sees. The house
+    // idiom for exactly this (`ProposalsCard.tsx`, `FirstRunSetup.tsx`).
+    retry: false,
     mutationFn: async (issuedLabel: string) => {
       const issued = await issueMcpToken(issuedLabel);
       setReveal(issued);
@@ -551,6 +564,9 @@ function AgentAccessCard() {
   });
 
   const rotate = useMutation({
+    // Same reasoning as `issue`: a retried rotate is a second live secret for
+    // one request.
+    retry: false,
     mutationFn: async (id: number) => {
       const issued = await rotateMcpToken(id);
       setReveal(issued);
@@ -786,7 +802,27 @@ function TokenRow({
           >
             Rotate
           </button>
-          {confirming ? (
+          {/*
+            Rendered unconditionally, the way `Disconnect` next door renders
+            its own trigger: `abandon()` below focuses this ref, and a ref
+            behind a ternary's other branch is null the moment `confirming`
+            flips true, which sends Escape and Keep's focus to
+            `document.body` instead of back to this button.
+          */}
+          <button
+            ref={trigger}
+            type="button"
+            aria-label={`Revoke ${token.label}`}
+            aria-expanded={confirming}
+            disabled={revoking}
+            onClick={() => {
+              setConfirming(true);
+            }}
+            className={DANGER_BUTTON}
+          >
+            Revoke
+          </button>
+          {confirming && (
             <>
               <button
                 type="button"
@@ -809,20 +845,6 @@ function TokenRow({
                 Keep
               </button>
             </>
-          ) : (
-            <button
-              ref={trigger}
-              type="button"
-              aria-label={`Revoke ${token.label}`}
-              aria-expanded={confirming}
-              disabled={revoking}
-              onClick={() => {
-                setConfirming(true);
-              }}
-              className={DANGER_BUTTON}
-            >
-              Revoke
-            </button>
           )}
         </div>
       </td>
