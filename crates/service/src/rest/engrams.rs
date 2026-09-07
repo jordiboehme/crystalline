@@ -1219,13 +1219,16 @@ pub async fn move_action(
     }
     let value = state
         .engine
-        .move_engram(&MoveParams {
-            identifier: body.permalink,
-            domain,
-            destination: body.destination,
-            destination_domain: body.destination_domain,
-            update_links: None,
-        })
+        .move_engram(
+            &MoveParams {
+                identifier: body.permalink,
+                domain,
+                destination: body.destination,
+                destination_domain: body.destination_domain,
+                update_links: None,
+            },
+            &identity.scope(),
+        )
         .await
         // The one collision this verb can hit: a destination already taken.
         // Answered 409 rather than the generic 422 caller-error class, same

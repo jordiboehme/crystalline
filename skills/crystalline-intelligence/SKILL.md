@@ -11,6 +11,14 @@ Crystalline is your crystallized intelligence across sessions: what you have bee
 
 At connection you are handed a routing block as your instructions: one line per registered domain plus the tool names it routes through. Treat each line as a targeting aid, not a full catalog - an unrelated-looking domain may still hold the answer. Re-fetch the same index mid-session with `list_domains` and `include_routing: true`.
 
+On a shared instance that block may be a count rather than a list, or may name fewer domains than exist: an instance can hold private domains, and what you are shown is what the account you connected as may see. So `list_domains` with `include_routing: true` is the index, not a refresh of one you already have - call it at session start whenever the instructions carried no domain lines.
+
+## Domains you may not see
+
+A domain the account you connected as is not a member of is not there for you at all: it is absent from `list_domains` and from every search, and naming it directly answers exactly as naming a domain nobody ever registered. Read a "not registered" answer as "not yours to see or not there, and you cannot tell which" - never as a cue to create it with `add_domain`, and never as a bug to report. Ask the person you are working with for access instead.
+
+A write is a second question, answered separately. Where you may read a domain but not change it, the refusal names the level you hold on it (`viewer`, for instance) and needs an upgrade rather than a retry: relay it and ask, rather than trying another verb or another phrasing of the same write.
+
 ## Recall before you answer
 
 Never answer from pre-trained knowledge alone when a domain could cover it; search first. This holds even for a question that looks self-contained or seems to need clarification - a question that feels ambiguous is a signal to search first, not to ask the user before searching. Only ask a clarifying question once a search comes back genuinely empty or irrelevant. One domain obviously owns the task: a scoped search (`domains: ["that-domain"]`); broad or cross-cutting: a sweep with `domains` omitted. Decide that scope by matching the question's subject against the routing block's domain lines before you search, not after seeing results - when a domain's description names the topic (say a payments domain whose line mentions refunds and retries), scope to it on the first call rather than sweeping unscoped out of caution. For a "what is true now" question, filter on `status: stable` (`current` is the older word for the same state and a filter on either returns both). Follow a strong hit with `build_context` to pull in what surrounds it - it returns node titles, relations and untyped prose links (the latter as `links_to`) but no content, ranked by how strongly each node connects to the anchor, so reads follow it. If a first phrasing turns up nothing, reformulate once before concluding the knowledge was not captured.

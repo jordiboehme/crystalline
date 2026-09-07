@@ -1082,3 +1082,806 @@ async fn a_client_that_is_only_the_join_word_composes_as_the_stand_in() {
         "an unnamed client still records that an agent acted for ada: {written}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Private domains over MCP
+// ---------------------------------------------------------------------------
+//
+// The gate says who a caller is; this half says what that entitles them to.
+// Every read verb answers from the domains its caller may see and every write
+// verb refuses what it may not change, and both hold over the wire rather than
+// only in the engine (`tests/visibility.rs` is the engine's own leg).
+//
+// The property under all of it is the one the whole program is built on: a
+// domain somebody may not see is answered exactly as a domain nobody
+// registered, and an engram inside it exactly as an engram nobody wrote. Not
+// "forbidden" - the existence of a private domain is the secret it keeps.
+//
+// The three tiers reach here as three scopes. A local stdio session is the
+// machine owner and is unrestricted; an authenticated HTTP session is the
+// account it authenticated as, with the instance role the gate resolved; an
+// HTTP session on an instance with `auth.mcp` off is nobody in particular,
+// which is the legacy open tier and now sees only what is shared.
+
+const VIS_OPEN_MANIFEST: &str = "---\ntype: manifest\ntitle: open\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# open\n\n## Scope\n\n- The shared domain\n\n## When to Use\n\n- Route here for shared questions\n";
+const VIS_SECOND_MANIFEST: &str = "---\ntype: manifest\ntitle: second\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# second\n\n## Scope\n\n- The other shared domain\n\n## When to Use\n\n- Route here for second questions\n";
+const VIS_LAB_MANIFEST: &str = "---\ntype: manifest\ntitle: lab\npermalink: manifest\ntags:\n  - manifest\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# lab\n\n## Scope\n\n- The private domain\n\n## When to Use\n\n- Route here for confidential lab questions\n";
+const VIS_OPEN_NOTE: &str = "---\ntype: engram\ntitle: Open Note\npermalink: open-note\ntags:\n  - shared\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Open Note\n\n- [decision] the shared thing is public #shared\n";
+/// The private engram, written so a cross-domain move of `open-note` reaches
+/// into it. The prefixed `[[open:Open Note]]` relation is what resolves, so
+/// this file is one of the inbound references the move gathers; the bare
+/// `[[Open Note]]` in its prose is what the rewrite would then replace, which
+/// is the side effect the mover's scope has to bound. Its third link resolves
+/// to nothing, so the maintenance sweep has something to find in `lab` and a
+/// sweep that reached in would say so.
+const VIS_LAB_NOTE: &str = "---\ntype: dossier\ntitle: Lab Note\npermalink: lab-note\ntags:\n  - confidential\nstatus: stable\nrecorded_at: 2026-01-03\n---\n\n# Lab Note\n\n- [secret] the secret formula is here #confidential\n- relates_to [[open:Open Note]]\n- relates_to [[Nothing Here At All]]\n\nSee also [[Open Note]] for the shared half.\n";
+const VIS_LAB_ASSET: &str = "the attachment nobody outside lab may read\n";
+
+/// A three-domain instance behind the production router: `open` and `second`
+/// are shared, `lab` is private to `owner` with `mem` invited as a viewer.
+///
+/// `fault` installs a **broken** private-domain resolver before the router
+/// builds one, which is the whole of the fail-closed injection. The engine's
+/// resolver slot is a `OnceLock` (`Engine::set_domain_access`), so whoever
+/// installs first wins and `http_base`'s own call becomes a no-op. The gate
+/// keeps the healthy store, so a token still authenticates and the request
+/// still reaches a tool; only the question "what may this caller see" is
+/// unanswerable.
+struct VisibilityCtx {
+    addr: std::net::SocketAddr,
+    tmp: tempfile::TempDir,
+    store: Arc<AuthStore>,
+    engine: Arc<Engine>,
+}
+
+impl VisibilityCtx {
+    /// Invite `account` into `domain` at `level`.
+    async fn add_member(
+        &self,
+        domain: &str,
+        account: &str,
+        level: crystalline_service::rest::MemberLevel,
+    ) {
+        self.store
+            .upsert_domain_member(domain, account, level, "owner")
+            .await
+            .unwrap();
+    }
+
+    /// A live MCP token for `account`.
+    async fn token_for(&self, account: &str) -> String {
+        self.store
+            .issue_mcp_token(account, "agent")
+            .await
+            .unwrap()
+            .token
+    }
+
+    fn path(&self, domain: &str, file: &str) -> std::path::PathBuf {
+        self.tmp.path().join(domain).join(file)
+    }
+}
+
+/// Give `path` a `domain_acl` table of the wrong shape before the auth store
+/// opens one, so every later read of it fails.
+///
+/// The store's schema statement is `CREATE TABLE IF NOT EXISTS`, so it leaves a
+/// table that already exists alone whatever its columns are; `private_domains`
+/// then selects columns that are not there and errors. Sequential by
+/// construction - this connection is closed before `AuthStore::open` makes its
+/// own - so nothing here depends on two connections sharing one file.
+async fn break_the_visibility_table(path: &std::path::Path) {
+    let name = path.to_string_lossy().to_string();
+    let db = match turso::Builder::new_local(&name)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+    {
+        Ok(db) => db,
+        // The same fallback `AuthStore`'s own opener makes where this platform
+        // has no shared WAL coordination.
+        Err(_) => turso::Builder::new_local(&name).build().await.unwrap(),
+    };
+    let conn = db.connect().unwrap();
+    conn.execute_batch("CREATE TABLE domain_acl (junk TEXT);")
+        .await
+        .unwrap();
+}
+
+async fn mcp_ctx(mcp_auth: bool) -> VisibilityCtx {
+    mcp_ctx_with(mcp_auth, false).await
+}
+
+async fn mcp_ctx_with(mcp_auth: bool, fault: bool) -> VisibilityCtx {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig::default();
+    for (name, manifest) in [
+        ("open", VIS_OPEN_MANIFEST),
+        ("second", VIS_SECOND_MANIFEST),
+        ("lab", VIS_LAB_MANIFEST),
+    ] {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("MANIFEST.md"), manifest).unwrap();
+        cfg.domains.insert(name.to_string(), DomainEntry::file(dir));
+    }
+    std::fs::write(root.join("open").join("open-note.md"), VIS_OPEN_NOTE).unwrap();
+    std::fs::write(root.join("lab").join("lab-note.md"), VIS_LAB_NOTE).unwrap();
+    std::fs::create_dir_all(root.join("lab").join("assets")).unwrap();
+    std::fs::write(
+        root.join("lab").join("assets").join("secret.txt"),
+        VIS_LAB_ASSET,
+    )
+    .unwrap();
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    cfg.auth = Some(AuthConfig {
+        mcp: Some(mcp_auth),
+        ..AuthConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+    engine.sync(None).await.unwrap();
+
+    let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
+    for (name, role) in [
+        ("owner", Role::Editor),
+        ("mem", Role::Editor),
+        ("out", Role::Editor),
+        ("boss", Role::Admin),
+        ("looker", Role::Viewer),
+    ] {
+        auth.add_user(name, name, None, role, "pw12345678")
+            .await
+            .unwrap();
+    }
+    auth.set_domain_visibility("lab", true, "owner")
+        .await
+        .unwrap();
+
+    if fault {
+        let broken_path = root.join("broken-auth.db");
+        break_the_visibility_table(&broken_path).await;
+        let broken = Arc::new(AuthStore::open(&broken_path).await.unwrap());
+        engine.set_domain_access(Arc::new(crystalline_service::DomainAccess::new(broken)));
+    }
+
+    let router = http_router(
+        engine.clone(),
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        auth.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    VisibilityCtx {
+        addr,
+        tmp,
+        store: auth,
+        engine,
+    }
+}
+
+/// One modern-era POST, optionally authenticated: the era's `_meta` in the body
+/// and the SEP-2243 standard headers beside it, which is the shape that reaches
+/// the transport with no session in the picture at all.
+async fn era_post(
+    addr: &std::net::SocketAddr,
+    id: u32,
+    method: &str,
+    params: serde_json::Value,
+    token: Option<&str>,
+) -> String {
+    let name = params
+        .get("name")
+        .or_else(|| params.get("uri"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let mut params = params;
+    params["_meta"] = serde_json::json!({
+        "io.modelcontextprotocol/protocolVersion": ERA,
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": { "name": "mcp-auth-test", "version": "0.0.0" },
+    });
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let mut headers: Vec<(&str, &str)> =
+        vec![("MCP-Protocol-Version", ERA), ("Mcp-Method", method)];
+    if let Some(name) = name.as_deref() {
+        headers.push(("Mcp-Name", name));
+    }
+    raw_post(addr, &body, &headers, token).await
+}
+
+/// **The legacy open tier sees only what is shared.**
+///
+/// With `auth.mcp` off the gate is a pass-through and there is nobody to be, so
+/// every agent reaching the endpoint is the anonymous tier: it reads the shared
+/// domains and a private one is simply not there. That is the one behaviour
+/// change a default install can notice, and it only happens once somebody has
+/// made a domain private - on an installation where nobody has, the listing is
+/// byte-identical to its old self.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_legacy_open_tier_sees_only_non_private_domains() {
+    let ctx = mcp_ctx(false).await;
+    let session = McpTestSession::open(&ctx.addr, None).await;
+
+    let listed = session
+        .call_tool("list_domains", serde_json::json!({}))
+        .await;
+    assert!(
+        listed.contains("open") && listed.contains("second"),
+        "the shared domains are listed:\n{listed}"
+    );
+    assert!(!listed.contains("lab"), "the private one is not:\n{listed}");
+
+    let browsed = session
+        .call_tool("browse_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        browsed.contains("not registered"),
+        "and naming it answers exactly as naming an unregistered domain:\n{browsed}"
+    );
+}
+
+/// **An invited member reads its private domain over MCP, and a viewer's
+/// membership is not a licence to write it.**
+///
+/// The two halves are one test because they are one decision read at two rungs
+/// of the same ladder: `mem` may see `lab` (so it is in the listing and its
+/// engrams are readable) and holds `viewer` on it (so a write is refused, and
+/// the refusal names the level, because "forbidden" on a domain the caller can
+/// see and read is otherwise indistinguishable from a bug).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authenticated_member_reads_its_private_domain_over_mcp() {
+    let ctx = mcp_ctx(true).await;
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Viewer)
+        .await;
+    let token = ctx.token_for("mem").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    let listed = session
+        .call_tool("list_domains", serde_json::json!({}))
+        .await;
+    assert!(
+        listed.contains("lab"),
+        "an invited member sees the domain it was invited to:\n{listed}"
+    );
+
+    let read = session
+        .call_tool(
+            "read_engram",
+            serde_json::json!({ "identifier": "lab-note", "domain": "lab" }),
+        )
+        .await;
+    assert!(
+        read.contains("secret formula"),
+        "and reads what is in it:\n{read}"
+    );
+
+    let refused = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({ "domain": "lab", "title": "Nope", "content": "x" }),
+        )
+        .await;
+    assert!(
+        refused.contains("viewer"),
+        "the level is named in the refusal:\n{refused}"
+    );
+    assert!(
+        !ctx.path("lab", "nope.md").exists(),
+        "and nothing was written"
+    );
+}
+
+/// **A stranger is answered as though the domain did not exist**, on every
+/// shape of question: the index, a named domain, and an engram named by its
+/// absolute address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stranger_reaches_nothing_of_a_private_domain_over_mcp() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    let listed = session
+        .call_tool("list_domains", serde_json::json!({}))
+        .await;
+    assert!(!listed.contains("lab"), "absent from the index:\n{listed}");
+
+    // The same call with the routing bullets, which is what every pointer on
+    // this server sends a client to - the count line the HTTP handshake now
+    // carries, the connector snippet and the shipped skills all name it. If
+    // this branch were unfiltered the handshake's degradation would have moved
+    // the disclosure one call deeper rather than closed it.
+    let routed = session
+        .call_tool(
+            "list_domains",
+            serde_json::json!({ "include_routing": true }),
+        )
+        .await;
+    assert!(
+        routed.contains("Route here for shared questions"),
+        "a stranger still gets its own routing index:\n{routed}"
+    );
+    assert!(
+        !routed.contains("lab") && !routed.contains("confidential lab questions"),
+        "with no line and no bullet of the domain it may not see:\n{routed}"
+    );
+
+    let searched = session
+        .call_tool(
+            "search_engrams",
+            serde_json::json!({ "query": "secret formula" }),
+        )
+        .await;
+    assert!(
+        !searched.contains("secret formula"),
+        "absent from search:\n{searched}"
+    );
+
+    let read = session
+        .call_tool(
+            "read_engram",
+            serde_json::json!({ "identifier": "crystalline://lab/lab-note" }),
+        )
+        .await;
+    assert!(
+        read.contains("no engram") && !read.contains("secret formula"),
+        "and its absolute address answers as an engram nobody wrote:\n{read}"
+    );
+}
+
+/// **An absolute identifier cannot carry a write into a domain the caller may
+/// not see.**
+///
+/// A `crystalline://` URL is the one identifier form that overrides the domain
+/// argument, so a gate reading the argument alone would gate the wrong domain:
+/// a caller who may write `open` names `crystalline://lab/lab-note` and reaches
+/// an engram it was never invited to. The refusal is the missing-engram one,
+/// and the file is proof it was a refusal rather than a partial move.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absolute_identifier_cannot_write_into_a_hidden_domain() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+
+    for (tool, arguments) in [
+        (
+            "move_engram",
+            serde_json::json!({
+                "identifier": "crystalline://lab/lab-note",
+                "domain": "open",
+                "destination": "stolen.md",
+                "destination_domain": "open",
+            }),
+        ),
+        (
+            "delete_engram",
+            serde_json::json!({
+                "identifier": "crystalline://lab/lab-note",
+                "domain": "open",
+            }),
+        ),
+        (
+            "edit_engram",
+            serde_json::json!({
+                "identifier": "crystalline://lab/lab-note",
+                "domain": "open",
+                "operation": "append",
+                "content": "- [fact] injected\n",
+            }),
+        ),
+    ] {
+        let answer = session.call_tool(tool, arguments).await;
+        assert!(
+            answer.contains("no engram") && !answer.contains("secret formula"),
+            "{tool} must answer as a missing engram:\n{answer}"
+        );
+    }
+
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "the private engram is byte-for-byte what it was"
+    );
+    assert!(!ctx.path("open", "stolen.md").exists());
+}
+
+/// **An instance viewer's agent cannot write, on any domain.**
+///
+/// An MCP token is issued to an account, so an agent holding one acts with that
+/// account's instance role. A viewer whose agent could write over MCP what the
+/// same viewer cannot write over the JSON API would be an escalation path
+/// around the role system rather than a convenience.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
+    let ctx = mcp_ctx(true).await;
+
+    let viewer = ctx.token_for("looker").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&viewer)).await;
+    let refused = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({ "domain": "open", "title": "Nope", "content": "x" }),
+        )
+        .await;
+    assert!(
+        refused.contains("viewer"),
+        "a viewer's agent is refused, and told what it holds:\n{refused}"
+    );
+
+    // An admin resolves to owner on every domain, private ones included.
+    let admin = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&admin)).await;
+    let written = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({ "domain": "lab", "title": "Admin Note", "content": "- [fact] yes" }),
+        )
+        .await;
+    assert!(
+        written.contains("\"result\""),
+        "an admin writes the private domain:\n{written}"
+    );
+    assert!(ctx.path("lab", "admin-note.md").exists());
+}
+
+/// **A cross-domain move rewrites links only where the mover can see.**
+///
+/// Moving an engram between domains rewrites every bare `[[target]]` that
+/// pointed at it into the prefixed form, and those linking engrams were not
+/// written by whoever asked for the move. A linking engram in a domain the
+/// mover may not see is therefore left exactly as it was - dangling, which its
+/// own members see as an unresolved-reference finding on their next sweep -
+/// rather than silently edited by somebody with no access to it, and the
+/// receipt counts only the rewrites its reader may know about.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_strangers_move_leaves_a_hidden_domains_link_alone() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+
+    let moved = session
+        .call_tool(
+            "move_engram",
+            serde_json::json!({
+                "identifier": "open-note",
+                "domain": "open",
+                "destination": "open-note.md",
+                "destination_domain": "second",
+            }),
+        )
+        .await;
+    assert!(
+        moved.contains("cross_domain\\\":true"),
+        "the move itself runs:\n{moved}"
+    );
+    assert!(
+        moved.contains("links_rewritten\\\":0"),
+        "and counts no rewrite it may not report:\n{moved}"
+    );
+    assert!(
+        !moved.contains("lab"),
+        "the receipt names no hidden domain:\n{moved}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "the private engram's link is byte-for-byte what it was"
+    );
+}
+
+/// The converse, so the skip above is the scope rather than a broken rewrite:
+/// an admin sees every domain, so the same move rewrites the same link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_admins_move_rewrites_the_private_domains_link() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    let moved = session
+        .call_tool(
+            "move_engram",
+            serde_json::json!({
+                "identifier": "open-note",
+                "domain": "open",
+                "destination": "open-note.md",
+                "destination_domain": "second",
+            }),
+        )
+        .await;
+    assert!(
+        moved.contains("links_rewritten\\\":1"),
+        "an admin's move rewrites it:\n{moved}"
+    );
+    assert!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md"))
+            .unwrap()
+            .contains("[[second:Open Note]]"),
+        "and the link is prefixed"
+    );
+}
+
+/// **The sweep and the schema verbs are scoped too.**
+///
+/// `evolve_engrams` sweeps every domain when it is given none, and
+/// `validate_engrams` and `infer_schema` each take a domain by name. All three
+/// reach the store directly rather than through a read verb, so each needed the
+/// caller's scope of its own; a queue of work in a domain the caller cannot see
+/// would name its engrams, its paths and its rules.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_sweep_and_schema_verbs_answer_nothing_for_a_hidden_domain() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    let swept = session
+        .call_tool("evolve_engrams", serde_json::json!({ "limit": 50 }))
+        .await;
+    assert!(
+        !swept.contains("lab-note") && !swept.contains("Nothing Here At All"),
+        "an unscoped sweep stops at the domains this caller may see:\n{swept}"
+    );
+
+    for tool in ["validate_engrams", "infer_schema"] {
+        let answer = session
+            .call_tool(
+                tool,
+                serde_json::json!({ "domain": "lab", "type": "dossier" }),
+            )
+            .await;
+        assert!(
+            answer.contains("not registered"),
+            "{tool} refuses a hidden domain as an unregistered one:\n{answer}"
+        );
+        assert!(!answer.contains("confidential"), "{tool}:\n{answer}");
+    }
+
+    let named = session
+        .call_tool(
+            "evolve_engrams",
+            serde_json::json!({ "domains": ["lab"], "limit": 50 }),
+        )
+        .await;
+    assert!(
+        !named.contains("Nothing Here At All"),
+        "and naming it directly finds nothing:\n{named}"
+    );
+
+    // The same holds for every other verb that reaches a domain by name.
+    // `provision` is the one of those that needs no collaboration setting to
+    // reach its gate, so it stands for the set here; deciding about a domain is
+    // itself a way of asking whether it exists.
+    let decided = session
+        .call_tool(
+            "provision",
+            serde_json::json!({ "action": "allow", "domain": "lab" }),
+        )
+        .await;
+    assert!(
+        decided.contains("not registered"),
+        "provision refuses a hidden domain as an unregistered one:\n{decided}"
+    );
+}
+
+/// **An attachment is reachable only inside a domain the caller may see.**
+///
+/// `resources/read` is the one attachment path a caller reaches cold: the uri
+/// names its domain outright and nothing had to be read first to learn the
+/// name, so a client can ask for any domain's file without ever touching a
+/// scoped verb.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_attachment_in_a_hidden_domain_is_not_readable() {
+    let ctx = mcp_ctx(true).await;
+    let uri = "crystalline://lab/assets/secret.txt";
+
+    let stranger = ctx.token_for("out").await;
+    let refused = era_post(
+        &ctx.addr,
+        1,
+        "resources/read",
+        serde_json::json!({ "uri": uri }),
+        Some(&stranger),
+    )
+    .await;
+    assert!(
+        !refused.contains("nobody outside lab"),
+        "a stranger never gets the bytes:\n{refused}"
+    );
+    assert!(
+        refused.contains("not registered"),
+        "and is answered as though the domain were not registered:\n{refused}"
+    );
+
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Viewer)
+        .await;
+    let member = ctx.token_for("mem").await;
+    let served = era_post(
+        &ctx.addr,
+        2,
+        "resources/read",
+        serde_json::json!({ "uri": uri }),
+        Some(&member),
+    )
+    .await;
+    assert!(
+        served.contains("nobody outside lab"),
+        "a member does:\n{served}"
+    );
+    assert!(
+        served.contains("\\\"cacheScope\\\":\\\"private\\\"")
+            || served.contains("\"cacheScope\":\"private\""),
+        "and the answer is cached per caller rather than shared, since it \
+         depends on who asked:\n{served}"
+    );
+}
+
+/// **`server/discover` hands each modern peer its own index.**
+///
+/// The era deletes `initialize` outright and moves `instructions` to
+/// `DiscoverResult`, so this is the modern client's only onboarding channel -
+/// and unlike the legacy handshake it carries a request context, so it is
+/// scoped per caller rather than degraded for everybody.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn discover_onboards_each_caller_with_the_domains_it_may_see() {
+    let ctx = mcp_ctx(true).await;
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Viewer)
+        .await;
+
+    let stranger = ctx.token_for("out").await;
+    let theirs = era_post(
+        &ctx.addr,
+        1,
+        "server/discover",
+        serde_json::json!({}),
+        Some(&stranger),
+    )
+    .await;
+    assert!(
+        theirs.contains("CRYSTALLINE KNOWLEDGE ROUTING") && theirs.contains("- open:"),
+        "a stranger is still onboarded:\n{theirs}"
+    );
+    assert!(
+        !theirs.contains("- lab:") && !theirs.contains("confidential lab questions"),
+        "with no bullet of the domain it may not see:\n{theirs}"
+    );
+
+    let member = ctx.token_for("mem").await;
+    let mine = era_post(
+        &ctx.addr,
+        2,
+        "server/discover",
+        serde_json::json!({}),
+        Some(&member),
+    )
+    .await;
+    assert!(
+        mine.contains("confidential lab questions"),
+        "a member is onboarded into it:\n{mine}"
+    );
+
+    // The `onboarding` prompt is the same block by another channel, and it
+    // carries a request context too, so it is scoped rather than degraded.
+    let prompted = era_post(
+        &ctx.addr,
+        3,
+        "prompts/get",
+        serde_json::json!({ "name": "onboarding" }),
+        Some(&stranger),
+    )
+    .await;
+    assert!(
+        prompted.contains("CRYSTALLINE KNOWLEDGE ROUTING"),
+        "the prompt answers:\n{prompted}"
+    );
+    assert!(
+        !prompted.contains("confidential lab questions"),
+        "and drops the bullets of a domain this caller may not see:\n{prompted}"
+    );
+}
+
+/// **The legacy handshake over HTTP names no domain at all.**
+///
+/// `get_info` is synchronous and rmcp calls it with no request context, so this
+/// one channel cannot know who is connecting and cannot leave a private
+/// domain's bullets out of a per-caller block. It therefore carries every
+/// behavior rule, the count of registered domains and the pointer at
+/// `list_domains` - which does resolve a caller and does filter - and no name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_http_handshake_carries_the_rules_and_no_domain_name() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let handshake = raw_post(&ctx.addr, &initialize_body(), &[], Some(&token)).await;
+
+    assert!(
+        handshake.contains("CRYSTALLINE KNOWLEDGE ROUTING") && handshake.contains("Behavior:"),
+        "the rules still arrive:\n{handshake}"
+    );
+    assert!(
+        handshake.contains("3 domains registered"),
+        "with the count line:\n{handshake}"
+    );
+    assert!(
+        !handshake.contains("confidential lab questions")
+            && !handshake.contains("Route here for shared questions"),
+        "and no domain's routing bullets:\n{handshake}"
+    );
+}
+
+/// **A resolver that cannot answer refuses; it never widens.**
+///
+/// Every scoped read holds one set of hidden domains for the whole call, read
+/// from the accounts database. The failure mode worth testing is not the one
+/// where that read says "nothing is hidden" - it is the one where it cannot
+/// say anything at all, because an empty answer and an unanswerable question
+/// look the same to a `unwrap_or_default`. Here the resolver's own table is
+/// unreadable while the door is fine, so a call authenticates, reaches a tool,
+/// and has to decide what to do with a question it cannot answer.
+///
+/// It answers nothing. Not the unfiltered list, not a partial one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_read_refuses_when_the_resolver_cannot_answer() {
+    let ctx = mcp_ctx_with(true, true).await;
+    let token = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    for (tool, arguments) in [
+        ("list_domains", serde_json::json!({})),
+        ("browse_domain", serde_json::json!({ "domain": "open" })),
+        ("search_engrams", serde_json::json!({ "query": "shared" })),
+        (
+            "read_engram",
+            serde_json::json!({ "identifier": "open-note", "domain": "open" }),
+        ),
+    ] {
+        let answer = session.call_tool(tool, arguments).await;
+        assert!(
+            answer.contains("\"error\""),
+            "{tool} must refuse rather than answer:\n{answer}"
+        );
+        for leaked in ["lab", "open-note", "the shared thing is public"] {
+            assert!(
+                !answer.contains(leaked),
+                "{tool} leaked '{leaked}' out of a read it could not scope:\n{answer}"
+            );
+        }
+    }
+
+    // And the engine agrees one layer down, so the refusal is the resolver's
+    // rather than a happy accident of one verb's error handling.
+    assert!(
+        ctx.engine
+            .hidden_domains(&crystalline_service::Scope::Anonymous)
+            .await
+            .is_err(),
+        "the resolver itself is what is failing"
+    );
+}

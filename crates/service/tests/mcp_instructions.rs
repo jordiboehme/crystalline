@@ -459,20 +459,54 @@ async fn an_onboarded_harness_gets_the_minimal_block() {
     );
 }
 
-/// An HTTP session is never suppressed, whatever this machine has installed:
+/// An HTTP session is never *suppressed*, whatever this machine has installed:
 /// one daemon serves every HTTP client, a remote client never ran
 /// `crystalline install` here, and a remote client is exactly who the served
 /// surface exists for. The `onboarded` argument is passed and deliberately
 /// ignored on that transport.
+///
+/// What it does not get is the domain lines. `get_info` is synchronous and rmcp
+/// hands it no request context, so the legacy handshake cannot know who is
+/// connecting and cannot leave a private domain's bullets out of a per-caller
+/// block; over HTTP it therefore carries every behavior rule, the count of
+/// registered domains and the pointer at `list_domains` - which does resolve a
+/// caller and does filter - and no domain name at all. Stdio is the
+/// unchanged full block, pinned by every other test in this file.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_http_session_always_gets_the_full_block() {
+async fn an_http_session_gets_the_rules_and_no_domain_names() {
     let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
 
     let (client, _server) = h.connect_as(true, ServedTransport::Http).await;
     let text = instructions(&client);
     assert!(
-        text.contains("Behavior:") && text.contains("- eng: Route here for eng questions"),
-        "an HTTP session always gets the full routing block:\n{text}"
+        text.starts_with("CRYSTALLINE KNOWLEDGE ROUTING"),
+        "the header still names what the server is:\n{text}"
+    );
+    assert!(
+        text.contains("Behavior:"),
+        "an HTTP session still gets every behavior rule:\n{text}"
+    );
+    assert!(
+        text.contains("1 domain registered; list_domains with include_routing=true"),
+        "and the count line pointing at the call that does filter:\n{text}"
+    );
+    assert!(
+        !text.contains("- eng:") && !text.contains("Route here for eng questions"),
+        "no domain is named to a caller this channel cannot resolve:\n{text}"
+    );
+}
+
+/// The same handshake over stdio is the whole block, so the split above is a
+/// property of the transport rather than of the renderer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stdio_session_still_gets_every_domain_line() {
+    let h = Harness::build(&[("eng", &["Route here for eng questions"])], &[], false).await;
+
+    let (client, _server) = h.connect_as(false, ServedTransport::Stdio).await;
+    let text = instructions(&client);
+    assert!(
+        text.contains("- eng: Route here for eng questions"),
+        "a local session is the machine owner and keeps the full block:\n{text}"
     );
 }
 

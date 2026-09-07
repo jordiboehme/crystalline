@@ -59,8 +59,8 @@ pub use manifest::{
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
 pub use prompt::{
     CONNECTOR_SNIPPET, INSTRUCTIONS_BUDGET, PromptDomain, PromptOutput, behavior_bullets,
-    generate_prompt, generate_prompt_unscoped, render_instructions, render_json,
-    render_minimal_instructions, render_text,
+    generate_prompt, generate_prompt_unscoped, render_counted_instructions, render_instructions,
+    render_json, render_minimal_instructions, render_text,
 };
 pub use provision::{
     ActionStatus, Agent, ArtifactAction, ArtifactFile, Command, DeferringMcpRunner, DesiredFile,

@@ -480,20 +480,7 @@ pub const INSTRUCTIONS_BUDGET: usize = 1900;
 /// function of the rendered sizes, so the determinism contract holds and the
 /// cost is at most three renders of the same small strings.
 pub fn render_instructions(output: &PromptOutput) -> String {
-    let mut head = String::new();
-    head.push_str(ROUTING_HEADER);
-    if output.read_only {
-        head.push_str(
-            "Crystalline is your crystallized intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
-        );
-    } else {
-        head.push_str(
-            "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
-        );
-    }
-    render_behavior_block(output, &mut head);
-    head.push('\n');
-    head.push_str("Domains:\n");
+    let head = instructions_head(output);
 
     // Tier 1: every routing line, up to three bullets each.
     let mut full = head.clone();
@@ -511,12 +498,65 @@ pub fn render_instructions(output: &PromptOutput) -> String {
 
     // Tier 3: a single count line; the index itself is one tool call away.
     let mut counted = head;
+    push_count_line(output, &mut counted);
+    counted
+}
+
+/// The fixed half of [`render_instructions`]: header, intro, the Behavior
+/// block and the `Domains:` label the variable half hangs under. Shared so the
+/// two renderers below cannot grow an intro or a rule the other lacks.
+fn instructions_head(output: &PromptOutput) -> String {
+    let mut head = String::new();
+    head.push_str(ROUTING_HEADER);
+    if output.read_only {
+        head.push_str(
+            "Crystalline is your crystallized intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+        );
+    } else {
+        head.push_str(
+            "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+        );
+    }
+    render_behavior_block(output, &mut head);
+    head.push('\n');
+    head.push_str("Domains:\n");
+    head
+}
+
+/// The single line that stands in for the domain list: how many are
+/// registered, and the one call that returns them. One writer, so
+/// [`render_instructions`]'s last tier and [`render_counted_instructions`]
+/// cannot word it differently.
+fn push_count_line(output: &PromptOutput, out: &mut String) {
     let n = output.domains.len();
     let noun = if n == 1 { "domain" } else { "domains" };
     let _ = writeln!(
-        counted,
+        out,
         "{n} {noun} registered; list_domains with include_routing=true returns the full index and its behavior rules."
     );
+}
+
+/// [`render_instructions`] with the domain lines always replaced by the count
+/// line: the whole of the behavior rules, none of the names.
+///
+/// **For the one onboarding channel that cannot know who is asking.** The
+/// legacy `initialize` handshake is answered from `get_info`, which rmcp calls
+/// with no request context at all, so an HTTP server has no caller to scope the
+/// block to and cannot leave a private domain's name out of it. Naming every
+/// registered domain to every anonymous peer that opens a session is exactly
+/// what a private domain is not, so that channel renders this instead and
+/// points at `list_domains`, which does resolve a caller and does filter.
+///
+/// Stdio is unaffected and keeps the full block: a local session is the machine
+/// owner, which already has the files on disk.
+///
+/// The count itself is deliberately the count of *registered* domains rather
+/// than of visible ones - there is nobody here to make it visible to - so this
+/// channel still says how many exist. That is the residue of the split, and it
+/// is one integer against the full index this used to hand out.
+pub fn render_counted_instructions(output: &PromptOutput) -> String {
+    let mut counted = instructions_head(output);
+    push_count_line(output, &mut counted);
     counted
 }
 

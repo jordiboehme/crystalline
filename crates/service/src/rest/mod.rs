@@ -802,7 +802,7 @@ pub(super) async fn require_domain_write(
 /// that has to name it. Only [`DomainRight::Read`] reaches a message today;
 /// the rest are spelled out so the mapping is complete rather than a default
 /// arm that would print "viewer" for something else one day.
-fn member_level_word(right: DomainRight) -> &'static str {
+pub(crate) fn member_level_word(right: DomainRight) -> &'static str {
     match right {
         DomainRight::None => "none",
         DomainRight::Read => "viewer",

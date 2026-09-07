@@ -53,6 +53,17 @@
 //! required. It re-fetches mid-session through `list_domains` with
 //! `include_routing=true`, the same index the instructions carry.
 //!
+//! **Over HTTP that block names no domain.** `get_info` is synchronous and rmcp
+//! calls it with no request context, so the legacy handshake cannot know who is
+//! connecting and cannot leave a private domain out of a per-caller block;
+//! there it renders [`crate::engine::Engine::routing_text_counted`] instead -
+//! every behavior rule, the count of registered domains, and the pointer at
+//! `list_domains`, which does resolve a caller and does filter. Stdio keeps the
+//! whole block, because a local session is the machine owner. Every channel
+//! that *does* carry a request context is scoped per caller instead:
+//! `server/discover` through [`McpServer::arrival_info_scoped`], the
+//! `onboarding` prompt, and `list_domains` itself.
+//!
 //! In read-only mode (the engine's `read_only` flag) the write-gated tools are
 //! filtered out of `list_tools` and `get_tool`; the routes stay registered so
 //! a client that calls a hidden tool by name reaches the engine's read-only
@@ -388,6 +399,14 @@ const CACHE_TTL_MS: u64 = 0;
 /// the one variation SEP-2567 explicitly permits and the one that would force
 /// `private`. The shipped skills a `resources/read` returns are static copy
 /// compiled into this binary.
+///
+/// **One result on this server is not that, and it says so itself.** An
+/// attachment read through the same `resources/read` endpoint *does* vary by
+/// the authorization on the request: a file inside a private domain is served
+/// to its members and refused to everybody else. A shared cache holding that
+/// answer under a public scope would hand one caller's attachment to the next
+/// one, so that branch passes [`CacheScope::Private`] to
+/// [`CacheHinted::with_cache_hints_as`] instead of taking this default.
 const CACHE_SCOPE: CacheScope = CacheScope::Public;
 
 /// Whether the peer this request belongs to gets SEP-2549 caching hints.
@@ -657,16 +676,27 @@ fn chosen_resolution(
 /// regardless of the capabilities `get_info` advertises. An un-advertised
 /// capability is therefore not a defence against this MUST; an override is.
 pub(crate) trait CacheHinted: Sized {
-    /// Set both hints, or neither.
-    fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self;
+    /// Set both hints, or neither, at the default [`CACHE_SCOPE`].
+    fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self {
+        self.with_cache_hints_as(context, CACHE_SCOPE)
+    }
+
+    /// Set both hints, or neither, at a scope this result chose for itself.
+    /// The one caller that does is the attachment branch of
+    /// [`McpServer::read_resource`], whose answer varies by who asked.
+    fn with_cache_hints_as(self, context: &RequestContext<RoleServer>, scope: CacheScope) -> Self;
 }
 
 macro_rules! impl_cache_hinted {
     ($($t:ty),+ $(,)?) => {
         $(impl CacheHinted for $t {
-            fn with_cache_hints(self, context: &RequestContext<RoleServer>) -> Self {
+            fn with_cache_hints_as(
+                self,
+                context: &RequestContext<RoleServer>,
+                scope: CacheScope,
+            ) -> Self {
                 if peer_gets_cache_hints(context) {
-                    self.with_ttl_ms(CACHE_TTL_MS).with_cache_scope(CACHE_SCOPE)
+                    self.with_ttl_ms(CACHE_TTL_MS).with_cache_scope(scope)
                 } else {
                     self
                 }
@@ -931,7 +961,8 @@ use crate::engine::{
     ProvisionAction, ShareActor, sanitize_actor,
 };
 use crate::params::*;
-use crate::scope::Scope;
+use crate::rest::member_level_word;
+use crate::scope::{DomainRight, Scope};
 
 /// The connected client's identity in the OKF agent form `name/version`, read
 /// from the initialize handshake rmcp keeps on the peer.
@@ -992,21 +1023,22 @@ fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
 /// where there are no HTTP parts at all, and auth-off HTTP, where the gate is a
 /// pass-through and inserts nothing.
 pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
-    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
-    let identity = parts.extensions.get::<crate::mcp_gate::McpIdentity>()?;
-    Some(identity.name.clone())
+    mcp_identity(ctx).map(|identity| identity.name)
 }
 
-/// The scope every read verb on this server is answered with today: none.
+/// The whole identity the gate resolved, name and instance role together.
 ///
-/// A placeholder, and one name rather than seven literals on purpose. Task 11
-/// resolves the calling session's real scope - the account [`mcp_account`]
-/// already reads out of the gate's extension for stdio and HTTP alike - and
-/// replaces the uses of this constant; grepping this name finds every site that
-/// has to move together. Until then an MCP read is what it has always been,
-/// unfiltered, so the tree stays green between the two tasks and stdio (which
-/// is the machine owner and passes this for real) never changes at all.
-const TASK_11_SCOPE: Scope = Scope::Unrestricted;
+/// [`mcp_account`] wants only the name; an authorization decision wants the
+/// role beside it, and the gate already read both out of the same row (see
+/// [`crate::mcp_gate::McpIdentity`]), so taking them from one place is what
+/// keeps the two from ever disagreeing.
+fn mcp_identity(ctx: &RequestContext<RoleServer>) -> Option<crate::mcp_gate::McpIdentity> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    parts
+        .extensions
+        .get::<crate::mcp_gate::McpIdentity>()
+        .cloned()
+}
 
 /// What stands in for the client half when a client declared no usable name.
 ///
@@ -1224,6 +1256,107 @@ impl McpServer {
     /// Read per call rather than stored: the account comes off the request
     /// (see [`mcp_account`]), and a copy of it kept on the server would be one
     /// more thing that could disagree with the door.
+    /// Who this call is acting as, as the one value every scoped verb on this
+    /// server is threaded with.
+    ///
+    /// Resolved per call rather than stored, for the same reason
+    /// [`McpServer::share_actor`] is: the account comes off the request the
+    /// gate authenticated, and a copy kept on the server would be one more
+    /// thing that could disagree with the door.
+    ///
+    /// Three answers, one per way of reaching this server:
+    ///
+    /// * **stdio is [`Scope::Unrestricted`]**, and not as a shortcut. A stdio
+    ///   session is a process this machine's harness started, so its caller
+    ///   already has every domain's files on disk; there is nothing here for a
+    ///   check to protect, and the CLI and control socket pass the same value
+    ///   for the same reason.
+    /// * **an authenticated HTTP session is [`Scope::User`]**, carrying the
+    ///   name and the instance role [`crate::mcp_gate::McpGate`] resolved once,
+    ///   before the transport saw the request. Nothing a client sends is read
+    ///   here: the extension is inserted server-side or not at all.
+    /// * **an HTTP session with no identity is [`Scope::Anonymous`]**, which
+    ///   exists only where `auth.mcp` is off - the legacy open tier, where the
+    ///   gate is a pass-through. It reads what is shared and sees no private
+    ///   domain, which is exactly the tier's promise: an instance that never
+    ///   made anything private is byte-identical to its old self, and one that
+    ///   did keeps it out of an unauthenticated agent's reach.
+    fn scope_of(&self, ctx: &RequestContext<RoleServer>) -> Scope {
+        match self.transport {
+            Transport::Stdio => Scope::Unrestricted,
+            Transport::Http => match mcp_identity(ctx) {
+                Some(identity) => Scope::User {
+                    account: identity.name,
+                    admin: identity.admin,
+                },
+                None => Scope::Anonymous,
+            },
+        }
+    }
+
+    /// The gate every write verb passes before it touches a domain, answering
+    /// the same two refusals the REST write routes answer and in the same
+    /// order.
+    ///
+    /// 1. **A domain this caller may not see is the not-found**, decided first,
+    ///    so a stranger writing into a private domain learns exactly what a
+    ///    stranger writing into a domain nobody registered learns. When the
+    ///    call carries an identifier, the domain checked is the one the
+    ///    identifier actually addresses ([`Engine::addressed_domain`]): the
+    ///    absolute `crystalline://` form overrides the domain argument, so
+    ///    gating the argument alone would gate the wrong domain.
+    /// 2. **Then the right**, which is what a private domain adds and what the
+    ///    instance role decides on a shared one. The refusal names the level
+    ///    the caller holds, because "forbidden" on a domain they can see and
+    ///    read is otherwise indistinguishable from a bug.
+    ///
+    /// `Ok(None)` is the allowed case. `Ok(Some(text))` is a refusal to hand
+    /// back through [`refuse`], so the model reads why rather than a bare
+    /// error. `Err` is step one's not-found, which is an engine error because
+    /// it has to be the engine's own bytes.
+    ///
+    /// **[`Scope::Anonymous`] is never refused by step two**, and that is the
+    /// legacy open tier rather than an oversight: an instance with `auth.mcp`
+    /// off has no accounts to hold a level, and every agent reaching it writes
+    /// exactly what it always wrote. Step one still runs for it, and a private
+    /// domain is invisible to it, so there is nothing there for step two to
+    /// protect. [`Scope::Unrestricted`] needs no arm at all - it resolves to
+    /// [`DomainRight::Own`] on every domain.
+    async fn refuse_unwritable(
+        &self,
+        domain: &str,
+        identifier: Option<&str>,
+        scope: &Scope,
+    ) -> Result<Option<String>, ErrorData> {
+        let addressed = match identifier {
+            Some(identifier) => self
+                .engine
+                .addressed_domain(identifier, domain, scope)
+                .await
+                .map_err(to_error)?,
+            None => domain.to_string(),
+        };
+        self.engine
+            .require_domain(&addressed, scope)
+            .await
+            .map_err(to_error)?;
+        if matches!(scope, Scope::Anonymous) {
+            return Ok(None);
+        }
+        let right = self
+            .engine
+            .domain_right(scope, &addressed)
+            .await
+            .map_err(to_error)?;
+        if right < DomainRight::Write {
+            return Ok(Some(format!(
+                "your membership on '{addressed}' is {}, and editor access is required to change it",
+                member_level_word(right)
+            )));
+        }
+        Ok(None)
+    }
+
     fn share_actor(&self, ctx: &RequestContext<RoleServer>) -> ShareActor {
         match self.transport {
             Transport::Stdio => ShareActor::Owner,
@@ -1254,6 +1387,12 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        if let Some(refusal) = self
+            .refuse_unwritable(&p.domain, None, &self.scope_of(&ctx))
+            .await?
+        {
+            return refuse(refusal).map(CallToolResponse::from);
+        }
         let actor = acting_actor(&ctx);
 
         // **A refusal is read before the engine runs, never after it.** A
@@ -1337,13 +1476,15 @@ impl McpServer {
     async fn read_engram(
         &self,
         Parameters(p): Parameters<ReadParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let scope = self.scope_of(&ctx);
         let value = self
             .engine
-            .read_engram(&p, &TASK_11_SCOPE)
+            .read_engram(&p, &scope)
             .await
             .map_err(to_error)?;
-        let links = self.attachment_links(&value).await;
+        let links = self.attachment_links(&value, &scope).await;
         let mut result = ok(value)?;
         result.content.extend(links);
         Ok(result)
@@ -1366,6 +1507,16 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // Before the confirmation round, not after it: a question naming an
+        // engram in a domain the caller may not see is the leak this gate
+        // exists to prevent, and a question about a write that would be
+        // refused is a question nobody should be asked.
+        if let Some(refusal) = self
+            .refuse_unwritable(&p.domain, Some(&p.identifier), &self.scope_of(&ctx))
+            .await?
+        {
+            return refuse(refusal).map(CallToolResponse::from);
+        }
         // One key arms the round and every other edit runs untouched. The
         // parse failure is swallowed rather than reported here on purpose: the
         // engine is the one place that words it, and asking a user about an
@@ -1407,9 +1558,31 @@ impl McpServer {
     async fn move_engram(
         &self,
         Parameters(p): Parameters<MoveParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        let scope = self.scope_of(&ctx);
+        // Both ends, because a move writes at both: a caller who may write only
+        // one of the two could otherwise carry knowledge out of a private
+        // domain into a shared one, or into a domain it was never invited to.
+        // A destination it may not see answers the same not-found the source
+        // would - naming a domain is not a way to learn that it exists.
+        if let Some(refusal) = self
+            .refuse_unwritable(&p.domain, Some(&p.identifier), &scope)
+            .await?
+        {
+            return refuse(refusal);
+        }
+        if let Some(destination) = p
+            .destination_domain
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty() && *d != p.domain)
+            && let Some(refusal) = self.refuse_unwritable(destination, None, &scope).await?
+        {
+            return refuse(refusal);
+        }
         self.engine
-            .move_engram(&p)
+            .move_engram(&p, &scope)
             .await
             .map_err(to_error)
             .and_then(ok_moved)
@@ -1432,6 +1605,13 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
+        // Before the confirmation round, for the reason `edit_engram` states.
+        if let Some(refusal) = self
+            .refuse_unwritable(&p.domain, Some(&p.identifier), &self.scope_of(&ctx))
+            .await?
+        {
+            return refuse(refusal).map(CallToolResponse::from);
+        }
         // The whole confirmation flow lives inside this gate, so a peer that
         // cannot be asked is served exactly what it was served before the flow
         // existed: one call, one delete, one `CallToolResult`.
@@ -1467,9 +1647,10 @@ impl McpServer {
     async fn search_engrams(
         &self,
         Parameters(p): Parameters<SearchParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .search_engrams(&p, &TASK_11_SCOPE)
+            .search_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_found(v))
@@ -1484,9 +1665,10 @@ impl McpServer {
     async fn build_context(
         &self,
         Parameters(p): Parameters<ContextParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .build_context(&p, &TASK_11_SCOPE)
+            .build_context(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1501,9 +1683,10 @@ impl McpServer {
     async fn recent_activity(
         &self,
         Parameters(p): Parameters<RecentParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .recent_activity(&p, &TASK_11_SCOPE)
+            .recent_activity(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1518,9 +1701,10 @@ impl McpServer {
     async fn list_domains(
         &self,
         Parameters(p): Parameters<ListDomainsParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .list_domains(&p, &TASK_11_SCOPE)
+            .list_domains(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1535,9 +1719,10 @@ impl McpServer {
     async fn browse_domain(
         &self,
         Parameters(p): Parameters<BrowseParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .browse_domain(&p, &TASK_11_SCOPE)
+            .browse_domain(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1552,9 +1737,10 @@ impl McpServer {
     async fn validate_engrams(
         &self,
         Parameters(p): Parameters<ValidateParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .validate_engrams(&p, &TASK_11_SCOPE)
+            .validate_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1569,9 +1755,10 @@ impl McpServer {
     async fn infer_schema(
         &self,
         Parameters(p): Parameters<InferParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .infer_schema(&p, &TASK_11_SCOPE)
+            .infer_schema(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1586,9 +1773,10 @@ impl McpServer {
     async fn vocabulary(
         &self,
         Parameters(p): Parameters<VocabularyParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .vocabulary(&p, &TASK_11_SCOPE)
+            .vocabulary(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1603,9 +1791,10 @@ impl McpServer {
     async fn evolve_engrams(
         &self,
         Parameters(p): Parameters<EvolveParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .evolve_engrams(&p, &TASK_11_SCOPE)
+            .evolve_engrams(&p, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1774,6 +1963,15 @@ impl McpServer {
         if refused_collab_tool("share_changes", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // A named domain this caller may not see is refused as an unregistered
+        // one, before the preview names a single file of it. A read gate rather
+        // than a write one: what may be shared is `github.share_identity`'s
+        // question and answered further in, and the narrow form so a domain
+        // that is merely unregistered keeps the answer it always had.
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
                 None => {
@@ -1837,9 +2035,16 @@ impl McpServer {
     async fn update_domain(
         &self,
         Parameters(p): Parameters<UpdateDomainParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if refused_collab_tool("update_domain", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
+        }
+        if let Some(domain) = p.domain.as_deref() {
+            self.engine
+                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .await
+                .map_err(to_error)?;
         }
         // A pull can rewrite a domain's MANIFEST, so `provisioning_declared`
         // can flip here too, and like `add_domain` that announces nothing: the
@@ -1857,9 +2062,16 @@ impl McpServer {
     async fn origin_status(
         &self,
         Parameters(p): Parameters<OriginStatusParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if refused_collab_tool("origin_status", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string());
+        }
+        if let Some(domain) = p.domain.as_deref() {
+            self.engine
+                .refuse_hidden_domain(domain, &self.scope_of(&ctx))
+                .await
+                .map_err(to_error)?;
         }
         self.engine
             .origin_status(p.domain.as_deref())
@@ -1889,6 +2101,12 @@ impl McpServer {
         if refused_collab_tool("resolve_conflict", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Before the question, so a conflict preview never shows both sides of
+        // an engram in a domain this caller may not see.
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
         // Three ways to arrive at a resolution, and the arm order is the
         // behaviour: an explicit one is honoured for every peer and never
         // asked about, an eliciting peer that named none is asked, and any
@@ -1962,6 +2180,11 @@ impl McpServer {
         if refused_collab_tool("withdraw_proposal", self.engine.github_enabled()) {
             return refuse(RemoteError::NotEnabled.to_string()).map(CallToolResponse::from);
         }
+        // Before the preview, for the reason `resolve_conflict` states.
+        self.engine
+            .refuse_hidden_domain(&p.domain, &self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
         let revert = p.revert.unwrap_or(false);
         if confirmation_supported(&ctx) {
             match confirmed(&responses.0) {
@@ -2011,6 +2234,7 @@ impl McpServer {
     async fn provision(
         &self,
         Parameters(p): Parameters<ProvisionParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let action = match p.action.as_str() {
             "status" => ProvisionAction::Status,
@@ -2022,6 +2246,13 @@ impl McpServer {
                         None,
                     ));
                 };
+                // Deciding about a domain is a way of asking whether it
+                // exists, so a domain this caller may not see is refused as an
+                // unregistered one first.
+                self.engine
+                    .refuse_hidden_domain(&domain, &self.scope_of(&ctx))
+                    .await
+                    .map_err(to_error)?;
                 if p.action == "allow" {
                     ProvisionAction::Allow { domain }
                 } else {
@@ -2096,20 +2327,34 @@ impl McpServer {
 /// docs.
 #[prompt_router]
 impl McpServer {
-    /// The routing block the initialize `instructions` also carry, re-rendered
-    /// per call: the cache refresh first is what makes a virtual domain's
-    /// bullets current, exactly as the daemon does before `get_info`.
+    /// The routing block, re-rendered per call and scoped to whoever asked:
+    /// the cache refresh first is what makes a virtual domain's bullets
+    /// current, exactly as the daemon does before `get_info`.
+    ///
+    /// This is the pull-shaped mitigation for a client that never received the
+    /// block on arrival, and unlike the legacy handshake it carries a request
+    /// context - so it hands out that caller's own index rather than either
+    /// everybody's or nobody's.
     #[prompt(
         name = "onboarding",
         title = "Knowledge routing",
         description = "The live knowledge routing block for this server: one routing line per domain plus the behavior rules. Insert at session start."
     )]
-    async fn onboarding_prompt(&self) -> Vec<PromptMessage> {
+    async fn onboarding_prompt(
+        &self,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<Vec<PromptMessage>, ErrorData> {
         self.engine.refresh_routing_cache().await;
-        vec![PromptMessage::new_text(
-            Role::User,
-            self.engine.routing_text(),
-        )]
+        // Scoped, unlike the legacy handshake block: a prompt request carries a
+        // context, so this channel knows who is asking and hands out that
+        // caller's own index. On stdio the scope is unrestricted and the bytes
+        // are the whole block, exactly as before.
+        let text = self
+            .engine
+            .routing_text_scoped(&self.scope_of(&ctx))
+            .await
+            .map_err(to_error)?;
+        Ok(vec![PromptMessage::new_text(Role::User, text)])
     }
 
     /// The static bootstrap snippet, identical to what `crystalline prompt
@@ -2157,6 +2402,36 @@ impl McpServer {
         info
     }
 
+    /// [`McpServer::arrival_info`] for the one arrival path that knows who is
+    /// asking: the 2026-07-28 era's `server/discover`, which carries a request
+    /// context where `initialize` carries none.
+    ///
+    /// Only the routing block is substituted, and only when the deployment's
+    /// onboarding decision left one there. Everything else - the minimal-block
+    /// decision, the TOON note, the server info, the capabilities - comes from
+    /// the shared builder, so the two arrival paths cannot grow a variant the
+    /// other lacks.
+    ///
+    /// A scope that cannot be resolved is an error rather than the unfiltered
+    /// block: onboarding that names a domain the caller may not see is exactly
+    /// what this exists to prevent, and a client that gets an error re-asks.
+    async fn arrival_info_scoped(&self, scope: &Scope) -> Result<ServerInfo, ErrorData> {
+        let mut info = self.arrival_info();
+        if minimal_instructions(self.engine.skills_serve(), self.harness_onboarded) {
+            return Ok(info);
+        }
+        let mut instructions = self
+            .engine
+            .routing_text_scoped(scope)
+            .await
+            .map_err(to_error)?;
+        if self.engine.response_format() == ResponseFormat::Toon {
+            instructions.push_str(TOON_INSTRUCTIONS_NOTE);
+        }
+        info.instructions = Some(instructions);
+        Ok(info)
+    }
+
     /// The resource links a `read_engram` result carries: one per distinct
     /// `assets/` reference in the body that resolves to a stored attachment.
     ///
@@ -2169,7 +2444,15 @@ impl McpServer {
     /// a dangling attachment reference is knowledge debt, and `evolve_engrams`
     /// is where debt is reported. A listing that cannot be read (a domain
     /// dropped between the read and this call) costs the links, never the read.
-    async fn attachment_links(&self, value: &Value) -> Vec<ContentBlock> {
+    ///
+    /// `scope` is the caller's, and the domain is re-checked against it before
+    /// the listing is read. Belt and braces: the value handed in came out of a
+    /// scoped `read_engram`, so its domain is one this caller may already see.
+    /// The engine's attachment listing takes a domain by name and no scope of
+    /// its own, though, so the check is made where the name is used rather than
+    /// assumed from where it came - and a resolver that cannot answer costs the
+    /// links rather than widening them.
+    async fn attachment_links(&self, value: &Value, scope: &Scope) -> Vec<ContentBlock> {
         let (Some(domain), Some(content)) = (
             value.get("domain").and_then(Value::as_str),
             value.get("content").and_then(Value::as_str),
@@ -2178,6 +2461,9 @@ impl McpServer {
         };
         let refs = crystalline_core::find_asset_refs(content);
         if refs.is_empty() {
+            return Vec::new();
+        }
+        if self.engine.require_domain(domain, scope).await.is_err() {
             return Vec::new();
         }
         let Ok(rows) = self.engine.attachment_list(domain).await else {
@@ -2336,7 +2622,23 @@ impl ServerHandler for McpServer {
         // `ServerInfo::default()` would leave rmcp's own `ProtocolVersion::
         // LATEST` here, which moves when the crate does.
         info.protocol_version = newest_legacy_handshake_version();
-        let mut instructions = self.engine.routing_text();
+        // **Which block, and why the transport decides it.** This method is
+        // synchronous and rmcp hands it no request context, so an HTTP server
+        // answering `initialize` has no caller to resolve and no way to leave a
+        // private domain's bullets out of a per-caller block. Naming every
+        // registered domain to whoever opened a session is what a private
+        // domain is not, so HTTP gets the countable half - every behavior rule,
+        // the number of domains, and the pointer at `list_domains`, which does
+        // resolve a caller and does filter. Stdio keeps the full block: that
+        // caller is the machine owner and has the files already.
+        //
+        // The era's own instructions channel does not go through here at all
+        // ([`McpServer::discover`] carries a request context and is scoped);
+        // this is the legacy lifecycle only.
+        let mut instructions = match self.transport {
+            Transport::Stdio => self.engine.routing_text(),
+            Transport::Http => self.engine.routing_text_counted(),
+        };
         if self.engine.response_format() == ResponseFormat::Toon {
             instructions.push_str(TOON_INSTRUCTIONS_NOTE);
         }
@@ -2519,17 +2821,25 @@ impl ServerHandler for McpServer {
     ///
     /// The client's own `_meta.clientInfo` is deliberately not read here. The
     /// specification says implementations "SHOULD NOT use them to change the
-    /// behavior of the client or server", and keying instructions on it would
-    /// additionally force a private cache scope on a result the spec wants
-    /// cacheable.
+    /// behavior of the client or server", so nothing a client *says* about
+    /// itself shapes this answer.
+    ///
+    /// What does shape it is the authorization on the request, which is the one
+    /// variation the caching rules provide for and which rmcp's own
+    /// construction already accounts for: `DiscoverResult::from_server_info`
+    /// sets `cache_scope: Private`, so a per-caller block is never cached
+    /// across callers. The block is rendered through
+    /// [`McpServer::arrival_info_scoped`], so a domain this caller may not see
+    /// is absent from its onboarding rather than named to it.
     async fn discover(
         &self,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<DiscoverResult, ErrorData> {
         self.engine.refresh_routing_cache().await;
+        let info = self.arrival_info_scoped(&self.scope_of(&context)).await?;
         Ok(DiscoverResult::from_server_info(
             self.supported_protocol_versions().into_owned(),
-            self.arrival_info(),
+            info,
         ))
     }
 
@@ -2801,6 +3111,16 @@ impl ServerHandler for McpServer {
                 ..url
             };
             if let Some(path) = url.asset_path() {
+                // An attachment uri names its domain outright, and nothing had
+                // to be read first to learn the name, so this is the one
+                // attachment path a caller can reach cold. A domain it may not
+                // see is refused exactly as an unregistered one - the same
+                // bytes, from the engine's own line - before the file is
+                // touched.
+                self.engine
+                    .require_domain(&url.domain, &self.scope_of(&context))
+                    .await
+                    .map_err(to_error)?;
                 let (bytes, row) = self
                     .engine
                     .attachment_read(&url.domain, path)
@@ -2811,7 +3131,9 @@ impl ServerHandler for McpServer {
                     bytes,
                     &row.mime,
                 )])
-                .with_cache_hints(&context)
+                // Private: this answer depends on who asked, unlike every
+                // other result this server hints (see [`CACHE_SCOPE`]).
+                .with_cache_hints_as(&context, CacheScope::Private)
                 .into());
             }
         }

@@ -1105,6 +1105,84 @@ impl Engine {
             .map_err(|e| EngineError::Internal(e.to_string()))
     }
 
+    /// What `scope` may do on one domain, for a surface that has to refuse a
+    /// write rather than hide the domain.
+    ///
+    /// [`DomainRight::Own`] when no resolver is installed, which is the same
+    /// answer [`Engine::hidden_domains`] gives on that engine: a one-shot CLI
+    /// command, the embedded stdio stack and a test engine are all the machine
+    /// owner. A resolver that cannot answer is an error rather than a
+    /// permissive default - a write that cannot learn what its caller may do
+    /// refuses instead of proceeding on an assumption, exactly as the REST
+    /// write gate does.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    pub async fn domain_right(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+    ) -> Result<crate::scope::DomainRight> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(crate::scope::DomainRight::Own);
+        };
+        access.right(scope, domain).await.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
+    /// Refuse a domain this caller may not see, and say nothing about one that
+    /// is merely unregistered.
+    ///
+    /// The narrow half of [`Engine::require_domain`], for a verb that already
+    /// has its own words for a domain nobody registered and its own order for
+    /// saying them. A hidden domain is refused here with exactly the bytes an
+    /// unregistered one gets, which is the whole point; anything else falls
+    /// through untouched, so adding this gate to a verb cannot change what that
+    /// verb answered before on any input but a private domain.
+    pub async fn refuse_hidden_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        let hidden = self.hidden_for(scope).await?;
+        if hidden.contains(name) {
+            self.domain_entry_scoped(name, &hidden)?;
+        }
+        Ok(())
+    }
+
+    /// The domain a verb is really about once its identifier has been read.
+    ///
+    /// A bare permalink or title is domain-relative, so the domain the call
+    /// named is the domain it acts on. A `crystalline://` URL is the one
+    /// absolute form and overrides that hint, so a gate that checked only the
+    /// named domain would be checking the wrong one: a caller who may write
+    /// `open` could name `crystalline://lab/secret` and reach an engram in a
+    /// domain it was never invited to. This resolves the absolute form through
+    /// [`Engine::resolve_scoped`] with the caller's own hidden set, so a URL
+    /// naming a domain the caller may not see answers exactly as an engram
+    /// nobody wrote does - the same bytes, from the same line.
+    ///
+    /// One extra store lookup, and only for the absolute form; the relative
+    /// form answers without touching the store at all. An `assets/` identifier
+    /// is always relative (see `attachment_identifier`), so an attachment
+    /// delete never takes the resolving branch.
+    pub async fn addressed_domain(
+        &self,
+        identifier: &str,
+        domain: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<String> {
+        if CrystallineUrl::parse(identifier).is_none() {
+            return Ok(domain.to_string());
+        }
+        let hidden = self.hidden_for(scope).await?;
+        let (found, _) = self
+            .resolve_scoped(identifier, Some(domain), &hidden)
+            .await?;
+        Ok(found.domain)
+    }
+
     /// [`Engine::hidden_domains`] as a plain set, with "no filtering at all"
     /// folded into "nothing is hidden".
     ///
@@ -3970,10 +4048,26 @@ impl Engine {
     /// domain, so a move carries content between the two truths: a same-domain
     /// move is a rename (no reparse), a cross-domain move reads the source
     /// content and re-indexes it into the destination's source.
-    pub async fn move_engram(&self, p: &MoveParams) -> Result<Value> {
+    ///
+    /// `scope` bounds the *side effect*, which is the half a surface cannot
+    /// gate for itself. Whether this caller may write either end is decided at
+    /// the edge (the REST write gate, the MCP domain gate); what only this
+    /// function can decide is which other domains it rewrites a link inside.
+    /// A cross-domain move rewrites every bare `[[target]]` that pointed at the
+    /// moved engram into the prefixed form, and those linking engrams live in
+    /// domains the mover may never have been shown. So the rewrite skips a
+    /// domain this caller may not see: its link is left as it was - dangling,
+    /// which its own members see as an unresolved-reference finding on the next
+    /// sweep - rather than silently edited by somebody with no access to it,
+    /// and `links_rewritten` counts the visible rewrites only, so a receipt
+    /// never counts a file its reader may not know exists.
+    pub async fn move_engram(&self, p: &MoveParams, scope: &crate::scope::Scope) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
+        // Resolved once, before anything is written, and used only for the
+        // inbound rewrite below.
+        let hidden = self.hidden_for(scope).await?;
         let (src, src_source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
         let dest_domain = p
             .destination_domain
@@ -4134,6 +4228,11 @@ impl Engine {
         let mut rewritten = 0usize;
         for r in inbound {
             if r.src_domain == dest_domain || r.to_target.contains(':') {
+                continue;
+            }
+            // A linking engram in a domain this caller may not see is left
+            // exactly as it was: see the scope note on this function.
+            if hidden.contains(&r.src_domain) {
                 continue;
             }
             let needle = format!("[[{}]]", r.to_target);
@@ -5632,14 +5731,29 @@ impl Engine {
     /// `None` branch below. So the re-read stays for as long as `domain
     /// remove` is the one mutation path that does not refresh `self.config`.
     pub fn routing_text(&self) -> String {
-        self.routing_text_without(&HashSet::new())
+        crystalline_core::render_instructions(&self.routing_output(&HashSet::new()))
     }
 
-    /// The routing block over every registered domain except the named ones.
-    /// The body of both [`Engine::routing_text`] and
-    /// [`Engine::routing_text_scoped`], so the filtered block is the unfiltered
-    /// one minus some bullets rather than a second rendering.
-    fn routing_text_without(&self, hidden: &HashSet<String>) -> String {
+    /// [`Engine::routing_text`] with the domain lines replaced by the count
+    /// line: every behavior rule, no domain named.
+    ///
+    /// What the legacy `initialize` handshake serves over HTTP. `get_info` is
+    /// synchronous and rmcp calls it with no request context, so that one
+    /// channel has no caller to resolve and cannot leave a private domain's
+    /// bullets out of a per-caller block; it hands out the countable half
+    /// instead and points at `list_domains`, which does resolve a caller. See
+    /// [`crystalline_core::render_counted_instructions`] for the residue that
+    /// leaves. Stdio never calls this: a local session is the machine owner.
+    pub fn routing_text_counted(&self) -> String {
+        crystalline_core::render_counted_instructions(&self.routing_output(&HashSet::new()))
+    }
+
+    /// The routing block's model over every registered domain except the named
+    /// ones. The body of [`Engine::routing_text`],
+    /// [`Engine::routing_text_counted`] and [`Engine::routing_text_scoped`], so
+    /// a filtered block is the unfiltered one minus some bullets rather than a
+    /// second rendering.
+    fn routing_output(&self, hidden: &HashSet<String>) -> crystalline_core::PromptOutput {
         // (1) The effective config, composed the same way a fresh load would
         // see it. With a config path this is a fresh file read plus the overlay;
         // a read error falls back to the in-memory effective config.
@@ -5685,7 +5799,7 @@ impl Engine {
         };
         let mut output = crystalline_core::generate_prompt_unscoped(&global, &virtual_bullets);
         output.read_only = self.read_only();
-        crystalline_core::render_instructions(&output)
+        output
     }
 
     /// [`Engine::routing_text`] for a caller who may not see every domain: the
@@ -5694,18 +5808,22 @@ impl Engine {
     /// Async because resolving a scope reads the accounts database, which is
     /// also why the sync render cannot do this and does not try. The sync one
     /// stays, and stays unfiltered, for the surfaces that have no caller to
-    /// resolve: the CLI and the control socket are the machine owner, and the
-    /// MCP handshake (`get_info`, which rmcp calls without a request context)
-    /// has no identity to scope by at all. That last one is not the machine
-    /// owner - it is an HTTP peer whose initialize instructions this server
-    /// cannot key on anybody - and Task 9 leaves it named here rather than
-    /// silently: on an instance with private domains, the arrival block still
-    /// carries every domain name. The era's own instructions channel
-    /// (`server/discover`) does carry a request context, so scoping it is
-    /// Task 11's to wire through this method.
+    /// resolve: the CLI and the control socket are the machine owner, and they
+    /// already have the files on disk.
+    ///
+    /// The MCP handshake (`get_info`, which rmcp calls without a request
+    /// context) is the one channel that is neither - an HTTP peer whose
+    /// initialize instructions this server cannot key on anybody - and it is
+    /// answered by [`Engine::routing_text_counted`] rather than by this: no
+    /// caller to resolve means no bullets at all rather than everybody's. The
+    /// era's own instructions channel (`server/discover`) does carry a request
+    /// context, and the `onboarding` prompt carries one too, so both are
+    /// scoped through here.
     pub async fn routing_text_scoped(&self, scope: &crate::scope::Scope) -> Result<String> {
         let hidden = self.hidden_for(scope).await?;
-        Ok(self.routing_text_without(&hidden))
+        Ok(crystalline_core::render_instructions(
+            &self.routing_output(&hidden),
+        ))
     }
 
     // --- browse --------------------------------------------------------------

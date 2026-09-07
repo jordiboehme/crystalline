@@ -106,13 +106,16 @@ async fn a_move_and_a_delete_keep_both_folders_in_step() {
 
     // Moving the only engram out of a folder removes that folder's listing.
     engine
-        .move_engram(&MoveParams {
-            identifier: "runbooks/restart".to_string(),
-            domain: "notes".to_string(),
-            destination: "archive/restart.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &MoveParams {
+                identifier: "runbooks/restart".to_string(),
+                domain: "notes".to_string(),
+                destination: "archive/restart.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(!root.join("runbooks/index.md").exists());
@@ -281,13 +284,16 @@ async fn a_reserved_destination_is_refused_with_an_actionable_error() {
         .await
         .unwrap();
     let err = engine
-        .move_engram(&MoveParams {
-            identifier: "keeper".to_string(),
-            domain: "notes".to_string(),
-            destination: "runbooks/index.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &MoveParams {
+                identifier: "keeper".to_string(),
+                domain: "notes".to_string(),
+                destination: "runbooks/index.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("reserved"), "{err}");

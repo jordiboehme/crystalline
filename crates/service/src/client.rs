@@ -1275,7 +1275,11 @@ pub(crate) async fn dispatch_engine(
                 .edit_engram_as(&decode::<EditParams>(args)?, Some(CLI_ACTOR))
                 .await?
         }
-        "move_engram" => engine.move_engram(&decode::<MoveParams>(args)?).await?,
+        "move_engram" => {
+            engine
+                .move_engram(&decode::<MoveParams>(args)?, &Scope::Unrestricted)
+                .await?
+        }
         "delete_engram" => engine.delete_engram(&decode::<DeleteParams>(args)?).await?,
         "search_engrams" => {
             engine
