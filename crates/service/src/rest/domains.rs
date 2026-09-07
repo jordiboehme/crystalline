@@ -74,9 +74,12 @@ use crate::params::{BrowseParams, ListDomainsParams};
 pub async fn list(State(state): State<RestState>) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .list_domains(&ListDomainsParams {
-            include_routing: true,
-        })
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: true,
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     Ok(Json(value))
 }
@@ -192,12 +195,15 @@ pub async fn tree(
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .browse_domain(&BrowseParams {
-            domain,
-            path: query.path,
-            depth: query.depth,
-            glob: query.glob,
-        })
+        .browse_domain(
+            &BrowseParams {
+                domain,
+                path: query.path,
+                depth: query.depth,
+                glob: query.glob,
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     Ok(Json(value))
 }

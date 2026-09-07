@@ -212,6 +212,7 @@ pub async fn list(
                 ..SearchParams::default()
             },
             query.path.as_deref(),
+            &crate::rest::TASK_10_SCOPE,
         )
         .await?;
     Ok(Json(value))
@@ -320,10 +321,13 @@ pub async fn detail(
 ) -> Result<Response, ApiError> {
     let value = state
         .engine
-        .read_engram(&ReadParams {
-            identifier: permalink,
-            domain: Some(domain),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: permalink,
+                domain: Some(domain),
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     let checksum = checksum_of(&value)?.to_string();
     if if_none_match_matches(&headers, &checksum) {
@@ -949,10 +953,13 @@ pub async fn save(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
-                .read_engram(&ReadParams {
-                    identifier: permalink,
-                    domain: Some(domain),
-                })
+                .read_engram(
+                    &ReadParams {
+                        identifier: permalink,
+                        domain: Some(domain),
+                    },
+                    &crate::rest::TASK_10_SCOPE,
+                )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
                 ApiError::internal("the engram read carried no checksum to version it by")
@@ -1510,10 +1517,13 @@ pub async fn remove(
         Err(EngineError::Conflict(message)) if message.starts_with(STALE_EDIT) => {
             let current = state
                 .engine
-                .read_engram(&ReadParams {
-                    identifier: permalink,
-                    domain: Some(domain),
-                })
+                .read_engram(
+                    &ReadParams {
+                        identifier: permalink,
+                        domain: Some(domain),
+                    },
+                    &crate::rest::TASK_10_SCOPE,
+                )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
                 ApiError::internal("the engram read carried no checksum to version it by")
@@ -1545,10 +1555,13 @@ async fn detail_response(
 ) -> Result<Response, ApiError> {
     let value = state
         .engine
-        .read_engram(&ReadParams {
-            identifier: permalink.to_string(),
-            domain: Some(domain.to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: permalink.to_string(),
+                domain: Some(domain.to_string()),
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     let etag = etag(&value)?;
     let mut resp = (status, Json(value)).into_response();

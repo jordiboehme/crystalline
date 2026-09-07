@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, IndexConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::*;
 use tokio::sync::Mutex;
 
@@ -217,21 +218,27 @@ async fn a_dropped_in_index_or_log_file_is_never_indexed() {
     engine.sync(None).await.unwrap();
 
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("reservedlogtoken".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("reservedlogtoken".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 0, "a reserved file never reaches search");
 
     let browsed = engine
-        .browse_domain(&BrowseParams {
-            domain: "notes".to_string(),
-            path: None,
-            depth: None,
-            glob: None,
-        })
+        .browse_domain(
+            &BrowseParams {
+                domain: "notes".to_string(),
+                path: None,
+                depth: None,
+                glob: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let paths: Vec<&str> = browsed["engrams"]
@@ -309,10 +316,13 @@ async fn the_setting_turned_off_generates_nothing_and_leaves_existing_files_alon
     );
     // It stays out of the index either way.
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("hand".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("hand".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 0);

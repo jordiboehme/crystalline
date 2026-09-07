@@ -143,6 +143,7 @@ pub async fn graph(
             &query.anchor,
             query.depth.unwrap_or(DEFAULT_DEPTH),
             query.max_nodes.unwrap_or(DEFAULT_MAX_NODES),
+            &crate::rest::TASK_10_SCOPE,
         )
         .await?;
     Ok(Json(value))

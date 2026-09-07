@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
+use crystalline_service::Scope;
 use crystalline_service::params::WriteParams;
 use crystalline_service::{Engine, EngineError};
 use tokio::sync::Mutex;
@@ -1438,10 +1439,13 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
     );
     assert!(
         engine
-            .read_engram(&crystalline_service::params::ReadParams {
-                identifier: "note".to_string(),
-                domain: Some("into".to_string()),
-            })
+            .read_engram(
+                &crystalline_service::params::ReadParams {
+                    identifier: "note".to_string(),
+                    domain: Some("into".to_string()),
+                },
+                &Scope::Unrestricted
+            )
             .await
             .is_err(),
         "and nothing was indexed there either"

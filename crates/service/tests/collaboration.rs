@@ -13,6 +13,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::{Store, TursoStore};
+use crystalline_service::Scope;
 use crystalline_service::engine::{Engine, EngineError};
 use crystalline_service::params::*;
 use tokio::sync::Mutex;
@@ -147,7 +148,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
     engine_a.sync(None).await.unwrap();
     // domain_stats (through A) shows A hosts eng.
     let a_domains = engine_a
-        .list_domains(&ListDomainsParams::default())
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
         .await
         .unwrap();
     let eng_entry = a_domains["domains"]
@@ -175,20 +176,26 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
 
     // B searches A's hosted domain from the database.
     let hits = engine_b
-        .search_engrams(&SearchParams {
-            query: Some("turbines".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("turbines".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1, "B searches A's hosted domain from the DB");
 
     // B reads A's engram, served from the database content column (file gone).
     let read = engine_b
-        .read_engram(&ReadParams {
-            identifier: "alpha".to_string(),
-            domain: Some("eng".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("eng".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -209,10 +216,13 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
         .await
         .unwrap();
     let a_hits = engine_a
-        .search_engrams(&SearchParams {
-            query: Some("photosynthesis".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("photosynthesis".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(a_hits["total"], 1, "A searches B's virtual engram");
@@ -220,10 +230,13 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
     // A stale-checksum edit conflicts: B reads, A moves the engram on, B's edit
     // with the now-stale checksum is refused.
     let b_read = engine_b
-        .read_engram(&ReadParams {
-            identifier: "shared-insight".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "shared-insight".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let stale = b_read["checksum"].as_str().unwrap().to_string();
@@ -252,7 +265,7 @@ async fn collaboration_flow(store: Arc<Mutex<dyn Store>>) {
     // B migrates hosting with --take-over and acquires the file domain.
     engine_b.sync_take_over(Some("eng"), true).await.unwrap();
     let b_domains = engine_b
-        .list_domains(&ListDomainsParams::default())
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
         .await
         .unwrap();
     let eng_after = b_domains["domains"]

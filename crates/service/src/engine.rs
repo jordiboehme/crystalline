@@ -732,6 +732,44 @@ pub struct Engine {
     domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
 }
 
+/// What a scoped read hands the store as its domain filter, once the caller's
+/// own filter and the domains it may not see have been reconciled.
+///
+/// Three answers rather than an `Option<Vec<String>>`, because the empty vector
+/// is ambiguous where it matters most: the store reads "no filter" as "every
+/// domain", so a caller whose entire filter was hidden would be answered with a
+/// sweep of everything. [`ScopedDomains::Nothing`] is that case, named.
+#[derive(Debug, PartialEq)]
+enum ScopedDomains {
+    /// Nothing is hidden from this caller, so the query keeps the filter it was
+    /// given - empty (every domain) or not. The machine owner's answer, and the
+    /// answer on any installation where nobody made a domain private.
+    AsAsked,
+    /// Query exactly these domains.
+    Only(Vec<String>),
+    /// Nothing in range is readable by this caller. The answer is an empty
+    /// result, which is what a domain nobody registered already produces.
+    Nothing,
+}
+
+/// Cut every node in a hidden domain out of a graph slice, and with it every
+/// edge that had an end there.
+///
+/// A dangling edge is as much of a disclosure as the node it points at - it
+/// says an engram exists, in a domain the caller was told nothing about - so
+/// the two go together, and this runs before anything ranks or caps the slice.
+/// A no-op when nothing is hidden, which is every unscoped read.
+fn retain_visible(slice: &mut GraphSlice, hidden: &HashSet<String>) {
+    if hidden.is_empty() {
+        return;
+    }
+    slice.nodes.retain(|node| !hidden.contains(&node.domain));
+    let kept: HashSet<i64> = slice.nodes.iter().map(|node| node.id.0).collect();
+    slice
+        .edges
+        .retain(|edge| kept.contains(&edge.from.0) && kept.contains(&edge.to.0));
+}
+
 /// One identity's cached GitHub credential for one host: the resolved store
 /// and the token it held at the single keychain read this process ever does for
 /// that pair. The token is non-optional - only a present-token outcome is ever
@@ -1065,6 +1103,73 @@ impl Engine {
             .hidden_domains(scope)
             .await
             .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// [`Engine::hidden_domains`] as a plain set, with "no filtering at all"
+    /// folded into "nothing is hidden".
+    ///
+    /// The two are one instruction to a read path - subtract these names, of
+    /// which there may be none - and folding them here is what keeps every verb
+    /// from re-deciding it. A scoped read holds this set for the whole call and
+    /// hands it to each helper, so one call resolves the caller once.
+    ///
+    /// A resolver error propagates rather than resolving to an empty set: a
+    /// read that cannot learn what its caller may see refuses, and never widens.
+    async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
+        Ok(self.hidden_domains(scope).await?.unwrap_or_default())
+    }
+
+    /// The domain list a scoped store query is given: the caller's own filter
+    /// with the hidden names subtracted, or - when the caller named none and
+    /// something is hidden - every domain the store holds minus those.
+    ///
+    /// [`ScopedDomains::AsAsked`] is the machine owner's answer and the answer
+    /// on any installation with no private domains: nothing is subtracted, no
+    /// extra query runs and the store sees exactly the filter it always saw.
+    ///
+    /// [`ScopedDomains::Nothing`] is the case an empty list would silently
+    /// widen. A caller that named only hidden domains has asked for nothing it
+    /// may read, and `Some(vec![])` is not that request - the search verbs drop
+    /// an empty filter and sweep everything. So it is its own answer, and the
+    /// caller returns the empty page a name nobody registered would have
+    /// produced.
+    async fn scoped_domains(
+        &self,
+        requested: &[String],
+        hidden: &HashSet<String>,
+    ) -> Result<ScopedDomains> {
+        if hidden.is_empty() {
+            return Ok(ScopedDomains::AsAsked);
+        }
+        if !requested.is_empty() {
+            let kept: Vec<String> = requested
+                .iter()
+                .filter(|name| !hidden.contains(*name))
+                .cloned()
+                .collect();
+            return Ok(if kept.is_empty() {
+                ScopedDomains::Nothing
+            } else {
+                ScopedDomains::Only(kept)
+            });
+        }
+        // The store's own domain list rather than the registered one: a shared
+        // database can hold a domain this instance never registered, and a read
+        // that turned an unfiltered sweep into a list of local registrations
+        // would quietly stop answering for those.
+        let store = self.store.lock().await;
+        let stats = store.domain_stats().await?;
+        drop(store);
+        let visible: Vec<String> = stats
+            .into_iter()
+            .map(|d| d.name)
+            .filter(|name| !hidden.contains(name))
+            .collect();
+        Ok(if visible.is_empty() {
+            ScopedDomains::Nothing
+        } else {
+            ScopedDomains::Only(visible)
+        })
     }
 
     /// Turn on shared-database collaboration for this engine by giving it a
@@ -1494,6 +1599,40 @@ impl Engine {
         })
     }
 
+    /// [`Engine::domain_entry`] for a scoped read: a domain the caller may not
+    /// see is answered exactly as a domain nobody registered.
+    ///
+    /// Both halves matter. The hidden name errors instead of resolving, and the
+    /// error's `registered` list has the hidden names taken out of it - an
+    /// unfiltered list would name every private domain on the instance in the
+    /// error text of a request for a domain that does not exist.
+    fn domain_entry_scoped(&self, name: &str, hidden: &HashSet<String>) -> Result<DomainEntry> {
+        if hidden.contains(name) {
+            return Err(self.unknown_domain(name, hidden));
+        }
+        match self.domain_entry(name) {
+            Err(EngineError::UnknownDomain { domain, .. }) => {
+                Err(self.unknown_domain(&domain, hidden))
+            }
+            other => other,
+        }
+    }
+
+    /// The [`EngineError::UnknownDomain`] a scoped caller gets: the registered
+    /// set it names, minus what the caller may not see. A hidden domain and a
+    /// name nobody ever registered produce the same bytes, which is the point -
+    /// existence is the secret being kept.
+    fn unknown_domain(&self, name: &str, hidden: &HashSet<String>) -> EngineError {
+        EngineError::UnknownDomain {
+            domain: name.to_string(),
+            registered: self
+                .known_domain_names()
+                .into_iter()
+                .filter(|known| !hidden.contains(known))
+                .collect(),
+        }
+    }
+
     /// Re-read the global config from disk looking for a domain registered
     /// after this engine started. A hit is cached in `discovered_domains` and,
     /// for a file domain on the daemon, reported over `watch_tx` so the watcher
@@ -1565,25 +1704,54 @@ impl Engine {
         identifier: &str,
         domain: Option<&str>,
     ) -> Result<(EngramDescriptor, ContentSource)> {
+        self.resolve_scoped(identifier, domain, &HashSet::new())
+            .await
+    }
+
+    /// [`Engine::resolve`] with the domains the caller may not see subtracted.
+    ///
+    /// A hidden domain resolves as an empty one rather than as a refusal: the
+    /// lookup is skipped and the miss falls through to the very same
+    /// [`EngineError::NotFound`] an engram that was never written produces,
+    /// byte for byte, because it is produced by the same line. That equality is
+    /// the property this whole path exists for - a caller must not be able to
+    /// tell "you may not see this" from "there is nothing here" - and it holds
+    /// by construction rather than by two messages being kept in step.
+    ///
+    /// The bare cross-domain form filters its matches before it counts them, so
+    /// a hidden domain neither makes an identifier ambiguous nor gets its name
+    /// printed into the ambiguity error.
+    async fn resolve_scoped(
+        &self,
+        identifier: &str,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
         if let Some(url) = CrystallineUrl::parse(identifier) {
-            let store = self.store.lock().await;
-            let d = store
-                .find_engram(&url.domain, &url.permalink)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        url.permalink, url.domain
-                    ))
-                })?;
-            drop(store);
+            let found = if hidden.contains(&url.domain) {
+                None
+            } else {
+                let store = self.store.lock().await;
+                store.find_engram(&url.domain, &url.permalink).await?
+            };
+            let d = found.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    url.permalink, url.domain
+                ))
+            })?;
             let source = self.read_source(&url.domain);
             return Ok((d, source));
         }
 
         if let Some(dom) = domain {
-            let store = self.store.lock().await;
-            let d = store.find_engram(dom, identifier).await?.ok_or_else(|| {
+            let found = if hidden.contains(dom) {
+                None
+            } else {
+                let store = self.store.lock().await;
+                store.find_engram(dom, identifier).await?
+            };
+            let d = found.ok_or_else(|| {
                 // The one wrong shape agents keep producing is the domain
                 // glued onto the permalink; the error teaches the fix so a
                 // stumble recovers in one step.
@@ -1600,15 +1768,17 @@ impl Engine {
                     )),
                 }
             })?;
-            drop(store);
             let source = self.read_source(dom);
             return Ok((d, source));
         }
 
-        // Bare identifier across all domains.
+        // Bare identifier across all domains, minus the ones this caller may
+        // not see. Filtered before the count, so a hidden twin neither turns a
+        // single match into an ambiguity nor names itself in the error.
         let store = self.store.lock().await;
         let mut matches = store.find_engram_any(identifier).await?;
         drop(store);
+        matches.retain(|d| !hidden.contains(&d.domain));
         match matches.len() {
             0 => Err(EngineError::NotFound(format!(
                 "no engram matches '{identifier}'"
@@ -3126,8 +3296,16 @@ impl Engine {
     /// database (virtual domains, and non-host reads over a shared database). The
     /// returned `checksum` is the CAS token an `edit_engram` can pass back as
     /// `expected_checksum` to detect a change since this read.
-    pub async fn read_engram(&self, p: &ReadParams) -> Result<Value> {
-        let (desc, source) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+    ///
+    /// `scope` decides what may be read at all: an engram in a domain the
+    /// caller may not see is [`EngineError::NotFound`], the same miss an engram
+    /// nobody wrote produces, and the inbound sample below never names a domain
+    /// the caller cannot see.
+    pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let (desc, source) = self
+            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
+            .await?;
         let content = self.load_content(&source, &desc).await?;
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let checksum = sha256_hex(content.as_bytes());
@@ -3138,9 +3316,16 @@ impl Engine {
         let (outbound, inbound) = {
             let store = self.store.lock().await;
             let outbound = store.outbound_refs(desc.id).await?;
-            let inbound = store
+            let mut inbound = store
                 .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
                 .await?;
+            // Who points here is answered for the caller asking: a reference
+            // out of a domain this caller may not see names that domain and one
+            // of its file paths, so it is dropped before the count as well as
+            // before the sample. The count states what the sample is drawn
+            // from, and a count of references that cannot be shown would be a
+            // second, quieter way of saying the domain is there.
+            inbound.retain(|r| !hidden.contains(&r.src_domain));
             (outbound, inbound)
         };
 
@@ -4564,8 +4749,17 @@ impl Engine {
     // --- search --------------------------------------------------------------
 
     /// Search across domains, embedding the query when the mode needs it.
-    pub async fn search_engrams(&self, p: &SearchParams) -> Result<Value> {
-        self.search_engrams_under(p, None).await
+    ///
+    /// `scope` decides which domains are in range at all: a caller that named a
+    /// domain it may not see gets what naming an unregistered domain gets - no
+    /// hits from it, and no error saying it is there - and a caller that named
+    /// none searches every domain minus those.
+    pub async fn search_engrams(
+        &self,
+        p: &SearchParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.search_engrams_under(p, None, scope).await
     }
 
     /// [`Engine::search_engrams`] narrowed to one domain-relative folder, which
@@ -4588,8 +4782,11 @@ impl Engine {
         &self,
         p: &SearchParams,
         folder: Option<&str>,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
+        let hidden = self.hidden_for(scope).await?;
+        let scoped = self.scoped_domains(&p.domains, &hidden).await?;
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {
             text: text.clone(),
@@ -4628,6 +4825,25 @@ impl Engine {
                 .await?
         };
         query.mode = effective;
+
+        // The visibility filter is applied after the mode is settled and before
+        // the query is embedded: a search of nothing this caller may read costs
+        // no embedding call and no store round trip, and still reports the mode
+        // the same search over a visible domain would have reported.
+        match scoped {
+            ScopedDomains::AsAsked => {}
+            ScopedDomains::Only(domains) => query.domains = Some(domains),
+            ScopedDomains::Nothing => {
+                return Ok(json!({
+                    "mode": mode_str(effective),
+                    "total": 0,
+                    "page": query.page,
+                    "limit": query.limit,
+                    "count": 0,
+                    "hits": Value::Array(Vec::new()),
+                }));
+            }
+        }
         if matches!(effective, SearchMode::Semantic | SearchMode::Hybrid)
             && let Some(provider) = &provider
         {
@@ -4676,24 +4892,49 @@ impl Engine {
     // --- context -------------------------------------------------------------
 
     /// Traverse the graph around a `crystalline://` anchor.
-    pub async fn build_context(&self, p: &ContextParams) -> Result<Value> {
+    ///
+    /// `scope` bounds the neighbourhood twice over: an anchor in a domain the
+    /// caller may not see is the not-found an anchor that matched nothing gets,
+    /// and a neighbour in such a domain is cut out of the slice before anything
+    /// is ranked, so it neither appears nor lends its mass to what does.
+    pub async fn build_context(
+        &self,
+        p: &ContextParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let url = CrystallineUrl::parse(&p.anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{}' is not a crystalline:// URL", p.anchor))
         })?;
         let depth = p.depth.unwrap_or(1).clamp(1, 3);
         let max_related = p.max_related.unwrap_or(10);
         let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
+        let hidden = self.hidden_for(scope).await?;
 
         let store = self.store.lock().await;
+        // A hidden domain skips the lookup and keeps the branch: a glob over one
+        // falls into the same "matched no engrams" an empty glob produces, and a
+        // named anchor into the same not-found a missing engram produces. Both
+        // are reached by the same lines a visible domain reaches, which is what
+        // makes the two indistinguishable.
+        let visible_anchor = !hidden.contains(&url.domain);
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            store
-                .list_engrams(&url.domain, None, None)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            if visible_anchor {
+                store
+                    .list_engrams(&url.domain, None, None)
+                    .await?
+                    .into_iter()
+                    .filter(|d| url.matches(&d.domain, &d.permalink))
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
-            match store.find_engram(&url.domain, &url.permalink).await? {
+            let found = if visible_anchor {
+                store.find_engram(&url.domain, &url.permalink).await?
+            } else {
+                None
+            };
+            match found {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -4711,7 +4952,14 @@ impl Engine {
         }
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let slice = store.neighbors(&ids, depth).await?;
+        let mut slice = store.neighbors(&ids, depth).await?;
+        // Cut before the ranking, not at output selection like the caller's own
+        // `domains` filter below. The two look alike and are not: a presentation
+        // filter leaves a node in the graph so it still conducts mass as a
+        // bridge, and a node this caller may not see must not be in the graph at
+        // all - a path that only exists through a private engram is a fact about
+        // that engram.
+        retain_visible(&mut slice, &hidden);
 
         // Rank the full slice before any filtering so a domain-filtered node
         // still conducts mass as a bridge; the domain filter applies only at
@@ -4825,23 +5073,38 @@ impl Engine {
         anchor: &str,
         depth: u8,
         max_nodes: usize,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let url = CrystallineUrl::parse(anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{anchor}' is not a crystalline:// URL"))
         })?;
         let depth = depth.clamp(1, 2);
         let max_nodes = max_nodes.clamp(1, MAX_GRAPH_NODES);
+        let hidden = self.hidden_for(scope).await?;
 
         let store = self.store.lock().await;
+        // A hidden domain skips the lookup and keeps the branch, so it answers
+        // with the same miss a visible domain with nothing in it answers with.
+        // See [`Engine::build_context`], which seeds the same way.
+        let visible_anchor = !hidden.contains(&url.domain);
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            store
-                .list_engrams(&url.domain, None, None)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            if visible_anchor {
+                store
+                    .list_engrams(&url.domain, None, None)
+                    .await?
+                    .into_iter()
+                    .filter(|d| url.matches(&d.domain, &d.permalink))
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
-            match store.find_engram(&url.domain, &url.permalink).await? {
+            let found = if visible_anchor {
+                store.find_engram(&url.domain, &url.permalink).await?
+            } else {
+                None
+            };
+            match found {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -4860,7 +5123,11 @@ impl Engine {
 
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let slice = self.sweep_neighbors(&ids, depth).await?;
+        let mut slice = self.sweep_neighbors(&ids, depth).await?;
+        // Before the ranking and before the cap, so a hidden neighbour is
+        // neither drawn nor counted in `hidden` - that number reports what the
+        // cap cut, and a node this caller may not see was never in the picture.
+        retain_visible(&mut slice, &hidden);
 
         let mass = context_rank(&slice, &seed_ids);
         let weight = {
@@ -4938,11 +5205,32 @@ impl Engine {
 
     // --- recent --------------------------------------------------------------
 
-    /// Recent engrams within a timeframe.
-    pub async fn recent_activity(&self, p: &RecentParams) -> Result<Value> {
+    /// Recent engrams within a timeframe, from the domains `scope` may read.
+    ///
+    /// The visibility filter is pushed into the query rather than applied to
+    /// what comes back: the row limit is enforced in SQL, so dropping rows
+    /// afterwards would quietly shorten a scoped caller's answer instead of
+    /// filling it with the next visible engram.
+    pub async fn recent_activity(
+        &self,
+        p: &RecentParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
+        let hidden = self.hidden_for(scope).await?;
+        let domains = match self.scoped_domains(&p.domains, &hidden).await? {
+            ScopedDomains::AsAsked => Some(p.domains.clone()).filter(|d| !d.is_empty()),
+            ScopedDomains::Only(domains) => Some(domains),
+            ScopedDomains::Nothing => {
+                return Ok(json!({
+                    "timeframe": timeframe,
+                    "count": 0,
+                    "engrams": Value::Array(Vec::new()),
+                }));
+            }
+        };
         let filter = RecentFilter {
-            domains: Some(p.domains.clone()).filter(|d| !d.is_empty()),
+            domains,
             after: timeframe_cutoff(&timeframe),
             engram_types: Some(p.types.clone()).filter(|t| !t.is_empty()),
             limit: 50,
@@ -4968,7 +5256,16 @@ impl Engine {
     /// [`crystalline_core::behavior_bullets`]. Remote clients never show the
     /// model the initialize instructions, so this one call is their whole
     /// onboarding - the routing lines and the rules that govern them together.
-    pub async fn list_domains(&self, p: &ListDomainsParams) -> Result<Value> {
+    ///
+    /// A domain `scope` may not see is absent from the listing, not marked as
+    /// withheld: this is the index a caller routes by, and a name in it is the
+    /// whole of what a private domain keeps.
+    pub async fn list_domains(
+        &self,
+        p: &ListDomainsParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
@@ -4977,7 +5274,7 @@ impl Engine {
         // Cloned out from behind the lock before any `.await` below, matching
         // the `hosted`/`discovered_domains` convention elsewhere in this file.
         let domains = self.config.read().unwrap().domains.clone();
-        for (name, entry) in &domains {
+        for (name, entry) in domains.iter().filter(|(name, _)| !hidden.contains(*name)) {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
             let mut obj = json!({
@@ -5297,6 +5594,14 @@ impl Engine {
     /// `None` branch below. So the re-read stays for as long as `domain
     /// remove` is the one mutation path that does not refresh `self.config`.
     pub fn routing_text(&self) -> String {
+        self.routing_text_without(&HashSet::new())
+    }
+
+    /// The routing block over every registered domain except the named ones.
+    /// The body of both [`Engine::routing_text`] and
+    /// [`Engine::routing_text_scoped`], so the filtered block is the unfiltered
+    /// one minus some bullets rather than a second rendering.
+    fn routing_text_without(&self, hidden: &HashSet<String>) -> String {
         // (1) The effective config, composed the same way a fresh load would
         // see it. With a config path this is a fresh file read plus the overlay;
         // a read error falls back to the in-memory effective config.
@@ -5326,10 +5631,43 @@ impl Engine {
 
         // (2) Generate over every registered domain from the cached virtual map,
         // (3) force the engine's effective read-only mode, then (4) render.
+        // A domain the caller may not see is dropped from both halves: out of
+        // the config so it names no routing line, and out of the cached bullets
+        // so nothing of its MANIFEST is rendered.
+        let mut global = global;
         let virtual_bullets = self.routing_virtual.read().unwrap().clone();
+        let virtual_bullets = if hidden.is_empty() {
+            virtual_bullets
+        } else {
+            global.domains.retain(|name, _| !hidden.contains(name));
+            virtual_bullets
+                .into_iter()
+                .filter(|(name, _)| !hidden.contains(name))
+                .collect()
+        };
         let mut output = crystalline_core::generate_prompt_unscoped(&global, &virtual_bullets);
         output.read_only = self.read_only();
         crystalline_core::render_instructions(&output)
+    }
+
+    /// [`Engine::routing_text`] for a caller who may not see every domain: the
+    /// same block, with the hidden domains' routing bullets left out.
+    ///
+    /// Async because resolving a scope reads the accounts database, which is
+    /// also why the sync render cannot do this and does not try. The sync one
+    /// stays, and stays unfiltered, for the surfaces that have no caller to
+    /// resolve: the CLI and the control socket are the machine owner, and the
+    /// MCP handshake (`get_info`, which rmcp calls without a request context)
+    /// has no identity to scope by at all. That last one is not the machine
+    /// owner - it is an HTTP peer whose initialize instructions this server
+    /// cannot key on anybody - and Task 9 leaves it named here rather than
+    /// silently: on an instance with private domains, the arrival block still
+    /// carries every domain name. The era's own instructions channel
+    /// (`server/discover`) does carry a request context, so scoping it is
+    /// Task 11's to wire through this method.
+    pub async fn routing_text_scoped(&self, scope: &crate::scope::Scope) -> Result<String> {
+        let hidden = self.hidden_for(scope).await?;
+        Ok(self.routing_text_without(&hidden))
     }
 
     // --- browse --------------------------------------------------------------
@@ -5358,10 +5696,18 @@ impl Engine {
     /// it selects within the cap rather than across the whole folder. The tree
     /// is a navigation aid; a folder too big to draw is what the paged listing
     /// is for.
-    pub async fn browse_domain(&self, p: &BrowseParams) -> Result<Value> {
+    ///
+    /// A domain `scope` may not see is refused exactly as an unregistered one,
+    /// down to the registered set the error names.
+    pub async fn browse_domain(
+        &self,
+        p: &BrowseParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
-        self.domain_entry(&p.domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        self.domain_entry_scoped(&p.domain, &hidden)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
         let prefix = folder_prefix(&raw);
         let depth = p.depth.unwrap_or(1).clamp(1, TREE_MAX_DEPTH);
@@ -6264,10 +6610,51 @@ impl Engine {
     /// rather than erroring, matching the store contract, so an agent can probe a
     /// fresh domain safely. `domain` echoes the request, `null` for an all-domain
     /// sweep.
-    pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
-        let store = self.store.lock().await;
-        let vocab = store.vocabulary(p.domain.as_deref()).await?;
-        drop(store);
+    ///
+    /// Scoped: a named domain the caller may not see reports the same empty
+    /// lists an unknown one does, and an all-domain sweep covers the domains the
+    /// caller may read. Tag names and their counts are content, so a sweep that
+    /// summed a private domain into its totals would publish that domain's
+    /// vocabulary to everyone who asked for the whole picture.
+    ///
+    /// The sweep is one query per visible domain, merged by
+    /// [`crystalline_index::merge_vocabularies`], and only when something is
+    /// hidden - the store's own sweep is all-domains or one domain, with no
+    /// domain list to hand it. Every unscoped caller keeps the single query.
+    pub async fn vocabulary(
+        &self,
+        p: &VocabularyParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let vocab = match (&p.domain, hidden.is_empty()) {
+            (_, true) => {
+                let store = self.store.lock().await;
+                store.vocabulary(p.domain.as_deref()).await?
+            }
+            (Some(domain), false) if hidden.contains(domain) => {
+                crystalline_index::Vocabulary::default()
+            }
+            (Some(domain), false) => {
+                let store = self.store.lock().await;
+                store.vocabulary(Some(domain)).await?
+            }
+            (None, false) => {
+                let names = match self.scoped_domains(&[], &hidden).await? {
+                    ScopedDomains::Only(names) => names,
+                    // `AsAsked` cannot arrive with something hidden, and
+                    // `Nothing` means there is no domain to sweep.
+                    _ => Vec::new(),
+                };
+                let store = self.store.lock().await;
+                let mut parts = Vec::with_capacity(names.len());
+                for name in &names {
+                    parts.push(store.vocabulary(Some(name)).await?);
+                }
+                drop(store);
+                crystalline_index::merge_vocabularies(parts)
+            }
+        };
         // Every count list is present unconditionally, empty when nothing is in
         // use, so a client reads a list rather than testing for a missing key.
         // Only the two advisory keys below (clusters, aliases) are omitted when

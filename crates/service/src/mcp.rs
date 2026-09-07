@@ -931,6 +931,7 @@ use crate::engine::{
     ProvisionAction, ShareActor, sanitize_actor,
 };
 use crate::params::*;
+use crate::scope::Scope;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
 /// from the initialize handshake rmcp keeps on the peer.
@@ -995,6 +996,17 @@ pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
     let identity = parts.extensions.get::<crate::mcp_gate::McpIdentity>()?;
     Some(identity.name.clone())
 }
+
+/// The scope every read verb on this server is answered with today: none.
+///
+/// A placeholder, and one name rather than seven literals on purpose. Task 11
+/// resolves the calling session's real scope - the account [`mcp_account`]
+/// already reads out of the gate's extension for stdio and HTTP alike - and
+/// replaces the uses of this constant; grepping this name finds every site that
+/// has to move together. Until then an MCP read is what it has always been,
+/// unfiltered, so the tree stays green between the two tasks and stdio (which
+/// is the machine owner and passes this for real) never changes at all.
+const TASK_11_SCOPE: Scope = Scope::Unrestricted;
 
 /// What stands in for the client half when a client declared no usable name.
 ///
@@ -1326,7 +1338,11 @@ impl McpServer {
         &self,
         Parameters(p): Parameters<ReadParams>,
     ) -> Result<CallToolResult, ErrorData> {
-        let value = self.engine.read_engram(&p).await.map_err(to_error)?;
+        let value = self
+            .engine
+            .read_engram(&p, &TASK_11_SCOPE)
+            .await
+            .map_err(to_error)?;
         let links = self.attachment_links(&value).await;
         let mut result = ok(value)?;
         result.content.extend(links);
@@ -1453,7 +1469,7 @@ impl McpServer {
         Parameters(p): Parameters<SearchParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .search_engrams(&p)
+            .search_engrams(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_found(v))
@@ -1470,7 +1486,7 @@ impl McpServer {
         Parameters(p): Parameters<ContextParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .build_context(&p)
+            .build_context(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1487,7 +1503,7 @@ impl McpServer {
         Parameters(p): Parameters<RecentParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .recent_activity(&p)
+            .recent_activity(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1504,7 +1520,7 @@ impl McpServer {
         Parameters(p): Parameters<ListDomainsParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .list_domains(&p)
+            .list_domains(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1521,7 +1537,7 @@ impl McpServer {
         Parameters(p): Parameters<BrowseParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .browse_domain(&p)
+            .browse_domain(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1572,7 +1588,7 @@ impl McpServer {
         Parameters(p): Parameters<VocabularyParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .vocabulary(&p)
+            .vocabulary(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))

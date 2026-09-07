@@ -36,6 +36,17 @@ pub use error::{
 };
 
 use crate::engine::Engine;
+use crate::scope::Scope;
+
+/// The scope every read route on this surface is answered with today: none.
+///
+/// A placeholder, and one name rather than a literal at each call, so Task 10
+/// can grep exactly the sites that move together. That task resolves the real
+/// scope from the session the auth layer already authenticated - a signed-in
+/// account, or [`Scope::Anonymous`] on an instance serving the anonymous
+/// viewer tier - and replaces the uses of this constant. Until then a REST read
+/// is what it has always been, unfiltered.
+pub(crate) const TASK_10_SCOPE: Scope = Scope::Unrestricted;
 
 /// The OpenAPI 3.1 document for this surface, assembled from the
 /// `#[utoipa::path]` annotation on every handler.

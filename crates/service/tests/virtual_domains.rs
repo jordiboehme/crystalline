@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::{Store, TursoStore};
+use crystalline_service::Scope;
 use crystalline_service::engine::{Engine, EngineError};
 use crystalline_service::params::*;
 use tokio::sync::Mutex;
@@ -111,10 +112,13 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
     // Read serves the full markdown from the database, with frontmatter parsed
     // and a checksum returned.
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: "first-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "first-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let content = read["content"].as_str().unwrap();
@@ -140,10 +144,13 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
         .await
         .unwrap();
     let read2 = engine
-        .read_engram(&ReadParams {
-            identifier: "first-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "first-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -155,23 +162,29 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
 
     // Search finds it (text mode; no embeddings configured).
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("appended".to_string()),
-            domains: vec!["notes".to_string()],
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("appended".to_string()),
+                domains: vec!["notes".to_string()],
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1);
 
     // Browse lists the virtual domain's engrams.
     let browsed = engine
-        .browse_domain(&BrowseParams {
-            domain: "notes".to_string(),
-            path: None,
-            depth: None,
-            glob: None,
-        })
+        .browse_domain(
+            &BrowseParams {
+                domain: "notes".to_string(),
+                path: None,
+                depth: None,
+                glob: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let engrams = browsed["engrams"].as_array().unwrap();
@@ -187,10 +200,13 @@ async fn virtual_crud(store: Arc<Mutex<dyn Store>>) {
         .await
         .unwrap();
     let gone = engine
-        .read_engram(&ReadParams {
-            identifier: "first-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "first-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await;
     assert!(matches!(gone, Err(EngineError::NotFound(_))));
 }
@@ -207,10 +223,13 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
 
     // Read to capture the checksum, then let another edit move the engram on.
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: "note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let stale_checksum = read["checksum"].as_str().unwrap().to_string();
@@ -255,10 +274,13 @@ async fn stale_edit_conflict(store: Arc<Mutex<dyn Store>>) {
 
     // The stale change never landed.
     let read2 = engine
-        .read_engram(&ReadParams {
-            identifier: "note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let content = read2["content"].as_str().unwrap();
@@ -313,10 +335,13 @@ async fn virtual_edit_drop_is_cas_consistent(store: Arc<Mutex<dyn Store>>) {
         .unwrap();
 
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: "sentinel-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "sentinel-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let content = read["content"].as_str().unwrap();
@@ -361,10 +386,13 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
         .unwrap();
 
     let before = engine
-        .read_engram(&ReadParams {
-            identifier: "timestamp-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "timestamp-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let before_content = before["content"].as_str().unwrap().to_string();
@@ -395,10 +423,13 @@ async fn virtual_edit_rejects_malformed_temporal_date(store: Arc<Mutex<dyn Store
     // The row is untouched by the rejected edit: a fresh read still returns
     // the pre-edit content and checksum, which still guards a normal edit.
     let after = engine
-        .read_engram(&ReadParams {
-            identifier: "timestamp-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "timestamp-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(after["content"].as_str().unwrap(), before_content);
@@ -463,10 +494,13 @@ async fn full_reindex_preserves_virtual(store: Arc<Mutex<dyn Store>>) {
     engine.reindex(true).await.unwrap();
 
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: "kept-note".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "kept-note".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .expect("virtual engram survives a full reindex");
     assert!(
@@ -478,10 +512,13 @@ async fn full_reindex_preserves_virtual(store: Arc<Mutex<dyn Store>>) {
 
     // The file domain is still indexed too.
     let page = engine
-        .read_engram(&ReadParams {
-            identifier: "page".to_string(),
-            domain: Some("docs".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "page".to_string(),
+                domain: Some("docs".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(page["content"].as_str().unwrap().contains("file body"));
@@ -620,10 +657,13 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
     assert_eq!(dry["rewritten"], 1);
     assert_eq!(dry["dry_run"], true);
     let pre = engine
-        .read_engram(&ReadParams {
-            identifier: "alpha".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -638,10 +678,13 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
         .unwrap();
     assert_eq!(done["rewritten"], 1);
     let after = engine
-        .read_engram(&ReadParams {
-            identifier: "alpha".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let content = after["content"].as_str().unwrap();
@@ -657,9 +700,12 @@ async fn retag_renames_and_merges(store: Arc<Mutex<dyn Store>>) {
 
     // The vocabulary now reports `subject`, never `topic`.
     let vocab = engine
-        .vocabulary(&VocabularyParams {
-            domain: Some("notes".to_string()),
-        })
+        .vocabulary(
+            &VocabularyParams {
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let names: Vec<&str> = vocab["tags"]
@@ -724,10 +770,13 @@ async fn retag_merges_separator_variant(store: Arc<Mutex<dyn Store>>) {
     assert_eq!(merged["rewritten"], 1);
 
     let after = engine
-        .read_engram(&ReadParams {
-            identifier: "under".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "under".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let content = after["content"].as_str().unwrap();
@@ -742,9 +791,12 @@ async fn retag_merges_separator_variant(store: Arc<Mutex<dyn Store>>) {
 
     // The vocabulary now reports only the canonical `multi-word`.
     let vocab = engine
-        .vocabulary(&VocabularyParams {
-            domain: Some("notes".to_string()),
-        })
+        .vocabulary(
+            &VocabularyParams {
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let names: Vec<&str> = vocab["tags"]
@@ -799,10 +851,13 @@ async fn merge_records_alias_in_virtual_manifest(store: Arc<Mutex<dyn Store>>) {
 
     // The virtual MANIFEST now declares the alias, appended as plain content.
     let manifest = engine
-        .read_engram(&ReadParams {
-            identifier: "manifest".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "manifest".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -817,11 +872,14 @@ async fn merge_records_alias_in_virtual_manifest(store: Arc<Mutex<dyn Store>>) {
     // A subsequent search by the old tag folds through the recorded alias and
     // finds the engrams now carrying the canonical tag.
     let hits = engine
-        .search_engrams(&SearchParams {
-            tags: vec!["colour".to_string()],
-            domains: vec!["notes".to_string()],
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                tags: vec!["colour".to_string()],
+                domains: vec!["notes".to_string()],
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -851,10 +909,13 @@ async fn merge_surfaces_conflict_in_virtual_manifest(store: Arc<Mutex<dyn Store>
     // Capture the MANIFEST engram content before the merge, to prove it is left
     // byte-identical (the conflict skips the write).
     let before = engine
-        .read_engram(&ReadParams {
-            identifier: "manifest".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "manifest".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let manifest_before = before["content"].as_str().unwrap().to_string();
@@ -892,10 +953,13 @@ async fn merge_surfaces_conflict_in_virtual_manifest(store: Arc<Mutex<dyn Store>
 
     // The virtual MANIFEST engram is left untouched: nothing was appended.
     let after = engine
-        .read_engram(&ReadParams {
-            identifier: "manifest".to_string(),
-            domain: Some("notes".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "manifest".to_string(),
+                domain: Some("notes".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -932,11 +996,14 @@ async fn deleting_manifest_clears_alias_folding(store: Arc<Mutex<dyn Store>>) {
 
     // The declared alias folds: a search by the old tag finds both engrams.
     let folded = engine
-        .search_engrams(&SearchParams {
-            tags: vec!["colour".to_string()],
-            domains: vec!["notes".to_string()],
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                tags: vec!["colour".to_string()],
+                domains: vec!["notes".to_string()],
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -957,11 +1024,14 @@ async fn deleting_manifest_clears_alias_folding(store: Arc<Mutex<dyn Store>>) {
     // The derived alias rows are cleared, so folding stops: the old tag now finds
     // only its own engram.
     let unfolded = engine
-        .search_engrams(&SearchParams {
-            tags: vec!["colour".to_string()],
-            domains: vec!["notes".to_string()],
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                tags: vec!["colour".to_string()],
+                domains: vec!["notes".to_string()],
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(

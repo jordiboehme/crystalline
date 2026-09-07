@@ -153,19 +153,22 @@ pub async fn search(
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .search_engrams(&SearchParams {
-            query: query.q,
-            domains: csv(query.domains.as_deref()),
-            engram_type: query.engram_type,
-            tags: csv(query.tags.as_deref()),
-            status: query.status,
-            metadata_filters: None,
-            after: query.after,
-            search_type: query.search_type,
-            min_similarity: query.min_similarity,
-            limit: query.limit,
-            page: query.page,
-        })
+        .search_engrams(
+            &SearchParams {
+                query: query.q,
+                domains: csv(query.domains.as_deref()),
+                engram_type: query.engram_type,
+                tags: csv(query.tags.as_deref()),
+                status: query.status,
+                metadata_filters: None,
+                after: query.after,
+                search_type: query.search_type,
+                min_similarity: query.min_similarity,
+                limit: query.limit,
+                page: query.page,
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     Ok(Json(value))
 }
@@ -241,9 +244,12 @@ pub async fn vocabulary(
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .vocabulary(&VocabularyParams {
-            domain: query.domain,
-        })
+        .vocabulary(
+            &VocabularyParams {
+                domain: query.domain,
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     Ok(Json(value))
 }
@@ -362,13 +368,16 @@ pub async fn context(
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .build_context(&ContextParams {
-            anchor: query.anchor,
-            depth: query.depth,
-            domains: csv(query.domains.as_deref()),
-            timeframe: None,
-            max_related: query.max_related,
-        })
+        .build_context(
+            &ContextParams {
+                anchor: query.anchor,
+                depth: query.depth,
+                domains: csv(query.domains.as_deref()),
+                timeframe: None,
+                max_related: query.max_related,
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     Ok(Json(value))
 }
@@ -449,11 +458,14 @@ pub async fn activity(
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .recent_activity(&RecentParams {
-            domains: csv(query.domains.as_deref()),
-            timeframe: query.timeframe,
-            types: csv(query.types.as_deref()),
-        })
+        .recent_activity(
+            &RecentParams {
+                domains: csv(query.domains.as_deref()),
+                timeframe: query.timeframe,
+                types: csv(query.types.as_deref()),
+            },
+            &crate::rest::TASK_10_SCOPE,
+        )
         .await?;
     Ok(Json(value))
 }

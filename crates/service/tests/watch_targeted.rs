@@ -15,6 +15,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::SearchParams;
 use tokio::sync::Mutex;
 
@@ -30,10 +31,13 @@ fn engram(title: &str, permalink: &str, body: &str) -> String {
 
 async fn search_total(engine: &Engine, query: &str) -> u64 {
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some(query.to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some(query.to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     hits["total"].as_u64().unwrap()

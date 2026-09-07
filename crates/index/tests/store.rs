@@ -2646,6 +2646,17 @@ async fn vocabulary_counts(store: &dyn Store) {
         eng_vocab.relation_types
     );
 
+    // Merging every domain's own sweep is the all-domain sweep, name for name
+    // and count for count. That is what a caller who may not read every domain
+    // assembles, and it must not be able to order or count itself differently
+    // from the single query.
+    let ops_vocab = store.vocabulary(Some("ops")).await.unwrap();
+    assert_eq!(
+        crystalline_index::merge_vocabularies(vec![eng_vocab.clone(), ops_vocab]),
+        all,
+        "the merge of the per-domain sweeps is the all-domain sweep"
+    );
+
     // An unknown domain yields empty vectors rather than an error.
     let missing = store.vocabulary(Some("nope")).await.unwrap();
     assert!(

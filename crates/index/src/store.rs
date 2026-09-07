@@ -1198,6 +1198,60 @@ pub(crate) fn build_vocabulary(
     }
 }
 
+/// Sum several vocabularies into one, ordered exactly as a single sweep over
+/// the same domains would order it.
+///
+/// This exists for the one caller that cannot ask SQL for what it wants: a
+/// vocabulary sweep for a caller who may not read every domain. The store's own
+/// sweep is all-domains or one domain, so such a caller reads the domains it may
+/// see and merges here - and the merge is [`build_vocabulary`] itself, fed the
+/// summed per-name counts, so the result cannot order or shape itself
+/// differently from a sweep the store answered in one query.
+pub fn merge_vocabularies(parts: Vec<Vocabulary>) -> Vocabulary {
+    let mut engram_tags: HashMap<String, i64> = HashMap::new();
+    let mut observation_tags: HashMap<String, i64> = HashMap::new();
+    let mut categories: HashMap<String, i64> = HashMap::new();
+    let mut relation_types: HashMap<String, i64> = HashMap::new();
+    let mut types: HashMap<String, i64> = HashMap::new();
+    let mut statuses: HashMap<String, i64> = HashMap::new();
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    fn sum(into: &mut HashMap<String, i64>, rows: Vec<NamedCount>) {
+        for row in rows {
+            *into.entry(row.name).or_default() += row.count;
+        }
+    }
+    for part in parts {
+        for tag in part.tags {
+            // A zero count is a name SQL would never have grouped, so it is not
+            // carried into the pair lists `build_vocabulary` expects.
+            if tag.engrams != 0 {
+                *engram_tags.entry(tag.name.clone()).or_default() += tag.engrams;
+            }
+            if tag.observations != 0 {
+                *observation_tags.entry(tag.name).or_default() += tag.observations;
+            }
+        }
+        sum(&mut categories, part.categories);
+        sum(&mut relation_types, part.relation_types);
+        sum(&mut types, part.types);
+        sum(&mut statuses, part.statuses);
+        aliases.extend(
+            part.aliases
+                .into_iter()
+                .map(|alias| (alias.alias, alias.canonical)),
+        );
+    }
+    build_vocabulary(
+        engram_tags.into_iter().collect(),
+        observation_tags.into_iter().collect(),
+        categories.into_iter().collect(),
+        relation_types.into_iter().collect(),
+        types.into_iter().collect(),
+        statuses.into_iter().collect(),
+        aliases,
+    )
+}
+
 /// The backend-agnostic storage interface. All methods are async so a network
 /// backend can implement the same trait.
 #[async_trait]

@@ -42,7 +42,7 @@ pub use store::{
     InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, MetadataFilter,
     NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter, SearchHit, SearchMode,
     SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status,
-    is_retired_status, parse_metadata_filters, retired_factor, salience_prior,
+    is_retired_status, merge_vocabularies, parse_metadata_filters, retired_factor, salience_prior,
 };
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, Family, Finding, RULES, RuleInfo, SHARE_STALE_DAYS,

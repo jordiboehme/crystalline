@@ -24,6 +24,7 @@ use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
     FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
+use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
 use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::{Engine, EnvOverlay};
@@ -351,10 +352,13 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
 
     // Indexed: readable through the engine's own read path.
     let read = eng
-        .read_engram(&ReadParams {
-            identifier: "alpha".to_string(),
-            domain: Some("brand-knowledge".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("brand-knowledge".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -907,10 +911,13 @@ async fn origin_update_applies_an_upstream_edit_and_the_index_reflects_it() {
 
     // The index reflects it too.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("revised upstream".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("revised upstream".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1);
@@ -1031,10 +1038,13 @@ async fn origin_update_bootstraps_an_env_domain_then_plain_pulls() {
 
     // Indexed and searchable through the engine's own read path.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("turbines".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("turbines".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1);
@@ -1669,10 +1679,13 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     let found = |needle: &'static str| {
         let eng = &eng;
         async move {
-            eng.search_engrams(&SearchParams {
-                query: Some(needle.to_string()),
-                ..SearchParams::default()
-            })
+            eng.search_engrams(
+                &SearchParams {
+                    query: Some(needle.to_string()),
+                    ..SearchParams::default()
+                },
+                &Scope::Unrestricted,
+            )
             .await
             .unwrap()["total"]
                 .as_u64()
@@ -2474,10 +2487,13 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
 
     // The index reflects the restored content: sync ran after the withdraw.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("base content".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("base content".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1, "{hits}");
@@ -2622,10 +2638,13 @@ async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
 
     // The index reflects the resolved content: sync ran after resolve.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("UPSTREAM".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("UPSTREAM".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1, "{hits}");
@@ -2749,12 +2768,15 @@ async fn hybrid_search_returns_hits_and_embeds_the_query_once() {
     assert!(before >= 1, "the inline embed pass ran during domain add");
 
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("alpha".to_string()),
-            search_type: Some("hybrid".to_string()),
-            domains: vec!["local-notes".to_string()],
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("alpha".to_string()),
+                search_type: Some("hybrid".to_string()),
+                domains: vec!["local-notes".to_string()],
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 

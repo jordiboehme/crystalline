@@ -19,6 +19,7 @@ use crate::instance::{Connection, acquire_ownership, ensure_daemon, try_attach};
 use crate::mcp::McpServer;
 use crate::overlay;
 use crate::params::*;
+use crate::scope::Scope;
 
 /// Whether a CLI verb may route to a running daemon instead of opening the
 /// index (or config) directly. An explicit `db` or `config_path` override means
@@ -1247,6 +1248,10 @@ pub async fn virtual_routing_bullets(
 /// tool's params type. Reachable from [`crate::control`] so the ctl `tool`
 /// command dispatches a daemon-attached CLI data verb through the exact same
 /// name-to-method mapping the standalone path uses.
+///
+/// Every read here is [`Scope::Unrestricted`], and that is the answer rather
+/// than a placeholder: this dispatcher is reached from the CLI and the control
+/// socket, and whoever can run either already holds the files on disk.
 pub(crate) async fn dispatch_engine(
     engine: &Engine,
     tool: &str,
@@ -1260,7 +1265,11 @@ pub(crate) async fn dispatch_engine(
                 .write_engram_as(&decode::<WriteParams>(args)?, Some(CLI_ACTOR))
                 .await?
         }
-        "read_engram" => engine.read_engram(&decode::<ReadParams>(args)?).await?,
+        "read_engram" => {
+            engine
+                .read_engram(&decode::<ReadParams>(args)?, &Scope::Unrestricted)
+                .await?
+        }
         "edit_engram" => {
             engine
                 .edit_engram_as(&decode::<EditParams>(args)?, Some(CLI_ACTOR))
@@ -1270,25 +1279,29 @@ pub(crate) async fn dispatch_engine(
         "delete_engram" => engine.delete_engram(&decode::<DeleteParams>(args)?).await?,
         "search_engrams" => {
             engine
-                .search_engrams(&decode::<SearchParams>(args)?)
+                .search_engrams(&decode::<SearchParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
         "build_context" => {
             engine
-                .build_context(&decode::<ContextParams>(args)?)
+                .build_context(&decode::<ContextParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
         "recent_activity" => {
             engine
-                .recent_activity(&decode::<RecentParams>(args)?)
+                .recent_activity(&decode::<RecentParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
         "list_domains" => {
             engine
-                .list_domains(&decode::<ListDomainsParams>(args)?)
+                .list_domains(&decode::<ListDomainsParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
-        "browse_domain" => engine.browse_domain(&decode::<BrowseParams>(args)?).await?,
+        "browse_domain" => {
+            engine
+                .browse_domain(&decode::<BrowseParams>(args)?, &Scope::Unrestricted)
+                .await?
+        }
         "validate_engrams" => {
             engine
                 .validate_engrams(&decode::<ValidateParams>(args)?)
@@ -1297,7 +1310,7 @@ pub(crate) async fn dispatch_engine(
         "infer_schema" => engine.infer_schema(&decode::<InferParams>(args)?).await?,
         "vocabulary" => {
             engine
-                .vocabulary(&decode::<VocabularyParams>(args)?)
+                .vocabulary(&decode::<VocabularyParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
         // Matched through the constant rather than a literal so the CLI verb,

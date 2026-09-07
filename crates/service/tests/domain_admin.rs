@@ -10,6 +10,7 @@ use crystalline_core::config::{
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams};
 use tokio::sync::Mutex;
 
@@ -64,10 +65,13 @@ async fn unregister_keeps_files_and_clears_the_index() {
     let (tmp, engine) = engine().await;
     // Indexed before: the engram is findable.
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("alpha".to_string()),
-            ..Default::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("alpha".to_string()),
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(hits.to_string().contains("alpha"), "{hits}");
@@ -79,15 +83,18 @@ async fn unregister_keeps_files_and_clears_the_index() {
     // The files survive; the registration and the index rows do not.
     assert!(tmp.path().join("eng/alpha.md").exists());
     let listing = engine
-        .list_domains(&ListDomainsParams::default())
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
         .await
         .unwrap();
     assert!(!listing.to_string().contains("\"eng\""), "{listing}");
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("alpha".to_string()),
-            ..Default::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("alpha".to_string()),
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -341,20 +348,26 @@ async fn import_files_walks_the_classification_on_a_file_domain() {
         .unwrap();
     assert!(tmp.path().join("eng/beta.md").exists());
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("beta".to_string()),
-            ..Default::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("beta".to_string()),
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(hits.to_string().contains("beta"), "{hits}");
     // Findable by identifier too: the targeted sync really indexed the file,
     // rather than the query text merely echoing in the response.
     engine
-        .read_engram(&ReadParams {
-            identifier: "beta".to_string(),
-            domain: Some("eng".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "beta".to_string(),
+                domain: Some("eng".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -456,10 +469,13 @@ async fn import_files_lands_in_a_virtual_domain_too() {
     assert_eq!(preview["created"], 1, "{preview}");
     assert!(
         engine
-            .read_engram(&ReadParams {
-                identifier: "beta".to_string(),
-                domain: Some("pad".to_string()),
-            })
+            .read_engram(
+                &ReadParams {
+                    identifier: "beta".to_string(),
+                    domain: Some("pad".to_string()),
+                },
+                &Scope::Unrestricted
+            )
             .await
             .is_err(),
         "dry_run writes nothing on the virtual arm either"
@@ -476,10 +492,13 @@ async fn import_files_lands_in_a_virtual_domain_too() {
         .unwrap();
     assert_eq!(done["created"], 1, "{done}");
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: "beta".to_string(),
-            domain: Some("pad".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "beta".to_string(),
+                domain: Some("pad".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(read.to_string().contains("The beta rule."), "{read}");

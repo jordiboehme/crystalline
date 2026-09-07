@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::{DeleteParams, ReadParams, RetireParams, SaveParams};
 use tokio::sync::Mutex;
 
@@ -51,10 +52,13 @@ async fn engine_fixture() -> (tempfile::TempDir, Arc<Engine>) {
 /// The checksum a read reports, which is the save's CAS token.
 async fn checksum_of(engine: &Engine, domain: &str, identifier: &str) -> (String, String) {
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: identifier.to_string(),
-            domain: Some(domain.to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: identifier.to_string(),
+                domain: Some(domain.to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     (
