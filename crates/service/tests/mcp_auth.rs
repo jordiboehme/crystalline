@@ -25,7 +25,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
+    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, OriginConfig, ResponseFormat,
+    ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
@@ -1189,10 +1190,19 @@ async fn break_the_visibility_table(path: &std::path::Path) {
 }
 
 async fn mcp_ctx(mcp_auth: bool) -> VisibilityCtx {
-    mcp_ctx_with(mcp_auth, false).await
+    mcp_ctx_with(mcp_auth, false, false).await
 }
 
-async fn mcp_ctx_with(mcp_auth: bool, fault: bool) -> VisibilityCtx {
+/// The same instance with `lab` also carrying a GitHub origin and
+/// `github.enabled` on, which is what the collaboration verbs need before they
+/// answer anything at all. Only `lab` is a team domain, so a caller that may
+/// not see it has an empty target list and the aggregate verbs resolve no
+/// provider and reach no network for it.
+async fn mcp_team_ctx() -> VisibilityCtx {
+    mcp_ctx_with(true, false, true).await
+}
+
+async fn mcp_ctx_with(mcp_auth: bool, fault: bool, team: bool) -> VisibilityCtx {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -1204,7 +1214,26 @@ async fn mcp_ctx_with(mcp_auth: bool, fault: bool) -> VisibilityCtx {
         let dir = root.join(name);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("MANIFEST.md"), manifest).unwrap();
-        cfg.domains.insert(name.to_string(), DomainEntry::file(dir));
+        let entry = if team && name == "lab" {
+            DomainEntry {
+                origin: Some(OriginConfig {
+                    repo: "acme/lab".to_string(),
+                    path: None,
+                    branch: None,
+                    poll_secs: None,
+                }),
+                ..DomainEntry::file(dir)
+            }
+        } else {
+            DomainEntry::file(dir)
+        };
+        cfg.domains.insert(name.to_string(), entry);
+    }
+    if team {
+        cfg.github = Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        });
     }
     std::fs::write(root.join("open").join("open-note.md"), VIS_OPEN_NOTE).unwrap();
     std::fs::write(root.join("lab").join("lab-note.md"), VIS_LAB_NOTE).unwrap();
@@ -1225,12 +1254,12 @@ async fn mcp_ctx_with(mcp_auth: bool, fault: bool) -> VisibilityCtx {
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
-    let engine = Arc::new(Engine::new(
-        Arc::new(Mutex::new(store)),
-        cfg,
-        None,
-        Some(config_path),
-    ));
+    let engine = Arc::new(
+        Engine::new(Arc::new(Mutex::new(store)), cfg, None, Some(config_path))
+            // An empty temp directory, so nothing here ever reads the developer's
+            // real OS keychain looking for a GitHub credential.
+            .with_token_store_dir(root.join("tokens")),
+    );
     engine.sync(None).await.unwrap();
 
     let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
@@ -1547,8 +1576,9 @@ async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
         )
         .await;
     assert!(
-        written.contains("\"result\""),
-        "an admin writes the private domain:\n{written}"
+        written.contains("admin-note"),
+        "an admin writes the private domain, and the receipt names what it \
+         wrote rather than merely arriving:\n{written}"
     );
     assert!(ctx.path("lab", "admin-note.md").exists());
 }
@@ -1849,7 +1879,7 @@ async fn the_http_handshake_carries_the_rules_and_no_domain_name() {
 /// It answers nothing. Not the unfiltered list, not a partial one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_scoped_read_refuses_when_the_resolver_cannot_answer() {
-    let ctx = mcp_ctx_with(true, true).await;
+    let ctx = mcp_ctx_with(true, true, false).await;
     let token = ctx.token_for("boss").await;
     let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
 
@@ -1879,9 +1909,210 @@ async fn a_scoped_read_refuses_when_the_resolver_cannot_answer() {
     // rather than a happy accident of one verb's error handling.
     assert!(
         ctx.engine
-            .hidden_domains(&crystalline_service::Scope::Anonymous)
+            .hidden_domains(&crystalline_service::Scope::User {
+                account: "boss".to_string(),
+                admin: true,
+            })
             .await
             .is_err(),
-        "the resolver itself is what is failing"
+        "the resolver itself is what is failing, for the very scope those \
+         calls were made under"
+    );
+}
+
+/// **`provision` with `action: "status"` enumerates, so it is scoped like every
+/// other listing.**
+///
+/// `status` walks every registered domain and reports one entry per domain
+/// whether or not that domain declares a `## Provisioning` section, so its
+/// `domains` array is a complete list of names - the same disclosure
+/// `list_domains` exists to prevent, through a verb nobody would look at twice.
+/// It is a pure read and stays allowed on a read-only instance, so the answer
+/// is to narrow what it may see rather than to refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_status_lists_only_the_domains_a_caller_may_see() {
+    let ctx = mcp_ctx(true).await;
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Viewer)
+        .await;
+
+    let status = serde_json::json!({ "action": "status" });
+
+    let stranger = ctx.token_for("out").await;
+    let theirs = McpTestSession::open(&ctx.addr, Some(&stranger))
+        .await
+        .call_tool("provision", status.clone())
+        .await;
+    assert!(
+        theirs.contains("open") && theirs.contains("second"),
+        "a stranger still gets a real report:\n{theirs}"
+    );
+    assert!(
+        !theirs.contains("lab"),
+        "with no entry for the domain it may not see:\n{theirs}"
+    );
+
+    for (who, token) in [
+        ("mem", ctx.token_for("mem").await),
+        ("boss", ctx.token_for("boss").await),
+    ] {
+        let mine = McpTestSession::open(&ctx.addr, Some(&token))
+            .await
+            .call_tool("provision", status.clone())
+            .await;
+        assert!(
+            mine.contains("lab"),
+            "{who} may see lab, so its status names it:\n{mine}"
+        );
+    }
+}
+
+/// The same, one tier down: with `auth.mcp` off there is nobody to be, and the
+/// open tier must not be the way around the filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_status_hides_a_private_domain_from_the_open_tier_too() {
+    let ctx = mcp_ctx(false).await;
+    let report = McpTestSession::open(&ctx.addr, None)
+        .await
+        .call_tool("provision", serde_json::json!({ "action": "status" }))
+        .await;
+    assert!(report.contains("open"), "the report is real:\n{report}");
+    assert!(
+        !report.contains("lab"),
+        "and names no private domain:\n{report}"
+    );
+}
+
+/// **The aggregate collaboration verbs answer over the caller's own domains.**
+///
+/// `origin_status` and `update_domain` both take an optional domain, and with
+/// none they sweep every registered domain that carries an origin. That
+/// aggregate form is where a private team domain's name, its open proposals and
+/// its conflicts would reach a stranger - and `update_domain` would go further
+/// and pull into it, a write inside a domain the caller is not a member of.
+///
+/// Only `lab` carries an origin here, so a caller that may not see it has an
+/// empty target list: nothing resolves a provider and nothing reaches the
+/// network, which is also what keeps this test offline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_aggregate_origin_verbs_answer_over_visible_domains_only() {
+    let ctx = mcp_team_ctx().await;
+    ctx.add_member("lab", "mem", crystalline_service::rest::MemberLevel::Viewer)
+        .await;
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+
+    let stranger = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&stranger)).await;
+    let status = session
+        .call_tool("origin_status", serde_json::json!({}))
+        .await;
+    assert!(
+        status.contains("connection"),
+        "the verb answers rather than refusing:\n{status}"
+    );
+    assert!(
+        !status.contains("lab") && !status.contains("acme"),
+        "and names no team domain this caller may not see:\n{status}"
+    );
+
+    let pulled = session
+        .call_tool("update_domain", serde_json::json!({}))
+        .await;
+    assert!(
+        !pulled.contains("lab"),
+        "the sweep pull names none of it either:\n{pulled}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "and nothing was pulled into a domain the caller is no member of"
+    );
+
+    // Naming it directly is answered as an unregistered domain, and the
+    // registered set the error names is filtered too.
+    let named = session
+        .call_tool("origin_status", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        named.contains("not registered") && !named.contains("acme"),
+        "a named hidden team domain is refused as unregistered:\n{named}"
+    );
+
+    for (who, token) in [
+        ("mem", ctx.token_for("mem").await),
+        ("boss", ctx.token_for("boss").await),
+    ] {
+        let mine = McpTestSession::open(&ctx.addr, Some(&token))
+            .await
+            .call_tool("origin_status", serde_json::json!({}))
+            .await;
+        assert!(
+            mine.contains("lab"),
+            "{who} may see lab, so the sweep reports it:\n{mine}"
+        );
+    }
+}
+
+/// **A call whose two halves disagree is refused before it can name anything.**
+///
+/// An absolute `crystalline://` identifier and a different `domain` argument
+/// used to send the gate and the engine to two different domains: the gate
+/// checked the identifier's, the engine used the argument's, and the argument
+/// was never checked at all. Reaching the unscoped source lookup behind it
+/// answers with the whole registered set, private domains included - a full
+/// enumeration out of a write the caller was never entitled to make.
+///
+/// Both halves are now the named domain, and the engine refuses the mismatch
+/// itself, so neither the registered set nor a path inside a hidden domain
+/// comes back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mismatched_identifier_and_domain_names_no_other_domain() {
+    let ctx = mcp_ctx(true).await;
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    // An unregistered domain argument: the error must not enumerate.
+    let ghost = session
+        .call_tool(
+            "move_engram",
+            serde_json::json!({
+                "identifier": "crystalline://open/open-note",
+                "domain": "ghost",
+                "destination": "y.md",
+            }),
+        )
+        .await;
+    assert!(
+        ghost.contains("not registered"),
+        "the call is refused at the domain check rather than somewhere earlier, \
+         which is what makes the assertion below say anything:\n{ghost}"
+    );
+    assert!(
+        !ghost.contains("lab"),
+        "and the registered set it names is the caller's own:\n{ghost}"
+    );
+
+    // A hidden domain argument: answered as an unregistered one, with no
+    // path-existence oracle inside it.
+    let hidden = session
+        .call_tool(
+            "move_engram",
+            serde_json::json!({
+                "identifier": "crystalline://open/open-note",
+                "domain": "lab",
+                "destination": "lab-note.md",
+            }),
+        )
+        .await;
+    assert!(
+        hidden.contains("not registered"),
+        "a hidden domain argument is the unregistered answer:\n{hidden}"
+    );
+    assert!(
+        !hidden.contains("already exists"),
+        "and never a report about what is inside it:\n{hidden}"
+    );
+    assert!(
+        std::fs::read_to_string(ctx.path("open", "open-note.md")).is_ok(),
+        "nothing moved"
     );
 }

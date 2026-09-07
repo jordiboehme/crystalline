@@ -204,7 +204,10 @@ impl Harness {
         }
         let c2 = mock.add_commit(origin_tree);
         mock.set_branch("main", &c2);
-        engine.origin_update(Some("kb")).await.unwrap();
+        engine
+            .origin_update(Some("kb"), &crystalline_service::Scope::Unrestricted)
+            .await
+            .unwrap();
         (
             Harness {
                 _tmp: tmp,
@@ -3152,7 +3155,11 @@ async fn conflicted_kb(h: &Harness, mock: &MockProvider) -> String {
         .collect(),
     );
     mock.set_branch("main", &c2);
-    let update = h.engine.origin_update(Some("kb")).await.unwrap();
+    let update = h
+        .engine
+        .origin_update(Some("kb"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
     let conflicts = update["domains"][0]["conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1, "{update}");
     conflicts[0]["path"].as_str().unwrap().to_string()
@@ -3251,7 +3258,11 @@ async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three()
     assert!(text.contains("theirs"), "{text}");
     assert!(text.contains("merged"), "{text}");
     // And the conflict is still open.
-    let status = h.engine.origin_status(Some("kb")).await.unwrap();
+    let status = h
+        .engine
+        .origin_status(Some("kb"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(
         status["domains"][0]["conflicts"].as_array().unwrap().len(),
         1

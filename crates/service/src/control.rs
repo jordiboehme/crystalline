@@ -285,7 +285,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {
             let domain = req.get("domain").and_then(Value::as_str);
-            match shared.engine.origin_update(domain).await {
+            match shared
+                .engine
+                .origin_update(domain, &crate::scope::Scope::Unrestricted)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -294,7 +298,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // relative to its origin, plus this machine's GitHub connection.
         "origin_status" => {
             let domain = req.get("domain").and_then(Value::as_str);
-            match shared.engine.origin_status(domain).await {
+            match shared
+                .engine
+                .origin_status(domain, &crate::scope::Scope::Unrestricted)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -401,7 +409,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 )),
             };
             match action {
-                Ok(action) => match shared.engine.provision(&action).await {
+                Ok(action) => match shared
+                    .engine
+                    .provision(&action, &crate::scope::Scope::Unrestricted)
+                    .await
+                {
                     Ok(data) => (envelope_ok(data), false),
                     Err(e) => (envelope_err(e.to_string()), false),
                 },

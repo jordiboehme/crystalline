@@ -2228,7 +2228,9 @@ async fn resolve_conflict_tool_wires_through_to_origin_resolve() {
         ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
     ]));
     mock.set_branch("main", &c2);
-    eng.origin_update(Some("brand")).await.unwrap();
+    eng.origin_update(Some("brand"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
 
     let (client, _server) = connect(eng).await;
     let peer = client.peer();

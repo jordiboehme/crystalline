@@ -1151,38 +1151,6 @@ impl Engine {
         Ok(())
     }
 
-    /// The domain a verb is really about once its identifier has been read.
-    ///
-    /// A bare permalink or title is domain-relative, so the domain the call
-    /// named is the domain it acts on. A `crystalline://` URL is the one
-    /// absolute form and overrides that hint, so a gate that checked only the
-    /// named domain would be checking the wrong one: a caller who may write
-    /// `open` could name `crystalline://lab/secret` and reach an engram in a
-    /// domain it was never invited to. This resolves the absolute form through
-    /// [`Engine::resolve_scoped`] with the caller's own hidden set, so a URL
-    /// naming a domain the caller may not see answers exactly as an engram
-    /// nobody wrote does - the same bytes, from the same line.
-    ///
-    /// One extra store lookup, and only for the absolute form; the relative
-    /// form answers without touching the store at all. An `assets/` identifier
-    /// is always relative (see `attachment_identifier`), so an attachment
-    /// delete never takes the resolving branch.
-    pub async fn addressed_domain(
-        &self,
-        identifier: &str,
-        domain: &str,
-        scope: &crate::scope::Scope,
-    ) -> Result<String> {
-        if CrystallineUrl::parse(identifier).is_none() {
-            return Ok(domain.to_string());
-        }
-        let hidden = self.hidden_for(scope).await?;
-        let (found, _) = self
-            .resolve_scoped(identifier, Some(domain), &hidden)
-            .await?;
-        Ok(found.domain)
-    }
-
     /// [`Engine::hidden_domains`] as a plain set, with "no filtering at all"
     /// folded into "nothing is hidden".
     ///
@@ -8164,7 +8132,20 @@ impl Engine {
     /// receipt (`crystalline install`'s own memory of which harnesses are
     /// onboarded), never a caller-supplied list: provisioning targets every
     /// harness this machine has actually wired up.
-    pub async fn provision(&self, action: &ProvisionAction) -> Result<Value> {
+    pub async fn provision(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        // Resolved once, and used two different ways below because the two
+        // arms owe different things. `Status` is a pure read, so it must not
+        // even compute over a domain this caller may not see: the config it is
+        // given is narrowed first. `Allow`, `Deny` and `Apply` reconcile this
+        // *machine's* harnesses, and narrowing what they reconcile over would
+        // make a stranger's call retire a hidden domain's installed artifacts -
+        // worse than the disclosure it would close - so those keep the whole
+        // config and only their report is narrowed.
+        let hidden = self.hidden_for(scope).await?;
         let install_receipt = crystalline_core::provision::install_receipt_path()
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
@@ -8179,7 +8160,15 @@ impl Engine {
 
         match action {
             ProvisionAction::Status => {
-                let config = self.config.read().unwrap().clone();
+                let mut config = self.config.read().unwrap().clone();
+                // The whole of the scoping for this arm: `provision::status`
+                // walks `config.domains` and pushes one entry per registered
+                // domain whether or not it declares anything, so its report is
+                // a complete list of domain names. Subtracting first drops a
+                // hidden domain out of `domains`, `pending` and
+                // `virtual_with_decision` at once, and out of the counts that
+                // are derived from them.
+                config.domains.retain(|name, _| !hidden.contains(name));
                 let report = crystalline_core::provision::status(
                     &config,
                     &receipt_path,
@@ -8219,13 +8208,13 @@ impl Engine {
                     *file_guard = file;
                     *self.config.write().unwrap() = effective;
                 }
-                self.run_provision_apply(&receipt_path, &harnesses)
+                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
             ProvisionAction::Apply => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                self.run_provision_apply(&receipt_path, &harnesses)
+                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
         }
     }
@@ -8233,7 +8222,12 @@ impl Engine {
     /// Reconcile every opted-in domain's declared artifacts into `harnesses`
     /// through the real system MCP runner - the shared tail of
     /// `provision`'s `Allow`, `Deny` and `Apply` arms.
-    fn run_provision_apply(&self, receipt_path: &Path, harnesses: &[HarnessKind]) -> Result<Value> {
+    fn run_provision_apply(
+        &self,
+        receipt_path: &Path,
+        harnesses: &[HarnessKind],
+        hidden: &HashSet<String>,
+    ) -> Result<Value> {
         let config = self.config.read().unwrap().clone();
         let mut mcp = crate::harness_cli::SystemMcpRunner;
         let env_domains: HashSet<&str> = self
@@ -8249,7 +8243,18 @@ impl Engine {
             &env_domains,
         )
         .map_err(|e| EngineError::Internal(e.to_string()))?;
-        Ok(apply_report_json(&report))
+        let mut value = apply_report_json(&report);
+        // The reconcile ran over the whole machine, as it must; the report goes
+        // back to one caller, so it names only the domains that caller may see.
+        // `pending` is the only array here that carries a domain name.
+        if let Some(pending) = value["pending"].as_array_mut() {
+            pending.retain(|entry| {
+                entry["domain"]
+                    .as_str()
+                    .is_none_or(|name| !hidden.contains(name))
+            });
+        }
+        Ok(value)
     }
 
     // --- domain add (local and virtual) ---------------------------------------
@@ -8853,11 +8858,16 @@ impl Engine {
     /// never aborts the others, each per-domain failure is collected into the
     /// `errors` array instead. Allowed on a read-only instance: a pull is a
     /// derived-truth update like sync, not a user-authored content write.
-    pub async fn origin_update(&self, domain: Option<&str>) -> Result<Value> {
+    pub async fn origin_update(
+        &self,
+        domain: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
-        let targets = self.origin_targets(domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
 
         let mut domains = Vec::new();
         let mut errors = Vec::new();
@@ -9062,11 +9072,16 @@ impl Engine {
     /// filesystem root) never aborts the others: it is collected into the
     /// `errors` array instead, mirroring `origin_update`. Allowed on a
     /// read-only instance (a pure read).
-    pub async fn origin_status(&self, domain: Option<&str>) -> Result<Value> {
+    pub async fn origin_status(
+        &self,
+        domain: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
-        let targets = self.origin_targets(domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
         let connection = self.origin_status_connection().await?;
 
         let mut domains = Vec::new();
@@ -9181,7 +9196,9 @@ impl Engine {
             }
             return;
         }
-        let Ok(targets) = self.origin_targets(None) else {
+        // The poller is the machine itself rather than a caller, so nothing is
+        // subtracted: it polls every origin this daemon hosts.
+        let Ok(targets) = self.origin_targets(None, &HashSet::new()) else {
             return;
         };
         let github_poll_secs = self
@@ -9315,7 +9332,11 @@ impl Engine {
     async fn origins_status_block(&self) -> Value {
         let (connected, token_store) = self.origin_connection_offline();
         let rate_limit_wait_until = self.origin_poller.rate_limited_until();
-        let targets = self.origin_targets(None).unwrap_or_default();
+        // `status`'s own block, which the CLI and the control socket read: the
+        // machine owner, so nothing is subtracted.
+        let targets = self
+            .origin_targets(None, &HashSet::new())
+            .unwrap_or_default();
 
         let mut domains = Vec::new();
         for (name, entry) in targets {
@@ -9804,10 +9825,25 @@ impl Engine {
     /// (erroring if it is not registered or has no origin) or every
     /// registered domain with an origin, mirroring `sync_targets`'s
     /// config-then-discovered layering.
-    fn origin_targets(&self, domain: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
+    ///
+    /// `hidden` is the caller's own set of domains it may not see, and it binds
+    /// both arms. A named one is refused exactly as an unregistered one, with
+    /// the registered list in the error filtered to what this caller may see.
+    /// The unnamed arm - "every domain with an origin" - drops them, which is
+    /// the whole of what makes the aggregate form safe: without it a stranger
+    /// asking for the standing of "every shared domain" is handed a private
+    /// team domain's name, its open proposals and its conflicts, and
+    /// `origin_update` additionally pulls into it. Every machine-owner caller
+    /// (the CLI, the control socket, the poller, the status block) passes an
+    /// empty set, which is the answer they would resolve to anyway.
+    fn origin_targets(
+        &self,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<Vec<(String, DomainEntry)>> {
         match domain {
             Some(name) => {
-                let entry = self.domain_entry(name)?;
+                let entry = self.domain_entry_scoped(name, hidden)?;
                 if entry.origin.is_none() {
                     return Err(EngineError::Invalid(format!(
                         "domain '{name}' has no origin; connect it with `crystalline domain add --origin`"
@@ -9819,7 +9855,7 @@ impl Engine {
                 let mut out: Vec<(String, DomainEntry)> = Vec::new();
                 let config = self.config.read().unwrap();
                 for (name, entry) in &config.domains {
-                    if entry.origin.is_some() {
+                    if entry.origin.is_some() && !hidden.contains(name) {
                         out.push((name.clone(), entry.clone()));
                     }
                 }
@@ -9827,7 +9863,7 @@ impl Engine {
                     if config.domains.contains_key(name) {
                         continue;
                     }
-                    if entry.origin.is_some() {
+                    if entry.origin.is_some() && !hidden.contains(name) {
                         out.push((name.clone(), entry.clone()));
                     }
                 }
@@ -14592,7 +14628,10 @@ mod share_actor_tests {
         let tokens = tmp.path().join("tokens");
         write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
 
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["share_identity"], "instance");
         assert!(
             status["connection"].get("owner_identity").is_none(),
@@ -14606,7 +14645,10 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["share_identity"], "personal");
         assert_eq!(
             status["connection"]["owner_identity"]["account"],
@@ -14619,7 +14661,10 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["owner_identity"]["connected"], true);
         assert_eq!(status["connection"]["owner_identity"]["user"], "owner-gh");
     }
@@ -14644,7 +14689,10 @@ mod share_actor_tests {
             .unwrap();
 
         // Instance mode has no personal slot in play at all, agent or owner.
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert!(
             status["connection"].get("agent_identity").is_none(),
             "instance mode reports no personal slot: {status}"
@@ -14657,7 +14705,10 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         let agent = &status["connection"]["agent_identity"];
         assert_eq!(agent["account"], "share-bot");
         assert_eq!(agent["connected"], false, "nothing is on file for it yet");
@@ -14667,7 +14718,10 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["agent_identity"]["connected"], true);
         assert_eq!(status["connection"]["agent_identity"]["user"], "bot-gh");
         assert_eq!(
@@ -14696,7 +14750,10 @@ mod share_actor_tests {
             .await
             .unwrap();
 
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert!(
             status["connection"].get("agent_identity").is_none(),
             "{status}"

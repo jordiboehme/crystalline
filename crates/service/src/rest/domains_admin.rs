@@ -746,7 +746,10 @@ pub async fn sync_status(
     // rather than a no-op over an admin.
     require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
-    let aggregate = state.engine.origin_status(Some(&domain)).await?;
+    let aggregate = state
+        .engine
+        .origin_status(Some(&domain), &identity.scope())
+        .await?;
     // Lifted before `single_domain` takes the per-domain entry, which is all
     // that survives of the aggregate.
     let connection = aggregate.get("connection").cloned();
@@ -914,7 +917,7 @@ pub async fn sync_summary(
     if !state.engine.github_enabled() {
         return Err(github_off_conflict());
     }
-    let aggregate = state.engine.origin_status(None).await?;
+    let aggregate = state.engine.origin_status(None, &identity.scope()).await?;
     // This one route enumerates domains rather than addressing one, so the
     // filtering happens here, on the aggregate: `origin_status` walks the
     // registry and knows nothing about who is asking. A team domain the
@@ -1130,7 +1133,10 @@ pub async fn sync_now(
         ));
     }
     let report = single_domain(
-        state.engine.origin_update(Some(&domain)).await?,
+        state
+            .engine
+            .origin_update(Some(&domain), &identity.scope())
+            .await?,
         &domain,
         "the pull",
     )?;

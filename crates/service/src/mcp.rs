@@ -393,12 +393,18 @@ const CACHE_TTL_MS: u64 = 0;
 ///
 /// [`CacheScope::Public`] is truthful rather than convenient, and it became
 /// truthful only once the list endpoints stopped varying per connection: every
-/// list this server answers is decided before the first request from
-/// deployment configuration and machine state, never from who is asking, and
-/// none of it varies by the authorization presented on the request - which is
-/// the one variation SEP-2567 explicitly permits and the one that would force
-/// `private`. The shipped skills a `resources/read` returns are static copy
-/// compiled into this binary.
+/// **protocol** list this server answers - `tools/list`, `prompts/list`,
+/// `resources/list`, `resources/templates/list`, the five results this constant
+/// governs - is decided before the first request from deployment configuration
+/// and machine state, never from who is asking, and none of it varies by the
+/// authorization presented on the request, which is the one variation SEP-2567
+/// explicitly permits and the one that would force `private`. The shipped
+/// skills a `resources/read` returns are static copy compiled into this binary.
+///
+/// It is a claim about those results and not about the server: a *tool* result
+/// may vary by caller and several now do (`list_domains` answers each account
+/// its own index). Tool results carry no caching hints at all, so nothing about
+/// them is promised here.
 ///
 /// **One result on this server is not that, and it says so itself.** An
 /// attachment read through the same `resources/read` endpoint *does* vary by
@@ -1231,31 +1237,6 @@ impl McpServer {
         self
     }
 
-    /// Who a write verb over this connection acts as, when this instance
-    /// shares with personal GitHub identities (`github.share_identity =
-    /// personal`). Inert in the default `instance` mode, where one credential
-    /// does everything.
-    ///
-    /// **An authenticated session IS its account.** A stdio session is a
-    /// process this machine's harness started, so it is the machine owner in
-    /// exactly the sense the CLI is - the same local `owner` credential,
-    /// connected once with `crystalline connect github --personal`. An HTTP
-    /// session that authenticated at the door acts as the account it
-    /// authenticated as, so a share goes out on that person's own connected
-    /// GitHub identity and their name is on the proposal: the agent acts as the
-    /// user rather than as one shared bot everybody's work is filed under.
-    ///
-    /// **The transport-only answer survives where there is nothing else.** An
-    /// HTTP session on an instance that does not make agents authenticate
-    /// carries no user auth at all - there is nobody to be - so it stays
-    /// [`ShareActor::HttpAgent`] and resolves through `github.agent_identity`,
-    /// refusing with a text naming that setting when an admin has named none.
-    /// That is the legacy tier unchanged, which is what keeps a default install
-    /// behaving as it did.
-    ///
-    /// Read per call rather than stored: the account comes off the request
-    /// (see [`mcp_account`]), and a copy of it kept on the server would be one
-    /// more thing that could disagree with the door.
     /// Who this call is acting as, as the one value every scoped verb on this
     /// server is threaded with.
     ///
@@ -1300,63 +1281,93 @@ impl McpServer {
     ///
     /// 1. **A domain this caller may not see is the not-found**, decided first,
     ///    so a stranger writing into a private domain learns exactly what a
-    ///    stranger writing into a domain nobody registered learns. When the
-    ///    call carries an identifier, the domain checked is the one the
-    ///    identifier actually addresses ([`Engine::addressed_domain`]): the
-    ///    absolute `crystalline://` form overrides the domain argument, so
-    ///    gating the argument alone would gate the wrong domain.
+    ///    stranger writing into a domain nobody registered learns.
     /// 2. **Then the right**, which is what a private domain adds and what the
     ///    instance role decides on a shared one. The refusal names the level
     ///    the caller holds, because "forbidden" on a domain they can see and
     ///    read is otherwise indistinguishable from a bug.
+    ///
+    /// **The domain gated is the one the call named, and that is the whole of
+    /// it.** An identifier cannot move a write to another domain: the absolute
+    /// `crystalline://` form is refused outright when its domain is not the
+    /// `domain` argument (`Engine::resolve_in`, which every write verb resolves
+    /// through), so the named domain is the only domain a write can
+    /// reach. An earlier draft of this gate resolved the identifier and checked
+    /// *its* domain instead, which left the named one unchecked and let a call
+    /// whose two halves disagree reach the unscoped `content_source` behind
+    /// them - an error naming every registered domain, private ones included.
+    /// The gate and the engine now read the same field.
     ///
     /// `Ok(None)` is the allowed case. `Ok(Some(text))` is a refusal to hand
     /// back through [`refuse`], so the model reads why rather than a bare
     /// error. `Err` is step one's not-found, which is an engine error because
     /// it has to be the engine's own bytes.
     ///
-    /// **[`Scope::Anonymous`] is never refused by step two**, and that is the
-    /// legacy open tier rather than an oversight: an instance with `auth.mcp`
-    /// off has no accounts to hold a level, and every agent reaching it writes
-    /// exactly what it always wrote. Step one still runs for it, and a private
-    /// domain is invisible to it, so there is nothing there for step two to
-    /// protect. [`Scope::Unrestricted`] needs no arm at all - it resolves to
-    /// [`DomainRight::Own`] on every domain.
+    /// **The legacy open tier is never refused by step two**, and that is the
+    /// tier rather than an oversight: an instance with `auth.mcp` off has no
+    /// accounts to hold a level, and every agent reaching it writes exactly
+    /// what it always wrote. Step one still runs for it, and a private domain
+    /// is invisible to it, so there is nothing there for step two to protect.
+    ///
+    /// That carve-out is read from the setting that creates the tier rather
+    /// than from the absence of an identity, which are not the same statement.
+    /// With `auth.mcp` on, an unauthenticated request is refused at the door
+    /// and never reaches a tool at all; if a gate regression ever let one
+    /// through it would arrive here as [`Scope::Anonymous`] too, and it must
+    /// not inherit the open tier's writes. So the condition is "the door is
+    /// open", not "nobody is there". [`Scope::Unrestricted`] needs no arm at
+    /// all - it resolves to [`DomainRight::Own`] on every domain.
     async fn refuse_unwritable(
         &self,
         domain: &str,
-        identifier: Option<&str>,
         scope: &Scope,
     ) -> Result<Option<String>, ErrorData> {
-        let addressed = match identifier {
-            Some(identifier) => self
-                .engine
-                .addressed_domain(identifier, domain, scope)
-                .await
-                .map_err(to_error)?,
-            None => domain.to_string(),
-        };
         self.engine
-            .require_domain(&addressed, scope)
+            .require_domain(domain, scope)
             .await
             .map_err(to_error)?;
-        if matches!(scope, Scope::Anonymous) {
+        if matches!(scope, Scope::Anonymous) && !self.engine.config().auth_mcp() {
             return Ok(None);
         }
         let right = self
             .engine
-            .domain_right(scope, &addressed)
+            .domain_right(scope, domain)
             .await
             .map_err(to_error)?;
         if right < DomainRight::Write {
             return Ok(Some(format!(
-                "your membership on '{addressed}' is {}, and editor access is required to change it",
+                "your membership on '{domain}' is {}, and editor access is required to change it",
                 member_level_word(right)
             )));
         }
         Ok(None)
     }
 
+    /// Who a write verb over this connection acts as, when this instance
+    /// shares with personal GitHub identities (`github.share_identity =
+    /// personal`). Inert in the default `instance` mode, where one credential
+    /// does everything.
+    ///
+    /// **An authenticated session IS its account.** A stdio session is a
+    /// process this machine's harness started, so it is the machine owner in
+    /// exactly the sense the CLI is - the same local `owner` credential,
+    /// connected once with `crystalline connect github --personal`. An HTTP
+    /// session that authenticated at the door acts as the account it
+    /// authenticated as, so a share goes out on that person's own connected
+    /// GitHub identity and their name is on the proposal: the agent acts as the
+    /// user rather than as one shared bot everybody's work is filed under.
+    ///
+    /// **The transport-only answer survives where there is nothing else.** An
+    /// HTTP session on an instance that does not make agents authenticate
+    /// carries no user auth at all - there is nobody to be - so it stays
+    /// [`ShareActor::HttpAgent`] and resolves through `github.agent_identity`,
+    /// refusing with a text naming that setting when an admin has named none.
+    /// That is the legacy tier unchanged, which is what keeps a default install
+    /// behaving as it did.
+    ///
+    /// Read per call rather than stored: the account comes off the request
+    /// (see [`mcp_account`]), and a copy of it kept on the server would be one
+    /// more thing that could disagree with the door.
     fn share_actor(&self, ctx: &RequestContext<RoleServer>) -> ShareActor {
         match self.transport {
             Transport::Stdio => ShareActor::Owner,
@@ -1388,7 +1399,7 @@ impl McpServer {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, None, &self.scope_of(&ctx))
+            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
             .await?
         {
             return refuse(refusal).map(CallToolResponse::from);
@@ -1512,7 +1523,7 @@ impl McpServer {
         // exists to prevent, and a question about a write that would be
         // refused is a question nobody should be asked.
         if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, Some(&p.identifier), &self.scope_of(&ctx))
+            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
             .await?
         {
             return refuse(refusal).map(CallToolResponse::from);
@@ -1566,20 +1577,22 @@ impl McpServer {
         // domain into a shared one, or into a domain it was never invited to.
         // A destination it may not see answers the same not-found the source
         // would - naming a domain is not a way to learn that it exists.
-        if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, Some(&p.identifier), &scope)
-            .await?
-        {
-            return refuse(refusal);
-        }
-        if let Some(destination) = p
+        //
+        // The destination is gated whether or not it repeats the source's
+        // spelling: an omitted or equal `destination_domain` means the source
+        // domain, which the first gate already passed, so the second call is a
+        // no-op there rather than a case to skip - and a skip is how a check
+        // goes missing when the two spellings stop coinciding.
+        let destination = p
             .destination_domain
             .as_deref()
             .map(str::trim)
-            .filter(|d| !d.is_empty() && *d != p.domain)
-            && let Some(refusal) = self.refuse_unwritable(destination, None, &scope).await?
-        {
-            return refuse(refusal);
+            .filter(|d| !d.is_empty())
+            .unwrap_or(&p.domain);
+        for end in [p.domain.as_str(), destination] {
+            if let Some(refusal) = self.refuse_unwritable(end, &scope).await? {
+                return refuse(refusal);
+            }
         }
         self.engine
             .move_engram(&p, &scope)
@@ -1607,7 +1620,7 @@ impl McpServer {
     ) -> Result<CallToolResponse, ErrorData> {
         // Before the confirmation round, for the reason `edit_engram` states.
         if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, Some(&p.identifier), &self.scope_of(&ctx))
+            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
             .await?
         {
             return refuse(refusal).map(CallToolResponse::from);
@@ -2049,7 +2062,10 @@ impl McpServer {
         // A pull can rewrite a domain's MANIFEST, so `provisioning_declared`
         // can flip here too, and like `add_domain` that announces nothing: the
         // gate it feeds refuses at call time instead of shaping a list.
-        let result = self.engine.origin_update(p.domain.as_deref()).await;
+        let result = self
+            .engine
+            .origin_update(p.domain.as_deref(), &self.scope_of(&ctx))
+            .await;
         result.map_err(to_error).and_then(|v| self.ok_list(v))
     }
 
@@ -2074,7 +2090,7 @@ impl McpServer {
                 .map_err(to_error)?;
         }
         self.engine
-            .origin_status(p.domain.as_deref())
+            .origin_status(p.domain.as_deref(), &self.scope_of(&ctx))
             .await
             .map(lean_origin_status)
             .map_err(to_error)
@@ -2274,7 +2290,7 @@ impl McpServer {
             return refuse(PROVISION_NOT_DECLARED);
         }
         self.engine
-            .provision(&action)
+            .provision(&action, &self.scope_of(&ctx))
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))

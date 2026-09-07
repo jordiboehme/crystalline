@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::engine::ProvisionAction;
-use crystalline_service::{Engine, EngineError, EnvOverlay};
+use crystalline_service::{Engine, EngineError, EnvOverlay, Scope};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Serializes every `HOME`/`XDG_STATE_HOME`-mutating test in this binary. A
@@ -154,9 +154,12 @@ async fn allow_persists_the_decision_into_the_config_file_and_returns_a_report()
     let engine = engine_at(&config_path, config_with_harbor(&harbor_dir), false).await;
 
     let data = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "harbor".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "harbor".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -203,9 +206,12 @@ async fn read_only_refuses_allow_but_answers_status() {
     let engine = engine_at(&config_path, config_with_harbor(&harbor_dir), true).await;
 
     let err = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "harbor".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "harbor".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::ReadOnly), "{err}");
@@ -214,12 +220,18 @@ async fn read_only_refuses_allow_but_answers_status() {
     assert!(!config_path.exists());
     assert!(!home.join(".claude").exists());
 
-    let err = engine.provision(&ProvisionAction::Apply).await.unwrap_err();
+    let err = engine
+        .provision(&ProvisionAction::Apply, &Scope::Unrestricted)
+        .await
+        .unwrap_err();
     assert!(matches!(err, EngineError::ReadOnly), "{err}");
 
     // status is still answered on a read-only instance, the same "Show is
     // always allowed" carve-out `configure` documents.
-    let data = engine.provision(&ProvisionAction::Status).await.unwrap();
+    let data = engine
+        .provision(&ProvisionAction::Status, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = data["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1, "{data}");
     assert_eq!(domains[0]["domain"], "harbor");
@@ -252,9 +264,12 @@ async fn allow_on_an_unknown_or_virtual_domain_errors_through_the_normal_mapping
     let engine = engine_at(&config_path, cfg, false).await;
 
     let err = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "does-not-exist".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "does-not-exist".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::UnknownDomain { .. }), "{err}");
@@ -263,9 +278,12 @@ async fn allow_on_an_unknown_or_virtual_domain_errors_through_the_normal_mapping
     assert!(message.contains("harbor"), "{message}");
 
     let err = engine
-        .provision(&ProvisionAction::Deny {
-            domain: "notes".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Deny {
+                domain: "notes".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Invalid(_)), "{err}");
@@ -319,9 +337,12 @@ async fn env_defined_domain_decisions_are_refused_naming_the_variable() {
     // written to the file would be silently discarded on the next overlay
     // apply - refused up front, naming the variable.
     let err = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "harbor".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "harbor".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Conflict(_)), "{err}");
@@ -333,9 +354,12 @@ async fn env_defined_domain_decisions_are_refused_naming_the_variable() {
     // Env-only: the env message too, never UnknownDomain - status lists the
     // domain, so "not registered" would be a lie.
     let err = engine
-        .provision(&ProvisionAction::Deny {
-            domain: "cove".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Deny {
+                domain: "cove".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Conflict(_)), "{err}");

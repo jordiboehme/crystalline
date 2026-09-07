@@ -868,7 +868,7 @@ pub async fn origin_update(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_update(domain).await?)
+    Ok(engine.origin_update(domain, &Scope::Unrestricted).await?)
 }
 
 /// Report where one origin-connected domain (or every one) stands relative to
@@ -889,7 +889,7 @@ pub async fn origin_status(
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_status(domain).await?)
+    Ok(engine.origin_status(domain, &Scope::Unrestricted).await?)
 }
 
 /// Propose one team domain's local changes as a pull request against its
