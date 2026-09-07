@@ -997,11 +997,18 @@ enum DomainCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Remove a domain from the global config. Leaves its files and index
-    /// rows untouched (the rows are dropped by a later full reindex).
+    /// Unregister a domain. A file or team domain's files are never touched,
+    /// so registering the folder again re-adopts them; a virtual domain's
+    /// engrams live in the database and go with it, which is what --purge
+    /// confirms.
     Remove {
         /// The domain name to remove.
         name: String,
+        /// Confirm that a virtual domain's engrams are to be deleted with it.
+        /// Required for a virtual domain that holds any; a file or team
+        /// domain never needs it, since its files are never touched.
+        #[arg(long)]
+        purge: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -2716,9 +2723,11 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
         } => on_runtime(move || {
             domain_export_dispatch(domain, path, force, dry_run, config, db, json)
         }),
-        DomainCommand::Remove { name, config } => {
-            on_runtime(move || domain_remove_dispatch(name, config, json))
-        }
+        DomainCommand::Remove {
+            name,
+            purge,
+            config,
+        } => on_runtime(move || domain_remove_dispatch(name, purge, config, db, json)),
         DomainCommand::Members { domain, command } => {
             on_runtime(move || members::run(domain, command, json))
         }
@@ -3171,25 +3180,28 @@ async fn domain_add_origin_dispatch(
     Ok(())
 }
 
-/// `domain remove`: drop it from the config, then best-effort tell a running
-/// daemon to stop watching its path. Never fails on the ctl round trip; the
-/// config edit already succeeded by the time it runs. The notify fires only
-/// when the removal happened in the daemon's own config: an explicit --config
-/// edited a different file the daemon does not serve, so its watch set is
-/// unaffected and there is nothing to forget.
+/// `domain remove`: the engine's own unregistration, over the daemon when one
+/// is running and against a directly opened engine otherwise.
+///
+/// It used to be a config-file edit of its own plus a best-effort `forget_domain`
+/// ctl notify. That path skipped everything the entry point does around the
+/// registry edit - the join fence, the co-editing sweep, the index clear, and
+/// the retirement of the domain's visibility and membership records - so a
+/// domain later registered under the same name inherited the old one's owner
+/// and members. `crystalline_service::domain_remove` is the same entry point
+/// the JSON API and the `remove_domain` MCP tool call, so the four surfaces
+/// cannot answer differently; the daemon branch is what makes the watcher
+/// notify unnecessary, since the daemon's own engine did the removal.
 async fn domain_remove_dispatch(
     name: String,
+    purge: bool,
     config: Option<PathBuf>,
+    db: Option<PathBuf>,
     json: bool,
 ) -> anyhow::Result<()> {
-    cmd::domain_remove(&name, config.as_deref(), json)?;
-    use serde_json::json as j;
-    if config.is_none() {
-        let _ = crystalline_service::ctl_if_running(
-            j!({ "v": 1, "cmd": "forget_domain", "domain": name }),
-        )
-        .await;
-    }
+    let report =
+        crystalline_service::domain_remove(&name, purge, db.as_deref(), config.as_deref()).await?;
+    cmd::print_domain_remove(&name, &report, json);
     Ok(())
 }
 

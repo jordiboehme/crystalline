@@ -817,6 +817,53 @@ pub async fn domain_export(
     Ok(engine.export_domain(domain, dest, force, dry_run).await?)
 }
 
+/// Unregister a domain: over the daemon when one owns the index, else against a
+/// directly opened store.
+///
+/// The CLI is the machine owner, so it passes [`Scope::Unrestricted`] and the
+/// gate resolves to `Own` on every domain - whoever can run this already holds
+/// the files. What the CLI must NOT skip is the rest of the entry point: the
+/// join fence, the co-editing sweep, the index clear and the retirement of the
+/// domain's visibility and membership records. That last one is why this
+/// function exists at all. The CLI used to be a config-file edit of its own,
+/// so a `domain_acl` row outlived every removal and a domain later registered
+/// under the same name came back private, owned by whoever owned the old one.
+///
+/// **The standalone branch installs the resolver itself.** A one-shot engine
+/// has none, and without one the record sweep is a silent no-op - which is the
+/// bug, not a mitigation of it. The accounts database is opened only when the
+/// file is already there: a machine that has never had an account has no
+/// records to retire, and creating an accounts database as a side effect of a
+/// removal would be a surprising thing for this command to do.
+pub async fn domain_remove(
+    name: &str,
+    purge: bool,
+    db: Option<&Path>,
+    config_path: Option<&Path>,
+) -> anyhow::Result<Value> {
+    use serde_json::json;
+    if use_daemon(db, config_path)
+        && let Some(data) = ctl_if_running(json!({
+            "v": 1, "cmd": "domain_remove", "domain": name, "purge": purge,
+        }))
+        .await?
+    {
+        return Ok(data);
+    }
+    let loaded = overlay::load(config_path)?;
+    let db_path = resolve_db(db)?;
+    let engine = open_standalone(loaded, &db_path, false).await?;
+    if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
+        && auth_path.exists()
+    {
+        let auth = std::sync::Arc::new(crate::rest::AuthStore::open(&auth_path).await?);
+        engine.set_domain_access(std::sync::Arc::new(crate::scope::DomainAccess::new(auth)));
+    }
+    Ok(engine
+        .unregister_domain(name, &Scope::Unrestricted, purge)
+        .await?)
+}
+
 /// Connect a new domain to a GitHub repository: over the daemon when one owns
 /// the index, else against a directly opened store. `want_embeddings` is
 /// `false` in the standalone fallback, matching `domain_import` and

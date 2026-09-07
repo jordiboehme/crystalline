@@ -305,6 +305,13 @@ pub enum EngineError {
     /// from a bug.
     #[error("{0}")]
     Forbidden(String),
+    /// The request would destroy knowledge that only exists here, and it did
+    /// not say so. Not a permission problem and not a malformed request: the
+    /// caller may do this and asked for it correctly, and the server is
+    /// refusing to guess that the loss was intended. The message names the flag
+    /// that says it was, on every surface that has one.
+    #[error("{0}")]
+    ConfirmationRequired(String),
     /// An interactive connect action (`connect_with_token`,
     /// `start_device_connect`) was attempted while `CRYSTALLINE_GITHUB_TOKEN`
     /// is set. This machine's identity is fixed by the environment, so there
@@ -8992,6 +8999,84 @@ impl Engine {
         ))
     }
 
+    /// What a caller is told when a removal would delete a virtual domain's
+    /// engrams and nothing said the loss was intended.
+    ///
+    /// One sentence for every surface, naming the flag in each of their
+    /// spellings, because the rule is one rule and the surfaces are three. It
+    /// speaks only about a virtual domain: a file or team domain's markdown is
+    /// never touched by a removal, so there is nothing there to confirm.
+    fn purge_refusal(name: &str, engrams: i64) -> EngineError {
+        let held = if engrams == 1 {
+            "1 engram".to_string()
+        } else {
+            format!("{engrams} engrams")
+        };
+        EngineError::ConfirmationRequired(format!(
+            "domain '{name}' is a virtual domain holding {held}: its knowledge lives in the \
+             database, so unregistering it DELETES those engrams and leaves no files to \
+             re-adopt. Export or share what is worth keeping first, then repeat the removal \
+             with purge set - 'purge: true' over MCP, '?purge=true' on the JSON API, '--purge' \
+             at the command line. A file or team domain needs no purge, since a removal never \
+             touches its files."
+        ))
+    }
+
+    /// The kind a removal speaks about: three, where the registry itself knows
+    /// two.
+    ///
+    /// A team domain is a file domain carrying an origin, and for every other
+    /// purpose that distinction is the origin's business. It matters here
+    /// because the recovery differs: re-adding the FOLDER of a team domain
+    /// registers a plain local one and drops the origin, the base commit and
+    /// the team connection, so a confirmation that offered that recovery would
+    /// be telling somebody the wrong thing on the way to a destructive act.
+    fn removal_kind(entry: &DomainEntry) -> &'static str {
+        if entry.is_virtual() {
+            "virtual"
+        } else if entry.origin.is_some() {
+            "team"
+        } else {
+            "file"
+        }
+    }
+
+    /// How many engrams the index holds for `name`, refusing a virtual domain
+    /// that holds knowledge unless `purge` says the loss was intended.
+    ///
+    /// The count and the refusal come out of one read on purpose: they are the
+    /// same fact asked twice, and a preview whose count disagreed with the
+    /// refusal that follows it would be worse than either alone. `None` is a
+    /// domain the index has no row for, which is one nothing has synced rather
+    /// than an empty one; it is not treated as knowledge to protect, since
+    /// there is nothing recorded to lose.
+    ///
+    /// In practice the count is never zero for a virtual domain a caller could
+    /// be looking at: `domain_add_virtual` scaffolds a MANIFEST engram into the
+    /// database, so one exists from the moment the domain does. The condition
+    /// is written on the count anyway rather than on the kind, because what is
+    /// being protected is knowledge rather than a category, and a virtual
+    /// domain whose rows were cleared by something else has nothing left to
+    /// confirm the loss of.
+    async fn removal_engrams(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        purge: bool,
+    ) -> Result<Option<i64>> {
+        let store = self.store.lock().await;
+        let stats = store.domain_stats().await.unwrap_or_default();
+        drop(store);
+        let engrams = stats.iter().find(|d| d.name == name).map(|d| d.engrams);
+        if entry.is_virtual()
+            && !purge
+            && let Some(held) = engrams.filter(|n| *n > 0)
+        {
+            return Err(Engine::purge_refusal(name, held));
+        }
+        Ok(engrams)
+    }
+
     /// Whether `name` is a domain the environment defines, as the conflict both
     /// surfaces answer with.
     ///
@@ -9051,27 +9136,29 @@ impl Engine {
     ///
     /// `{ domain, kind, engrams, files_kept }` - the three things somebody
     /// needs in order to answer the question, plus the one that decides how it
-    /// is worded: a file domain's files stay on disk and a virtual domain's
-    /// rows ARE its knowledge. Gated exactly as the removal is, and it raises
-    /// the environment conflict too, so a question is never put about a removal
-    /// that would refuse anyway.
+    /// is worded: a file or team domain's files stay on disk and a virtual
+    /// domain's rows ARE its knowledge.
+    ///
+    /// Every refusal the removal itself would raise is raised here first, in
+    /// the same order - the gate, the environment conflict, the unconfirmed
+    /// purge - so a question is never put about a removal that would refuse
+    /// anyway. Advisory rather than authoritative: the removal re-decides all
+    /// of it under its own lock, which is where the decision has to hold.
     pub async fn domain_remove_preview(
         &self,
         name: &str,
         scope: &crate::scope::Scope,
+        purge: bool,
     ) -> Result<Value> {
         self.require_domain_owner(name, scope).await?;
         if let Some(conflict) = self.env_domain_conflict(name) {
             return Err(conflict);
         }
         let entry = self.domain_entry(name)?;
-        let store = self.store.lock().await;
-        let stats = store.domain_stats().await.unwrap_or_default();
-        drop(store);
-        let engrams = stats.iter().find(|d| d.name == name).map(|d| d.engrams);
+        let engrams = self.removal_engrams(name, &entry, purge).await?;
         Ok(json!({
             "domain": name,
-            "kind": if entry.is_virtual() { "virtual" } else { "file" },
+            "kind": Engine::removal_kind(&entry),
             "engrams": engrams,
             "files_kept": !entry.is_virtual(),
         }))
@@ -9085,11 +9172,17 @@ impl Engine {
     /// (see [`crate::collab::session::CollabSessions::dispose_domain`], which
     /// records the argument in full):
     ///
-    /// 1. The gate, [`Engine::require_domain_owner`], before anything moves.
-    /// 2. The join fence goes up, so no socket can open a room in this domain
-    ///    from here on. Without it the sweep would close what is open and a
-    ///    join arriving one instant later would open a fresh room over a domain
-    ///    that is about to vanish.
+    /// 1. The domain-admin lock and the join fence go up, so no socket can open
+    ///    a room in this domain from here on and no registration of the same
+    ///    name can interleave. Without the fence the sweep would close what is
+    ///    open and a join arriving one instant later would open a fresh room
+    ///    over a domain that is about to vanish.
+    /// 2. Every refusal is decided **inside** those guards: the gate
+    ///    ([`Engine::require_domain_owner`]), the environment conflict, and the
+    ///    unconfirmed purge of a virtual domain's engrams. That ordering is the
+    ///    point of holding the lock at all - a gate decided outside it is a
+    ///    check somebody's ownership transfer can land behind - and it is what
+    ///    makes the preview above advisory rather than authoritative.
     /// 3. The rooms are swept while the domain is STILL registered, so each
     ///    room's final save lands in the file that stays on disk.
     /// 4. Only then is the domain unregistered, and only then are its
@@ -9114,13 +9207,24 @@ impl Engine {
         &self,
         name: &str,
         scope: &crate::scope::Scope,
+        purge: bool,
     ) -> Result<Value> {
+        // Ahead of the guards, and only this one: its answer is the same for
+        // every caller and every name, so it discloses nothing and there is
+        // nothing for a concurrent change to move.
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.require_domain_owner(name, scope).await?;
         let _admin = self.domain_admin().await;
         let _fence = self.fence_joins().await;
+        self.require_domain_owner(name, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(name) {
+            return Err(conflict);
+        }
+        // Before the sweep, not after: a removal that is going to refuse must
+        // not have closed somebody's co-editing room on the way to refusing.
+        let entry = self.domain_entry(name)?;
+        self.removal_engrams(name, &entry, purge).await?;
         let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
             Some(sessions) => sessions.dispose_domain(name).await,
             None => 0,

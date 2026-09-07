@@ -341,3 +341,89 @@ fn the_help_says_the_machine_operator_administers_every_domain() {
         );
     }
 }
+
+/// **Unregistering a domain from the CLI retires its visibility and membership
+/// records too, so the name comes back shared and ownerless.**
+///
+/// The CLI used to be a config-file edit of its own that never reached the
+/// engine, so the `domain_acl` and `domain_member` rows outlived every removal.
+/// That is an access-control inheritance rather than untidy rows: a domain
+/// later registered under the same name came back private, owned by whoever
+/// owned the old one and invisible to everybody else on the instance. It goes
+/// through `Engine::unregister_domain` now, as the machine owner, which is the
+/// same entry point the JSON API and the MCP tool call.
+#[test]
+fn removing_a_domain_retires_its_membership_so_the_name_comes_back_shared() {
+    let fx = Fixture::new();
+    let dir = fx.home.path().join("kb");
+    let dir = dir.to_str().unwrap().to_string();
+
+    fx.domain(&["visibility", "eng", "private", "--owner", "ada"]);
+    fx.domain(&["members", "eng", "add", "bob", "--level", "manager"]);
+    let closed = fx.domain(&["members", "eng", "list"]);
+    assert!(closed.contains("private, owned by 'ada'"), "{closed}");
+
+    fx.domain(&["remove", "eng"]);
+    // A different folder registered under the freed name: a new domain, and
+    // whoever registers it must not inherit the old one's owner and members.
+    fx.domain(&["add", "eng", &dir, "--no-sync"]);
+
+    let reopened = fx.domain(&["members", "eng", "list"]);
+    assert!(
+        reopened.contains("is shared"),
+        "a re-added name comes back shared: {reopened}"
+    );
+    assert!(
+        !reopened.contains("ada"),
+        "and inherits no owner: {reopened}"
+    );
+    assert!(!reopened.contains("bob"), "and no members: {reopened}");
+}
+
+/// **A read-only instance's registry is frozen along with its knowledge.**
+///
+/// A consequence of routing the CLI through `Engine::unregister_domain` rather
+/// than a config edit of its own, and worth pinning rather than discovering:
+/// `crystalline domain remove` now follows `service.read_only` the way
+/// `crystalline config set` and `crystalline write` already do. Unregistering a
+/// domain mutates the config, which is exactly what that mode freezes.
+#[test]
+fn a_read_only_instance_refuses_to_unregister_a_domain() {
+    let fx = Fixture::new();
+    let dir = fx.home.path().join("kb");
+    std::fs::write(
+        &fx.config,
+        format!(
+            "domains:\n  eng:\n    path: {}\nservice:\n  read_only: true\n",
+            dir.display()
+        ),
+    )
+    .unwrap();
+
+    let refused = fx.domain_err(&["remove", "eng"]);
+    assert!(
+        refused.contains("read-only"),
+        "the refusal says which mode did it: {refused}"
+    );
+    assert!(
+        dir.join("MANIFEST.md").exists(),
+        "and nothing was touched on disk"
+    );
+}
+
+/// A file domain's files are never deleted by a removal, so `--purge` is inert
+/// on one, and the removal says the files were kept.
+#[test]
+fn removing_a_file_domain_keeps_its_files_and_says_so() {
+    let fx = Fixture::new();
+    let dir = fx.home.path().join("kb");
+    let removed = fx.domain(&["remove", "eng"]);
+    assert!(
+        removed.contains("eng"),
+        "the removal names the domain: {removed}"
+    );
+    assert!(
+        dir.join("MANIFEST.md").exists(),
+        "the files stay exactly where they were"
+    );
+}

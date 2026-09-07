@@ -245,6 +245,21 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         // Connect a new domain to a GitHub repository: downloads its tracked
         // subtree, registers it in the global config and indexes it.
+        // Unregister a domain, the same entry point the JSON API and the MCP
+        // tool call. As the machine owner: whoever reaches this socket is on
+        // the machine that holds the files.
+        "domain_remove" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let purge = req.get("purge").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .unregister_domain(domain, &crate::scope::Scope::Unrestricted, purge)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "origin_add" => {
             let repo = req.get("repo").and_then(Value::as_str).unwrap_or("");
             let domain = req.get("domain").and_then(Value::as_str);
@@ -433,7 +448,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         other => (
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
-                 routing_bullets, scaffold_manifest, domain_import, domain_export, retag, \
+                 routing_bullets, scaffold_manifest, domain_import, domain_export, \
+                 domain_remove, retag, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
                  origin_withdraw, origin_resolve, provision, forget_domain or shutdown"
             )),

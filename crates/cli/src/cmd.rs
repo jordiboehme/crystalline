@@ -799,37 +799,30 @@ fn provision_action_label(status: &str) -> &str {
 
 // --- domain remove -----------------------------------------------------------
 
-/// Remove a domain from the global config. Leaves its files and index rows
-/// untouched; the rows are only dropped by a later full reindex.
-pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> Result<()> {
-    let loaded = load(config_override)?;
-    let mut cfg = loaded.file;
-    if cfg.domains.shift_remove(name).is_none() {
-        // A miss in the file config may be an env-defined domain: those are
-        // immune to `domain remove` (the variable is their source of truth).
-        if let Some(env) = loaded.overlay.env_domain(name) {
-            bail!(
-                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                env.var
-            );
-        }
-        bail!("no domain named '{name}' is registered");
-    }
-    config::save_yaml(&loaded.path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+/// Render the engine's own unregistration report.
+///
+/// The removal itself is `crystalline_service::domain_remove`, the entry point
+/// every surface calls; this only says what happened. The two sentences it can
+/// print are the two things that differ by kind, and the difference is the
+/// whole reason a virtual domain needs `--purge`: a file or team domain's files
+/// were left exactly where they are and registering the folder again re-adopts
+/// them, while a virtual domain's engrams were in the database and are gone.
+pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "removed": name,
-                "note": "index rows for this domain remain until the next full reindex",
-            })
-        );
-    } else {
-        println!("Removed domain '{name}' (files and index rows left untouched)");
-        println!("Run: crystalline reindex --full to drop its rows from the index");
+        println!("{report}");
+        return;
     }
-    Ok(())
+    let files_kept = report["files_kept"].as_bool().unwrap_or(true);
+    println!("Unregistered domain '{name}' and cleared its rows from the index.");
+    if files_kept {
+        println!("Its files were left untouched: register the folder again to re-adopt them.");
+    } else {
+        println!("It was a virtual domain, so its engrams went with it.");
+    }
+    let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
+    if rooms > 0 {
+        println!("{rooms} open co-editing session(s) were saved and closed.");
+    }
 }
 
 // --- domain list -------------------------------------------------------------
