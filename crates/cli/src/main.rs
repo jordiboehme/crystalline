@@ -3190,8 +3190,11 @@ async fn domain_add_origin_dispatch(
 /// domain later registered under the same name inherited the old one's owner
 /// and members. `crystalline_service::domain_remove` is the same entry point
 /// the JSON API and the `remove_domain` MCP tool call, so the four surfaces
-/// cannot answer differently; the daemon branch is what makes the watcher
-/// notify unnecessary, since the daemon's own engine did the removal.
+/// cannot answer differently. The watcher notify is kept for the case that
+/// still needs it, inside `crystalline_service::domain_remove`: the standalone
+/// branch is reachable with a daemon running (`--db` is a global flag), and a
+/// removal taken there edits the config the daemon is serving while that
+/// daemon goes on watching the root.
 async fn domain_remove_dispatch(
     name: String,
     purge: bool,

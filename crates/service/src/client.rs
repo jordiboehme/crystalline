@@ -846,6 +846,26 @@ pub async fn domain_export(
 /// leave the domain live for everybody else while this machine stopped serving
 /// it. The error says so, and names the file an operator can edit by hand if
 /// their database is gone for good.
+///
+/// **The standalone branch still tells a running daemon**, and that is not
+/// belt-and-braces: [`use_daemon`] is false whenever `--db` or `--config` is
+/// given, and `--db` is a GLOBAL flag, so `crystalline --db /somewhere.db
+/// domain remove eng` takes this branch while a daemon is live. With
+/// `--config` absent, `overlay::load(None)` then edits the very config file
+/// that daemon is serving, and without the notify nothing would tell it: it
+/// would go on watching a root that is no longer registered. Best effort and
+/// never fatal, exactly as before this function existed - by the time it runs
+/// the removal has already happened, and a daemon that is not there has
+/// nothing to be told.
+///
+/// Be exact about what that buys, because the notify is not a substitute for
+/// the daemon doing the removal itself. `Engine::forget_domain` drops the
+/// discovered-domain entry and stops the watcher; a domain that was in the
+/// daemon's STARTUP config stays in that daemon's in-memory effective config
+/// until it restarts, because only the daemon's own `unregister_domain` writes
+/// that snapshot. So the ordinary path - no `--db`, no `--config` - is the
+/// daemon branch above, which has none of this residue, and this is the
+/// best-effort tail for the flag combination that bypasses it.
 pub async fn domain_remove(
     name: &str,
     purge: bool,
@@ -880,9 +900,15 @@ pub async fn domain_remove(
         let auth = std::sync::Arc::new(crate::rest::AuthStore::open(&auth_path).await?);
         engine.set_domain_access(std::sync::Arc::new(crate::scope::DomainAccess::new(auth)));
     }
-    Ok(engine
+    let report = engine
         .unregister_domain(name, &Scope::Unrestricted, purge)
-        .await?)
+        .await?;
+    // Only when this removal edited the daemon's own config file: an explicit
+    // --config edited a different one, whose domains that daemon never served.
+    if config_path.is_none() {
+        let _ = ctl_if_running(json!({ "v": 1, "cmd": "forget_domain", "domain": name })).await;
+    }
+    Ok(report)
 }
 
 /// Connect a new domain to a GitHub repository: over the daemon when one owns
