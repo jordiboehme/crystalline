@@ -2119,6 +2119,20 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Editor,
             read_only_exempt: false,
         },
+        // Starting a single sign-on that links its identity to the caller's
+        // account. Viewer-level like the two surfaces below (how somebody
+        // signs in is not a privilege) and read-only exempt for the same
+        // reason: an identity link is account state in the accounts database.
+        // The fixture instance has no provider configured, so every allowed
+        // leg answers 404 - past authorization, which is what this matrix
+        // asserts, and starting nothing.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/auth/oidc/login",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
         // The self-service MCP token surface: the first viewer-level writes
         // on this API, because an agent acts as the account that issued its
         // token, so a viewer's agent is read-only by construction. Every
@@ -2309,9 +2323,11 @@ async fn the_write_matrix_holds_on_every_route() {
             .await
             .unwrap();
         if op.read_only_exempt {
-            // The self-service MCP token surface, and only it: `read_only`
-            // protects the knowledge, and a token is account state in the
-            // accounts database. A read-only team server with `auth.mcp` on is
+            // The self-service account-state surfaces, and only those:
+            // `read_only` protects the knowledge, and neither an MCP token
+            // nor a single sign-on identity is knowledge - both live in the
+            // accounts database, beside the password that logs the same
+            // person in. A read-only team server with `auth.mcp` on is
             // where an agent most needs one - it cannot connect at all
             // without it - so issuing answers 200 here and the two id-bearing
             // rows answer 404, both past authorization. This assertion IS the

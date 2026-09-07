@@ -56,6 +56,7 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "GET /api/v1/auth/me",
     "POST /api/v1/auth/setup",
     "GET /api/v1/auth/oidc/login",
+    "POST /api/v1/auth/oidc/login",
     "GET /api/v1/auth/oidc/callback",
     "GET /api/v1/auth/providers",
     "GET /api/v1/me/identity-links",

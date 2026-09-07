@@ -426,7 +426,7 @@
           {
             "name": "link",
             "in": "query",
-            "description": "Link the provider identity to the caller's existing account instead of\nsigning in as whoever it turns out to be. Needs a signed-in session.",
+            "description": "Recognized so that a request meaning to link is told where linking\nlives, rather than quietly started as an ordinary sign-in. Starting a\nlink is `POST /auth/oidc/login`; see [`start_link`] for why it cannot\nbe a GET.",
             "required": false,
             "schema": {
               "type": "boolean"
@@ -463,6 +463,94 @@
           },
           "401": {
             "description": "`link=true` on a request with no signed-in session.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No provider is configured on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The provider's discovery document could not be fetched, or it names a tenant-independent issuer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many sign-ins are in flight to start another. Wait a moment and try again.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Start a single sign-on that links its identity to this account.",
+        "description": "Starts the same authorization-code flow the GET does, and records that it is for the calling account: the callback ties the provider identity to that account rather than signing in as whoever it turns out to be. Needs a signed-in account and the session's CSRF token, because starting a link is an unsafe act - a GET would be startable by another origin. Answers the authorization endpoint in `location`; navigate the whole page to it. Served on a read-only instance: an identity link is account state rather than knowledge.",
+        "operationId": "oidc_start_link",
+        "responses": {
+          "200": {
+            "description": "Navigate to `location`.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartLinkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request carries no Host header, or one that is not a bare host and port, so no redirect uri can be derived.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No signed-in account to link to.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The session's CSRF token was missing or wrong.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -7725,6 +7813,20 @@
             ],
             "description": "The pull request title. Defaults to a generated summary.",
             "example": "Refine 2 engrams in kb"
+          }
+        }
+      },
+      "StartLinkResponse": {
+        "type": "object",
+        "description": "Where to send the browser to link a provider identity to the caller's account. Navigate the whole page to it: what follows is a redirect to the provider and a redirect back, so a background fetch would land nowhere anybody can authenticate.",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "The provider's authorization endpoint, with PKCE, state and nonce.",
+            "example": "https://idp.example/authorize?client_id=..."
           }
         }
       },

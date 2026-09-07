@@ -2863,9 +2863,6 @@ impl AuthStore {
         bail!("refusing to provision an account: every name from '{base}' on is taken")
     }
 
-    /// Drop every identity linked to one account. Called inside the removal
-    /// transaction: a link that outlived its account would hand the next
-    /// account to claim the name somebody else's sign-on.
     /// Whether `user` holds a link at `issuer`. Callers hold the lock and are
     /// inside a transaction.
     async fn link_at(&self, issuer: &str, user: &str) -> Result<bool> {
@@ -2914,6 +2911,9 @@ impl AuthStore {
         ))
     }
 
+    /// Drop every identity linked to one account. Called inside the removal
+    /// transaction: a link that outlived its account would hand the next
+    /// account to claim the name somebody else's sign-on.
     async fn delete_identity_links_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(

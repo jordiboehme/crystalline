@@ -1106,10 +1106,36 @@ fn host_is_well_formed(host: &str) -> bool {
 #[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct LoginQuery {
-    /// Link the provider identity to the caller's existing account instead of
-    /// signing in as whoever it turns out to be. Needs a signed-in session.
+    /// Recognized so that a request meaning to link is told where linking
+    /// lives, rather than quietly started as an ordinary sign-in. Starting a
+    /// link is `POST /auth/oidc/login`; see [`start_link`] for why it cannot
+    /// be a GET.
     #[serde(default)]
     pub link: bool,
+}
+
+/// What `POST /auth/oidc/login` answers with: where to send the browser.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+#[schema(description = "Where to send the browser to link a provider \
+                        identity to the caller's account. Navigate the whole \
+                        page to it: what follows is a redirect to the \
+                        provider and a redirect back, so a background fetch \
+                        would land nowhere anybody can authenticate.")]
+pub struct StartLinkResponse {
+    /// The provider's authorization endpoint, with PKCE, state and nonce.
+    #[schema(example = "https://idp.example/authorize?client_id=...")]
+    pub location: String,
+}
+
+/// Everything one sign-on start produces: where to send the browser, and the
+/// cookie that binds the journey to it.
+///
+/// One body for the two routes below, so the ordinary sign-in and the link
+/// differ in exactly one thing - whether an account is recorded as the one
+/// this journey is for - rather than in two copies of a protocol dance.
+struct StartedSignOn {
+    authorize_url: String,
+    cookie: Cookie<'static>,
 }
 
 /// `GET /auth/oidc/login` - start a sign-in against the configured provider.
@@ -1179,34 +1205,164 @@ pub struct LoginQuery {
 )]
 pub async fn login(
     State(state): State<RestState>,
-    identity: Identity,
     jar: CookieJar,
     headers: HeaderMap,
     ApiQuery(query): ApiQuery<LoginQuery>,
 ) -> Result<Response, ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
-    // Link intent is an authenticated act: it says "add this provider identity
-    // to the account I am already signed in as", so there has to be one.
-    let link_for = if query.link {
-        Some(
-            identity
-                .require_account()
-                .map_err(|_| {
-                    refused(
-                        "link intent without a signed-in session",
-                        &client.settings.issuer,
-                    );
-                    ApiError::unauthorized(
-                        "linking a single sign-on identity needs a signed-in account - sign in \
-                         first, then link from your profile",
-                    )
-                })?
-                .name,
+    if query.link {
+        // Recognized and refused rather than honored: see `start_link`. A GET
+        // that started a link would be startable by any other origin, since
+        // the session cookie is SameSite=Lax and rides a top-level navigation.
+        refused("link intent on a GET", &client.settings.issuer);
+        return Err(ApiError::bad_request(
+            "a link is started with POST /auth/oidc/login, which needs the session's CSRF \
+             token - this GET starts an ordinary sign-in and will not link anything",
+        ));
+    }
+    let started = start_sign_on(&state, &headers, None).await?;
+    Ok((
+        jar.add(started.cookie),
+        super::auth::no_store(),
+        found(&started.authorize_url),
+    )
+        .into_response())
+}
+
+/// `POST /auth/oidc/login` - start a sign-on that LINKS the provider identity
+/// to the account this request is made by.
+///
+/// A POST, and that is the security property rather than a style choice. The
+/// session cookie is `SameSite=Lax`, which rides a top-level cross-site
+/// navigation, so a GET that started a link could be started by any page on
+/// the internet: it would plant a state cookie in a signed-in browser and bind
+/// a pending link to that account, and a browser then authenticated at the
+/// provider as somebody else would finish it. An unsafe method cannot be sent
+/// cross-site with the cookie at all, and the guard's one CSRF rule covers it
+/// on top of that, in every identity mode - which matters most in the one
+/// where `SameSite` protects nothing, because the identity rides a header a
+/// proxy sets.
+///
+/// The answer is a body rather than a redirect. The only client that can send
+/// the CSRF header is a script, and a script cannot read where a redirect went
+/// (a followed cross-origin redirect is a CORS failure, a manual one is
+/// opaque), so a 303 here would hand the browser somewhere it could not learn.
+/// The caller navigates the whole page to `location` itself.
+#[utoipa::path(
+    post,
+    path = "/api/v1/auth/oidc/login",
+    tag = "auth",
+    operation_id = "oidc_start_link",
+    summary = "Start a single sign-on that links its identity to this account.",
+    description = "Starts the same authorization-code flow the GET does, and \
+                   records that it is for the calling account: the callback \
+                   ties the provider identity to that account rather than \
+                   signing in as whoever it turns out to be. Needs a \
+                   signed-in account and the session's CSRF token, because \
+                   starting a link is an unsafe act - a GET would be \
+                   startable by another origin. Answers the authorization \
+                   endpoint in `location`; navigate the whole page to it. \
+                   Served on a read-only instance: an identity link is \
+                   account state rather than knowledge.",
+    responses(
+        (
+            status = 200,
+            description = "Navigate to `location`.",
+            body = StartLinkResponse,
+            headers(
+                ("set-cookie" = String, description = "The `fluid_oidc_state` \
+                 cookie, HttpOnly and SameSite=Lax."),
+            ),
+        ),
+        (
+            status = 400,
+            description = "The request carries no Host header, or one that is \
+                           not a bare host and port, so no redirect uri can be \
+                           derived.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No signed-in account to link to.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The session's CSRF token was missing or wrong.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No provider is configured on this instance.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 502,
+            description = "The provider's discovery document could not be fetched, \
+                           or it names a tenant-independent issuer.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 503,
+            description = "Too many sign-ins are in flight to start another. \
+                           Wait a moment and try again.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn start_link(
+    State(state): State<RestState>,
+    identity: Identity,
+    jar: CookieJar,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    // Before the provider is even consulted, and in this order: an instance
+    // with no provider must still answer an unauthenticated caller the way
+    // every other account-bearing route does.
+    let account = identity.require_account().map_err(|_| {
+        ApiError::unauthorized(
+            "linking a single sign-on identity needs a signed-in account - sign in first, then \
+             link from your profile",
         )
-    } else {
-        None
-    };
-    let redirect_uri = absolute_url(&headers, CALLBACK_PATH).inspect_err(|_| {
+    })?;
+    let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
+    if identity.user.is_none() {
+        refused(
+            "link intent without a signed-in session",
+            &client.settings.issuer,
+        );
+    }
+    let started = start_sign_on(&state, &headers, Some(account.name)).await?;
+    Ok((
+        jar.add(started.cookie),
+        super::auth::no_store(),
+        axum::Json(StartLinkResponse {
+            location: started.authorize_url,
+        }),
+    )
+        .into_response())
+}
+
+/// The authorization-code dance both routes above run: derive the redirect
+/// uri, build the authorize url with PKCE, a state and a nonce, remember the
+/// pending journey and hand back the cookie that binds it to this browser.
+///
+/// `link_for` is the only difference between an ordinary sign-in and a link,
+/// and it is carried in the pending record rather than in the url, so nothing
+/// a browser or a provider can rewrite decides which of the two this is.
+async fn start_sign_on(
+    state: &RestState,
+    headers: &HeaderMap,
+    link_for: Option<String>,
+) -> Result<StartedSignOn, ApiError> {
+    let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
+    let redirect_uri = absolute_url(headers, CALLBACK_PATH).inspect_err(|_| {
         // The 400 an operator debugging a proxy most wants to see in the log.
         refused(
             "redirect uri could not be derived from the Host header",
@@ -1263,15 +1419,13 @@ pub async fn login(
         // top-level cross-site navigation, and a Strict cookie is not sent on
         // one, so the callback would find nothing to match against.
         .same_site(SameSite::Lax)
-        .secure(super::auth::cookie_needs_secure(&headers))
+        .secure(super::auth::cookie_needs_secure(headers))
         .max_age(time::Duration::seconds(PENDING_TTL.as_secs() as i64))
         .build();
-    Ok((
-        jar.add(cookie),
-        super::auth::no_store(),
-        found(authorize_url.as_str()),
-    )
-        .into_response())
+    Ok(StartedSignOn {
+        authorize_url: authorize_url.to_string(),
+        cookie,
+    })
 }
 
 /// The query of `GET /auth/oidc/callback`: what the provider sends back, in
@@ -1370,6 +1524,7 @@ pub struct CallbackQuery {
 )]
 pub async fn callback(
     State(state): State<RestState>,
+    identity: Identity,
     jar: CookieJar,
     headers: HeaderMap,
     ApiQuery(query): ApiQuery<CallbackQuery>,
@@ -1389,7 +1544,7 @@ pub async fn callback(
         Ok(claims) => claims,
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
-    let user = resolve_oidc_identity(&state, claims, &jar).await;
+    let user = resolve_oidc_identity(&state, claims, &identity).await;
     let user = match user {
         Ok(user) => user,
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
@@ -1795,10 +1950,10 @@ fn account_is_disabled() -> ApiError {
 async fn resolve_oidc_identity(
     state: &RestState,
     claims: OidcClaims,
-    jar: &CookieJar,
+    identity: &Identity,
 ) -> Result<User, ApiError> {
     if let Some(intent) = claims.link_for.clone() {
-        return link_the_started_account(state, &claims, &intent, jar).await;
+        return link_the_started_account(state, &claims, &intent, identity).await;
     }
     let settings = &state.oidc.as_ref().ok_or_else(sso_is_off)?.settings;
     if let Some(user) = state
@@ -1873,7 +2028,7 @@ async fn resolve_oidc_identity(
 /// session; this checks the other end of the same journey, against the session
 /// the callback actually arrives on:
 ///
-/// * no live session on the callback - signed out, expired, or revoked while
+/// * no live account on the callback - signed out, expired, or revoked while
 ///   the browser was away at the provider - is a 401. There is nobody to link
 ///   to, and signing in again is exactly what fixes it.
 /// * a live session naming a DIFFERENT account is a 409. The one thing that
@@ -1887,19 +2042,26 @@ async fn resolve_oidc_identity(
 /// A pair already linked to THIS account is not a refusal at all: somebody
 /// pressed the button twice, and the honest answer is the sign-in they asked
 /// for.
+///
+/// Who the caller is comes from [`Identity`] rather than from the session
+/// cookie, which is the same question [`start_link`] asks at the other end of
+/// the journey. That matters on an instance whose identities arrive in a
+/// trusted header: reading the cookie here would let such a browser start a
+/// link it could never finish, since it may hold no session cookie at all. The
+/// guard has already resolved the identity for this route (the callback is
+/// public by path, not unauthenticated by nature), so this costs no store
+/// lookup either.
 async fn link_the_started_account(
     state: &RestState,
     claims: &OidcClaims,
     intent: &str,
-    jar: &CookieJar,
+    identity: &Identity,
 ) -> Result<User, ApiError> {
-    let session = match jar.get(super::auth::SESSION_COOKIE) {
-        Some(cookie) => state.auth.session_user(cookie.value()).await?,
-        None => None,
-    };
-    // A disabled account's session does not resolve here either (the store
-    // refuses it), so this one arm covers signed out, expired and disabled.
-    let Some((user, _csrf)) = session else {
+    // A session the store has forgotten, one that expired, one revoked while
+    // the browser was away at the provider, a disabled account and the
+    // anonymous viewer all arrive here the same way: with no account behind
+    // the request.
+    let Ok(user) = identity.require_account() else {
         tracing::debug!("a link callback arrived on no live session");
         return Err(ApiError::unauthorized(
             "the session that started this link is no longer signed in - sign in again, then \

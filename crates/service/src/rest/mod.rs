@@ -158,6 +158,7 @@ use crate::scope::{DomainAccess, DomainRight};
         mcp_tokens::issue,
         mcp_tokens::rotate,
         mcp_tokens::revoke,
+        oidc::start_link,
         identity_links::list,
         identity_links::unlink,
     ),
@@ -194,6 +195,7 @@ use crate::scope::{DomainAccess, DomainRight};
         auth::LogoutResponse,
         auth::MeResponse,
         auth::SetupBody,
+        oidc::StartLinkResponse,
         oidc::ProvidersResponse,
         oidc::OidcProviderView,
         IdentityLink,
@@ -471,7 +473,11 @@ pub fn router(state: RestState) -> Router {
         // above are public. The callback's protection is the single-use state
         // it generated and the cookie it bound to this browser, not a session
         // that does not exist yet. See [`oidc`].
-        .route(oidc::LOGIN_PATH, get(oidc::login))
+        // One path, two verbs, and the difference is the whole security
+        // story: the GET starts an ordinary sign-in and is public, the POST
+        // starts a link and is an unsafe request by a signed-in account, so
+        // the CSRF gate covers it and no other origin can start one.
+        .route(oidc::LOGIN_PATH, get(oidc::login).post(oidc::start_link))
         .route(oidc::CALLBACK_PATH, get(oidc::callback))
         .route(oidc::PROVIDERS_PATH, get(oidc::providers))
         .route("/domains", get(domains::list).post(domains_admin::create))

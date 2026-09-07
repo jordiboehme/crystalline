@@ -626,6 +626,24 @@ impl RestCtx {
         RestCtx::build(None).await
     }
 
+    /// A provider plus `auth.trusted_header`: the deployment whose identities
+    /// arrive in a header a proxy sets rather than in a session cookie.
+    async fn with_oidc_and_trusted_header(issuer: &str, header: &str) -> RestCtx {
+        RestCtx::build_with(
+            Some(OidcConfig {
+                issuer: Some(issuer.to_string()),
+                client_id: Some(CLIENT_ID.to_string()),
+                client_secret: Some(CLIENT_SECRET.to_string()),
+                name: Some("Contoso".to_string()),
+                scopes: None,
+                default_role: None,
+            }),
+            None,
+            Some(header.to_string()),
+        )
+        .await
+    }
+
     async fn build(oidc: Option<OidcConfig>) -> RestCtx {
         RestCtx::build_capped(oidc, None).await
     }
@@ -633,6 +651,14 @@ impl RestCtx {
     /// The same instance with `auth.max_users` set, so the cap a provisioning
     /// has to respect can actually be reached in a test.
     async fn build_capped(oidc: Option<OidcConfig>, max_users: Option<u32>) -> RestCtx {
+        RestCtx::build_with(oidc, max_users, None).await
+    }
+
+    async fn build_with(
+        oidc: Option<OidcConfig>,
+        max_users: Option<u32>,
+        trusted_header: Option<String>,
+    ) -> RestCtx {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("eng");
         std::fs::create_dir_all(&dir).unwrap();
@@ -644,7 +670,7 @@ impl RestCtx {
         .unwrap();
         let mut config = GlobalConfig {
             auth: Some(AuthConfig {
-                trusted_header: None,
+                trusted_header,
                 anonymous: None,
                 mcp: None,
                 max_users,
@@ -742,14 +768,24 @@ impl RestCtx {
     /// A GET carrying `cookies`, which the caller collects by hand because the
     /// browser here has no cookie jar.
     async fn get(&self, url: &str, cookies: &[(String, String)]) -> reqwest::Response {
+        self.get_with(url, cookies, &[]).await
+    }
+
+    /// The same, plus request headers of the caller's own - the trusted header
+    /// a proxy sets, for the tests that drive an instance whose identities come
+    /// from somewhere other than the session cookie.
+    async fn get_with(
+        &self,
+        url: &str,
+        cookies: &[(String, String)],
+        extra: &[(&str, String)],
+    ) -> reqwest::Response {
         let mut request = self.client.get(url);
         if !cookies.is_empty() {
-            let header = cookies
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join("; ");
-            request = request.header(reqwest::header::COOKIE, header);
+            request = request.header(reqwest::header::COOKIE, cookie_header(cookies));
+        }
+        for (name, value) in extra {
+            request = request.header(*name, value);
         }
         request.send().await.unwrap()
     }
@@ -766,6 +802,59 @@ impl RestCtx {
     async fn sign_in_from(&self, path: &str, held: &[(String, String)]) -> reqwest::Response {
         let (callback, cookies) = self.walk_to_callback(path, held).await;
         self.get(&callback, &cookies).await
+    }
+
+    /// The link flow, walked the way the app walks it: POST the start with the
+    /// session's CSRF token, take the authorize url out of the answer, bounce
+    /// off the provider and answer the callback.
+    async fn link_from(&self, held: &[(String, String)]) -> reqwest::Response {
+        let (callback, cookies) = self.walk_link_to_callback(held, &[]).await;
+        self.get(&callback, &cookies).await
+    }
+
+    /// That walk stopped one hop short, so a test can answer the callback with
+    /// somebody else's cookies - which is what "started by one session,
+    /// finished by another" looks like on the wire - or with a trusted header
+    /// and no cookie at all.
+    async fn walk_link_to_callback(
+        &self,
+        held: &[(String, String)],
+        extra: &[(&str, String)],
+    ) -> (String, Vec<(String, String)>) {
+        let start = self.start_link(held, extra).await;
+        assert_eq!(start.status(), 200, "the link start should be accepted");
+        let mut cookies = held.to_vec();
+        cookies.extend(cookies_from(&start));
+        let body: serde_json::Value = start.json().await.unwrap();
+        let authorize = body["location"]
+            .as_str()
+            .expect("the start hands back where to send the browser")
+            .to_string();
+        let bounced = self.client.get(&authorize).send().await.unwrap();
+        assert_eq!(bounced.status(), 302, "the provider should redirect back");
+        (location(&bounced), cookies)
+    }
+
+    /// `POST /auth/oidc/login`, carrying the caller's CSRF token: starting a
+    /// link is an unsafe act by a signed-in account, and the guard treats it
+    /// as one.
+    async fn start_link(
+        &self,
+        held: &[(String, String)],
+        extra: &[(&str, String)],
+    ) -> reqwest::Response {
+        let csrf = self.csrf_with(held, extra).await;
+        let mut request = self.client.post(self.url("/auth/oidc/login"));
+        if !held.is_empty() {
+            request = request.header(reqwest::header::COOKIE, cookie_header(held));
+        }
+        for (name, value) in extra {
+            request = request.header(*name, value);
+        }
+        if let Some(token) = csrf {
+            request = request.header("x-csrf-token", token);
+        }
+        request.send().await.unwrap()
     }
 
     /// The same walk stopped one hop short: the callback url the provider sent
@@ -792,26 +881,32 @@ impl RestCtx {
     /// client opens on. Needed by the unsafe requests below, which the guard
     /// refuses without it.
     async fn csrf(&self, cookies: &[(String, String)]) -> String {
+        self.csrf_with(cookies, &[])
+            .await
+            .expect("a session carries a csrf token")
+    }
+
+    /// The same probe with headers of the caller's own, and tolerant of there
+    /// being no token at all: an identity with no account has none, and the
+    /// route it is about to drive is the one that says so.
+    async fn csrf_with(
+        &self,
+        cookies: &[(String, String)],
+        extra: &[(&str, String)],
+    ) -> Option<String> {
         let body: serde_json::Value = self
-            .get(&self.url("/auth/me"), cookies)
+            .get_with(&self.url("/auth/me"), cookies, extra)
             .await
             .json()
             .await
             .unwrap();
-        body["csrf"]
-            .as_str()
-            .expect("a session carries a csrf token")
-            .to_string()
+        body["csrf"].as_str().map(str::to_string)
     }
 
     /// A DELETE carrying `cookies` and the session's CSRF token.
     async fn delete(&self, url: &str, cookies: &[(String, String)]) -> reqwest::Response {
         let csrf = self.csrf(cookies).await;
-        let header = cookies
-            .iter()
-            .map(|(name, value)| format!("{name}={value}"))
-            .collect::<Vec<_>>()
-            .join("; ");
+        let header = cookie_header(cookies);
         self.client
             .delete(url)
             .header(reqwest::header::COOKIE, header)
@@ -830,6 +925,15 @@ impl RestCtx {
             .await
             .unwrap()
     }
+}
+
+/// The `Cookie` header for a browser holding `cookies`.
+fn cookie_header(cookies: &[(String, String)]) -> String {
+    cookies
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Every `set-cookie` on a response, as name and value pairs.
@@ -1156,10 +1260,108 @@ async fn the_three_routes_are_reachable_without_a_session() {
 async fn link_intent_without_a_session_is_refused() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
-    let refused = ctx.get(&ctx.url("/auth/oidc/login?link=true"), &[]).await;
+    let refused = ctx.start_link(&[], &[]).await;
     assert_eq!(refused.status(), 401);
     let detail = refused.text().await.unwrap();
     assert!(detail.contains("sign in first"), "{detail}");
+}
+
+/// A GET never starts a link, whoever sends it.
+///
+/// `GET /auth/oidc/login` is public, the session cookie is `SameSite=Lax`, and
+/// a Lax cookie rides a top-level cross-site navigation - so another origin
+/// could send a signed-in browser to `?link=true` and start a link bound to
+/// that account without its owner doing anything. Starting one is an unsafe
+/// act by a signed-in account and is a POST, which the CSRF gate covers like
+/// every other write; the flag on a GET is refused in words that say so, and
+/// an ordinary sign-in through the same GET is untouched.
+#[tokio::test]
+async fn a_get_never_starts_a_link() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+
+    let refused = ctx
+        .get(&ctx.url("/auth/oidc/login?link=true"), &session)
+        .await;
+    assert_eq!(refused.status(), 400);
+    let detail = refused.text().await.unwrap();
+    assert!(detail.contains("POST"), "{detail}");
+    assert!(
+        ctx.auth.identity_links("ada").await.unwrap().is_empty(),
+        "nothing was started, so nothing can be finished"
+    );
+
+    // The ordinary sign-in through the same route is exactly as it was.
+    assert_eq!(
+        ctx.get(&ctx.url("/auth/oidc/login"), &session)
+            .await
+            .status(),
+        302
+    );
+}
+
+/// The POST is an unsafe request from a signed-in account, so the guard's one
+/// CSRF rule covers it: no token and a wrong token are both refused before the
+/// handler runs, which is the whole point of moving the start off the GET.
+#[tokio::test]
+async fn starting_a_link_needs_the_session_csrf_token() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+
+    let bare = ctx
+        .client
+        .post(ctx.url("/auth/oidc/login"))
+        .header(reqwest::header::COOKIE, cookie_header(&session))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 403, "no token, no link");
+    let wrong = ctx
+        .client
+        .post(ctx.url("/auth/oidc/login"))
+        .header(reqwest::header::COOKIE, cookie_header(&session))
+        .header("x-csrf-token", "not-the-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 403, "a guessed token is no token");
+}
+
+/// The finishing session is resolved the way the starting one is - through the
+/// request's identity - so an instance whose identities arrive in a trusted
+/// header rather than in a cookie can link at all.
+///
+/// The browser here holds no session cookie on any hop: the proxy's header is
+/// the whole of who it is, exactly as it is for every other route on such an
+/// instance.
+#[tokio::test]
+async fn a_trusted_header_instance_can_link_without_a_session_cookie() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc_and_trusted_header(&idp.issuer(), "x-forwarded-user").await;
+    let header = [("x-forwarded-user", "ada".to_string())];
+
+    let (callback, cookies) = ctx.walk_link_to_callback(&[], &header).await;
+    let state_only: Vec<(String, String)> = cookies
+        .into_iter()
+        .filter(|(name, _)| name == "fluid_oidc_state")
+        .collect();
+    let linked = ctx.get_with(&callback, &state_only, &header).await;
+    assert_eq!(linked.status(), 302, "the header names who finished it");
+
+    let links = ctx.auth.identity_links("ada").await.unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].subject, "sub-ada");
+    assert_eq!(links[0].linked_by, "ada");
+    assert!(
+        ctx.user("ada.lovelace").await.is_none(),
+        "a link provisions nobody"
+    );
 }
 
 /// Two concurrent first sign-ins share ONE discovery fetch, and neither waits
@@ -1321,9 +1523,7 @@ async fn every_callback_answer_is_uncacheable() {
     assert_eq!(refused.status(), 401);
     assert!(cache_control(&refused).contains("no-store"), "{refused:?}");
 
-    let past_the_seam = ctx
-        .sign_in_from("/auth/oidc/login?link=true", &session)
-        .await;
+    let past_the_seam = ctx.link_from(&session).await;
     assert_eq!(past_the_seam.status(), 409);
     assert!(
         cache_control(&past_the_seam).contains("no-store"),
@@ -1638,9 +1838,7 @@ async fn a_link_intent_sign_in_links_the_account_that_started_it() {
         .await;
     let session = ctx.local_login("ada").await;
 
-    let linked = ctx
-        .sign_in_from("/auth/oidc/login?link=true", &session)
-        .await;
+    let linked = ctx.link_from(&session).await;
     assert_eq!(
         linked.status(),
         302,
@@ -1685,9 +1883,7 @@ async fn a_link_started_by_one_session_is_not_finished_by_another() {
     // ada starts the link; the state cookie ada picked up is presented with
     // grace's session cookie, which is what a link finished from somebody
     // else's session looks like on the wire.
-    let (callback, cookies) = ctx
-        .walk_to_callback("/auth/oidc/login?link=true", &ada)
-        .await;
+    let (callback, cookies) = ctx.walk_link_to_callback(&ada, &[]).await;
     let mut as_grace: Vec<(String, String)> = cookies
         .iter()
         .filter(|(name, _)| name == "fluid_oidc_state")
@@ -1717,9 +1913,7 @@ async fn a_link_whose_session_is_gone_is_refused() {
         .await;
     let session = ctx.local_login("ada").await;
 
-    let (callback, cookies) = ctx
-        .walk_to_callback("/auth/oidc/login?link=true", &session)
-        .await;
+    let (callback, cookies) = ctx.walk_link_to_callback(&session, &[]).await;
     // The session is revoked while the browser is away at the provider.
     ctx.auth
         .set_password("ada", "correct horse battery staple")
@@ -1745,7 +1939,7 @@ async fn an_identity_linked_elsewhere_is_refused_without_naming_the_holder() {
         .await;
     let grace = ctx.local_login("grace").await;
 
-    let refused = ctx.sign_in_from("/auth/oidc/login?link=true", &grace).await;
+    let refused = ctx.link_from(&grace).await;
     assert_eq!(refused.status(), 409);
     let body = refused.text().await.unwrap();
     assert!(body.contains("already linked to another account"), "{body}");
@@ -1766,17 +1960,10 @@ async fn linking_an_identity_the_account_already_holds_signs_it_in() {
     ctx.create_local_user("ada", "ada@example.test", Role::Admin)
         .await;
     let session = ctx.local_login("ada").await;
-    assert_eq!(
-        ctx.sign_in_from("/auth/oidc/login?link=true", &session)
-            .await
-            .status(),
-        302
-    );
+    assert_eq!(ctx.link_from(&session).await.status(), 302);
 
     let session = ctx.local_login("ada").await;
-    let again = ctx
-        .sign_in_from("/auth/oidc/login?link=true", &session)
-        .await;
+    let again = ctx.link_from(&session).await;
     assert_eq!(again.status(), 302);
     assert_eq!(
         ctx.auth.identity_links("ada").await.unwrap().len(),
@@ -1795,12 +1982,7 @@ async fn an_account_lists_and_unlinks_its_own_identities() {
     ctx.create_local_user("ada", "ada@example.test", Role::Admin)
         .await;
     let session = ctx.local_login("ada").await;
-    assert_eq!(
-        ctx.sign_in_from("/auth/oidc/login?link=true", &session)
-            .await
-            .status(),
-        302
-    );
+    assert_eq!(ctx.link_from(&session).await.status(), 302);
     let session = ctx.local_login("ada").await;
 
     let listed = ctx.my_links(&session).await;
@@ -1871,30 +2053,52 @@ async fn unlinking_the_last_way_in_is_refused_over_http_too() {
     assert_eq!(removed.status(), 204);
 }
 
-/// Which spelling of the flag starts a link, pinned because the profile
-/// card's button is a plain navigation to this url and has no way to recover
-/// from getting it wrong. `link=true` is the one the query deserializes;
-/// `link=1` is not a bool as far as the query layer is concerned, and a
-/// refusal in problem+json is a better answer than an ordinary sign-in that
-/// silently signs somebody in as somebody else.
+/// Both spellings of the flag on a GET are refused, and for two different
+/// reasons: `link=true` is understood and answered with the route that starts
+/// a link, `link=1` is not a bool as far as the query layer is concerned and
+/// never reaches the handler at all. Pinned because both are 400s a client
+/// would otherwise have to tell apart by prose.
 #[tokio::test]
-async fn the_link_flag_is_spelled_true() {
+async fn neither_spelling_of_the_flag_starts_a_link_on_a_get() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
     ctx.create_local_user("ada", "ada@example.test", Role::Admin)
         .await;
     let session = ctx.local_login("ada").await;
 
-    let started = ctx
+    let understood = ctx
         .get(&ctx.url("/auth/oidc/login?link=true"), &session)
         .await;
-    assert_eq!(started.status(), 302);
+    assert_eq!(understood.status(), 400);
+    let detail = understood.text().await.unwrap();
+    assert!(detail.contains("POST"), "{detail}");
+
     let numeric = ctx.get(&ctx.url("/auth/oidc/login?link=1"), &session).await;
     assert_eq!(
         numeric.status(),
         400,
         "`link=1` is refused rather than read as an ordinary sign-in"
     );
+}
+
+/// An issuer that is not one - blank, or nothing but spaces - is the same 404
+/// as any other issuer this account holds no link at, rather than a 500. It
+/// names no link either way, and a client that mis-encodes a segment should
+/// read that as "not found", not as "this server broke".
+#[tokio::test]
+async fn a_blank_issuer_is_not_found_rather_than_a_server_error() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+
+    for segment in ["%20", "%20%20"] {
+        let answer = ctx
+            .delete(&ctx.url(&format!("/me/identity-links/{segment}")), &session)
+            .await;
+        assert_eq!(answer.status(), 404, "segment {segment}");
+    }
 }
 
 /// The identity-link surface is the caller's own: no session, no answer.

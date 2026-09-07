@@ -199,15 +199,29 @@ pub async fn unlink(
     ApiPath(issuer): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_own_account(&identity)?;
+    // A segment that is not an issuer at all names no link, which is what the
+    // 404 below says. Answered here rather than by the store, whose own
+    // refusal for a blank value is a plain error this surface would have to
+    // render as a 500 - a worse answer to "unlink nothing" than "there is no
+    // such link".
+    if issuer.trim().is_empty() {
+        return Err(no_such_link());
+    }
     let removed = state
         .auth
         .unlink_identity(&issuer, &user.name)
         .await
         .map_err(store_error)?;
     if !removed {
-        return Err(ApiError::not_found(
-            "this account holds no single sign-on identity at that issuer",
-        ));
+        return Err(no_such_link());
     }
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// What an issuer this account holds nothing at is told, in one place because
+/// two paths produce it: a well-formed issuer with no link, and a segment that
+/// is not an issuer. Deliberately the same answer, so the route cannot become
+/// a probe for which providers exist here.
+fn no_such_link() -> ApiError {
+    ApiError::not_found("this account holds no single sign-on identity at that issuer")
 }
