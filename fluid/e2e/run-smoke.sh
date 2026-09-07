@@ -2,8 +2,9 @@
 # Run the Fluid browser smoke against a real Crystalline daemon.
 #
 # One command, the same one locally and in CI: it stands up a daemon holding a
-# copy of the fixture domain, creates the admin account through the first-run
-# setup endpoint the browser wizard drives and seeds a peer editor with the CLI,
+# copy of each fixture domain, creates the admin account through the first-run
+# setup endpoint the browser wizard drives, seeds a peer and an outsider editor
+# with the CLI and closes the second fixture domain to the admin who owns it,
 # checks the web UI that daemon serves out of its own binary, then builds the
 # bundle and hands both to Playwright, which serves the bundle with `vite
 # preview` (see playwright.config.ts) and drives a browser against it.
@@ -81,8 +82,26 @@ FLUID_E2E_DOMAIN="${FLUID_E2E_DOMAIN:-fluid-smoke}"
 # people, and two people in one room need two logins.
 FLUID_E2E_PEER="${FLUID_E2E_PEER:-peer}"
 FLUID_E2E_PEER_PASSWORD="${FLUID_E2E_PEER_PASSWORD:-peer-password}"
+# The third account, for the members journey: proving that an invitation is
+# what makes a private domain visible takes somebody who was NOT invited, and
+# neither of the two above can be that person once one of them has been.
+FLUID_E2E_OUTSIDER="${FLUID_E2E_OUTSIDER:-outsider}"
+FLUID_E2E_OUTSIDER_PASSWORD="${FLUID_E2E_OUTSIDER_PASSWORD:-outsider-password}"
+# The domain that journey closes, invites into and opens again. A domain of its
+# own rather than the fixture one every other journey browses: making that one
+# private would hide it from the peer half of the co-editing journey.
+#
+# The name deliberately does not begin with the fixture domain's name: the
+# sidebar assertions match a domain link by prefix, and a name starting with
+# `fluid-smoke` would match two links and fail those on strictness alone. It
+# also deliberately does not contain the word "private", which is the badge's
+# own text - a domain whose name carried it could not be told apart from a
+# domain wearing it.
+FLUID_E2E_PRIVATE_DOMAIN="${FLUID_E2E_PRIVATE_DOMAIN:-smoke-vault}"
 export FLUID_E2E_USER FLUID_E2E_PASSWORD FLUID_E2E_DOMAIN
 export FLUID_E2E_PEER FLUID_E2E_PEER_PASSWORD
+export FLUID_E2E_OUTSIDER FLUID_E2E_OUTSIDER_PASSWORD
+export FLUID_E2E_PRIVATE_DOMAIN
 
 bin="${CRYSTALLINE_BIN:-}"
 if [ -z "$bin" ]; then
@@ -162,9 +181,17 @@ mkdir -p "$run_dir/config" "$run_dir/state" "$run_dir/cache" "$run_dir/data" \
 
 domain_root="$run_dir/domain"
 cp -R "$here/fixtures/domain" "$domain_root"
+private_root="$run_dir/private-domain"
+cp -R "$here/fixtures/private-domain" "$private_root"
 
-echo "smoke: registering the fixture domain"
+echo "smoke: registering the fixture domains"
 "${isolated[@]}" "$bin" domain add "$FLUID_E2E_DOMAIN" "$domain_root"
+# Registered here, made private further down: registration is a config write
+# the daemon reads at startup, so it has to happen before the daemon comes up,
+# while the visibility record names an owner and so has to wait until there is
+# an account to name. The acl row is read fresh on every request, so no restart
+# stands between the two halves.
+"${isolated[@]}" "$bin" domain add "$FLUID_E2E_PRIVATE_DOMAIN" "$private_root"
 
 # The daemon comes up before any account exists, which is the state a real
 # first run is in: the admin below is created through the daemon's own setup
@@ -278,6 +305,21 @@ fi
 echo "smoke: seeding the peer account"
 printf '%s' "$FLUID_E2E_PEER_PASSWORD" \
     | "${isolated[@]}" "$bin" users add "$FLUID_E2E_PEER" --role editor --password-stdin
+
+# The third account, at the same instance role as the peer. Same role on
+# purpose: what the members journey then proves is that the difference between
+# the two is the invitation and nothing else.
+echo "smoke: seeding the outsider account"
+printf '%s' "$FLUID_E2E_OUTSIDER_PASSWORD" \
+    | "${isolated[@]}" "$bin" users add "$FLUID_E2E_OUTSIDER" --role editor --password-stdin
+
+# The private domain, closed from the terminal the way an operator closes one -
+# and the only half of the members journey that is not driven through the
+# browser, because the admin has to own the domain before the browser can
+# invite anybody into it.
+echo "smoke: making $FLUID_E2E_PRIVATE_DOMAIN private"
+"${isolated[@]}" "$bin" domain visibility "$FLUID_E2E_PRIVATE_DOMAIN" private \
+    --owner "$FLUID_E2E_USER"
 
 # The embedded web UI, checked against the daemon's own port before the browser
 # journeys start. Playwright drives `vite preview` (the compose scenario, where
