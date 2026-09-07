@@ -230,8 +230,24 @@ async fn serve_personal_share_with_mcp_auth()
 /// `tests/http_stream.rs` drives the handshake through, so a refusal here can
 /// only be the gate and never a malformed body.
 fn initialize_body() -> String {
-    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"mcp-auth-test","version":"0.0.0"}}}"#
-        .to_string()
+    initialize_body_as("mcp-auth-test")
+}
+
+/// The same handshake from a client naming itself `client`, which is the whole
+/// of what a client gets to say about its own identity and therefore the input
+/// the provenance composition has to be safe against.
+fn initialize_body_as(client: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": client, "version": "0.0.0" },
+        },
+    })
+    .to_string()
 }
 
 /// POST that handshake at the endpoint root, optionally presenting `bearer` as
@@ -640,7 +656,16 @@ impl McpTestSession {
     /// `notifications/initialized` a client owes the session before its first
     /// call.
     async fn open(addr: &std::net::SocketAddr, token: Option<&str>) -> McpTestSession {
-        let handshake = raw_post(addr, &initialize_body(), &[], token).await;
+        McpTestSession::open_as(addr, token, "mcp-auth-test").await
+    }
+
+    /// [`McpTestSession::open`] from a client that names itself `client`.
+    async fn open_as(
+        addr: &std::net::SocketAddr,
+        token: Option<&str>,
+        client: &str,
+    ) -> McpTestSession {
+        let handshake = raw_post(addr, &initialize_body_as(client), &[], token).await;
         assert!(
             handshake.starts_with("HTTP/1.1 200 "),
             "the handshake must be served:\n{handshake}"
@@ -900,5 +925,97 @@ async fn an_authenticated_modern_era_call_carries_the_account_with_no_session() 
     assert!(
         written.contains("for-ada"),
         "the account reaches a call that never opened a session: {written}"
+    );
+}
+
+/// **A client cannot spend the provenance budget and truncate the account off
+/// the end.**
+///
+/// `clientInfo.name` is client-supplied and unbounded, while the actor a write
+/// records is capped. Composing the two halves and sanitizing once would let a
+/// long enough client name fill the cap and drop, or half-drop, the half the
+/// server asserts - `...-for-ad`, or no account at all, with the write
+/// succeeding either way and nothing to notice it. The account is measured
+/// first instead, so it lands whole and the client half is what gets cut.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_client_name_is_cut_and_the_account_still_lands_whole() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+
+    let long = "c".repeat(200);
+    let session = McpTestSession::open_as(&addr, Some(&token), &long).await;
+    let answer = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Budget Trace",
+                "content": "- [fact] traced",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the write must be served, not refused:\n{answer}"
+    );
+
+    let written =
+        std::fs::read_to_string(guard.path().join("eng").join("budget-trace.md")).unwrap();
+    assert!(
+        written.contains("-for-ada,"),
+        "the account survives whole, join and all: {written}"
+    );
+    assert!(
+        written.contains("ccc"),
+        "and the client half is still recorded, just cut: {written}"
+    );
+}
+
+/// **A client cannot write the composed shape itself.**
+///
+/// With `auth.mcp` off - the default install - nobody authenticates, so the
+/// composition never runs and `generated.by` is the client's own name. A client
+/// naming itself `claude-code for ada` would otherwise land
+/// `claude-code-for-ada` on disk, byte-identical to what an authenticated ada
+/// session writes, which would make the whole `-for-` shape worthless as
+/// evidence. The join is the server's word, so it is taken out of the client
+/// half.
+///
+/// This also pins the auth-off HTTP tier at the real transport: the request
+/// carries `http::request::Parts` and no `McpIdentity`, which is the shape the
+/// duplex-transport tests elsewhere cannot produce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_client_cannot_write_the_composed_shape() {
+    let (addr, guard, _store) = serve_with_mcp_auth(false).await;
+
+    let session = McpTestSession::open_as(&addr, None, "claude-code for ada").await;
+    let answer = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Forged Trace",
+                "content": "- [fact] traced",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the open tier still serves the write:\n{answer}"
+    );
+
+    let written =
+        std::fs::read_to_string(guard.path().join("eng").join("forged-trace.md")).unwrap();
+    assert!(
+        !written.contains("-for-"),
+        "the join is the server's word, not the client's: {written}"
+    );
+    assert!(
+        written.contains("claude-code"),
+        "the rest of the name a client chose is still its own: {written}"
     );
 }

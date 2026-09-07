@@ -927,7 +927,8 @@ fn refused_collab_tool(name: &str, github_enabled: bool) -> bool {
 use crystalline_core::config::{ResponseFormat, SkillsServe};
 
 use crate::engine::{
-    AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential, ProvisionAction, ShareActor,
+    ACTOR_MAX_CHARS, AckIntent, ConfigureAction, Engine, EngineError, PreviewCredential,
+    ProvisionAction, ShareActor, sanitize_actor,
 };
 use crate::params::*;
 
@@ -995,6 +996,35 @@ pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
     Some(identity.name.clone())
 }
 
+/// What stands in for the client half when a client declared no usable name.
+///
+/// The composed actor is always two halves, so a bare account name never
+/// reaches `generated.by`: `ada` alone reads as "a client calling itself ada",
+/// and drops the one fact this composition exists to record - that an agent,
+/// not the person, did the writing.
+const UNKNOWN_CLIENT: &str = "agent";
+
+/// The join, and the cost of it in kept characters once the engine has folded
+/// its spaces into hyphens: `-for-`.
+const ACTOR_JOIN: &str = " for ";
+const ACTOR_JOIN_CHARS: usize = 5;
+
+/// The client half with any join in it taken out, so the composed shape is
+/// something only this server can produce.
+///
+/// [`sanitize_actor`] has already folded whitespace into hyphens by the time
+/// this runs, so a client naming itself `x for ada` arrives here as
+/// `x-for-ada` - byte-identical to what an authenticated ada session composes,
+/// on an instance where nobody authenticated at all. An account name cannot
+/// contain whitespace (the auth store's `normalize_name` refuses it), so the
+/// join is the only way that shape arises honestly, and collapsing the run is
+/// what keeps it that way. A client that genuinely has `-for-` in its name
+/// loses those five characters and keeps the rest.
+fn without_the_join(sanitized_client: &str) -> String {
+    let stripped = sanitized_client.replace("-for-", "-");
+    stripped.trim_matches('-').to_string()
+}
+
 /// The actor a write records: the client that asked, and - when the call
 /// authenticated - the account it asked on behalf of, as `"<client> for
 /// <account>"`.
@@ -1006,20 +1036,54 @@ pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
 /// recording only the second would lose which tool did the writing. So both are
 /// kept, in one line, in the one field OKF has for it.
 ///
-/// The engine sanitizes what it is given ([`Engine::actor`]), which folds the
-/// spaces into hyphens - `claude-code/2.0-for-ada` on disk. The word `for` is
-/// what survives that as the join, which is why the composition reads as a
-/// phrase rather than as punctuation.
+/// **Each half is sanitized on its own and the composition happens after**,
+/// which is the whole of the integrity here. [`Engine::actor`] sanitizes
+/// whatever it is handed and stops at [`ACTOR_MAX_CHARS`] kept characters;
+/// `clientInfo.name` and `.version` are client-supplied and unbounded, so
+/// composing first and sanitizing once would let a long enough client name
+/// spend the entire budget and truncate the half the server asserts off the
+/// end - silently, with the write still succeeding. Here the account is
+/// measured first and the client half is budgeted against what is left, so the
+/// account always lands whole; the second pass the engine makes over the
+/// composition is then idempotent apart from folding the join's spaces into
+/// hyphens.
+///
+/// So on disk: `claude-code/2.0-for-ada`. The word `for` is what survives the
+/// fold as the join, which is why the composition reads as a phrase rather
+/// than as punctuation, and [`without_the_join`] is what keeps a client from
+/// writing that phrase itself.
 ///
 /// `None` only when neither half is known, which is [`Engine::actor`]'s
 /// fallback case and behaves exactly as it did before.
 fn acting_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
-    match (client_actor(ctx), mcp_account(ctx)) {
-        (Some(client), Some(account)) => Some(format!("{client} for {account}")),
-        (Some(client), None) => Some(client),
-        (None, Some(account)) => Some(account),
-        (None, None) => None,
+    let account = mcp_account(ctx)
+        .map(|account| sanitize_actor(&account))
+        .filter(|account| !account.is_empty());
+    let client = client_actor(ctx)
+        .map(|client| without_the_join(&sanitize_actor(&client)))
+        .filter(|client| !client.is_empty());
+    let Some(account) = account else {
+        // Nobody authenticated: the client alone, exactly as before, minus a
+        // join it was never entitled to write.
+        return client;
+    };
+    // What is left for the client half once the account and the join are
+    // spoken for. A pathological account name can leave nothing, and then the
+    // account is the whole of it: the half a caller cannot choose is the half
+    // that survives.
+    let budget = ACTOR_MAX_CHARS.saturating_sub(account.chars().count() + ACTOR_JOIN_CHARS);
+    if budget == 0 {
+        return Some(account);
     }
+    let client = client.unwrap_or_else(|| UNKNOWN_CLIENT.to_string());
+    let client: String = client.chars().take(budget).collect();
+    let client = client.trim_end_matches('-');
+    if client.is_empty() {
+        // A budget too small to hold anything of the client at all. The
+        // account alone rather than a bare `for-ada`, which is neither half.
+        return Some(account);
+    }
+    Some(format!("{client}{ACTOR_JOIN}{account}"))
 }
 
 /// Which transport a server instance serves, the one distinction the `auto`
@@ -2276,7 +2340,7 @@ impl ServerHandler for McpServer {
     /// per-connection prohibition forbids, and the decision moved to the
     /// spawned process (see `McpServer::harness_onboarded`). What survives is
     /// what rmcp's own default does: publishing the peer info, which is what
-    /// `client_actor` and every `generated.by` write read afterwards, and the
+    /// `acting_actor` and every `generated.by` write read afterwards, and the
     /// version echo.
     ///
     /// # A version we do not serve is refused here, but only over HTTP

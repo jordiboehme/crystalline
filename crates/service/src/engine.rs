@@ -200,18 +200,27 @@ pub const DEFAULT_ACTOR: &str = "crystalline/mcp";
 /// the spec's `process:name` form.
 pub const CLI_ACTOR: &str = "process:crystalline-cli";
 
+/// The ceiling [`sanitize_actor`] keeps an actor token to, in kept characters.
+/// Exposed with it, because a caller composing an actor out of two halves has
+/// to budget against the same number to know what will survive the pass.
+pub(crate) const ACTOR_MAX_CHARS: usize = 120;
+
 /// Normalize a client-supplied identity into an OKF actor token: whitespace
 /// runs collapse to a single hyphen, control characters and the flow-mapping
 /// punctuation that would need quoting are dropped and the result is capped, so
 /// a client that calls itself "Some Client (beta)" still yields a clean
 /// `generated.by`.
-fn sanitize_actor(raw: &str) -> String {
-    const MAX_CHARS: usize = 120;
+///
+/// `pub(crate)` because an actor composed out of two halves has to sanitize
+/// each half on its own rather than the composition (`mcp::acting_actor`): a
+/// single pass over the joined string lets the client-supplied half spend the
+/// whole budget and truncate away the half the server asserts.
+pub(crate) fn sanitize_actor(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut kept = 0usize;
     let mut pending_gap = false;
     for c in raw.trim().chars() {
-        if kept >= MAX_CHARS {
+        if kept >= ACTOR_MAX_CHARS {
             break;
         }
         if c.is_whitespace() {
