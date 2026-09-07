@@ -2288,6 +2288,33 @@ async fn proxy_headers_are_no_way_past_the_mcp_gate() {
 
 // --- removing a domain, and the instance-state gate around it ---------------
 
+/// The JSON-RPC payload out of one raw SSE response.
+fn payload_of(raw: &str) -> serde_json::Value {
+    let line = raw
+        .lines()
+        .find(|l| l.starts_with("data: "))
+        .unwrap_or_else(|| panic!("no SSE data line in:\n{raw}"));
+    serde_json::from_str(line.trim_start_matches("data: ")).unwrap()
+}
+
+/// Assert that `raw` carries a refusal the CLIENT renders - a `CallToolResult`
+/// with `isError` - rather than a JSON-RPC protocol error, which rmcp's own
+/// guidance says clients render opaquely.
+///
+/// This is the assertion the text-only checks beside it cannot make: the raw
+/// frame carries the message in either shape, so `contains("admin")` passes
+/// whichever one the handler chose. It matters because the whole content of
+/// this refusal is teaching text naming who can end the domain, and both
+/// shipped skills tell an agent to relay it rather than retry.
+fn refusal_is_readable(raw: &str, label: &str) {
+    let payload = payload_of(raw);
+    assert_eq!(
+        payload["result"]["isError"],
+        serde_json::json!(true),
+        "{label} must come back as a tool error the model reads, not a protocol error:\n{raw}"
+    );
+}
+
 /// Whether `answer` still lists `domain` for the machine owner.
 ///
 /// Read through the engine rather than through a second MCP call, so the
@@ -2331,6 +2358,7 @@ async fn a_private_domains_owner_removes_it_and_a_manager_cannot() {
         refused.contains("admin") && refused.contains("owner"),
         "the refusal names who can remove it:\n{refused}"
     );
+    refusal_is_readable(&refused, "a manager's removal refusal");
     assert!(
         still_registered(&ctx, "lab").await,
         "and the manager removed nothing"
@@ -2374,6 +2402,7 @@ async fn a_shared_domain_is_removed_by_an_admin_and_by_nobody_else() {
         refused.contains("admin"),
         "an editor on a shared domain is refused, naming who can:\n{refused}"
     );
+    refusal_is_readable(&refused, "an editor's removal refusal on a shared domain");
     assert!(still_registered(&ctx, "open").await, "nothing was removed");
 
     let boss = ctx.token_for("boss").await;
@@ -2415,13 +2444,7 @@ async fn removing_a_hidden_domain_answers_exactly_as_removing_an_absent_one() {
     // length, which differ between two separate requests and say nothing about
     // what either caller was told.
     let message = |raw: &str| {
-        let line = raw
-            .lines()
-            .find(|l| l.starts_with("data: "))
-            .unwrap_or_default();
-        let parsed: serde_json::Value =
-            serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
-        parsed["error"]["message"]
+        payload_of(raw)["error"]["message"]
             .as_str()
             .unwrap_or_default()
             .replace("lab", "nowhere")
@@ -2456,6 +2479,7 @@ async fn the_open_tier_cannot_remove_a_domain() {
         refused.contains("admin"),
         "the open tier is refused, naming who can:\n{refused}"
     );
+    refusal_is_readable(&refused, "the open tier's removal refusal");
     assert!(still_registered(&ctx, "open").await, "nothing was removed");
 }
 
@@ -2482,6 +2506,10 @@ async fn instance_state_changes_over_mcp_are_admin_only() {
             added.contains("admin"),
             "{account} may not create a domain over MCP:\n{added}"
         );
+        // The same shape the removal refusal owes, asserted here so the two
+        // gates on one surface cannot disagree about whether their teaching
+        // text reaches the model at all.
+        refusal_is_readable(&added, "an add_domain refusal");
         let configured = session
             .call_tool(
                 "configure",
@@ -2492,6 +2520,7 @@ async fn instance_state_changes_over_mcp_are_admin_only() {
             configured.contains("admin"),
             "{account} may not change settings over MCP:\n{configured}"
         );
+        refusal_is_readable(&configured, "a configure refusal");
         let shown = session.call_tool("configure", serde_json::json!({})).await;
         assert!(
             !shown.contains("\"error\""),

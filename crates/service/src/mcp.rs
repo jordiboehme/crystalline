@@ -2070,11 +2070,10 @@ impl McpServer {
         // `delete_engram` states: never ask about an action that would refuse
         // anyway. `Engine::unregister_domain` re-checks the same gate under
         // its own lock, which is where the decision actually has to hold.
-        let preview = self
-            .engine
-            .domain_remove_preview(&p.domain, &scope)
-            .await
-            .map_err(to_error)?;
+        let preview = match self.engine.domain_remove_preview(&p.domain, &scope).await {
+            Ok(preview) => preview,
+            Err(e) => return refusal_or_error(e),
+        };
         if preview["kind"] == json!("virtual") && !p.purge {
             return refuse(purge_refusal(&p.domain)).map(CallToolResponse::from);
         }
@@ -2094,12 +2093,10 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
-            .unregister_domain(&p.domain, &scope)
-            .await
-            .map_err(to_error)
-            .and_then(ok)
-            .map(CallToolResponse::from)
+        match self.engine.unregister_domain(&p.domain, &scope).await {
+            Ok(report) => ok(report).map(CallToolResponse::from),
+            Err(e) => refusal_or_error(e),
+        }
     }
 
     #[tool(
@@ -4048,6 +4045,24 @@ fn refuse(message: impl Into<String>) -> Result<CallToolResult, ErrorData> {
     Ok(CallToolResult::error(vec![ContentBlock::text(
         message.into(),
     )]))
+}
+
+/// An engine error as the shape its content deserves: a refusal the model must
+/// read, or a protocol error.
+///
+/// The split [`McpServer::refuse_unwritable`] already makes, applied to an
+/// engine error rather than to a right. [`EngineError::Forbidden`] is raised
+/// only about something the caller can already see, and its whole content is
+/// teaching text naming who can - the skills tell an agent to relay exactly
+/// that rather than retry - so it goes back as a tool error the client renders,
+/// for the reason [`refuse`] states. Everything else keeps [`to_error`]'s
+/// protocol shape, and the not-found in particular must: its bytes are what a
+/// hidden domain is answered with, and the two have to stay identical.
+fn refusal_or_error(e: EngineError) -> Result<CallToolResponse, ErrorData> {
+    match e {
+        EngineError::Forbidden(text) => refuse(text).map(CallToolResponse::from),
+        other => Err(to_error(other)),
+    }
 }
 
 /// Map an engine error to an rmcp tool error with an actionable message.

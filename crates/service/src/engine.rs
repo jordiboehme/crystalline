@@ -9156,11 +9156,26 @@ impl Engine {
     /// its freshly-indexed rows wiped by this call's tail, since both resolve
     /// the same `DomainId` by name. Closing this needs the add verbs to take
     /// the same per-name lock this verb would need to hold across its own
-    /// tail, which is a cross-verb change out of scope here; a caller that
-    /// cannot tolerate the window should serialize admin mutations for a
-    /// given name at its own layer - which the REST surface does, in
-    /// `RestState::domain_admin`: one mutex held across the whole of a create
-    /// and the whole of an unregister.
+    /// tail, which is a cross-verb change out of scope here.
+    ///
+    /// [`Engine::domain_admin`] narrows the window without closing it, and it
+    /// is worth being exact about which half. [`Engine::unregister_domain`] -
+    /// the entry point every surface goes through - holds it across this whole
+    /// call, and the REST create holds it across its own registration, so those
+    /// two cannot interleave whichever surface each arrives on. The bare
+    /// `domain_add_local`, `domain_add_virtual` and `origin_add` verbs take no
+    /// lock at all, so an add reaching the engine directly can still race a
+    /// removal for the same name. That is the residue above, and it is the same
+    /// residue as before the lock moved onto this type; what changed is that
+    /// the lock is no longer one surface's, so it no longer leaves a second
+    /// surface's callers unserialized against each other.
+    ///
+    /// **This is the registry step alone.** [`Engine::unregister_domain`] is
+    /// the entry point: it decides who may end a domain, raises the join fence,
+    /// sweeps the co-editing rooms and retires the domain's visibility records
+    /// around this call. Reaching for this one directly skips all of that; the
+    /// only caller that does so on purpose is the REST create's rollback, which
+    /// already holds the lock the entry point would take.
     pub async fn domain_remove(&self, name: &str) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
