@@ -820,13 +820,13 @@ export interface paths {
         };
         /**
          * The caller's own MCP tokens, newest first.
-         * @description Every signed-in account has this, viewers included: an agent acts as the account that issued its token, so a viewer's agent is read-only by construction. The rows carry the label, when the token was issued and when it was last presented - never the token, which exists in the clear only in the reply that issued it. A pure read, served even on a read-only instance.
+         * @description Every signed-in account has this, viewers included: an agent acts as the account that issued its token, so a viewer's agent is read-only by construction. The rows carry the label, when the token was issued and when it was last presented - never the token, which exists in the clear only in the reply that issued it. Served on a read-only instance like the rest of this surface: a token is account state rather than knowledge.
          */
         get: operations["list_my_mcp_tokens"];
         put?: never;
         /**
          * Issue an MCP token for the caller's own account.
-         * @description Every signed-in account may issue one, viewers included. The reply is the only place the token is ever readable: only its hash is stored, so a lost token is revoked and replaced rather than looked up. Send it from the agent's MCP registration as `Authorization: Bearer <token>`. Refused on a read-only instance, where `crystalline users mcp-token <name>` on the machine that holds the database is the way to issue one.
+         * @description Every signed-in account may issue one, viewers included. The reply is the only place the token is ever readable: only its hash is stored, so a lost token is revoked and replaced rather than looked up. Send it from the agent's MCP registration as `Authorization: Bearer <token>`. Served on a read-only instance too: that setting protects the knowledge, and a token is account state rather than knowledge - a read-only server is where an agent most needs one.
          */
         post: operations["issue_my_mcp_token"];
         delete?: never;
@@ -5613,7 +5613,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5670,7 +5670,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5720,7 +5720,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;

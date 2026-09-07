@@ -1804,6 +1804,11 @@ struct WriteOp {
     /// this field is a role rather than the two-valued flag it started as
     /// because two values could not say that.
     min_role: Role,
+    /// Whether a read-only instance still serves this route. False for every
+    /// route that touches knowledge, which is nearly all of them; true only
+    /// for the self-service MCP token surface, whose writes land in the
+    /// accounts database rather than in a domain (see the rows below).
+    read_only_exempt: bool,
 }
 
 /// Every mutating route the `/api/v1` surface mounts, spec section 10's write
@@ -1818,30 +1823,35 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/engrams",
             body: Some(serde_json::json!({"title": "Fresh", "content": "# Fresh\n"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::PUT,
             path: "/api/v1/domains/eng/engrams/alpha",
             body: Some(serde_json::json!({"content": "x"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/retire",
             body: Some(serde_json::json!({"permalink": "alpha", "status": "deprecated"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/move",
             body: Some(serde_json::json!({"permalink": "alpha", "destination": "moved/alpha"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/domains/eng/engrams/alpha",
             body: None,
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::PUT,
@@ -1851,12 +1861,14 @@ fn write_ops() -> Vec<WriteOp> {
             // MANIFEST editing sits among the admin-only domain screens,
             // alongside creating and unregistering a domain).
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains",
             body: Some(serde_json::json!({"mode": "virtual", "name": "matrix-made"})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         // `eng` has no origin, so the allowed leg answers 409 - which is
         // exactly the "anything but 401/403" this matrix asserts, and it needs
@@ -1867,6 +1879,7 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/sync",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         // The three share-surface writes, for the same reason and with the
         // same answer: `eng` has no origin, so every allowed leg is a 409.
@@ -1878,18 +1891,21 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/sync/share",
             body: Some(serde_json::json!({})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/sync/proposals/1/withdraw",
             body: Some(serde_json::json!({})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/sync/conflicts/abc12345/resolve",
             body: Some(serde_json::json!({"resolution": "mine"})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         // Both archive uploads: admin-only writes, and their allowed legs
         // answer 422 (an empty body is not a zip), which passes this matrix's
@@ -1899,12 +1915,14 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/archive/preview",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/domains/eng/archive/import",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         // The attachment bytes, in this order so the delete row has something
         // to remove. Editor writes rather than admin ones: attaching a file to
@@ -1915,12 +1933,14 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/files/assets/matrix.png",
             body: Some(serde_json::json!("bytes")),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/domains/eng/files/assets/matrix.png",
             body: None,
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         // The acknowledgment pair: editor writes, because ruling a finding
         // intentional is a judgment about content rather than about the
@@ -1933,12 +1953,14 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/eng/evolve/ack",
             body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/domains/eng/evolve/ack",
             body: Some(serde_json::json!({"permalink": "alpha", "rule": "V006"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         // Last among the domain rows, and no later row targets `scrap`: this
         // one unregisters it.
@@ -1947,42 +1969,49 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/domains/scrap",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/validate",
             body: Some(serde_json::json!({"content": "x"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/users",
             body: Some(serde_json::json!({"name": "new", "role": "viewer", "password": "pw"})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::PATCH,
             path: "/api/v1/users/mark",
             body: Some(serde_json::json!({"display": "M"})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/users/mark/password",
             body: Some(serde_json::json!({"password": "pw2"})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/users/tina",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/settings/github/connect",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         // Before the disconnect row, so the disconnect's allowed leg has
         // something to forget; both legs are state-tolerant either way.
@@ -1991,12 +2020,14 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/settings/github/token",
             body: Some(serde_json::json!({"token": "matrix-pat"})),
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::DELETE,
             path: "/api/v1/settings/github",
             body: None,
             min_role: Role::Admin,
+            read_only_exempt: false,
         },
         // The self-service identity surface: the one settings-shaped write
         // group an editor may drive, because the credential it manages is the
@@ -2007,12 +2038,14 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/me/github-identity/token",
             body: Some(serde_json::json!({"token": "matrix-personal-pat"})),
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         WriteOp {
             method: Method::POST,
             path: "/api/v1/me/github-identity/connect",
             body: None,
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         // Last of the three, so the delete has something to forget on its
         // allowed leg; every leg is state-tolerant either way.
@@ -2021,6 +2054,7 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/me/github-identity",
             body: None,
             min_role: Role::Editor,
+            read_only_exempt: false,
         },
         // The self-service MCP token surface: the first viewer-level writes
         // on this API, because an agent acts as the account that issued its
@@ -2033,21 +2067,27 @@ fn write_ops() -> Vec<WriteOp> {
             path: "/api/v1/me/mcp-tokens",
             body: Some(serde_json::json!({"label": "the write matrix"})),
             min_role: Role::Viewer,
+            read_only_exempt: true,
         },
         // An id no account holds, so both rows answer 404 on their allowed
         // legs - past authorization, which is what this matrix asserts, while
-        // revoking nothing the issuing row above just minted.
+        // revoking nothing the issuing row above just minted. Well clear of
+        // the ids in play rather than one past them: the issuing row mints a
+        // token per allowed leg per fixture, so a leg added to the loop below
+        // would silently walk a small id into a real row.
         WriteOp {
             method: Method::POST,
-            path: "/api/v1/me/mcp-tokens/9/rotate",
+            path: "/api/v1/me/mcp-tokens/999999/rotate",
             body: None,
             min_role: Role::Viewer,
+            read_only_exempt: true,
         },
         WriteOp {
             method: Method::DELETE,
-            path: "/api/v1/me/mcp-tokens/9",
+            path: "/api/v1/me/mcp-tokens/999999",
             body: None,
             min_role: Role::Viewer,
+            read_only_exempt: true,
         },
     ]
 }
@@ -2191,13 +2231,30 @@ async fn the_write_matrix_holds_on_every_route() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            resp.status(),
-            403,
-            "{} {} under read_only",
-            op.method,
-            op.path
-        );
+        if op.read_only_exempt {
+            // The self-service MCP token surface, and only it: `read_only`
+            // protects the knowledge, and a token is account state in the
+            // accounts database. A read-only team server with `auth.mcp` on is
+            // where an agent most needs one - it cannot connect at all
+            // without it - so issuing answers 200 here and the two id-bearing
+            // rows answer 404, both past authorization. This assertion IS the
+            // test for that rule.
+            assert!(
+                resp.status() != 401 && resp.status() != 403,
+                "{} {} must still be served under read_only, got {}",
+                op.method,
+                op.path,
+                resp.status()
+            );
+        } else {
+            assert_eq!(
+                resp.status(),
+                403,
+                "{} {} under read_only",
+                op.method,
+                op.path
+            );
+        }
     }
 }
 

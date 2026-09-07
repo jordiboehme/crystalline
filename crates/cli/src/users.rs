@@ -120,6 +120,14 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
             revoke,
             rotate,
         } => {
+            // Issuing checks the account inside its own transaction; the
+            // other three branches would otherwise answer about an account
+            // that does not exist - an empty listing, or "no such token" - and
+            // a typo would read as a fact.
+            if (list || revoke.is_some() || rotate.is_some()) && store.user(&name).await?.is_none()
+            {
+                bail!("no such user: '{}'", stored_name(&name));
+            }
             if list {
                 let tokens = store.list_mcp_tokens(&name).await?;
                 if json {

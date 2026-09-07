@@ -947,6 +947,27 @@ impl AuthStore {
         self.finish(result).await
     }
 
+    /// One account by name, or `None` when there is none. The name is folded
+    /// by [`normalize_name`] like every other lookup, so `Ada` finds `ada`.
+    ///
+    /// A pure existence-and-details read, with none of
+    /// [`AuthStore::session_user`]'s stamping: the caller is asking whether a
+    /// name is an account, not resolving a credential, so nothing about the
+    /// account changes. What it exists for is telling a mistyped name apart
+    /// from a real account with nothing in it - `crystalline users mcp-token
+    /// ghsot --list` must say "no such user" rather than "holds no tokens".
+    pub async fn user(&self, name: &str) -> Result<Option<User>> {
+        let name = normalize_name(name)?;
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name)],
+            )
+            .await?
+            .map(|row| user_from_row(&row)))
+    }
+
     /// Every account, by name. Names sort byte-wise, which is the ordering
     /// contract the rest of the workspace's text columns use.
     pub async fn list_users(&self) -> Result<Vec<User>> {
@@ -3503,6 +3524,23 @@ mod tests {
         store.remove_user("ada").await.unwrap();
         assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
         assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
+    }
+
+    /// A name that is not an account reads as `None`, and a folded spelling of
+    /// one that is finds it: the difference between "no such user" and "an
+    /// account with no tokens" rests on this.
+    #[tokio::test]
+    async fn one_account_is_read_back_by_any_spelling_of_its_name() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        for spelling in ["ada", "ADA", "  Ada  "] {
+            let found = store.user(spelling).await.unwrap();
+            assert_eq!(found.expect("'{spelling}' is ada").name, "ada");
+        }
+        assert!(store.user("ghost").await.unwrap().is_none());
     }
 
     /// The one unhashed copy of a live credential must never be one

@@ -215,6 +215,11 @@ async fn login(addr: std::net::SocketAddr, name: &str, password: &str) -> (Strin
     (cookie, csrf.to_string())
 }
 
+/// A response's `Cache-Control`, which the two token-carrying replies set.
+fn no_store(resp: &reqwest::Response) -> Option<&str> {
+    resp.headers().get("cache-control")?.to_str().ok()
+}
+
 /// The body of a response, as JSON.
 async fn body(resp: reqwest::Response) -> serde_json::Value {
     resp.json().await.unwrap()
@@ -228,6 +233,11 @@ async fn editor_issues_lists_rotates_and_revokes_own_tokens() {
         .post_json("/api/v1/me/mcp-tokens", json!({"label": "laptop"}))
         .await;
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        no_store(&resp),
+        Some("no-store"),
+        "the one response carrying a live credential is never stored"
+    );
     let issued = body(resp).await;
     let token = issued["token"]
         .as_str()
@@ -244,6 +254,11 @@ async fn editor_issues_lists_rotates_and_revokes_own_tokens() {
         .post_json(&format!("/api/v1/me/mcp-tokens/{id}/rotate"), json!({}))
         .await;
     assert_eq!(resp.status(), 200);
+    assert_eq!(
+        no_store(&resp),
+        Some("no-store"),
+        "and neither is the rotation's"
+    );
     let rotated = body(resp).await;
     let rotated_id = rotated["id"].as_i64().unwrap();
     assert_ne!(rotated_id, id, "rotation issues a new row, not the old one");

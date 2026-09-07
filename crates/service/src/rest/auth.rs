@@ -1371,7 +1371,11 @@ pub type NoStore = [(HeaderName, &'static str); 1];
 /// is only cacheable with explicit freshness information, so it is defence in
 /// depth there rather than a hole being closed, but a reader should not have to
 /// work out which of the three was safe.
-fn no_store() -> NoStore {
+///
+/// `pub(super)` because one route outside this module answers with material of
+/// the same class: `POST /me/mcp-tokens` and its rotate sibling hand back a
+/// live bearer credential (see [`super::mcp_tokens`]).
+pub(super) fn no_store() -> NoStore {
     [(header::CACHE_CONTROL, "no-store")]
 }
 

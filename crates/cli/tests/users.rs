@@ -629,12 +629,51 @@ fn mcp_token_is_issued_once_then_listed_rotated_and_revoked() {
 }
 
 /// A token is minted against an account, so a mistyped name is refused rather
-/// than stranding a row nothing can resolve.
+/// than stranding a row nothing can resolve - on every branch of the verb,
+/// because "'ghsot' holds no MCP tokens" would read as a fact about an account
+/// that does not exist.
 #[test]
 fn an_mcp_token_for_an_unknown_account_is_refused() {
     let home = tempfile::tempdir().unwrap();
-    let err = users_err(home.path(), &["mcp-token", "ghost"], None);
-    assert!(err.contains("no such user"), "{err}");
+    for args in [
+        vec!["mcp-token", "ghost"],
+        vec!["mcp-token", "ghost", "--list"],
+        vec!["mcp-token", "ghost", "--revoke", "1"],
+        vec!["mcp-token", "ghost", "--rotate", "1"],
+    ] {
+        let err = users_err(home.path(), &args, None);
+        assert!(err.contains("no such user"), "{args:?}: {err}");
+    }
+}
+
+/// `--json` puts the object on stdout and the teaching line on stderr, so a
+/// provisioning script can pipe stdout straight into a parser. Asserted by
+/// parsing it: a stray `println!` on that path would break scripts silently.
+#[test]
+fn an_mcp_token_issued_with_json_leaves_stdout_parseable() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "editor", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    let out = users_ok(
+        home.path(),
+        &["--json", "mcp-token", "ada", "--label", "ci"],
+        None,
+    );
+    let issued: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("stdout is JSON: {e}: {out}"));
+    assert!(
+        issued["token"].as_str().unwrap().starts_with("cmt_"),
+        "{issued}"
+    );
+    assert_eq!(issued["label"], "ci");
+    assert!(issued["id"].as_i64().is_some(), "{issued}");
+    assert!(
+        !out.contains("Authorization"),
+        "the teaching line goes to stderr: {out}"
+    );
 }
 
 /// The spawned holder, killed when this goes out of scope.

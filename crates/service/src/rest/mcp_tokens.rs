@@ -11,6 +11,14 @@
 //!   construction and needs no separate gate. Refusing a viewer here would
 //!   only mean an instance with `auth.mcp` on had readers who could not
 //!   connect an agent at all.
+//! - **A read-only instance serves all four**, which is the one place on this
+//!   API where an unsafe method is not refused there. `service.read_only`
+//!   protects the knowledge, and a token is not knowledge: it is account
+//!   state, in the accounts database, beside the password that logs the same
+//!   person in. A read-only team server is exactly where agents need tokens,
+//!   because with `auth.mcp` on a reading agent cannot connect at all without
+//!   one - refusing here would make such an instance impossible to onboard an
+//!   agent onto over HTTP.
 //! - **The anonymous viewer is refused, 401.** It passes
 //!   [`Identity::require_viewer`] where `auth.anonymous` is on, but it has no
 //!   account, and a token is issued to an account. Logging in is what changes
@@ -26,9 +34,9 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 
-use super::auth::{Caller, Identity};
+use super::auth::{Caller, Identity, NoStore, no_store};
 use super::auth_store::{McpTokenInfo, User};
-use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only};
+use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState};
 
 /// What `POST /me/mcp-tokens` takes: what the token is for, so a row in the
 /// listing is recognizable months later when it comes time to revoke one.
@@ -67,6 +75,12 @@ pub struct IssuedTokenResponse {
     pub label: String,
 }
 
+/// The two responses that carry one are marked `Cache-Control: no-store`, the
+/// convention [`super::auth`] applies to every response carrying a CSRF token
+/// or a `Set-Cookie`. A 200 to a POST is not heuristically cacheable, so this
+/// is defence in depth rather than a hole being closed - but what these carry
+/// is a live bearer credential, which is the strongest case on this API for
+/// saying so out loud rather than relying on a caching rule holding.
 impl std::fmt::Debug for IssuedTokenResponse {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("IssuedTokenResponse")
@@ -153,8 +167,9 @@ const TOKEN_NOT_FOUND: &str = "no such MCP token: it may already have been revok
                    viewer's agent is read-only by construction. The rows \
                    carry the label, when the token was issued and when it was \
                    last presented - never the token, which exists in the clear \
-                   only in the reply that issued it. A pure read, served even \
-                   on a read-only instance.",
+                   only in the reply that issued it. Served on a read-only \
+                   instance like the rest of this surface: a token is account \
+                   state rather than knowledge.",
     responses(
         (status = 200, description = "This account's tokens.", body = Vec<McpTokenInfo>),
         (
@@ -202,9 +217,10 @@ pub async fn list(
                    only its hash is stored, so a lost token is revoked and \
                    replaced rather than looked up. Send it from the agent's \
                    MCP registration as `Authorization: Bearer <token>`. \
-                   Refused on a read-only instance, where \
-                   `crystalline users mcp-token <name>` on the machine that \
-                   holds the database is the way to issue one.",
+                   Served on a read-only instance too: that setting protects \
+                   the knowledge, and a token is account state rather than \
+                   knowledge - a read-only server is where an agent most \
+                   needs one.",
     request_body = IssueBody,
     responses(
         (status = 200, description = "The token, this once.", body = IssuedTokenResponse),
@@ -222,9 +238,9 @@ pub async fn list(
         ),
         (
             status = 403,
-            description = "A cookie session did not echo its CSRF token, this \
-                           instance is read-only, or the trusted-header \
-                           identity names a disabled account.",
+            description = "A cookie session did not echo its CSRF token, or \
+                           the trusted-header identity names a disabled \
+                           account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -246,16 +262,15 @@ pub async fn issue(
     State(state): State<RestState>,
     identity: Identity,
     ApiJson(body): ApiJson<IssueBody>,
-) -> Result<Json<IssuedTokenResponse>, ApiError> {
+) -> Result<(NoStore, Json<IssuedTokenResponse>), ApiError> {
     let user = require_own_account(&identity)?;
-    refuse_read_only(&state)?;
     let label = check_label(&body.label)?;
     let issued = state
         .auth
         .issue_mcp_token(&user.name, &label)
         .await
         .map_err(store_error)?;
-    Ok(Json(issued.into()))
+    Ok((no_store(), Json(issued.into())))
 }
 
 /// `POST /me/mcp-tokens/{id}/rotate` - replace one of the caller's tokens with
@@ -288,9 +303,9 @@ pub async fn issue(
         ),
         (
             status = 403,
-            description = "A cookie session did not echo its CSRF token, this \
-                           instance is read-only, or the trusted-header \
-                           identity names a disabled account.",
+            description = "A cookie session did not echo its CSRF token, or \
+                           the trusted-header identity names a disabled \
+                           account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -306,15 +321,14 @@ pub async fn rotate(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(id): ApiPath<i64>,
-) -> Result<Json<IssuedTokenResponse>, ApiError> {
+) -> Result<(NoStore, Json<IssuedTokenResponse>), ApiError> {
     let user = require_own_account(&identity)?;
-    refuse_read_only(&state)?;
     let issued = state
         .auth
         .rotate_mcp_token(&user.name, id)
         .await
         .map_err(store_error)?;
-    Ok(Json(issued.into()))
+    Ok((no_store(), Json(issued.into())))
 }
 
 /// `DELETE /me/mcp-tokens/{id}` - revoke one of the caller's tokens, 204.
@@ -345,9 +359,9 @@ pub async fn rotate(
         ),
         (
             status = 403,
-            description = "A cookie session did not echo its CSRF token, this \
-                           instance is read-only, or the trusted-header \
-                           identity names a disabled account.",
+            description = "A cookie session did not echo its CSRF token, or \
+                           the trusted-header identity names a disabled \
+                           account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -365,7 +379,6 @@ pub async fn revoke(
     ApiPath(id): ApiPath<i64>,
 ) -> Result<StatusCode, ApiError> {
     let user = require_own_account(&identity)?;
-    refuse_read_only(&state)?;
     let revoked = state
         .auth
         .revoke_mcp_token(&user.name, id)

@@ -597,9 +597,13 @@ pub fn router(state: RestState) -> Router {
         // construction - and to no anonymous caller, which has no account to
         // issue for. No name in the path, for the reason the identity routes
         // above carry none: the session already names the account, so a
-        // caller can only ever reach its own. The listing is a pure read and
-        // stays served on a read-only instance; the three mutations are
-        // refused there like every other write here.
+        // caller can only ever reach its own. All four are served on a
+        // read-only instance, which is this surface's one departure from the
+        // rule that read-only refuses every unsafe method: that setting
+        // protects the knowledge, a token is account state in the accounts
+        // database rather than knowledge, and a read-only team server with
+        // `auth.mcp` on is exactly where an agent cannot connect at all
+        // without one.
         .route(
             "/me/mcp-tokens",
             get(mcp_tokens::list).post(mcp_tokens::issue),
