@@ -1019,6 +1019,14 @@ async fn proxy_headers_provision_once_and_return_on_the_same_subject() {
         "one CSRF rule for every identity mode: {me}"
     );
 
+    let seen = fixture.auth.user("ada").await.unwrap().unwrap();
+    assert!(
+        seen.last_seen.is_some(),
+        "arriving through the proxy is a sighting, exactly as arriving through \
+         the trusted header is: an admin's user list must not show every \
+         forward-auth account as never seen"
+    );
+
     let links = fixture.auth.identity_links("ada").await.unwrap();
     assert_eq!(links.len(), 1, "one link: {links:?}");
     assert_eq!(links[0].issuer, "proxy");

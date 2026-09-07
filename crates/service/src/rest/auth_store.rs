@@ -1973,6 +1973,32 @@ impl AuthStore {
         Ok(Some((user, csrf)))
     }
 
+    /// Stamp `name` as seen just now.
+    ///
+    /// The sighting a forward-auth request is. That path resolves an account
+    /// through its identity link rather than through a session or a
+    /// provisioning call, so nothing else on it would move `last_seen_at` and
+    /// an admin's user list would show every such account as never seen.
+    /// [`AuthStore::ensure_user`] and [`AuthStore::session_user`] do the same
+    /// write for the two paths they own; this is the third.
+    ///
+    /// `name` is an account name a row already carries, so it is stamped as
+    /// given: a name that is nobody stamps nothing, which is not an error.
+    pub async fn mark_seen(&self, name: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping last_seen_at")?;
+        Ok(())
+    }
+
     /// Revoke one session. Deleting an unknown token is not an error: logging
     /// out twice, or with a stale cookie, is a normal thing for a browser to
     /// do.
@@ -4652,6 +4678,23 @@ mod tests {
             provisioned.last_seen.is_some(),
             "provisioning is a sighting too"
         );
+    }
+
+    #[tokio::test]
+    async fn marking_a_sighting_moves_last_seen() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        let before = store.user("ada").await.unwrap().unwrap().last_seen;
+        assert!(before.is_none(), "an account nobody has used yet");
+        store.mark_seen("ada").await.unwrap();
+        let after = store.user("ada").await.unwrap().unwrap().last_seen;
+        assert!(after.is_some(), "and one that just arrived");
+        // A name nobody holds is not an error: the caller stamps a row it read,
+        // and a row removed in between is somebody else's problem to report.
+        store.mark_seen("nobody").await.unwrap();
     }
 
     /// The operator escape hatch: --force bypasses the last-admin guard. It still

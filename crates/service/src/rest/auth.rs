@@ -640,6 +640,13 @@ async fn proxy_header_user(
     if user.disabled {
         return Err(ApiError::forbidden("this account is disabled"));
     }
+    // The sighting. `ensure_user` stamps one for the trusted-header mode and
+    // `session_user` for the cookie mode; this path resolves through the
+    // identity link and would otherwise leave every forward-auth account
+    // reading as never seen. The returned row is the one read a moment ago, so
+    // what a caller sees is the previous sighting rather than this one, which
+    // is what "last seen" means anyway.
+    state.auth.mark_seen(&user.name).await?;
     match presentation_update(&user, display, email) {
         Some((display, email)) => Ok(state
             .auth
