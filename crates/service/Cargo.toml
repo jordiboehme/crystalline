@@ -59,6 +59,7 @@ fs4 = { workspace = true }
 notify = { workspace = true }
 axum = { workspace = true }
 axum-extra = { workspace = true }
+tower-service = { workspace = true }
 time = { workspace = true }
 utoipa = { workspace = true }
 schemars = { workspace = true }

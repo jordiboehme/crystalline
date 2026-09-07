@@ -82,6 +82,12 @@ axum-extra = { version = "0.12.6", default-features = false, features = ["cookie
 # axum-extra builds on takes its durations from here and re-exports no
 # constructor of its own. Already in the graph through that edge.
 time = { version = "0.3.55", default-features = false }
+# The `tower_service::Service` trait alone, which is what the MCP gate
+# implements and what axum's `any_service`/`fallback_service` bound on. rmcp
+# implements the same trait from the same crate; `tower::Service` is a
+# re-export of it, and pulling the trait crate keeps the middleware stack out
+# of the graph.
+tower-service = "0.3.3"
 libc = "0.2.189"
 serde_yaml_ng = "0.10.0"
 toml = "1.1.4"

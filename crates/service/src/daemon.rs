@@ -873,6 +873,12 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
     CountingSessions<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
 >;
 
+/// That transport with the identity gate in front of it, which is what every
+/// mount site actually mounts. With `auth.mcp` off the gate is a pass-through,
+/// so the type is the same either way and the router has one shape to reason
+/// about; see [`crate::mcp_gate`].
+type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
+
 /// A session manager that counts the sessions it creates, wrapping the real
 /// one and delegating everything else untouched.
 ///
@@ -1092,9 +1098,18 @@ pub fn http_router(
     {
         // No embed exists to serve, so the router is its pre-UI self: the
         // declared routes and the transport behind them.
-        let api = engine.config().api_enabled();
-        let (router, service) =
-            http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+        let config = engine.config();
+        let api = config.api_enabled();
+        let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let (router, service) = http_base(
+            engine,
+            http_sessions,
+            allowed_hosts,
+            auth,
+            api,
+            setup_token,
+            mcp_auth,
+        )?;
         Ok(router.fallback_service(service))
     }
 }
@@ -1111,15 +1126,25 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
-    // One snapshot for both keys: they are read once when the HTTP surface
-    // starts, like `service.read_only` and the `auth.*` keys, and `ui_enabled`
+    // One snapshot for all three keys: they are read once when the HTTP surface
+    // starts, like `service.read_only`, and `ui_enabled`
     // already carries the coupling (`service.api=false` turns the UI off with
     // it, since a shell whose data routes are gone can only render a login
     // error).
     let config = engine.config();
     let (api, ui) = (config.api_enabled(), config.ui_enabled());
-    let (router, service) =
-        http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+    // Read here with the other two, and for the same reason: the `auth.*` keys
+    // are startup-effective, so a running daemon serves the tier it started in.
+    let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    let (router, service) = http_base(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        api,
+        setup_token,
+        mcp_auth,
+    )?;
     if !ui {
         return Ok(router.fallback_service(service));
     }
@@ -1203,6 +1228,8 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// service the caller mounts as (or behind) the fallback. `setup_token` is this
 /// process's first-run token, handed to the REST state that answers the setup
 /// route; `None` closes the token path, which is what a loopback bind wants.
+/// `mcp_auth` is the store the identity gate resolves agent tokens through,
+/// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -1210,7 +1237,8 @@ fn http_base(
     auth: Arc<crate::rest::AuthStore>,
     api: bool,
     setup_token: Option<String>,
-) -> anyhow::Result<(axum::Router, McpService)> {
+    mcp_auth: Option<Arc<crate::rest::AuthStore>>,
+) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
@@ -1240,6 +1268,13 @@ fn http_base(
         session_manager,
         http_config(allowed_hosts),
     );
+    // The gate wraps the transport rather than the router, which is the whole
+    // of its scope: `/health` keeps answering an orchestrator's probe, the JSON
+    // API keeps its own session and trusted-header rules, and - where the UI is
+    // mounted - a browser navigation is answered by the shell middleware before
+    // the gate is ever reached. What is left for the gate is exactly the
+    // requests the transport would have served.
+    let service = crate::mcp_gate::McpGate::new(service, mcp_auth);
     let mut router = axum::Router::new().route("/health", axum::routing::get(health));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);

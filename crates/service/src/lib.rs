@@ -19,6 +19,7 @@ mod index_files;
 pub mod instance;
 pub mod maintenance;
 pub mod mcp;
+pub mod mcp_gate;
 mod origin;
 pub mod overlay;
 pub mod params;
@@ -53,6 +54,7 @@ pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
 pub use mcp::McpServer;
+pub use mcp_gate::{MCP_AUTH_REQUIRED, McpGate, McpIdentity};
 pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
 pub use stub::{DegradedServer, StubStatus};
