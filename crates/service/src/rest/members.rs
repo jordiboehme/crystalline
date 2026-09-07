@@ -163,11 +163,16 @@ fn store_error(e: anyhow::Error) -> ApiError {
              hand the domain on with PUT /domains/{domain}/owner instead",
         ),
         Some(RefusalKind::NoSuchAccount) => ApiError::unprocessable(NOT_AN_ENABLED_ACCOUNT),
-        // No membership statement can refuse for that reason - it is the
-        // identity-link surface's own - so it falls in with the server's
+        // No membership statement can refuse for those reasons - they are the
+        // identity-link surface's own - so they fall in with the server's
         // problems rather than being given a status here that would be a
         // guess.
-        Some(RefusalKind::LastCredential) | None => ApiError::internal(format!("{e:#}")),
+        Some(
+            RefusalKind::LastCredential
+            | RefusalKind::IdentityAlreadyLinked
+            | RefusalKind::IssuerAlreadyHeld,
+        )
+        | None => ApiError::internal(format!("{e:#}")),
     }
 }
 

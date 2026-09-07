@@ -84,7 +84,7 @@ use openidconnect::{
 use tokio::sync::{Mutex, RwLock};
 
 use super::auth::Identity;
-use super::auth_store::{DEFAULT_OIDC_ROLE, Role, User};
+use super::auth_store::{DEFAULT_OIDC_ROLE, RefusalKind, Role, StoreRefusal, User};
 use super::{ApiError, ApiQuery, ProblemDetail, RestState};
 
 /// The route that starts a sign-in, relative to the `/api/v1` mount.
@@ -1310,8 +1310,11 @@ pub struct CallbackQuery {
                    account in. The account is the one linked to the token's \
                    `(issuer, sub)` pair, or a fresh one provisioned at \
                    `auth.oidc.default_role`; a matching address never reaches \
-                   an existing account. The provider's own error text never \
-                   reaches this response.",
+                   an existing account. A sign-in started with `link=true` \
+                   instead ties the identity to the account whose session \
+                   started it, which has to be the session that finishes it \
+                   too. The provider's own error text never reaches this \
+                   response.",
     responses(
         (
             status = 302,
@@ -1325,9 +1328,10 @@ pub struct CallbackQuery {
         ),
         (
             status = 401,
-            description = "The provider refused, the state did not match, or \
-                           the ID token did not validate. One message for \
-                           every way this can fail.",
+            description = "The provider refused, the state did not match, the \
+                           ID token did not validate, or a link was finished \
+                           after its session was signed out. One message for \
+                           every way the protocol can fail.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1346,9 +1350,12 @@ pub struct CallbackQuery {
         ),
         (
             status = 409,
-            description = "The sign-in was started to link an identity to an \
-                           account, which this build cannot do yet. Nothing \
-                           was linked and no account was created.",
+            description = "The sign-in was started to link an identity and \
+                           could not be: it was finished on another account's \
+                           session, the identity belongs to another account \
+                           (which is never named), or this account already \
+                           holds one at that provider. Nothing was linked and \
+                           no account was created.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1382,7 +1389,7 @@ pub async fn callback(
         Ok(claims) => claims,
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
-    let user = resolve_oidc_identity(&state, claims).await;
+    let user = resolve_oidc_identity(&state, claims, &jar).await;
     let user = match user {
         Ok(user) => user,
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
@@ -1764,11 +1771,10 @@ fn account_is_disabled() -> ApiError {
 /// The seam between the protocol and the accounts database. Three cases, and
 /// the order they are in is the policy:
 ///
-/// 1. A sign-in started to LINK an identity to an account somebody is already
-///    signed in as is refused here, before anything is written. Linking is an
-///    explicit act with its own route and its own rules; provisioning a second
-///    account for a person who asked to link would be the opposite of what
-///    they asked for.
+/// 1. A sign-in started to LINK an identity to an account (`?link=true`, which
+///    needs a session to start) ties the pair to the account that started it
+///    and signs that account in. It never provisions and never moves an
+///    identity: see [`link_the_started_account`] for the three ways it refuses.
 /// 2. A `(issuer, subject)` pair this instance has seen signs into the account
 ///    it is linked to. Its role, its login name and its disabled state are
 ///    untouched: the provider asserts who somebody is, never what they may do
@@ -1782,13 +1788,17 @@ fn account_is_disabled() -> ApiError {
 /// matching username is NOT a match: an account is reached by an identity link
 /// or not at all, so a provider that will hand anybody an `email` claim cannot
 /// hand anybody somebody else's account.
-async fn resolve_oidc_identity(state: &RestState, claims: OidcClaims) -> Result<User, ApiError> {
-    if claims.link_for.is_some() {
-        tracing::debug!("a link-intent sign-in arrived before linking exists");
-        return Err(ApiError::conflict(
-            "linking a single sign-on identity to an existing account is not available on this \
-             build yet - this sign-in was not linked and no account was created",
-        ));
+///
+/// `jar` is the callback request's own cookies, and case 1 is the only reader:
+/// linking is an act by a signed-in person, so the session that finishes it has
+/// to be there and has to be the one that started it.
+async fn resolve_oidc_identity(
+    state: &RestState,
+    claims: OidcClaims,
+    jar: &CookieJar,
+) -> Result<User, ApiError> {
+    if let Some(intent) = claims.link_for.clone() {
+        return link_the_started_account(state, &claims, &intent, jar).await;
     }
     let settings = &state.oidc.as_ref().ok_or_else(sso_is_off)?.settings;
     if let Some(user) = state
@@ -1851,6 +1861,96 @@ async fn resolve_oidc_identity(state: &RestState, claims: OidcClaims) -> Result<
             }
         }
     }
+}
+
+/// Case 1 of [`resolve_oidc_identity`]: tie this identity to the account whose
+/// session started the sign-in, and sign that account in.
+///
+/// The rule this whole design is built around is that linking is an explicit
+/// act by the person who owns the account, so the account that started the
+/// link has to be the account that finishes it. `link_for` is written into the
+/// pending record by `/auth/oidc/login`, which refuses `?link=true` without a
+/// session; this checks the other end of the same journey, against the session
+/// the callback actually arrives on:
+///
+/// * no live session on the callback - signed out, expired, or revoked while
+///   the browser was away at the provider - is a 401. There is nobody to link
+///   to, and signing in again is exactly what fixes it.
+/// * a live session naming a DIFFERENT account is a 409. The one thing that
+///   must never happen is an identity landing in whichever account happened to
+///   be signed in when the browser came back.
+/// * a pair already linked to some other account is a 409 that does not say
+///   which. Naming it would turn any sign-on into a probe for who holds an
+///   identity here. An admin can move it (`crystalline users unlink` then
+///   `crystalline users link`), which is what the message points at.
+///
+/// A pair already linked to THIS account is not a refusal at all: somebody
+/// pressed the button twice, and the honest answer is the sign-in they asked
+/// for.
+async fn link_the_started_account(
+    state: &RestState,
+    claims: &OidcClaims,
+    intent: &str,
+    jar: &CookieJar,
+) -> Result<User, ApiError> {
+    let session = match jar.get(super::auth::SESSION_COOKIE) {
+        Some(cookie) => state.auth.session_user(cookie.value()).await?,
+        None => None,
+    };
+    // A disabled account's session does not resolve here either (the store
+    // refuses it), so this one arm covers signed out, expired and disabled.
+    let Some((user, _csrf)) = session else {
+        tracing::debug!("a link callback arrived on no live session");
+        return Err(ApiError::unauthorized(
+            "the session that started this link is no longer signed in - sign in again, then \
+             start the link from your profile",
+        ));
+    };
+    if user.name != intent {
+        tracing::debug!("a link callback arrived on another account's session");
+        return Err(ApiError::conflict(
+            "this link was started from another account's session - start it again from the \
+             profile of the account you want to link",
+        ));
+    }
+    match state
+        .auth
+        .linked_user(&claims.issuer, &claims.subject)
+        .await?
+    {
+        Some(holder) if holder.name == user.name => return Ok(user),
+        Some(_) => return Err(identity_is_taken()),
+        None => {}
+    }
+    match state
+        .auth
+        .link_identity(&claims.issuer, &claims.subject, &user.name, &user.name)
+        .await
+    {
+        Ok(()) => Ok(user),
+        // Both refusals are classified rather than read as prose, and neither
+        // forwards the store's own words: one of them names the account that
+        // holds the identity, which is precisely what this surface must not
+        // say. The first is the race the read above cannot close - two link
+        // flows for one pair, finishing at once.
+        Err(err) => match StoreRefusal::kind_of(&err) {
+            Some(RefusalKind::IdentityAlreadyLinked) => Err(identity_is_taken()),
+            Some(RefusalKind::IssuerAlreadyHeld) => Err(ApiError::conflict(
+                "this account already holds an identity at that provider - unlink it from your \
+                 profile first, then link this one",
+            )),
+            _ => Err(ApiError::internal(format!("{err:#}"))),
+        },
+    }
+}
+
+/// What a caller is told when the identity they signed on with belongs to
+/// somebody else's account. Deliberately the same sentence whoever asks, and
+/// deliberately without a name in it.
+fn identity_is_taken() -> ApiError {
+    ApiError::conflict(
+        "this SSO identity is already linked to another account - an admin can move it",
+    )
 }
 
 #[cfg(test)]

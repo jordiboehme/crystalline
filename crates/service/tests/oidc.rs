@@ -764,6 +764,20 @@ impl RestCtx {
     /// The same walk from a chosen start, carrying `held` (a session cookie,
     /// say) on every hop this instance sees.
     async fn sign_in_from(&self, path: &str, held: &[(String, String)]) -> reqwest::Response {
+        let (callback, cookies) = self.walk_to_callback(path, held).await;
+        self.get(&callback, &cookies).await
+    }
+
+    /// The same walk stopped one hop short: the callback url the provider sent
+    /// the browser to, and the cookies that browser is holding. Split out for
+    /// the tests that answer the callback with somebody else's cookies, which
+    /// is what "started by one session, finished by another" looks like on the
+    /// wire.
+    async fn walk_to_callback(
+        &self,
+        path: &str,
+        held: &[(String, String)],
+    ) -> (String, Vec<(String, String)>) {
         let start = self.get(&self.url(path), held).await;
         assert_eq!(start.status(), 302, "the sign-in should redirect out");
         let mut cookies = held.to_vec();
@@ -771,8 +785,50 @@ impl RestCtx {
         let authorize = location(&start);
         let bounced = self.client.get(&authorize).send().await.unwrap();
         assert_eq!(bounced.status(), 302, "the provider should redirect back");
-        let callback = location(&bounced);
-        self.get(&callback, &cookies).await
+        (location(&bounced), cookies)
+    }
+
+    /// The CSRF token of the session `cookies` carries, from the probe every
+    /// client opens on. Needed by the unsafe requests below, which the guard
+    /// refuses without it.
+    async fn csrf(&self, cookies: &[(String, String)]) -> String {
+        let body: serde_json::Value = self
+            .get(&self.url("/auth/me"), cookies)
+            .await
+            .json()
+            .await
+            .unwrap();
+        body["csrf"]
+            .as_str()
+            .expect("a session carries a csrf token")
+            .to_string()
+    }
+
+    /// A DELETE carrying `cookies` and the session's CSRF token.
+    async fn delete(&self, url: &str, cookies: &[(String, String)]) -> reqwest::Response {
+        let csrf = self.csrf(cookies).await;
+        let header = cookies
+            .iter()
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        self.client
+            .delete(url)
+            .header(reqwest::header::COOKIE, header)
+            .header("x-csrf-token", csrf)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// The identity links one session's account holds, as the profile card
+    /// reads them.
+    async fn my_links(&self, cookies: &[(String, String)]) -> serde_json::Value {
+        self.get(&self.url("/me/identity-links"), cookies)
+            .await
+            .json()
+            .await
+            .unwrap()
     }
 }
 
@@ -787,6 +843,13 @@ fn cookies_from(response: &reqwest::Response) -> Vec<(String, String)> {
         .filter_map(|pair| pair.split_once('='))
         .map(|(name, value)| (name.trim().to_string(), value.trim().to_string()))
         .collect()
+}
+
+/// One value as a single path segment: everything that is not alphanumeric is
+/// percent-encoded, which is what an issuer url needs before it can ride in a
+/// path the way `DELETE /me/identity-links/{issuer}` asks it to.
+fn path_segment(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
 
 fn location(response: &reqwest::Response) -> String {
@@ -1560,32 +1623,285 @@ async fn a_disabled_account_cannot_sign_on() {
     assert!(body.contains("this account is disabled"), "{body}");
 }
 
-/// Link intent is refused rather than provisioned: a sign-in started with
-/// `?link=true` must never create a second account for the person who is
-/// already signed in, and it must never link one either until the task that
-/// owns linking lands.
+/// The whole point of the task: a signed-in local account starts a sign-in
+/// with `?link=true` and comes back holding the provider identity, with no
+/// second account created and nothing about the account changed.
 #[tokio::test]
-async fn link_intent_is_refused_rather_than_provisioned() {
+async fn a_link_intent_sign_in_links_the_account_that_started_it() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
     ctx.create_local_user("ada", "ada@example.test", Role::Admin)
         .await;
     let session = ctx.local_login("ada").await;
 
-    let refused = ctx
+    let linked = ctx
         .sign_in_from("/auth/oidc/login?link=true", &session)
         .await;
-    assert_eq!(refused.status(), 409);
-    let body = refused.text().await.unwrap();
-    assert!(body.contains("linking"), "{body}");
+    assert_eq!(linked.status(), 302, "a completed link signs the account in");
+    assert_eq!(location(&linked), "/");
 
     assert!(
         ctx.user("ada.lovelace").await.is_none(),
-        "a link attempt provisions nothing"
+        "linking provisions no second account"
     );
+    let ada = ctx.user("ada").await.expect("the account survives");
+    assert_eq!(ada.role, Role::Admin, "linking moves no role");
+    let links = ctx.auth.identity_links("ada").await.unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0].issuer, idp.issuer());
+    assert_eq!(links[0].subject, "sub-ada");
+    assert_eq!(links[0].linked_by, "ada", "the account linked itself");
+
+    // And the link is what the next ordinary sign-on resolves: no `?link`,
+    // no session, and it lands in ada rather than provisioning anybody.
+    let again = ctx.sign_in().await;
+    assert_eq!(again.status(), 302);
+    assert!(ctx.user("ada.lovelace").await.is_none());
+    assert_eq!(ctx.auth.list_users().await.unwrap().len(), 1);
+}
+
+/// A link one session started cannot be finished by another: the callback is
+/// answered while a different account holds the session, and the link is
+/// refused rather than made for whoever happens to be signed in now.
+#[tokio::test]
+async fn a_link_started_by_one_session_is_not_finished_by_another() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    ctx.create_local_user("grace", "grace@example.test", Role::Editor)
+        .await;
+    let ada = ctx.local_login("ada").await;
+    let grace = ctx.local_login("grace").await;
+
+    // ada starts the link; the state cookie ada picked up is presented with
+    // grace's session cookie, which is what a link finished from somebody
+    // else's session looks like on the wire.
+    let (callback, cookies) = ctx.walk_to_callback("/auth/oidc/login?link=true", &ada).await;
+    let mut as_grace: Vec<(String, String)> = cookies
+        .iter()
+        .filter(|(name, _)| name == "fluid_oidc_state")
+        .cloned()
+        .collect();
+    as_grace.extend(grace.clone());
+    let refused = ctx.get(&callback, &as_grace).await;
+    assert_eq!(refused.status(), 409);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("started"), "{body}");
+    assert!(ctx.auth.identity_links("ada").await.unwrap().is_empty());
+    assert!(ctx.auth.identity_links("grace").await.unwrap().is_empty());
+    assert!(
+        ctx.user("ada.lovelace").await.is_none(),
+        "a refused link provisions nobody"
+    );
+}
+
+/// The same rule with nobody at all on the callback: a session that was signed
+/// out (or expired) while the browser was at the provider is not a session
+/// that can link anything.
+#[tokio::test]
+async fn a_link_whose_session_is_gone_is_refused() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+
+    let (callback, cookies) = ctx
+        .walk_to_callback("/auth/oidc/login?link=true", &session)
+        .await;
+    // The session is revoked while the browser is away at the provider.
+    ctx.auth
+        .set_password("ada", "correct horse battery staple")
+        .await
+        .unwrap();
+    let refused = ctx.get(&callback, &cookies).await;
+    assert_eq!(refused.status(), 401);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("signed in"), "{body}");
+    assert!(ctx.auth.identity_links("ada").await.unwrap().is_empty());
+}
+
+/// An identity another account already holds is refused, and the refusal does
+/// not say whose it is: a person who can start a sign-on must not be able to
+/// use it to learn which local account somebody else has.
+#[tokio::test]
+async fn an_identity_linked_elsewhere_is_refused_without_naming_the_holder() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    // The identity's own first sign-on provisions `ada.lovelace` and links it.
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    ctx.create_local_user("grace", "grace@example.test", Role::Editor)
+        .await;
+    let grace = ctx.local_login("grace").await;
+
+    let refused = ctx.sign_in_from("/auth/oidc/login?link=true", &grace).await;
+    assert_eq!(refused.status(), 409);
+    let body = refused.text().await.unwrap();
+    assert!(
+        body.contains("already linked to another account"),
+        "{body}"
+    );
+    assert!(
+        !body.contains("ada.lovelace"),
+        "the refusal names no other account: {body}"
+    );
+    assert!(ctx.auth.identity_links("grace").await.unwrap().is_empty());
+}
+
+/// Linking an identity the account already holds is not an error: the person
+/// pressed the button twice, and the honest answer is the sign-in they asked
+/// for rather than a conflict with themselves.
+#[tokio::test]
+async fn linking_an_identity_the_account_already_holds_signs_it_in() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
     assert_eq!(
-        ctx.user("ada").await.expect("the account survives").role,
-        Role::Admin
+        ctx.sign_in_from("/auth/oidc/login?link=true", &session)
+            .await
+            .status(),
+        302
+    );
+
+    let session = ctx.local_login("ada").await;
+    let again = ctx
+        .sign_in_from("/auth/oidc/login?link=true", &session)
+        .await;
+    assert_eq!(again.status(), 302);
+    assert_eq!(
+        ctx.auth.identity_links("ada").await.unwrap().len(),
+        1,
+        "the second link is the same link"
+    );
+}
+
+/// The profile surface: an account reads back the identities it holds and
+/// unlinks one, and the listing says whether it has a password to fall back
+/// on.
+#[tokio::test]
+async fn an_account_lists_and_unlinks_its_own_identities() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+    assert_eq!(
+        ctx.sign_in_from("/auth/oidc/login?link=true", &session)
+            .await
+            .status(),
+        302
+    );
+    let session = ctx.local_login("ada").await;
+
+    let listed = ctx.my_links(&session).await;
+    assert_eq!(listed["links"].as_array().unwrap().len(), 1);
+    assert_eq!(listed["links"][0]["issuer"], idp.issuer());
+    assert_eq!(listed["links"][0]["linked_by"], "ada");
+    assert_eq!(listed["has_password"], true);
+
+    let issuer = path_segment(&idp.issuer());
+    let removed = ctx
+        .delete(&ctx.url(&format!("/me/identity-links/{issuer}")), &session)
+        .await;
+    assert_eq!(removed.status(), 204);
+    assert!(
+        ctx.my_links(&session).await["links"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    assert!(ctx.auth.identity_links("ada").await.unwrap().is_empty());
+
+    let again = ctx
+        .delete(&ctx.url(&format!("/me/identity-links/{issuer}")), &session)
+        .await;
+    assert_eq!(again.status(), 404, "there is no such link to remove");
+}
+
+/// The rule that keeps an account reachable: an account provisioned by a
+/// sign-on has no password, so its one identity is its only way in and the
+/// unlink is refused in words that name the command which fixes that.
+#[tokio::test]
+async fn unlinking_the_last_way_in_is_refused_over_http_too() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    let signed_in = ctx.sign_in().await;
+    assert_eq!(signed_in.status(), 302);
+    let session = cookies_from(&signed_in);
+
+    let listed = ctx.my_links(&session).await;
+    assert_eq!(listed["links"][0]["linked_by"], "jit");
+    assert_eq!(
+        listed["has_password"], false,
+        "a provisioned account has no password to fall back on"
+    );
+
+    let issuer = path_segment(&idp.issuer());
+    let refused = ctx
+        .delete(&ctx.url(&format!("/me/identity-links/{issuer}")), &session)
+        .await;
+    assert_eq!(refused.status(), 409);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("crystalline users passwd"), "{body}");
+    assert_eq!(
+        ctx.auth
+            .identity_links("ada.lovelace")
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "a refused unlink removes nothing"
+    );
+
+    // A password is the second way in, and with one the unlink goes through.
+    ctx.auth
+        .set_password("ada.lovelace", "correct horse battery staple")
+        .await
+        .unwrap();
+    let session = ctx.local_login("ada.lovelace").await;
+    let removed = ctx
+        .delete(&ctx.url(&format!("/me/identity-links/{issuer}")), &session)
+        .await;
+    assert_eq!(removed.status(), 204);
+}
+
+/// Which spelling of the flag starts a link, pinned because the profile
+/// card's button is a plain navigation to this url and has no way to recover
+/// from getting it wrong. `link=true` is the one the query deserializes;
+/// `link=1` is not a bool as far as the query layer is concerned, and a
+/// refusal in problem+json is a better answer than an ordinary sign-in that
+/// silently signs somebody in as somebody else.
+#[tokio::test]
+async fn the_link_flag_is_spelled_true() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+
+    let started = ctx
+        .get(&ctx.url("/auth/oidc/login?link=true"), &session)
+        .await;
+    assert_eq!(started.status(), 302);
+    let numeric = ctx.get(&ctx.url("/auth/oidc/login?link=1"), &session).await;
+    assert_eq!(
+        numeric.status(),
+        400,
+        "`link=1` is refused rather than read as an ordinary sign-in"
+    );
+}
+
+/// The identity-link surface is the caller's own: no session, no answer.
+#[tokio::test]
+async fn the_identity_link_routes_need_a_session() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    assert_eq!(
+        ctx.get(&ctx.url("/me/identity-links"), &[]).await.status(),
+        401
     );
 }
 

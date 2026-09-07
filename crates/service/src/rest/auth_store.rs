@@ -446,6 +446,14 @@ pub enum RefusalKind {
     /// variant for both on purpose: a surface that cannot read the user list
     /// must not be handed a probe for which of the two it is.
     NoSuchAccount,
+    /// The `(issuer, subject)` pair is already linked, to this account or to
+    /// another one. The message names the account that holds it, for the
+    /// operator surfaces; the web surface must answer without it, which is why
+    /// the classification is what travels.
+    IdentityAlreadyLinked,
+    /// The account already holds an identity at this issuer, and one per
+    /// issuer is the rule: the one it holds has to go first.
+    IssuerAlreadyHeld,
     /// The identity being unlinked is the last way into its account: there is
     /// no password to fall back on and no other identity linked, so removing
     /// it would leave nobody able to sign in. See
@@ -2791,7 +2799,10 @@ impl AuthStore {
             .await?
         {
             let holder = cell_text(&row, 0).unwrap_or_default();
-            bail!("this identity is already linked to account '{holder}': an admin can move it");
+            return Err(refuse(
+                RefusalKind::IdentityAlreadyLinked,
+                format!("this identity is already linked to account '{holder}': an admin can move it"),
+            ));
         }
         if self
             .query_first(
@@ -2804,10 +2815,13 @@ impl AuthStore {
             .await?
             .is_some()
         {
-            bail!(
-                "account '{user}' already holds an identity at this provider: unlink that one \
-                 first"
-            );
+            return Err(refuse(
+                RefusalKind::IssuerAlreadyHeld,
+                format!(
+                    "account '{user}' already holds an identity at this provider: unlink that \
+                     one first"
+                ),
+            ));
         }
         self.conn
             .execute(

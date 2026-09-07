@@ -16,6 +16,7 @@ mod files;
 mod github_identity;
 mod github_settings;
 mod graph;
+mod identity_links;
 mod mcp_tokens;
 mod members;
 mod oidc;
@@ -157,6 +158,8 @@ use crate::scope::{DomainAccess, DomainRight};
         mcp_tokens::issue,
         mcp_tokens::rotate,
         mcp_tokens::revoke,
+        identity_links::list,
+        identity_links::unlink,
     ),
     components(schemas(
         ProblemDetail,
@@ -193,6 +196,8 @@ use crate::scope::{DomainAccess, DomainRight};
         auth::SetupBody,
         oidc::ProvidersResponse,
         oidc::OidcProviderView,
+        IdentityLink,
+        identity_links::IdentityLinksResponse,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::PasswordBody,
@@ -680,6 +685,17 @@ pub fn router(state: RestState) -> Router {
         )
         .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
         .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
+        // The caller's own single sign-on identities, on the same settlement
+        // as the tokens above: self-service, every account included, and
+        // served on a read-only instance because a link is account state
+        // rather than knowledge. Making one is not here - that is the sign-on
+        // itself, which is the only thing that can prove the identity is the
+        // caller's.
+        .route("/me/identity-links", get(identity_links::list))
+        .route(
+            "/me/identity-links/{issuer}",
+            delete(identity_links::unlink),
+        )
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.
