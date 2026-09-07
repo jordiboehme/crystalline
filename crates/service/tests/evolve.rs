@@ -16,6 +16,7 @@ use crystalline_core::config::{DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::EvolveParams;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -219,10 +220,13 @@ fn files() -> Vec<(String, String)> {
 /// wrapper has its own tests at the end of this file.
 async fn sweep(engine: &Engine, today: &str, p: EvolveParams) -> Value {
     engine
-        .evolve_detect(&EvolveParams {
-            today: Some(today.to_string()),
-            ..p
-        })
+        .evolve_detect(
+            &EvolveParams {
+                today: Some(today.to_string()),
+                ..p
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap()
 }
@@ -554,10 +558,13 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     let (_tmp, engine) = fixture().await;
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            domains: vec!["nope".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["nope".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -565,10 +572,13 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     assert!(e.contains("eng"), "{e}");
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            families: vec!["lifecycle".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                families: vec!["lifecycle".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -578,10 +588,13 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     );
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            rules: vec!["V301".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                rules: vec!["V301".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -592,10 +605,13 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     assert!(e.ends_with("V203"), "{e}");
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            today: Some("last tuesday".to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                today: Some("last tuesday".to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -715,11 +731,14 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     // Detection changes nothing at all, which is what lets a queue view show
     // this page without claiming anybody worked it.
     engine
-        .evolve_detect(&EvolveParams {
-            domains: vec!["eng".to_string()],
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["eng".to_string()],
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -729,11 +748,14 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     );
 
     let v = engine
-        .evolve_engrams(&EvolveParams {
-            domains: vec!["eng".to_string()],
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["eng".to_string()],
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(v["scope"]["domains"], serde_json::json!(["eng"]));
@@ -776,10 +798,13 @@ async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
     crystalline_service::maintenance::record_pending("ghost");
 
     let v = engine
-        .evolve_engrams(&EvolveParams {
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(

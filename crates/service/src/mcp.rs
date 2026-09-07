@@ -1554,7 +1554,7 @@ impl McpServer {
         Parameters(p): Parameters<ValidateParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .validate_engrams(&p)
+            .validate_engrams(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))
@@ -1571,7 +1571,7 @@ impl McpServer {
         Parameters(p): Parameters<InferParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .infer_schema(&p)
+            .infer_schema(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1605,7 +1605,7 @@ impl McpServer {
         Parameters(p): Parameters<EvolveParams>,
     ) -> Result<CallToolResult, ErrorData> {
         self.engine
-            .evolve_engrams(&p)
+            .evolve_engrams(&p, &TASK_11_SCOPE)
             .await
             .map_err(to_error)
             .and_then(|v| self.ok_list(v))

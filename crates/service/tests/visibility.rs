@@ -18,8 +18,8 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::params::{
-    BrowseParams, ContextParams, ListDomainsParams, ReadParams, RecentParams, SearchParams,
-    VocabularyParams,
+    BrowseParams, ContextParams, EvolveParams, InferParams, ListDomainsParams, ReadParams,
+    RecentParams, SearchParams, ValidateParams, VocabularyParams,
 };
 use crystalline_service::rest::{AuthStore, MemberLevel, Role};
 use crystalline_service::{DomainAccess, Engine, Scope};
@@ -33,6 +33,10 @@ const OPEN_NOTE: &str = "---\ntype: engram\ntitle: Open Note\npermalink: open-no
 /// any verb. Its relation points into `open`, so it is also an inbound
 /// reference the shared engram must not report.
 const LAB_NOTE: &str = "---\ntype: dossier\ntitle: Lab Note\npermalink: lab-note\ntags:\n  - confidential\nstatus: stable\nrecorded_at: 2026-01-03\n---\n\n# Lab Note\n\n- [secret] the secret formula is here #confidential\n- relates_to [[open:Open Note]]\n";
+/// A second private engram, written so the maintenance sweep has something to
+/// find in `lab`: its relation resolves to nothing, which is an unresolved
+/// reference every detector run reports by domain, permalink and path.
+const LAB_DRAFT: &str = "---\ntype: dossier\ntitle: Lab Draft\npermalink: lab-draft\ntags:\n  - confidential\nstatus: stable\nrecorded_at: 2026-01-04\n---\n\n# Lab Draft\n\n- [secret] the draft points nowhere yet #confidential\n- relates_to [[Nothing Here At All]]\n";
 
 /// Two file domains, `open` and `lab`, each with a MANIFEST and one engram,
 /// plus an accounts store where `lab` is private to `owner` with `mem` invited.
@@ -52,6 +56,9 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>) {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("MANIFEST.md"), manifest).unwrap();
         std::fs::write(dir.join(format!("{name}-note.md")), note).unwrap();
+        if name == "lab" {
+            std::fs::write(dir.join("lab-draft.md"), LAB_DRAFT).unwrap();
+        }
         cfg.domains.insert(name.to_string(), DomainEntry::file(dir));
     }
     let config_path = root.join("config.yaml");
@@ -66,8 +73,13 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>) {
     engine.sync(None).await.unwrap();
 
     let auth = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
-    for name in ["owner", "mem", "out"] {
-        auth.add_user(name, name, None, Role::Editor, "pw12345678")
+    for (name, role) in [
+        ("owner", Role::Editor),
+        ("mem", Role::Editor),
+        ("out", Role::Editor),
+        ("boss", Role::Admin),
+    ] {
+        auth.add_user(name, name, None, role, "pw12345678")
             .await
             .unwrap();
     }
@@ -85,6 +97,17 @@ fn user(account: &str) -> Scope {
     Scope::User {
         account: account.into(),
         admin: false,
+    }
+}
+
+/// An instance admin, with the flag the surface resolved carried along. An
+/// admin already manages every account here, so a domain it could not see would
+/// be a secret kept from the person who can grant themselves the account that
+/// holds it - the resolver says so, and these verbs have to agree.
+fn admin(account: &str) -> Scope {
+    Scope::User {
+        account: account.into(),
+        admin: true,
     }
 }
 
@@ -171,12 +194,16 @@ async fn a_hidden_domain_is_absent_from_search_list_and_read() {
 }
 
 /// An invitation is what makes the difference, not the shape of the request:
-/// the member and the owner read exactly what the stranger cannot.
+/// the member and the owner read exactly what the stranger cannot - and so does
+/// an instance admin, who is never a member of anything.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_and_the_owner_see_the_private_domain() {
     let (_tmp, engine) = fixture().await;
-    for account in ["mem", "owner"] {
-        let scope = user(account);
+    for (account, scope) in [
+        ("mem", user("mem")),
+        ("owner", user("owner")),
+        ("boss", admin("boss")),
+    ] {
         let listed = engine
             .list_domains(&ListDomainsParams::default(), &scope)
             .await
@@ -198,7 +225,7 @@ async fn a_member_and_the_owner_see_the_private_domain() {
                 .read_engram(&read("lab-note", "lab"), &scope)
                 .await
                 .is_ok(),
-            "{account} reads the engram it was invited to"
+            "{account} reads the private engram"
         );
     }
 }
@@ -281,6 +308,21 @@ async fn an_explicit_filter_naming_a_hidden_domain_answers_like_an_unknown_one()
         )
         .await
         .unwrap();
+    let unknown_only = engine
+        .recent_activity(
+            &RecentParams {
+                domains: vec!["nope".to_string()],
+                timeframe: Some("100y".to_string()),
+                types: Vec::new(),
+            },
+            &stranger,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        hidden_only, unknown_only,
+        "the whole envelope matches, not just the count: {hidden_only}"
+    );
     assert_eq!(hidden_only["count"], 0, "{hidden_only}");
 }
 
@@ -549,5 +591,151 @@ async fn the_routing_block_drops_a_hidden_domain() {
             .unwrap(),
         engine.routing_text(),
         "and the machine owner's scoped block is the unscoped one"
+    );
+}
+
+/// The maintenance sweep is a read that enumerates every registered domain and
+/// names the domain, permalink and path of everything it finds. Scoped like the
+/// rest: the sweep covers what the caller may read, and naming a hidden domain
+/// fails exactly as naming an unregistered one does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_evolve_sweep_covers_only_visible_domains() {
+    let (_tmp, engine) = fixture().await;
+    let stranger = user("out");
+
+    let swept = engine
+        .evolve_engrams(&EvolveParams::default(), &stranger)
+        .await
+        .unwrap();
+    assert_eq!(
+        swept["scope"]["domains"],
+        serde_json::json!(["open"]),
+        "the default scope is every domain the caller may read: {swept}"
+    );
+    assert!(
+        !swept.to_string().contains("lab"),
+        "and no finding names the private domain: {swept}"
+    );
+
+    // The finding really is there for somebody who may see it, so the assertion
+    // above is not passing because the sweep found nothing at all.
+    let admin_view = engine
+        .evolve_engrams(&EvolveParams::default(), &admin("boss"))
+        .await
+        .unwrap();
+    assert!(
+        admin_view.to_string().contains("lab-draft"),
+        "an admin sweeps the private domain too: {admin_view}"
+    );
+    assert!(
+        engine
+            .evolve_engrams(&EvolveParams::default(), &user("mem"))
+            .await
+            .unwrap()
+            .to_string()
+            .contains("lab-draft"),
+        "and so does the member"
+    );
+
+    let named_hidden = engine
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["lab".to_string()],
+                ..EvolveParams::default()
+            },
+            &stranger,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    let named_unknown = engine
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["nope".to_string()],
+                ..EvolveParams::default()
+            },
+            &stranger,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        named_hidden,
+        named_unknown.replace("'nope'", "'lab'"),
+        "a named hidden domain fails as an unregistered one"
+    );
+    assert!(!named_unknown.contains("lab"), "{named_unknown}");
+}
+
+/// The two schema verbs read a named domain's engrams whole - permalinks, paths
+/// and per-engram messages out of validate, field names generalized out of the
+/// content by infer. Both refuse a hidden domain as an unregistered one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_schema_verbs_refuse_a_hidden_domain_as_unregistered() {
+    let (_tmp, engine) = fixture().await;
+    let stranger = user("out");
+
+    let validate = |domain: &str, scope: Scope| {
+        let engine = engine.clone();
+        let domain = domain.to_string();
+        async move {
+            engine
+                .validate_engrams(
+                    &ValidateParams {
+                        domain,
+                        identifier: None,
+                        engram_type: None,
+                        drift: false,
+                    },
+                    &scope,
+                )
+                .await
+        }
+    };
+    let infer = |domain: &str, scope: Scope| {
+        let engine = engine.clone();
+        let domain = domain.to_string();
+        async move {
+            engine
+                .infer_schema(
+                    &InferParams {
+                        domain,
+                        engram_type: "dossier".to_string(),
+                        threshold: None,
+                    },
+                    &scope,
+                )
+                .await
+        }
+    };
+
+    let hidden = validate("lab", stranger.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    let unknown = validate("nope", stranger.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(hidden, unknown.replace("'nope'", "'lab'"), "validate");
+    assert!(!unknown.contains("lab"), "{unknown}");
+
+    let hidden = infer("lab", stranger.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    let unknown = infer("nope", stranger.clone())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(hidden, unknown.replace("'nope'", "'lab'"), "infer");
+
+    // Both answer for somebody who may read the domain.
+    assert!(validate("lab", admin("boss")).await.is_ok());
+    assert!(validate("lab", user("mem")).await.is_ok());
+    let inferred = infer("lab", user("mem")).await.unwrap();
+    assert!(
+        inferred.to_string().contains("dossier"),
+        "the member infers over the private domain: {inferred}"
     );
 }

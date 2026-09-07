@@ -1304,10 +1304,14 @@ pub(crate) async fn dispatch_engine(
         }
         "validate_engrams" => {
             engine
-                .validate_engrams(&decode::<ValidateParams>(args)?)
+                .validate_engrams(&decode::<ValidateParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
-        "infer_schema" => engine.infer_schema(&decode::<InferParams>(args)?).await?,
+        "infer_schema" => {
+            engine
+                .infer_schema(&decode::<InferParams>(args)?, &Scope::Unrestricted)
+                .await?
+        }
         "vocabulary" => {
             engine
                 .vocabulary(&decode::<VocabularyParams>(args)?, &Scope::Unrestricted)
@@ -1317,7 +1321,7 @@ pub(crate) async fn dispatch_engine(
         // this arm and the router name can never drift apart.
         t if t == crate::EVOLVE_TOOL_NAME => {
             engine
-                .evolve_engrams(&decode::<EvolveParams>(args)?)
+                .evolve_engrams(&decode::<EvolveParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
         other => anyhow::bail!("unknown tool '{other}'"),

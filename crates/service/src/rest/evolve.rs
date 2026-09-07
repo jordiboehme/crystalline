@@ -201,17 +201,20 @@ pub async fn queue(
     let domains = sweepable_domains(&state, &identity, csv(query.domains.as_deref())).await?;
     let value = state
         .engine
-        .evolve_detect(&EvolveParams {
-            domains,
-            families: csv(query.families.as_deref()),
-            rules: csv(query.rules.as_deref()),
-            min_priority: query.min_priority,
-            limit: query.limit,
-            page: query.page,
-            include_acknowledged: query.include_acknowledged.unwrap_or(false),
-            // Never from the caller: see the type and the operation doc above.
-            today: None,
-        })
+        .evolve_detect(
+            &EvolveParams {
+                domains,
+                families: csv(query.families.as_deref()),
+                rules: csv(query.rules.as_deref()),
+                min_priority: query.min_priority,
+                limit: query.limit,
+                page: query.page,
+                include_acknowledged: query.include_acknowledged.unwrap_or(false),
+                // Never from the caller: see the type and the operation doc above.
+                today: None,
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }

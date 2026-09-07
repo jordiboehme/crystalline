@@ -1156,7 +1156,10 @@ impl Engine {
         // The store's own domain list rather than the registered one: a shared
         // database can hold a domain this instance never registered, and a read
         // that turned an unfiltered sweep into a list of local registrations
-        // would quietly stop answering for those.
+        // would quietly stop answering for those. The other side of that choice
+        // is that a registered domain with no rows yet is absent from the list -
+        // which costs nothing, since a domain with no rows has nothing to
+        // return to any query this list narrows.
         let store = self.store.lock().await;
         let stats = store.domain_stats().await?;
         drop(store);
@@ -1563,6 +1566,15 @@ impl Engine {
     /// mirroring [`Engine::domain_entry`].
     fn content_source(&self, name: &str) -> Result<ContentSource> {
         let entry = self.domain_entry(name)?;
+        Ok(self.source_of(&entry))
+    }
+
+    /// [`Engine::content_source`] for a scoped read: a domain the caller may
+    /// not see resolves to no source at all, with the same
+    /// [`EngineError::UnknownDomain`] a name nobody registered gets, its
+    /// `registered` list filtered to the visible set.
+    fn content_source_scoped(&self, name: &str, hidden: &HashSet<String>) -> Result<ContentSource> {
+        let entry = self.domain_entry_scoped(name, hidden)?;
         Ok(self.source_of(&entry))
     }
 
@@ -5797,8 +5809,17 @@ impl Engine {
     /// Validate a domain's engrams against its schema engrams. Engram content is
     /// loaded from disk for a file domain and from the database for a virtual
     /// domain, so validation covers both kinds.
-    pub async fn validate_engrams(&self, p: &ValidateParams) -> Result<Value> {
-        let source = self.content_source(&p.domain)?;
+    ///
+    /// A domain `scope` may not see is refused as an unregistered one before
+    /// anything is listed: the report names permalinks, paths and per-engram
+    /// messages, which is a reading of the domain's contents by another route.
+    pub async fn validate_engrams(
+        &self,
+        p: &ValidateParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let schema_descs = store.list_engrams(&p.domain, None, Some("schema")).await?;
         let targets = if let Some(id) = &p.identifier {
@@ -5918,8 +5939,12 @@ impl Engine {
     ///
     /// The recording is best effort by design - see [`crate::maintenance`] -
     /// and the response is returned exactly as detection built it.
-    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
-        let value = self.evolve_detect(p).await?;
+    pub async fn evolve_engrams(
+        &self,
+        p: &EvolveParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let value = self.evolve_detect(p, scope).await?;
         // The swept scope is read back out of the response rather than
         // re-derived from the parameters: an unscoped call defaults to every
         // registered domain, and only the response knows which those were.
@@ -5986,7 +6011,12 @@ impl Engine {
     ///   split [`Engine::peer_engram_text`] makes for the move's referent
     ///   count, and the two agree on what a reference is: an `assets/` link in
     ///   the body or the `analyzes` key, compared as exact paths.
-    pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
+    pub async fn evolve_detect(
+        &self,
+        p: &EvolveParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
@@ -5996,23 +6026,29 @@ impl Engine {
         let families = parse_families(&p.families)?;
         let rules = parse_rules(&p.rules)?;
 
-        // Every registered domain, both as the default scope and as `V102`'s
-        // idea of which `[[domain:Target]]` prefixes name a real domain.
+        // Every registered domain this caller may see, both as the default
+        // scope and as `V102`'s idea of which `[[domain:Target]]` prefixes name
+        // a real domain. Filtered on both counts deliberately: a finding names
+        // the domain, permalink and file path it fired on, and `V102`'s verdict
+        // on a cross-domain target is itself an answer about whether that
+        // domain exists.
         let mut known_domains = self.known_domain_names();
+        known_domains.retain(|name| !hidden.contains(name));
         known_domains.sort();
         known_domains.dedup();
 
-        let mut scope: Vec<String> = Vec::new();
+        let mut swept_scope: Vec<String> = Vec::new();
         if p.domains.is_empty() {
-            scope = known_domains.clone();
+            swept_scope = known_domains.clone();
         } else {
             for name in &p.domains {
                 // The same resolution every other tool uses, so an unknown name
                 // errors identically and a domain registered after startup is
-                // still found.
-                self.domain_entry(name)?;
-                if !scope.contains(name) {
-                    scope.push(name.clone());
+                // still found - and a domain this caller may not see is one of
+                // the names that errors.
+                self.domain_entry_scoped(name, &hidden)?;
+                if !swept_scope.contains(name) {
+                    swept_scope.push(name.clone());
                 }
             }
         }
@@ -6026,7 +6062,7 @@ impl Engine {
         // One domain at a time: `SweepInput` is domain-scoped (two rules are
         // domain-relative) and processing them in turn bounds the memory an
         // unscoped sweep needs to whatever the largest domain costs.
-        for name in &scope {
+        for name in &swept_scope {
             let Some(swept) = self
                 .sweep_domain(name, today, &known_domains, p.include_acknowledged)
                 .await?
@@ -6150,7 +6186,7 @@ impl Engine {
 
         Ok(json!({
             "scope": {
-                "domains": scope,
+                "domains": swept_scope,
                 "families": families.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
                 "rules": rules,
                 "min_priority": p.min_priority,
@@ -6603,8 +6639,17 @@ impl Engine {
     /// Infer a Picoschema from a domain's engrams of a type. Engram content is
     /// loaded from disk for a file domain and from the database for a virtual
     /// domain.
-    pub async fn infer_schema(&self, p: &InferParams) -> Result<Value> {
-        let source = self.content_source(&p.domain)?;
+    ///
+    /// Scoped like [`Engine::validate_engrams`]: the inferred field names are
+    /// generalized out of the domain's own engrams, so a domain the caller may
+    /// not see is refused as an unregistered one.
+    pub async fn infer_schema(
+        &self,
+        p: &InferParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let descs = store
             .list_engrams(&p.domain, None, Some(&p.engram_type))
