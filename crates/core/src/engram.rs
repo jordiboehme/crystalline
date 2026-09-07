@@ -325,6 +325,19 @@ pub struct LinkTarget {
     pub domain: Option<String>,
     /// The target title or permalink.
     pub target: String,
+    /// The bracket text exactly as it was written, trimmed at the ends and
+    /// nothing else.
+    ///
+    /// The parse below is domain-agnostic: it cannot know whether the segment
+    /// before a colon names a real domain, so a title whose own first word ends
+    /// in a colon (`Log: Weekly Garden Notes`) splits like a cross-domain
+    /// prefix. Only a resolver holding the registry can tell the two apart, and
+    /// telling them apart means looking the whole original string up as a
+    /// title, which the split has by then thrown away. So it is kept here.
+    /// Not part of the serialized shape: it is what the parse consumed, not a
+    /// second field a client should read.
+    #[serde(skip)]
+    pub raw: String,
 }
 
 impl LinkTarget {
@@ -342,12 +355,14 @@ impl LinkTarget {
                 return LinkTarget {
                     domain: Some(domain.to_string()),
                     target: rest.to_string(),
+                    raw: inner.to_string(),
                 };
             }
         }
         LinkTarget {
             domain: None,
             target: inner.to_string(),
+            raw: inner.to_string(),
         }
     }
 }

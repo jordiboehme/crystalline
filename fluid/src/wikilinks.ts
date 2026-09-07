@@ -14,6 +14,14 @@
  * become a link a moment later, and marking it broken in the meantime would be
  * a claim the app cannot back. Parsed and unresolved is the one honest negative,
  * and it is drawn as such.
+ *
+ * One thing the bracket text cannot settle on its own, and the server's
+ * resolver cannot either: `[[Log: Weekly Garden Notes]]` splits exactly like
+ * `[[ops:Runbook]]`, and only the domain registry says which of the two words
+ * before the colon is a domain. So the split below stays domain-agnostic - it
+ * mirrors the server's parser, and the two must not drift - and the fallback
+ * lives in the resolver, which is handed the domain list this app already
+ * holds. That mirrors where the server keeps it too (`core/src/address.rs`).
  */
 
 import type { EngramDetail, LinkTarget } from "./api/engram";
@@ -109,6 +117,32 @@ function keyOf(target: LinkTarget, fallbackDomain: string): string {
 }
 
 /**
+ * The readings of one bracket text, in the order they are tried.
+ *
+ * Almost always one: what the parser made of it. A second is added only when
+ * the parser found a prefix and the caller's domain list says nothing is
+ * registered under that name - then the whole bracket text, colon and all, is
+ * a title in the engram's own domain. The cross-domain reading is still tried
+ * first, so a prefix naming a real domain never loses to a title that merely
+ * looks like one, and a caller that passes no domain list gets the single
+ * reading it always got.
+ */
+function readings(
+  inner: string,
+  known: ReadonlySet<string> | undefined,
+): LinkTarget[] {
+  const parsed = parseWikiTarget(inner);
+  if (
+    parsed.domain === null ||
+    known === undefined ||
+    known.has(parsed.domain)
+  ) {
+    return [parsed];
+  }
+  return [parsed, { domain: null, target: inner.trim() }];
+}
+
+/**
  * Build the resolver for one engram page.
  *
  * `graph` is optional because it arrives second: the same resolver is used
@@ -118,8 +152,13 @@ function keyOf(target: LinkTarget, fallbackDomain: string): string {
 export function buildWikilinkResolver(
   detail: EngramDetail,
   graph: GraphNeighborhood | undefined,
+  domains?: readonly string[],
 ): WikilinkResolver {
   const home = detail.domain;
+  // Undefined rather than empty when the caller has no listing to give: an
+  // empty set would say every prefix names no domain, which is a claim, where
+  // undefined says this caller cannot tell and asks for the old behavior.
+  const known = domains === undefined ? undefined : new Set(domains);
 
   // What the index made of each parsed reference. Both lists are consulted,
   // because a target written as prose on one line and declared as a relation on
@@ -149,9 +188,14 @@ export function buildWikilinkResolver(
   }
 
   return (inner: string) => {
-    const target = parseWikiTarget(inner);
-    const key = keyOf(target, home);
-    const resolved = parsed.get(key);
+    const candidates = readings(inner, known);
+
+    // What the index made of it, taken from the first reading it has anything
+    // to say about. A verdict of false is the verdict: a second reading is a
+    // different way of asking the same server, not a second opinion.
+    const resolved = candidates
+      .map((target) => parsed.get(keyOf(target, home)))
+      .find((verdict) => verdict !== undefined);
     if (resolved === undefined) {
       // Not a reference the server parsed out of this engram at all. Rendered
       // as prose rather than guessed at: bracket text inside, say, a quoted
@@ -161,13 +205,20 @@ export function buildWikilinkResolver(
     if (!resolved) {
       return { kind: "unresolved" };
     }
-    const where = located.get(key);
-    return where === undefined
-      ? null
-      : {
+
+    // Where it lives, over every reading: the graph places an engram under its
+    // own title, so a target the index resolved through the fallback reading is
+    // findable under that reading and under no other.
+    for (const target of candidates) {
+      const where = located.get(keyOf(target, home));
+      if (where !== undefined) {
+        return {
           kind: "resolved",
           href: engramRoute(where.domain, where.permalink),
           label: target.target,
         };
+      }
+    }
+    return null;
   };
 }

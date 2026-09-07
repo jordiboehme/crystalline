@@ -21,6 +21,10 @@ use super::{Severity, Sink};
 pub(crate) fn build_lookup(domains: &[Domain]) -> LookupTable {
     let mut table = LookupTable::new();
     for domain in domains {
+        // Declared whether or not it holds anything a link can land on, so
+        // `[[name:Target]]` is judged against the scan set rather than against
+        // whichever domains happened to parse.
+        table.register_domain(&domain.name);
         for file in &domain.files {
             let Ok(engram) = &file.parsed else { continue };
             let permalink = effective_permalink(file, engram);

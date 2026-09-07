@@ -3330,7 +3330,11 @@ impl Engine {
                 p.successor.as_deref().unwrap_or_default()
             )));
         }
-        let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
+        // The permalink, not the title. A title is prose and may carry a
+        // colon, which `[[...]]` parses as a cross-domain prefix (issue #65);
+        // a permalink is the stable identity and never carries one. Fluid goes
+        // on rendering the title, which it reads off the engram it lands on.
+        let successor_permalink = successor.as_ref().map(|(d, _)| d.permalink.clone());
 
         // -- target: status, optional valid_to, optional superseded_by line --
         match &source {
@@ -3350,7 +3354,7 @@ impl Engine {
                     &current,
                     &p.status,
                     valid_to,
-                    successor_title.as_deref(),
+                    successor_permalink.as_deref(),
                     &actor,
                 );
                 let edited = Self::enforce_temporal(edited)?;
@@ -3376,7 +3380,7 @@ impl Engine {
                     &current,
                     &p.status,
                     valid_to,
-                    successor_title.as_deref(),
+                    successor_permalink.as_deref(),
                     &actor,
                 );
                 let edited = Self::enforce_temporal(edited)?;
@@ -3401,7 +3405,7 @@ impl Engine {
 
         // -- successor: reciprocal supersedes line, appended once --
         if let Some((succ_desc, succ_source)) = &successor {
-            let line = format!("- supersedes [[{}]]", desc.title);
+            let line = format!("- supersedes [[{}]]", desc.permalink);
             match succ_source {
                 ContentSource::File { root } => {
                     let abs = join_rel(root, &succ_desc.path);
@@ -3483,7 +3487,7 @@ impl Engine {
         current: &str,
         status: &str,
         valid_to: Option<NaiveDate>,
-        successor_title: Option<&str>,
+        successor_permalink: Option<&str>,
         actor: &str,
     ) -> String {
         let mut edited = set_frontmatter_field(current, "status", status);
@@ -3491,8 +3495,8 @@ impl Engine {
             edited =
                 set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
         }
-        if let Some(title) = successor_title {
-            let line = format!("- superseded_by [[{title}]]");
+        if let Some(permalink) = successor_permalink {
+            let line = format!("- superseded_by [[{permalink}]]");
             if !current.contains(&line) {
                 edited = append_body(&edited, &line);
             }
@@ -3591,7 +3595,7 @@ impl Engine {
         // the ones every other new engram gets.
         let body = format!(
             "# {title}\n\n{}\n\n- derived_from [[{}]]",
-            plan.moved, desc.title
+            plan.moved, desc.permalink
         );
         let created = self
             .write_engram_as(
@@ -3617,7 +3621,13 @@ impl Engine {
         let new_permalink = created["permalink"].as_str().map(str::to_string);
         let new_path = created["path"].as_str().unwrap_or_default().to_string();
 
-        let remaining = append_body(&plan.remaining, &format!("- split_into [[{title}]]"));
+        // By permalink, for the reason `derived_from` above is: a title is
+        // prose and may carry a colon that `[[...]]` reads as a cross-domain
+        // prefix (issue #65). The title is the fallback for the one case that
+        // has no permalink to name - a receipt whose shape changed under this
+        // code, which the rollback below reports rather than acts on.
+        let back_link = new_permalink.clone().unwrap_or_else(|| title.clone());
+        let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
         let edited = self
             .apply_source_edit_staged(&desc, &source, Some(&checksum), &actor, move |_| {
                 Ok(remaining)

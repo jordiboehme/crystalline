@@ -26,6 +26,7 @@ import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
 import type { EngramDetail } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
@@ -568,9 +569,20 @@ function Surface({
     queryKey: graphKey(engram.domain, engram.permalink, NEIGHBORHOOD_DEPTH),
     queryFn: () => fetchGraph(engram.domain, engram.permalink),
   });
+  // Under the sidebar's own key, so this is a cache read rather than a
+  // request: the chips need it to tell `[[Log: Weekly Notes]]`, a title, from
+  // `[[ops:Runbook]]`, a domain, and only the registry knows which is which.
+  const domains = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
+  const domainNames = useMemo(
+    () => domains.data?.domains.map((entry) => entry.name),
+    [domains.data],
+  );
   const resolver = useMemo(
-    () => buildWikilinkResolver(engram, graph.data),
-    [engram, graph.data],
+    () => buildWikilinkResolver(engram, graph.data, domainNames),
+    [engram, graph.data, domainNames],
   );
   // `fullVocabularyKey` rather than `vocabularyKey`: `DomainHome` caches
   // `fetchTags` under the latter, a different shape, and the two landing on

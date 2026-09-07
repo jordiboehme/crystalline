@@ -1071,7 +1071,7 @@ async fn retire_move_and_delete_run_through_their_endpoints() {
     assert_eq!(retired.status(), 200);
     let alpha = std::fs::read_to_string(fx._tmp.path().join("eng/alpha.md")).unwrap();
     assert!(alpha.contains("status: superseded"), "{alpha}");
-    assert!(alpha.contains("- superseded_by [[Beta]]"), "{alpha}");
+    assert!(alpha.contains("- superseded_by [[beta]]"), "{alpha}");
 
     // An invalid retirement status is a 422 with the engine's words.
     let bad = as_session(

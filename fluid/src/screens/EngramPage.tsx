@@ -111,10 +111,21 @@ export default function EngramPage() {
     enabled: detail.isSuccess,
   });
 
+  // The names alone, and only once the listing has landed: the resolver reads
+  // a missing list as "this caller cannot tell whether a prefix is a domain"
+  // and an empty one as "none of them is", so handing it an empty array while
+  // the request is in flight would answer a question nobody can answer yet.
+  const domainNames = useMemo(
+    () => domains.data?.domains.map((entry) => entry.name),
+    [domains.data],
+  );
+
   const wikilinks = useMemo(
     () =>
-      detail.data ? buildWikilinkResolver(detail.data, graph.data) : undefined,
-    [detail.data, graph.data],
+      detail.data
+        ? buildWikilinkResolver(detail.data, graph.data, domainNames)
+        : undefined,
+    [detail.data, graph.data, domainNames],
   );
 
   /*

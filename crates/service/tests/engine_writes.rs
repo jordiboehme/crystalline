@@ -412,9 +412,124 @@ async fn retirement_sets_status_and_wires_the_supersede_pair() {
     let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert!(alpha.contains("status: superseded"), "{alpha}");
     assert!(alpha.contains("valid_to: 2026-08-01"), "{alpha}");
-    assert!(alpha.contains("- superseded_by [[Beta]]"), "{alpha}");
+    assert!(alpha.contains("- superseded_by [[beta]]"), "{alpha}");
     let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
-    assert!(beta.contains("- supersedes [[Alpha]]"), "{beta}");
+    assert!(beta.contains("- supersedes [[alpha]]"), "{beta}");
+}
+
+/// Issue #65: an engram whose title's own first word ends in a colon.
+///
+/// `[[Log: Weekly Garden Notes]]` splits like `[[domain:Target]]` - the parser
+/// is domain-agnostic and cannot tell the two apart - so a relation written by
+/// title pointed at a domain called `Log` that nobody has, and the pair the
+/// verb exists to wire came out broken. Every relation the engine writes for
+/// itself names the permalink instead: it is the stable identity, and it never
+/// carries a colon.
+#[tokio::test]
+async fn the_supersede_pair_links_by_permalink_so_a_colon_in_a_title_cannot_break_it() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/log-weekly.md"),
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "superseded".to_string(),
+            successor: Some("log-weekly".to_string()),
+            valid_to: None,
+        })
+        .await
+        .unwrap();
+
+    let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
+    assert!(alpha.contains("- superseded_by [[log-weekly]]"), "{alpha}");
+    let successor = std::fs::read_to_string(tmp.path().join("eng/log-weekly.md")).unwrap();
+    assert!(successor.contains("- supersedes [[alpha]]"), "{successor}");
+
+    // Both halves resolve, which is the whole point: the title form did not.
+    for (identifier, rel_type) in [("alpha", "superseded_by"), ("log-weekly", "supersedes")] {
+        let read = engine
+            .read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("eng".to_string()),
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let relation = read["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rel_type"] == rel_type)
+            .unwrap_or_else(|| panic!("{identifier} declares {rel_type}"));
+        assert_eq!(relation["resolved"], true, "{identifier} {rel_type}");
+    }
+}
+
+/// The same rule on the other pair-writing verb, and the sharper case: the
+/// engram carrying the colon is the SOURCE, so both bullets are affected.
+#[tokio::test]
+async fn split_links_by_permalink_so_a_colon_in_a_title_cannot_break_the_pair() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/log-weekly.md"),
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n\n- [fact] The beans went in on Tuesday\n- [fact] The compost bin was turned\n- [decision] The tomatoes stay under glass\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+    let (checksum, _) = checksum_of(&engine, "eng", "log-weekly").await;
+    let lines = observation_lines(&engine, "log-weekly", &["beans went in"]).await;
+
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "log-weekly".to_string(),
+            title: "Sowing: What Went In".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: Some(checksum),
+        })
+        .await
+        .unwrap();
+
+    let new = std::fs::read_to_string(tmp.path().join("eng/sowing-what-went-in.md")).unwrap();
+    assert!(new.contains("- derived_from [[log-weekly]]"), "{new}");
+    let source = std::fs::read_to_string(tmp.path().join("eng/log-weekly.md")).unwrap();
+    assert!(
+        source.contains("- split_into [[sowing-what-went-in]]"),
+        "{source}"
+    );
+
+    for (identifier, rel_type) in [
+        ("log-weekly", "split_into"),
+        ("sowing-what-went-in", "derived_from"),
+    ] {
+        let read = engine
+            .read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("eng".to_string()),
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let relation = read["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rel_type"] == rel_type)
+            .unwrap_or_else(|| panic!("{identifier} declares {rel_type}"));
+        assert_eq!(relation["resolved"], true, "{identifier} {rel_type}");
+    }
 }
 
 #[tokio::test]
@@ -562,12 +677,12 @@ async fn retiring_the_same_engram_twice_is_idempotent() {
 
     let alpha = std::fs::read_to_string(tmp.path().join("eng/alpha.md")).unwrap();
     assert_eq!(
-        alpha.matches("- superseded_by [[Beta]]").count(),
+        alpha.matches("- superseded_by [[beta]]").count(),
         1,
         "{alpha}"
     );
     let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
-    assert_eq!(beta.matches("- supersedes [[Alpha]]").count(), 1, "{beta}");
+    assert_eq!(beta.matches("- supersedes [[alpha]]").count(), 1, "{beta}");
 }
 
 #[tokio::test]
@@ -874,7 +989,7 @@ async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
     let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md")).unwrap();
     assert!(new.contains("- [fact] The loop needs a 40 minute purge before a mix swap"));
     assert!(new.contains("- [fact] The purge pump is rated for 12 bar"));
-    assert!(new.contains("- derived_from [[Coolant Bundle]]"));
+    assert!(new.contains("- derived_from [[coolant-bundle]]"));
     assert!(new.contains("status: stable"), "{new}");
     assert!(
         new.contains("- coolant") && new.contains("- cooling"),
@@ -896,7 +1011,7 @@ async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
     assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
     assert!(source.contains("- [convention] Log every mix swap in the ship register"));
     assert!(
-        source.contains("- split_into [[Purge Procedure]]"),
+        source.contains("- split_into [[purge-procedure]]"),
         "{source}"
     );
 
@@ -1091,7 +1206,7 @@ async fn split_works_on_a_virtual_domain_too() {
         .await
         .unwrap();
     assert!(new.content.contains("The register lives in the wardroom"));
-    assert!(new.content.contains("- derived_from [[Scratch Bundle]]"));
+    assert!(new.content.contains("- derived_from [[scratch-bundle]]"));
     let source = engine
         .engram_text("scratch", "scratch-bundle")
         .await
@@ -1100,7 +1215,7 @@ async fn split_works_on_a_virtual_domain_too() {
     assert!(
         source
             .content
-            .contains("- split_into [[Register Location]]")
+            .contains("- split_into [[register-location]]")
     );
 }
 
@@ -1218,7 +1333,7 @@ async fn split_keeps_both_files_when_the_reindex_fails_after_the_source_was_writ
     let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
     assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
     assert!(
-        source.contains("- split_into [[Purge Procedure]]"),
+        source.contains("- split_into [[purge-procedure]]"),
         "{source}"
     );
     assert!(!source.contains("40 minute purge"), "{source}");

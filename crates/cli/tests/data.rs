@@ -963,7 +963,7 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
     assert!(new_content.contains("40 minute purge"), "{new_content}");
     assert!(new_content.contains("12 bar"), "{new_content}");
     assert!(
-        new_content.contains("- derived_from [[Coolant Bundle]]"),
+        new_content.contains("- derived_from [[coolant-bundle]]"),
         "{new_content}"
     );
 
@@ -981,7 +981,7 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
         "{source_content}"
     );
     assert!(
-        source_content.contains("- split_into [[Purge Procedure]]"),
+        source_content.contains("- split_into [[purge-procedure]]"),
         "{source_content}"
     );
     assert!(
