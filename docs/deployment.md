@@ -123,26 +123,6 @@ Any proxy in front of the daemon's HTTP endpoint needs WebSocket upgrade pass-th
 
 Fluid holds no state of its own, so it scales to as many replicas as a deployment wants. One variable configures the image: `CRYSTALLINE_UPSTREAM`, the daemon's `host:port`, `crystalline:7411` by default. nginx resolves it once, when it loads its configuration, which is why the compose file gates Fluid on the daemon's healthcheck and why a daemon that moves to a new address needs the Fluid container restarted rather than only itself. Reading is what the UI is for: the sidebar lists what this instance knows about, an engram page carries its frontmatter, observations, relations, backlinks and an interactive neighborhood graph, and Cmd+K (Ctrl+K where there is no Cmd key) opens a command palette that jumps to any domain, or to any engram by title, from anywhere in the app.
 
-## Private domains
-
-Every domain starts shared: every account on the instance may read it, following the roles above. A domain may instead be made private - visible to its owner, the accounts invited into it and instance admins, and to nobody else. A private domain a caller cannot see answers exactly as a domain nobody registered: absent from the domain list, absent from search, "not registered" when named directly. There is no way to tell "private" apart from "does not exist" from the outside, which is the point.
-
-**Membership levels**, from least to most: viewer (read and search, nothing more), editor (everything a viewer may do, plus writing and editing its engrams), manager (everything an editor may do, plus inviting, removing and re-leveling members, including other managers). The owner sits above all three: only the owner or an instance admin changes a domain's visibility, transfers it or removes it, so a manager may fill a domain with people but cannot re-share it or hand it to someone else, and privatizing an existing shared domain is admin-only even for the account about to own it.
-
-**Instance admins always see and administer every domain**, private ones included - the same rule a GitHub organization owner already knows about its repositories. And whoever holds the machine administers every domain too, invited or not: the CLI runs on the host that already holds the domain's files and the accounts database beside them, so a permission check there would protect nothing that is not already open to whoever is sitting at that terminal. Private domains protect an account from other accounts, never from whoever operates the machine.
-
-Manage membership from Fluid's Members card on the domain, or from the CLI:
-
-- **`crystalline domain members <domain> list`** - who owns the domain and who is invited, with each member's level.
-- **`crystalline domain members <domain> add <user> [--level viewer|editor|manager]`** - invite an account, or move one to a different level. Defaults to viewer.
-- **`crystalline domain members <domain> remove <user>`** - end a membership. The owner holds no membership row of its own; hand the domain to someone else with `domain transfer` instead.
-- **`crystalline domain visibility <domain> private --owner <account>`** - close a shared domain, naming who owns it from here.
-- **`crystalline domain visibility <domain> default`** - share it with every account again; this forgets who was invited.
-- **`crystalline domain transfer <domain> <new-owner>`** - hand a private domain to a different account. The old owner keeps nothing; invite them back if they should stay.
-- **`crystalline domain add <name> <path> --private --owner <account>`** - register a domain already private, owned by the account named, in one step.
-
-Every one of these writes the accounts database directly from the host, the same way `crystalline users` does, so each works whether or not a daemon is running.
-
 ## Linux server with systemd
 
 The team server shape without a container: the `.deb` ships a systemd unit,
@@ -341,6 +321,26 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 
 `<NAME>` in a domain variable is lowercased with underscores turned into hyphens for the domain name itself (`CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE` becomes the domain `team-knowledge`). Precedence, highest first: a command-line flag, then an environment variable, then `config.yaml`, then the built-in default; an environment value is never written back to the config file.
 
+## Private domains
+
+Every domain starts shared: every account on the instance may read it, following the roles [Team server with Fluid](#team-server-with-fluid) describes. A domain may instead be made private - visible to its owner, the accounts invited into it and instance admins, and to nobody else. A private domain a caller cannot see answers exactly as a domain nobody registered: absent from the domain list, absent from search, "not registered" when named directly. There is no way to tell "private" apart from "does not exist" from the outside, which is the point.
+
+**Membership levels**, from least to most: viewer (read and search, nothing more), editor (everything a viewer may do, plus writing and editing its engrams), manager (everything an editor may do, plus inviting, removing and re-leveling members, including other managers). The owner sits above all three: only the owner of a private domain, or an instance admin, changes its visibility, transfers it or removes it, so a manager may fill a domain with people but cannot re-share it, hand it to someone else or delete it. A shared domain has no owner, so only an instance admin removes one; privatizing an existing shared domain is admin-only too, even for the account about to own it.
+
+**Instance admins always see and administer every domain**, private ones included - the same rule a GitHub organization owner already knows about its repositories. And whoever holds the machine administers every domain too, invited or not: the CLI runs on the host that already holds the domain's files and the accounts database beside them, so a permission check there would protect nothing that is not already open to whoever is sitting at that terminal. Private domains protect an account from other accounts, never from whoever operates the machine.
+
+Manage membership from Fluid's Members card on the domain, or from the CLI:
+
+- **`crystalline domain members <domain> list`** - who owns the domain and who is invited, with each member's level.
+- **`crystalline domain members <domain> add <user> [--level viewer|editor|manager]`** - invite an account, or move one to a different level. Defaults to viewer.
+- **`crystalline domain members <domain> remove <user>`** - end a membership. The owner holds no membership row of its own; hand the domain to someone else with `domain transfer` instead.
+- **`crystalline domain visibility <domain> private --owner <account>`** - close a shared domain, naming who owns it from here.
+- **`crystalline domain visibility <domain> default`** - share it with every account again; this forgets who was invited.
+- **`crystalline domain transfer <domain> <new-owner>`** - hand a private domain to a different account. The old owner keeps nothing; invite them back if they should stay.
+- **`crystalline domain add <name> <path> --private --owner <account>`** - register a domain already private, owned by the account named, in one step.
+
+Every one of these writes the accounts database directly from the host, the same way `crystalline users` does, so each works whether or not a daemon is running.
+
 ## Authenticated agents
 
 `auth.mcp` (or `CRYSTALLINE_AUTH_MCP=true`) decides whether an HTTP MCP connection has to authenticate, separately from the three modes above that govern people in a browser. Off (the default) is the legacy open tier: any client that can reach the port is served, with no account behind the connection. On, every one of them presents a personal MCP token exactly like a human user, as `Authorization: Bearer cmt_...`, and a request without a valid one is answered `401` with `WWW-Authenticate: Bearer` before the transport sees it, so the session never opens. Every rejected credential gets the identical answer, so nothing about the response says which token exists or why it failed. Local stdio clients are unaffected either way, since those are the machine's owner; turn this on for any instance reachable beyond a trusted network.
@@ -354,7 +354,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
   "mcpServers": {
     "crystalline": {
       "type": "http",
-      "url": "https://team.example.com/api/v1/mcp",
+      "url": "https://team.example.com/",
       "headers": {
         "Authorization": "Bearer cmt_xxxxxxxxxxxxxxxxxxxxxxxxxxxx"
       }
@@ -365,7 +365,7 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 
 That is the shape most remote-server-capable MCP clients use for a custom header; consult the harness's own docs for its exact spelling. Each request carries the header, not just the handshake: a session belongs to the account that opened it, and another account naming it - even with a valid token of its own - is answered `403` without being told whose session it is.
 
-**What an authenticated agent may see.** It acts as its account: it reads the domains that account may read, its writes are refused where that account is only a viewer - of the instance, or of a private domain it was invited into as one - and a private domain it is not a member of is answered exactly as a domain nobody registered: absent from `list_domains`, absent from search, "not registered" when named (see [Private domains](#private-domains)). With `auth.mcp` off there is no account to be, so every agent on the open tier is the anonymous tier: it reads and writes what is shared and sees no private domain at all. On an instance where nobody has made a domain private, both tiers behave exactly as they always did. Every write an authenticated agent makes carries who it acted as in the engram's own provenance: `generated.by` records `<client>-for-<account>` - the MCP client's own name and the account it authenticated as, joined by the word `for` (a client calling itself `claude-code/2.0`, authenticated as `ada`, lands `claude-code/2.0-for-ada`) - so a later reader can tell which person's session made a given write.
+**What an authenticated agent may see.** It acts as its account: it reads the domains that account may read, its writes are refused where that account is only a viewer - of the instance, or of a private domain it was invited into as one - and a private domain it is not a member of is answered exactly as a domain nobody registered: absent from `list_domains`, absent from search, "not registered" when named (see [Private domains](#private-domains)). With `auth.mcp` off there is no account to be, so every agent on the open tier is the anonymous tier: it reads and writes what is shared and sees no private domain at all. On an instance where nobody has made a domain private, both tiers behave exactly as they always did. Every write an authenticated agent makes carries who it acted as in the engram's own provenance, unless `identity.actor` is set: `generated.by` records `<client>-for-<account>` - the MCP client's own name and the account it authenticated as, joined by the word `for` (a client calling itself `claude-code/2.0`, authenticated as `ada`, lands `claude-code/2.0-for-ada`) - so a later reader can tell which person's session made a given write. `identity.actor`, where configured, overrides this and every other actor string with its own fixed value (see the `CRYSTALLINE_IDENTITY_ACTOR` row above).
 
 ```mermaid
 flowchart LR
@@ -377,7 +377,7 @@ flowchart LR
 
 ## Enterprise SSO
 
-Setting `auth.oidc.issuer`, `auth.oidc.client_id` and `auth.oidc.client_secret` (or the three matching `CRYSTALLINE_AUTH_OIDC_*` variables) turns on a sign-in button beside the local one. It is opt-in and additive: local accounts keep working, and an instance with none of the three set behaves exactly as it did before. All six keys are read once when the HTTP surface starts, like `service.read_only`, so a change takes effect at the next start; a block missing any of the three required keys leaves single sign-on off and says which key is missing in a startup warning rather than refusing to come up.
+Setting `auth.oidc.issuer`, `auth.oidc.client_id` and `auth.oidc.client_secret` (or the three matching `CRYSTALLINE_AUTH_OIDC_*` variables) turns on a sign-in button beside the local one. It is opt-in and additive: local accounts keep working, and an instance with none of the three set behaves exactly as it did before. All seven keys are read once when the HTTP surface starts, like `service.read_only`, so a change takes effect at the next start; a block missing any of the three required keys leaves single sign-on off and says which key is missing in a startup warning rather than refusing to come up.
 
 Three routes come with it, all public because a browser reaching them has no session yet, and all under the existing `/api/v1` mount, so a reverse proxy that already forwards `/api/` needs no new rule:
 
@@ -418,7 +418,7 @@ flowchart LR
     D -->|8. session cookie, 302 to /| B
 ```
 
-**Notes for Microsoft Entra ID**, gathered in one place since a tenant's setup touches all four:
+**Notes for Microsoft Entra ID**, gathered in one place since a tenant's setup touches all four of the following:
 
 - **Tenant-specific issuer.** `auth.oidc.issuer` has to be the tenant-specific `https://login.microsoftonline.com/<your-tenant-id>/v2.0`, never the `common`, `organizations` or `consumers` endpoint a portal page shows by default (its literal `{tenantid}` template breaks issuer checks and is refused with that correction, and so are the three tenant-independent aliases). See the `CRYSTALLINE_AUTH_OIDC_ISSUER` row above.
 - **A certificate over a secret.** Entra can authenticate a confidential client with a certificate credential instead of a client secret, and an organization's app-registration policy may require it. Crystalline speaks `auth.oidc.client_secret` only in 0.18.0 - register a client-secret credential for the app, or hold off on certificate-only tenants until that support lands.
