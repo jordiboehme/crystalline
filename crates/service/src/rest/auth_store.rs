@@ -323,6 +323,121 @@ impl std::fmt::Debug for IssuedMcpToken {
     }
 }
 
+/// A registered OAuth client, as the authorization server stores it. Public
+/// clients are the only kind here (`token_endpoint_auth_method: "none"`), so
+/// there is no secret in this record and nothing in it needs redacting: a
+/// client id is an identifier, and PKCE is what proves the exchange belongs to
+/// the browser that started the flow.
+#[derive(Clone, Debug)]
+pub struct OauthClient {
+    /// [`OAUTH_CLIENT_PREFIX`] plus 32 hex characters, the primary key.
+    pub client_id: String,
+    /// The name the client called itself, shown on the consent screen.
+    pub client_name: String,
+    /// The client's own page, when it registered one.
+    pub client_uri: Option<String>,
+    /// Every redirect uri this registration may be sent back to, in the order
+    /// it registered them. Never empty.
+    pub redirect_uris: Vec<String>,
+    /// RFC 3339, when the registration was written.
+    pub created_at: String,
+    /// RFC 3339, when this registration last started an authorization.
+    /// `None` until one does, which is what makes it prunable.
+    pub last_used: Option<String>,
+}
+
+/// A freshly issued - or freshly rotated - OAuth grant. The two tokens are the
+/// only unhashed copies in existence: they go to the client once, in the token
+/// endpoint's answer, and only their sha256 is written here.
+#[derive(Clone)]
+pub struct IssuedOauthGrant {
+    /// The grant row's id, which is what revokes it later and what a rotation
+    /// keeps: a refresh moves one grant along rather than forking it.
+    pub id: i64,
+    /// [`OAUTH_ACCESS_PREFIX`] plus 64 hex characters.
+    pub access_token: String,
+    /// [`OAUTH_REFRESH_PREFIX`] plus 64 hex characters.
+    pub refresh_token: String,
+    /// Seconds the access token has left, [`OAUTH_ACCESS_TTL_SECS`], reported
+    /// to the client as RFC 6749's `expires_in`.
+    pub expires_in: u64,
+}
+
+/// Hand-written for the reason [`IssuedMcpToken`]'s is: the id still prints,
+/// so a `tracing::debug!` or a failed assertion says something useful, while
+/// neither live credential can reach a log line.
+impl std::fmt::Debug for IssuedOauthGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedOauthGrant")
+            .field("id", &self.id)
+            .field("access_token", &"coa_[redacted]")
+            .field("refresh_token", &"cor_[redacted]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// What presenting a refresh token did.
+///
+/// Three outcomes rather than a `Result<Option<_>>`, because the third one is
+/// not a failure to find anything: it is a fact about the grant that the
+/// caller has to act on.
+pub enum RefreshOutcome {
+    /// The grant moved along: both tokens are new, the predecessors are dead.
+    Rotated(IssuedOauthGrant),
+    /// Nothing matched - an invented token, one at the wrong registration, one
+    /// past its window, or one belonging to an account that can no longer sign
+    /// in. Deliberately one outcome for all four, the way
+    /// [`AuthStore::mcp_token_user`] answers `None` for all of its misses.
+    Unknown,
+    /// The token had already been rotated away, so a copy of it outlived the
+    /// rotation. The grant it belonged to is revoked by the time this is
+    /// returned; `grant` is the id it had, for the log line.
+    Replayed {
+        /// The id of the grant this replay revoked.
+        grant: i64,
+    },
+}
+
+/// Hand-written rather than derived, so the rule that no type carrying a token
+/// derives `Debug` holds for the wrapper too. `Rotated` prints through
+/// [`IssuedOauthGrant`]'s redacting `Debug`, which is where the redaction is.
+impl std::fmt::Debug for RefreshOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshOutcome::Rotated(grant) => f.debug_tuple("Rotated").field(grant).finish(),
+            RefreshOutcome::Unknown => f.write_str("Unknown"),
+            RefreshOutcome::Replayed { grant } => {
+                f.debug_struct("Replayed").field("grant", grant).finish()
+            }
+        }
+    }
+}
+
+/// One row of an account's OAuth grant list: which client is connected, since
+/// when, and until when it may keep refreshing. Never carries a token - only
+/// hashes are stored, so there is nothing to show back.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct OauthGrantInfo {
+    /// The grant's id, which is what revokes it.
+    pub id: i64,
+    /// The registration this grant belongs to.
+    pub client_id: String,
+    /// The name that registration gave for itself, or a stand-in when the
+    /// registration is gone.
+    pub client_name: String,
+    /// The host the client is redirected back to, for a person deciding
+    /// whether they recognize this connection.
+    pub redirect_host: String,
+    /// RFC 3339, when the grant was created.
+    pub created_at: String,
+    /// RFC 3339, when one of its access tokens last resolved a request.
+    pub last_used: Option<String>,
+    /// RFC 3339, when the refresh token stops working unless it is rotated
+    /// before then.
+    pub refresh_expires_at: String,
+}
+
 /// One row of an account's MCP token list, for a management UI or CLI. Never
 /// carries the token itself - only the hash is stored, so there is nothing to
 /// show back after issuance.
@@ -663,12 +778,79 @@ CREATE TABLE IF NOT EXISTS identity_link (
 CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
 CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
     ON identity_link (issuer, user);
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    client_name TEXT NOT NULL,
+    client_uri TEXT,
+    redirect_uris TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used TEXT
+);
+CREATE TABLE IF NOT EXISTS oauth_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    access_hash TEXT NOT NULL UNIQUE,
+    access_expires_at INTEGER NOT NULL,
+    refresh_hash TEXT NOT NULL UNIQUE,
+    previous_refresh_hash TEXT,
+    refresh_expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used TEXT
+);
+CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user);
+CREATE INDEX IF NOT EXISTS oauth_grants_client ON oauth_grants (client_id);
+CREATE INDEX IF NOT EXISTS oauth_grants_previous_refresh
+    ON oauth_grants (previous_refresh_hash);
 ";
 
 /// Prefix every MCP token is minted with, so a token is recognizable at a
 /// glance and distinct from a session cookie or a CSRF value. The remainder is
 /// 64 lowercase hex characters, 32 bytes from the OS CSPRNG.
 pub const MCP_TOKEN_PREFIX: &str = "cmt_";
+
+/// Prefix on every OAuth access token, so the MCP gate can tell one from an
+/// MCP token by looking at it and route it to the right lookup. The remainder
+/// is 64 lowercase hex characters, 32 bytes from the OS CSPRNG, exactly as an
+/// MCP token's is.
+pub const OAUTH_ACCESS_PREFIX: &str = "coa_";
+
+/// Prefix on every OAuth refresh token. A separate prefix from the access
+/// token's on purpose: the two are presented at different endpoints, and a
+/// client that sends the wrong one gets a refusal rather than a lookup that
+/// happens to miss.
+pub const OAUTH_REFRESH_PREFIX: &str = "cor_";
+
+/// Prefix on every registered client id. Not a credential - a public client
+/// authorizes with nothing but this id and PKCE - so its random half is 32 hex
+/// characters rather than 64.
+pub const OAUTH_CLIENT_PREFIX: &str = "coc_";
+
+/// How long an OAuth access token lives, in seconds. One hour: long enough
+/// that a session is not a stream of refreshes, short enough that a leaked
+/// token stops working on its own, and the number the token endpoint reports
+/// as `expires_in`.
+pub const OAUTH_ACCESS_TTL_SECS: i64 = 3600;
+
+/// How long an OAuth refresh token lives, in seconds. Thirty days, restarted
+/// at every rotation, so a client used at all keeps working and one abandoned
+/// for a month has to ask its person again.
+pub const OAUTH_REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a registration that never became a connection is kept, in seconds.
+/// Dynamic registration means one row per fresh client, arriving whether or
+/// not anybody ever consents, and nothing deletes them; thirty days after the
+/// last authorization request (or the registration itself) an unused one is
+/// swept by [`AuthStore::prune_oauth_clients`]. A registration that holds a
+/// grant is never pruned, however old it is.
+pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
+
+/// What [`AuthStore::list_oauth_grants`] shows where a client name should be,
+/// for a grant whose registration is gone. The grant stays listed - and
+/// therefore revocable - rather than disappearing from the one screen that can
+/// stop it.
+const GONE_OAUTH_CLIENT: &str = "a client that is no longer registered";
 
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
 const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at";
@@ -1215,6 +1397,7 @@ impl AuthStore {
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
+            self.delete_oauth_grants_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1258,6 +1441,7 @@ impl AuthStore {
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
             self.delete_identity_links_of(&name).await?;
+            self.delete_oauth_grants_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -2281,6 +2465,517 @@ impl AuthStore {
         Ok(IssuedMcpToken { id, token, label })
     }
 
+    /// Register a public OAuth client and hand the record back, `client_id`
+    /// and all. RFC 7591 dynamic registration is what calls this: a client
+    /// nobody configured says what it is called and where it may be redirected
+    /// to, and gets an id and no secret.
+    ///
+    /// What a redirect uri is allowed to be, how long a name may be and which
+    /// authentication methods are refused belong to the endpoint that speaks
+    /// RFC 7591's error codes. The one thing insisted on here is the one a
+    /// stored row would be useless without: somewhere to redirect. A
+    /// registration with no uri could never finish a flow, and
+    /// [`AuthStore::list_oauth_grants`] reads the first one to tell a person
+    /// which client a grant belongs to.
+    pub async fn register_oauth_client(
+        &self,
+        name: &str,
+        client_uri: Option<&str>,
+        redirect_uris: &[String],
+    ) -> Result<OauthClient> {
+        if redirect_uris.is_empty() {
+            bail!("an oauth client registration needs at least one redirect uri");
+        }
+        let client = OauthClient {
+            client_id: format!("{OAUTH_CLIENT_PREFIX}{}", random_id_hex()),
+            client_name: name.to_string(),
+            client_uri: client_uri.map(str::to_string),
+            redirect_uris: redirect_uris.to_vec(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            last_used: None,
+        };
+        let encoded = serde_json::to_string(&client.redirect_uris)
+            .context("encoding an oauth client's redirect uris")?;
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "INSERT INTO oauth_clients
+                     (client_id, client_name, client_uri, redirect_uris, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    Value::Text(client.client_id.clone()),
+                    Value::Text(client.client_name.clone()),
+                    match &client.client_uri {
+                        Some(uri) => Value::Text(uri.clone()),
+                        None => Value::Null,
+                    },
+                    Value::Text(encoded),
+                    Value::Text(client.created_at.clone()),
+                ],
+            )
+            .await
+            .context("registering an oauth client")?;
+        Ok(client)
+    }
+
+    /// One registration by id, or `None` when there is none - which is what an
+    /// unknown `client_id` at the authorize or token endpoint looks like.
+    pub async fn oauth_client(&self, client_id: &str) -> Result<Option<OauthClient>> {
+        let _guard = self.guard.lock().await;
+        self.oauth_client_row(client_id).await
+    }
+
+    /// [`AuthStore::oauth_client`] without the lock, for the methods that
+    /// already hold it.
+    async fn oauth_client_row(&self, client_id: &str) -> Result<Option<OauthClient>> {
+        let Some(row) = self
+            .query_first(
+                "SELECT client_id, client_name, client_uri, redirect_uris, created_at, last_used
+                 FROM oauth_clients WHERE client_id = ?1",
+                vec![Value::Text(client_id.to_string())],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(OauthClient {
+            client_id: cell_text(&row, 0).unwrap_or_default(),
+            client_name: cell_text(&row, 1).unwrap_or_default(),
+            client_uri: cell_text(&row, 2),
+            redirect_uris: decode_redirect_uris(cell_text(&row, 3).as_deref()),
+            created_at: cell_text(&row, 4).unwrap_or_default(),
+            last_used: cell_text(&row, 5),
+        }))
+    }
+
+    /// Stamp a registration as used, which every authorization request does.
+    /// That stamp is the whole input to [`AuthStore::prune_oauth_clients`]:
+    /// a client still asking for authorizations is a client in use, whether or
+    /// not anybody consented.
+    ///
+    /// A `client_id` that names no registration is a no-op rather than an
+    /// error: the caller has already refused the request it was stamping for,
+    /// and a second failure mode here would tell it nothing new.
+    pub async fn touch_oauth_client(&self, client_id: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(client_id.to_string()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping an oauth client registration")?;
+        Ok(())
+    }
+
+    /// Delete every registration that has been idle for
+    /// [`OAUTH_CLIENT_UNUSED_SECS`] and holds no grant, and report how many
+    /// went. Runs at every registration and at daemon start.
+    ///
+    /// The `NOT EXISTS` is the load-bearing half: a registration somebody is
+    /// connected through is kept however old it is, because deleting it would
+    /// leave live grants pointing at nothing. Idleness is measured from
+    /// `last_used`, falling back to `created_at` for a registration that never
+    /// asked for an authorization at all.
+    ///
+    /// Both sides of that comparison are RFC 3339 UTC written by this file, so
+    /// byte order is time order - the same property
+    /// [`AuthStore::list_mcp_tokens`] already orders on.
+    pub async fn prune_oauth_clients(&self) -> Result<usize> {
+        let cutoff =
+            (chrono::Utc::now() - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
+        let _guard = self.guard.lock().await;
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_clients
+                 WHERE COALESCE(last_used, created_at) < ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM oauth_grants g
+                       WHERE g.client_id = oauth_clients.client_id
+                   )",
+                vec![Value::Text(cutoff)],
+            )
+            .await
+            .context("pruning unused oauth client registrations")?;
+        Ok(removed as usize)
+    }
+
+    /// How many registrations are stored, for the cap the registration
+    /// endpoint enforces and for the settings surface that reports it.
+    pub async fn count_oauth_clients(&self) -> Result<usize> {
+        let _guard = self.guard.lock().await;
+        Ok(
+            match self
+                .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            },
+        )
+    }
+
+    /// Issue a grant: one row carrying an access token good for an hour and a
+    /// refresh token good for thirty days, both hashed, both bound to `user`,
+    /// `client_id` and `resource`. The returned tokens are the only unhashed
+    /// copies.
+    ///
+    /// The account check and the registration check share one `BEGIN
+    /// IMMEDIATE` with the insert, for the reason
+    /// [`AuthStore::issue_mcp_token`] documents: neither table carries a
+    /// foreign key, so without the transaction a concurrent `remove_user` or
+    /// prune could leave this grant pointing at nothing.
+    ///
+    /// `resource` is stored as [`normalize_resource`] spells it, so the
+    /// audience comparison at read time is an equality test on one spelling
+    /// rather than a family of them.
+    pub async fn issue_oauth_grant(
+        &self,
+        user: &str,
+        client_id: &str,
+        resource: &str,
+    ) -> Result<IssuedOauthGrant> {
+        let user = normalize_account_name(user)?;
+        let resource = normalize_resource(resource);
+        let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
+        let refresh_token = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let now = chrono::Utc::now();
+        let issued_at = now.timestamp();
+        let created_at = now.to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
+        let result = async {
+            self.require_live_user(&user).await?;
+            if self
+                .query_first(
+                    "SELECT 1 FROM oauth_clients WHERE client_id = ?1",
+                    vec![Value::Text(client_id.to_string())],
+                )
+                .await?
+                .is_none()
+            {
+                bail!("no such oauth client: '{client_id}'");
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO oauth_grants
+                         (user, client_id, resource, access_hash, access_expires_at,
+                          refresh_hash, refresh_expires_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        Value::Text(user.clone()),
+                        Value::Text(client_id.to_string()),
+                        Value::Text(resource.clone()),
+                        Value::Text(token_hash(&access_token)),
+                        Value::Integer(issued_at + OAUTH_ACCESS_TTL_SECS),
+                        Value::Text(token_hash(&refresh_token)),
+                        Value::Integer(issued_at + OAUTH_REFRESH_TTL_SECS),
+                        Value::Text(created_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        // Read after commit, still under `self.guard` and on this connection:
+        // see `issue_mcp_token`'s matching comment.
+        let id = self.conn.last_insert_rowid();
+        Ok(IssuedOauthGrant {
+            id,
+            access_token,
+            refresh_token,
+            expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
+        })
+    }
+
+    /// Present a refresh token. Either it rotates the grant, or it is a replay
+    /// that revokes it, or it matches nothing.
+    ///
+    /// Both lookups and the write they lead to are one `BEGIN IMMEDIATE`, so
+    /// two clients racing the same refresh token cannot both rotate it: the
+    /// loser arrives after the winner's update and finds its token in
+    /// `previous_refresh_hash`, which is a replay by definition and revokes
+    /// the grant. That is the intended answer, not a false positive - two
+    /// holders of one refresh token is exactly what the replay rule is for.
+    ///
+    /// The rotation keys on the token, its client and its window, and joins
+    /// `users` so a disabled account rotates nothing (`Unknown`, indistinguishable
+    /// from a miss, and reversible: re-enabling the account hands its grants
+    /// back the way it hands MCP tokens back). Expiry is a comparison inside
+    /// the statement, never a check in Rust after the read.
+    ///
+    /// The replay lookup deliberately keys on the token hash *alone*: a
+    /// rotated token coming back is evidence a copy of it leaked, whoever
+    /// presents it and however long ago the window closed. Only the immediate
+    /// predecessor is detectable - a second rotation overwrites
+    /// `previous_refresh_hash` - which is enough, because a client that keeps
+    /// rotating is the one that holds the live token.
+    pub async fn refresh_oauth_grant(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+    ) -> Result<RefreshOutcome> {
+        let presented = token_hash(refresh_token);
+        let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
+        let next_refresh = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("refreshing an oauth grant")?;
+        // Captured by the block below and read after `finish` commits, the
+        // shape `rotate_mcp_token` already uses for a transaction whose caller
+        // needs more out of it than `Result<()>`.
+        let mut outcome = RefreshOutcome::Unknown;
+        let result = async {
+            let live = self
+                .query_first(
+                    "SELECT g.id FROM oauth_grants g JOIN users u ON u.name = g.user
+                     WHERE g.refresh_hash = ?1 AND g.client_id = ?2
+                       AND g.refresh_expires_at > ?3 AND u.disabled = 0",
+                    vec![
+                        Value::Text(presented.clone()),
+                        Value::Text(client_id.to_string()),
+                        Value::Integer(now),
+                    ],
+                )
+                .await?;
+            if let Some(row) = live {
+                let Ok(Value::Integer(id)) = row.get_value(0) else {
+                    return Ok(());
+                };
+                self.conn
+                    .execute(
+                        "UPDATE oauth_grants
+                         SET access_hash = ?2,
+                             access_expires_at = ?3,
+                             previous_refresh_hash = refresh_hash,
+                             refresh_hash = ?4,
+                             refresh_expires_at = ?5
+                         WHERE id = ?1",
+                        vec![
+                            Value::Integer(id),
+                            Value::Text(token_hash(&access_token)),
+                            Value::Integer(now + OAUTH_ACCESS_TTL_SECS),
+                            Value::Text(token_hash(&next_refresh)),
+                            Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                        ],
+                    )
+                    .await
+                    .context("rotating an oauth grant")?;
+                tracing::debug!(grant = id, client = %client_id, "rotated an oauth grant");
+                outcome = RefreshOutcome::Rotated(IssuedOauthGrant {
+                    id,
+                    access_token: access_token.clone(),
+                    refresh_token: next_refresh.clone(),
+                    expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
+                });
+                return Ok(());
+            }
+            let replayed = self
+                .query_first(
+                    "SELECT id FROM oauth_grants WHERE previous_refresh_hash = ?1",
+                    vec![Value::Text(presented.clone())],
+                )
+                .await?;
+            if let Some(row) = replayed {
+                let Ok(Value::Integer(id)) = row.get_value(0) else {
+                    return Ok(());
+                };
+                self.conn
+                    .execute(
+                        "DELETE FROM oauth_grants WHERE id = ?1",
+                        vec![Value::Integer(id)],
+                    )
+                    .await
+                    .context("revoking a replayed oauth grant")?;
+                tracing::info!(
+                    grant = id,
+                    client = %client_id,
+                    "a replayed refresh token revoked an oauth grant"
+                );
+                outcome = RefreshOutcome::Replayed { grant: id };
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        Ok(outcome)
+    }
+
+    /// Resolve an OAuth access token to its account, for one resource. `None`
+    /// for an unknown, expired, revoked or wrong-audience token and for a
+    /// disabled account - deliberately indistinguishable, the way
+    /// [`AuthStore::mcp_token_user`] answers, because the gate sends one
+    /// refusal for all of them.
+    ///
+    /// `resource` is the origin this request arrived at. It is compared to the
+    /// one the grant was issued for after [`normalize_resource`] has taken one
+    /// trailing slash off each side, and the comparison happens *in the
+    /// statement*: a token minted for another deployment of this server cannot
+    /// be replayed here, and no branch in Rust can forget to check.
+    ///
+    /// Stamps `last_used` on a hit, and prunes any grant whose account is gone
+    /// on every call - the same defense in depth `mcp_token_user` applies to
+    /// tokens, for a row reached by some path the issuing transaction does not
+    /// cover.
+    pub async fn oauth_access_user(&self, token: &str, resource: &str) -> Result<Option<User>> {
+        let hash = token_hash(token);
+        let resource = normalize_resource(resource);
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grants
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.user)",
+                (),
+            )
+            .await
+            .context("pruning orphaned oauth grants")?;
+        let Some(row) = self
+            .query_first(
+                &format!(
+                    "SELECT {USER_COLUMNS_JOINED}, g.id
+                     FROM oauth_grants g JOIN users u ON u.name = g.user
+                     WHERE g.access_hash = ?1 AND g.access_expires_at > ?2 AND g.resource = ?3"
+                ),
+                vec![
+                    Value::Text(hash),
+                    Value::Integer(now),
+                    Value::Text(resource),
+                ],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let user = user_from_row(&row);
+        if user.disabled {
+            return Ok(None);
+        }
+        if let Ok(Value::Integer(id)) = row.get_value(6) {
+            self.conn
+                .execute(
+                    "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
+                    vec![
+                        Value::Integer(id),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .context("stamping an oauth grant's last_used")?;
+        }
+        Ok(Some(user))
+    }
+
+    /// Every OAuth grant `user` holds, newest first, never carrying a token.
+    ///
+    /// A `LEFT JOIN` on purpose: a grant whose registration vanished still
+    /// resolves its tokens, so it has to stay listed to stay revocable. It
+    /// shows [`GONE_OAUTH_CLIENT`] where the name would be rather than
+    /// dropping out of the one screen that can stop it.
+    pub async fn list_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT g.id, g.client_id, c.client_name, c.redirect_uris,
+                        g.created_at, g.last_used, g.refresh_expires_at
+                 FROM oauth_grants g
+                 LEFT JOIN oauth_clients c ON c.client_id = g.client_id
+                 WHERE g.user = ?1 ORDER BY g.created_at DESC, g.id DESC",
+                vec![Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("listing oauth grants for user '{user}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing oauth grants for user '{user}'"))?
+        {
+            let Ok(Value::Integer(id)) = row.get_value(0) else {
+                continue;
+            };
+            let refresh_expires_at = match row.get_value(6) {
+                Ok(Value::Integer(secs)) => rfc3339_from_unix(secs),
+                _ => String::new(),
+            };
+            out.push(OauthGrantInfo {
+                id,
+                client_id: cell_text(&row, 1).unwrap_or_default(),
+                client_name: cell_text(&row, 2).unwrap_or_else(|| GONE_OAUTH_CLIENT.to_string()),
+                redirect_host: decode_redirect_uris(cell_text(&row, 3).as_deref())
+                    .first()
+                    .map(|uri| redirect_host(uri))
+                    .unwrap_or_default(),
+                created_at: cell_text(&row, 4).unwrap_or_default(),
+                last_used: cell_text(&row, 5),
+                refresh_expires_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Revoke one of `user`'s grants by id, reporting whether a row went.
+    /// `false` covers both an unknown id and one belonging to another account,
+    /// deliberately indistinguishable so a caller cannot probe for ids.
+    ///
+    /// One delete stops both of the grant's tokens at once, which is the whole
+    /// reason a grant is one row rather than a token table plus a refresh
+    /// table.
+    pub async fn revoke_oauth_grant(&self, user: &str, id: i64) -> Result<bool> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE id = ?1 AND user = ?2",
+                vec![Value::Integer(id), Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("revoking an oauth grant for user '{user}'"))?;
+        if changed > 0 {
+            tracing::info!(grant = id, user = %user, "revoked an oauth grant");
+        }
+        Ok(changed > 0)
+    }
+
+    /// Drop every OAuth grant of one account. Called by both removal paths
+    /// inside their transaction, for the reason [`AuthStore::delete_mcp_tokens_of`]
+    /// documents one table over: `oauth_grants` carries no foreign key, so a
+    /// row that outlived its account would resolve for whoever next claims the
+    /// freed name.
+    ///
+    /// Deliberately not called by [`AuthStore::set_disabled`]: disabling is
+    /// reversible, and both OAuth lookups refuse a disabled account at read
+    /// time, so re-enabling hands the connections back rather than making
+    /// every client authorize again.
+    ///
+    /// The registrations themselves are left alone: they are shared, and the
+    /// ones nobody is connected through go on their own schedule, through
+    /// [`AuthStore::prune_oauth_clients`].
+    async fn delete_oauth_grants_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing oauth grants for user '{name}'"))?;
+        Ok(())
+    }
+
     /// The visibility record of one domain: `Some` when it is private, `None`
     /// when it is shared, which is every domain nobody ever made private.
     ///
@@ -3116,6 +3811,72 @@ fn random_hex() -> String {
     let mut bytes = [0u8; 32];
     OsRng.fill_bytes(&mut bytes);
     crystalline_index::hex_lower(&bytes)
+}
+
+/// 16 bytes from the OS CSPRNG, lowercase hex: the random half of a client id.
+/// Half the width of [`random_hex`] on purpose - a client id is a public
+/// identifier that authorizes nothing by itself, and 128 random bits is
+/// already far past guessing.
+fn random_id_hex() -> String {
+    let mut bytes = [0u8; 16];
+    OsRng.fill_bytes(&mut bytes);
+    crystalline_index::hex_lower(&bytes)
+}
+
+/// A resource identifier as the audience check compares it: trimmed, with at
+/// most one trailing slash taken off.
+///
+/// Exactly that tolerance and nothing more. Nothing is lowercased and no other
+/// canonicalization happens, because an origin that differs in any other way
+/// is a different origin, and an audience check that "helpfully" folded
+/// spellings together would be the hole it exists to close. The trailing slash
+/// is the one difference clients actually produce, since a person typing the
+/// server address into a client adds or omits it without meaning anything by
+/// it.
+///
+/// `pub(crate)` so the request-origin side compares the same spelling this one
+/// stores; a second implementation of this rule is a bug waiting to happen.
+pub(crate) fn normalize_resource(resource: &str) -> String {
+    let trimmed = resource.trim();
+    trimmed.strip_suffix('/').unwrap_or(trimmed).to_string()
+}
+
+/// The host (with its port, when the uri names one) a client is redirected
+/// back to, for the consent screen and the grant list.
+///
+/// Display only. Whether a redirect uri is acceptable, and whether the one
+/// presented at the token endpoint matches the registration, are decisions
+/// made against the registered uris themselves - never against this string.
+/// A uri that does not parse is shown as it was written rather than hidden.
+pub(crate) fn redirect_host(uri: &str) -> String {
+    let Ok(parsed) = openidconnect::url::Url::parse(uri) else {
+        return uri.to_string();
+    };
+    match (parsed.host_str(), parsed.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => uri.to_string(),
+    }
+}
+
+/// Decode the JSON array a registration's redirect uris are stored as.
+///
+/// A missing or unreadable value reads as no uris at all, which fails closed:
+/// a registration with nothing to match against can complete no flow, where a
+/// tolerant fallback would have to invent a uri to redirect to.
+fn decode_redirect_uris(encoded: Option<&str>) -> Vec<String> {
+    encoded
+        .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default()
+}
+
+/// A unix timestamp column as the RFC 3339 string a person reads. The expiry
+/// columns are integers so every comparison happens in SQL; this is the one
+/// place that turns one back into text, on the way out to a management screen.
+fn rfc3339_from_unix(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|when| when.to_rfc3339())
+        .unwrap_or_default()
 }
 
 /// What is stored for a session token. The token itself is never written, so a
@@ -6118,5 +6879,826 @@ mod tests {
             "the loser left no orphan account behind"
         );
         assert_eq!(store.identity_links("ada").await.unwrap().len(), 1);
+    }
+
+    /// The resource every grant below is issued for: the origin the MCP
+    /// transport is served from, no trailing slash, which is the spelling
+    /// [`normalize_resource`] settles on.
+    const OAUTH_RESOURCE: &str = "https://crystal.example";
+
+    /// The OAuth cast every grant test starts from: one account and one
+    /// registered client.
+    async fn oauth_cast(store: &AuthStore) -> OauthClient {
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .register_oauth_client(
+                "Some Client",
+                Some("https://client.example"),
+                &["https://client.example/callback".to_string()],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// One integer column of one grant row, for the assertions that are about
+    /// what the database holds rather than about what a method answered.
+    async fn grant_int(store: &AuthStore, id: i64, column: &str) -> i64 {
+        let row = store
+            .query_first(
+                &format!("SELECT {column} FROM oauth_grants WHERE id = ?1"),
+                vec![Value::Integer(id)],
+            )
+            .await
+            .unwrap()
+            .expect("the grant row is there");
+        match row.get_value(0) {
+            Ok(Value::Integer(n)) => n,
+            other => panic!("unexpected {column}: {other:?}"),
+        }
+    }
+
+    /// The same for a text column.
+    async fn grant_text(store: &AuthStore, id: i64, column: &str) -> String {
+        let row = store
+            .query_first(
+                &format!("SELECT {column} FROM oauth_grants WHERE id = ?1"),
+                vec![Value::Integer(id)],
+            )
+            .await
+            .unwrap()
+            .expect("the grant row is there");
+        cell_text(&row, 0).unwrap_or_default()
+    }
+
+    async fn count_rows(store: &AuthStore, table: &str) -> i64 {
+        let row = store
+            .query_first(&format!("SELECT COUNT(*) FROM {table}"), vec![])
+            .await
+            .unwrap()
+            .expect("COUNT(*) always answers");
+        match row.get_value(0) {
+            Ok(Value::Integer(n)) => n,
+            other => panic!("unexpected COUNT(*) result: {other:?}"),
+        }
+    }
+
+    /// The audience rule and the expiry, the two properties an access token
+    /// carries beyond "this is ada". The expiry is reached by winding the
+    /// column back through the connection, because `issue_oauth_grant` takes
+    /// no TTL: the thirty days and the hour are the store's, not a caller's.
+    #[tokio::test]
+    async fn an_oauth_grant_resolves_only_for_its_resource_and_until_it_expires() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        assert!(issued.access_token.starts_with(OAUTH_ACCESS_PREFIX));
+        assert!(issued.refresh_token.starts_with(OAUTH_REFRESH_PREFIX));
+        assert_eq!(issued.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
+        assert_eq!(
+            grant_text(&store, issued.id, "access_hash").await,
+            token_hash(&issued.access_token),
+            "only the hash is written, the same way an MCP token is stored"
+        );
+
+        let user = store
+            .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+            .await
+            .unwrap()
+            .expect("the token resolves for the resource it was issued for");
+        assert_eq!(user.name, "ada");
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, "https://crystal.example/")
+                .await
+                .unwrap()
+                .is_some(),
+            "one trailing slash is the same resource"
+        );
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, "https://other.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "a token issued for one resource never opens another"
+        );
+        assert!(
+            store
+                .oauth_access_user("coa_not-a-token", OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].last_used.is_some(),
+            "resolving stamped the grant, which is what the management list shows"
+        );
+
+        store.set_disabled("ada", true).await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "a disabled account's grant resolves for nobody"
+        );
+        store.set_disabled("ada", false).await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "and re-enabling hands it back, the way a disabled account's MCP tokens come back"
+        );
+
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired access token resolves for nobody"
+        );
+    }
+
+    /// A grant is a row about an account and a registration, so neither may be
+    /// invented by the write. The transaction is what makes the two checks
+    /// mean anything at the moment of the insert.
+    #[tokio::test]
+    async fn a_grant_needs_a_live_account_and_a_registered_client() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let ghost = store
+            .issue_oauth_grant("ghost", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .expect_err("an account that is nobody gets no grant");
+        assert!(format!("{ghost:#}").contains("no such user"), "{ghost:#}");
+
+        let stranger = store
+            .issue_oauth_grant("ada", "coc_nobody", OAUTH_RESOURCE)
+            .await
+            .expect_err("a registration that does not exist gets no grant");
+        assert!(
+            format!("{stranger:#}").contains("no such oauth client"),
+            "{stranger:#}"
+        );
+
+        store.set_disabled("ada", true).await.unwrap();
+        let disabled = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .expect_err("a disabled account gets no new grant");
+        assert!(format!("{disabled:#}").contains("disabled"), "{disabled:#}");
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// What a rotation is: one grant row moved along, both tokens replaced,
+    /// the predecessor's access token dead on the spot and the refresh window
+    /// restarted. Presenting the predecessor's *refresh* token is a replay
+    /// rather than a miss, so that half is
+    /// [`a_replayed_refresh_token_revokes_the_whole_grant`]'s.
+    #[tokio::test]
+    async fn a_refresh_rotates_both_tokens_and_the_predecessor_stops_working() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let first = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        // Bring the refresh window in close, so "the thirty days start at
+        // rotation" cannot pass by accident on the window the issue opened.
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = ?2 WHERE id = ?1",
+                vec![
+                    Value::Integer(first.id),
+                    Value::Integer(chrono::Utc::now().timestamp() + 60),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+        assert_eq!(
+            second.id, first.id,
+            "a rotation moves one grant along rather than forking it"
+        );
+        assert_ne!(second.access_token, first.access_token);
+        assert_ne!(second.refresh_token, first.refresh_token);
+        assert_eq!(second.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
+        assert!(
+            store
+                .oauth_access_user(&first.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the predecessor's access token stops the moment its successor exists"
+        );
+        assert!(
+            store
+                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            grant_int(&store, first.id, "refresh_expires_at").await
+                > chrono::Utc::now().timestamp() + OAUTH_REFRESH_TTL_SECS - 60,
+            "the new refresh token's thirty days start at the rotation"
+        );
+        assert_eq!(
+            grant_text(&store, first.id, "previous_refresh_hash").await,
+            token_hash(&first.refresh_token),
+            "the predecessor's hash is kept, which is what makes a replay detectable"
+        );
+        assert_eq!(store.list_oauth_grants("ada").await.unwrap().len(), 1);
+    }
+
+    /// A rotated refresh token coming back is evidence that a copy of it
+    /// leaked, so the grant it belonged to is revoked rather than refreshed -
+    /// and it is evidence whoever presents it, which is why the rule keys on
+    /// the token alone while a rotation keys on the token and its client.
+    #[tokio::test]
+    async fn a_replayed_refresh_token_revokes_the_whole_grant() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let stranger = store
+            .register_oauth_client(
+                "Another Client",
+                None,
+                &["https://x.example/cb".to_string()],
+            )
+            .await
+            .unwrap();
+        let first = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let outcome = store
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+
+        let replay = store
+            .refresh_oauth_grant(&first.refresh_token, &stranger.client_id)
+            .await
+            .unwrap();
+        match replay {
+            RefreshOutcome::Replayed { grant } => assert_eq!(grant, first.id),
+            other => panic!("a rotated refresh token is a replay, got {other:?}"),
+        }
+        assert!(
+            store
+                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the revocation took the successor's access token with it"
+        );
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&second.refresh_token, &client.client_id)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "and its refresh token, because the whole row is gone"
+        );
+        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// Only the token a rotation just replaced is a replay. A second rotation
+    /// overwrites `previous_refresh_hash`, so the one before it matches
+    /// nothing at all - which is the behaviour the column can support, and
+    /// enough, because the client that keeps rotating is the one holding the
+    /// live token.
+    #[tokio::test]
+    async fn only_the_immediate_predecessor_of_a_refresh_token_is_a_replay() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let first = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let outcome = store
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+        let outcome = store
+            .refresh_oauth_grant(&second.refresh_token, &client.client_id)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(third) = outcome else {
+            panic!("the successor rotates in its turn, got {outcome:?}");
+        };
+
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "the token two rotations back is forgotten, not a replay"
+        );
+        assert!(
+            store
+                .oauth_access_user(&third.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "so the grant is still live"
+        );
+        match store
+            .refresh_oauth_grant(&second.refresh_token, &client.client_id)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { grant } => assert_eq!(grant, first.id),
+            other => panic!("the immediate predecessor is the replay, got {other:?}"),
+        }
+    }
+
+    /// The three ways a refresh misses without being a replay. None of them
+    /// may touch the grant: an unknown token is a stranger, a live token at
+    /// the wrong registration is a client mixing up its credentials, and an
+    /// expired one is a client that waited too long. Only a token that was
+    /// actually rotated revokes anything.
+    #[tokio::test]
+    async fn an_unknown_refresh_token_is_neither_rotated_nor_a_replay() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let stranger = store
+            .register_oauth_client(
+                "Another Client",
+                None,
+                &["https://x.example/cb".to_string()],
+            )
+            .await
+            .unwrap();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        for (token, client_id, why) in [
+            (
+                "cor_nothing".to_string(),
+                client.client_id.clone(),
+                "a token nobody issued",
+            ),
+            (
+                issued.refresh_token.clone(),
+                stranger.client_id.clone(),
+                "a live token at the wrong registration",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    store.refresh_oauth_grant(&token, &client_id).await.unwrap(),
+                    RefreshOutcome::Unknown
+                ),
+                "{why} rotates nothing"
+            );
+        }
+
+        store.set_disabled("ada", true).await.unwrap();
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "a disabled account refreshes nothing"
+        );
+        store.set_disabled("ada", false).await.unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = 1 WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "an expired refresh token rotates nothing"
+        );
+        assert_eq!(
+            count_rows(&store, "oauth_grants").await,
+            1,
+            "and none of the four refusals deleted the grant"
+        );
+    }
+
+    /// Revoking is one delete, so both of a grant's tokens stop together, and
+    /// removing the account sweeps what is left - the resurrection hazard
+    /// `mcp_tokens` documents, one table over: a grant row that outlived its
+    /// account would be inherited by the next holder of the freed name.
+    #[tokio::test]
+    async fn revoking_a_grant_stops_both_tokens_and_removing_the_account_sweeps_them() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, issued.id);
+        assert_eq!(listed[0].client_id, client.client_id);
+        assert_eq!(listed[0].client_name, "Some Client");
+        assert_eq!(
+            listed[0].redirect_host, "client.example",
+            "the card names the host the client redirects to"
+        );
+        assert!(listed[0].last_used.is_none());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&listed[0].refresh_expires_at).is_ok(),
+            "the expiry a person reads is RFC 3339: {}",
+            listed[0].refresh_expires_at
+        );
+
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        assert!(
+            !store.revoke_oauth_grant("bob", issued.id).await.unwrap(),
+            "another account's revoke never reaches this grant"
+        );
+        assert!(store.revoke_oauth_grant("ada", issued.id).await.unwrap());
+        assert!(
+            !store.revoke_oauth_grant("ada", issued.id).await.unwrap(),
+            "a second revoke removes nothing"
+        );
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "one deleted row stops both tokens at once"
+        );
+
+        let second = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store.remove_user("ada").await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            count_rows(&store, "oauth_grants").await,
+            0,
+            "the removal swept the row rather than leaving it for the next holder of the name"
+        );
+        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
+    }
+
+    /// The forced removal path sweeps the same rows the guarded one does. The
+    /// two are separate statements that have to be kept in step, which is why
+    /// every sweep on this file carries a test on both.
+    #[tokio::test]
+    async fn force_removing_an_account_sweeps_its_oauth_grants_too() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store.remove_user_force("ada").await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// A registration is what a client gets instead of a secret, so it has to
+    /// come back exactly as it was written, including the order of its
+    /// redirect uris - the token endpoint compares against them.
+    #[tokio::test]
+    async fn a_registration_is_read_back_by_its_client_id_and_touched() {
+        let (_dir, store) = store().await;
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 0);
+        let uris = vec![
+            "http://127.0.0.1:33418/callback".to_string(),
+            "https://client.example/cb".to_string(),
+        ];
+        let client = store
+            .register_oauth_client("Some Client", Some("https://client.example"), &uris)
+            .await
+            .unwrap();
+        assert!(client.client_id.starts_with(OAUTH_CLIENT_PREFIX));
+        assert_eq!(
+            client.client_id.len(),
+            OAUTH_CLIENT_PREFIX.len() + 32,
+            "a client id is the prefix plus 32 hex characters"
+        );
+        assert!(client.last_used.is_none());
+
+        let read = store
+            .oauth_client(&client.client_id)
+            .await
+            .unwrap()
+            .expect("the registration reads back by its id");
+        assert_eq!(read.client_name, "Some Client");
+        assert_eq!(read.client_uri.as_deref(), Some("https://client.example"));
+        assert_eq!(read.redirect_uris, uris);
+        assert_eq!(read.created_at, client.created_at);
+        assert!(store.oauth_client("coc_nobody").await.unwrap().is_none());
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 1);
+
+        store.touch_oauth_client(&client.client_id).await.unwrap();
+        let touched = store
+            .oauth_client(&client.client_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            touched.last_used.is_some(),
+            "an authorization request stamps the registration"
+        );
+        store
+            .touch_oauth_client("coc_nobody")
+            .await
+            .expect("touching a registration that is gone is a no-op, not an error");
+
+        assert!(
+            store
+                .register_oauth_client("Some Client", None, &[])
+                .await
+                .is_err(),
+            "a registration with nowhere to redirect is refused"
+        );
+        let second = store
+            .register_oauth_client("Another", None, &["https://a.example/cb".to_string()])
+            .await
+            .unwrap();
+        assert_ne!(second.client_id, client.client_id);
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
+    }
+
+    /// Registrations arrive one per fresh connection and nobody deletes them,
+    /// so the store prunes the ones that never became a connection. A
+    /// registration somebody is still connected through is never pruned, and
+    /// an authorization request buys another thirty days.
+    #[tokio::test]
+    async fn an_unused_registration_is_pruned_after_thirty_days() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let fresh = store
+            .register_oauth_client("Fresh", None, &["https://fresh.example/cb".to_string()])
+            .await
+            .unwrap();
+        let stale = store
+            .register_oauth_client("Stale", None, &["https://stale.example/cb".to_string()])
+            .await
+            .unwrap();
+        let used = store
+            .register_oauth_client("Used", None, &["https://used.example/cb".to_string()])
+            .await
+            .unwrap();
+        let issued = store
+            .issue_oauth_grant("ada", &used.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        // Age two of the three through the connection: the thirty days are the
+        // store's, and no method winds the clock back.
+        let long_ago = "2020-01-01T00:00:00+00:00";
+        for id in [&stale.client_id, &used.client_id] {
+            store
+                .conn
+                .execute(
+                    "UPDATE oauth_clients SET created_at = ?2, last_used = NULL
+                     WHERE client_id = ?1",
+                    vec![Value::Text(id.clone()), Value::Text(long_ago.to_string())],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 3);
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "only the old registration that never produced a grant goes"
+        );
+        assert!(
+            store
+                .oauth_client(&stale.client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .oauth_client(&fresh.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a registration inside the window stays"
+        );
+        assert!(
+            store.oauth_client(&used.client_id).await.unwrap().is_some(),
+            "and so does an old one somebody is still connected through"
+        );
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "the prune left the live connection alone"
+        );
+
+        // An authorization request stamps `last_used`, and that is what keeps
+        // an old registration alive for another thirty days.
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(fresh.client_id.clone()),
+                    Value::Text(long_ago.to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        store.touch_oauth_client(&fresh.client_id).await.unwrap();
+        assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
+    }
+
+    /// The two unhashed copies of a live credential must never be one
+    /// `tracing::debug!` or one failed assertion away from a log file, and the
+    /// enum that carries a rotation's answer must not undo that.
+    #[tokio::test]
+    async fn an_issued_oauth_grant_never_prints_its_secrets() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let text = format!("{issued:?}");
+        for (prefix, token) in [
+            (OAUTH_ACCESS_PREFIX, &issued.access_token),
+            (OAUTH_REFRESH_PREFIX, &issued.refresh_token),
+        ] {
+            let secret = token
+                .strip_prefix(prefix)
+                .expect("a token carries its prefix");
+            assert!(!text.contains(secret), "the secret is redacted: {text}");
+        }
+        assert!(text.contains("redacted"), "and says so: {text}");
+        assert!(
+            text.contains(&issued.id.to_string()),
+            "while the id still prints: {text}"
+        );
+
+        let rotated = store
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+            .await
+            .unwrap();
+        let printed = format!("{rotated:?}");
+        let RefreshOutcome::Rotated(next) = &rotated else {
+            panic!("a live refresh token rotates, got {printed}");
+        };
+        let secret = next
+            .access_token
+            .strip_prefix(OAUTH_ACCESS_PREFIX)
+            .expect("a token carries its prefix");
+        assert!(
+            !printed.contains(secret),
+            "the outcome redacts what it wraps: {printed}"
+        );
+    }
+
+    /// A grant whose registration vanished stays listable, so it stays
+    /// revocable: its tokens still resolve, and a list that dropped the row
+    /// would leave the account no way to stop them.
+    #[tokio::test]
+    async fn a_grant_outlives_a_vanished_registration_rather_than_hiding() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM oauth_clients", ())
+            .await
+            .unwrap();
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(listed.len(), 1, "the grant is still listed");
+        assert_eq!(listed[0].id, issued.id);
+        assert!(
+            !listed[0].client_name.is_empty(),
+            "with something a person can read where the registration was"
+        );
+        assert!(store.revoke_oauth_grant("ada", issued.id).await.unwrap());
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The resource comparison is the audience check, so its tolerance is
+    /// exactly one trailing slash: nothing is lowercased and no other
+    /// canonicalization happens, because an origin that differs in any other
+    /// way is a different origin.
+    #[test]
+    fn a_resource_tolerates_one_trailing_slash_and_nothing_else() {
+        assert_eq!(
+            normalize_resource("https://crystal.example/"),
+            "https://crystal.example"
+        );
+        assert_eq!(
+            normalize_resource("  https://crystal.example  "),
+            "https://crystal.example"
+        );
+        assert_eq!(
+            normalize_resource("https://crystal.example//"),
+            "https://crystal.example/",
+            "one slash, not every slash"
+        );
+        assert_eq!(
+            normalize_resource("https://Crystal.Example"),
+            "https://Crystal.Example",
+            "case is the caller's business, not the store's"
+        );
+        assert_eq!(normalize_resource("/"), "");
     }
 }
