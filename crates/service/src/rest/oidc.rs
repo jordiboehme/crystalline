@@ -1322,18 +1322,19 @@ pub async fn start_link(
     // with no provider must still answer an unauthenticated caller the way
     // every other account-bearing route does.
     let account = identity.require_account().map_err(|_| {
+        // Logged without the issuer, which is a field of a provider this
+        // instance may not even have configured: the account check comes
+        // first so that an unauthenticated caller is told to log in rather
+        // than told which providers exist here.
+        tracing::warn!("single sign-on refused (link start without a signed-in account)");
         ApiError::unauthorized(
             "linking a single sign-on identity needs a signed-in account - sign in first, then \
              link from your profile",
         )
     })?;
-    let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
-    if identity.user.is_none() {
-        refused(
-            "link intent without a signed-in session",
-            &client.settings.issuer,
-        );
-    }
+    // An instance with no provider is the 404 `start_sign_on` answers on its
+    // own first line; the account check above it is what keeps that answer
+    // from telling an unauthenticated caller anything.
     let started = start_sign_on(&state, &headers, Some(account.name)).await?;
     Ok((
         jar.add(started.cookie),
