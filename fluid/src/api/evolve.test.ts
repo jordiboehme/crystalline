@@ -520,11 +520,40 @@ describe("fetching the queue", () => {
     );
   });
 
+  it("names the families it was scoped to, and leaves an empty filter off", async () => {
+    apiMock.mockResolvedValue(evolvePayload());
+
+    await fetchEvolveQueue({ families: ["temporal"], limit: 25 });
+
+    // A server-side narrowing, not a filter over what came back: the page is
+    // ranked and capped across the whole result, so a low-ranking family can
+    // be missing from an unfiltered page entirely.
+    expect(apiMock).toHaveBeenCalledWith("/evolve?families=temporal&limit=25");
+
+    apiMock.mockClear();
+    await fetchEvolveQueue({ families: [], limit: 25 });
+
+    // Empty is every family, which is what the engine reads a missing filter
+    // as, so it goes out as a sweep that named none.
+    expect(apiMock).toHaveBeenCalledWith("/evolve?limit=25");
+  });
+
   it("keys a sweep by what it asked for, the suppressed rows included", () => {
     // Two different questions, so two different cached answers: showing the
     // silenced findings must not read back the sweep that left them out.
     expect(evolveKey()).not.toEqual(evolveKey([], true));
     expect(evolveKey([], true)).toEqual(evolveKey([], true));
+  });
+
+  it("keys a sweep by its scope too, since a scope changes the answer", () => {
+    // Every parameter narrows the sweep on the server rather than the view of
+    // it: a scoped sweep can hold findings the unscoped one had no room for,
+    // so reading one back for the other would draw the wrong queue.
+    expect(evolveKey(["eng"])).not.toEqual(evolveKey());
+    expect(evolveKey([], false, ["temporal"])).not.toEqual(evolveKey());
+    expect(evolveKey(["eng"], false, ["temporal"])).toEqual(
+      evolveKey(["eng"], false, ["temporal"]),
+    );
   });
 });
 

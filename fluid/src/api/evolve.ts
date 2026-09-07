@@ -331,15 +331,20 @@ export const EVOLVE_KEY_ROOT = ["evolve"] as const;
 /**
  * The cache key of one sweep, which is every parameter it carries.
  *
- * Whether the silenced findings were asked for is one of them: it is a
- * different question with a different answer, and reading one back for the
- * other would draw a queue that does not match the toggle above it.
+ * Every one of them, because each narrows the sweep on the server and so
+ * changes the answer rather than the view of it. Whether the silenced findings
+ * were asked for is the plainest case - it is a different question, and reading
+ * one back for the other would draw a queue that does not match the toggle
+ * above it - but the domains and the families are no different: a page ranks
+ * and caps the whole result, so a scoped sweep can hold findings an unscoped
+ * one had no room for.
  */
 export function evolveKey(
   domains: string[] = [],
   includeAcknowledged = false,
+  families: string[] = [],
 ): readonly unknown[] {
-  return [...EVOLVE_KEY_ROOT, domains, includeAcknowledged];
+  return [...EVOLVE_KEY_ROOT, domains, includeAcknowledged, families];
 }
 
 /**
@@ -353,6 +358,13 @@ export function evolveKey(
 export async function fetchEvolveQueue(
   opts: {
     domains?: string[];
+    /**
+     * Restrict the sweep to these detector families. Empty is all three, and
+     * it is a server-side narrowing rather than a filter over what came back:
+     * the page is ranked and capped across the whole result, so a family that
+     * ranks low can be missing from an unfiltered page entirely.
+     */
+    families?: string[];
     limit?: number;
     /** Ask for the silenced findings too, each marked acknowledged. */
     includeAcknowledged?: boolean;
@@ -362,6 +374,10 @@ export async function fetchEvolveQueue(
   const domains = opts.domains ?? [];
   if (domains.length > 0) {
     query.set("domains", domains.join(","));
+  }
+  const families = opts.families ?? [];
+  if (families.length > 0) {
+    query.set("families", families.join(","));
   }
   query.set("limit", String(opts.limit ?? EVOLVE_LIMIT));
   // Sent only when it is asked for, so an ordinary sweep goes out as the
