@@ -1637,7 +1637,11 @@ async fn a_link_intent_sign_in_links_the_account_that_started_it() {
     let linked = ctx
         .sign_in_from("/auth/oidc/login?link=true", &session)
         .await;
-    assert_eq!(linked.status(), 302, "a completed link signs the account in");
+    assert_eq!(
+        linked.status(),
+        302,
+        "a completed link signs the account in"
+    );
     assert_eq!(location(&linked), "/");
 
     assert!(
@@ -1677,7 +1681,9 @@ async fn a_link_started_by_one_session_is_not_finished_by_another() {
     // ada starts the link; the state cookie ada picked up is presented with
     // grace's session cookie, which is what a link finished from somebody
     // else's session looks like on the wire.
-    let (callback, cookies) = ctx.walk_to_callback("/auth/oidc/login?link=true", &ada).await;
+    let (callback, cookies) = ctx
+        .walk_to_callback("/auth/oidc/login?link=true", &ada)
+        .await;
     let mut as_grace: Vec<(String, String)> = cookies
         .iter()
         .filter(|(name, _)| name == "fluid_oidc_state")
@@ -1738,10 +1744,7 @@ async fn an_identity_linked_elsewhere_is_refused_without_naming_the_holder() {
     let refused = ctx.sign_in_from("/auth/oidc/login?link=true", &grace).await;
     assert_eq!(refused.status(), 409);
     let body = refused.text().await.unwrap();
-    assert!(
-        body.contains("already linked to another account"),
-        "{body}"
-    );
+    assert!(body.contains("already linked to another account"), "{body}");
     assert!(
         !body.contains("ada.lovelace"),
         "the refusal names no other account: {body}"
@@ -1847,11 +1850,7 @@ async fn unlinking_the_last_way_in_is_refused_over_http_too() {
     let body = refused.text().await.unwrap();
     assert!(body.contains("crystalline users passwd"), "{body}");
     assert_eq!(
-        ctx.auth
-            .identity_links("ada.lovelace")
-            .await
-            .unwrap()
-            .len(),
+        ctx.auth.identity_links("ada.lovelace").await.unwrap().len(),
         1,
         "a refused unlink removes nothing"
     );

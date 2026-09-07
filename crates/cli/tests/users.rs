@@ -523,7 +523,9 @@ fn users_unlink_refuses_the_last_way_in_unless_forced() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let store = crystalline_service::rest::AuthStore::open(&db).await.unwrap();
+        let store = crystalline_service::rest::AuthStore::open(&db)
+            .await
+            .unwrap();
         store
             .provision_linked_user(
                 "https://idp.example",

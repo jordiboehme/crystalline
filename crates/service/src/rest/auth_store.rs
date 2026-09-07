@@ -1523,10 +1523,7 @@ impl AuthStore {
                 .conn
                 .execute(
                     "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
-                    vec![
-                        Value::Text(issuer.clone()),
-                        Value::Text(user.to_string()),
-                    ],
+                    vec![Value::Text(issuer.clone()), Value::Text(user.to_string())],
                 )
                 .await
                 .with_context(|| format!("unlinking an identity from user '{user}'"))?;
@@ -2801,7 +2798,9 @@ impl AuthStore {
             let holder = cell_text(&row, 0).unwrap_or_default();
             return Err(refuse(
                 RefusalKind::IdentityAlreadyLinked,
-                format!("this identity is already linked to account '{holder}': an admin can move it"),
+                format!(
+                    "this identity is already linked to account '{holder}': an admin can move it"
+                ),
             ));
         }
         if self

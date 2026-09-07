@@ -60,7 +60,7 @@ use axum::http::StatusCode;
 
 use super::auth::Identity;
 use super::auth_store::{
-    DomainMember, MemberLevel, StoreRefusal, RefusalKind, normalize_account_name,
+    DomainMember, MemberLevel, RefusalKind, StoreRefusal, normalize_account_name,
 };
 use super::{
     ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only, require_domain_read,
