@@ -18,6 +18,7 @@ mod github_settings;
 mod graph;
 mod mcp_tokens;
 mod members;
+mod oidc;
 mod users_api;
 
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub use error::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
     if_none_match_matches, precondition_failed,
 };
+pub use oidc::{OidcClaims, OidcClient, OidcSettings, STATE_COOKIE as OIDC_STATE_COOKIE};
 
 use crate::engine::Engine;
 use crate::scope::{DomainAccess, DomainRight};
@@ -60,7 +62,8 @@ use crate::scope::{DomainAccess, DomainRight};
                        editor account and the `If-Match` token of the version \
                        being replaced, and account management needs an \
                        admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
-                       `/auth/me` and `/auth/setup` is closed by default: a \
+                       `/auth/me`, `/auth/setup`, `/auth/providers` and the \
+                       two `/auth/oidc/*` routes is closed by default: a \
                        request that \
                        carries no identity is answered 401 ahead of routing, so \
                        an unauthenticated caller never learns which paths \
@@ -90,6 +93,9 @@ use crate::scope::{DomainAccess, DomainRight};
         auth::logout,
         auth::me,
         auth::setup,
+        oidc::login,
+        oidc::callback,
+        oidc::providers,
         domains::list,
         domains_admin::create,
         domains_admin::remove,
@@ -185,6 +191,8 @@ use crate::scope::{DomainAccess, DomainRight};
         auth::LogoutResponse,
         auth::MeResponse,
         auth::SetupBody,
+        oidc::ProvidersResponse,
+        oidc::OidcProviderView,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::PasswordBody,
@@ -230,6 +238,12 @@ pub struct RestState {
     pub access: Arc<DomainAccess>,
     /// The auth settings as of startup. See [`AuthCfg`].
     pub auth_cfg: AuthCfg,
+    /// The single sign-on relying party, when `auth.oidc` names a usable
+    /// provider. `None` is an instance with local accounts only, which is
+    /// every instance until someone configures one. Resolved at startup with
+    /// the rest of `auth.*`, so a running daemon serves the provider it came
+    /// up with. See [`oidc`].
+    pub oidc: Option<Arc<OidcClient>>,
     /// The open co-editing sessions, one registry for this process: the
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
@@ -258,10 +272,13 @@ impl RestState {
     /// HTTP header name: the HTTP surface then refuses to come up, naming the
     /// setting, rather than serving with a header that silently never matches.
     pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>) -> anyhow::Result<RestState> {
-        let auth_cfg = AuthCfg::resolve(&engine.config())?;
+        let config = engine.config();
+        let auth_cfg = AuthCfg::resolve(&config)?;
+        let oidc = OidcClient::new(&config)?;
         Ok(RestState {
             collab: crate::collab::session::CollabSessions::new(engine.clone()),
             engine,
+            oidc,
             access: Arc::new(DomainAccess::new(auth.clone())),
             auth,
             auth_cfg,
@@ -445,6 +462,13 @@ pub fn router(state: RestState) -> Router {
         // The first-run path: public, CSRF-exempt by path like login, and 410
         // for good once any account exists. See [`auth::setup`].
         .route("/auth/setup", post(auth::setup))
+        // Single sign-on: three public GETs, for the reason the four routes
+        // above are public. The callback's protection is the single-use state
+        // it generated and the cookie it bound to this browser, not a session
+        // that does not exist yet. See [`oidc`].
+        .route(oidc::LOGIN_PATH, get(oidc::login))
+        .route(oidc::CALLBACK_PATH, get(oidc::callback))
+        .route(oidc::PROVIDERS_PATH, get(oidc::providers))
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route
         // here. Registered before the domain sub-paths for readability only;

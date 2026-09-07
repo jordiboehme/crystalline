@@ -16,7 +16,8 @@ filter = '''
     package(crystalline-remote) & (binary(github_client) | binary(github_auth))
     | package(crystalline-service) & (binary(collab_ws) | binary(rest_admin_api)
         | binary(rest_api) | binary(rest_evolve) | binary(rest_files)
-        | binary(rest_setup_api) | binary(rest_write_api) | binary(ui_serving))
+        | binary(rest_setup_api) | binary(rest_write_api) | binary(ui_serving)
+        | binary(oidc))
     | package(crystalline) & binary(service)
 '''
 test-group = 'forge-wire'

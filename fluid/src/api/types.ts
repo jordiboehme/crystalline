@@ -92,6 +92,66 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/auth/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Finish a single sign-on the provider sent back.
+         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The provider's own error text never reaches this response.
+         */
+        get: operations["oidc_callback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/oidc/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start a single sign-on against the configured provider.
+         * @description Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. `link=true` links the provider identity to the caller's existing account and needs a signed-in session.
+         */
+        get: operations["oidc_login"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Which ways into this instance exist.
+         * @description Read by the sign-in screen before anyone is signed in, so it is public like the login route. Carries whether a single sign-on provider is configured and the label for its button, and nothing else about it: no issuer, no client id, no secret.
+         */
+        get: operations["auth_providers"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/auth/setup": {
         parameters: {
             query?: never;
@@ -1803,6 +1863,19 @@ export interface components {
              */
             permalink: string;
         };
+        /** @description The configured single sign-on provider as the sign-in screen needs it: whether to draw the button and what to write on it. Never the issuer, the client id or the secret. */
+        OidcProviderView: {
+            /**
+             * @description Whether a provider is configured and usable.
+             * @example true
+             */
+            enabled: boolean;
+            /**
+             * @description The label for the button, when enabled.
+             * @example Contoso
+             */
+            name?: string | null;
+        };
         /** @description The account to hand this private domain to. It must be an existing, enabled account; its own membership row, if it had one, is dropped, since an owner holds every level already. */
         OwnerBody: {
             /**
@@ -1872,6 +1945,17 @@ export interface components {
              * @example about:blank
              */
             type: string;
+        };
+        /** @description Which ways into this instance exist, for the sign-in screen to draw. Public: it is read before anyone is signed in, and it carries no configuration beyond the button's label. */
+        ProvidersResponse: {
+            /**
+             * @description Whether local name-and-password accounts are offered. Always true: they
+             *     are the accounts single sign-on is layered on top of.
+             * @example true
+             */
+            local: boolean;
+            /** @description The single sign-on provider, if one is configured. */
+            oidc: components["schemas"]["OidcProviderView"];
         };
         /** @description How to settle the conflict: keep `mine`, take `theirs`, or write `merged` content of your own. `content` belongs to `merged` and to nothing else. */
         ResolveBody: {
@@ -2382,6 +2466,157 @@ export interface operations {
                 };
                 content: {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oidc_callback: {
+        parameters: {
+            query?: {
+                /** @description The authorization code, on success. */
+                code?: string;
+                /** @description The state this instance generated, echoed back. */
+                state?: string;
+                /** @description The provider's error code, when it refused. */
+                error?: string;
+                /** @description The provider's human-readable reason, when it refused. */
+                error_description?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Signed in. The session cookie is set and `location` is the application root. */
+            302: {
+                headers: {
+                    /** @description `/`. */
+                    location?: string;
+                    /** @description The `fluid_session` cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The provider refused, the state did not match, or the ID token did not validate. One message for every way this can fail. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No provider is configured on this instance. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The claims validated but this build cannot yet turn them into an account. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The provider could not be reached for the token exchange. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oidc_login: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Link the provider identity to the caller's existing account instead of
+                 *     signing in as whoever it turns out to be. Needs a signed-in session.
+                 */
+                link?: boolean;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Follow `location` to the provider. */
+            302: {
+                headers: {
+                    /** @description The provider's authorization endpoint. */
+                    location?: string;
+                    /** @description The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The request carries no Host header, so no redirect uri can be derived. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description `link=true` on a request with no signed-in session. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No provider is configured on this instance. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The provider's discovery document could not be fetched. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    auth_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The ways in. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvidersResponse"];
                 };
             };
         };

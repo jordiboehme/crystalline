@@ -82,6 +82,15 @@ bytes = { workspace = true }
 # needs its own line.
 diffy = { workspace = true }
 zip = { workspace = true }
+# The OpenID Connect relying party (rest::oidc). Built with no default
+# features (see the workspace pin), so its HTTP calls go through the client
+# below rather than through a reqwest of its own.
+openidconnect = { workspace = true }
+# The one HTTP client this crate makes outbound calls with: discovery, the
+# JWKS fetch and the OIDC token exchange, wired into openidconnect through
+# `rest::oidc`'s `AsyncHttpClient` implementation. Was a dev-dependency only
+# until the relying party landed.
+reqwest = { workspace = true }
 # Optional: the embedded Fluid bundle, behind the `fluid-ui` feature.
 rust-embed = { workspace = true, optional = true }
 
@@ -99,9 +108,14 @@ tempfile = { workspace = true }
 # already depends on.
 tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
-reqwest = { workspace = true }
 serde_yaml_ng = { workspace = true }
 flate2 = { workspace = true }
 tar = { workspace = true }
 tiktoken-rs = { workspace = true }
 tokio-tungstenite = { workspace = true }
+# The fake identity provider in tests/oidc.rs: `jsonwebtoken` signs its ID
+# tokens (RS256, from the committed PEM fixtures) and `rsa` reads the same PEM
+# back to publish the matching modulus and exponent as a JWKS, so the key set
+# the relying party validates against cannot drift from the key that signed.
+jsonwebtoken = { workspace = true }
+rsa = { workspace = true }

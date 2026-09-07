@@ -152,8 +152,38 @@ rust-embed = { version = "8.12", features = [
 # switch serde_json's map type on the whole workspace.
 utoipa = "5.5.0"
 
+# The OpenID Connect relying party (crates/service). `default-features = false`
+# is load bearing: the defaults are `reqwest` + `rustls-tls`, which reach
+# reqwest through oauth2's `^0.12` requirement and would put a SECOND reqwest
+# and a second TLS stack in the graph beside the workspace's 0.13. The crate
+# has an `AsyncHttpClient` trait for exactly this, so `rest::oidc` implements
+# it over the one reqwest this workspace already builds.
+#
+# `accept-string-booleans` and `accept-rfc3339-timestamps` are tolerance for
+# providers that spell a claim the way the specification does not: Entra, the
+# provider the settings layer names, sends `email_verified` as the string
+# "true", and RFC 3339 timestamps turn up in the wild where the spec asks for
+# seconds since the epoch. Both only widen what parses; neither loosens a
+# signature, an issuer or an audience check.
+openidconnect = { version = "4.0.1", default-features = false, features = [
+    "accept-string-booleans",
+    "accept-rfc3339-timestamps",
+] }
+
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"
+# Dev-only, for the fake OpenID Connect provider the relying-party tests run
+# against (crates/service). `rust_crypto` rather than `aws_lc_rs`: every crate
+# it names - rsa, sha2 0.10, p256, p384, ed25519-dalek - is already in the
+# graph through openidconnect, so the backend adds no new C or assembly build.
+jsonwebtoken = { version = "11.0.0", default-features = false, features = [
+    "use_pem",
+    "rust_crypto",
+] }
+# Dev-only beside it: reads a PKCS#8 test key back out of its PEM so the fake
+# provider can publish the matching JWKS. Already in the graph through
+# openidconnect.
+rsa = { version = "0.9.10", features = ["pem"] }
 tempfile = "3.27.0"
 # o200k_base tokenizer for the TOON vs JSON payload measurement test; pulls no
 # serde_json (verified against its crates.io dependency list), so it cannot

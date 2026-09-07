@@ -321,6 +321,34 @@ An immutable image with no `config.yaml` to mount or edit configures purely thro
 
 `<NAME>` in a domain variable is lowercased with underscores turned into hyphens for the domain name itself (`CRYSTALLINE_DOMAIN_TEAM_KNOWLEDGE` becomes the domain `team-knowledge`). Precedence, highest first: a command-line flag, then an environment variable, then `config.yaml`, then the built-in default; an environment value is never written back to the config file.
 
+## Single sign-on with an OpenID Connect provider
+
+Setting `auth.oidc.issuer`, `auth.oidc.client_id` and `auth.oidc.client_secret` (or the three matching `CRYSTALLINE_AUTH_OIDC_*` variables) turns on a sign-in button beside the local one. It is opt-in and additive: local accounts keep working, and an instance with none of the three set behaves exactly as it did before. All six keys are read once when the HTTP surface starts, like `service.read_only`, so a change takes effect at the next start; a block missing any of the three required keys leaves single sign-on off and says which key is missing in a startup warning rather than refusing to come up.
+
+Three routes come with it, all public because a browser reaching them has no session yet, and all under the existing `/api/v1` mount, so a reverse proxy that already forwards `/api/` needs no new rule:
+
+| Route | What it is for |
+| --- | --- |
+| `GET /api/v1/auth/providers` | Whether to draw the button, and its label. Carries no issuer, client id or secret |
+| `GET /api/v1/auth/oidc/login` | Starts the sign-in: redirects to the provider with PKCE (S256), a state and a nonce |
+| `GET /api/v1/auth/oidc/callback` | Where the provider sends the browser back |
+
+**Register the callback with the provider as the redirect uri**, spelled with the scheme and host your users reach the instance at: `https://<your-host>/api/v1/auth/oidc/callback`. Crystalline derives that address from each request's own `Host` header and from `X-Forwarded-Proto` (or RFC 7239 `Forwarded: proto=`), which is the same pair it already uses to decide whether a session cookie gets `Secure`, so a reverse proxy terminating TLS must set one of those two headers or the redirect uri will be built with `http://` and the provider will refuse it. An instance reachable under more than one hostname needs every one of them registered.
+
+The client secret is stored but never rendered: `crystalline config show`, the `configure` tool and `crystalline doctor` all print `(set)`, and a failure from the provider reaches the browser as a sentence written by Crystalline, with the provider's own words going only to the daemon's `debug` log. Set the secret through `CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET` where a deployment keeps credentials out of `config.yaml` entirely.
+
+```mermaid
+flowchart LR
+    B[Browser] -->|1. GET /auth/oidc/login| D[Daemon]
+    D -->|2. 302 with PKCE, state, nonce| B
+    B -->|3. authenticate| P[Identity provider]
+    P -->|4. 302 back with a code| B
+    B -->|5. GET /auth/oidc/callback| D
+    D -->|6. code plus client secret| P
+    P -->|7. ID token| D
+    D -->|8. session cookie, 302 to /| B
+```
+
 ## The stdio and HTTP surfaces can differ
 
 One daemon can serve a local agent over stdio and a remote one over HTTP at the same time, and with `skills.serve` at its `auto` default those two clients are deliberately not served the same skill surface. An operator who notices that is looking at a decision rather than a bug, so here is the whole of it.

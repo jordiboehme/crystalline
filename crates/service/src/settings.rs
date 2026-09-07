@@ -1454,6 +1454,19 @@ fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
 
 // --- auth.oidc.* --------------------------------------------------------------
 
+/// The placeholder in the tenant-independent Entra discovery url, lowercased
+/// so a `{tenantId}` copied off a portal page matches too.
+///
+/// Shared with the relying party rather than spelled twice: `set_oidc_issuer`
+/// is one way the issuer reaches the config and `CRYSTALLINE_AUTH_OIDC_ISSUER`
+/// is another, and a guard that only one of them applies is a guard that does
+/// not hold.
+pub const ENTRA_TEMPLATE_MARKER: &str = "{tenantid}";
+
+/// What to say when the template turns up, wherever it turns up.
+pub const ENTRA_TEMPLATE_HELP: &str = "this is the tenant-independent Entra discovery template, not your issuer - use the \
+     tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0";
+
 /// The `auth.oidc` block, created on demand so the first `auth.oidc.*` write
 /// materializes it and every later one reuses it.
 fn oidc_mut(config: &mut GlobalConfig) -> &mut OidcConfig {
@@ -1517,12 +1530,8 @@ fn set_oidc_issuer(config: &mut GlobalConfig, value: &str) -> Result<(), Setting
     // people paste from a portal page, and it fails much later as an issuer
     // mismatch on a token nobody can read. Refuse it here, where the fix is a
     // sentence away.
-    if issuer.to_ascii_lowercase().contains("{tenantid}") {
-        return Err(SettingsError(
-            "this is the tenant-independent Entra discovery template, not your issuer - use the \
-             tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0"
-                .to_string(),
-        ));
+    if issuer.to_ascii_lowercase().contains(ENTRA_TEMPLATE_MARKER) {
+        return Err(SettingsError(ENTRA_TEMPLATE_HELP.to_string()));
     }
     oidc_mut(config).issuer = Some(issuer);
     Ok(())

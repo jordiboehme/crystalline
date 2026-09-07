@@ -77,7 +77,20 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// `/auth/setup` runs when no account exists at all, so there is no identity
 /// for the guard to find and it would otherwise 401 the one route the wizard
 /// has.
-const PUBLIC_PATHS: [&str; 4] = [LOGIN_PATH, "/auth/logout", "/auth/me", SETUP_PATH];
+/// The three single sign-on paths are public for the same reason login is:
+/// the browser reaching them has no session yet. The callback is not
+/// unprotected for it - it authenticates on a single-use state this process
+/// generated, matched against a cookie only the browser that started the
+/// sign-in holds. See [`super::oidc`].
+const PUBLIC_PATHS: [&str; 7] = [
+    LOGIN_PATH,
+    "/auth/logout",
+    "/auth/me",
+    SETUP_PATH,
+    super::oidc::LOGIN_PATH,
+    super::oidc::CALLBACK_PATH,
+    super::oidc::PROVIDERS_PATH,
+];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
 ///
@@ -710,6 +723,25 @@ async fn sign_in(
     headers: &HeaderMap,
     user: User,
 ) -> Result<(CookieJar, NoStore, axum::Json<LoginResponse>), ApiError> {
+    let (jar, csrf) = issue_session_with_csrf(state, jar, headers, &user).await?;
+    Ok((jar, no_store(), axum::Json(LoginResponse { user, csrf })))
+}
+
+/// Retire the session the caller arrived holding, issue a fresh one for
+/// `user` and return the jar carrying its cookie.
+///
+/// The single definition of what signing in DOES, shared by the password
+/// login, the first-run setup and the single sign-on callback: the fixation
+/// defense, the cookie attributes and the TTL are one piece of code with three
+/// callers rather than three copies that could drift. The CSRF token comes
+/// back beside the jar because the two body-answering callers put it in their
+/// response; the redirecting one has nowhere to put it and does not ask.
+pub(super) async fn issue_session_with_csrf(
+    state: &RestState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    user: &User,
+) -> Result<(CookieJar, String), ApiError> {
     // Whatever session the caller arrived holding is retired rather than left
     // live beside the new one. A session fixation attack works by planting a
     // token the victim then logs in under, so the token that was presented is
@@ -728,14 +760,21 @@ async fn sign_in(
         .secure(cookie_needs_secure(headers))
         .max_age(time::Duration::seconds(SESSION_TTL_SECS))
         .build();
-    Ok((
-        jar.add(cookie),
-        no_store(),
-        axum::Json(LoginResponse {
-            user,
-            csrf: session.csrf,
-        }),
-    ))
+    Ok((jar.add(cookie), session.csrf))
+}
+
+/// [`issue_session_with_csrf`] for a caller that redirects rather than
+/// answering a body: the browser lands on the app and asks `GET /auth/me` for
+/// its CSRF token, which is the only channel that route has ever handed one
+/// back through.
+pub(super) async fn issue_session(
+    state: &RestState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    user: &User,
+) -> Result<CookieJar, ApiError> {
+    let (jar, _csrf) = issue_session_with_csrf(state, jar, headers, user).await?;
+    Ok(jar)
 }
 
 /// Check a password at a cost that does not depend on which account it names.
@@ -1347,7 +1386,7 @@ pub async fn me(
 ///
 /// A request with no `Host` is treated as remote: HTTP/1.1 requires the header,
 /// so its absence is not a local browser.
-fn cookie_needs_secure(headers: &HeaderMap) -> bool {
+pub(super) fn cookie_needs_secure(headers: &HeaderMap) -> bool {
     forwarded_https(headers) || !is_loopback_request(headers)
 }
 
@@ -1357,7 +1396,7 @@ fn cookie_needs_secure(headers: &HeaderMap) -> bool {
 /// Any `proto=https` anywhere in the chain counts. The error that matters here
 /// is dropping `Secure` from a cookie that travels over the internet, so an
 /// ambiguous header resolves towards setting the flag.
-fn forwarded_https(headers: &HeaderMap) -> bool {
+pub(super) fn forwarded_https(headers: &HeaderMap) -> bool {
     let x_forwarded = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -1380,7 +1419,7 @@ fn forwarded_https(headers: &HeaderMap) -> bool {
 }
 
 /// Whether the `Host` the client asked for names this machine.
-fn is_loopback_request(headers: &HeaderMap) -> bool {
+pub(super) fn is_loopback_request(headers: &HeaderMap) -> bool {
     headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
