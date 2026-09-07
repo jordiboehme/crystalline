@@ -1,6 +1,6 @@
 //! Who a REST request is, and what that lets it do.
 //!
-//! Three ways in, tried in this order and never blended:
+//! Four ways in, tried in this order and never blended:
 //!
 //! 1. **The trusted header.** An upstream proxy has already authenticated the
 //!    caller and names them in the header `auth.trusted_header` configures. The
@@ -8,15 +8,24 @@
 //!    needs no separate user creation step. Believed only when configured: an
 //!    instance that has not been told to trust a proxy ignores the header
 //!    whatever a client sends.
-//! 2. **The session cookie.** [`SESSION_COOKIE`] carries a token issued by
+//! 2. **The forward-auth headers.** With `auth.proxy_headers` on, a proxy that
+//!    speaks the standard `Remote-*` quartet is believed the same way, and the
+//!    identity it asserts is keyed as `(proxy, <the forwarded user>)` in the
+//!    identity-link table - the same durable key single sign-on uses, so a
+//!    header identity and a provider identity are two people until somebody
+//!    links them. Off by default and trust-the-proxy by construction: safe
+//!    only where this instance is unreachable except through that proxy and
+//!    the proxy strips client-supplied copies of the headers. The two header
+//!    modes are mutually exclusive and refused together at startup.
+//! 3. **The session cookie.** [`SESSION_COOKIE`] carries a token issued by
 //!    `POST /auth/login`; the store resolves it to an account and the session's
 //!    CSRF token.
-//! 3. **Anonymous.** With `auth.anonymous` on, a request that carries neither
-//!    is still served, at viewer level and with no account behind it.
+//! 4. **Anonymous.** With `auth.anonymous` on, a request that carries none of
+//!    them is still served, at viewer level and with no account behind it.
 //!
-//! Both settings are resolved once, when the HTTP surface is built (see
-//! [`AuthCfg`]), matching `service.read_only`: a flip takes effect at the next
-//! start, never halfway through a served request.
+//! Every one of those settings is resolved once, when the HTTP surface is
+//! built (see [`AuthCfg`]), matching `service.read_only`: a flip takes effect
+//! at the next start, never halfway through a served request.
 //!
 //! Everything below the auth endpoints is closed by default. [`guard`] runs
 //! ahead of routing for every `/api/v1` path, so a caller with no identity is
@@ -38,7 +47,10 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use crystalline_core::config::{GlobalConfig, ShareIdentityMode};
 use tokio::sync::Semaphore;
 
-use super::auth_store::{AuthStore, PasswordCheck, Role, SessionMint, User, dummy_verify};
+use super::auth_store::{
+    AuthStore, DEFAULT_OIDC_ROLE, PasswordCheck, Role, SessionMint, User, dummy_verify,
+    normalize_account_name,
+};
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
 use crate::scope::Scope;
 
@@ -61,6 +73,32 @@ pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 /// Four is enough that a household of users never queues noticeably and small
 /// enough that the worst case is a rounding error.
 pub const LOGIN_SLOTS: usize = 4;
+
+/// The header a forward-auth proxy names the authenticated person in, and the
+/// three beside it that say how to show them and what they belong to.
+///
+/// A fixed set rather than four configurable names: `Remote-User` and its
+/// siblings are what a forward-auth proxy already sends, and a deployment
+/// whose proxy sends something else has `auth.trusted_header` for the name it
+/// does send. Lowercase, which is how a header map compares.
+const REMOTE_USER_HEADER: &str = "remote-user";
+const REMOTE_NAME_HEADER: &str = "remote-name";
+const REMOTE_EMAIL_HEADER: &str = "remote-email";
+const REMOTE_GROUPS_HEADER: &str = "remote-groups";
+
+/// The issuer half of a forward-auth identity's durable key.
+///
+/// There is no issuer url in this mode - a proxy is not an OpenID Connect
+/// provider - so every header identity is namespaced under this one value and
+/// keyed as `(proxy, <the forwarded user>)` in the identity-link table. That
+/// makes a header-provisioned account and a provider-provisioned account for
+/// the same person two accounts until an admin links them, which is the
+/// no-silent-linking rule applied to a mode that asserts nothing but a name.
+///
+/// A constant rather than a setting: one instance sits behind one proxy, and
+/// an operator who ever needs to tell two apart has an additive key to ask
+/// for rather than a stored value to keep in step with their proxy.
+pub const PROXY_ISSUER: &str = "proxy";
 
 /// The one path the CSRF check cannot apply to: there is no session yet, so
 /// there is no token to echo.
@@ -103,6 +141,19 @@ pub struct AuthCfg {
     /// The header a trusted proxy names the authenticated user in, from
     /// `auth.trusted_header`. `None` means the path is off.
     pub trusted_header: Option<HeaderName>,
+    /// Whether the standard forward-auth quartet names the signed-in user,
+    /// from `auth.proxy_headers`. `false` means no `Remote-*` header is
+    /// believed, whatever a client sends.
+    pub proxy_headers: bool,
+    /// The role a forward-auth identity is provisioned at, from
+    /// `auth.oidc.default_role`.
+    ///
+    /// The single sign-on key rather than one of its own: both modes are an
+    /// external authenticator asserting a person this instance has never seen,
+    /// and one answer to "what may a newcomer do here" is easier to reason
+    /// about than two. Unset means [`DEFAULT_OIDC_ROLE`], the least privileged
+    /// one.
+    pub proxy_role: Role,
     /// Whether a request carrying no identity is served anyway, from
     /// `auth.anonymous`.
     pub anonymous: bool,
@@ -119,6 +170,8 @@ impl Default for AuthCfg {
     fn default() -> AuthCfg {
         AuthCfg {
             trusted_header: None,
+            proxy_headers: false,
+            proxy_role: DEFAULT_OIDC_ROLE,
             anonymous: false,
             mcp: false,
             max_users: crystalline_core::config::DEFAULT_MAX_USERS,
@@ -127,13 +180,19 @@ impl Default for AuthCfg {
 }
 
 impl AuthCfg {
-    /// Read all four settings out of `config`, validating the header name.
+    /// Read the auth settings out of `config`, validating the header name and
+    /// refusing the one combination that has no meaning.
     ///
     /// The settings layer only checks that the value is non-empty and has no
     /// whitespace (see `settings::set_trusted_header`), which still admits
     /// names HTTP does not allow. Rejecting those here means an operator who
     /// mistypes learns at startup instead of wondering why their proxy's header
     /// is ignored.
+    ///
+    /// The two header modes together are refused rather than ordered: they are
+    /// two answers to one question, an instance that carried both would believe
+    /// whichever header arrived first, and an operator who set both meant one
+    /// of them. Refusing at startup is the one moment they are still watching.
     pub fn resolve(config: &GlobalConfig) -> anyhow::Result<AuthCfg> {
         let trusted_header = match config.auth_trusted_header() {
             Some(raw) => Some(HeaderName::try_from(raw.to_ascii_lowercase()).with_context(
@@ -141,8 +200,25 @@ impl AuthCfg {
             )?),
             None => None,
         };
+        let proxy_headers = config.auth_proxy_headers();
+        if proxy_headers && trusted_header.is_some() {
+            anyhow::bail!(
+                "pick one: auth.trusted_header names a custom header, auth.proxy_headers \
+                 trusts the standard Remote-* set"
+            );
+        }
+        // Guaranteed parseable by the settings layer, which stores a role it
+        // already parsed; an environment variable can still carry anything, so
+        // an unreadable value falls back rather than refusing to serve.
+        let proxy_role = config
+            .auth_oidc()
+            .and_then(|oidc| oidc.default_role.as_deref())
+            .and_then(|raw| raw.parse::<Role>().ok())
+            .unwrap_or(DEFAULT_OIDC_ROLE);
         Ok(AuthCfg {
             trusted_header,
+            proxy_headers,
+            proxy_role,
             anonymous: config.auth_anonymous(),
             mcp: config.auth_mcp(),
             max_users: config.auth_max_users(),
@@ -357,7 +433,7 @@ pub async fn guard(
     Ok(next.run(req).await)
 }
 
-/// The trusted header, then the session cookie, then anonymous, then nothing.
+/// A header mode, then the session cookie, then anonymous, then nothing.
 async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, ApiError> {
     if let Some(name) = &state.auth_cfg.trusted_header
         && let Some(raw) = headers.get(name)
@@ -384,32 +460,24 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
         if user.disabled {
             return Err(ApiError::forbidden("this account is disabled"));
         }
-        // The settlement gives trusted-header identities a real session too:
-        // /auth/me mints it and this adopts its CSRF token. The cookie is
-        // preferred when it names the same account the header does, so a
-        // browser echoes the token of the session it actually holds. A cookie
-        // for anyone else (the proxy re-mapped the identity) is ignored: the
-        // header is the authority in this mode.
-        let from_cookie = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
-            Some(cookie) => match state.auth.session_user(cookie.value()).await? {
-                Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
-                _ => None,
-            },
-            None => None,
-        };
-        // With no usable cookie, fall back to the account's own live session.
-        // In this mode the cookie carries nothing the header has not already
-        // said, so binding the token to it would lock out exactly the callers
-        // that have none: a client that keeps no cookie jar, a device whose
-        // cookie went stale, and the second of two tabs opened at once, which
-        // is handed a reused session precisely because it has no token of its
-        // own to be given. What the token proves is unchanged either way - that
-        // whoever sent this read an /auth/me answer for this identity, which no
-        // other origin can do while no CORS layer exists.
-        let csrf = match from_cookie {
-            Some(csrf) => Some(csrf),
-            None => state.auth.newest_session_csrf(&user.name).await?,
-        };
+        let csrf = header_mode_csrf(state, headers, &user).await?;
+        return Ok(Identity {
+            user: Some(user),
+            csrf,
+            anonymous: false,
+        });
+    }
+    // The forward-auth quartet. Nothing here is read at all while the mode is
+    // off, which is the property that makes a spoofed `Remote-User` worth
+    // exactly nothing on a default install; and a request that carries no
+    // `Remote-User` while the mode IS on falls through to the session path
+    // below rather than becoming anybody, so turning the mode on escalates
+    // nobody.
+    if state.auth_cfg.proxy_headers
+        && let Some(subject) = forwarded_subject(headers)?
+    {
+        let user = proxy_header_user(state, &subject, headers).await?;
+        let csrf = header_mode_csrf(state, headers, &user).await?;
         return Ok(Identity {
             user: Some(user),
             csrf,
@@ -430,6 +498,198 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
         csrf: None,
         anonymous: state.auth_cfg.anonymous,
     })
+}
+
+/// The CSRF token a header-mode identity's mutating requests must echo.
+///
+/// The settlement gives a header identity a real session too: `/auth/me` mints
+/// it and this adopts its token. The cookie is preferred when it names the same
+/// account the header does, so a browser echoes the token of the session it
+/// actually holds. A cookie for anyone else (the proxy re-mapped the identity)
+/// is ignored: the header is the authority in this mode.
+///
+/// With no usable cookie, fall back to the account's own live session. In these
+/// modes the cookie carries nothing the header has not already said, so binding
+/// the token to it would lock out exactly the callers that have none: a client
+/// that keeps no cookie jar, a device whose cookie went stale, and the second of
+/// two tabs opened at once, which is handed a reused session precisely because
+/// it has no token of its own to be given. What the token proves is unchanged
+/// either way - that whoever sent this read an `/auth/me` answer for this
+/// identity, which no other origin can do while no CORS layer exists.
+async fn header_mode_csrf(
+    state: &RestState,
+    headers: &HeaderMap,
+    user: &User,
+) -> Result<Option<String>, ApiError> {
+    let from_cookie = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
+        Some(cookie) => match state.auth.session_user(cookie.value()).await? {
+            Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
+            _ => None,
+        },
+        None => None,
+    };
+    match from_cookie {
+        Some(csrf) => Ok(Some(csrf)),
+        None => Ok(state.auth.newest_session_csrf(&user.name).await?),
+    }
+}
+
+/// The person a forward-auth proxy is asserting, folded into the form the
+/// identity key is stored in, or `None` when it is asserting nobody.
+///
+/// Folded because the proxy is naming a person, not quoting a provider's opaque
+/// subject: one that sends `Ada` today and `ada` tomorrow means the same person
+/// both times, and two accounts would be the wrong answer. An absent or blank
+/// header is not an identity and not an error - the request simply falls
+/// through to the session path. A value that cannot be a login name is refused
+/// `403`, the same answer the trusted-header mode gives it: the caller cannot
+/// fix their proxy's header, and the operator can.
+fn forwarded_subject(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = header_text(headers, REMOTE_USER_HEADER) else {
+        return Ok(None);
+    };
+    normalize_account_name(raw)
+        .map(Some)
+        .map_err(|err| ApiError::forbidden(format!("{err:#}")))
+}
+
+/// One header's trimmed value, or `None` when it is absent, unreadable or
+/// blank. A blank header says nothing, which is different from saying the
+/// value is empty.
+fn header_text<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// The groups a proxy forwards, parsed and nothing more.
+///
+/// Claim mapping is not built: no group decides a role, a membership or a
+/// visibility here, and until it does, reading this header changes nothing
+/// about what the caller may do. The parse exists so the layer that will map
+/// them slots in where the values already are, rather than starting from the
+/// header again.
+fn forwarded_groups(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// What the proxy's presentation headers change about `user`, or `None` when
+/// they change nothing.
+///
+/// Every request in this mode carries the headers, so a resolver that wrote
+/// them back each time would put a database write, under the store's own guard,
+/// in front of every authenticated read on the instance. Comparing first makes
+/// the write what it should be: something that happens when the person's name
+/// or address actually changed at the provider.
+///
+/// An absent header asks for nothing rather than asking for a clear: a proxy
+/// that stopped sending `Remote-Email` has said nothing about whether the
+/// person still has an address, which is the same rule the single sign-on path
+/// applies to an absent claim.
+fn presentation_update<'h>(
+    user: &User,
+    display: Option<&'h str>,
+    email: Option<&'h str>,
+) -> Option<(Option<&'h str>, Option<&'h str>)> {
+    let display = display
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != user.display);
+    let email = email
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && Some(*value) != user.email.as_deref());
+    (display.is_some() || email.is_some()).then_some((display, email))
+}
+
+/// The account a forward-auth request is served as: the one linked to
+/// `(proxy, subject)`, or a fresh one provisioned on first sight.
+///
+/// The lookup is by identity link and never by account name, which is what
+/// keeps this mode from being a silent takeover: a local `ada` who signs in
+/// with a password is a different person from whoever the proxy calls `ada`
+/// until an admin says otherwise, and the store's uniquifier gives the newcomer
+/// a name of their own. The subject is the durable key through every rename the
+/// proxy ever performs.
+async fn proxy_header_user(
+    state: &RestState,
+    subject: &str,
+    headers: &HeaderMap,
+) -> Result<User, ApiError> {
+    let display = header_text(headers, REMOTE_NAME_HEADER);
+    let email = header_text(headers, REMOTE_EMAIL_HEADER);
+    if let Some(raw) = header_text(headers, REMOTE_GROUPS_HEADER) {
+        let groups = forwarded_groups(raw);
+        if !groups.is_empty() {
+            tracing::debug!(
+                groups = groups.join(","),
+                "groups seen but claim mapping is not built"
+            );
+        }
+    }
+    let user = match state.auth.linked_user(PROXY_ISSUER, subject).await? {
+        Some(user) => user,
+        None => provision_forwarded_user(state, subject, display, email).await?,
+    };
+    // Refused before anything is written back: a disabled account is not a
+    // person whose display name we go on maintaining.
+    if user.disabled {
+        return Err(ApiError::forbidden("this account is disabled"));
+    }
+    match presentation_update(&user, display, email) {
+        Some((display, email)) => Ok(state
+            .auth
+            .refresh_presentation(&user.name, display, email)
+            .await?),
+        None => Ok(user),
+    }
+}
+
+/// Mint the account behind a forwarded identity, linking it to
+/// `(proxy, subject)` in the same transaction.
+///
+/// One store call rather than an account insert followed by a link: two
+/// requests for one newcomer can arrive at once, and the loser of that race
+/// must leave no half-made account behind. The loser instead re-reads the
+/// winner's link, because a sign-in that did work should not answer an error.
+async fn provision_forwarded_user(
+    state: &RestState,
+    subject: &str,
+    display: Option<&str>,
+    email: Option<&str>,
+) -> Result<User, ApiError> {
+    let provisioned = state
+        .auth
+        .provision_linked_user(
+            PROXY_ISSUER,
+            subject,
+            subject,
+            display,
+            email,
+            state.auth_cfg.proxy_role,
+            state.auth_cfg.max_users,
+        )
+        .await;
+    match provisioned {
+        Ok(user) => Ok(user),
+        Err(err) => {
+            if let Some(user) = state.auth.linked_user(PROXY_ISSUER, subject).await? {
+                return Ok(user);
+            }
+            let msg = format!("{err:#}");
+            if msg.contains("auth.max_users") || msg.contains("login name") {
+                // The proxy named an identity this instance will not provision:
+                // the caller cannot fix it, the operator can.
+                Err(ApiError::forbidden(msg))
+            } else {
+                Err(ApiError::internal(msg))
+            }
+        }
+    }
 }
 
 /// Refuse a mutating request that does not echo its session's CSRF token.
@@ -1605,6 +1865,7 @@ mod tests {
 
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("Remote-User".to_string()),
+            proxy_headers: None,
             anonymous: Some(true),
             mcp: None,
             max_users: Some(5),
@@ -1617,6 +1878,7 @@ mod tests {
 
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("not a header".to_string()),
+            proxy_headers: None,
             anonymous: None,
             mcp: None,
             max_users: None,
@@ -1627,6 +1889,103 @@ mod tests {
             err.contains("auth.trusted_header"),
             "the startup error must name the setting, got: {err}"
         );
+    }
+
+    #[test]
+    fn the_proxy_header_mode_is_off_until_it_is_turned_on() {
+        let config = GlobalConfig::default();
+        let cfg = AuthCfg::resolve(&config).unwrap();
+        assert!(
+            !cfg.proxy_headers,
+            "trust-the-proxy is opt in: a fresh install believes no Remote-* header"
+        );
+        assert_eq!(
+            cfg.proxy_role,
+            crate::rest::DEFAULT_OIDC_ROLE,
+            "and provisions at the least privileged role"
+        );
+    }
+
+    #[test]
+    fn the_proxy_header_role_follows_the_configured_default() {
+        let mut config = GlobalConfig::default();
+        crate::settings::apply(&mut config, "auth.proxy_headers", "true").unwrap();
+        crate::settings::apply(&mut config, "auth.oidc.default_role", "editor").unwrap();
+        let cfg = AuthCfg::resolve(&config).unwrap();
+        assert!(cfg.proxy_headers);
+        assert_eq!(cfg.proxy_role, Role::Editor);
+    }
+
+    #[test]
+    fn both_header_modes_together_refuse_startup() {
+        let mut config = GlobalConfig::default();
+        crate::settings::apply(&mut config, "auth.trusted_header", "X-Auth-User").unwrap();
+        crate::settings::apply(&mut config, "auth.proxy_headers", "true").unwrap();
+        let err = AuthCfg::resolve(&config).unwrap_err().to_string();
+        assert!(err.contains("pick one"), "{err}");
+        assert!(
+            err.contains("auth.trusted_header") && err.contains("auth.proxy_headers"),
+            "the refusal names both settings so the operator knows what to drop: {err}"
+        );
+    }
+
+    /// A `User` as the store hands one back, for the pure helpers below.
+    fn stored_user(display: &str, email: Option<&str>) -> User {
+        User {
+            name: "ada".to_string(),
+            display: display.to_string(),
+            email: email.map(str::to_string),
+            role: Role::Viewer,
+            disabled: false,
+            last_seen: None,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_presentation_asks_for_no_write() {
+        let user = stored_user("Ada Lovelace", Some("ada@example.test"));
+        assert!(
+            presentation_update(&user, Some("Ada Lovelace"), Some("ada@example.test")).is_none(),
+            "every request carries the headers, so an unchanged pair must not write"
+        );
+        assert!(
+            presentation_update(&user, None, None).is_none(),
+            "an absent header asks for nothing"
+        );
+        assert!(
+            presentation_update(&user, Some("  Ada Lovelace  "), None).is_none(),
+            "and neither does one that only differs by the whitespace around it"
+        );
+    }
+
+    #[test]
+    fn a_changed_presentation_asks_only_for_what_changed() {
+        let user = stored_user("Ada Lovelace", Some("ada@example.test"));
+        assert_eq!(
+            presentation_update(&user, Some("Countess Lovelace"), Some("ada@example.test")),
+            Some((Some("Countess Lovelace"), None)),
+            "the address is unchanged, so it is not rewritten"
+        );
+        assert_eq!(
+            presentation_update(&user, None, Some("ada@contoso.test")),
+            Some((None, Some("ada@contoso.test"))),
+        );
+        let unnamed = stored_user("ada", None);
+        assert_eq!(
+            presentation_update(&unnamed, None, Some("ada@example.test")),
+            Some((None, Some("ada@example.test"))),
+            "an account with no address stored takes the one the proxy sends"
+        );
+    }
+
+    #[test]
+    fn forwarded_groups_are_parsed_and_go_no_further() {
+        assert_eq!(
+            forwarded_groups("eng, ops ,,admins"),
+            vec!["eng".to_string(), "ops".to_string(), "admins".to_string()],
+            "the parse exists so claim mapping can slot in later"
+        );
+        assert!(forwarded_groups("  ,, ").is_empty());
     }
 
     #[test]

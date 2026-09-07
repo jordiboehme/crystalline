@@ -60,6 +60,7 @@ async fn instance(opts: &Options) -> (Arc<Engine>, Arc<AuthStore>, tempfile::Tem
     let cfg = GlobalConfig {
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,

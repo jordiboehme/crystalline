@@ -35,10 +35,18 @@ use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
 /// A real temp-directory domain synced into an in-memory store, with
-/// `auth.mcp` set to `mcp_auth`. Modelled on the other service integration
-/// suites' engine builders; the response format is pinned to plain JSON so no
-/// assertion here has to account for TOON framing.
-async fn build_engine(mcp_auth: bool) -> (tempfile::TempDir, Arc<Engine>) {
+/// `auth.mcp` set to `mcp_auth` and `auth.proxy_headers` to `proxy_headers`.
+/// Modelled on the other service integration suites' engine builders; the
+/// response format is pinned to plain JSON so no assertion here has to account
+/// for TOON framing.
+///
+/// The forward-auth mode is a parameter so a test can prove it opens no door
+/// here: this gate resolves personal MCP tokens and reads nothing else,
+/// whatever a proxy in front says about the person.
+async fn build_engine_with(
+    mcp_auth: bool,
+    proxy_headers: bool,
+) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
     let mut cfg = GlobalConfig::default();
@@ -57,6 +65,7 @@ async fn build_engine(mcp_auth: bool) -> (tempfile::TempDir, Arc<Engine>) {
     });
     cfg.auth = Some(AuthConfig {
         mcp: Some(mcp_auth),
+        proxy_headers: proxy_headers.then_some(true),
         ..AuthConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -79,7 +88,16 @@ async fn build_engine(mcp_auth: bool) -> (tempfile::TempDir, Arc<Engine>) {
 async fn serve_with_mcp_auth(
     mcp_auth: bool,
 ) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
-    let (tmp, engine) = build_engine(mcp_auth).await;
+    serve_with_mcp_auth_and(mcp_auth, false).await
+}
+
+/// [`serve_with_mcp_auth`] on an instance that also trusts the forward-auth
+/// `Remote-*` headers.
+async fn serve_with_mcp_auth_and(
+    mcp_auth: bool,
+    proxy_headers: bool,
+) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
+    let (tmp, engine) = build_engine_with(mcp_auth, proxy_headers).await;
     let store = Arc::new(
         AuthStore::open(&tmp.path().join("web-auth.db"))
             .await
@@ -2233,5 +2251,37 @@ async fn the_aggregate_origin_verbs_hide_a_private_team_domain_from_the_open_tie
         std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
         before,
         "and nothing was pulled into it"
+    );
+}
+
+/// The forward-auth headers open no door here. `auth.mcp` is the locked rule
+/// that every HTTP agent connection authenticates like a human user, and
+/// `auth.proxy_headers` is a browser-facing mode: the gate resolves personal
+/// MCP tokens and reads nothing else, so a handshake carrying the whole
+/// quartet is refused in the identical words a bare one is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_headers_are_no_way_past_the_mcp_gate() {
+    let (addr, _tmp, _store) = serve_with_mcp_auth_and(true, true).await;
+    let refused = reqwest::Client::new()
+        .post(format!("http://{addr}/"))
+        .header("content-type", "application/json")
+        .header("accept", "application/json, text/event-stream")
+        .header("Remote-User", "ada")
+        .header("Remote-Name", "Ada Lovelace")
+        .header("Remote-Email", "ada@example.test")
+        .header("Remote-Groups", "admins")
+        .body(initialize_body())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 401, "an agent still authenticates");
+    assert_eq!(refused.headers()["www-authenticate"], "Bearer");
+
+    let bare = post_initialize(&addr, None).await;
+    assert_eq!(bare.status(), 401);
+    assert_eq!(
+        refused.text().await.unwrap(),
+        bare.text().await.unwrap(),
+        "and is told the same thing a caller with no header at all is"
     );
 }

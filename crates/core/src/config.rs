@@ -260,6 +260,16 @@ impl GlobalConfig {
             .filter(|s| !s.is_empty())
     }
 
+    /// Whether the forward-auth `Remote-*` headers name the signed-in user,
+    /// from `auth.proxy_headers`. Absent config or an absent key means off:
+    /// a header is believed only where an operator has said a proxy sets it.
+    pub fn auth_proxy_headers(&self) -> bool {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.proxy_headers)
+            .unwrap_or(false)
+    }
+
     /// Whether a request that carries no identity is served anyway, from
     /// `auth.anonymous`. Absent config or an absent key means off (false).
     pub fn auth_anonymous(&self) -> bool {
@@ -661,6 +671,13 @@ pub struct AuthConfig {
     /// strips the header from client requests and sets it itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_header: Option<String>,
+    /// Trust the forward-auth quartet a reverse proxy sets - `Remote-User`,
+    /// `Remote-Name`, `Remote-Email` and `Remote-Groups` - to name the
+    /// authenticated user. Absent means off, and no such header is believed.
+    /// Only safe where Crystalline is unreachable except through that proxy
+    /// and the proxy strips client-supplied copies of the headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_headers: Option<bool>,
     /// Serve requests that carry no identity at all. Absent means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
@@ -716,6 +733,12 @@ pub struct OidcConfig {
     /// `viewer`, `editor` or `admin`. Absent means the least privileged one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_role: Option<String>,
+    /// The address the provider sends the browser back to, used verbatim
+    /// instead of the one derived from a request's `Host` and forwarded
+    /// scheme. Absent means derive it, which is right wherever the browser
+    /// reaches this instance at the address the request says it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
 }
 
 /// What a credential renders as wherever a config is displayed instead of
@@ -742,6 +765,7 @@ impl std::fmt::Debug for OidcConfig {
             .field("name", &self.name)
             .field("scopes", &self.scopes)
             .field("default_role", &self.default_role)
+            .field("redirect_uri", &self.redirect_uri)
             .finish()
     }
 }

@@ -50,6 +50,7 @@ async fn serve(opts: Options) -> Fixture {
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
+            proxy_headers: None,
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,
@@ -1337,6 +1338,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
     let mut cfg = GlobalConfig {
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(false),
             mcp: None,
             max_users: None,

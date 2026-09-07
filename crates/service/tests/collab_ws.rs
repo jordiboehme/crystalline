@@ -61,6 +61,7 @@ async fn serve(opts: Options_) -> Fixture {
     let mut cfg = GlobalConfig {
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,

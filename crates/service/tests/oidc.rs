@@ -617,6 +617,22 @@ impl RestCtx {
             name: Some("Contoso".to_string()),
             scopes: None,
             default_role: role.map(str::to_string),
+            redirect_uri: None,
+        }))
+        .await
+    }
+
+    /// The same instance with `auth.oidc.redirect_uri` set, the override a
+    /// deployment behind a proxy that rewrites the Host needs.
+    async fn with_redirect_uri(issuer: &str, redirect_uri: &str) -> RestCtx {
+        RestCtx::build(Some(OidcConfig {
+            issuer: Some(issuer.to_string()),
+            client_id: Some(CLIENT_ID.to_string()),
+            client_secret: Some(CLIENT_SECRET.to_string()),
+            name: Some("Contoso".to_string()),
+            scopes: None,
+            default_role: None,
+            redirect_uri: Some(redirect_uri.to_string()),
         }))
         .await
     }
@@ -671,6 +687,7 @@ impl RestCtx {
         let mut config = GlobalConfig {
             auth: Some(AuthConfig {
                 trusted_header,
+                proxy_headers: None,
                 anonymous: None,
                 mcp: None,
                 max_users,
@@ -2129,6 +2146,7 @@ async fn a_sign_in_past_the_account_cap_is_refused_in_the_operators_words() {
             name: Some("Contoso".to_string()),
             scopes: None,
             default_role: None,
+            redirect_uri: None,
         }),
         Some(1),
     )
@@ -2219,4 +2237,31 @@ async fn control_characters_never_reach_a_stored_name_through_userinfo() {
             "{stored:?} still carries a character that is not text"
         );
     }
+}
+
+/// The configured callback address goes out on the authorization request
+/// exactly as written, instead of the one this instance's own `Host` would
+/// derive. That is what a deployment behind a proxy needs: the address
+/// registered with the provider is a fact about the public entrance, and the
+/// token exchange has to repeat it byte for byte.
+#[tokio::test]
+async fn a_configured_redirect_uri_goes_out_instead_of_the_derived_one() {
+    let idp = FakeIdp::start().await;
+    let configured = "https://kb.example.test/api/v1/auth/oidc/callback";
+    let ctx = RestCtx::with_redirect_uri(&idp.issuer(), configured).await;
+
+    let start = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+    assert_eq!(start.status(), 302);
+    let authorize = location(&start);
+    let sent = openidconnect::url::Url::parse(&authorize)
+        .unwrap()
+        .query_pairs()
+        .find(|(key, _)| key == "redirect_uri")
+        .map(|(_, value)| value.into_owned())
+        .expect("the relying party sends a redirect_uri");
+    assert_eq!(sent, configured);
+    assert!(
+        !sent.contains(&ctx.addr.to_string()),
+        "the request's own address is not what was registered: {sent}"
+    );
 }

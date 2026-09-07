@@ -191,6 +191,10 @@ pub struct OidcSettings {
     /// The role an account provisioned through this provider is created at.
     /// Read by [`resolve_oidc_identity`]'s implementation, not by the protocol.
     default_role: Role,
+    /// The callback address to send out verbatim, from
+    /// `auth.oidc.redirect_uri`. `None` means derive it from each request,
+    /// which is what an instance the browser reaches directly wants.
+    redirect_uri: Option<RedirectUrl>,
 }
 
 impl OidcSettings {
@@ -275,6 +279,30 @@ impl OidcSettings {
         let default_role = trimmed(&block.default_role)
             .and_then(|raw| raw.parse::<Role>().ok())
             .unwrap_or(DEFAULT_OIDC_ROLE);
+        // A configured callback address is checked here as well as at the
+        // settings layer, for the reason the Entra guard is: an environment
+        // variable reaches the config without passing through `settings::apply`.
+        // A provider whose callback address cannot work is one that must not be
+        // offered at all - a sign-in that fails at the provider's own error page
+        // teaches nobody anything, and this refusal names the key.
+        let redirect_uri = match trimmed(&block.redirect_uri) {
+            Some(raw) => {
+                if let Some(problem) = crate::settings::oidc_redirect_uri_problem(&raw) {
+                    tracing::warn!("single sign-on is off: {problem}");
+                    return None;
+                }
+                match RedirectUrl::new(raw) {
+                    Ok(url) => Some(url),
+                    Err(err) => {
+                        tracing::warn!(
+                            "single sign-on is off: auth.oidc.redirect_uri is not a url ({err})"
+                        );
+                        return None;
+                    }
+                }
+            }
+            None => None,
+        };
         Some(OidcSettings {
             issuer,
             client_id: ClientId::new(client_id),
@@ -282,6 +310,7 @@ impl OidcSettings {
             name: trimmed(&block.name).unwrap_or_else(|| DEFAULT_PROVIDER_NAME.to_string()),
             scopes,
             default_role,
+            redirect_uri,
         })
     }
 
@@ -293,6 +322,38 @@ impl OidcSettings {
     /// The role an account provisioned through this provider is created at.
     pub fn default_role(&self) -> Role {
         self.default_role
+    }
+
+    /// The address to send the provider back to, for a request that arrived
+    /// with `headers`.
+    ///
+    /// The configured value wins verbatim when there is one: a deployment
+    /// whose proxy rewrites the `Host`, or terminates a different public name
+    /// in front of this process, has no way to derive the address it
+    /// registered with the provider, and the token exchange has to repeat that
+    /// address byte for byte. With the key unset the address is derived from
+    /// the request, which is right wherever the browser reached this instance
+    /// at the address the request says it did.
+    pub fn redirect_uri(&self, headers: &HeaderMap) -> Result<RedirectUrl, ApiError> {
+        if let Some(configured) = &self.redirect_uri {
+            return Ok(configured.clone());
+        }
+        let derived = absolute_url(headers, CALLBACK_PATH).inspect_err(|_| {
+            // The 400 an operator debugging a proxy most wants to see in the
+            // log - and the moment to remember there is a key that fixes it.
+            refused(
+                "redirect uri could not be derived from the Host header: set \
+                 auth.oidc.redirect_uri when a proxy rewrites it",
+                &self.issuer,
+            );
+        })?;
+        RedirectUrl::new(derived).map_err(|err| {
+            tracing::debug!("the derived redirect uri is not a url: {err}");
+            refused("derived redirect uri is not a url", &self.issuer);
+            ApiError::bad_request(
+                "the address this instance was reached at cannot be turned into a redirect uri",
+            )
+        })
     }
 }
 
@@ -1359,20 +1420,7 @@ async fn start_sign_on(
     link_for: Option<String>,
 ) -> Result<StartedSignOn, ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
-    let redirect_uri = absolute_url(headers, CALLBACK_PATH).inspect_err(|_| {
-        // The 400 an operator debugging a proxy most wants to see in the log.
-        refused(
-            "redirect uri could not be derived from the Host header",
-            &client.settings.issuer,
-        );
-    })?;
-    let redirect_uri = RedirectUrl::new(redirect_uri).map_err(|err| {
-        tracing::debug!("the derived redirect uri is not a url: {err}");
-        refused("derived redirect uri is not a url", &client.settings.issuer);
-        ApiError::bad_request(
-            "the address this instance was reached at cannot be turned into a redirect uri",
-        )
-    })?;
+    let redirect_uri = client.settings.redirect_uri(headers)?;
     let metadata = client.metadata().await?;
     let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
     let provider = client.client(metadata, redirect_uri.clone());
@@ -2123,6 +2171,7 @@ mod tests {
         GlobalConfig {
             auth: Some(AuthConfig {
                 trusted_header: None,
+                proxy_headers: None,
                 anonymous: None,
                 mcp: None,
                 max_users: None,
@@ -2141,6 +2190,7 @@ mod tests {
             name: None,
             scopes: None,
             default_role: None,
+            redirect_uri: None,
         }
     }
 
@@ -2182,6 +2232,70 @@ mod tests {
                 .to_string(),
         );
         assert!(OidcSettings::resolve(&config_with(real)).is_some());
+    }
+
+    /// The configured callback address is taken verbatim, which is the whole
+    /// point of the key: a deployment whose proxy rewrites the Host, or serves
+    /// this instance under a path a request cannot see, has no way to derive
+    /// the address it registered with the provider.
+    #[test]
+    fn a_configured_redirect_uri_is_used_verbatim() {
+        let configured = "https://kb.example.test/api/v1/auth/oidc/callback";
+        let mut oidc = complete();
+        oidc.redirect_uri = Some(configured.to_string());
+        let resolved = OidcSettings::resolve(&config_with(oidc)).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "internal.svc:8787".parse().unwrap());
+        assert_eq!(
+            resolved.redirect_uri(&headers).unwrap().as_str(),
+            configured,
+            "the request's own Host is not consulted when the key is set"
+        );
+    }
+
+    /// With the key unset the address is derived from the request, which is
+    /// what every deployment that needs no override keeps doing.
+    #[test]
+    fn an_unset_redirect_uri_still_follows_the_request() {
+        let resolved = OidcSettings::resolve(&config_with(complete())).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, "knowledge.example".parse().unwrap());
+        assert_eq!(
+            resolved.redirect_uri(&headers).unwrap().as_str(),
+            "https://knowledge.example/api/v1/auth/oidc/callback"
+        );
+    }
+
+    /// The settings layer validates this key, and so does this one: an
+    /// environment variable reaches the config without passing the first
+    /// guard, and a callback address that cannot work is a provider that must
+    /// not be offered at all rather than a sign-in that fails halfway.
+    #[test]
+    fn an_unusable_redirect_uri_leaves_sso_off() {
+        for bad in [
+            "http://kb.example.test/api/v1/auth/oidc/callback",
+            "https://kb.example.test/somewhere-else",
+            "not a url",
+        ] {
+            let mut oidc = complete();
+            oidc.redirect_uri = Some(bad.to_string());
+            assert!(
+                OidcSettings::resolve(&config_with(oidc)).is_none(),
+                "{bad} must not resolve into a working provider"
+            );
+        }
+    }
+
+    /// The path the settings layer validates a configured callback address
+    /// against is the path this router serves it at. Two constants, one fact:
+    /// moving the route without moving the guard would accept an address the
+    /// browser never reaches.
+    #[test]
+    fn the_validated_callback_path_is_the_one_this_router_serves() {
+        assert_eq!(
+            crate::settings::OIDC_CALLBACK_PATH,
+            format!("/api/v1{CALLBACK_PATH}")
+        );
     }
 
     /// An issuer that is not a url is the same class of mistake as a missing

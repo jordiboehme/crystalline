@@ -397,6 +397,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: max_users_effective,
         },
         SettingSpec {
+            key: "auth.proxy_headers",
+            doc: "Trust the reverse proxy's Remote-User, Remote-Name, Remote-Email and Remote-Groups headers to name the signed-in user - ONLY safe when crystalline is unreachable except through that proxy and the proxy strips client-supplied copies of those headers (default false); an account is provisioned on first sight at the auth.oidc.default_role role, viewer when that is unset (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            secret: false,
+            apply: set_proxy_headers,
+            clear: clear_proxy_headers,
+            effective: proxy_headers_effective,
+        },
+        SettingSpec {
             key: "auth.oidc.issuer",
             doc: "The single sign-on provider's issuer url, the one discovery appends /.well-known/openid-configuration to, for example https://login.microsoftonline.com/<your-tenant-id>/v2.0; unset means SSO is off and only the local accounts sign in (applies at the next daemon start)",
             kind: SettingKind::String,
@@ -455,6 +465,16 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_oidc_default_role,
             clear: clear_oidc_default_role,
             effective: oidc_default_role_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.redirect_uri",
+            doc: "The address the single sign-on provider sends the browser back to, used verbatim instead of the one derived from a request's Host and forwarded scheme; an absolute https url (http only on loopback) ending in /api/v1/auth/oidc/callback, registered with the provider in exactly that spelling - set it where a proxy rewrites the Host, unset it to derive the address per request (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_redirect_uri,
+            clear: clear_oidc_redirect_uri,
+            effective: oidc_redirect_uri_effective,
         },
     ]
 }
@@ -1419,6 +1439,33 @@ fn mcp_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_mcp().to_string(), is_default)
 }
 
+// --- auth.proxy_headers -------------------------------------------------------
+
+fn set_proxy_headers(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.proxy_headers must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .proxy_headers = Some(parsed);
+    Ok(())
+}
+
+fn clear_proxy_headers(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.proxy_headers = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn proxy_headers_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.proxy_headers).is_none();
+    (config.auth_proxy_headers().to_string(), is_default)
+}
+
 // --- auth.max_users -----------------------------------------------------------
 
 fn set_max_users(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1660,6 +1707,79 @@ fn oidc_default_role_effective(config: &GlobalConfig) -> (String, bool) {
     }
 }
 
+/// The path the callback is served at, absolute on this instance's HTTP
+/// surface. A configured `auth.oidc.redirect_uri` has to end here, because
+/// that is where the browser the provider redirects actually lands.
+///
+/// Spelled once, and pinned against the router's own constant by
+/// `rest::oidc`'s `the_validated_callback_path_is_the_one_this_router_serves`.
+pub const OIDC_CALLBACK_PATH: &str = "/api/v1/auth/oidc/callback";
+
+/// Why `value` cannot be the address a provider sends a browser back to, or
+/// `None` when it can.
+///
+/// One function for both places the key arrives through - the settings
+/// registry and the environment overlay - so the two guards cannot drift,
+/// exactly as [`entra_issuer_problem`] does for the issuer.
+///
+/// Three rules, and each one is a mistake an operator makes rather than a
+/// theoretical shape: the value has to be an absolute url (a path alone is
+/// what somebody writes who expects the host to be filled in), it has to be
+/// https unless it is a development server on loopback (an identity crossing
+/// plaintext is the one thing this whole flow exists to avoid), and it has to
+/// end at the callback this instance actually serves (anything else registers
+/// an address the browser never reaches).
+pub fn oidc_redirect_uri_problem(value: &str) -> Option<String> {
+    let key = "auth.oidc.redirect_uri";
+    let Ok(url) = openidconnect::url::Url::parse(value.trim()) else {
+        return Some(format!(
+            "{key} must be an absolute url, for example \
+             https://knowledge.example.com{OIDC_CALLBACK_PATH}, got '{value}'"
+        ));
+    };
+    let loopback = match url.host() {
+        Some(openidconnect::url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(openidconnect::url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(openidconnect::url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => {
+            return Some(format!(
+                "{key} must be an https url - an identity is what comes back to it; \
+                 http is allowed only on loopback, for a development server"
+            ));
+        }
+    }
+    if url.path() != OIDC_CALLBACK_PATH || url.query().is_some() || url.fragment().is_some() {
+        return Some(format!(
+            "{key} must end in {OIDC_CALLBACK_PATH}, with no query and no fragment - \
+             that is the one address this instance serves the callback at, and the \
+             provider has to have it registered in exactly that spelling"
+        ));
+    }
+    None
+}
+
+fn set_oidc_redirect_uri(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let uri = oidc_value("auth.oidc.redirect_uri", value)?;
+    if let Some(problem) = oidc_redirect_uri_problem(&uri) {
+        return Err(SettingsError(problem));
+    }
+    oidc_mut(config).redirect_uri = Some(uri);
+    Ok(())
+}
+
+fn clear_oidc_redirect_uri(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.redirect_uri);
+}
+
+fn oidc_redirect_uri_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.redirect_uri.as_ref())
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1693,7 +1813,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirty_one_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_three_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1722,12 +1842,14 @@ mod tests {
                 "auth.anonymous",
                 "auth.mcp",
                 "auth.max_users",
+                "auth.proxy_headers",
                 "auth.oidc.issuer",
                 "auth.oidc.client_id",
                 "auth.oidc.client_secret",
                 "auth.oidc.name",
                 "auth.oidc.scopes",
                 "auth.oidc.default_role",
+                "auth.oidc.redirect_uri",
             ]
         );
     }
@@ -1798,6 +1920,10 @@ mod tests {
                 ("auth.mcp", "CRYSTALLINE_AUTH_MCP".to_string()),
                 ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
                 (
+                    "auth.proxy_headers",
+                    "CRYSTALLINE_AUTH_PROXY_HEADERS".to_string()
+                ),
+                (
                     "auth.oidc.issuer",
                     "CRYSTALLINE_AUTH_OIDC_ISSUER".to_string()
                 ),
@@ -1817,6 +1943,10 @@ mod tests {
                 (
                     "auth.oidc.default_role",
                     "CRYSTALLINE_AUTH_OIDC_DEFAULT_ROLE".to_string()
+                ),
+                (
+                    "auth.oidc.redirect_uri",
+                    "CRYSTALLINE_AUTH_OIDC_REDIRECT_URI".to_string()
                 ),
             ]
         );
@@ -1855,6 +1985,8 @@ mod tests {
         assert!(change_note("auth.oidc.name", &no_env).is_some());
         assert!(change_note("auth.oidc.scopes", &no_env).is_some());
         assert!(change_note("auth.oidc.default_role", &no_env).is_some());
+        assert!(change_note("auth.oidc.redirect_uri", &no_env).is_some());
+        assert!(change_note("auth.proxy_headers", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -2307,7 +2439,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 31);
+        assert_eq!(views.len(), 33);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2336,12 +2468,14 @@ mod tests {
                 "auth.anonymous",
                 "auth.mcp",
                 "auth.max_users",
+                "auth.proxy_headers",
                 "auth.oidc.issuer",
                 "auth.oidc.client_id",
                 "auth.oidc.client_secret",
                 "auth.oidc.name",
                 "auth.oidc.scopes",
                 "auth.oidc.default_role",
+                "auth.oidc.redirect_uri",
             ]
         );
 
@@ -3004,6 +3138,66 @@ mod tests {
         assert!(!config.auth_mcp());
     }
 
+    // --- auth.proxy_headers ---------------------------------------------------
+
+    #[test]
+    fn proxy_headers_round_trips_and_defaults_off() {
+        let mut config = GlobalConfig::default();
+        assert!(
+            !config.auth_proxy_headers(),
+            "trust-the-proxy is off unless an operator turns it on"
+        );
+        apply(&mut config, "auth.proxy_headers", "true").unwrap();
+        assert!(config.auth_proxy_headers());
+        assert_eq!(
+            proxy_headers_effective(&config),
+            ("true".to_string(), false)
+        );
+        unset(&mut config, "auth.proxy_headers").unwrap();
+        assert!(!config.auth_proxy_headers());
+        assert!(
+            config.auth.is_none(),
+            "the block this key created goes with it"
+        );
+    }
+
+    #[test]
+    fn proxy_headers_refuses_anything_but_a_boolean() {
+        let mut config = GlobalConfig::default();
+        let err = apply(&mut config, "auth.proxy_headers", "yes").unwrap_err();
+        assert!(err.to_string().contains("true or false"), "{err}");
+        assert!(config.auth.is_none(), "a rejected value is not written");
+    }
+
+    /// The teaching text is the feature here as much as the flag is: an
+    /// operator who turns this on is trusting every header their proxy does
+    /// not strip, and the doc string has to say so where they read it.
+    #[test]
+    fn proxy_headers_teaches_the_trust_boundary() {
+        let spec = find("auth.proxy_headers").unwrap();
+        assert!(
+            spec.startup_effective,
+            "resolved once, like the other modes"
+        );
+        assert!(!spec.secret);
+        assert!(matches!(spec.kind, SettingKind::Bool));
+        for phrase in [
+            "Remote-User",
+            "Remote-Name",
+            "Remote-Email",
+            "Remote-Groups",
+            "ONLY safe",
+            "unreachable except through",
+            "strips",
+        ] {
+            assert!(
+                spec.doc.contains(phrase),
+                "the doc must teach the trust boundary, missing '{phrase}': {}",
+                spec.doc
+            );
+        }
+    }
+
     // --- auth.max_users -----------------------------------------------------------
 
     #[test]
@@ -3347,6 +3541,77 @@ mod tests {
             assert_eq!(
                 cfg.auth_oidc().and_then(|o| o.default_role.as_deref()),
                 Some(stored)
+            );
+        }
+    }
+
+    // --- auth.oidc.redirect_uri -----------------------------------------------
+
+    #[test]
+    fn oidc_redirect_uri_round_trips_and_unsets_back_to_nothing() {
+        let mut cfg = GlobalConfig::default();
+        let configured = "https://kb.example.test/api/v1/auth/oidc/callback";
+        apply(&mut cfg, "auth.oidc.redirect_uri", configured).unwrap();
+        assert_eq!(
+            cfg.auth_oidc().and_then(|o| o.redirect_uri.as_deref()),
+            Some(configured)
+        );
+        assert_eq!(
+            oidc_redirect_uri_effective(&cfg),
+            (configured.to_string(), false)
+        );
+        unset(&mut cfg, "auth.oidc.redirect_uri").unwrap();
+        assert!(cfg.auth.is_none(), "the emptied blocks go with it");
+        assert_eq!(oidc_redirect_uri_effective(&cfg), (String::new(), true));
+    }
+
+    /// The address the provider sends the browser back to has to be one this
+    /// instance actually serves the callback at, and one an identity may
+    /// safely cross: https everywhere except a loopback development server.
+    #[test]
+    fn oidc_redirect_uri_is_validated_where_it_is_set() {
+        for good in [
+            "https://kb.example.test/api/v1/auth/oidc/callback",
+            "https://kb.example.test:8443/api/v1/auth/oidc/callback",
+            "http://localhost:8787/api/v1/auth/oidc/callback",
+            "http://127.0.0.1:8787/api/v1/auth/oidc/callback",
+        ] {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, "auth.oidc.redirect_uri", good).unwrap_or_else(|e| {
+                panic!("{good} should be accepted: {e}");
+            });
+            assert!(oidc_redirect_uri_problem(good).is_none());
+        }
+
+        let cases = [
+            ("http://kb.example.test/api/v1/auth/oidc/callback", "https"),
+            (
+                "https://kb.example.test/callback",
+                "/api/v1/auth/oidc/callback",
+            ),
+            ("/api/v1/auth/oidc/callback", "absolute"),
+            ("not a url at all", "absolute"),
+        ];
+        for (bad, phrase) in cases {
+            let mut cfg = GlobalConfig::default();
+            let err = apply(&mut cfg, "auth.oidc.redirect_uri", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(phrase),
+                "{bad} must be refused with teaching text naming '{phrase}', got: {err}"
+            );
+            assert!(cfg.auth.is_none(), "a rejected value is not written");
+        }
+    }
+
+    #[test]
+    fn oidc_redirect_uri_names_the_setting_in_every_refusal() {
+        for bad in ["http://kb.example.test/api/v1/auth/oidc/callback", "junk"] {
+            let problem = oidc_redirect_uri_problem(bad).unwrap();
+            assert!(
+                problem.contains("auth.oidc.redirect_uri"),
+                "the refusal must name the key it is about: {problem}"
             );
         }
     }
