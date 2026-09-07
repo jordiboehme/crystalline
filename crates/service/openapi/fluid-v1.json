@@ -482,7 +482,17 @@
             }
           },
           "502": {
-            "description": "The provider's discovery document could not be fetched.",
+            "description": "The provider's discovery document could not be fetched, or it names a tenant-independent issuer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many sign-ins are in flight to start another. Wait a moment and try again.",
             "content": {
               "application/problem+json": {
                 "schema": {

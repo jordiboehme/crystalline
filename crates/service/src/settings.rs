@@ -1467,6 +1467,31 @@ pub const ENTRA_TEMPLATE_MARKER: &str = "{tenantid}";
 pub const ENTRA_TEMPLATE_HELP: &str = "this is the tenant-independent Entra discovery template, not your issuer - use the \
      tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0";
 
+/// What to say when one of the tenant-independent Entra endpoints turns up.
+/// They are worse than the template: they discover cleanly and then refuse
+/// every token as an issuer mismatch, which nobody can read back to this.
+pub const ENTRA_TENANT_INDEPENDENT_HELP: &str = "common, organizations and consumers are the tenant-independent Entra endpoints, not \
+     your issuer - they discover fine and then refuse every token as an issuer mismatch; use \
+     the tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0";
+
+/// Why `issuer` cannot be an issuer, when it is one of the Entra values an
+/// operator pastes off a portal page: the `{tenantid}` template, or the
+/// `common`, `organizations` and `consumers` endpoints. `None` means it may
+/// still be wrong, but not in a way this guard knows about.
+///
+/// One function for both places the issuer can arrive through - the settings
+/// registry and the environment overlay - so the two guards cannot drift.
+pub fn entra_issuer_problem(issuer: &str) -> Option<&'static str> {
+    let lower = issuer.to_ascii_lowercase();
+    if lower.contains(ENTRA_TEMPLATE_MARKER) {
+        return Some(ENTRA_TEMPLATE_HELP);
+    }
+    let (_, after_host) = lower.split_once("login.microsoftonline.com/")?;
+    let first_segment = after_host.split('/').next().unwrap_or("");
+    matches!(first_segment, "common" | "organizations" | "consumers")
+        .then_some(ENTRA_TENANT_INDEPENDENT_HELP)
+}
+
 /// The `auth.oidc` block, created on demand so the first `auth.oidc.*` write
 /// materializes it and every later one reuses it.
 fn oidc_mut(config: &mut GlobalConfig) -> &mut OidcConfig {
@@ -1530,8 +1555,8 @@ fn set_oidc_issuer(config: &mut GlobalConfig, value: &str) -> Result<(), Setting
     // people paste from a portal page, and it fails much later as an issuer
     // mismatch on a token nobody can read. Refuse it here, where the fix is a
     // sentence away.
-    if issuer.to_ascii_lowercase().contains(ENTRA_TEMPLATE_MARKER) {
-        return Err(SettingsError(ENTRA_TEMPLATE_HELP.to_string()));
+    if let Some(help) = entra_issuer_problem(&issuer) {
+        return Err(SettingsError(help.to_string()));
     }
     oidc_mut(config).issuer = Some(issuer);
     Ok(())
@@ -3183,6 +3208,50 @@ mod tests {
             cfg.auth_oidc().is_none(),
             "an auth block without oidc is still SSO off"
         );
+    }
+
+    /// `common`, `organizations` and `consumers` are the tenant-independent
+    /// Entra endpoints. They discover fine and then fail as an issuer mismatch
+    /// on the first token, so they are refused here with the same correction
+    /// the template gets.
+    #[test]
+    fn oidc_issuer_refuses_the_tenant_independent_entra_endpoints() {
+        for endpoint in ["common", "organizations", "consumers"] {
+            let mut config = GlobalConfig::default();
+            let err = apply(
+                &mut config,
+                "auth.oidc.issuer",
+                &format!("https://login.microsoftonline.com/{endpoint}/v2.0"),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("tenant-specific"),
+                "{endpoint}: {err}"
+            );
+            assert!(config.auth.is_none(), "{endpoint} must not be written");
+            // Case and a trailing slash do not get it past the guard.
+            let err = apply(
+                &mut config,
+                "auth.oidc.issuer",
+                &format!(
+                    "https://LOGIN.microsoftonline.com/{}/v2.0/",
+                    endpoint.to_uppercase()
+                ),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("tenant-specific"),
+                "{endpoint}: {err}"
+            );
+        }
+        // A tenant whose id merely starts with one of those words is a tenant.
+        let mut config = GlobalConfig::default();
+        apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/commonwealth-corp/v2.0",
+        )
+        .unwrap();
     }
 
     #[test]

@@ -22,6 +22,38 @@
 //! written here before it reaches a caller. The provider's own words go to
 //! `tracing` at `debug` and nowhere else.
 //!
+//! Three things a reader may go looking for a setting for, and will not find:
+//!
+//! - **No clock-skew leeway on `exp`.** `openidconnect` 4.0.1 checks the expiry
+//!   against the current instant with no leeway knob and leaves `iat`
+//!   unchecked; the only override is replacing its clock, which is a worse
+//!   trade than asking an operator to run NTP.
+//! - **One sign-in per browser at a time.** A second `/login` in the same
+//!   browser overwrites the state cookie, so the first tab's callback answers
+//!   the generic state mismatch. Correct and safe; the person starts again.
+//! - **The provider's endpoints are trusted as far as the issuer is.** The
+//!   token endpoint and the key set url come from the discovery document and
+//!   are fetched wherever it says; a compromised provider could aim those at
+//!   an internal address. Outbound redirects are refused and bodies are
+//!   capped, which closes the cheap half; the rest is the trust the protocol
+//!   places in the operator's choice of issuer.
+//!
+//! **What an operator sees.** The daemon's subscriber is capped at `info`, so
+//! every refusal on these routes is a `warn!` line naming the reason category
+//! and the issuer - never a state, a code, a nonce, a token, the secret or a
+//! claim value - and a validated sign-in is one `info!` line naming the issuer
+//! and the subject. The provider's own words, which can quote its response
+//! body, go to `debug!` and are only seen in a build that raises the cap.
+//!
+//! **Presentation claims may come from userinfo.** A provider that keeps
+//! `preferred_username`, `name` and `email` out of the ID token (Authelia
+//! 4.38+ without a claims policy) has the missing ones fetched from its
+//! userinfo endpoint with the access token, after the ID token validated and
+//! only for the fields it lacked. Userinfo's `sub` must equal the token's or
+//! the sign-in is refused; userinfo never supplies the issuer or the subject,
+//! and never overrides a claim the token carried. An unreachable userinfo
+//! costs the sign-in those fields, not the sign-in.
+//!
 //! **Who the claims are is decided in one place.** The callback ends at
 //! [`resolve_oidc_identity`], which matches the `(issuer, subject)` pair to an
 //! account and provisions one when there is no match. Keeping that behind a
@@ -29,7 +61,7 @@
 //! it is why "an address never reaches an account" is a property of one
 //! function rather than a habit spread over a handler.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,11 +74,12 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use crystalline_core::config::GlobalConfig;
 use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdTokenClaims, CoreIdTokenVerifier,
-    CoreProviderMetadata,
+    CoreProviderMetadata, CoreUserInfoClaims,
 };
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, JsonWebKeySet, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, SignatureVerificationError, http,
+    AccessToken, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken,
+    IssuerUrl, JsonWebKeySet, Nonce, OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier,
+    RedirectUrl, Scope, SignatureVerificationError, SubjectIdentifier, UserInfoError, http,
 };
 use tokio::sync::{Mutex, RwLock};
 
@@ -83,10 +116,38 @@ const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 ///
 /// [`login`] is public and unauthenticated, so the pending map is something a
 /// stranger can add to. The cap is what stops that from being a way to make
-/// this process reserve memory: past it, the oldest record is dropped, which
-/// costs an abandoned tab a restarted sign-in and costs an attacker nothing
-/// they wanted. Generous next to any real instance's concurrent logins.
-const MAX_PENDING: usize = 256;
+/// this process reserve memory. A record is a few hundred bytes, so a full map
+/// is single-digit megabytes; the number is generous next to any real
+/// instance's concurrent logins and small next to what a flood would want.
+const MAX_PENDING: usize = 10_000;
+
+/// How old a record must be before a full map may drop it to make room.
+///
+/// Without this, filling the map is a way to evict every real sign-in mid
+/// consent: the cap would be reached and the oldest record - somebody who
+/// pressed the button a few seconds ago - would go. With it, a full map of
+/// records younger than this refuses the newcomer instead, which costs a
+/// flood its own next request and costs the person mid-consent nothing.
+const MIN_EVICT_AGE: Duration = Duration::from_secs(30);
+
+/// How long a failed discovery is remembered before the provider is asked
+/// again.
+///
+/// Every discovery is an outbound request that can take the whole
+/// [`PROVIDER_TIMEOUT`] to fail, started from a public route. Without a
+/// negative cache a dark provider is probed once per sign-in, which makes N
+/// strangers' GETs N ten-second requests aimed at it; with one, the sign-ins
+/// inside the window are refused from memory with the same sentence.
+const DISCOVERY_FAILURE_TTL: Duration = Duration::from_secs(5);
+
+/// The most a provider's answer to any single outbound call may weigh.
+///
+/// A discovery document is a few kilobytes and a key set a few more; a
+/// provider that sends a megabyte is not one whose answer this process should
+/// buffer. The provider is operator-configured and so trusted, and the timeout
+/// bounds the read in practice, but the bound is one comparison to make
+/// explicit.
+const MAX_PROVIDER_BODY: usize = 1024 * 1024;
 
 /// The scopes requested when `auth.oidc.scopes` is unset. `openid` is added by
 /// the library itself and is deliberately not repeated here.
@@ -136,12 +197,12 @@ impl OidcSettings {
     /// Read the `auth.oidc` block, or `None` when this instance has no
     /// provider configured.
     ///
-    /// The `{tenantid}` check the settings layer already applies is repeated
-    /// here on purpose. `CRYSTALLINE_AUTH_OIDC_ISSUER` reaches the config
-    /// through the environment overlay, which does not go through
-    /// `settings::apply` for every key on every path, and an issuer template
-    /// that got past the first guard would otherwise fail much later as an
-    /// unreadable token. Same string, same sentence, one definition of both.
+    /// The Entra checks the settings layer already applies are repeated here
+    /// on purpose. `CRYSTALLINE_AUTH_OIDC_ISSUER` reaches the config through
+    /// the environment overlay, which does not go through `settings::apply`
+    /// for every key on every path, and a template or a tenant-independent
+    /// endpoint that got past the first guard would otherwise fail much later
+    /// as an unreadable token. One function, called from both places.
     pub fn resolve(config: &GlobalConfig) -> Option<OidcSettings> {
         let block = config.auth_oidc()?;
         let mut missing: Vec<&str> = Vec::new();
@@ -175,14 +236,8 @@ impl OidcSettings {
             client_id.expect("checked above"),
             client_secret.expect("checked above"),
         );
-        if issuer
-            .to_ascii_lowercase()
-            .contains(crate::settings::ENTRA_TEMPLATE_MARKER)
-        {
-            tracing::warn!(
-                "single sign-on is off: {}",
-                crate::settings::ENTRA_TEMPLATE_HELP
-            );
+        if let Some(help) = crate::settings::entra_issuer_problem(&issuer) {
+            tracing::warn!("single sign-on is off: {help}");
             return None;
         }
         let issuer = match IssuerUrl::new(issuer) {
@@ -192,6 +247,12 @@ impl OidcSettings {
                 return None;
             }
         };
+        if issuer_is_plaintext_off_loopback(&issuer) {
+            tracing::warn!(
+                "auth.oidc.issuer is served over plain http off loopback: the client secret and \
+                 every ID token cross the network in clear text - use an https issuer"
+            );
+        }
         let scopes = match trimmed(&block.scopes) {
             Some(raw) => raw
                 .split_whitespace()
@@ -251,6 +312,25 @@ impl std::fmt::Debug for OidcSettings {
     }
 }
 
+/// Whether `issuer` would carry the client secret and every ID token in clear
+/// text: an `http://` url whose host is not a loopback address.
+///
+/// Loopback is allowed without comment because a development setup and this
+/// crate's own tests depend on it; anything else over plain http is a
+/// configuration worth a warning, not a refusal.
+fn issuer_is_plaintext_off_loopback(issuer: &IssuerUrl) -> bool {
+    let url = issuer.url();
+    if url.scheme() == "https" {
+        return false;
+    }
+    match url.host() {
+        Some(openidconnect::url::Host::Domain(domain)) => !domain.eq_ignore_ascii_case("localhost"),
+        Some(openidconnect::url::Host::Ipv4(ip)) => !ip.is_loopback(),
+        Some(openidconnect::url::Host::Ipv6(ip)) => !ip.is_loopback(),
+        None => true,
+    }
+}
+
 // --- the http client ----------------------------------------------------
 
 /// The one HTTP client the relying party makes its outbound calls with.
@@ -274,6 +354,8 @@ enum OidcHttpError {
     Build(#[from] http::Error),
     #[error("the identity provider could not be reached: {0}")]
     Send(#[from] reqwest::Error),
+    #[error("the identity provider's answer was larger than {MAX_PROVIDER_BODY} bytes")]
+    TooLarge,
 }
 
 impl OidcHttp {
@@ -302,15 +384,21 @@ impl OidcHttp {
         for (name, value) in parts.headers.iter() {
             outbound = outbound.header(name, value);
         }
-        let response = outbound.send().await?;
+        let mut response = outbound.send().await?;
         let status = response.status();
         let headers = response.headers().clone();
-        let body = response.bytes().await?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await? {
+            if body.len() + chunk.len() > MAX_PROVIDER_BODY {
+                return Err(OidcHttpError::TooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
         let mut built = http::Response::builder().status(status);
         if let Some(existing) = built.headers_mut() {
             *existing = headers;
         }
-        Ok(built.body(body.to_vec())?)
+        Ok(built.body(body)?)
     }
 }
 
@@ -346,7 +434,7 @@ struct Pending {
     /// proxy the second derivation can differ from the first.
     redirect_uri: RedirectUrl,
     /// The account this sign-in is linking an identity to, when it was started
-    /// with `?link=1` from a signed-in session. `None` is an ordinary sign-in.
+    /// with `?link=true` from a signed-in session. `None` is an ordinary sign-in.
     /// Read by the account-linking task; carried here because the intent
     /// belongs to the request that started the flow, not to the one that
     /// finishes it.
@@ -357,37 +445,177 @@ struct Pending {
 
 /// The sign-ins in flight, keyed by state.
 #[derive(Default)]
-struct PendingStore(HashMap<String, Pending>);
+struct PendingStore {
+    records: HashMap<String, Pending>,
+    /// Every state inserted, oldest first. Records are only ever inserted
+    /// with a fresh `started`, so this is chronological, and expiry and
+    /// eviction both walk it from the front in O(1) per record. An entry
+    /// whose record was already taken is skipped when it is reached.
+    order: VecDeque<(Instant, String)>,
+}
+
+/// The map is full of sign-ins too young to evict. See [`MIN_EVICT_AGE`].
+#[derive(Debug)]
+struct PendingFull;
+
+/// Why a state had no record to take: it names none, or it named one that
+/// outlived [`PENDING_TTL`]. Both answer the same sentence; they warn
+/// differently, because an operator reading "expired" checks the provider's
+/// consent screen and one reading "unknown" checks for a replay.
+#[derive(Debug, PartialEq, Eq)]
+enum StateMiss {
+    Unknown,
+    Expired,
+}
 
 impl PendingStore {
+    /// How many sign-ins are in flight.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
     /// Remember `pending` under `state`, forgetting whatever has expired and,
-    /// if the map is still full, the oldest record left.
-    fn insert(&mut self, state: String, pending: Pending) {
+    /// if the map is still full, the oldest records past [`MIN_EVICT_AGE`].
+    /// Refuses when the map is full of records younger than that: a flood
+    /// must not be able to push a real sign-in out from under someone.
+    fn insert(&mut self, state: String, pending: Pending) -> Result<(), PendingFull> {
         let now = Instant::now();
-        self.0
-            .retain(|_, p| now.duration_since(p.started) < PENDING_TTL);
-        while self.0.len() >= MAX_PENDING {
-            let Some(oldest) = self
-                .0
-                .iter()
-                .min_by_key(|(_, p)| p.started)
-                .map(|(k, _)| k.clone())
-            else {
+        self.purge_expired(now);
+        while self.records.len() >= MAX_PENDING {
+            let Some((started, key)) = self.order.front() else {
                 break;
             };
-            self.0.remove(&oldest);
+            let already_taken = !self.records.contains_key(key);
+            if !already_taken && now.duration_since(*started) < MIN_EVICT_AGE {
+                return Err(PendingFull);
+            }
+            let (_, key) = self.order.pop_front().expect("checked just above");
+            self.records.remove(&key);
         }
-        self.0.insert(state, pending);
+        self.order.push_back((pending.started, state.clone()));
+        self.records.insert(state, pending);
+        Ok(())
     }
 
     /// Take the record for `state`, if it exists and has not expired.
     ///
     /// Taking rather than reading is the whole point: an authorization code
     /// may be presented once, so the record that authorizes presenting it is
-    /// removed before the exchange runs and a replay finds nothing.
-    fn take(&mut self, state: &str) -> Option<Pending> {
-        let pending = self.0.remove(state)?;
-        (Instant::now().duration_since(pending.started) < PENDING_TTL).then_some(pending)
+    /// removed before the exchange runs and a replay finds nothing. Expired
+    /// records are purged here too, so an idle instance does not hold them
+    /// until the next login happens to insert.
+    fn take(&mut self, state: &str) -> Result<Pending, StateMiss> {
+        let now = Instant::now();
+        // Looked up before the purge, so an expired record is reported as
+        // expired rather than as never having existed.
+        let taken = self.records.remove(state);
+        self.purge_expired(now);
+        match taken {
+            Some(pending) if now.duration_since(pending.started) < PENDING_TTL => Ok(pending),
+            Some(_) => Err(StateMiss::Expired),
+            None => Err(StateMiss::Unknown),
+        }
+    }
+
+    /// Forget every record older than [`PENDING_TTL`], from the front of the
+    /// chronological order until the first one that is still live.
+    fn purge_expired(&mut self, now: Instant) {
+        while let Some((started, _)) = self.order.front() {
+            if now.duration_since(*started) < PENDING_TTL {
+                break;
+            }
+            let (_, key) = self.order.pop_front().expect("checked just above");
+            self.records.remove(&key);
+        }
+    }
+}
+
+// --- discovery ------------------------------------------------------------
+
+/// Why discovery did not produce usable metadata, in the two shapes a caller
+/// is told apart by. `Clone` because one result is handed to every sign-in
+/// that shared the fetch.
+#[derive(Clone, Debug)]
+enum DiscoveryFailure {
+    /// The document was fetched and its `issuer` is the Entra `{tenantid}`
+    /// template: the operator configured a tenant-independent endpoint, and
+    /// the provider was reached and said so.
+    TenantIndependentIssuer,
+    /// Everything else - unreachable, a non-2xx, malformed, a plain issuer
+    /// mismatch.
+    Unavailable,
+}
+
+impl DiscoveryFailure {
+    fn classify(err: &openidconnect::DiscoveryError<OidcHttpError>) -> DiscoveryFailure {
+        if let openidconnect::DiscoveryError::Validation(message) = err
+            && message
+                .to_ascii_lowercase()
+                .contains(crate::settings::ENTRA_TEMPLATE_MARKER)
+        {
+            return DiscoveryFailure::TenantIndependentIssuer;
+        }
+        DiscoveryFailure::Unavailable
+    }
+
+    fn into_error(self, issuer: &IssuerUrl) -> ApiError {
+        let reason = match self {
+            DiscoveryFailure::TenantIndependentIssuer => {
+                "discovery names a tenant-independent issuer"
+            }
+            DiscoveryFailure::Unavailable => "discovery failed",
+        };
+        refused(reason, issuer);
+        match self {
+            DiscoveryFailure::TenantIndependentIssuer => ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                title: "Identity provider misconfigured",
+                detail: format!(
+                    "the identity provider answered discovery with a tenant-independent issuer, so \
+                     auth.oidc.issuer is not a tenant's issuer: {}",
+                    crate::settings::ENTRA_TEMPLATE_HELP
+                ),
+                token_required: None,
+            },
+            DiscoveryFailure::Unavailable => provider_unavailable("discovery"),
+        }
+    }
+}
+
+/// The value a shared discovery publishes: `None` while in flight, then the
+/// result every waiter reads.
+type Flight = Option<Result<CoreProviderMetadata, DiscoveryFailure>>;
+
+/// The discovery bookkeeping beside the metadata cache: the one fetch in
+/// flight, if any, and the last failure for the negative cache. Behind a
+/// `std` mutex that is only ever held for a few instructions and never across
+/// an await.
+#[derive(Default)]
+struct Discovery {
+    in_flight: Option<tokio::sync::watch::Receiver<Flight>>,
+    last_failure: Option<(Instant, DiscoveryFailure)>,
+}
+
+/// Clears the in-flight marker if the leading fetch is dropped before it
+/// finishes - a browser that gave up mid-discovery takes its handler's future
+/// with it - so the followers, whose `changed()` fails when the sender goes,
+/// find the way clear to lead the next attempt instead of a marker nobody
+/// will ever clear.
+struct FlightGuard<'a> {
+    discovery: &'a std::sync::Mutex<Discovery>,
+    finished: bool,
+}
+
+impl Drop for FlightGuard<'_> {
+    fn drop(&mut self) {
+        if !self.finished {
+            let mut discovery = self
+                .discovery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            discovery.in_flight = None;
+        }
     }
 }
 
@@ -406,6 +634,8 @@ pub struct OidcClient {
     http: OidcHttp,
     /// The discovery document plus its JSON Web Key Set, once fetched.
     metadata: RwLock<Option<CoreProviderMetadata>>,
+    /// The fetch in flight and the last failure. See [`Discovery`].
+    discovery: std::sync::Mutex<Discovery>,
     pending: Mutex<PendingStore>,
 }
 
@@ -420,6 +650,7 @@ impl OidcClient {
             settings,
             http: OidcHttp::new()?,
             metadata: RwLock::new(None),
+            discovery: std::sync::Mutex::new(Discovery::default()),
             pending: Mutex::new(PendingStore::default()),
         })))
     }
@@ -431,31 +662,93 @@ impl OidcClient {
 
     /// The provider metadata, fetching and caching it on first use.
     ///
-    /// The fetch happens with NO lock held, and the lock is taken only to
-    /// store the result. Two concurrent first sign-ins therefore both fetch
-    /// and one result is discarded, which is the deliberate side of the
-    /// trade: holding the write lock across the call would serialize every
-    /// waiting request behind it, so a provider that has gone dark would turn
-    /// ten simultaneous sign-ins on this public route into ten sequential
-    /// timeouts rather than ten concurrent ones. A duplicate fetch costs one
-    /// extra request; serialization costs the whole login surface.
+    /// The fetch is shared and unlocked. Shared: concurrent first sign-ins
+    /// elect one leader, which fetches and publishes the result on a watch
+    /// channel every follower awaits, so N sign-ins arriving at a cold cache
+    /// are one outbound request rather than N. Unlocked: the leader holds no
+    /// lock across the network call, so a provider that has gone dark cannot
+    /// turn the followers into a queue of ten-second waits; they all wake on
+    /// the one result. A failure is remembered for [`DISCOVERY_FAILURE_TTL`]
+    /// and answered from memory inside that window, so a dark provider is
+    /// probed once per window rather than once per stranger's GET.
     async fn metadata(&self) -> Result<CoreProviderMetadata, ApiError> {
-        if let Some(cached) = self.metadata.read().await.clone() {
-            return Ok(cached);
+        // A follower whose leader vanished mid-fetch takes the lead itself.
+        // Bounded so a pathological run of vanishing leaders ends in an
+        // answer rather than a loop.
+        for _ in 0..4 {
+            if let Some(cached) = self.metadata.read().await.clone() {
+                return Ok(cached);
+            }
+            let role = {
+                let mut discovery = self
+                    .discovery
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(receiver) = &discovery.in_flight {
+                    Err(receiver.clone())
+                } else if let Some((at, failure)) = &discovery.last_failure
+                    && at.elapsed() < DISCOVERY_FAILURE_TTL
+                {
+                    return Err(failure.clone().into_error(&self.settings.issuer));
+                } else {
+                    let (sender, receiver) = tokio::sync::watch::channel(None);
+                    discovery.in_flight = Some(receiver);
+                    Ok(sender)
+                }
+            };
+            match role {
+                Err(mut receiver) => loop {
+                    if let Some(result) = receiver.borrow_and_update().clone() {
+                        return result.map_err(|failure| failure.into_error(&self.settings.issuer));
+                    }
+                    if receiver.changed().await.is_err() {
+                        // The leader is gone without publishing. Go round
+                        // again; the guard has cleared the marker.
+                        break;
+                    }
+                },
+                Ok(sender) => {
+                    let mut guard = FlightGuard {
+                        discovery: &self.discovery,
+                        finished: false,
+                    };
+                    let result = CoreProviderMetadata::discover_async(
+                        self.settings.issuer.clone(),
+                        &self.http,
+                    )
+                    .await
+                    .map_err(|err| {
+                        tracing::debug!("discovery against the identity provider failed: {err}");
+                        DiscoveryFailure::classify(&err)
+                    });
+                    // The cache is written before the marker is cleared, so
+                    // a sign-in arriving in between finds the document rather
+                    // than an empty cache and a clear road to a second fetch.
+                    if let Ok(fetched) = &result {
+                        let mut slot = self.metadata.write().await;
+                        if slot.is_none() {
+                            *slot = Some(fetched.clone());
+                        }
+                    }
+                    {
+                        let mut discovery = self
+                            .discovery
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        discovery.in_flight = None;
+                        discovery.last_failure = result
+                            .as_ref()
+                            .err()
+                            .map(|failure| (Instant::now(), failure.clone()));
+                    }
+                    guard.finished = true;
+                    let _ = sender.send(Some(result.clone()));
+                    return result.map_err(|failure| failure.into_error(&self.settings.issuer));
+                }
+            }
         }
-        let fetched =
-            CoreProviderMetadata::discover_async(self.settings.issuer.clone(), &self.http)
-                .await
-                .map_err(|err| provider_failure("discovery", err))?;
-        let mut slot = self.metadata.write().await;
-        // Another request may have landed its own fetch while this one ran.
-        // Keep theirs: both are the same document, and the cached one may
-        // already be the refreshed-keys copy `refresh_keys` wrote.
-        if let Some(cached) = slot.clone() {
-            return Ok(cached);
-        }
-        *slot = Some(fetched.clone());
-        Ok(fetched)
+        refused("discovery kept being abandoned", &self.settings.issuer);
+        Err(provider_unavailable("discovery"))
     }
 
     /// Re-fetch the JSON Web Key Set and replace the cached copy's.
@@ -470,7 +763,9 @@ impl OidcClient {
         let current = self.metadata().await?;
         let jwks = JsonWebKeySet::fetch_async(current.jwks_uri(), &self.http)
             .await
-            .map_err(|err| provider_failure("fetching the signing keys", err))?;
+            .map_err(|err| {
+                provider_failure("fetching the signing keys", &self.settings.issuer, err)
+            })?;
         let refreshed = current.set_jwks(jwks);
         *self.metadata.write().await = Some(refreshed.clone());
         Ok(refreshed)
@@ -534,7 +829,10 @@ impl OidcClient {
             Ok(claims) => return Ok(claims.clone()),
             Err(err) if !signature_failed => {
                 tracing::debug!("the id token did not validate: {err}");
-                return Err(refused_token());
+                return Err(refused_token(
+                    token_refusal_reason(&err),
+                    &self.settings.issuer,
+                ));
             }
             Err(err) => {
                 tracing::debug!(
@@ -549,10 +847,97 @@ impl OidcClient {
             Ok(claims) => Ok(claims.clone()),
             Err(err) => {
                 tracing::debug!("the id token did not validate against the refreshed keys: {err}");
-                Err(refused_token())
+                Err(refused_token(
+                    token_refusal_reason(&err),
+                    &self.settings.issuer,
+                ))
             }
         }
     }
+
+    /// Fill the presentation claims the ID token lacked from the provider's
+    /// userinfo endpoint. See the module doc for the rules; in short, only the
+    /// missing fields, never the identity, and a `sub` that is not the
+    /// token's refuses the sign-in.
+    ///
+    /// An unreachable or unusable userinfo is a `warn!` and an `Ok(())`: the
+    /// identity is the validated token's, which is already in hand, and the
+    /// fields stay `None` for the resolver to cope with.
+    async fn complete_from_userinfo(
+        &self,
+        metadata: CoreProviderMetadata,
+        redirect_uri: RedirectUrl,
+        access_token: AccessToken,
+        claims: &mut OidcClaims,
+    ) -> Result<(), ApiError> {
+        let issuer = &self.settings.issuer;
+        let provider = self.client(metadata, redirect_uri);
+        let expected = SubjectIdentifier::new(claims.subject.clone());
+        let request = match provider.user_info(access_token, Some(expected.clone())) {
+            Ok(request) => request,
+            Err(err) => {
+                tracing::warn!(
+                    "single sign-on at issuer {} carried a minimal id token and the provider \
+                     publishes no userinfo endpoint, so the presentation claims stay absent ({err})",
+                    issuer.as_str()
+                );
+                return Ok(());
+            }
+        };
+        let info: CoreUserInfoClaims = match request.request_async(&self.http).await {
+            Ok(info) => info,
+            Err(UserInfoError::ClaimsVerification(err)) => {
+                // The library already compared `sub` against `expected`; this
+                // is the token substitution the check exists for.
+                tracing::debug!("userinfo did not verify: {err}");
+                return Err(refused_token("userinfo subject mismatch", issuer));
+            }
+            Err(err) => {
+                tracing::debug!("userinfo against the identity provider failed: {err}");
+                tracing::warn!(
+                    "single sign-on at issuer {} could not complete its claims from userinfo, so \
+                     the presentation claims stay absent (userinfo unavailable)",
+                    issuer.as_str()
+                );
+                return Ok(());
+            }
+        };
+        // Belt and braces beside the library's own comparison: the subject is
+        // the one thing userinfo is never allowed to change.
+        if info.subject() != &expected {
+            return Err(refused_token("userinfo subject mismatch", issuer));
+        }
+        let filled = claims.fill_missing_from_userinfo(&info);
+        if filled.is_empty() {
+            tracing::debug!("userinfo carried none of the missing presentation claims");
+        } else {
+            tracing::debug!("filled {} from userinfo", filled.join(", "));
+        }
+        Ok(())
+    }
+}
+
+/// The category a `warn!` line names for a token that did not validate: the
+/// check that failed, never its inputs.
+fn token_refusal_reason(err: &ClaimsVerificationError) -> &'static str {
+    match err {
+        ClaimsVerificationError::SignatureVerification(_) => "id token signature",
+        ClaimsVerificationError::InvalidIssuer(_) => "id token issuer",
+        ClaimsVerificationError::InvalidAudience(_) => "id token audience",
+        ClaimsVerificationError::Expired(_) => "id token expired",
+        ClaimsVerificationError::InvalidNonce(_) => "id token nonce",
+        ClaimsVerificationError::InvalidSubject(_) => "id token subject",
+        _ => "id token validation",
+    }
+}
+
+/// The one `warn!` shape for every refusal on these routes: the reason
+/// category and the issuer, nothing that came from the flow itself.
+fn refused(reason: &str, issuer: &IssuerUrl) {
+    tracing::warn!(
+        "single sign-on refused ({reason}) for issuer {}",
+        issuer.as_str()
+    );
 }
 
 /// The one sentence a caller ever hears about a token that did not validate.
@@ -560,9 +945,10 @@ impl OidcClient {
 /// One message for every way validation can fail - a wrong issuer, a stale
 /// nonce, an unknown key, an expired token - for the reason the password login
 /// gives one message for a wrong name and a wrong password: which half failed
-/// is exactly what a prober is asking. The reason itself is in the `debug` log
-/// beside the call.
-fn refused_token() -> ApiError {
+/// is exactly what a prober is asking. The reason category goes to the
+/// operator's log at `warn`, the provider's own words at `debug`.
+fn refused_token(reason: &str, issuer: &IssuerUrl) -> ApiError {
+    refused(reason, issuer);
     ApiError::unauthorized(
         "the identity provider's answer could not be verified, so this sign-in was refused - \
          start again from the sign-in page",
@@ -576,8 +962,16 @@ fn refused_token() -> ApiError {
 /// provider's raw response body, which for a token exchange is a response to a
 /// request that carried this instance's client secret. None of it reaches the
 /// browser.
-fn provider_failure(what: &str, err: impl std::fmt::Display) -> ApiError {
+fn provider_failure(what: &str, issuer: &IssuerUrl, err: impl std::fmt::Display) -> ApiError {
     tracing::debug!("{what} against the identity provider failed: {err}");
+    refused(&format!("{what} failed"), issuer);
+    provider_unavailable(what)
+}
+
+/// The sentence for a provider that did not answer `what` usably, with
+/// nothing to log. The negative cache answers with this too, so a refusal
+/// from memory reads the same as the one it remembers.
+fn provider_unavailable(what: &str) -> ApiError {
     ApiError {
         status: StatusCode::BAD_GATEWAY,
         title: "Identity provider unavailable",
@@ -625,6 +1019,16 @@ fn absolute_url(headers: &HeaderMap, path: &str) -> Result<String, ApiError> {
                  provider back to cannot be worked out",
             )
         })?;
+    // The header is untrusted input that ends up inside a url. A browser sends
+    // the real host, so this only ever refuses a hand-made request, but a
+    // value that could open a path, a query or a userinfo component is not one
+    // to interpolate.
+    if !host_is_well_formed(host) {
+        return Err(ApiError::bad_request(
+            "this request's Host header is not a host name or address with an optional port, \
+             so it cannot be part of the address to send the identity provider back to",
+        ));
+    }
     let scheme =
         if super::auth::forwarded_https(headers) || !super::auth::is_loopback_request(headers) {
             "https"
@@ -632,6 +1036,53 @@ fn absolute_url(headers: &HeaderMap, path: &str) -> Result<String, ApiError> {
             "http"
         };
     Ok(format!("{scheme}://{host}/api/v1{path}"))
+}
+
+/// Whether `host` is a bare host and optional port: a name of letters, digits,
+/// dots and hyphens, or a dotted address, or a bracketed IPv6 address, and
+/// then nothing but `:` and up to five digits. Deliberately conservative -
+/// no underscores, no percent-encoding, nothing a url parser would read as
+/// anything but a host.
+fn host_is_well_formed(host: &str) -> bool {
+    let (name, port) = match host.strip_prefix('[') {
+        Some(rest) => {
+            let Some((address, tail)) = rest.split_once(']') else {
+                return false;
+            };
+            let address_ok = !address.is_empty()
+                && address
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+            if !address_ok {
+                return false;
+            }
+            match tail {
+                "" => (None, None),
+                tail => match tail.strip_prefix(':') {
+                    Some(port) => (None, Some(port)),
+                    None => return false,
+                },
+            }
+        }
+        None => match host.rsplit_once(':') {
+            Some((name, port)) => (Some(name), Some(port)),
+            None => (Some(host), None),
+        },
+    };
+    if let Some(name) = name
+        && (name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-'))
+    {
+        return false;
+    }
+    match port {
+        None => true,
+        Some(port) => {
+            !port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit())
+        }
+    }
 }
 
 // --- the routes ---------------------------------------------------------
@@ -696,7 +1147,15 @@ pub struct LoginQuery {
         ),
         (
             status = 502,
-            description = "The provider's discovery document could not be fetched.",
+            description = "The provider's discovery document could not be fetched, \
+                           or it names a tenant-independent issuer.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 503,
+            description = "Too many sign-ins are in flight to start another. \
+                           Wait a moment and try again.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -717,6 +1176,10 @@ pub async fn login(
             identity
                 .require_account()
                 .map_err(|_| {
+                    refused(
+                        "link intent without a signed-in session",
+                        &client.settings.issuer,
+                    );
                     ApiError::unauthorized(
                         "linking a single sign-on identity needs a signed-in account - sign in \
                          first, then link from your profile",
@@ -748,7 +1211,7 @@ pub async fn login(
     }
     let (authorize_url, csrf, nonce) = request.url();
     let state_value = csrf.secret().clone();
-    client.pending.lock().await.insert(
+    let remembered = client.pending.lock().await.insert(
         state_value.clone(),
         Pending {
             nonce,
@@ -758,6 +1221,17 @@ pub async fn login(
             started: Instant::now(),
         },
     );
+    if remembered.is_err() {
+        refused("too many sign-ins in flight", &client.settings.issuer);
+        return Err(ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            title: "Too many sign-ins in flight",
+            detail: "this instance has too many single sign-ons in flight to start another - \
+                     wait a moment and try again"
+                .to_string(),
+            token_required: None,
+        });
+    }
     let cookie = Cookie::build((STATE_COOKIE, state_value))
         .path("/")
         .http_only(true)
@@ -882,12 +1356,12 @@ pub async fn callback(
     let outcome = finish(&state, bound, query).await;
     let claims = match outcome {
         Ok(claims) => claims,
-        Err(err) => return Ok((jar, err).into_response()),
+        Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
     let user = resolve_oidc_identity(&state, claims).await;
     let user = match user {
         Ok(user) => user,
-        Err(err) => return Ok((jar, err).into_response()),
+        Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
     let jar = super::auth::issue_session(&state, jar, &headers, &user).await?;
     Ok((jar, super::auth::no_store(), found("/")).into_response())
@@ -905,20 +1379,23 @@ async fn finish(
     query: CallbackQuery,
 ) -> Result<OidcClaims, ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
+    let issuer = &client.settings.issuer;
     if let Some(error) = query.error.as_deref() {
-        // The provider's words go to the log; the browser gets ours. An
+        // The provider's words go to the debug log; the browser gets ours. An
         // `error_description` is attacker-influenceable text on some providers
         // and is echoed into a page nobody would have reason to distrust.
         tracing::debug!(
             "the identity provider refused the sign-in: {error} ({})",
             query.error_description.as_deref().unwrap_or("no detail")
         );
+        refused("the provider refused the sign-in", issuer);
         return Err(ApiError::unauthorized(
             "the identity provider did not complete this sign-in - start again from the sign-in \
              page",
         ));
     }
     let (Some(code), Some(returned_state)) = (query.code, query.state) else {
+        refused("callback without a code and a state", issuer);
         return Err(ApiError::unauthorized(
             "this callback did not carry an authorization code and a state, so there is no \
              sign-in to finish",
@@ -927,31 +1404,61 @@ async fn finish(
     // Both halves, and in this order: the cookie proves the browser is the one
     // that started a sign-in, the record proves the state is one this process
     // generated and has not already spent.
-    if bound.as_deref() != Some(returned_state.as_str()) {
-        tracing::debug!("the callback's state does not match the state cookie");
-        return Err(state_mismatch());
+    let cookie_matches = bound.as_deref().is_some_and(|bound| {
+        super::auth::constant_time_eq(bound.as_bytes(), returned_state.as_bytes())
+    });
+    if !cookie_matches {
+        return Err(state_mismatch(
+            "state does not match the browser's cookie",
+            issuer,
+        ));
     }
-    let Some(pending) = client.pending.lock().await.take(&returned_state) else {
-        tracing::debug!("the callback's state names no pending sign-in");
-        return Err(state_mismatch());
+    let pending = match client.pending.lock().await.take(&returned_state) {
+        Ok(pending) => pending,
+        Err(StateMiss::Unknown) => {
+            return Err(state_mismatch("state names no pending sign-in", issuer));
+        }
+        Err(StateMiss::Expired) => {
+            return Err(state_mismatch("pending sign-in expired", issuer));
+        }
     };
     let metadata = client.metadata().await?;
     let response = client
         .client(metadata.clone(), pending.redirect_uri.clone())
         .exchange_code(AuthorizationCode::new(code))
-        .map_err(|err| provider_failure("the token exchange", err))?
+        .map_err(|err| provider_failure("the token exchange", issuer, err))?
         .set_pkce_verifier(pending.verifier)
         .request_async(&client.http)
         .await
-        .map_err(|err| provider_failure("the token exchange", err))?;
+        .map_err(|err| provider_failure("the token exchange", issuer, err))?;
     let Some(id_token) = response.extra_fields().id_token() else {
-        tracing::debug!("the token response carried no id token");
-        return Err(refused_token());
+        return Err(refused_token("no id token in the token response", issuer));
     };
-    let claims = client
-        .verify_id_token(metadata, pending.redirect_uri, id_token, &pending.nonce)
+    let verified = client
+        .verify_id_token(
+            metadata.clone(),
+            pending.redirect_uri.clone(),
+            id_token,
+            &pending.nonce,
+        )
         .await?;
-    Ok(OidcClaims::from_id_token(&claims, pending.link_for))
+    let mut claims = OidcClaims::from_id_token(&verified, pending.link_for);
+    if claims.lacks_presentation_claims() {
+        client
+            .complete_from_userinfo(
+                metadata,
+                pending.redirect_uri,
+                response.access_token().clone(),
+                &mut claims,
+            )
+            .await?;
+    }
+    tracing::info!(
+        "single sign-on validated for subject '{}' at issuer '{}'",
+        claims.subject,
+        claims.issuer
+    );
+    Ok(claims)
 }
 
 /// A 302 to `location`.
@@ -970,7 +1477,8 @@ fn found(location: &str) -> Response {
 }
 
 /// One message for a state that did not match, whichever half missed.
-fn state_mismatch() -> ApiError {
+fn state_mismatch(reason: &str, issuer: &IssuerUrl) -> ApiError {
+    refused(reason, issuer);
     ApiError::unauthorized(
         "this sign-in could not be matched to one this browser started - start again from the \
          sign-in page",
@@ -1059,7 +1567,7 @@ pub struct OidcClaims {
     /// account is exactly the silent takeover this design refuses.
     pub email: Option<String>,
     /// The account this sign-in was started to link an identity to, from
-    /// `?link=1`. `None` is an ordinary sign-in.
+    /// `?link=true`. `None` is an ordinary sign-in.
     pub link_for: Option<String>,
 }
 
@@ -1086,6 +1594,48 @@ impl OidcClaims {
             email: claims.email().and_then(|value| text(value.as_str())),
             link_for,
         }
+    }
+
+    /// Whether any of the three presentation claims is absent, which is when
+    /// userinfo is worth asking.
+    fn lacks_presentation_claims(&self) -> bool {
+        self.preferred_username.is_none() || self.display.is_none() || self.email.is_none()
+    }
+
+    /// Fill the presentation claims that are absent from `info`, and only
+    /// those: a claim the ID token carried is never replaced, and the issuer
+    /// and subject are not read at all. Returns the names of the fields
+    /// filled, for the log.
+    fn fill_missing_from_userinfo(&mut self, info: &CoreUserInfoClaims) -> Vec<&'static str> {
+        let text = |value: &str| {
+            let value = value.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        };
+        let mut filled = Vec::new();
+        if self.preferred_username.is_none()
+            && let Some(value) = info
+                .preferred_username()
+                .and_then(|value| text(value.as_str()))
+        {
+            self.preferred_username = Some(value);
+            filled.push("preferred_username");
+        }
+        if self.display.is_none()
+            && let Some(value) = info
+                .name()
+                .and_then(|localized| localized.get(None))
+                .and_then(|value| text(value.as_str()))
+        {
+            self.display = Some(value);
+            filled.push("name");
+        }
+        if self.email.is_none()
+            && let Some(value) = info.email().and_then(|value| text(value.as_str()))
+        {
+            self.email = Some(value);
+            filled.push("email");
+        }
+        filled
     }
 }
 
@@ -1472,33 +2022,227 @@ mod tests {
         );
     }
 
-    /// The pending map is something an unauthenticated caller can add to, so
-    /// its two bounds are the ones worth pinning: a record is single use, and
-    /// the map has a ceiling.
+    /// Userinfo fills exactly the presentation claims the ID token lacked. A
+    /// claim the token carried stays, whatever userinfo says about it, and
+    /// the issuer and subject are not read from it at all.
     #[test]
-    fn a_pending_record_is_single_use_and_the_map_is_capped() {
+    fn userinfo_fills_only_what_the_id_token_lacked() {
+        let info = CoreUserInfoClaims::from_json::<std::convert::Infallible>(
+            br#"{"sub":"sub-1","preferred_username":"ada.lovelace","name":"Ada Lovelace","email":"ada@example.test","iss":"https://somewhere.else"}"#,
+            None,
+        )
+        .expect("a userinfo document");
+        let mut claims = OidcClaims {
+            issuer: "https://idp.example/realm".to_string(),
+            subject: "sub-1".to_string(),
+            preferred_username: None,
+            display: Some("Ada L".to_string()),
+            email: None,
+            link_for: None,
+        };
+        assert!(claims.lacks_presentation_claims());
+        let filled = claims.fill_missing_from_userinfo(&info);
+        assert_eq!(filled, vec!["preferred_username", "email"]);
+        assert_eq!(claims.preferred_username.as_deref(), Some("ada.lovelace"));
+        assert_eq!(
+            claims.display.as_deref(),
+            Some("Ada L"),
+            "the token's name is not replaced by userinfo's"
+        );
+        assert_eq!(claims.email.as_deref(), Some("ada@example.test"));
+        assert_eq!(claims.issuer, "https://idp.example/realm");
+        assert_eq!(claims.subject, "sub-1");
+        assert!(!claims.lacks_presentation_claims());
+
+        // A userinfo with nothing useful fills nothing and says so.
+        let sparse = CoreUserInfoClaims::from_json::<std::convert::Infallible>(
+            br#"{"sub":"sub-2","preferred_username":"   "}"#,
+            None,
+        )
+        .unwrap();
+        let mut claims = OidcClaims {
+            issuer: "i".to_string(),
+            subject: "sub-2".to_string(),
+            preferred_username: None,
+            display: None,
+            email: None,
+            link_for: None,
+        };
+        assert!(claims.fill_missing_from_userinfo(&sparse).is_empty());
+        assert!(claims.lacks_presentation_claims());
+    }
+
+    /// The pending map is something an unauthenticated caller can add to, so
+    /// its bounds are the ones worth pinning: a record is single use, the map
+    /// has a ceiling, and the ceiling cannot be used to push a real sign-in
+    /// out from under someone mid-consent.
+    /// Why a take missed, without asking `Pending` - which holds the PKCE
+    /// verifier and the nonce - to implement `Debug` for the sake of a test.
+    fn miss(taken: Result<Pending, StateMiss>) -> StateMiss {
+        match taken {
+            Ok(_) => panic!("expected the take to miss"),
+            Err(miss) => miss,
+        }
+    }
+
+    #[test]
+    fn a_flood_of_sign_ins_cannot_evict_one_that_started_moments_ago() {
         let mut store = PendingStore::default();
-        let record = |name: &str| Pending {
-            nonce: Nonce::new(format!("nonce-{name}")),
+        let record = |age: Duration| Pending {
+            nonce: Nonce::new("n".to_string()),
             verifier: PkceCodeVerifier::new("v".repeat(43)),
             redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
             link_for: None,
-            started: Instant::now(),
+            started: Instant::now() - age,
         };
-        store.insert("first".to_string(), record("first"));
-        assert!(store.take("first").is_some());
-        assert!(
-            store.take("first").is_none(),
+        // Single use.
+        store
+            .insert("first".to_string(), record(Duration::ZERO))
+            .unwrap();
+        assert!(store.take("first").is_ok());
+        assert_eq!(
+            miss(store.take("first")),
+            StateMiss::Unknown,
             "a state may authorize exactly one code exchange"
         );
+
+        // A real person started a sign-in a few seconds ago...
+        store
+            .insert("real".to_string(), record(Duration::from_secs(5)))
+            .unwrap();
+        // ...and then a stranger fills the map to the brim, all just now.
+        let mut refused = 0;
         for i in 0..(MAX_PENDING * 2) {
-            store.insert(format!("state-{i}"), record("bulk"));
+            if store
+                .insert(format!("flood-{i}"), record(Duration::ZERO))
+                .is_err()
+            {
+                refused += 1;
+            }
         }
         assert!(
-            store.0.len() <= MAX_PENDING,
-            "the pending map grew past its cap: {}",
-            store.0.len()
+            store.len() <= MAX_PENDING,
+            "the map grew past its cap: {}",
+            store.len()
         );
+        assert!(
+            refused > 0,
+            "past the cap, a flood is refused rather than evicting"
+        );
+        assert!(
+            store.take("real").is_ok(),
+            "the sign-in that started five seconds ago survived the flood"
+        );
+
+        // A record older than the eviction age is fair game once the map is
+        // full: it makes room instead of refusing.
+        let mut store = PendingStore::default();
+        store
+            .insert(
+                "stale".to_string(),
+                record(MIN_EVICT_AGE + Duration::from_secs(1)),
+            )
+            .unwrap();
+        for i in 0..MAX_PENDING {
+            store
+                .insert(format!("fill-{i}"), record(Duration::ZERO))
+                .unwrap_or_else(|_| panic!("insert {i} should have evicted the stale record"));
+        }
+        assert_eq!(
+            miss(store.take("stale")),
+            StateMiss::Unknown,
+            "the stale record was evicted"
+        );
+        assert!(store.len() <= MAX_PENDING);
+
+        // An expired record is forgotten by a take as well as by an insert,
+        // so an idle instance does not hold expired sign-ins until the next
+        // login happens to purge them.
+        let mut store = PendingStore::default();
+        store
+            .insert(
+                "expired".to_string(),
+                record(PENDING_TTL + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert_eq!(miss(store.take("nobody")), StateMiss::Unknown);
+        assert_eq!(store.len(), 0, "a take purges what has expired");
+        // And one that is asked for by name after it expired says so.
+        store
+            .insert(
+                "late".to_string(),
+                record(PENDING_TTL + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert_eq!(miss(store.take("late")), StateMiss::Expired);
+    }
+
+    /// `common`, `organizations` and `consumers` are refused where the
+    /// template is: an environment variable reaches this guard without passing
+    /// the settings layer's.
+    #[test]
+    fn the_tenant_independent_entra_endpoints_are_refused_here_too() {
+        for endpoint in ["common", "organizations", "consumers"] {
+            let mut oidc = complete();
+            oidc.issuer = Some(format!("https://login.microsoftonline.com/{endpoint}/v2.0"));
+            assert!(
+                OidcSettings::resolve(&config_with(oidc)).is_none(),
+                "{endpoint} must not resolve"
+            );
+        }
+    }
+
+    /// An `http://` issuer anywhere but loopback sends the client secret and
+    /// the ID token in clear text. It is allowed, because the test suite and a
+    /// development setup depend on it against loopback, and it is flagged.
+    #[test]
+    fn a_plaintext_issuer_off_loopback_is_flagged_and_loopback_is_not() {
+        let flagged = |issuer: &str| {
+            issuer_is_plaintext_off_loopback(&IssuerUrl::new(issuer.to_string()).unwrap())
+        };
+        assert!(flagged("http://idp.internal/realm"));
+        assert!(flagged("http://10.0.0.7:8080/realm"));
+        assert!(!flagged("https://idp.internal/realm"));
+        assert!(!flagged("http://127.0.0.1:7411"));
+        assert!(!flagged("http://localhost:8080/realm"));
+        assert!(!flagged("http://[::1]:8080/realm"));
+    }
+
+    /// The `Host` header is untrusted input that ends up inside a url, so it
+    /// is held to the shape of a host: a name or address plus an optional
+    /// port, nothing that could open a path, a query or a userinfo component.
+    #[test]
+    fn the_host_header_must_be_a_bare_host_and_port() {
+        for good in [
+            "knowledge.example",
+            "knowledge.example:8443",
+            "127.0.0.1:7411",
+            "localhost",
+            "[::1]:7411",
+            "[2001:db8::1]",
+            "a-b.c-d.example",
+        ] {
+            assert!(host_is_well_formed(good), "{good} is a host");
+        }
+        for bad in [
+            "",
+            "evil.test/x",
+            "a@b",
+            "knowledge.example?x=1",
+            "knowledge.example#frag",
+            "knowledge.example:port",
+            "knowledge.example:",
+            "[::1",
+            "[::1]x",
+            "[zz]",
+            "ünïcode.example",
+            "knowledge.example:123456",
+        ] {
+            assert!(!host_is_well_formed(bad), "{bad:?} is not a host");
+        }
+        let mut forged = HeaderMap::new();
+        forged.insert(header::HOST, "evil.test/x".parse().unwrap());
+        assert!(absolute_url(&forged, CALLBACK_PATH).is_err());
     }
 
     /// Claims carrying just the two fields a derivation reads.

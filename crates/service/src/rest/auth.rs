@@ -513,7 +513,7 @@ fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
 /// Compare without an early exit, so the time taken does not narrow down how
 /// much of the token an attacker has guessed. Lengths are allowed to leak: both
 /// sides are fixed-width hex.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }

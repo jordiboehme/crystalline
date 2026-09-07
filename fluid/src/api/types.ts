@@ -2599,8 +2599,17 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The provider's discovery document could not be fetched. */
+            /** @description The provider's discovery document could not be fetched, or it names a tenant-independent issuer. */
             502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Too many sign-ins are in flight to start another. Wait a moment and try again. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

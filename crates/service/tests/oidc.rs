@@ -113,6 +113,27 @@ struct IdpState {
     issuer: Mutex<String>,
     /// What the ID token claims as `iss`. `None` is the truth.
     token_issuer: Mutex<Option<String>>,
+    /// What the discovery document claims as `issuer`. `None` is the truth.
+    discovery_issuer: Mutex<Option<String>>,
+    /// What the ID token claims as `aud`. `None` is the client id.
+    audience_override: Mutex<Option<String>>,
+    /// Seconds from now to the ID token's `exp`. `None` is five minutes.
+    expiry_offset: Mutex<Option<i64>>,
+    /// While set, discovery answers 500: a provider that is up and broken.
+    discovery_broken: std::sync::atomic::AtomicBool,
+    /// While set, the ID token carries only the required claims and the
+    /// presentation claims are served from userinfo alone, the way Authelia
+    /// 4.38+ does without a claims policy.
+    minimal_id_token: std::sync::atomic::AtomicBool,
+    /// What userinfo answers as `sub`. `None` is the signed-in subject.
+    userinfo_subject_override: Mutex<Option<String>>,
+    /// Where discovery says userinfo lives. `None` is this provider's own.
+    userinfo_endpoint_override: Mutex<Option<String>>,
+    /// How many times userinfo was asked, so "never asked" is an assertion.
+    userinfo_hits: AtomicUsize,
+    /// The last ID token issued, so a log-hygiene test knows the one string
+    /// that must never appear.
+    last_id_token: Mutex<Option<String>>,
     /// The nonce to put in the ID token instead of the one that was asked for.
     nonce_override: Mutex<Option<String>>,
     /// The signing key in use. Index into [`IdpState::keys`].
@@ -169,6 +190,7 @@ impl FakeIdp {
             .route("/jwks", get(idp_jwks))
             .route("/authorize", get(idp_authorize))
             .route("/token", post(idp_token))
+            .route("/userinfo", get(idp_userinfo))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -188,6 +210,67 @@ impl FakeIdp {
     /// under a configured issuer.
     fn lie_about_the_token_issuer(&self, issuer: &str) {
         *self.state.token_issuer.lock().unwrap() = Some(issuer.to_string());
+    }
+
+    /// Advertise a different `issuer` in the discovery document than the url
+    /// it is served from. This is exactly what Entra's tenant-independent
+    /// `common` endpoint does: it answers with the `{tenantid}` template.
+    fn lie_about_the_discovery_issuer(&self, issuer: &str) {
+        *self.state.discovery_issuer.lock().unwrap() = Some(issuer.to_string());
+    }
+
+    /// Sign the next ID token for a different client.
+    fn sign_for_another_audience(&self) {
+        *self.state.audience_override.lock().unwrap() = Some("somebody-else".to_string());
+    }
+
+    /// Sign the next ID token with an `exp` this many seconds from now.
+    fn expire_tokens_after(&self, seconds: i64) {
+        *self.state.expiry_offset.lock().unwrap() = Some(seconds);
+    }
+
+    /// Issue ID tokens carrying only the required claims from now on, and
+    /// serve `preferred_username`, `name` and `email` from userinfo alone.
+    fn keep_presentation_claims_out_of_the_id_token(&self) {
+        self.state
+            .minimal_id_token
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Answer userinfo for somebody else: the token substitution the `sub`
+    /// check exists for.
+    fn answer_userinfo_for_another_subject(&self) {
+        *self.state.userinfo_subject_override.lock().unwrap() =
+            Some("sub-somebody-else".to_string());
+    }
+
+    /// Advertise a userinfo endpoint nobody is listening on.
+    async fn point_userinfo_at_a_dead_port(&self) {
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = dead.local_addr().unwrap();
+        drop(dead);
+        *self.state.userinfo_endpoint_override.lock().unwrap() =
+            Some(format!("http://{address}/userinfo"));
+    }
+
+    fn userinfo_hits(&self) -> usize {
+        self.state.userinfo_hits.load(Ordering::SeqCst)
+    }
+
+    fn last_id_token(&self) -> String {
+        self.state
+            .last_id_token
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("an id token was issued")
+    }
+
+    /// Answer discovery with a 500 from now on.
+    fn break_discovery(&self) {
+        self.state
+            .discovery_broken
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Put a nonce in the next ID token that nobody asked for.
@@ -232,7 +315,7 @@ impl FakeIdp {
     }
 }
 
-async fn idp_discovery(State(state): State<Arc<IdpState>>) -> Json<serde_json::Value> {
+async fn idp_discovery(State(state): State<Arc<IdpState>>) -> Response {
     state.discovery_entries.fetch_add(1, Ordering::SeqCst);
     let gate = state.discovery_gate.lock().unwrap().clone();
     if let Some(mut gate) = gate {
@@ -242,11 +325,34 @@ async fn idp_discovery(State(state): State<Arc<IdpState>>) -> Json<serde_json::V
                 .expect("the gate's sender outlives the test");
         }
     }
+    if state
+        .discovery_broken
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            "discovery is broken today",
+        )
+            .into_response();
+    }
     let issuer = state.issuer.lock().unwrap().clone();
+    let advertised = state
+        .discovery_issuer
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| issuer.clone());
+    let userinfo = state
+        .userinfo_endpoint_override
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| format!("{issuer}/userinfo"));
     Json(serde_json::json!({
-        "issuer": issuer,
+        "issuer": advertised,
         "authorization_endpoint": format!("{issuer}/authorize"),
         "token_endpoint": format!("{issuer}/token"),
+        "userinfo_endpoint": userinfo,
         "jwks_uri": format!("{issuer}/jwks"),
         "response_types_supported": ["code"],
         "subject_types_supported": ["public"],
@@ -254,6 +360,7 @@ async fn idp_discovery(State(state): State<Arc<IdpState>>) -> Json<serde_json::V
         "scopes_supported": ["openid", "profile", "email"],
         "claims_supported": ["sub", "iss", "aud", "exp", "iat", "nonce", "name", "email", "preferred_username"],
     }))
+    .into_response()
 }
 
 async fn idp_jwks(State(state): State<Arc<IdpState>>) -> Json<serde_json::Value> {
@@ -346,19 +453,25 @@ async fn idp_token(
         )
             .into_response();
     };
-    // PKCE, checked rather than accepted: a relying party that stopped sending
-    // the verifier must fail here rather than sign somebody in.
-    if let Some(challenge) = record.code_challenge.as_deref() {
-        let verifier = form.get("code_verifier").cloned().unwrap_or_default();
-        let digest = <sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes());
-        let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
-        if computed != challenge {
-            return (
-                axum::http::StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({ "error": "invalid_grant" })),
-            )
-                .into_response();
-        }
+    // PKCE, required rather than accepted: a relying party that stopped sending
+    // the challenge, or the verifier, must fail here rather than sign somebody
+    // in. A real provider with PKCE enforced behaves the same way.
+    let Some(challenge) = record.code_challenge.as_deref() else {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_request" })),
+        )
+            .into_response();
+    };
+    let verifier = form.get("code_verifier").cloned().unwrap_or_default();
+    let digest = <sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes());
+    let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
+    if computed != challenge {
+        return (
+            axum::http::StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "invalid_grant" })),
+        )
+            .into_response();
     }
     if form.get("redirect_uri").map(String::as_str) != Some(record.redirect_uri.as_str()) {
         return (
@@ -381,25 +494,37 @@ async fn idp_token(
         .unwrap()
         .clone()
         .or(record.nonce);
+    let audience = state
+        .audience_override
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or_else(|| CLIENT_ID.to_string());
+    let expires_in = state.expiry_offset.lock().unwrap().unwrap_or(300);
     let mut claims = serde_json::json!({
         "iss": issuer,
         "sub": user.subject,
-        "aud": CLIENT_ID,
-        "exp": now + 300,
+        "aud": audience,
+        "exp": now + expires_in,
         "iat": now,
     });
     let object = claims.as_object_mut().unwrap();
     if let Some(nonce) = nonce {
         object.insert("nonce".to_string(), nonce.into());
     }
-    if let Some(value) = user.preferred_username {
-        object.insert("preferred_username".to_string(), value.into());
-    }
-    if let Some(value) = user.name {
-        object.insert("name".to_string(), value.into());
-    }
-    if let Some(value) = user.email {
-        object.insert("email".to_string(), value.into());
+    let minimal = state
+        .minimal_id_token
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if !minimal {
+        if let Some(value) = user.preferred_username {
+            object.insert("preferred_username".to_string(), value.into());
+        }
+        if let Some(value) = user.name {
+            object.insert("name".to_string(), value.into());
+        }
+        if let Some(value) = user.email {
+            object.insert("email".to_string(), value.into());
+        }
     }
     let key = state.active();
     let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
@@ -410,6 +535,7 @@ async fn idp_token(
         &jsonwebtoken::EncodingKey::from_rsa_pem(key.pem.as_bytes()).expect("the fixture parses"),
     )
     .expect("the fixture signs");
+    *state.last_id_token.lock().unwrap() = Some(id_token.clone());
     Json(serde_json::json!({
         "access_token": "access-token",
         "token_type": "Bearer",
@@ -417,6 +543,43 @@ async fn idp_token(
         "id_token": id_token,
     }))
     .into_response()
+}
+
+/// The userinfo endpoint: the access token in, the presentation claims out.
+async fn idp_userinfo(
+    State(state): State<Arc<IdpState>>,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    state.userinfo_hits.fetch_add(1, Ordering::SeqCst);
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    if bearer != Some("Bearer access-token") {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "invalid_token" })),
+        )
+            .into_response();
+    }
+    let user = state.user.lock().unwrap().clone();
+    let subject = state
+        .userinfo_subject_override
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap_or(user.subject);
+    let mut body = serde_json::json!({ "sub": subject });
+    let object = body.as_object_mut().unwrap();
+    if let Some(value) = user.preferred_username {
+        object.insert("preferred_username".to_string(), value.into());
+    }
+    if let Some(value) = user.name {
+        object.insert("name".to_string(), value.into());
+    }
+    if let Some(value) = user.email {
+        object.insert("email".to_string(), value.into());
+    }
+    Json(body).into_response()
 }
 
 /// `application/x-www-form-urlencoded` decoding for the Basic credentials.
@@ -930,16 +1093,18 @@ async fn link_intent_without_a_session_is_refused() {
     assert!(detail.contains("sign in first"), "{detail}");
 }
 
-/// Discovery is fetched with no lock held, so a provider that has gone quiet
-/// does not turn concurrent sign-ins into a queue.
+/// Two concurrent first sign-ins share ONE discovery fetch, and neither waits
+/// behind a second one.
 ///
 /// `/auth/oidc/login` is public and unauthenticated and the outbound timeout is
-/// ten seconds, so serializing the first fetch would let anyone make every
-/// waiting sign-in wait for every earlier one. The assertion is direct: with
-/// the provider's discovery endpoint blocked, two logins both reach it before
-/// either is answered.
+/// ten seconds, so both halves matter: a lock held across the fetch would let
+/// anyone turn concurrent sign-ins into a queue, and a fetch per call would
+/// let anyone turn them into an amplifier aimed at the provider. The fake
+/// provider's discovery endpoint is held on a gate, two logins are started at
+/// once, and the assertion is that exactly one request reaches the gate while
+/// it is held and that both logins are answered promptly once it opens.
 #[tokio::test]
-async fn a_slow_provider_does_not_serialize_concurrent_sign_ins() {
+async fn concurrent_first_sign_ins_share_one_discovery_and_neither_waits_twice() {
     let idp = FakeIdp::start().await;
     let gate = idp.block_discovery();
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
@@ -947,23 +1112,271 @@ async fn a_slow_provider_does_not_serialize_concurrent_sign_ins() {
     let login_url = ctx.url("/auth/oidc/login");
     let logins = async { tokio::join!(ctx.get(&login_url, &[]), ctx.get(&login_url, &[])) };
     let watcher = async {
-        let both_arrived = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while idp.discovery_entries() < 2 {
+        let first_arrived = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while idp.discovery_entries() < 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(5)).await;
             }
         })
         .await;
+        // Long enough for a second, uncoalesced request to have reached the
+        // gate too; it must not have.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let entries_while_held = idp.discovery_entries();
+        let released = std::time::Instant::now();
         gate.send(true).unwrap();
-        both_arrived
+        (first_arrived, entries_while_held, released)
     };
-    let ((first, second), both_arrived) = tokio::join!(logins, watcher);
+    let ((first, second), (first_arrived, entries_while_held, released)) =
+        tokio::join!(logins, watcher);
+    let answered_after = released.elapsed();
 
-    assert!(
-        both_arrived.is_ok(),
-        "the second sign-in never reached discovery: the first one was holding a lock across it"
+    assert!(first_arrived.is_ok(), "no sign-in ever reached discovery");
+    assert_eq!(
+        entries_while_held, 1,
+        "two concurrent first sign-ins must share one discovery fetch"
     );
     assert_eq!(first.status(), 302);
     assert_eq!(second.status(), 302);
+    assert_eq!(
+        idp.discovery_entries(),
+        1,
+        "the second sign-in must not fetch again after the first one landed"
+    );
+    assert!(
+        answered_after < std::time::Duration::from_secs(2),
+        "both sign-ins should be answered right after the one release, not {answered_after:?} later"
+    );
+}
+
+/// A provider that is up and broken is probed once, not once per sign-in.
+///
+/// Every failed discovery is a ten-second outbound request on a public route;
+/// without a negative cache, N strangers' GETs are N outbound requests at the
+/// provider. With one, the second sign-in inside the window is refused from
+/// memory.
+#[tokio::test]
+async fn a_broken_provider_is_not_re_probed_on_every_sign_in() {
+    let idp = FakeIdp::start().await;
+    idp.break_discovery();
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    let first = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+    assert_eq!(first.status(), 502);
+    let second = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+    assert_eq!(second.status(), 502);
+    assert_eq!(
+        idp.discovery_entries(),
+        1,
+        "the second sign-in must be refused from the negative cache"
+    );
+    // The refusal is the same sentence either way: nothing about the second
+    // answer says it came from memory.
+    assert_eq!(first.text().await.unwrap(), second.text().await.unwrap());
+}
+
+/// A discovery document whose `issuer` is the Entra `{tenantid}` template is
+/// what the tenant-independent `common` endpoint answers. The operator who
+/// configured it gets the correction written for that mistake, not "could not
+/// be reached": the provider was reached, and it answered.
+#[tokio::test]
+async fn a_discovery_document_naming_the_entra_template_gets_the_correction() {
+    let idp = FakeIdp::start().await;
+    idp.lie_about_the_discovery_issuer("https://login.microsoftonline.com/{tenantid}/v2.0");
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    let refused = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+    assert_eq!(refused.status(), 502);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("tenant-specific"), "{body}");
+    assert!(!body.contains("could not be reached"), "{body}");
+}
+
+/// A token for another client and a token that has already expired are both
+/// refused, with the same sentence as every other refused token.
+#[tokio::test]
+async fn a_wrong_audience_and_an_expired_token_are_refused() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    idp.lie_about_the_token_issuer("https://evil.example");
+    let refused = ctx.sign_in().await;
+    assert_eq!(refused.status(), 401);
+    let reference = refused.text().await.unwrap();
+    *idp.state.token_issuer.lock().unwrap() = None;
+
+    idp.sign_for_another_audience();
+    let refused = ctx.sign_in().await;
+    assert_eq!(refused.status(), 401, "a token for another client");
+    assert_eq!(refused.text().await.unwrap(), reference);
+    *idp.state.audience_override.lock().unwrap() = None;
+
+    idp.expire_tokens_after(-60);
+    let refused = ctx.sign_in().await;
+    assert_eq!(refused.status(), 401, "a token that expired a minute ago");
+    assert_eq!(refused.text().await.unwrap(), reference);
+
+    // And the control: with both knobs back, the same browser signs in.
+    idp.expire_tokens_after(300);
+    assert_eq!(ctx.sign_in().await.status(), 501);
+}
+
+/// Every answer the callback gives is marked uncacheable, the refusals
+/// included: a 401 or a 501 is heuristically cacheable and carries the state
+/// cookie's deletion, and nothing on this route should be served from a cache.
+#[tokio::test]
+async fn every_callback_answer_is_uncacheable() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    let cache_control = |response: &reqwest::Response| {
+        response
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("")
+            .to_string()
+    };
+    let refused = ctx
+        .get(&ctx.url("/auth/oidc/callback?code=a&state=b"), &[])
+        .await;
+    assert_eq!(refused.status(), 401);
+    assert!(cache_control(&refused).contains("no-store"), "{refused:?}");
+
+    let seam = ctx.sign_in().await;
+    assert_eq!(seam.status(), 501);
+    assert!(cache_control(&seam).contains("no-store"), "{seam:?}");
+}
+
+/// A provider that keeps the presentation claims out of the ID token - Authelia
+/// 4.38+ without a claims policy - has them fetched from userinfo, and a
+/// provider that puts them in the token is never asked.
+#[tokio::test]
+async fn presentation_claims_missing_from_the_id_token_are_filled_from_userinfo() {
+    let (logs, _guard) = support::capture_logs();
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(
+        idp.userinfo_hits(),
+        0,
+        "a complete id token needs no userinfo call"
+    );
+
+    idp.keep_presentation_claims_out_of_the_id_token();
+    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(
+        idp.userinfo_hits(),
+        1,
+        "a minimal id token is completed from userinfo"
+    );
+    assert!(
+        logs.any_contains("filled preferred_username, name, email from userinfo"),
+        "the fill is recorded by field name: {:?}",
+        logs.lines()
+    );
+}
+
+/// Userinfo answering for another subject is the token substitution the `sub`
+/// check exists for: the sign-in is refused rather than completed with
+/// somebody else's name on it.
+#[tokio::test]
+async fn a_userinfo_answer_for_another_subject_refuses_the_sign_in() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.keep_presentation_claims_out_of_the_id_token();
+    idp.answer_userinfo_for_another_subject();
+
+    let refused = ctx.sign_in().await;
+    assert_eq!(refused.status(), 401);
+    assert_eq!(idp.userinfo_hits(), 1);
+}
+
+/// A userinfo endpoint that cannot be reached costs the sign-in its
+/// presentation claims, not the sign-in: the identity is the validated ID
+/// token's `(issuer, subject)`, and that is already in hand.
+#[tokio::test]
+async fn an_unreachable_userinfo_endpoint_does_not_block_the_sign_in() {
+    let (logs, _guard) = support::capture_logs();
+    let idp = FakeIdp::start().await;
+    idp.point_userinfo_at_a_dead_port().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.keep_presentation_claims_out_of_the_id_token();
+
+    assert_eq!(
+        ctx.sign_in().await.status(),
+        501,
+        "the flow reached the seam"
+    );
+    assert_eq!(idp.userinfo_hits(), 0);
+    assert!(
+        logs.lines()
+            .iter()
+            .any(|line| line.starts_with("WARN") && line.contains("userinfo")),
+        "an operator can see that userinfo was unreachable: {:?}",
+        logs.lines()
+    );
+}
+
+/// A refused sign-in leaves a line an operator can read at the daemon's
+/// default level, naming the reason and the issuer, and nothing else: no
+/// state, no code, no nonce, no token, no secret, no claim value.
+#[tokio::test]
+async fn a_refused_callback_warns_the_operator_and_leaks_nothing() {
+    let (logs, _guard) = support::capture_logs();
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.lie_about_the_token_issuer("https://evil.example");
+
+    // Walked by hand so every secret of the flow is in hand to assert on.
+    let start = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+    let cookies = cookies_from(&start);
+    let state_value = cookies
+        .iter()
+        .find(|(name, _)| name == "fluid_oidc_state")
+        .map(|(_, value)| value.clone())
+        .expect("the state cookie");
+    let authorize = location(&start);
+    let nonce = authorize
+        .split('&')
+        .find_map(|pair| pair.strip_prefix("nonce="))
+        .expect("the nonce")
+        .to_string();
+    let bounced = ctx.client.get(&authorize).send().await.unwrap();
+    let callback = location(&bounced);
+    let code = callback
+        .split(&['?', '&'][..])
+        .find_map(|pair| pair.strip_prefix("code="))
+        .expect("the code")
+        .to_string();
+    let refused = ctx.get(&callback, &cookies).await;
+    assert_eq!(refused.status(), 401);
+
+    let lines = logs.lines();
+    let warning = lines
+        .iter()
+        .find(|line| line.starts_with("WARN") && line.contains("refused"))
+        .unwrap_or_else(|| panic!("a refusal warns at a level the daemon shows: {lines:?}"));
+    assert!(warning.contains("issuer"), "{warning}");
+    assert!(
+        warning.contains(&idp.issuer()),
+        "the warning names the issuer: {warning}"
+    );
+
+    let id_token = idp.last_id_token();
+    for (what, needle) in [
+        ("the state", state_value.as_str()),
+        ("the code", code.as_str()),
+        ("the nonce", nonce.as_str()),
+        ("the id token", id_token.as_str()),
+        ("the client secret", CLIENT_SECRET),
+        ("a claim value", "ada@example.test"),
+    ] {
+        assert!(
+            !lines.iter().any(|line| line.contains(needle)),
+            "{what} reached the log: {lines:?}"
+        );
+    }
 }
 
 // --- provisioning and the identity key --------------------------------------
