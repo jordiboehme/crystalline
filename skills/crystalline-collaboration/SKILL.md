@@ -7,6 +7,8 @@ description: Use when working in a domain that has a team origin on GitHub - che
 
 A team domain is an ordinary domain that also tracks a GitHub repository: the files on disk stay the source of truth on this machine, and an origin records which repository, subfolder and branch it follows. Call `origin_status` with no arguments to see which registered domains have a team origin and where each one stands; it lists only origin-connected domains, so an empty result means none of the current domains are shared this way.
 
+On an instance that requires agent authentication, connect with the MCP token your user issued in Fluid (profile > Agent access); you then act as that person - their visibility, their share identity. A domain you cannot see may simply be private; ask the domain owner for membership rather than treating absence as deletion.
+
 ## Session start in a shared domain
 
 Before doing deep work in a domain with a team origin, call `origin_status` for that domain. If it reports the domain is behind, call `update_domain` to bring it up to date first: this merges the team's latest knowledge cleanly where possible and flags any real conflicts for `resolve_conflict`. Skipping this risks building on stale knowledge or creating an avoidable conflict later. A teammate's merged changes can also add `## Tag Aliases` entries to a MANIFEST, which change how tag searches fold the moment `update_domain` pulls them in.

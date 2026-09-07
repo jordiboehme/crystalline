@@ -422,6 +422,10 @@ github:
   oauth_client_id: abc123                       # a self-hosted OAuth App, GitHub Enterprise Server only
 ```
 
+### Private domains
+
+A domain does not have to be shared with the whole team to exist on a team instance. Make one private - from its Members card in Fluid, or `crystalline domain visibility <domain> private --owner <account>` from the CLI - and only its owner, the accounts invited into it and instance admins can see it at all; everyone else gets the same answer a domain nobody registered gets. Be honest about what that protects: private is a wall between accounts, not from whoever operates the machine - the CLI, running on the host, administers every domain, invited or not, exactly the way a GitHub organization owner sees every repository in it. See [Private domains](docs/deployment.md#private-domains) for membership levels and the full command set.
+
 ## Keep knowledge honest
 
 `crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
@@ -464,6 +468,9 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals |
+| [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
+| [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in |
+| [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet |
 
 ## Virtual domains
 
