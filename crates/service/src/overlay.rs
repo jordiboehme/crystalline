@@ -753,6 +753,24 @@ mod tests {
         assert!(ov.is_empty());
     }
 
+    /// The `auth.oidc.*` setters refuse an empty value, because `unset` is how
+    /// a key is turned off. That refusal must never reach a blanked compose
+    /// variable: the empty-is-unset filter runs first, so `VAR=` skips the key
+    /// rather than failing startup. Pinned separately because reordering the
+    /// two would turn a blank line in a compose file into a daemon that does
+    /// not come up.
+    #[test]
+    fn a_blanked_oidc_variable_is_unset_rather_than_a_startup_failure() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_ISSUER", ""),
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", ""),
+        ])
+        .unwrap();
+        assert!(!ov.overrides_key("auth.oidc.issuer"));
+        assert!(!ov.overrides_key("auth.oidc.client_secret"));
+        assert!(ov.is_empty());
+    }
+
     #[test]
     fn an_invalid_value_errors_naming_the_variable() {
         let err = overlay(&[("CRYSTALLINE_GITHUB_POLL_SECS", "10")]).unwrap_err();
