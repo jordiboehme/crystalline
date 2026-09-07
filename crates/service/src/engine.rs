@@ -728,10 +728,13 @@ struct CachedGithub {
 pub enum ShareActor {
     /// The machine owner: the CLI, control-socket clients and stdio MCP.
     Owner,
-    /// An authenticated account: Fluid and the REST API.
+    /// An authenticated account: Fluid, the REST API and an HTTP MCP session
+    /// that authenticated at the door (`auth.mcp`), which acts as the account
+    /// whose token opened it.
     Account(String),
-    /// An agent over HTTP MCP, a transport with no user auth of its own:
-    /// resolved through the `github.agent_identity` setting.
+    /// An agent over HTTP MCP on an instance that does not make agents
+    /// authenticate, so the transport carries no user auth and there is nobody
+    /// to be: resolved through the `github.agent_identity` setting.
     HttpAgent,
 }
 
@@ -9404,9 +9407,10 @@ impl Engine {
     /// The personal identity name a write runs under, in personal mode.
     ///
     /// The machine owner has no account to be, so it gets the one fixed local
-    /// name; an account is itself; an HTTP-MCP agent is whoever
-    /// `github.agent_identity` names, or a refusal that says which setting to
-    /// write.
+    /// name; an account is itself, whether it signed in to Fluid or
+    /// authenticated an MCP session; an unauthenticated HTTP-MCP agent is
+    /// whoever `github.agent_identity` names, or a refusal that says which
+    /// setting to write.
     fn acting_identity_name(
         &self,
         actor: &ShareActor,

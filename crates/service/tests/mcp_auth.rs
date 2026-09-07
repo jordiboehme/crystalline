@@ -19,11 +19,13 @@
 //! session to the identity that opened it and refuses anyone else who names it.
 //! Two accounts that both hold valid tokens are still two accounts.
 
+mod support;
+
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use crystalline_core::config::{
-    AuthConfig, DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig,
+    AuthConfig, DomainEntry, GitHubConfig, GlobalConfig, ResponseFormat, ServiceConfig,
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
@@ -96,6 +98,124 @@ async fn serve_with_mcp_auth(
         // Served the way `run_http` serves it, connect info included: the peer
         // address the first-run setup route reads lives in the extensions this
         // adds, and a plain router would leave it missing.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+        .unwrap();
+    });
+    (addr, tmp, store)
+}
+
+/// Serve a team instance that shares with personal GitHub identities, with the
+/// gate on and nobody connected to anything.
+///
+/// Built in two phases, and both halves are load-bearing (the pattern is
+/// `tests/mcp_modern_era.rs`'s `Harness::share_personally`). Phase one
+/// subscribes a team domain through an injected mock forge, so no network is
+/// touched and no credential is needed. Phase two re-opens the engine from the
+/// config the subscription left on disk with NO provider injected: an injected
+/// mock short-circuits credential resolution for both identity modes
+/// (`Engine::resolve_share_provider`), so a test that kept it would never reach
+/// the token store and never see the refusal this asserts on.
+///
+/// The token store is an empty temp directory throughout, which is what
+/// "connected nothing yet" means here and is why the developer's real OS
+/// keychain is never read.
+async fn serve_personal_share_with_mcp_auth()
+-> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let config_path = root.join("config.yaml");
+    let token_store = root.join("token-store");
+    let origins = root.join("origins");
+    std::fs::create_dir_all(&token_store).unwrap();
+
+    let mut cfg = GlobalConfig {
+        github: Some(GitHubConfig {
+            enabled: Some(true),
+            ..GitHubConfig::default()
+        }),
+        service: Some(ServiceConfig {
+            response_format: Some(ResponseFormat::Json),
+            ..ServiceConfig::default()
+        }),
+        auth: Some(AuthConfig {
+            mcp: Some(true),
+            ..AuthConfig::default()
+        }),
+        ..GlobalConfig::default()
+    };
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let mock = Arc::new(support::MockProvider::new());
+    let commit = mock.add_commit(
+        [(
+            "MANIFEST.md".to_string(),
+            b"---\ntype: manifest\ntitle: kb\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# kb\n\n## Scope\n\n- Everything\n\n## When to Use\n\n- Always\n"
+                .to_vec(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    mock.set_branch("main", &commit);
+    let subscribing = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            cfg.clone(),
+            None,
+            Some(config_path.clone()),
+        )
+        .with_token_store_dir(token_store.clone())
+        .with_origin_provider(mock)
+        .with_origins_dir(origins.clone()),
+    );
+    subscribing
+        .origin_add(
+            "team/knowledge",
+            Some("kb"),
+            None,
+            None,
+            Some(root.join("kb").to_str().unwrap()),
+        )
+        .await
+        .unwrap();
+    drop(subscribing);
+
+    // Phase two, off the config the subscription wrote: the domain
+    // registration is on disk, the mode is personal and no agent identity is
+    // named, which is the one configuration in which an account actor and the
+    // HTTP-agent actor refuse with different texts.
+    cfg = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let github = cfg.github.get_or_insert_with(GitHubConfig::default);
+    github.enabled = Some(true);
+    github.share_identity = Some("personal".to_string());
+    github.agent_identity = None;
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let engine = Arc::new(
+        Engine::new(
+            Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap())),
+            cfg,
+            None,
+            Some(config_path),
+        )
+        .with_token_store_dir(token_store)
+        .with_origins_dir(origins),
+    );
+
+    let store = Arc::new(AuthStore::open(&root.join("web-auth.db")).await.unwrap());
+    let router = http_router(
+        engine,
+        Arc::new(AtomicUsize::new(0)),
+        &[],
+        store.clone(),
+        None,
+    )
+    .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
         axum::serve(
             listener,
             router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
@@ -488,5 +608,222 @@ async fn an_unauthenticated_modern_era_request_is_refused_at_the_same_door() {
         refused.text().await.unwrap(),
         baseline,
         "one refusal, whatever era the request speaks"
+    );
+}
+
+// --- the session IS the account ---------------------------------------------
+//
+// Authenticating at the door is half of it. The other half is that the account
+// the door resolved reaches the tool call: a write records the human the agent
+// acted for, and a personal-identity share runs on that human's own GitHub
+// credential rather than on the instance-wide agent account. Both are driven
+// end to end here, through the real transport, because the whole claim is that
+// the identity survives the trip from the HTTP request into the tool body.
+
+/// One authenticated MCP conversation over the real transport: the legacy
+/// handshake, the `notifications/initialized` that follows it, and the
+/// `tools/call` POSTs a test drives afterwards.
+///
+/// Raw HTTP/1.1 over a fresh connection per request, modelled on
+/// `tests/http_stream.rs`: a `tools/call` answer is a chunked SSE stream the
+/// transport leaves open for the session's own use, so there is no
+/// end-of-message a buffering client could wait for. Reading for a bounded
+/// window and asserting on substrings is what that shape allows.
+struct McpTestSession {
+    addr: std::net::SocketAddr,
+    session: String,
+    token: Option<String>,
+}
+
+impl McpTestSession {
+    /// Handshake at `addr` presenting `token`, then send the
+    /// `notifications/initialized` a client owes the session before its first
+    /// call.
+    async fn open(addr: &std::net::SocketAddr, token: Option<&str>) -> McpTestSession {
+        let handshake = raw_post(addr, &initialize_body(), None, token).await;
+        assert!(
+            handshake.starts_with("HTTP/1.1 200 "),
+            "the handshake must be served:\n{handshake}"
+        );
+        let session = raw_session_id(&handshake);
+        let ready = raw_post(
+            addr,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            Some(&session),
+            token,
+        )
+        .await;
+        assert!(
+            ready.starts_with("HTTP/1.1 2"),
+            "the initialized notification must be accepted:\n{ready}"
+        );
+        McpTestSession {
+            addr: *addr,
+            session,
+            token: token.map(str::to_string),
+        }
+    }
+
+    /// Call `tool` on this session, handing back the raw response bytes.
+    async fn call_tool(&self, tool: &str, arguments: serde_json::Value) -> String {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        })
+        .to_string();
+        raw_post(
+            &self.addr,
+            &body,
+            Some(&self.session),
+            self.token.as_deref(),
+        )
+        .await
+    }
+}
+
+/// Send one raw HTTP/1.1 POST and read back whatever arrives within a bounded
+/// window (see [`McpTestSession`] for why the window is bounded rather than a
+/// read to EOF).
+async fn raw_post(
+    addr: &std::net::SocketAddr,
+    body: &str,
+    session: Option<&str>,
+    token: Option<&str>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = "POST / HTTP/1.1\r\n\
+         Host: 127.0.0.1\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n"
+        .to_string();
+    if let Some(session) = session {
+        request.push_str(&format!("Mcp-Session-Id: {session}\r\n"));
+    }
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// The `mcp-session-id` header out of a raw response head, case-insensitively.
+fn raw_session_id(raw: &str) -> String {
+    for line in raw.split("\r\n") {
+        if let Some((name, value)) = line.split_once(':')
+            && name.trim().eq_ignore_ascii_case("mcp-session-id")
+        {
+            return value.trim().to_string();
+        }
+    }
+    panic!("no mcp-session-id header in response:\n{raw}");
+}
+
+/// **A write by an authenticated agent records the account it acted for.**
+///
+/// The provenance an engram carries is `generated.by`, and with the gate on it
+/// names both halves of who wrote it: the client that asked, and the human
+/// whose token opened the session. Without the identity reaching the tool body
+/// this reads as the client alone, and an audit of who taught the instance what
+/// would stop at "some agent".
+///
+/// The account arrives as `for-ada` rather than `for ada` because
+/// `Engine::actor` runs every actor string through the engine's sanitizer,
+/// which folds whitespace runs into a hyphen; the composition itself is
+/// `"<client> for <account>"`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_authenticated_agents_write_records_the_account_it_acts_for() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+
+    let session = McpTestSession::open(&addr, Some(&token)).await;
+    let answer = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Auth Trace",
+                "content": "- [fact] traced",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the write must be served, not refused:\n{answer}"
+    );
+
+    let written = std::fs::read_to_string(guard.path().join("eng").join("auth-trace.md")).unwrap();
+    assert!(
+        written.contains("for-ada"),
+        "generated.by names the account the agent acted for: {written}"
+    );
+    assert!(
+        written.contains("mcp-auth-test"),
+        "and still names the client that asked: {written}"
+    );
+}
+
+/// **A personal-identity share by an authenticated agent resolves that
+/// account's own credential**, not the instance-wide one
+/// `github.agent_identity` names.
+///
+/// The two refusals are what tell them apart, and this instance is configured
+/// so that they differ: personal share identity, no agent identity set, no
+/// credential connected for anybody. An unauthenticated HTTP agent is
+/// `ShareActor::HttpAgent` and gets the text naming the setting an admin must
+/// write; ada's session is `ShareActor::Account("ada")` and gets the text
+/// telling ada to connect her own GitHub identity. Asserting on "Connect yours
+/// in Fluid" is therefore asserting on which actor reached the engine.
+///
+/// The agent identity is deliberately left unset and no token is seeded: that
+/// is the only configuration in which the two actors say different things. With
+/// a bot token on file the share would reach the forge, and with the identity
+/// set but no token both actors would refuse identically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_personal_share_by_an_authenticated_agent_resolves_that_accounts_credential() {
+    let (addr, _guard, store) = serve_personal_share_with_mcp_auth().await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+
+    let session = McpTestSession::open(&addr, Some(&token)).await;
+    let answer = session
+        .call_tool("share_changes", serde_json::json!({ "domain": "kb" }))
+        .await;
+    assert!(
+        answer.contains("Connect yours in Fluid"),
+        "the share runs as ada, so it is ada's missing connection that refuses it:\n{answer}"
+    );
+    assert!(
+        !answer.contains("no agent identity is configured"),
+        "an authenticated session is never the configured agent identity:\n{answer}"
     );
 }

@@ -967,6 +967,61 @@ fn client_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
     Some(format!("{name}/{version}"))
 }
 
+/// The account this call authenticated as, or `None` when nobody did.
+///
+/// The door does the resolving: with `auth.mcp` on, [`crate::mcp_gate::McpGate`]
+/// turns the `Authorization` header into an account before the transport sees
+/// the request and leaves it in the request's extensions. rmcp copies the
+/// remaining `http::request::Parts` into every tool call's `ctx.extensions`
+/// (3.2.0 `transport/streamable_http_server/tower.rs`, four injection sites:
+/// `:1219` stateless negotiated, `:1775` session POST, `:1855` session
+/// creation, `:1974` stateless POST), so the identity is readable here with no
+/// second lookup, no per-connection state of our own and no second channel that
+/// could disagree with the gate.
+///
+/// **What makes it trustworthy is the gate, not this read.** A request bearing
+/// a session id is checked against the identity that opened that session before
+/// it is routed, so an account cannot arrive on somebody else's session state;
+/// a session-less request carries its own credential and is resolved on its
+/// own. Nothing a client sends is read here - the extension is inserted
+/// server-side or not at all - so an identity cannot be forged by a caller.
+///
+/// `None` in exactly two cases, both of which keep their legacy actor: stdio,
+/// where there are no HTTP parts at all, and auth-off HTTP, where the gate is a
+/// pass-through and inserts nothing.
+fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    let parts = ctx.extensions.get::<axum::http::request::Parts>()?;
+    let identity = parts.extensions.get::<crate::mcp_gate::McpIdentity>()?;
+    Some(identity.name.clone())
+}
+
+/// The actor a write records: the client that asked, and - when the call
+/// authenticated - the account it asked on behalf of, as `"<client> for
+/// <account>"`.
+///
+/// An agent is not a person, and with the gate on both halves are known: the
+/// harness that made the call ([`client_actor`]) and the human whose token
+/// opened the session ([`mcp_account`]). Recording only the first would leave
+/// an audit of who taught this instance what stopping at "some agent";
+/// recording only the second would lose which tool did the writing. So both are
+/// kept, in one line, in the one field OKF has for it.
+///
+/// The engine sanitizes what it is given ([`Engine::actor`]), which folds the
+/// spaces into hyphens - `claude-code/2.0-for-ada` on disk. The word `for` is
+/// what survives that as the join, which is why the composition reads as a
+/// phrase rather than as punctuation.
+///
+/// `None` only when neither half is known, which is [`Engine::actor`]'s
+/// fallback case and behaves exactly as it did before.
+fn acting_actor(ctx: &RequestContext<RoleServer>) -> Option<String> {
+    match (client_actor(ctx), mcp_account(ctx)) {
+        (Some(client), Some(account)) => Some(format!("{client} for {account}")),
+        (Some(client), None) => Some(client),
+        (None, Some(account)) => Some(account),
+        (None, None) => None,
+    }
+}
+
 /// Which transport a server instance serves, the one distinction the `auto`
 /// value of `skills.serve` turns on.
 ///
@@ -1048,22 +1103,33 @@ impl McpServer {
     /// personal`). Inert in the default `instance` mode, where one credential
     /// does everything.
     ///
-    /// **The transport is the identity here, because it is the only thing
-    /// there is.** A stdio session is a process this machine's harness
-    /// started, so it is the machine owner in exactly the sense the CLI is -
-    /// the same local `owner` credential, connected once with `crystalline
-    /// connect github --personal`. An HTTP session carries no user auth at all
-    /// (there is nobody to be), so it acts as the account
-    /// `github.agent_identity` names, and refuses with a text naming that
-    /// setting when an admin has named none.
+    /// **An authenticated session IS its account.** A stdio session is a
+    /// process this machine's harness started, so it is the machine owner in
+    /// exactly the sense the CLI is - the same local `owner` credential,
+    /// connected once with `crystalline connect github --personal`. An HTTP
+    /// session that authenticated at the door acts as the account it
+    /// authenticated as, so a share goes out on that person's own connected
+    /// GitHub identity and their name is on the proposal: the agent acts as the
+    /// user rather than as one shared bot everybody's work is filed under.
     ///
-    /// Read per call rather than stored: the two constructors already record
-    /// the transport, and one more copy of it would be one more thing that can
-    /// disagree with them.
-    fn share_actor(&self) -> ShareActor {
+    /// **The transport-only answer survives where there is nothing else.** An
+    /// HTTP session on an instance that does not make agents authenticate
+    /// carries no user auth at all - there is nobody to be - so it stays
+    /// [`ShareActor::HttpAgent`] and resolves through `github.agent_identity`,
+    /// refusing with a text naming that setting when an admin has named none.
+    /// That is the legacy tier unchanged, which is what keeps a default install
+    /// behaving as it did.
+    ///
+    /// Read per call rather than stored: the account comes off the request
+    /// (see [`mcp_account`]), and a copy of it kept on the server would be one
+    /// more thing that could disagree with the door.
+    fn share_actor(&self, ctx: &RequestContext<RoleServer>) -> ShareActor {
         match self.transport {
             Transport::Stdio => ShareActor::Owner,
-            Transport::Http => ShareActor::HttpAgent,
+            Transport::Http => match mcp_account(ctx) {
+                Some(account) => ShareActor::Account(account),
+                None => ShareActor::HttpAgent,
+            },
         }
     }
 }
@@ -1087,7 +1153,7 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        let actor = client_actor(&ctx);
+        let actor = acting_actor(&ctx);
 
         // **A refusal is read before the engine runs, never after it.** A
         // collision is discovered by attempting the write, so the shape that
@@ -1215,7 +1281,7 @@ impl McpServer {
             }
         }
         self.engine
-            .edit_engram_as(&p, client_actor(&ctx).as_deref())
+            .edit_engram_as(&p, acting_actor(&ctx).as_deref())
             .await
             .map_err(to_error)
             .and_then(ok_written)
@@ -1586,7 +1652,7 @@ impl McpServer {
     #[tool(
         name = "share_changes",
         title = "Share changes",
-        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
+        description = "Share this domain's new knowledge and experience with the team as a proposal they review on GitHub; returns the review URL to hand to the user. Where the forge serves stacked pull requests, sharing while a proposal is open STACKS a new proposal on top of it - each share gets its own focused review - and reviewers merge layers bottom-up (merging the top lands the whole chain). Pass proposal to amend that open layer instead (the way to act on its review feedback); layers above it are re-based automatically. An edit to a file an open higher layer already changed belongs in that higher layer - pass its number - rather than in a lower amend, which would only be overwritten by the layer above it. On forges without stacks the open proposal is updated in place as before: same proposal number, same URL, a fresh commit reviewers are notified about, never a duplicate. Review feedback (approvals, change requests, comments) arrives through update_domain and origin_status, so the loop is: share, read the feedback, refine the engrams, share again naming the layer the feedback belongs to. If a reviewer pushed commits onto the proposal branch the update refuses with guidance: let the review finish on GitHub, or withdraw_proposal and share afresh. Pass files to share only some of the changed files - an array of domain-relative paths, with the generated folder indexes of the folders they live in riding along; anything left out stays an unshared local change for a later share, and a path that is not among this domain's unshared changes refuses and names itself. Refuses while conflicts are unsettled so the team always reviews a clean proposal. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, the proposal is authored by the sharer's own personal GitHub identity rather than by the one instance credential: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the share refuses and says so - while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. On a 2026-07-28 peer that declared an elicitation capability the first call shares nothing and answers input_required instead: a confirmation question naming the action (open a new proposal, stack one on the open layer, amend a named layer or update the open proposal in place), the title or commit message and the changed files, answered by re-sending the same call; anything but a yes shares nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1622,7 +1688,7 @@ impl McpServer {
                             // call would, so an instance that would refuse the
                             // share refuses here instead of asking a question
                             // it could not honour.
-                            self.share_actor(),
+                            self.share_actor(&ctx),
                             PreviewCredential::ActingIdentity,
                         )
                         .await
@@ -1644,7 +1710,7 @@ impl McpServer {
                 p.description.as_deref(),
                 p.proposal,
                 p.files.as_deref(),
-                self.share_actor(),
+                self.share_actor(&ctx),
             )
             .await
             .map_err(to_error)
@@ -1680,7 +1746,7 @@ impl McpServer {
     #[tool(
         name = "origin_status",
         title = "Origin status",
-        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP use the account github.agent_identity names; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
+        description = "Review each shared domain's standing: whether the team has new knowledge to learn, what is waiting to be shared, each open proposal's number, URL, review state (approved, changes requested, commented), whether a reviewer amended its branch, its feedback count, plus declined proposals and any conflicts to settle. Where the forge serves stacked pull requests every open proposal also carries its position in the chain - layer 1 is the bottom, and reviewers merge bottom-up - beside the domain's stack number, the declined layers still wedged under open work, and whether this chain is mid-repair, which means the next share or withdraw finishes it. Those keys are absent while nothing is stacked, and a position with no stack number means these layers are not grouped on the forge - either the link is still owed, or this domain is not stacking at all. Feedback bodies are not repeated here - update_domain returns the reviewers' comment text. Each proposal carries the author_login it was shared under where one was recorded, which is how a chain whose layers belong to different people says so: an instance that sets github.share_identity to personal shares under each sharer's own connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'), while agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate; reading and pulling always stay on the one instance credential. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure.",
         annotations(read_only_hint = true, open_world_hint = true)
     )]
     async fn origin_status(
@@ -1701,7 +1767,7 @@ impl McpServer {
     #[tool(
         name = "resolve_conflict",
         title = "Resolve conflict",
-        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP use the account github.agent_identity names). resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
+        description = "Settle a flagged conflict by keeping your version (mine), taking the team's version (theirs) or providing merged content. The engram then counts as ordinary local knowledge you can share. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Resolving touches only this machine and reaches the forge on the next share, which is where an instance that sets github.share_identity to personal needs the sharer's connected personal GitHub identity (Fluid's profile > GitHub identity, or 'crystalline connect github --personal'; agent shares over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate). resolution may be omitted on a 2026-07-28 peer that declared an elicitation capability: the call then answers input_required with a mine-or-theirs question previewing both sides, and the client re-sends the call with the answer. A hand-merged result never travels through the question - call with resolution merged plus content.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1764,7 +1830,7 @@ impl McpServer {
             }
         };
         self.engine
-            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor())
+            .origin_resolve(&p.domain, &p.path, keep, content, self.share_actor(&ctx))
             .await
             .map_err(to_error)
             .and_then(ok)
@@ -1774,7 +1840,7 @@ impl McpServer {
     #[tool(
         name = "withdraw_proposal",
         title = "Withdraw proposal",
-        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP use the account github.agent_identity names. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
+        description = "Withdraw, retract, cancel or abandon a share proposal the team no longer wants: closes the open pull request on the forge, deletes its branch, and clears the proposal record from this domain's state. Pass proposal to name a number, or omit it to withdraw the domain's single open proposal; a declined proposal can be withdrawn too, which tidies its record away. Where the forge stacks proposals, withdrawing a layer that is not the top one closes it and re-bases every layer above it onto what is left, so the chain stays reviewable and nothing above the withdrawal is lost. Set revert true to also restore the shared files to their pre-share content - files edited since sharing are never touched - and leave it off to keep the knowledge local while only the proposal goes away. Use it when a review stalled, a proposal was superseded by better work, or a reviewer amended the branch and share_changes refuses to update it. Needs github.enabled turned on: with team collaboration off this refuses and says how to turn it on with configure. Where the instance sets github.share_identity to personal, closing the proposal goes out on your own personal GitHub identity: connect one in Fluid (profile > GitHub identity) or with 'crystalline connect github --personal' - without a connection the withdrawal refuses and says so - while agent withdrawals over HTTP run as the account the agent authenticated as, or as the account github.agent_identity names where agents are not made to authenticate. On a 2026-07-28 peer that declared an elicitation capability the first call withdraws nothing and answers input_required instead: a confirmation question naming the proposal it would close, how many layers above it would be re-based and whether the shared files are restored locally, answered by re-sending the same call; anything but a yes withdraws nothing.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1802,7 +1868,12 @@ impl McpServer {
                     // about a proposal that does not exist.
                     let preview = self
                         .engine
-                        .origin_withdraw_preview(&p.domain, p.proposal, revert, self.share_actor())
+                        .origin_withdraw_preview(
+                            &p.domain,
+                            p.proposal,
+                            revert,
+                            self.share_actor(&ctx),
+                        )
                         .await
                         .map_err(to_error)?;
                     return Ok(confirm_question(withdraw_question(&preview)).into());
@@ -1814,7 +1885,7 @@ impl McpServer {
             }
         }
         self.engine
-            .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor())
+            .origin_withdraw(&p.domain, p.proposal, revert, self.share_actor(&ctx))
             .await
             .map_err(to_error)
             .and_then(ok)
