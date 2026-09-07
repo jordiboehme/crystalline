@@ -3463,6 +3463,15 @@ impl Engine {
     ///
     /// An engram nobody wrote is [`EngineError::NotFound`], the same resolution
     /// every other read of one identifier opens with.
+    ///
+    /// Scoped: the anchor resolves through [`Engine::resolve_scoped`], so an
+    /// engram in a domain the caller may not see is the not-found a missing
+    /// one produces, and the domains it may not see are subtracted inside the
+    /// query rather than from its answer. This list names other domains by
+    /// name and path - it is the one read on this surface whose *rows* are
+    /// mostly about somewhere else - so a referrer inside a hidden domain is
+    /// absent from the page, from the total and from the per-relation summary
+    /// alike. [`crate::scope::Scope::Unrestricted`] subtracts nothing.
     pub async fn inbound_references(
         &self,
         p: &ReadParams,
@@ -3470,8 +3479,12 @@ impl Engine {
         rel: Option<&str>,
         page: Option<usize>,
         limit: Option<usize>,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        let (desc, _) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+        let hidden = self.hidden_for(scope).await?;
+        let (desc, _) = self
+            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
+            .await?;
         // Clamped rather than refused, the way the listing clamps its own: a
         // hand-written page number below one is answered with the first page,
         // and a page size past [`MAX_INBOUND_LIMIT`] is answered with that
@@ -3480,6 +3493,11 @@ impl Engine {
         // back at it.
         let page = page.unwrap_or(1).max(1);
         let limit = limit.unwrap_or(10).clamp(1, MAX_INBOUND_LIMIT);
+        // Sorted so the query text is stable for one caller across calls,
+        // which keeps a prepared-statement cache and a log line honest; the
+        // set itself is unordered.
+        let mut exclude: Vec<String> = hidden.iter().cloned().collect();
+        exclude.sort();
         let found = {
             let store = self.store.lock().await;
             store
@@ -3490,6 +3508,7 @@ impl Engine {
                     title: &desc.title,
                     q,
                     rel,
+                    exclude_domains: &exclude,
                     page,
                     limit,
                 })

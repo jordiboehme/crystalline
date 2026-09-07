@@ -95,7 +95,9 @@ use axum::{Json, body::Bytes};
 
 use super::auth::Identity;
 use super::engrams::ValidateFinding;
-use super::{ApiError, ApiPath, ApiQuery, ProblemDetail, RestState, refuse_read_only};
+use super::{
+    ApiError, ApiPath, ApiQuery, ProblemDetail, RestState, refuse_read_only, require_domain_read,
+};
 
 /// How many entries an uploaded archive may hold.
 const MAX_ARCHIVE_ENTRIES: usize = 1000;
@@ -194,6 +196,13 @@ pub async fn download(
 ) -> Result<Response, ApiError> {
     identity.require_admin()?;
     // No refuse_read_only: this is a read. See the doc comment.
+    //
+    // Scoped like every other domain-addressed read, even though an admin is
+    // the only caller who reaches it and an admin may see every domain: an
+    // export is the whole domain in one file, so if the role gate above ever
+    // widens, the export of a domain the caller may not see must already be
+    // the 404 an unregistered name gets.
+    require_domain_read(&state, &identity, &domain).await?;
     let files = state.engine.domain_files(&domain).await?;
     let bytes = tokio::task::spawn_blocking(move || build_zip(&files))
         .await
@@ -649,6 +658,7 @@ fn status_of(action: &str, dry_run: bool) -> String {
 /// call that commits.
 async fn run_archive(
     state: &RestState,
+    identity: &Identity,
     domain: &str,
     bytes: Bytes,
     overwrite: bool,
@@ -664,7 +674,7 @@ async fn run_archive(
     // unauthorized caller learn which domains exist.
     state
         .engine
-        .require_domain(domain, &crate::rest::TASK_10_SCOPE)
+        .require_domain(domain, &identity.scope())
         .await?;
     // On the blocking pool, like `build_zip` on the way out: inflating an
     // archive is synchronous CPU work bounded by MAX_TOTAL_BYTES, and running
@@ -938,7 +948,9 @@ pub async fn preview(
 ) -> Result<Json<ArchiveReport>, ApiError> {
     identity.require_admin()?;
     refuse_read_only(&state)?;
-    Ok(Json(run_archive(&state, &domain, body, false, true).await?))
+    Ok(Json(
+        run_archive(&state, &identity, &domain, body, false, true).await?,
+    ))
 }
 
 /// `POST /domains/{domain}/archive/import?policy=skip|overwrite` - commit the
@@ -1047,7 +1059,7 @@ pub async fn import(
         }
     };
     Ok(Json(
-        run_archive(&state, &domain, body, overwrite, false).await?,
+        run_archive(&state, &identity, &domain, body, overwrite, false).await?,
     ))
 }
 

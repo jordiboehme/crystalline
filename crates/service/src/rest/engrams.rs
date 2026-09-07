@@ -37,7 +37,7 @@ use utoipa::IntoParams;
 use super::auth::Identity;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
-    csv, if_match, if_none_match_matches, precondition_failed,
+    csv, if_match, if_none_match_matches, precondition_failed, require_domain_write,
 };
 use crate::engine::EngineError;
 use crate::params::{
@@ -191,13 +191,12 @@ pub struct ListQuery {
 )]
 pub async fn list(
     State(state): State<RestState>,
+    identity: Identity,
     ApiPath(domain): ApiPath<String>,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    state
-        .engine
-        .require_domain(&domain, &crate::rest::TASK_10_SCOPE)
-        .await?;
+    let scope = identity.scope();
+    state.engine.require_domain(&domain, &scope).await?;
     let value = state
         .engine
         .search_engrams_under(
@@ -215,7 +214,7 @@ pub async fn list(
                 ..SearchParams::default()
             },
             query.path.as_deref(),
-            &crate::rest::TASK_10_SCOPE,
+            &scope,
         )
         .await?;
     Ok(Json(value))
@@ -319,6 +318,7 @@ pub async fn list(
 )]
 pub async fn detail(
     State(state): State<RestState>,
+    identity: Identity,
     headers: HeaderMap,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
@@ -329,7 +329,7 @@ pub async fn detail(
                 identifier: permalink,
                 domain: Some(domain),
             },
-            &crate::rest::TASK_10_SCOPE,
+            &identity.scope(),
         )
         .await?;
     let checksum = checksum_of(&value)?.to_string();
@@ -483,6 +483,7 @@ pub struct InboundQueryParams {
 )]
 pub async fn inbound(
     State(state): State<RestState>,
+    identity: Identity,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
     ApiQuery(query): ApiQuery<InboundQueryParams>,
 ) -> Result<Json<Value>, ApiError> {
@@ -497,6 +498,7 @@ pub async fn inbound(
             query.rel.as_deref(),
             query.page,
             query.limit,
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))
@@ -698,7 +700,7 @@ pub async fn create(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<CreateEngramBody>,
 ) -> Result<Response, ApiError> {
-    let caller = identity.require_editor()?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     // The provenance the engram records. `human:` rather than a bare name so
     // `generated.by` says what kind of author this was: an MCP client writes
     // its own `clientname/version` there, and the two must not be mistaken for
@@ -749,7 +751,14 @@ pub async fn create(
         .as_str()
         .ok_or_else(|| ApiError::internal("the write did not report a permalink to read back"))?
         .to_string();
-    detail_response(&state, &domain, &permalink, StatusCode::CREATED).await
+    detail_response(
+        &state,
+        &domain,
+        &permalink,
+        StatusCode::CREATED,
+        &identity.scope(),
+    )
+    .await
 }
 
 /// `PUT /domains/{domain}/engrams/{*permalink}` - save an engram's complete
@@ -901,7 +910,7 @@ pub async fn save(
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
     ApiJson(body): ApiJson<SaveEngramBody>,
 ) -> Result<Response, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
     // Before the If-Match parse, not after: an instance that refuses writes
     // refuses them whatever headers arrive, so this answers 403 rather than
     // sending a client off to fetch a token for a write that can never land.
@@ -945,7 +954,7 @@ pub async fn save(
                     ApiError::internal("the save did not report a permalink to read back")
                 })?
                 .to_string();
-            detail_response(&state, &domain, &moved, StatusCode::OK).await
+            detail_response(&state, &domain, &moved, StatusCode::OK, &identity.scope()).await
         }
         // The one conflict this route translates rather than propagates. Keyed
         // on the prefix `stale_edit_message` owns, which is the seam both
@@ -961,7 +970,7 @@ pub async fn save(
                         identifier: permalink,
                         domain: Some(domain),
                     },
-                    &crate::rest::TASK_10_SCOPE,
+                    &identity.scope(),
                 )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
@@ -1067,7 +1076,10 @@ pub async fn retire(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<RetireBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_editor()?;
+    // The successor a retirement wires rides in the same domain by
+    // construction (the engine resolves it there), so this domain is the only
+    // one a retirement can touch.
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     let value = state
         .engine
         .retire_engram_as(
@@ -1188,7 +1200,23 @@ pub async fn move_action(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<MoveBody>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
+    // Both ends, because a move writes at both: it takes an engram out of the
+    // source and puts it into the destination, and a caller who may write only
+    // one of the two could otherwise carry knowledge out of a private domain
+    // into a shared one, or into a domain they were never invited to. A
+    // destination the caller may not see answers the same 404 the source
+    // would - the destination is named in the body rather than the path, but
+    // it is a domain name either way, and naming one is not a way to learn
+    // that it exists.
+    if let Some(destination) = body
+        .destination_domain
+        .as_deref()
+        .map(str::trim)
+        .filter(|d| !d.is_empty() && *d != domain)
+    {
+        require_domain_write(&state, &identity, destination).await?;
+    }
     let value = state
         .engine
         .move_engram(&MoveParams {
@@ -1495,7 +1523,7 @@ pub async fn remove(
     headers: HeaderMap,
     ApiPath((domain, permalink)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
     // Before the If-Match parse, not after: the same reasoning as `save`'s
     // own read-only check, repeated here rather than shared, since the two
     // handlers are not yet worth abstracting over.
@@ -1525,7 +1553,7 @@ pub async fn remove(
                         identifier: permalink,
                         domain: Some(domain),
                     },
-                    &crate::rest::TASK_10_SCOPE,
+                    &identity.scope(),
                 )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
@@ -1555,6 +1583,7 @@ async fn detail_response(
     domain: &str,
     permalink: &str,
     status: StatusCode,
+    scope: &crate::scope::Scope,
 ) -> Result<Response, ApiError> {
     let value = state
         .engine
@@ -1563,7 +1592,7 @@ async fn detail_response(
                 identifier: permalink.to_string(),
                 domain: Some(domain.to_string()),
             },
-            &crate::rest::TASK_10_SCOPE,
+            scope,
         )
         .await?;
     let etag = etag(&value)?;

@@ -1528,6 +1528,27 @@ impl Store for PostgresStore {
             .map(|text| format!("%{}%", like_escape(&text.to_lowercase())));
         let mut clauses: Vec<String> = Vec::new();
         let mut n = 5;
+        // The visibility exclusion, bound first so the summary below - which
+        // takes no reader-chosen filter - can bind exactly this prefix.
+        let mut exclude_sql = String::new();
+        if !query.exclude_domains.is_empty() {
+            let holes: Vec<String> = query
+                .exclude_domains
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", n + i))
+                .collect();
+            exclude_sql = format!("i.domain NOT IN ({})", holes.join(", "));
+            clauses.push(exclude_sql.clone());
+            n += query.exclude_domains.len();
+        }
+        let excluded = || {
+            let mut params = target();
+            for domain in query.exclude_domains {
+                params.push(Param::Text(domain.clone()));
+            }
+            params
+        };
         if rel.is_some() {
             clauses.push(format!("i.rel=${n}"));
             n += 1;
@@ -1545,7 +1566,7 @@ impl Store for PostgresStore {
             format!(" WHERE {}", clauses.join(" AND "))
         };
         let filtered = || {
-            let mut params = target();
+            let mut params = excluded();
             if let Some(rel) = &rel {
                 params.push(Param::Text(rel.clone()));
             }
@@ -1594,13 +1615,20 @@ impl Store for PostgresStore {
             })
             .collect();
 
+        // The Turso twin's summary: over the unfiltered set, because the
+        // caller filters *with* it, minus the domains the caller may not see.
+        let summary_sql = if exclude_sql.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {exclude_sql}")
+        };
         let summary = query_all(
             conn.as_mut(),
             &format!(
-                "SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel \
+                "SELECT i.rel, COUNT(*) FROM ({source}) i{summary_sql} GROUP BY i.rel \
                  ORDER BY COUNT(*) DESC, i.rel COLLATE \"C\""
             ),
-            target(),
+            excluded(),
         )
         .await?;
         let types = summary

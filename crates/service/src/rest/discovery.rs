@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use utoipa::IntoParams;
 
+use super::auth::Identity;
 use super::{ApiError, ApiQuery, ProblemDetail, RestState, csv};
 use crate::params::{ContextParams, RecentParams, SearchParams, VocabularyParams};
 
@@ -149,6 +150,7 @@ pub struct SearchQuery {
 )]
 pub async fn search(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
@@ -167,7 +169,7 @@ pub async fn search(
                 limit: query.limit,
                 page: query.page,
             },
-            &crate::rest::TASK_10_SCOPE,
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))
@@ -240,6 +242,7 @@ pub struct VocabularyQuery {
 )]
 pub async fn vocabulary(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<VocabularyQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
@@ -248,7 +251,7 @@ pub async fn vocabulary(
             &VocabularyParams {
                 domain: query.domain,
             },
-            &crate::rest::TASK_10_SCOPE,
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))
@@ -364,6 +367,7 @@ pub struct ContextQuery {
 )]
 pub async fn context(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<ContextQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
@@ -376,7 +380,7 @@ pub async fn context(
                 timeframe: None,
                 max_related: query.max_related,
             },
-            &crate::rest::TASK_10_SCOPE,
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))
@@ -454,6 +458,7 @@ pub struct ActivityQuery {
 )]
 pub async fn activity(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<ActivityQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
@@ -464,7 +469,7 @@ pub async fn activity(
                 timeframe: query.timeframe,
                 types: csv(query.types.as_deref()),
             },
-            &crate::rest::TASK_10_SCOPE,
+            &identity.scope(),
         )
         .await?;
     Ok(Json(value))

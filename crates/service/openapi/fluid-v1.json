@@ -3856,6 +3856,72 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/visibility": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Make a domain private, or share it with the instance again.",
+        "description": "Admin only, in both directions. Making a domain private gives it an owner - the calling account - and hides it from every account that is not invited into it: a domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.\n\nA manager may invite people and change their levels and may NOT call this: making a domain private transfers ownership to the caller, so the verb belongs to the instance rather than to one domain's administration.\n\nMaking a domain shared again forgets its membership list.",
+        "operationId": "set_domain_visibility",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisibilityBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The visibility is now what was asked for."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/evolve": {
       "get": {
         "tags": [
@@ -7016,6 +7082,20 @@
               "$ref": "#/components/schemas/ValidateFinding"
             },
             "description": "Every finding, format and temporal families, default severities."
+          }
+        }
+      },
+      "VisibilityBody": {
+        "type": "object",
+        "description": "Whether the domain is private. `true` closes it to its owner and the people invited into it; `false` opens it to every account again and forgets the membership list.",
+        "required": [
+          "private"
+        ],
+        "properties": {
+          "private": {
+            "type": "boolean",
+            "description": "`true` makes the domain private, `false` makes it shared again.",
+            "example": true
           }
         }
       },

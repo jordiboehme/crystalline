@@ -40,6 +40,7 @@ use tokio::sync::Semaphore;
 
 use super::auth_store::{AuthStore, PasswordCheck, Role, SessionMint, User, dummy_verify};
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
+use crate::scope::Scope;
 
 /// The session cookie. Named for the UI it serves so it never collides with a
 /// cookie another app sets on a shared host.
@@ -193,6 +194,32 @@ fn rank(role: Role) -> u8 {
 }
 
 impl Identity {
+    /// What this request may see, as the one value every read below this layer
+    /// is threaded with.
+    ///
+    /// Resolved here and nowhere else on this surface: [`guard`] already did
+    /// the store lookups, so a handler that re-derived who somebody is would be
+    /// a second answer to a question that has one. An account maps to
+    /// [`Scope::User`] carrying the store's own spelling of the login name -
+    /// the acl and membership rows are keyed on the folded name, so a raw
+    /// header or cookie value would miss them - and everything else, the
+    /// anonymous viewer tier included, maps to [`Scope::Anonymous`], which sees
+    /// what is shared and no private domain.
+    ///
+    /// `admin` rides along rather than being read back a table deeper, because
+    /// this layer is the authority on it (see [`Scope::User::admin`]).
+    /// [`Scope::Unrestricted`] is deliberately unreachable from here: nothing
+    /// arriving over HTTP is the machine owner.
+    pub fn scope(&self) -> Scope {
+        match &self.user {
+            Some(user) => Scope::User {
+                account: user.name.clone(),
+                admin: user.role == Role::Admin,
+            },
+            None => Scope::Anonymous,
+        }
+    }
+
     /// The caller, when the request may be served at viewer level or above.
     /// 401 when the request carries no identity at all.
     pub fn require_viewer(&self) -> Result<Caller, ApiError> {

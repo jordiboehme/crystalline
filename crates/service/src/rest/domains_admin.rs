@@ -14,7 +14,10 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
 use super::auth::Identity;
-use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only};
+use super::{
+    ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only,
+    require_domain_read, require_domain_write,
+};
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
 
 /// The caller, when they may drive this instance's share surfaces - the status
@@ -681,6 +684,12 @@ pub async fn sync_status(
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
+    // A domain the caller may not see is refused as one nobody registered,
+    // before anything about its origin is read. The share role is not the
+    // admin role in every mode - with `github.share_identity = personal` an
+    // instance editor reaches these routes - so this is a real gate here
+    // rather than a no-op over an admin.
+    require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     let aggregate = state.engine.origin_status(Some(&domain)).await?;
     // Lifted before `single_domain` takes the per-domain entry, which is all
@@ -851,12 +860,35 @@ pub async fn sync_summary(
         return Err(github_off_conflict());
     }
     let aggregate = state.engine.origin_status(None).await?;
+    // This one route enumerates domains rather than addressing one, so the
+    // filtering happens here, on the aggregate: `origin_status` walks the
+    // registry and knows nothing about who is asking. A team domain the
+    // caller may not see is absent from the rows AND from the errors - a
+    // failure naming a domain would name it just as well as a success.
+    //
+    // The probe for such a domain still ran, which costs a request nobody
+    // reads; the alternative is a scope parameter on the origin family, which
+    // would reach the ctl and stdio paths that are the machine owner and have
+    // no scope to pass.
+    let hidden = state
+        .engine
+        .hidden_domains(&identity.scope())
+        .await?
+        .unwrap_or_default();
+    let visible = |entry: &Value| {
+        entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .is_none_or(|name| !hidden.contains(name))
+    };
     let mut domains: Vec<Value> = Vec::new();
     for entry in aggregate
         .get("domains")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+        .iter()
+        .filter(|entry| visible(entry))
     {
         // Per row rather than per request: the picker offers one domain at a
         // time, so the count that decides which row a reader recognizes as
@@ -872,8 +904,15 @@ pub async fn sync_summary(
         "domains": domains,
         "errors": aggregate
             .get("errors")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
+            .and_then(Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter(|e| visible(e))
+                    .cloned()
+                    .collect::<Vec<Value>>()
+            })
+            .unwrap_or_default(),
     })))
 }
 
@@ -1167,6 +1206,9 @@ pub async fn share_changes_preview(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The domain gate `sync_status` explains: a domain the caller may not see
+    // is refused as one nobody registered.
+    require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
@@ -1355,6 +1397,9 @@ pub async fn share_now(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The same gate one rung higher: this acts on the domain, so a caller who
+    // may only read it is refused by level rather than served.
+    require_domain_write(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
@@ -1491,6 +1536,9 @@ pub async fn withdraw_proposal(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The same gate one rung higher: this acts on the domain, so a caller who
+    // may only read it is refused by level rather than served.
+    require_domain_write(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
@@ -1593,6 +1641,9 @@ pub async fn conflict_detail(
     require_share_role(&state, &identity)?;
     // No connection check: every side of a conflict is already on this
     // machine. See the doc comment.
+    // The domain gate `sync_status` explains: a domain the caller may not see
+    // is refused as one nobody registered.
+    require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     Ok(Json(
         state
@@ -1709,6 +1760,9 @@ pub async fn resolve_conflict(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The same gate one rung higher: this acts on the domain, so a caller who
+    // may only read it is refused by level rather than served.
+    require_domain_write(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     // Resolve BY ID: look the path up first, then run the path-based verb.
     let detail = state
@@ -1805,6 +1859,109 @@ fn github_off_conflict() -> ApiError {
         "GitHub is switched off on this instance, so no origin can be \
          reached: turn it on under Settings > GitHub",
     )
+}
+
+/// What `PUT /domains/{domain}/visibility` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "Whether the domain is private. `true` closes it to \
+                        its owner and the people invited into it; `false` \
+                        opens it to every account again and forgets the \
+                        membership list.")]
+pub struct VisibilityBody {
+    /// `true` makes the domain private, `false` makes it shared again.
+    #[schema(example = true)]
+    pub private: bool,
+}
+
+/// `PUT /domains/{domain}/visibility` - make a domain private, or share it
+/// with the whole instance again.
+///
+/// **Admin only, in both directions, and deliberately not a manage-level
+/// verb.** Making a domain private hands it an owner - the account that made
+/// the call - and drops that account's own membership row, so a manager who
+/// could call this could take a domain they were merely invited to manage.
+/// Inviting people and changing their levels is a manager's job; deciding
+/// whether a domain is private at all is the instance's.
+///
+/// The name is resolved against the ENGINE's registry before the accounts
+/// database is touched. The visibility records are keyed by domain name and
+/// know nothing about which domains exist, so a typo would otherwise mint an
+/// acl row for a domain nobody registered - a private domain with no content,
+/// invisible until someone registered that name and found it already closed.
+///
+/// Refused on a read-only instance like every other mutation on this surface.
+/// The membership records are not knowledge, but what they decide is who may
+/// read it, and the recovery path is the same `crystalline` CLI the refusal
+/// already names.
+///
+/// Making a domain shared again forgets its membership list: there is no
+/// half-private state where the rows survive an opening, and re-closing the
+/// domain starts from the owner alone.
+#[utoipa::path(
+    put,
+    path = "/api/v1/domains/{domain}/visibility",
+    tag = "domains",
+    operation_id = "set_domain_visibility",
+    summary = "Make a domain private, or share it with the instance again.",
+    description = "Admin only, in both directions. Making a domain private \
+                   gives it an owner - the calling account - and hides it from \
+                   every account that is not invited into it: a domain nobody \
+                   may see is answered exactly as a domain nobody registered, \
+                   so a stranger's request for it is a 404 rather than a \
+                   403.\n\nA manager may invite people and change their levels \
+                   and may NOT call this: making a domain private transfers \
+                   ownership to the caller, so the verb belongs to the \
+                   instance rather than to one domain's \
+                   administration.\n\nMaking a domain shared again forgets its \
+                   membership list.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    request_body = VisibilityBody,
+    responses(
+        (status = 204, description = "The visibility is now what was asked for."),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller is not an admin, the request did not \
+                           echo its CSRF token, this instance is read-only, or \
+                           the trusted-header identity names a disabled \
+                           account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_visibility(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<VisibilityBody>,
+) -> Result<StatusCode, ApiError> {
+    let caller = identity.require_admin()?;
+    refuse_read_only(&state)?;
+    // The registry check, before anything is written to the accounts
+    // database. An admin sees every domain, so the scope here only ever
+    // refuses a name nobody registered - which is exactly what it is for.
+    state
+        .engine
+        .require_domain(&domain, &identity.scope())
+        .await?;
+    state
+        .auth
+        .set_domain_visibility(&domain, body.private, caller.name())
+        .await
+        .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

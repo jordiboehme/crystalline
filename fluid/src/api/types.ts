@@ -659,6 +659,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/visibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Make a domain private, or share it with the instance again.
+         * @description Admin only, in both directions. Making a domain private gives it an owner - the calling account - and hides it from every account that is not invited into it: a domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.
+         *
+         *     A manager may invite people and change their levels and may NOT call this: making a domain private transfers ownership to the caller, so the verb belongs to the instance rather than to one domain's administration.
+         *
+         *     Making a domain shared again forgets its membership list.
+         */
+        put: operations["set_domain_visibility"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/evolve": {
         parameters: {
             query?: never;
@@ -1972,6 +1996,14 @@ export interface components {
             errors: number;
             /** @description Every finding, format and temporal families, default severities. */
             findings: components["schemas"]["ValidateFinding"][];
+        };
+        /** @description Whether the domain is private. `true` closes it to its owner and the people invited into it; `false` opens it to every account again and forgets the membership list. */
+        VisibilityBody: {
+            /**
+             * @description `true` makes the domain private, `false` makes it shared again.
+             * @example true
+             */
+            private: boolean;
         };
         /** @description Whether withdrawing also puts the shared files back the way the team has them. Absent means false: the proposal closes and the working tree is left alone. */
         WithdrawBody: {
@@ -5027,6 +5059,58 @@ export interface operations {
             };
             /** @description The glob is not a valid pattern. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_visibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VisibilityBody"];
+            };
+        };
+        responses: {
+            /** @description The visibility is now what was asked for. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain. */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

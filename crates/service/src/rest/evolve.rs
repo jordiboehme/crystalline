@@ -21,8 +21,9 @@ use utoipa::IntoParams;
 use super::auth::Identity;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ProblemDetail, RestState, csv, refuse_read_only,
+    require_domain_write,
 };
-use crate::params::EvolveParams;
+use crate::params::{EvolveParams, ListDomainsParams};
 
 /// The query string `GET /evolve` takes, mirroring [`EvolveParams`] minus its
 /// `today`.
@@ -194,12 +195,14 @@ pub struct EvolveQuery {
 )]
 pub async fn queue(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<EvolveQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let domains = sweepable_domains(&state, &identity, csv(query.domains.as_deref())).await?;
     let value = state
         .engine
         .evolve_detect(&EvolveParams {
-            domains: csv(query.domains.as_deref()),
+            domains,
             families: csv(query.families.as_deref()),
             rules: csv(query.rules.as_deref()),
             min_priority: query.min_priority,
@@ -211,6 +214,73 @@ pub async fn queue(
         })
         .await?;
     Ok(Json(value))
+}
+
+/// The domain list a sweep runs over for this caller: the one they asked for,
+/// or - when they asked for none - every domain they may see.
+///
+/// The sweep verb takes a domain filter and reads an empty one as "every
+/// registered domain", which is the answer that must not be given to a caller
+/// who may not see all of them: a finding names its domain, its engram and its
+/// evidence, so an unfiltered queue is a list of private domain names with
+/// their contents attached.
+///
+/// Nothing is subtracted on an installation with no private domains (the usual
+/// case): the filter is handed back untouched and no extra query runs. A
+/// caller who names a domain they may not see is answered exactly as one
+/// naming a domain nobody registered, through the same engine check every
+/// other domain-addressed route opens with.
+///
+/// **Temporary.** `evolve_detect` is gaining a [`crate::scope::Scope`]
+/// parameter of its own, and when it lands this whole function collapses into
+/// passing `identity.scope()` beside the caller's own filter - the engine
+/// already holds the machinery for it (`ScopedDomains`), including the empty
+/// case this one has to refuse rather than answer.
+async fn sweepable_domains(
+    state: &RestState,
+    identity: &Identity,
+    requested: Vec<String>,
+) -> Result<Vec<String>, ApiError> {
+    let scope = identity.scope();
+    let hidden = state.engine.hidden_domains(&scope).await?;
+    if hidden.is_none_or(|hidden| hidden.is_empty()) {
+        return Ok(requested);
+    }
+    if !requested.is_empty() {
+        for name in &requested {
+            state.engine.require_domain(name, &scope).await?;
+        }
+        return Ok(requested);
+    }
+    let listed = state
+        .engine
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: false,
+            },
+            &scope,
+        )
+        .await?;
+    let visible: Vec<String> = listed["domains"]
+        .as_array()
+        .map(|domains| {
+            domains
+                .iter()
+                .filter_map(|d| d["name"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if visible.is_empty() {
+        // The one case this shim cannot express: an empty filter means "every
+        // domain" to the sweep verb, so a caller who may see none of them
+        // cannot be handed one. Refused rather than widened - there is no
+        // queue to show a caller with no domain, and the engine's own scope
+        // parameter answers it as the empty sweep it is.
+        return Err(ApiError::not_found(
+            "no domain here is visible to this account, so there is nothing to sweep",
+        ));
+    }
+    Ok(visible)
 }
 
 /// What the two acknowledgment endpoints take: which engram, which rule and,
@@ -317,7 +387,7 @@ pub async fn acknowledge(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<AckBody>,
 ) -> Result<Json<Value>, ApiError> {
-    let caller = identity.require_editor()?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     let entry = state
         .engine
@@ -392,7 +462,7 @@ pub async fn unacknowledge(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<AckBody>,
 ) -> Result<StatusCode, ApiError> {
-    let caller = identity.require_editor()?;
+    let caller = require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     let removed = state
         .engine

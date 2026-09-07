@@ -811,6 +811,18 @@ pub struct InboundQuery<'a> {
     /// Keep only references carrying this relation type ([`LINKS_TO`] for prose
     /// wikilinks). `None` selects every relation.
     pub rel: Option<&'a str>,
+    /// Domain names whose references are left out entirely: the private
+    /// domains the caller asking may not see. Empty for a caller who may see
+    /// everything, which is the usual case.
+    ///
+    /// Subtracted inside the query rather than from its answer, and from all
+    /// three of the statements it runs - the page, the total and the
+    /// per-relation summary. A caller that filtered the returned page would
+    /// hand out short pages and a `total` that counts what it did not show,
+    /// and a count that disagrees with its rows says a reference exists
+    /// somewhere the reader may not look, which is exactly the fact being
+    /// kept.
+    pub exclude_domains: &'a [String],
     /// One-based page number.
     pub page: usize,
     /// Page size.
@@ -1451,6 +1463,11 @@ pub trait Store: Send + Sync {
     /// references is browsed by picking a relation type and then searching
     /// inside it, and a summary that shrank as it was used would be a map that
     /// redraws itself while it is being read.
+    ///
+    /// [`InboundQuery::exclude_domains`] is the one narrowing all three of
+    /// them honor, summary included: it is not a filter a reader chose but the
+    /// set of domains that reader may not see, and a count that named one
+    /// would be the disclosure the exclusion is for.
     ///
     /// Ordered by title, then permalink, then domain, then relation, byte-wise
     /// on both backends, so paging is stable and a page boundary never drops or

@@ -38,7 +38,7 @@ use crystalline_index::AttachmentRow;
 use super::auth::Identity;
 use super::{
     ApiError, ApiPath, ProblemDetail, REVALIDATE, RestState, if_none_match_matches,
-    refuse_read_only,
+    refuse_read_only, require_domain_read, require_domain_write,
 };
 use crate::engine::EngineError;
 
@@ -221,9 +221,13 @@ pub struct UploadedAttachment {
 )]
 pub async fn read(
     State(state): State<RestState>,
+    identity: Identity,
     headers: HeaderMap,
     ApiPath((domain, path)): ApiPath<(String, String)>,
 ) -> Result<Response, ApiError> {
+    // The bytes an engram carries are the engram's domain's, so they are
+    // reached through the same visibility check the engram is.
+    require_domain_read(&state, &identity, &domain).await?;
     let (bytes, row) = state
         .engine
         .attachment_read(&domain, &path)
@@ -350,7 +354,7 @@ pub async fn write(
     // Last, and the only extractor here that consumes the body.
     body: Bytes,
 ) -> Result<Json<UploadedAttachment>, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     let row = state
         .engine
@@ -420,7 +424,7 @@ pub async fn remove(
     identity: Identity,
     ApiPath((domain, path)): ApiPath<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
-    identity.require_editor()?;
+    require_domain_write(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
     state
         .engine
@@ -469,8 +473,10 @@ pub async fn remove(
 )]
 pub async fn list(
     State(state): State<RestState>,
+    identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<AttachmentsResponse>, ApiError> {
+    require_domain_read(&state, &identity, &domain).await?;
     let rows = state.engine.attachment_list(&domain).await?;
     Ok(Json(AttachmentsResponse {
         attachments: rows.into_iter().map(AttachmentView::from).collect(),

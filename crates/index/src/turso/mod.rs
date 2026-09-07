@@ -1289,10 +1289,31 @@ impl Store for TursoStore {
             ]
         };
 
-        // The filters, appended after the four the target always binds.
+        // The visibility exclusion, bound first so the summary below - which
+        // takes no reader-chosen filter - can bind exactly this prefix.
         let mut params = target();
-        let mut clauses: Vec<String> = Vec::new();
         let mut n = 5;
+        let mut exclude_sql = String::new();
+        if !query.exclude_domains.is_empty() {
+            let holes: Vec<String> = query
+                .exclude_domains
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", n + i))
+                .collect();
+            exclude_sql = format!("i.domain NOT IN ({})", holes.join(", "));
+            for domain in query.exclude_domains {
+                params.push(Value::Text(domain.clone()));
+            }
+            n += query.exclude_domains.len();
+        }
+        let excluded = params.clone();
+
+        // The filters, appended after the target and the exclusion.
+        let mut clauses: Vec<String> = Vec::new();
+        if !exclude_sql.is_empty() {
+            clauses.push(exclude_sql.clone());
+        }
         if let Some(rel) = query.rel.filter(|r| !r.is_empty()) {
             clauses.push(format!("i.rel=?{n}"));
             params.push(Value::Text(rel.to_string()));
@@ -1357,11 +1378,20 @@ impl Store for TursoStore {
             .collect();
 
         // The summary, deliberately over the unfiltered set: the caller filters
-        // *with* it. One grouped pass, no page.
+        // *with* it. One grouped pass, no page. The visibility exclusion is
+        // the one narrowing it does honor - see the trait's doc comment.
+        let summary_sql = if exclude_sql.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {exclude_sql}")
+        };
         let summary = query_all(
             &self.conn,
-            &format!("SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel ORDER BY 2 DESC, 1"),
-            target(),
+            &format!(
+                "SELECT i.rel, COUNT(*) FROM ({source}) i{summary_sql} \
+                 GROUP BY i.rel ORDER BY 2 DESC, 1"
+            ),
+            excluded,
         )
         .await?;
         let types = summary

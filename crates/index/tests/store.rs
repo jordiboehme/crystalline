@@ -800,6 +800,7 @@ fn hub_query(hub: EngramId, domain: DomainId) -> InboundQuery<'static> {
         title: "Hub",
         q: None,
         rel: None,
+        exclude_domains: &[],
         page: 1,
         limit: 10,
     }
@@ -1145,6 +1146,75 @@ async fn inbound_page_empty(store: &dyn Store) {
 parity!(
     inbound_page_reports_nothing_pointing_here,
     inbound_page_empty
+);
+
+/// `exclude_domains` takes a domain out of all three answers at once: the page,
+/// the total and the per-relation summary. A reader who may not see `Zed`
+/// learns nothing about it - not the row, and not a count that would only make
+/// sense if the row existed.
+async fn inbound_page_excludes_domains(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+    let hidden = vec!["Zed".to_string()];
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        !page.hits.iter().any(|h| h.domain == "Zed"),
+        "the hidden domain's referrer is off the page: {page:?}"
+    );
+    assert!(
+        !hit_titles(&page).contains(&"Cross"),
+        "and it is the cross-domain one that went: {page:?}"
+    );
+    assert_eq!(page.total, 6, "the total counts what it showed: {page:?}");
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 3), ("part_of", 2), ("links_to", 1)],
+        "the summary drops the hidden reference too: {page:?}"
+    );
+
+    // The exclusion narrows and nothing else: a reader-chosen filter still
+    // applies on top of it, over the same reduced set.
+    let filtered = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 3, "{filtered:?}");
+    assert!(
+        !filtered.hits.iter().any(|h| h.domain == "Zed"),
+        "{filtered:?}"
+    );
+
+    // A name nobody registered excludes nothing, so the unfiltered answer is
+    // the one the empty exclusion gives.
+    let unrelated = vec!["ghost".to_string()];
+    let same = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &unrelated,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    let all = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+    assert_eq!(same.total, all.total, "{same:?}");
+    assert_eq!(hit_titles(&same), hit_titles(&all), "{same:?}");
+}
+parity!(
+    inbound_page_hides_the_domains_it_is_told_to,
+    inbound_page_excludes_domains
 );
 
 /// `unresolved_refs` reports every dangling relation and prose link in a domain,

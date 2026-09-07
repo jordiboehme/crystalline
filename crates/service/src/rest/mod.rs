@@ -36,17 +36,7 @@ pub use error::{
 };
 
 use crate::engine::Engine;
-use crate::scope::Scope;
-
-/// The scope every read route on this surface is answered with today: none.
-///
-/// A placeholder, and one name rather than a literal at each call, so Task 10
-/// can grep exactly the sites that move together. That task resolves the real
-/// scope from the session the auth layer already authenticated - a signed-in
-/// account, or [`Scope::Anonymous`] on an instance serving the anonymous
-/// viewer tier - and replaces the uses of this constant. Until then a REST read
-/// is what it has always been, unfiltered.
-pub(crate) const TASK_10_SCOPE: Scope = Scope::Unrestricted;
+use crate::scope::{DomainAccess, DomainRight};
 
 /// The OpenAPI 3.1 document for this surface, assembled from the
 /// `#[utoipa::path]` annotation on every handler.
@@ -102,6 +92,7 @@ pub(crate) const TASK_10_SCOPE: Scope = Scope::Unrestricted;
         domains::list,
         domains_admin::create,
         domains_admin::remove,
+        domains_admin::set_visibility,
         domains_admin::sync_status,
         domains_admin::sync_now,
         domains_admin::sync_summary,
@@ -163,6 +154,7 @@ pub(crate) const TASK_10_SCOPE: Scope = Scope::Unrestricted;
         Role,
         domains::SaveManifestBody,
         domains_admin::CreateDomainBody,
+        domains_admin::VisibilityBody,
         domains_admin::ShareBody,
         domains_admin::WithdrawBody,
         domains_admin::ResolveBody,
@@ -220,6 +212,12 @@ pub struct RestState {
     /// than opened per request: it serializes its own database access, so a
     /// second store would only add handles on one small file.
     pub auth: Arc<AuthStore>,
+    /// The private-domain resolver this surface asks before it serves anything
+    /// a domain name addresses. Over the same store as `auth` above, and the
+    /// same resolver the engine holds, so a membership change takes effect on
+    /// the next request rather than at the next restart and both layers cannot
+    /// answer differently.
+    pub access: Arc<DomainAccess>,
     /// The auth settings as of startup. See [`AuthCfg`].
     pub auth_cfg: AuthCfg,
     /// The open co-editing sessions, one registry for this process: the
@@ -254,6 +252,7 @@ impl RestState {
         Ok(RestState {
             collab: crate::collab::session::CollabSessions::new(engine.clone()),
             engine,
+            access: Arc::new(DomainAccess::new(auth.clone())),
             auth,
             auth_cfg,
             setup_token: None,
@@ -441,6 +440,15 @@ pub fn router(state: RestState) -> Router {
         // here. Registered before the domain sub-paths for readability only;
         // axum's router is order-independent.
         .route("/domains/{domain}", delete(domains_admin::remove))
+        // Whether a domain is private. Admin only in both directions, and
+        // deliberately NOT a manage-level verb: making a domain private
+        // transfers ownership to the caller, so a manager who could call it
+        // could seize a domain they were invited to administer. See
+        // [`domains_admin::set_visibility`].
+        .route(
+            "/domains/{domain}/visibility",
+            put(domains_admin::set_visibility),
+        )
         // Admin only as well. The GET is a pure read and stays served on a
         // read-only instance; the POST is a pull that writes, and does not.
         .route(
@@ -709,6 +717,99 @@ pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a request that names a domain this caller may not see, in the words
+/// a domain nobody registered is refused with.
+///
+/// The equality is the point, so it is one call rather than two messages kept
+/// in step: `Engine::require_domain` raises its `UnknownDomain` for a hidden
+/// name and for an unregistered one alike, and the registered set that error
+/// lists already has the caller's hidden domains taken out of it. A hidden
+/// domain therefore answers 404 and never 403 - being told "forbidden" would
+/// confirm the existence the privacy is for.
+///
+/// Every domain-addressed route whose engine verb is not itself scoped opens
+/// with this: the MANIFEST read, the attachment listing and bytes, the inbound
+/// list's siblings. A resolver that cannot answer propagates as a 500 through
+/// the engine's `EngineError::Internal`, so this fails closed.
+pub(super) async fn require_domain_read(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<(), ApiError> {
+    state
+        .engine
+        .require_domain(domain, &identity.scope())
+        .await?;
+    Ok(())
+}
+
+/// The caller, when the request may mutate content in `domain`.
+///
+/// Three refusals in the order they have to happen:
+///
+/// 1. a domain this caller may not see is the 404 above, decided before
+///    anything else, so a stranger writing to a private domain learns exactly
+///    what a stranger writing to a domain nobody registered learns;
+/// 2. then the instance role, unchanged: a domain invitation widens what an
+///    account may *reach*, never what its instance role lets it *do*, so a
+///    domain editor who is an instance viewer is still refused here;
+/// 3. then the membership level, which is what a private domain adds. The
+///    message names the level the caller holds, because "forbidden" on a
+///    domain they can see and read is otherwise indistinguishable from a bug.
+///
+/// Step 3 can only fire on a private domain. On a shared one the right is the
+/// instance role's own (the policy in `crate::scope`), so a caller past step 2
+/// holds `Write` or better by construction.
+///
+/// Three routes carry no domain gate of any kind, deliberately: unregistering
+/// a domain, saving its MANIFEST and the origin pull. All three are
+/// `require_admin`, and an instance admin resolves to [`DomainRight::Own`] on
+/// every domain, private ones included, so a gate there is a store round trip
+/// that cannot refuse. If that early return is ever narrowed, those three are
+/// what has to be revisited - which is why this sentence sits here rather than
+/// nowhere. The share surfaces beside them are NOT in that set: their gate
+/// moves with `github.share_identity`, so an instance editor reaches them in
+/// personal mode, and they carry a domain gate of their own.
+pub(super) async fn require_domain_write(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<Caller, ApiError> {
+    let scope = identity.scope();
+    state.engine.require_domain(domain, &scope).await?;
+    let caller = identity.require_editor()?;
+    let right = state
+        .access
+        .right(&scope, domain)
+        .await
+        // Never a fallback: a write that cannot learn what its caller may do
+        // refuses rather than proceeding on an assumption.
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Write {
+        return Err(ApiError::forbidden(format!(
+            "your membership on this domain is {}, and editor access is required",
+            member_level_word(right)
+        )));
+    }
+    Ok(caller)
+}
+
+/// What a caller holding this right is called on the domain, for a refusal
+/// that has to name it. Only [`DomainRight::Read`] reaches a message today;
+/// the rest are spelled out so the mapping is complete rather than a default
+/// arm that would print "viewer" for something else one day.
+fn member_level_word(right: DomainRight) -> &'static str {
+    match right {
+        DomainRight::None => "none",
+        DomainRight::Read => "viewer",
+        DomainRight::Write => "editor",
+        DomainRight::Manage => "manager",
+        DomainRight::Own => "owner",
+    }
 }
 
 /// Refuse an empty password before it is hashed into an account nobody can log

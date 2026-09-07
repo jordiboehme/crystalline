@@ -1870,6 +1870,19 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Admin,
             read_only_exempt: false,
         },
+        // Visibility, in the direction that changes nothing on a domain that
+        // is already shared: the allowed leg answers 204 and the domain stays
+        // reachable for every row below it. Admin only in BOTH directions -
+        // making a domain private transfers it to the caller - and refused on
+        // a read-only instance like every other mutation here: the membership
+        // records are not knowledge, but what they decide is who may read it.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/visibility",
+            body: Some(serde_json::json!({"private": false})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
         // `eng` has no origin, so the allowed leg answers 409 - which is
         // exactly the "anything but 401/403" this matrix asserts, and it needs
         // no team fixture to prove the gate. The endpoint's own semantics are

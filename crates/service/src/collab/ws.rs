@@ -62,7 +62,10 @@ pub async fn join(
     headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    identity.require_editor()?;
+    // The same gate the save routes carry, and for the same reason: a
+    // co-editing socket is a write channel. A domain this caller may not see
+    // answers the 404 an unregistered one does, before the upgrade.
+    crate::rest::require_domain_write(&state, &identity, &domain).await?;
     if state.engine.read_only() {
         return Err(ApiError::forbidden(
             "this instance is read-only, so collaborative editing is disabled",
