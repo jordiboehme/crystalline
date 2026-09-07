@@ -274,18 +274,19 @@ use crystalline_core::{CrystallineUrl, SKILL_ASSETS};
 use crystalline_remote::RemoteError;
 
 /// The tools hidden in read-only mode: the five content-mutating engram tools
-/// plus `add_domain`, which creates a domain (writing config, and files for a
-/// local domain). In read-only mode they are hidden from `list_tools` and
-/// `get_tool`, while their routes stay registered so a client that calls one by
-/// name still reaches the engine guard and gets the read-only error rather than
-/// a bare "tool not found".
-const WRITE_TOOLS: [&str; 6] = [
+/// plus `add_domain` and `remove_domain`, which create and unregister domains
+/// (writing config, and files for a local domain). In read-only mode they are
+/// hidden from `list_tools` and `get_tool`, while their routes stay registered
+/// so a client that calls one by name still reaches the engine guard and gets
+/// the read-only error rather than a bare "tool not found".
+const WRITE_TOOLS: [&str; 7] = [
     "write_engram",
     "edit_engram",
     "move_engram",
     "split_engram",
     "delete_engram",
     "add_domain",
+    "remove_domain",
 ];
 
 /// Whether a tool name is one of the write-gated tools (hidden in read-only
@@ -1344,6 +1345,38 @@ impl McpServer {
         Ok(None)
     }
 
+    /// The gate on changing what this instance IS: which domains are
+    /// registered on it, and how it is configured.
+    ///
+    /// Three answers, and each is a rule rather than a consequence:
+    ///
+    /// * **a local stdio session is the machine owner.** Whoever runs it
+    ///   already has the config file and the domains on disk, so there is
+    ///   nothing here for a check to protect;
+    /// * **the legacy open tier keeps exactly what it had.** With `auth.mcp`
+    ///   off there are no accounts to hold a role, and refusing here would take
+    ///   away what every single-user install does on every session. The
+    ///   condition is spelled the same way [`McpServer::refuse_unwritable`]
+    ///   spells it - the door is open, not merely that nobody is there - so an
+    ///   unauthenticated request that somehow got past a gate that is ON cannot
+    ///   inherit the open tier's powers;
+    /// * **an authenticated agent needs the instance admin role**, which is
+    ///   what the JSON API has always required of the same actions. Anything
+    ///   else is refused with [`INSTANCE_ADMIN_ONLY`].
+    ///
+    /// `remove_domain` deliberately does NOT go through here: ending a domain
+    /// is gated in the engine, where REST reads the same rule, and that rule is
+    /// narrower in one direction (a private domain's owner may end it without
+    /// being an admin) and wider in none.
+    fn refuse_instance_change(&self, scope: &Scope) -> Option<&'static str> {
+        match scope {
+            Scope::Unrestricted => None,
+            Scope::Anonymous if !self.engine.auth_mcp() => None,
+            Scope::User { admin: true, .. } => None,
+            _ => Some(INSTANCE_ADMIN_ONLY),
+        }
+    }
+
     /// Who a write verb over this connection acts as, when this instance
     /// shares with personal GitHub identities (`github.share_identity =
     /// personal`). Inert in the default `instance` mode, where one credential
@@ -1860,9 +1893,23 @@ impl McpServer {
     async fn configure(
         &self,
         Parameters(p): Parameters<ConfigureParams>,
+        ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         if self.engine.read_only() {
             return Err(to_error(EngineError::ReadOnly));
+        }
+
+        // A bare `configure` is the settings page, which is a read and stays
+        // open to every caller. Everything that CHANGES this instance - a set,
+        // an unset, and the three connect fields that decide which GitHub
+        // identity it acts as - is an instance change and is gated as one.
+        let changes = !p.set.is_empty()
+            || !p.unset.is_empty()
+            || p.connect.is_some()
+            || p.token.is_some()
+            || p.host.is_some();
+        if changes && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
+            return refuse(refusal);
         }
 
         if p.token.is_some() || p.connect.is_some() {
@@ -1922,6 +1969,12 @@ impl McpServer {
         Parameters(p): Parameters<AddDomainParams>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Registering a domain changes what this instance is, so it is gated
+        // before anything is validated: an agent that may not create one is
+        // told so rather than told its arguments were wrong.
+        if let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx)) {
+            return refuse(refusal);
+        }
         if p.repo.is_some() && p.is_virtual {
             return Err(to_error(EngineError::Invalid(
                 "add_domain: repo and virtual are mutually exclusive; a team domain is file-backed"
@@ -1987,6 +2040,66 @@ impl McpServer {
                 .await
         };
         result.map_err(to_error).and_then(ok)
+    }
+
+    #[tool(
+        name = "remove_domain",
+        title = "Remove domain",
+        description = "Unregister a domain when its knowledge no longer belongs on this instance - the counterpart to add_domain, and the way to remove, unregister, drop or disconnect a domain the agent should stop learning from and searching. What goes is the registration and the search index rows, not the knowledge: a local folder domain is unregistered and its markdown files stay exactly where they are on disk, so pointing add_domain at that folder again re-adopts them; a team domain is unregistered with its local folder left in place and its GitHub repository never touched, so nothing is removed for the rest of the team. A virtual domain is the exception, because its engrams live in the database and ARE its knowledge: it refuses unless you pass purge: true, and there is no folder left to re-adopt afterwards, so export or share what is worth keeping first. Any open co-editing rooms in the domain are saved and closed before it goes; rooms_closed counts them. On a 2026-07-28 peer that declared an elicitation capability the first call removes nothing and answers input_required instead: a confirmation question naming the domain, its kind and how many engrams it holds, which the client puts to the user and answers by re-sending the same call with the confirmation; anything but a yes removes nothing. A local session is the machine owner and may remove any domain; over HTTP this is for an instance admin, or for the owner of a private domain, and a caller who may not see a domain is answered exactly as if nobody had registered it. A domain defined by an environment variable belongs to that variable: unset it instead. Refuses on a read-only instance, like every mutating tool.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = true,
+            open_world_hint = false
+        )
+    )]
+    async fn remove_domain(
+        &self,
+        Parameters(p): Parameters<RemoveDomainParams>,
+        responses: InputResponses,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, ErrorData> {
+        if self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
+        let scope = self.scope_of(&ctx);
+        // The preview carries the gate: a domain this caller may not see is
+        // refused as an unregistered one, a caller who may see it and may not
+        // end it is told who can, and an environment-defined domain raises its
+        // conflict here. All three come before the question, for the reason
+        // `delete_engram` states: never ask about an action that would refuse
+        // anyway. `Engine::unregister_domain` re-checks the same gate under
+        // its own lock, which is where the decision actually has to hold.
+        let preview = self
+            .engine
+            .domain_remove_preview(&p.domain, &scope)
+            .await
+            .map_err(to_error)?;
+        if preview["kind"] == json!("virtual") && !p.purge {
+            return refuse(purge_refusal(&p.domain)).map(CallToolResponse::from);
+        }
+        if confirmation_supported(&ctx) {
+            match confirmed(&responses.0) {
+                None => {
+                    return Ok(confirm_question(remove_domain_question(&preview)).into());
+                }
+                Some(false) => {
+                    return refuse(format!(
+                        "The removal was not confirmed, so domain '{}' is still registered and \
+                         nothing was touched. Call remove_domain again if the user asks for it.",
+                        p.domain
+                    ))
+                    .map(CallToolResponse::from);
+                }
+                Some(true) => {}
+            }
+        }
+        self.engine
+            .unregister_domain(&p.domain, &scope)
+            .await
+            .map_err(to_error)
+            .and_then(ok)
+            .map(CallToolResponse::from)
     }
 
     #[tool(
@@ -3397,6 +3510,58 @@ fn delete_question(preview: &Value) -> String {
     format!("Delete '{title}' ({domain}/{permalink})? {clause} This cannot be undone.")
 }
 
+/// What an authenticated non-admin agent is told when it tries to change what
+/// this instance is: which domains are registered, and how it is configured.
+///
+/// The JSON API has always gated those admin-only; over MCP they were open to
+/// any account whose agent held a token, which is the last place the two
+/// surfaces disagreed. It names the role rather than the person, and it names
+/// the way out, because an agent that reads this has to be able to tell its
+/// user what to ask for.
+const INSTANCE_ADMIN_ONLY: &str = "Changing this instance itself - the domains registered on it and its settings - is reserved for an instance admin, and the account this session is authenticated as does not hold that role. Ask an admin to make the change (they can do it in Fluid under Settings, or with the crystalline CLI on the server). Capturing, reading and refining knowledge in the domains you can already see is unaffected.";
+
+/// What `remove_domain` says when a virtual domain is named without `purge`.
+///
+/// The one kind of domain where unregistering is destructive, and the refusal
+/// has to say so in the words an agent will relay: the rows ARE the knowledge,
+/// nothing on disk survives, and the way through is a deliberate second call.
+fn purge_refusal(domain: &str) -> String {
+    format!(
+        "Domain '{domain}' is a virtual domain: its engrams live in the database, so unregistering \
+         it DELETES that knowledge and nothing on disk is left to re-adopt. Export or share what is \
+         worth keeping first, then call remove_domain again with purge: true to confirm the loss. \
+         A file domain needs no purge: its files are never touched."
+    )
+}
+
+/// The sentence `remove_domain` asks before it acts, rendered from
+/// [`crate::engine::Engine::domain_remove_preview`].
+///
+/// Names the domain, its kind and how much knowledge is in it, because those
+/// are the three things somebody needs in order to answer - and then says what
+/// actually happens to that knowledge, which is the half that differs by kind:
+/// a file domain's markdown stays on disk and is re-adopted by adding the
+/// folder again, while a virtual domain's rows are the knowledge and go with
+/// it.
+fn remove_domain_question(preview: &Value) -> String {
+    let domain = preview["domain"].as_str().unwrap_or_default();
+    let kind = preview["kind"].as_str().unwrap_or("file");
+    let held = match preview["engrams"].as_u64() {
+        Some(1) => " holding 1 engram".to_string(),
+        Some(n) => format!(" holding {n} engrams"),
+        // The index has no row for it, which is a domain nothing has synced
+        // rather than an empty one; saying so beats claiming a count.
+        None => String::new(),
+    };
+    let consequence = if kind == "virtual" {
+        "Its engrams live in the database, so they are deleted with it and this cannot be undone."
+    } else {
+        "Its files stay on disk exactly as they are, so adding the folder again re-adopts them; \
+         the registration and the search index rows go."
+    };
+    format!("Unregister the {kind} domain '{domain}'{held}? {consequence}")
+}
+
 /// Whether a share plan has to be confirmed before it runs, given the plan's
 /// `action` word.
 ///
@@ -3894,6 +4059,10 @@ fn to_error(e: EngineError) -> ErrorData {
         | EngineError::Conflict(_)
         | EngineError::Invalid(_)
         | EngineError::ReadOnly
+        // The caller asked for something they are not allowed to do, and the
+        // message says who is: input-class guidance, like the read-only
+        // refusal above it.
+        | EngineError::Forbidden(_)
         | EngineError::EnvTokenConnect
         // The caller asked at the wrong moment rather than for the wrong
         // thing, and the message says to try again once the other sign-in is

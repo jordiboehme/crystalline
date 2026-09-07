@@ -277,6 +277,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
         "provision",
         "read_engram",
         "recent_activity",
+        "remove_domain",
         "search_engrams",
         "skills",
         "split_engram",
@@ -303,7 +304,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
             "{hidden} must be withheld while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 19, "every tool, exactly once: {names:?}");
+    assert_eq!(names.len(), 20, "every tool, exactly once: {names:?}");
 
     // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
     // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`
@@ -742,8 +743,9 @@ async fn read_only_hides_the_write_gated_tools() {
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
 
-    // The six write-gated tools (five content-mutating plus add_domain, which
-    // creates domains) are absent from the surface.
+    // The seven write-gated tools (five content-mutating plus add_domain and
+    // remove_domain, which create and unregister domains) are absent from the
+    // surface.
     for hidden in [
         "write_engram",
         "edit_engram",
@@ -751,6 +753,7 @@ async fn read_only_hides_the_write_gated_tools() {
         "split_engram",
         "delete_engram",
         "add_domain",
+        "remove_domain",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -4609,4 +4612,136 @@ async fn evolve_engrams_renders_the_queue_as_one_toon_table() {
     // The legend and the guidance ride the same response.
     assert!(text.contains("actions["), "{text}");
     assert!(text.contains("guidance:"), "{text}");
+}
+
+// --- remove_domain ----------------------------------------------------------
+
+/// **A local domain is unregistered and its files stay on disk**, and a stdio
+/// session may do it at all: the machine owner is `Scope::Unrestricted`, so the
+/// removal gate that an HTTP caller meets resolves to `Own` here and never
+/// stands between somebody and the files they already have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_unregisters_a_local_domain_and_keeps_its_files() {
+    let h = Harness::new(&["eng", "keep"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Alpha", "content": "Alpha knowledge" }),
+    )
+    .await
+    .unwrap();
+
+    let report = call(peer, "remove_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(report["domain"], json!("eng"), "{report}");
+    assert_eq!(report["unregistered"], json!(true), "{report}");
+    assert_eq!(
+        report["files_kept"],
+        json!(true),
+        "a file domain's files stay on disk: {report}"
+    );
+
+    assert!(
+        h.root.join("eng").join("alpha.md").exists(),
+        "the engram file was left exactly where it was"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        !listed.to_string().contains("\"eng\""),
+        "the domain is gone from the listing: {listed}"
+    );
+    assert!(
+        listed.to_string().contains("keep"),
+        "and the other domain is untouched: {listed}"
+    );
+}
+
+/// **A virtual domain's rows ARE its knowledge**, so the removal refuses until
+/// the caller says `purge: true` - and the refusal is the tool's own text a
+/// model can read, not an opaque protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_refuses_a_virtual_domain_without_purge() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mind", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "mind", "title": "Only Copy", "content": "Nowhere else" }),
+    )
+    .await
+    .unwrap();
+
+    let refused = call_result(peer, "remove_domain", json!({ "domain": "mind" })).await;
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "the refusal is a tool error the model reads: {refused:?}"
+    );
+    let text = result_text(&refused);
+    assert!(
+        text.contains("purge"),
+        "the refusal names the way through: {text}"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        listed.to_string().contains("mind"),
+        "and nothing was removed: {listed}"
+    );
+
+    let report = call(
+        peer,
+        "remove_domain",
+        json!({ "domain": "mind", "purge": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report["unregistered"], json!(true), "{report}");
+    assert_eq!(
+        report["files_kept"],
+        json!(false),
+        "a virtual domain has no files to keep: {report}"
+    );
+}
+
+/// A read-only instance hides `remove_domain` with the rest of the write-gated
+/// tools, and a call by name still reaches the engine guard rather than a bare
+/// "no such tool".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_is_hidden_and_refused_on_a_read_only_instance() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+    let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        !names.contains(&"remove_domain".to_string()),
+        "remove_domain is hidden read-only: {names:?}"
+    );
+
+    let refused = call(peer, "remove_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("read-only"),
+        "the route stays registered and answers the read-only refusal: {refused}"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "and nothing was unregistered: {listed}"
+    );
 }

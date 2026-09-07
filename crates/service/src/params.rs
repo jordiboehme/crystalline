@@ -512,6 +512,18 @@ pub struct AddDomainParams {
     pub branch: Option<String>,
 }
 
+/// Parameters for `remove_domain`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct RemoveDomainParams {
+    /// The registered domain to unregister.
+    pub domain: String,
+    /// Required to unregister a VIRTUAL domain, whose engrams live in the
+    /// database and are deleted with it. Ignored for a file domain, whose
+    /// files are never touched either way.
+    #[serde(default)]
+    pub purge: bool,
+}
+
 /// Parameters for `share_changes`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShareChangesParams {

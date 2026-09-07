@@ -2285,3 +2285,268 @@ async fn proxy_headers_are_no_way_past_the_mcp_gate() {
         "and is told the same thing a caller with no header at all is"
     );
 }
+
+// --- removing a domain, and the instance-state gate around it ---------------
+
+/// Whether `answer` still lists `domain` for the machine owner.
+///
+/// Read through the engine rather than through a second MCP call, so the
+/// assertion is about what the instance holds rather than about what one scope
+/// is shown.
+async fn still_registered(ctx: &VisibilityCtx, domain: &str) -> bool {
+    ctx.engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap()
+        .to_string()
+        .contains(&format!("\"{domain}\""))
+}
+
+/// **A private domain's owner unregisters it; a manager does not.**
+///
+/// The spec's locked rule, at the rung it is decided on: the owner of a private
+/// domain and an instance admin may remove it, and every level below - manager
+/// included - is refused with text naming who can. A manager may invite people
+/// into the domain and may write it; ending the domain is not a membership
+/// decision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_domains_owner_removes_it_and_a_manager_cannot() {
+    let ctx = mcp_ctx(true).await;
+    ctx.add_member(
+        "lab",
+        "mem",
+        crystalline_service::rest::MemberLevel::Manager,
+    )
+    .await;
+
+    let manager = ctx.token_for("mem").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&manager)).await;
+    let refused = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        refused.contains("admin") && refused.contains("owner"),
+        "the refusal names who can remove it:\n{refused}"
+    );
+    assert!(
+        still_registered(&ctx, "lab").await,
+        "and the manager removed nothing"
+    );
+
+    let owner = ctx.token_for("owner").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&owner)).await;
+    let removed = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        removed.contains("unregistered"),
+        "the owner's removal lands:\n{removed}"
+    );
+    assert!(
+        !still_registered(&ctx, "lab").await,
+        "and the domain is gone"
+    );
+    assert!(
+        ctx.path("lab", "lab-note.md").exists(),
+        "a file domain's files stay on disk"
+    );
+}
+
+/// **A shared domain is an admin's to remove and nobody else's.**
+///
+/// There is no owner concept on a shared domain and none is invented here: the
+/// same account that owns `lab` is an ordinary instance editor on `open`, and
+/// is refused there. The admin is allowed, which is what keeps the refusal from
+/// passing vacuously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_domain_is_removed_by_an_admin_and_by_nobody_else() {
+    let ctx = mcp_ctx(true).await;
+
+    let editor = ctx.token_for("owner").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&editor)).await;
+    let refused = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "open" }))
+        .await;
+    assert!(
+        refused.contains("admin"),
+        "an editor on a shared domain is refused, naming who can:\n{refused}"
+    );
+    assert!(still_registered(&ctx, "open").await, "nothing was removed");
+
+    let boss = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+    let removed = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "open" }))
+        .await;
+    assert!(
+        removed.contains("unregistered"),
+        "an instance admin removes it:\n{removed}"
+    );
+    assert!(!still_registered(&ctx, "open").await, "and it is gone");
+}
+
+/// **A domain this caller may not see is not removable, and the refusal says
+/// only that it is not registered.**
+///
+/// The gate would otherwise be an existence oracle: "you may not remove that"
+/// tells a stranger the domain is there. The two answers are compared against
+/// each other, so a later change that words one of them differently fails here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn removing_a_hidden_domain_answers_exactly_as_removing_an_absent_one() {
+    let ctx = mcp_ctx(true).await;
+    let stranger = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&stranger)).await;
+
+    let hidden = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "lab" }))
+        .await;
+    assert!(
+        hidden.contains("not registered"),
+        "a hidden domain is answered as an unregistered one:\n{hidden}"
+    );
+    let absent = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "nowhere" }))
+        .await;
+    // Compared as the JSON-RPC error message rather than as whole responses:
+    // the SSE frame around it carries a per-connection event id and a chunk
+    // length, which differ between two separate requests and say nothing about
+    // what either caller was told.
+    let message = |raw: &str| {
+        let line = raw
+            .lines()
+            .find(|l| l.starts_with("data: "))
+            .unwrap_or_default();
+        let parsed: serde_json::Value =
+            serde_json::from_str(line.trim_start_matches("data: ")).unwrap();
+        parsed["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .replace("lab", "nowhere")
+    };
+    assert_eq!(
+        message(&hidden),
+        message(&absent),
+        "the two refusals differ only in the name that was asked for"
+    );
+    assert!(
+        still_registered(&ctx, "lab").await,
+        "and the private domain is untouched"
+    );
+}
+
+/// **The open tier removes nothing.**
+///
+/// With `auth.mcp` off an HTTP agent is nobody in particular, and unregistering
+/// a domain is not something nobody in particular does. This is the one place
+/// the open tier's carve-out does NOT apply: `add_domain` and `configure` keep
+/// answering it exactly as they always did (the next test), because that is
+/// what a default install already relies on, while removal is new and arrives
+/// closed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_open_tier_cannot_remove_a_domain() {
+    let ctx = mcp_ctx(false).await;
+    let session = McpTestSession::open(&ctx.addr, None).await;
+    let refused = session
+        .call_tool("remove_domain", serde_json::json!({ "domain": "open" }))
+        .await;
+    assert!(
+        refused.contains("admin"),
+        "the open tier is refused, naming who can:\n{refused}"
+    );
+    assert!(still_registered(&ctx, "open").await, "nothing was removed");
+}
+
+/// **Instance-state changes over MCP are an admin's, once agents authenticate.**
+///
+/// `add_domain` and `configure`'s mutating half write instance state, which the
+/// JSON API has always gated admin-only; before this they were open to any
+/// account whose agent held a token. A viewer and an editor are both refused;
+/// an admin is not, which is what keeps the refusals from passing vacuously.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn instance_state_changes_over_mcp_are_admin_only() {
+    let ctx = mcp_ctx(true).await;
+
+    for account in ["looker", "owner"] {
+        let token = ctx.token_for(account).await;
+        let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+        let added = session
+            .call_tool(
+                "add_domain",
+                serde_json::json!({ "domain": "spare", "virtual": true }),
+            )
+            .await;
+        assert!(
+            added.contains("admin"),
+            "{account} may not create a domain over MCP:\n{added}"
+        );
+        let configured = session
+            .call_tool(
+                "configure",
+                serde_json::json!({ "set": { "github.enabled": "true" } }),
+            )
+            .await;
+        assert!(
+            configured.contains("admin"),
+            "{account} may not change settings over MCP:\n{configured}"
+        );
+        let shown = session.call_tool("configure", serde_json::json!({})).await;
+        assert!(
+            !shown.contains("\"error\""),
+            "but reading the settings is not a change:\n{shown}"
+        );
+    }
+    assert!(
+        !still_registered(&ctx, "spare").await,
+        "nothing was created"
+    );
+
+    let boss = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+    let added = session
+        .call_tool(
+            "add_domain",
+            serde_json::json!({ "domain": "spare", "virtual": true }),
+        )
+        .await;
+    assert!(
+        added.contains("spare") && !added.contains("admin"),
+        "an admin creates one:\n{added}"
+    );
+}
+
+/// **The open tier keeps exactly the instance-state powers it had.**
+///
+/// The carve-out that keeps a default install unchanged: with `auth.mcp` off
+/// there are no accounts to hold a role, and refusing here would take away what
+/// every single-user install already does on every session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_open_tier_still_creates_domains_and_configures() {
+    let ctx = mcp_ctx(false).await;
+    let session = McpTestSession::open(&ctx.addr, None).await;
+    let added = session
+        .call_tool(
+            "add_domain",
+            serde_json::json!({ "domain": "spare", "virtual": true }),
+        )
+        .await;
+    assert!(
+        added.contains("spare") && !added.contains("admin"),
+        "the open tier still creates a domain:\n{added}"
+    );
+    let configured = session
+        .call_tool(
+            "configure",
+            serde_json::json!({ "set": { "search.salience_weight": "0.2" } }),
+        )
+        .await;
+    // Asserted as the setting having actually moved rather than as the absence
+    // of a word: the settings snapshot this answers with documents every key,
+    // and several of those doc strings say "admin" for reasons of their own.
+    assert!(
+        configured.contains("\\\"value\\\":\\\"0.2\\\""),
+        "and still changes settings:\n{configured}"
+    );
+}

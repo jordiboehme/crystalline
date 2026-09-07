@@ -430,7 +430,7 @@ async fn a_modern_client_is_served_with_no_handshake_at_all() {
         .unwrap_or_else(|| panic!("no tool list in {answer}"));
     assert_eq!(
         tools.len(),
-        19,
+        20,
         "a default install's list, unchanged by the era"
     );
     assert_hinted("tools/list", &answer["result"]);
@@ -3678,5 +3678,143 @@ async fn calling_a_hidden_collaboration_tool_still_teaches_rather_than_vanishing
     assert!(
         text.contains("not enabled") && text.contains("github.enabled"),
         "the refusal names the setting to turn on: {answer}"
+    );
+}
+
+// --- the removal confirmation round -----------------------------------------
+
+/// The arguments that unregister the harness's one domain.
+fn remove_eng(responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "remove_domain",
+        "arguments": { "domain": "eng" },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// Round one: an eliciting peer is asked before the domain is unregistered,
+/// and the question says which domain, what kind it is and how much knowledge
+/// is in it - the three things somebody needs in order to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_eliciting_removal_asks_before_it_unregisters() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let written = wire
+        .open(modern(
+            1,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": { "domain": "eng", "title": "Kept", "content": "Stays on disk." },
+            }),
+        ))
+        .await;
+    assert!(written["error"].is_null(), "{written}");
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", remove_eng(None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than an unregistration: {asked}"
+    );
+    let message = result["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("eng"), "the question names it: {message}");
+    assert!(
+        message.contains("file"),
+        "and says what kind it is: {message}"
+    );
+    assert!(
+        message.contains('2'),
+        "and how many engrams are in it (the MANIFEST and the write): {message}"
+    );
+    assert!(
+        message.contains("stay"),
+        "and that a file domain's files are left alone: {message}"
+    );
+
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "round one unregisters nothing: {listed}"
+    );
+}
+
+/// Round two, both answers: a yes unregisters and a no leaves everything
+/// exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_removal_lands_and_a_declined_one_does_nothing() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let asked = wire
+        .open(eliciting(1, "tools/call", remove_eng(None)))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let declined = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            remove_eng(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(
+        declined["result"]["isError"],
+        json!(true),
+        "a no is a refusal the model reads: {declined}"
+    );
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "and the domain is still registered: {listed}"
+    );
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            remove_eng(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the confirmed round unregisters: {done}"
+    );
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains("\"eng\""),
+        "and the domain is gone: {listed}"
+    );
+    assert!(
+        h.root.join("eng").join("MANIFEST.md").exists(),
+        "with its files left on disk"
     );
 }
