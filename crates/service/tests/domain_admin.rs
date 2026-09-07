@@ -636,3 +636,141 @@ async fn the_domain_listing_is_sorted_by_name() {
         .collect();
     assert_eq!(names, ["Falcon", "falconry", "mercury", "zebra"]);
 }
+
+// --- the purge gate, and what it does when the index cannot be read ----------
+
+/// A file-backed engine over `path`, registering `virtual_domain` as a virtual
+/// domain and `file_domain` as a file domain.
+///
+/// File-backed rather than in-memory because the fault below is injected by
+/// re-opening the same database between two `TursoStore::open` calls, which
+/// needs a file to re-open.
+async fn engine_over(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    virtual_domain: &str,
+    file_domain: &str,
+) -> Arc<Engine> {
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert(virtual_domain.to_string(), DomainEntry::virtual_domain());
+    let dir = root.join(file_domain);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST).unwrap();
+    cfg.domains
+        .insert(file_domain.to_string(), DomainEntry::file(dir));
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open(path).await.unwrap();
+    Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ))
+}
+
+/// Break `domain_stats` on an already-migrated database, leaving every other
+/// query intact.
+///
+/// `domain_stats` is the only read in the removal path that joins `domain_lock`
+/// (`SELECT ... FROM domain d LEFT JOIN domain_lock dl ...`), so dropping that
+/// table makes exactly that one query fail while the targeted delete a removal
+/// performs afterwards still works. Sequential by construction, like
+/// `mcp_auth.rs`'s `break_the_visibility_table`: the store that created the
+/// schema is closed before this connection opens, and this connection is closed
+/// before the store re-opens. The migrations are recorded in
+/// `schema_migration`, so the re-opened store does not put the table back.
+async fn break_domain_stats(path: &std::path::Path) {
+    let name = path.to_string_lossy().to_string();
+    let db = match turso::Builder::new_local(&name)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+    {
+        Ok(db) => db,
+        Err(_) => turso::Builder::new_local(&name).build().await.unwrap(),
+    };
+    let conn = db.connect().unwrap();
+    conn.execute_batch("DROP TABLE domain_lock;").await.unwrap();
+}
+
+/// **An engram count that cannot be read is a refusal, not a zero.**
+///
+/// The gate that decides whether a virtual domain's knowledge is deleted must
+/// not read a failed query as "there was nothing there". An index error and an
+/// empty index are different facts, and only one of them means the removal is
+/// safe: `domain_stats` is an aggregate sweep over every domain and can fail on
+/// a database whose targeted delete would have succeeded, so a swallowed error
+/// here deletes somebody's only copy of their knowledge with no confirmation on
+/// any surface.
+///
+/// The second half is what keeps the first from being over-broad: the KIND is
+/// the primary key of the decision and comes from the config entry, so a file
+/// domain - which loses no knowledge to a removal at all - is unaffected by the
+/// same unreadable index and still unregisters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_purge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let db = root.join("index.db");
+
+    // Phase one creates the schema and records the migrations; phase two runs
+    // against the same file with `domain_stats`' join partner missing.
+    let engine = engine_over(&db, &root, "mind", "eng").await;
+    drop(engine);
+    break_domain_stats(&db).await;
+    let engine = engine_over(&db, &root, "mind", "eng").await;
+
+    let refused = engine
+        .unregister_domain("mind", &Scope::Unrestricted, false)
+        .await
+        .expect_err("an unreadable count must not read as an empty domain");
+    let text = refused.to_string();
+    assert!(
+        text.contains("purge"),
+        "the refusal names the flag that would let it through: {text}"
+    );
+    assert!(
+        text.contains("could not be read"),
+        "and says the count is unknown rather than claiming one: {text}"
+    );
+    assert!(
+        engine
+            .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("mind"),
+        "and the domain is still registered"
+    );
+
+    // A file domain loses no knowledge to a removal, so the same broken index
+    // costs it only the number in its receipt.
+    let removed = engine
+        .unregister_domain("eng", &Scope::Unrestricted, false)
+        .await
+        .expect("a file domain never needed the count to decide anything");
+    assert_eq!(removed["unregistered"], serde_json::json!(true));
+    assert_eq!(removed["files_kept"], serde_json::json!(true));
+    assert!(
+        tmp.path().join("eng/MANIFEST.md").exists(),
+        "and its files are where they were"
+    );
+
+    // With the loss already confirmed there is nothing left to ask about, so
+    // the same unreadable count no longer stands in the way.
+    let purged = engine
+        .unregister_domain("mind", &Scope::Unrestricted, true)
+        .await
+        .expect("purge is the confirmation the refusal asked for");
+    assert_eq!(purged["unregistered"], serde_json::json!(true));
+    assert_eq!(purged["files_kept"], serde_json::json!(false));
+}

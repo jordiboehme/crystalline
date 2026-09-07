@@ -9035,14 +9035,19 @@ impl Engine {
     /// spellings, because the rule is one rule and the surfaces are three. It
     /// speaks only about a virtual domain: a file or team domain's markdown is
     /// never touched by a removal, so there is nothing there to confirm.
-    fn purge_refusal(name: &str, engrams: i64) -> EngineError {
-        let held = if engrams == 1 {
-            "1 engram".to_string()
-        } else {
-            format!("{engrams} engrams")
+    /// `held` is `None` when the count could not be read at all, which is a
+    /// refusal in its own right: an unreadable index is not an empty one, and
+    /// the one branch that decides whether knowledge is deleted must not read
+    /// a failure as "there was nothing there".
+    fn purge_refusal(name: &str, held: Option<i64>) -> EngineError {
+        let holding = match held {
+            Some(1) => "holding 1 engram".to_string(),
+            Some(n) => format!("holding {n} engrams"),
+            None => "whose engrams could not be counted, because the index could not be read"
+                .to_string(),
         };
         EngineError::ConfirmationRequired(format!(
-            "domain '{name}' is a virtual domain holding {held}: its knowledge lives in the \
+            "domain '{name}' is a virtual domain {holding}: its knowledge lives in the \
              database, so unregistering it DELETES those engrams and leaves no files to \
              re-adopt. Export or share what is worth keeping first, then repeat the removal \
              with purge set - 'purge: true' over MCP, '?purge=true' on the JSON API, '--purge' \
@@ -9075,18 +9080,32 @@ impl Engine {
     ///
     /// The count and the refusal come out of one read on purpose: they are the
     /// same fact asked twice, and a preview whose count disagreed with the
-    /// refusal that follows it would be worse than either alone. `None` is a
-    /// domain the index has no row for, which is one nothing has synced rather
-    /// than an empty one; it is not treated as knowledge to protect, since
-    /// there is nothing recorded to lose.
+    /// refusal that follows it would be worse than either alone.
     ///
-    /// In practice the count is never zero for a virtual domain a caller could
-    /// be looking at: `domain_add_virtual` scaffolds a MANIFEST engram into the
-    /// database, so one exists from the moment the domain does. The condition
-    /// is written on the count anyway rather than on the kind, because what is
-    /// being protected is knowledge rather than a category, and a virtual
-    /// domain whose rows were cleared by something else has nothing left to
-    /// confirm the loss of.
+    /// **The KIND is the primary key of this decision, and it comes from the
+    /// config entry, which cannot fail to be read.** Only a virtual domain can
+    /// lose knowledge to a removal, so a file or team domain never reaches the
+    /// refusal at all and its count is a display value: an unreadable index
+    /// costs it nothing more than an absent number. That ordering is what keeps
+    /// this gate from failing open, and it is why the kind is tested before the
+    /// count rather than after it.
+    ///
+    /// **For a virtual domain, a count that cannot be read is a refusal.** An
+    /// error from the index is not the same fact as an empty index, and reading
+    /// it as one would delete somebody's only copy of their knowledge on the
+    /// strength of a failed query - `domain_stats` is an aggregate sweep over
+    /// every domain and can time out on a database whose targeted delete would
+    /// have succeeded, so "the clear would probably have failed too" is not an
+    /// argument a confirmation gate may rest on. With `purge` already set there
+    /// is nothing left to confirm, so the error costs the caller only the
+    /// number in the receipt.
+    ///
+    /// A `None` count for a virtual domain that COULD be read is a domain the
+    /// index has no row for, which is one nothing ever synced; it is not
+    /// knowledge to protect, since there is nothing recorded to lose. In
+    /// practice that case is unreachable for a domain a caller could be looking
+    /// at, because `domain_add_virtual` scaffolds a MANIFEST engram into the
+    /// database from the moment the domain exists.
     async fn removal_engrams(
         &self,
         name: &str,
@@ -9094,14 +9113,33 @@ impl Engine {
         purge: bool,
     ) -> Result<Option<i64>> {
         let store = self.store.lock().await;
-        let stats = store.domain_stats().await.unwrap_or_default();
+        let stats = store.domain_stats().await;
         drop(store);
-        let engrams = stats.iter().find(|d| d.name == name).map(|d| d.engrams);
-        if entry.is_virtual()
-            && !purge
-            && let Some(held) = engrams.filter(|n| *n > 0)
-        {
-            return Err(Engine::purge_refusal(name, held));
+        // The kind first: a file or team domain loses no knowledge here, so a
+        // read that failed only costs it the number.
+        if !entry.is_virtual() {
+            return Ok(stats
+                .ok()
+                .and_then(|stats| stats.iter().find(|d| d.name == name).map(|d| d.engrams)));
+        }
+        let engrams = match stats {
+            Ok(stats) => stats.iter().find(|d| d.name == name).map(|d| d.engrams),
+            Err(e) if purge => {
+                // Already confirmed: the removal proceeds and the receipt is
+                // one number poorer. Logged rather than swallowed silently,
+                // because an index that cannot be swept is worth knowing about.
+                tracing::warn!(
+                    domain = name,
+                    error = format!("{e:#}"),
+                    "the engram count for '{name}' could not be read; the confirmed removal \
+                     proceeds without it"
+                );
+                None
+            }
+            Err(_) => return Err(Engine::purge_refusal(name, None)),
+        };
+        if !purge && engrams.is_some_and(|n| n > 0) {
+            return Err(Engine::purge_refusal(name, engrams));
         }
         Ok(engrams)
     }
