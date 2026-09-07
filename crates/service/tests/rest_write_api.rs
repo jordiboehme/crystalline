@@ -53,6 +53,7 @@ async fn serve(opts: Options) -> Fixture {
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };
@@ -1339,6 +1340,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
             anonymous: Some(false),
             mcp: None,
             max_users: None,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };

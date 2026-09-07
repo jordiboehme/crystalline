@@ -11,13 +11,20 @@ use std::path::PathBuf;
 
 use crystalline_core::config::{
     AuthConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting,
-    IdentityConfig, IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode,
-    SkillsConfig, SkillsServe,
+    IdentityConfig, IndexConfig, OidcConfig, ResponseFormat, SearchConfig, ServiceConfig,
+    ShareIdentityMode, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
 
 use crate::overlay::EnvOverlay;
+use crate::rest::Role;
+
+/// What a credential-carrying setting renders as instead of its value:
+/// whether one is configured, and nothing more. Shared with
+/// [`crate::overlay::EnvOverlay::active_overrides`] so a secret reads the same
+/// wherever it is displayed.
+pub const SECRET_DISPLAY: &str = "(set)";
 
 /// An error applying, resetting or looking up a setting. The message is
 /// actionable and safe to show an agent or a terminal as-is.
@@ -333,6 +340,60 @@ pub fn registry() -> &'static [SettingSpec] {
             apply: set_max_users,
             clear: clear_max_users,
             effective: max_users_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.issuer",
+            doc: "The single sign-on provider's issuer url, the one discovery appends /.well-known/openid-configuration to, for example https://login.microsoftonline.com/<your-tenant-id>/v2.0; unset means SSO is off and only the local accounts sign in (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_oidc_issuer,
+            clear: clear_oidc_issuer,
+            effective: oidc_issuer_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.client_id",
+            doc: "The client id (application id) the single sign-on provider issued for this Crystalline instance (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_oidc_client_id,
+            clear: clear_oidc_client_id,
+            effective: oidc_client_id_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.client_secret",
+            doc: "The client secret that goes with auth.oidc.client_id; a credential, so it is only ever shown as (set) and never echoed back - CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET supplies it instead where secrets stay out of the config file (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_oidc_client_secret,
+            clear: clear_oidc_client_secret,
+            effective: oidc_client_secret_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.name",
+            doc: "The single sign-on provider's display name, the label on the sign-in button; unset means the generic wording (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_oidc_name,
+            clear: clear_oidc_name,
+            effective: oidc_name_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.scopes",
+            doc: "The scopes requested at authorization, space separated; unset means the standard set (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_oidc_scopes,
+            clear: clear_oidc_scopes,
+            effective: oidc_scopes_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.default_role",
+            doc: "The role an account provisioned through single sign-on is created at: viewer, editor or admin; unset means viewer, the least privileged one (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            apply: set_oidc_default_role,
+            clear: clear_oidc_default_role,
+            effective: oidc_default_role_effective,
         },
     ]
 }
@@ -1330,6 +1391,191 @@ fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_max_users().to_string(), is_default)
 }
 
+// --- auth.oidc.* --------------------------------------------------------------
+
+/// The `auth.oidc` block, created on demand so the first `auth.oidc.*` write
+/// materializes it and every later one reuses it.
+fn oidc_mut(config: &mut GlobalConfig) -> &mut OidcConfig {
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .oidc
+        .get_or_insert_with(OidcConfig::default)
+}
+
+/// Drop an emptied `auth.oidc` block, then an `auth` block emptied by that.
+/// Unsetting the last oidc key must leave the config exactly as it was before
+/// the first one was set, not a file carrying two empty maps.
+fn drop_oidc_if_empty(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut()
+        && a.oidc.as_ref() == Some(&OidcConfig::default())
+    {
+        a.oidc = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+/// Trim and reject an empty `auth.oidc.*` string, the shape every key in the
+/// block shares. `unset` is how a key is removed; an empty string would
+/// otherwise write a present-but-blank value the relying party would have to
+/// second-guess.
+fn oidc_value(key: &str, value: &str) -> Result<String, SettingsError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SettingsError(format!(
+            "{key} must not be empty - unset it instead to turn it off"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One `auth.oidc.*` string field's effective value: the configured value, or
+/// empty and flagged as a default when the block or the field is absent.
+fn oidc_effective(
+    config: &GlobalConfig,
+    field: fn(&OidcConfig) -> Option<&String>,
+) -> (String, bool) {
+    match config.auth_oidc().and_then(field) {
+        Some(v) => (v.clone(), false),
+        None => (String::new(), true),
+    }
+}
+
+fn set_oidc_issuer(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let issuer = oidc_value("auth.oidc.issuer", value)?;
+    // The tenant-independent Entra discovery template is the one wrong value
+    // people paste from a portal page, and it fails much later as an issuer
+    // mismatch on a token nobody can read. Refuse it here, where the fix is a
+    // sentence away.
+    if issuer.to_ascii_lowercase().contains("{tenantid}") {
+        return Err(SettingsError(
+            "this is the tenant-independent Entra discovery template, not your issuer - use the \
+             tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0"
+                .to_string(),
+        ));
+    }
+    oidc_mut(config).issuer = Some(issuer);
+    Ok(())
+}
+
+fn clear_oidc_issuer(config: &mut GlobalConfig) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        o.issuer = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+fn oidc_issuer_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.issuer.as_ref())
+}
+
+fn set_oidc_client_id(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let id = oidc_value("auth.oidc.client_id", value)?;
+    oidc_mut(config).client_id = Some(id);
+    Ok(())
+}
+
+fn clear_oidc_client_id(config: &mut GlobalConfig) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        o.client_id = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+fn oidc_client_id_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.client_id.as_ref())
+}
+
+fn set_oidc_client_secret(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let secret = oidc_value("auth.oidc.client_secret", value)?;
+    oidc_mut(config).client_secret = Some(secret);
+    Ok(())
+}
+
+fn clear_oidc_client_secret(config: &mut GlobalConfig) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        o.client_secret = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+/// The one setting whose effective value is not its value. A client secret
+/// that reaches a snapshot reaches `config show`, the `configure` tool result
+/// and `doctor`, so what is rendered is [`SECRET_DISPLAY`] and never the
+/// secret: an operator learns whether one is configured, and nothing more.
+fn oidc_client_secret_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.auth_oidc().and_then(|o| o.client_secret.as_ref()) {
+        Some(_) => (SECRET_DISPLAY.to_string(), false),
+        None => (String::new(), true),
+    }
+}
+
+fn set_oidc_name(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let name = oidc_value("auth.oidc.name", value)?;
+    oidc_mut(config).name = Some(name);
+    Ok(())
+}
+
+fn clear_oidc_name(config: &mut GlobalConfig) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        o.name = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+fn oidc_name_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.name.as_ref())
+}
+
+fn set_oidc_scopes(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    // Scopes are space separated on the wire, so the stored form is the wire
+    // form with its internal spacing normalized: a value pasted with newlines
+    // or double spaces still produces one valid scope parameter.
+    let scopes = oidc_value("auth.oidc.scopes", value)?;
+    let normalized = scopes.split_whitespace().collect::<Vec<_>>().join(" ");
+    oidc_mut(config).scopes = Some(normalized);
+    Ok(())
+}
+
+fn clear_oidc_scopes(config: &mut GlobalConfig) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        o.scopes = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+fn oidc_scopes_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.scopes.as_ref())
+}
+
+fn set_oidc_default_role(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let raw = oidc_value("auth.oidc.default_role", value)?;
+    // Parsed through the one role type the accounts database uses, so this key
+    // can never name a role that does not exist, and stored in that type's own
+    // spelling so casing is canonical on the way in.
+    let role: Role = raw.parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.oidc.default_role must be viewer, editor or admin, got '{value}'"
+        ))
+    })?;
+    oidc_mut(config).default_role = Some(role.as_str().to_string());
+    Ok(())
+}
+
+fn clear_oidc_default_role(config: &mut GlobalConfig) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        o.default_role = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+fn oidc_default_role_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.auth_oidc().and_then(|o| o.default_role.as_ref()) {
+        Some(role) => (role.clone(), false),
+        None => (Role::Viewer.as_str().to_string(), true),
+    }
+}
+
 // --- domains_root ----------------------------------------------------------
 
 fn set_domains_root(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1363,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_twenty_five_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_one_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1392,6 +1638,12 @@ mod tests {
                 "auth.anonymous",
                 "auth.mcp",
                 "auth.max_users",
+                "auth.oidc.issuer",
+                "auth.oidc.client_id",
+                "auth.oidc.client_secret",
+                "auth.oidc.name",
+                "auth.oidc.scopes",
+                "auth.oidc.default_role",
             ]
         );
     }
@@ -1461,6 +1713,27 @@ mod tests {
                 ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
                 ("auth.mcp", "CRYSTALLINE_AUTH_MCP".to_string()),
                 ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
+                (
+                    "auth.oidc.issuer",
+                    "CRYSTALLINE_AUTH_OIDC_ISSUER".to_string()
+                ),
+                (
+                    "auth.oidc.client_id",
+                    "CRYSTALLINE_AUTH_OIDC_CLIENT_ID".to_string()
+                ),
+                (
+                    "auth.oidc.client_secret",
+                    "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET".to_string()
+                ),
+                ("auth.oidc.name", "CRYSTALLINE_AUTH_OIDC_NAME".to_string()),
+                (
+                    "auth.oidc.scopes",
+                    "CRYSTALLINE_AUTH_OIDC_SCOPES".to_string()
+                ),
+                (
+                    "auth.oidc.default_role",
+                    "CRYSTALLINE_AUTH_OIDC_DEFAULT_ROLE".to_string()
+                ),
             ]
         );
     }
@@ -1492,6 +1765,12 @@ mod tests {
         assert!(change_note("auth.trusted_header", &no_env).is_some());
         assert!(change_note("auth.anonymous", &no_env).is_some());
         assert!(change_note("auth.max_users", &no_env).is_some());
+        assert!(change_note("auth.oidc.issuer", &no_env).is_some());
+        assert!(change_note("auth.oidc.client_id", &no_env).is_some());
+        assert!(change_note("auth.oidc.client_secret", &no_env).is_some());
+        assert!(change_note("auth.oidc.name", &no_env).is_some());
+        assert!(change_note("auth.oidc.scopes", &no_env).is_some());
+        assert!(change_note("auth.oidc.default_role", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1944,7 +2223,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 25);
+        assert_eq!(views.len(), 31);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1973,6 +2252,12 @@ mod tests {
                 "auth.anonymous",
                 "auth.mcp",
                 "auth.max_users",
+                "auth.oidc.issuer",
+                "auth.oidc.client_id",
+                "auth.oidc.client_secret",
+                "auth.oidc.name",
+                "auth.oidc.scopes",
+                "auth.oidc.default_role",
             ]
         );
 
@@ -2677,5 +2962,237 @@ mod tests {
             !yaml.contains("auth"),
             "an emptied auth block must not round-trip into the yaml: {yaml}"
         );
+    }
+
+    // --- auth.oidc.* --------------------------------------------------------
+
+    /// One key of the oidc block for the round-trip table: its setting key, a
+    /// representative value and the field that value must land in.
+    type OidcCase = (
+        &'static str,
+        &'static str,
+        fn(&OidcConfig) -> Option<&String>,
+    );
+
+    /// Every key in the block round-trips through its own accessor and leaves
+    /// no residue behind: unsetting the one key that was set drops the oidc
+    /// block and the auth block that only existed to hold it.
+    #[test]
+    fn every_oidc_key_round_trips_and_unsets_back_to_nothing() {
+        let cases: [OidcCase; 6] = [
+            ("auth.oidc.issuer", "https://login.example.com/v2.0", |o| {
+                o.issuer.as_ref()
+            }),
+            ("auth.oidc.client_id", "app-1234", |o| o.client_id.as_ref()),
+            ("auth.oidc.client_secret", "hunter2", |o| {
+                o.client_secret.as_ref()
+            }),
+            ("auth.oidc.name", "Example SSO", |o| o.name.as_ref()),
+            ("auth.oidc.scopes", "openid profile email", |o| {
+                o.scopes.as_ref()
+            }),
+            ("auth.oidc.default_role", "editor", |o| {
+                o.default_role.as_ref()
+            }),
+        ];
+
+        for (key, value, field) in cases {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, key, value).unwrap();
+            assert_eq!(
+                cfg.auth_oidc().and_then(field).map(String::as_str),
+                Some(value),
+                "{key} should round-trip"
+            );
+
+            unset(&mut cfg, key).unwrap();
+            assert!(
+                cfg.auth.is_none(),
+                "{key} was the only set field, so both blocks should vanish"
+            );
+            let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+            assert!(
+                !yaml.contains("oidc"),
+                "an emptied oidc block must not round-trip into the yaml: {yaml}"
+            );
+        }
+    }
+
+    /// Unsetting one key of several leaves the rest of the block standing:
+    /// the collapse is about an emptied block, not about any unset.
+    #[test]
+    fn unsetting_one_oidc_key_keeps_the_rest_of_the_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(
+            &mut cfg,
+            "auth.oidc.issuer",
+            "https://login.example.com/v2.0",
+        )
+        .unwrap();
+        apply(&mut cfg, "auth.oidc.client_id", "app-1234").unwrap();
+
+        unset(&mut cfg, "auth.oidc.client_id").unwrap();
+        assert_eq!(
+            cfg.auth_oidc().and_then(|o| o.issuer.as_deref()),
+            Some("https://login.example.com/v2.0")
+        );
+    }
+
+    /// An absent block is SSO off, and that is what the accessor says.
+    #[test]
+    fn auth_oidc_is_absent_until_a_key_is_set() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.auth_oidc().is_none());
+        apply(&mut cfg, "auth.mcp", "true").unwrap();
+        assert!(
+            cfg.auth_oidc().is_none(),
+            "an auth block without oidc is still SSO off"
+        );
+    }
+
+    #[test]
+    fn oidc_issuer_refuses_the_entra_template() {
+        let mut config = GlobalConfig::default();
+        let err = apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/{tenantid}/v2.0",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant-specific"), "{err}");
+        assert!(
+            config.auth.is_none(),
+            "a rejected issuer must not be written"
+        );
+
+        // The casing a portal page actually shows is refused too.
+        let err = apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/{tenantId}/v2.0",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant-specific"), "{err}");
+
+        // The tenant-specific url the message points at is accepted.
+        apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/9f1c-tenant/v2.0",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn oidc_client_secret_never_echoes() {
+        let mut config = GlobalConfig::default();
+        apply(&mut config, "auth.oidc.client_secret", "hunter2").unwrap();
+
+        let view = snapshot(&config, &EnvOverlay::default())
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_secret")
+            .unwrap();
+        assert!(!view.value.contains("hunter2"), "{}", view.value);
+        assert_eq!(view.value, SECRET_DISPLAY);
+        assert_eq!(view.source, SettingSource::Config);
+        // The secret is still stored: only the display is redacted.
+        assert_eq!(
+            config.auth_oidc().and_then(|o| o.client_secret.as_deref()),
+            Some("hunter2")
+        );
+    }
+
+    /// An unset secret shows nothing at all, so `(set)` really does mean set.
+    #[test]
+    fn oidc_client_secret_shows_empty_when_unset() {
+        let config = GlobalConfig::default();
+        let view = snapshot(&config, &EnvOverlay::default())
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_secret")
+            .unwrap();
+        assert_eq!(view.value, "");
+        assert_eq!(view.source, SettingSource::Default);
+    }
+
+    /// A secret supplied by the environment is redacted on the same terms as
+    /// one in the file, and the source still says where it came from.
+    #[test]
+    fn an_env_supplied_oidc_secret_is_redacted_too() {
+        let overlay = EnvOverlay::from_vars([(
+            "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET".to_string(),
+            "env-hunter2".to_string(),
+        )])
+        .unwrap();
+        let view = snapshot(&GlobalConfig::default(), &overlay)
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_secret")
+            .unwrap();
+        assert_eq!(view.value, SECRET_DISPLAY);
+        assert_eq!(view.source, SettingSource::Env);
+    }
+
+    #[test]
+    fn oidc_default_role_accepts_the_three_roles_and_canonicalizes_casing() {
+        let mut cfg = GlobalConfig::default();
+        for (typed, stored) in [
+            ("viewer", "viewer"),
+            ("Editor", "editor"),
+            ("ADMIN", "admin"),
+        ] {
+            apply(&mut cfg, "auth.oidc.default_role", typed).unwrap();
+            assert_eq!(
+                cfg.auth_oidc().and_then(|o| o.default_role.as_deref()),
+                Some(stored)
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_default_role_refuses_an_unknown_role() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "auth.oidc.default_role", "owner").unwrap_err();
+        assert!(err.to_string().contains("viewer, editor or admin"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected role must not be written");
+    }
+
+    /// Unset is how a key is turned off; an empty string would leave a
+    /// present-but-blank value behind, so it is refused with that instruction.
+    #[test]
+    fn an_empty_oidc_value_is_refused_with_the_unset_instruction() {
+        let mut cfg = GlobalConfig::default();
+        for key in [
+            "auth.oidc.issuer",
+            "auth.oidc.client_id",
+            "auth.oidc.client_secret",
+            "auth.oidc.name",
+            "auth.oidc.scopes",
+            "auth.oidc.default_role",
+        ] {
+            let err = apply(&mut cfg, key, "   ").unwrap_err();
+            assert!(err.to_string().contains("unset it instead"), "{key}: {err}");
+        }
+        assert!(cfg.auth.is_none());
+    }
+
+    #[test]
+    fn oidc_scopes_normalize_to_one_space_separated_parameter() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.oidc.scopes", "  openid   profile\n email ").unwrap();
+        assert_eq!(
+            cfg.auth_oidc().and_then(|o| o.scopes.as_deref()),
+            Some("openid profile email")
+        );
+    }
+
+    /// Every oidc key is startup-effective: the relying party is built once
+    /// when the HTTP surface comes up, so a change waits for the next start.
+    #[test]
+    fn every_oidc_key_is_startup_effective() {
+        for spec in registry()
+            .iter()
+            .filter(|s| s.key.starts_with("auth.oidc."))
+        {
+            assert!(spec.startup_effective, "{}", spec.key);
+        }
     }
 }

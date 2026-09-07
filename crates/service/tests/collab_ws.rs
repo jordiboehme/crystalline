@@ -64,6 +64,7 @@ async fn serve(opts: Options_) -> Fixture {
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };

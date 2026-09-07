@@ -479,6 +479,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };

@@ -52,6 +52,7 @@ async fn build_engine_with(
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: opts.max_users,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };

@@ -88,6 +88,7 @@ async fn serve(opts: Options) -> Fixture {
             anonymous: Some(false),
             mcp: None,
             max_users: None,
+            oidc: None,
         }),
         github: opts.github.then(|| GitHubConfig {
             enabled: Some(true),

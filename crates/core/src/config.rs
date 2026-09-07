@@ -284,6 +284,16 @@ impl GlobalConfig {
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_MAX_USERS)
     }
+
+    /// The `auth.oidc` block, from `auth.oidc.*`. Absent config or an absent
+    /// block means single sign-on is off: SSO is opt-in on top of the local
+    /// accounts, never a replacement for them. A present block is not
+    /// necessarily a complete one - the relying party decides which fields it
+    /// needs and says so - so this hands the block over as configured rather
+    /// than pre-judging it.
+    pub fn auth_oidc(&self) -> Option<&OidcConfig> {
+        self.auth.as_ref().and_then(|a| a.oidc.as_ref())
+    }
 }
 
 /// Which side of the one-truth-per-domain rule a domain lives on: files on
@@ -663,6 +673,49 @@ pub struct AuthConfig {
     /// capped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_users: Option<u32>,
+    /// The single sign-on block. Absent means SSO is off and only the local
+    /// accounts sign in; present means an OpenID Connect provider is offered
+    /// beside them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcConfig>,
+}
+
+/// The `auth.oidc` block: one OpenID Connect provider Crystalline signs people
+/// in against, on top of - never instead of - the local accounts. Every field
+/// is optional at this layer so a half-configured provider is a config a
+/// person can keep editing rather than a file that refuses to load; the
+/// relying party is what insists on a complete set before it offers the
+/// button.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// The provider's issuer url, the one discovery appends
+    /// `/.well-known/openid-configuration` to. Tenant-specific where the
+    /// provider is: `https://login.microsoftonline.com/<tenant-id>/v2.0`, not
+    /// the tenant-independent template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// The client id (application id) the provider issued for this
+    /// Crystalline instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The client secret that goes with the client id. A credential: it is
+    /// stored here but never rendered back, and `CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET`
+    /// supplies it instead where a deployment keeps secrets out of the config
+    /// file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// The provider's display name, the label on the sign-in button. Absent
+    /// means the generic wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The scopes requested at authorization, space separated. Absent means
+    /// the standard set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+    /// The role an account provisioned through this provider is created at:
+    /// `viewer`, `editor` or `admin`. Absent means the least privileged one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_role: Option<String>,
 }
 
 /// Service configuration.

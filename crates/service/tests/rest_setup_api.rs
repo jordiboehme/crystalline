@@ -63,6 +63,7 @@ async fn instance(opts: &Options) -> (Arc<Engine>, Arc<AuthStore>, tempfile::Tem
             anonymous: Some(opts.anonymous),
             mcp: None,
             max_users: None,
+            oidc: None,
         }),
         service: Some(ServiceConfig {
             response_format: Some(ResponseFormat::Json),

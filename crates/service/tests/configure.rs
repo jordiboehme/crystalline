@@ -56,7 +56,7 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 25);
+    assert_eq!(views.len(), 31);
     assert!(
         views
             .iter()
@@ -96,6 +96,73 @@ async fn set_persists_to_the_config_file_and_updates_the_in_memory_config() {
 
     // ...and so does this engine's in-memory config, without reconstructing it.
     assert!(engine.config().github_enabled());
+}
+
+/// The surface a person actually types at: `config set` and the `configure`
+/// tool both answer with the new value, and for a credential that answer is
+/// the redaction marker. The secret still lands in the file - it has to, the
+/// relying party reads it - but nothing hands it back.
+#[tokio::test]
+async fn setting_the_oidc_client_secret_answers_without_echoing_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    let data = engine
+        .configure(&ConfigureAction::Set {
+            key: "auth.oidc.client_secret".to_string(),
+            value: "hunter2".to_string(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(data["key"], "auth.oidc.client_secret");
+    assert_eq!(data["value"], "(set)");
+    assert_eq!(data["source"], "config");
+    assert!(
+        !data.to_string().contains("hunter2"),
+        "the whole result must be free of the secret: {data}"
+    );
+
+    // The snapshot every other surface reads is redacted on the same terms.
+    let shown = engine.configure(&ConfigureAction::Show).await.unwrap();
+    assert!(
+        !shown.to_string().contains("hunter2"),
+        "config show must not echo the secret: {shown}"
+    );
+
+    // The file carries the real secret, so the relying party can use it.
+    let on_disk: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    assert_eq!(
+        on_disk.auth_oidc().and_then(|o| o.client_secret.as_deref()),
+        Some("hunter2")
+    );
+}
+
+/// Unsetting the last key of the block leaves no residue in the file: no
+/// empty `oidc` map, and no `auth` block that only existed to hold it.
+#[tokio::test]
+async fn unsetting_the_last_oidc_key_drops_the_block_from_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config_path = tmp.path().join("config.yaml");
+    let engine = engine_at(&config_path, false).await;
+
+    engine
+        .configure(&ConfigureAction::Set {
+            key: "auth.oidc.issuer".to_string(),
+            value: "https://login.example.com/v2.0".to_string(),
+        })
+        .await
+        .unwrap();
+    engine
+        .configure(&ConfigureAction::Unset {
+            key: "auth.oidc.issuer".to_string(),
+        })
+        .await
+        .unwrap();
+
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!text.contains("oidc"), "{text}");
+    assert!(!text.contains("auth"), "{text}");
 }
 
 #[tokio::test]

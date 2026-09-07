@@ -120,6 +120,7 @@ impl RestCtx {
                 anonymous: Some(true),
                 mcp: None,
                 max_users: None,
+                oidc: None,
             }),
             ..GlobalConfig::default()
         };

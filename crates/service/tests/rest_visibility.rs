@@ -161,6 +161,7 @@ impl RestCtx {
                 anonymous: Some(anonymous),
                 mcp: None,
                 max_users: None,
+                oidc: None,
             }),
             github: team.then(|| GitHubConfig {
                 enabled: Some(true),
