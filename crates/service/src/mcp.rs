@@ -1466,7 +1466,11 @@ impl McpServer {
                         .connect_with_token(token, p.host.as_deref())
                         .await
                 }
-                (None, Some("github")) => self.engine.start_device_connect(p.host.as_deref()).await,
+                (None, Some("github")) => {
+                    self.engine
+                        .start_device_connect(p.host.as_deref(), p.restart)
+                        .await
+                }
                 (None, Some(other)) => Err(EngineError::Invalid(format!(
                     "configure connect must be 'github', got '{other}'"
                 ))),

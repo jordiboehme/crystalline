@@ -92,6 +92,12 @@ windows-sys = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# `test-util` adds the paused clock the device flow's countdown test runs on,
+# and `tracing-subscriber` the capture layer one test asserts the sign-in's
+# log lines through; both are test-only additions to crates this package
+# already depends on.
+tokio = { workspace = true, features = ["test-util"] }
+tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 serde_yaml_ng = { workspace = true }
 flate2 = { workspace = true }

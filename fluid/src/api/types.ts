@@ -782,7 +782,7 @@ export interface paths {
         put?: never;
         /**
          * Start a device-code sign-in for the caller's own identity.
-         * @description Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow; one made while another identity's sign-in is in flight is refused 409. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.
+         * @description Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow, unless `restart=true` is given, which abandons it and issues a fresh code; one made while another identity's sign-in is in flight is refused 409 either way. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.
          */
         post: operations["connect_my_github_identity_device"];
         delete?: never;
@@ -1351,12 +1351,15 @@ export interface components {
              */
             token_store?: string | null;
         };
-        /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid. */
+        /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long is left to do so. */
         GithubPendingView: {
             /**
              * Format: int64
-             * @description How many seconds from the flow's start the code stays valid.
-             * @example 900
+             * @description Seconds REMAINING before the code expires, recomputed on every read
+             *     and saturating at 0 - not the flow's original lifetime. Poll this
+             *     route and the number falls, which is how a live sign-in is told apart
+             *     from a wedged one; a countdown just starts from this value.
+             * @example 870
              */
             expires_in_secs: number;
             /**
@@ -5290,7 +5293,13 @@ export interface operations {
     };
     connect_my_github_identity_device: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Abandon this account's pending sign-in and start a fresh code.
+                 *     Defaults to false, which reports the outstanding code instead.
+                 */
+                restart?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;

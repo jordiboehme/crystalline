@@ -435,6 +435,10 @@ pub struct ConfigureParams {
     /// github.api_url`.
     #[serde(default)]
     pub host: Option<String>,
+    /// With connect: github, abandon a pending sign-in and start a fresh
+    /// code.
+    #[serde(default)]
+    pub restart: bool,
 }
 
 /// Parameters for `add_domain`. The mode follows the parameters: `repo` makes

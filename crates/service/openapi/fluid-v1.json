@@ -4303,8 +4303,19 @@
           "settings"
         ],
         "summary": "Start a device-code sign-in for the caller's own identity.",
-        "description": "Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow; one made while another identity's sign-in is in flight is refused 409. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.",
+        "description": "Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow, unless `restart=true` is given, which abandons it and issues a fresh code; one made while another identity's sign-in is in flight is refused 409 either way. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.",
         "operationId": "connect_my_github_identity_device",
+        "parameters": [
+          {
+            "name": "restart",
+            "in": "query",
+            "description": "Abandon this account's pending sign-in and start a fresh code.\nDefaults to false, which reports the outstanding code instead.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "202": {
             "description": "The flow started (or this account's was already running): `pending` carries the code to confirm. Poll `GET /me/github-identity` for the outcome.",
@@ -6009,7 +6020,7 @@
       },
       "GithubPendingView": {
         "type": "object",
-        "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid.",
+        "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long is left to do so.",
         "required": [
           "user_code",
           "verification_url",
@@ -6019,8 +6030,8 @@
           "expires_in_secs": {
             "type": "integer",
             "format": "int64",
-            "description": "How many seconds from the flow's start the code stays valid.",
-            "example": 900,
+            "description": "Seconds REMAINING before the code expires, recomputed on every read\nand saturating at 0 - not the flow's original lifetime. Poll this\nroute and the number falls, which is how a live sign-in is told apart\nfrom a wedged one; a countdown just starts from this value.",
+            "example": 870,
             "minimum": 0
           },
           "user_code": {

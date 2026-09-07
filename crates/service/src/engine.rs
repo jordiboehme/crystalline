@@ -9749,6 +9749,14 @@ impl Engine {
     }
 
     /// [`Engine::pending_view`] for one identity.
+    ///
+    /// `expires_in_secs` is what is LEFT of the code's life, not the flow's
+    /// original expiry: a caller that polls sees the number fall, which is
+    /// what tells a person (or a model relaying to one) that the flow is
+    /// alive rather than wedged. It saturates at 0 rather than going
+    /// negative; a code whose clock has run out stays reported until the
+    /// background task lands its own expiry error, which is the outcome that
+    /// clears the slot.
     fn pending_view_for(&self, identity: &TokenIdentity) -> Option<Value> {
         self.pending_connect
             .lock()
@@ -9760,7 +9768,7 @@ impl Engine {
                     "pending": true,
                     "user_code": p.user_code,
                     "verification_url": p.verification_url,
-                    "expires_in_secs": p.expires_in_secs,
+                    "expires_in_secs": p.remaining_secs(),
                     "next_steps": p.next_steps,
                 })
             })
@@ -10078,12 +10086,16 @@ impl Engine {
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan(token_host.as_deref())?;
-        plan.save(&StoredToken {
-            access_token: token.to_string(),
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user: user.clone(),
-            created_at: chrono::Utc::now(),
-        })?;
+        save_off_runtime(
+            plan,
+            StoredToken {
+                access_token: token.to_string(),
+                host: token_host.unwrap_or_else(|| "github.com".to_string()),
+                user: user.clone(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await?;
         self.clear_pending_for(&TokenIdentity::Instance);
 
         let mut github = self.origin_connection_json().await?;
@@ -10105,7 +10117,13 @@ impl Engine {
     /// the flow, never blocking on the user confirming the code. Refuses up
     /// front, before starting anything, when `CRYSTALLINE_GITHUB_TOKEN` is
     /// set: this machine's identity is already fixed by the environment.
-    pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+    ///
+    /// `restart` abandons a sign-in already pending and starts a fresh code,
+    /// for the person who never saw the first one or let it go stale. Without
+    /// it a second call reports the outstanding code as before, now with one
+    /// sentence naming `restart` so the way out is in the response rather
+    /// than in somebody's memory.
+    pub async fn start_device_connect(&self, host: Option<&str>, restart: bool) -> Result<Value> {
         if self.overlay.github_token().is_some() {
             return Err(EngineError::EnvTokenConnect);
         }
@@ -10113,10 +10131,18 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let Some(view) = self
-            .begin_device_flow(&TokenIdentity::Instance, host)
+            .begin_device_flow(&TokenIdentity::Instance, host, restart)
             .await?
         else {
-            let github = self.configure_connection_block().await?;
+            let mut github = self.configure_connection_block().await?;
+            // The code is the one already outstanding, so say how to give up
+            // on it. Only on this branch: the sentence is about a SECOND
+            // connect call, and repeating it on a first one would advertise
+            // abandoning a code the caller has not even relayed yet.
+            if let Some(next_steps) = github["pending_connect"]["next_steps"].as_str() {
+                let extended = format!("{next_steps} {RESTART_SENTENCE}");
+                github["pending_connect"]["next_steps"] = json!(extended);
+            }
             return self.configure_snapshot_with(github);
         };
 
@@ -10148,14 +10174,39 @@ impl Engine {
     /// saved and every status reads the store, so the only thing dropped is an
     /// unread error line for a flow nobody came back to look at - and the slot
     /// is taken over.
+    ///
+    /// `restart` is the escape hatch for the one case that used to have none:
+    /// a flow whose code the person lost, or never saw, with a slot that only
+    /// ever answered with that same unusable code. With it set, this identity's
+    /// pending flow is ABANDONED - its background task aborted and its record
+    /// dropped, so the fresh `outcome` slot below cannot be written by the old
+    /// task - and a new sign-in is started. It abandons only this identity's
+    /// flow: another identity's still refuses with
+    /// [`EngineError::ConnectInProgress`], since a restart is a statement
+    /// about one's own sign-in, never a licence to cancel somebody else's.
     async fn begin_device_flow(
         &self,
         identity: &TokenIdentity,
         host: Option<&str>,
+        restart: bool,
     ) -> Result<Option<Value>> {
         {
             let mut guard = self.pending_connect.lock().unwrap();
             match guard.as_ref() {
+                Some(p) if p.identity == *identity && restart => {
+                    // Abort first, then drop: the task stops at its next poll
+                    // and the record it would have written into is gone
+                    // either way, since the fresh flow below builds its own
+                    // outcome slot.
+                    if let Some(handle) = &p.abort {
+                        handle.abort();
+                    }
+                    tracing::info!(
+                        identity = %identity_label(identity),
+                        "github device sign-in abandoned on request; starting a fresh code"
+                    );
+                    *guard = None;
+                }
                 Some(p) if p.identity == *identity => return Ok(None),
                 Some(p) if p.outcome.lock().unwrap().is_some() => *guard = None,
                 Some(_) => return Err(EngineError::ConnectInProgress),
@@ -10166,10 +10217,29 @@ impl Engine {
         let api_url = self.connect_api_url(host);
         let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
         let client_id = self.oauth_client_id();
-        let start = self
+        let label = identity_label(identity);
+        let start = match self
             .connect_auth
             .start_device_flow(&auth_base, &client_id)
-            .await?;
+            .await
+        {
+            Ok(start) => start,
+            Err(e) => {
+                tracing::warn!(
+                    identity = %label,
+                    step = "start",
+                    error = %e,
+                    "github device sign-in could not be started"
+                );
+                return Err(e.into());
+            }
+        };
+        tracing::info!(
+            identity = %label,
+            user_code = %start.user_code,
+            expires_in_secs = start.expires_in_secs,
+            "github device sign-in started",
+        );
 
         let next_steps = crystalline_remote::github::auth::confirmation_guidance(&auth_base);
         let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
@@ -10179,41 +10249,81 @@ impl Engine {
             user_code: start.user_code.clone(),
             verification_url: start.verification_url.clone(),
             expires_in_secs: start.expires_in_secs,
+            started_at: tokio::time::Instant::now(),
             next_steps: next_steps.clone(),
             outcome: outcome_slot.clone(),
+            abort: None,
         };
-        let view = json!({
-            "pending": true,
-            "user_code": pending.user_code,
-            "verification_url": pending.verification_url,
-            "expires_in_secs": pending.expires_in_secs,
-            "next_steps": pending.next_steps,
-        });
         *self.pending_connect.lock().unwrap() = Some(pending);
 
         let auth = self.connect_auth.clone();
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
-        tokio::spawn(async move {
-            let result: std::result::Result<String, RemoteError> = async {
-                let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
+        let task_label = label.clone();
+        let task = tokio::spawn(async move {
+            let result: std::result::Result<String, (&'static str, RemoteError)> = async {
+                let access_token = auth
+                    .run_device_flow(&auth_base, &client_id, &start)
+                    .await
+                    .map_err(|e| ("poll", e))?;
+                tracing::info!(
+                    identity = %task_label,
+                    "github device sign-in: access token received from GitHub"
+                );
                 let user = auth
                     .validate_token(api_url.as_deref(), &access_token)
-                    .await?;
-                plan.save(&StoredToken {
+                    .await
+                    .map_err(|e| ("validate", e))?;
+                tracing::info!(
+                    identity = %task_label,
+                    login = %user,
+                    "github device sign-in: token validated"
+                );
+                let stored = StoredToken {
                     access_token,
                     host: token_host
                         .clone()
                         .unwrap_or_else(|| "github.com".to_string()),
                     user: user.clone(),
                     created_at: chrono::Utc::now(),
-                })?;
+                };
+                // The save touches the OS keychain, which is a blocking call
+                // with a bound but no cancellation: off the runtime's worker
+                // it goes, so a slow keychain cannot stall unrelated work.
+                save_off_runtime(plan, stored)
+                    .await
+                    .map_err(|e| ("save", e))?;
                 Ok(user)
             }
             .await;
+            let result = match result {
+                Ok(user) => Ok(user),
+                Err((step, e)) => {
+                    tracing::warn!(
+                        identity = %task_label,
+                        step,
+                        error = %e,
+                        "github device sign-in failed"
+                    );
+                    Err(e)
+                }
+            };
             *outcome_slot.lock().unwrap() = Some(result);
         });
-        Ok(Some(view))
+
+        // The handle only exists once the task is spawned, so the record is
+        // completed here rather than built with it. Nothing can have replaced
+        // the record in between: there is no await point between the insert
+        // above and this line, and the guard is re-checked by identity anyway.
+        {
+            let mut guard = self.pending_connect.lock().unwrap();
+            if let Some(p) = guard.as_mut()
+                && p.identity == *identity
+            {
+                p.abort = Some(task.abort_handle());
+            }
+        }
+        Ok(self.pending_view_for(identity))
     }
 
     // --- one account's own GitHub identity ----------------------------------
@@ -10285,12 +10395,16 @@ impl Engine {
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
-        plan.save(&StoredToken {
-            access_token: token.to_string(),
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user,
-            created_at: chrono::Utc::now(),
-        })?;
+        save_off_runtime(
+            plan,
+            StoredToken {
+                access_token: token.to_string(),
+                host: token_host.unwrap_or_else(|| "github.com".to_string()),
+                user,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await?;
         // A pasted token settles this identity now, so a device flow of this
         // person's still in flight must not land on top of it later.
         self.clear_pending_for(&identity);
@@ -10304,13 +10418,20 @@ impl Engine {
     ///
     /// One sign-in at a time across the whole engine: a second account's
     /// connect while this one runs is [`EngineError::ConnectInProgress`], and
-    /// the same account asking again reports the code already outstanding.
-    pub async fn start_github_identity_device_flow(&self, account: &str) -> Result<GithubIdentity> {
+    /// the same account asking again reports the code already outstanding -
+    /// unless `restart` is set, which abandons this account's own pending
+    /// flow and issues a fresh code. A restart never touches another
+    /// identity's flow; that is still refused.
+    pub async fn start_github_identity_device_flow(
+        &self,
+        account: &str,
+        restart: bool,
+    ) -> Result<GithubIdentity> {
         let identity = personal_identity(account)?;
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.begin_device_flow(&identity, None).await?;
+        self.begin_device_flow(&identity, None, restart).await?;
         self.github_identity_status(account).await
     }
 
@@ -10473,6 +10594,14 @@ fn context_rank(slice: &GraphSlice, seed_ids: &HashSet<i64>) -> HashMap<i64, f64
     ids.into_iter().zip(rank).collect()
 }
 
+/// What a second connect call adds to the outstanding flow's guidance: the
+/// way to give up on a code the person cannot use. Appended only on that
+/// branch (see [`Engine::start_device_connect`]), so a first connect never
+/// advertises abandoning a code nobody has tried yet.
+const RESTART_SENTENCE: &str = "If this code is not usable - it was never seen, or it has gone \
+                                stale - call configure again with connect \"github\" and restart \
+                                true to abandon it and get a fresh one.";
+
 /// The one-line status paired with `github_enabled` in a fresh connect
 /// response (see [`Engine::connect_with_token`] and
 /// [`Engine::start_device_connect`]), so an agent narrates enablement from
@@ -10514,10 +10643,17 @@ pub struct GithubConnection {
     pub error: Option<String>,
 }
 
+/// The half of a running device flow a surface has to show: the code, where
+/// to enter it, and how long is LEFT to do so.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GithubPending {
     pub user_code: String,
     pub verification_url: String,
+    /// Seconds REMAINING before the code expires, recomputed on every read
+    /// and saturating at 0 - not the flow's original lifetime. A caller that
+    /// polls therefore watches it fall, which is what distinguishes a live
+    /// sign-in from a wedged one; a countdown in a UI can simply start from
+    /// this number.
     pub expires_in_secs: u64,
 }
 
@@ -10565,7 +10701,23 @@ struct PendingConnect {
     /// Where the user confirms the code.
     verification_url: String,
     /// How many seconds from when the flow started it stops being valid.
+    /// Never reported as such: every surface reports what is LEFT of it,
+    /// derived here against `started_at` (see [`Engine::pending_view_for`]).
     expires_in_secs: u64,
+    /// When the flow started, so a pending view counts down instead of
+    /// repeating the original expiry on every call. A frozen number is what
+    /// made a live sign-in look stuck; a falling one is the cheapest possible
+    /// proof that the flow is still running.
+    ///
+    /// `tokio::time::Instant` rather than `std::time::Instant` deliberately:
+    /// the daemon's clock here is the runtime's, so a test can pause it and
+    /// advance it rather than sleeping through a real code lifetime.
+    started_at: tokio::time::Instant,
+    /// The background task running this flow, so a restart can abandon it
+    /// rather than leave it to land on top of the fresh sign-in. Filled in
+    /// immediately after the spawn (the handle does not exist yet when this
+    /// record is built), and `None` only in that instant.
+    abort: Option<tokio::task::AbortHandle>,
     /// What to do after the code is entered and how to tell whether it
     /// landed, computed once at flow start from that flow's own auth base
     /// (see [`crystalline_remote::github::auth::confirmation_guidance`]) so
@@ -10576,6 +10728,16 @@ struct PendingConnect {
     /// task that runs the flow to completion, to either the signed-in login
     /// or the error that ended the flow (expired, declined, offline).
     outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
+}
+
+impl PendingConnect {
+    /// How many seconds of this code's life are left, saturating at 0. The
+    /// one place the countdown is computed, so the MCP view and the REST one
+    /// can never report different numbers for the same flow.
+    fn remaining_secs(&self) -> u64 {
+        self.expires_in_secs
+            .saturating_sub(self.started_at.elapsed().as_secs())
+    }
 }
 
 /// How a connect flow persists a freshly issued token: where it writes and the
@@ -10612,12 +10774,59 @@ enum SaveTarget {
     },
 }
 
+/// How a credential's owner is named in a log line: `instance` for the
+/// machine's own, `personal:<account>` for one person's. Never a token, never
+/// a device code - just enough to tell two concurrent sign-ins apart in a
+/// daemon log a colleague pastes into a support thread.
+fn identity_label(identity: &TokenIdentity) -> String {
+    match identity {
+        TokenIdentity::Instance => "instance".to_string(),
+        TokenIdentity::Personal(name) => format!("personal:{name}"),
+    }
+}
+
+/// Runs a [`TokenSavePlan`] on the blocking pool, so the OS keychain write it
+/// performs never occupies an async worker. `crystalline_remote::token` bounds
+/// every keychain call at fifteen seconds, so this cannot park a blocking
+/// thread forever either; the two together are why a wedged keychain now
+/// degrades a sign-in instead of freezing the daemon.
+///
+/// A panic in the save is reported as a credential failure rather than
+/// unwrapped: the caller is a background flow whose whole job is to land an
+/// outcome, and a task that disappeared without one is exactly the silence
+/// this change exists to remove.
+async fn save_off_runtime(
+    plan: TokenSavePlan,
+    token: StoredToken,
+) -> std::result::Result<(), RemoteError> {
+    // Where the token landed is only known after the write - `save_resolving`
+    // falls through to the file store on its own - so the line is emitted
+    // here, back on the runtime, rather than inside the blocking closure.
+    // Both connect paths save through this function, so both get the line.
+    let identity = identity_label(&plan.identity);
+    match tokio::task::spawn_blocking(move || plan.save(&token)).await {
+        Ok(Ok(store)) => {
+            tracing::info!(identity = %identity, store, "github token saved");
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(RemoteError::Credential {
+            detail: format!("could not save the GitHub token: {e}"),
+        }),
+    }
+}
+
 impl TokenSavePlan {
     /// Writes `token` once (through the override file or `save_resolving`) then
     /// refreshes this host's cache entry, so the very next `github_credential`
     /// serves the new identity without another keychain read. A connect is
     /// therefore one keychain write and zero reads.
-    fn save(&self, token: &StoredToken) -> std::result::Result<(), RemoteError> {
+    ///
+    /// Answers WHERE the token landed (`"keyring"` or `"file"`), which only
+    /// this call knows: `save_resolving` falls through to the file store by
+    /// itself when the keychain refuses or does not answer in time.
+    /// [`save_off_runtime`] turns that into the one "token saved" log line.
+    fn save(&self, token: &StoredToken) -> std::result::Result<&'static str, RemoteError> {
         let store = match &self.target {
             SaveTarget::File(store) => {
                 store.save(token)?;
@@ -10634,6 +10843,7 @@ impl TokenSavePlan {
         // refreshed the instance entry would both strand the stale personal
         // client (the very next share would use the token just replaced) and
         // hand the machine's reads somebody's personal credential.
+        let kind = store.kind();
         let key = credential_cache_key(&self.identity, self.host.as_deref());
         self.cache.lock().unwrap().insert(
             key,
@@ -10642,7 +10852,7 @@ impl TokenSavePlan {
                 token: token.clone(),
             },
         );
-        Ok(())
+        Ok(kind)
     }
 }
 
@@ -13051,12 +13261,12 @@ mod share_actor_tests {
             .with_connect_auth(Arc::new(HangingAuth));
 
         engine
-            .start_github_identity_device_flow("alice")
+            .start_github_identity_device_flow("alice", false)
             .await
             .expect("the flow starts and stays pending");
         assert!(
             matches!(
-                engine.start_github_identity_device_flow("bob").await,
+                engine.start_github_identity_device_flow("bob", false).await,
                 Err(EngineError::ConnectInProgress)
             ),
             "a standing flow is what blocks the next one"
@@ -13065,7 +13275,7 @@ mod share_actor_tests {
         engine.forget_cached_credential(Some("alice")).unwrap();
 
         engine
-            .start_github_identity_device_flow("bob")
+            .start_github_identity_device_flow("bob", false)
             .await
             .expect("alice's flow was cancelled, so the slot is free");
     }
@@ -13314,7 +13524,7 @@ mod share_actor_tests {
         for err in [
             engine.github_identity_status("ann+lee").await.unwrap_err(),
             engine
-                .start_github_identity_device_flow("ann+lee")
+                .start_github_identity_device_flow("ann+lee", false)
                 .await
                 .unwrap_err(),
             engine
