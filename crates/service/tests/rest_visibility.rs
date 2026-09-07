@@ -1447,3 +1447,71 @@ async fn an_invite_never_says_whether_an_account_exists() {
     }
     assert_eq!(answers[0], answers[1]);
 }
+
+/// **A private domain's owner unregisters it over REST; a manager and a
+/// stranger do not.**
+///
+/// `DELETE /domains/{domain}` was admin-only, which left the owner of a private
+/// domain unable to end the domain they own. The rule now lives in the engine
+/// and both surfaces read it: owner-of-private or instance admin, everybody
+/// else refused with text naming who can - and a caller who may not see the
+/// domain gets the 404 an unregistered name gets, never a 403 that would tell
+/// them it is there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_private_domains_owner_unregisters_it_over_rest() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
+
+    let stranger = ctx.as_user("out").await;
+    let unseen = stranger.delete("/api/v1/domains/lab").await;
+    assert_eq!(
+        unseen.status(),
+        404,
+        "a caller who may not see it is told only that it is not there"
+    );
+
+    let manager = ctx.as_user("mgr").await;
+    let refused = manager.delete("/api/v1/domains/lab").await;
+    assert_eq!(refused.status(), 403, "a manager may not end the domain");
+    let detail = refused.text().await.unwrap();
+    assert!(
+        detail.contains("admin") && detail.contains("owner"),
+        "the refusal names who can: {detail}"
+    );
+
+    let owner = ctx.as_user("owner").await;
+    let removed = owner.delete("/api/v1/domains/lab").await;
+    let status = removed.status();
+    let body = removed.text().await.unwrap();
+    assert_eq!(status, 200, "the owner's removal lands: {body}");
+    assert!(body.contains("\"unregistered\":true"), "{body}");
+
+    // The visibility record goes with the registration, so the name is free
+    // and a domain re-added under it comes back shared rather than inheriting
+    // a stranger's private domain.
+    assert!(
+        ctx.auth.domain_visibility("lab").await.unwrap().is_none(),
+        "the acl row was swept"
+    );
+    assert!(
+        ctx.auth.domain_members("lab").await.unwrap().is_empty(),
+        "and the membership rows with it"
+    );
+}
+
+/// A shared domain stays an admin's to unregister: the account that owns a
+/// private domain elsewhere is an ordinary editor here, and is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_shared_domain_stays_admin_only_over_rest() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+
+    let editor = ctx.as_user("owner").await;
+    let refused = editor.delete("/api/v1/domains/open").await;
+    assert_eq!(refused.status(), 403, "no owner concept on a shared domain");
+
+    let boss = ctx.as_user("boss").await;
+    let removed = boss.delete("/api/v1/domains/open").await;
+    assert_eq!(removed.status(), 200, "an admin removes it");
+}

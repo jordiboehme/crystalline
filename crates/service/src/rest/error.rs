@@ -464,7 +464,10 @@ impl From<EngineError> for ApiError {
             EngineError::UnknownDomain { .. } | EngineError::NotFound(_) => {
                 ApiError::not_found(detail)
             }
-            EngineError::ReadOnly => ApiError::forbidden(detail),
+            // Two variants share the 403: the server knows who is asking and
+            // refuses. `ReadOnly` refuses everybody, `Forbidden` refuses this
+            // caller and its message names who would be allowed.
+            EngineError::ReadOnly | EngineError::Forbidden(_) => ApiError::forbidden(detail),
             // A second divergence for the same reason: HTTP has a status for
             // "the request is fine, the resource is busy", and a client that
             // reads 409 knows to retry once the sign-in in flight is done,

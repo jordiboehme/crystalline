@@ -2409,6 +2409,42 @@ impl AuthStore {
         self.finish(result).await
     }
 
+    /// Retire every visibility and membership record of one domain, for a
+    /// domain that has just been unregistered.
+    ///
+    /// Deliberately not [`AuthStore::set_domain_visibility`] with `private =
+    /// false`: that means "this domain is shared now", takes an owner it has no
+    /// use for here, and leaves a domain standing. This means "there is no such
+    /// domain any more", and it is the only caller that is allowed to drop an
+    /// acl row without somebody deciding the domain should be public.
+    ///
+    /// Both tables go in one transaction, so a domain can never be left
+    /// half-forgotten: an acl row with no members would still hide the name
+    /// from everyone but an admin. Answers whether there was an acl row at all,
+    /// which is how a caller can tell a private domain's records from a shared
+    /// domain's absence of them.
+    pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
+        let result = async {
+            let was_private = self.acl_of(&domain).await?.is_some();
+            self.delete_members_of_domain(&domain).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_acl WHERE domain = ?1",
+                    vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
+            Ok(was_private)
+        }
+        .await;
+        self.finish(result).await
+    }
+
     /// Hand a private domain to a different owner.
     ///
     /// The new owner must be an existing, enabled account, and the domain must

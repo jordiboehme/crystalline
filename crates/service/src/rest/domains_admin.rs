@@ -436,20 +436,18 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
 /// `DELETE /domains/{domain}` - unregister a domain: the registration and the
 /// index rows go, the files do not.
 ///
-/// The order of the three steps below is the whole content of this handler,
-/// and it is not free to rearrange (see [`crate::collab::session::CollabSessions::dispose_domain`],
-/// which records the argument in full):
+/// A thin call onto [`crate::Engine::unregister_domain`], which holds the whole
+/// of it: who may end a domain, the join fence, the co-editing sweep, the
+/// unregistration and the retirement of the domain's visibility and membership
+/// records, in that order and for the reasons stated there. This handler used
+/// to carry the ordering itself and used to gate the call with `require_admin`;
+/// both moved into the engine so this surface and the `remove_domain` MCP tool
+/// cannot drift apart.
 ///
-/// 1. The join fence goes up first, so no socket can open a room in this
-///    domain from here on. Without it the sweep would close what is open and
-///    a join arriving one instant later would open a fresh room over a domain
-///    that is about to vanish.
-/// 2. The rooms are swept while the domain is STILL registered, so each
-///    room's final save lands in the file that stays on disk.
-/// 3. Only then is the domain unregistered. Inverted, those final saves would
-///    be refused outright or - inside the window between the config write and
-///    the index clear - resolve as virtual and land in the DATABASE rather
-///    than in the file `files_kept` promises was left alone.
+/// Who may call it: an instance admin, or - new here - the owner of a private
+/// domain, which is the rule the private-domains design always stated and this
+/// route did not implement. A caller who may not SEE the domain is answered 404
+/// like anyone naming a domain nobody registered, never 403.
 ///
 /// The response is the engine's report plus `rooms_closed`, so a client can
 /// say how many co-editing sessions it just ended.
@@ -459,7 +457,8 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
     tag = "domains",
     operation_id = "unregister_domain",
     summary = "Unregister a domain. Files on disk are never touched.",
-    description = "Admin only. The registration and the domain's index rows \
+    description = "An instance admin, or a private domain's owner. The \
+                   registration and the domain's index rows \
                    go; a file domain's files stay exactly where they are \
                    (re-adding the folder adopts them again), which is what \
                    `files_kept` reports. A virtual domain has no files, so \
@@ -490,16 +489,17 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may see the domain and may not end it (an \
+                           instance admin can, and so can a private domain's \
+                           owner), the request did not echo its CSRF token, \
+                           this instance is read-only, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 404,
-            description = "No such domain.",
+            description = "No such domain, or one this caller may not see.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -517,25 +517,26 @@ pub async fn remove(
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    // The role check this route used to make is gone: who may end a domain is
+    // the engine's rule now, so this surface and MCP cannot answer it
+    // differently. What stays here is the one thing the engine cannot see -
+    // that an anonymous identity has no account to be a member of anything, so
+    // it is told to log in (401) rather than that it is forbidden (403).
+    identity.require_account()?;
     refuse_read_only(&state)?;
-    // Step 1 and step 2 of this handler's ordering; see the doc comment.
-    let _admin = state.domain_admin().await;
-    let _fence = state.fence_joins().await;
-    let rooms_closed = state.collab.dispose_domain(&domain).await;
-    // Step 3, still behind both guards.
-    let mut report = state.engine.domain_remove(&domain).await.map_err(|e| {
-        match e {
-            // An env-defined domain cannot be unregistered by anyone but the
-            // environment: a conflict on this surface rather than the generic
-            // 422, since no version of this request would succeed.
-            EngineError::Conflict(detail) => ApiError::conflict(detail),
-            other => other.into(),
-        }
-    })?;
-    if let Value::Object(map) = &mut report {
-        map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
-    }
+    let report = state
+        .engine
+        .unregister_domain(&domain, &identity.scope())
+        .await
+        .map_err(|e| {
+            match e {
+                // An env-defined domain cannot be unregistered by anyone but
+                // the environment: a conflict on this surface rather than the
+                // generic 422, since no version of this request would succeed.
+                EngineError::Conflict(detail) => ApiError::conflict(detail),
+                other => other.into(),
+            }
+        })?;
     Ok(Json(report))
 }
 

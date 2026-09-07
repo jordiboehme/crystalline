@@ -265,12 +265,6 @@ pub struct RestState {
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
-    /// Serializes domain create against domain unregister, process-wide. See
-    /// [`RestState::domain_admin`].
-    domain_admin: Arc<tokio::sync::Mutex<()>>,
-    /// The fence an unregistration raises against new co-editing joins. See
-    /// [`RestState::fence_joins`].
-    join_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl RestState {
@@ -285,8 +279,14 @@ impl RestState {
         let config = engine.config();
         let auth_cfg = AuthCfg::resolve(&config)?;
         let oidc = OidcClient::new(&config)?;
+        let collab = crate::collab::session::CollabSessions::new(engine.clone());
+        // The engine closes co-editing rooms itself when it unregisters a
+        // domain, whichever surface asked for the removal, so it needs the
+        // registry this state has just built. A `Weak` handle: see
+        // `Engine::set_collab_sessions`.
+        engine.set_collab_sessions(&collab);
         Ok(RestState {
-            collab: crate::collab::session::CollabSessions::new(engine.clone()),
+            collab,
             engine,
             oidc,
             access: Arc::new(DomainAccess::new(auth.clone())),
@@ -294,8 +294,6 @@ impl RestState {
             auth_cfg,
             setup_token: None,
             login_slots: auth::login_slots(),
-            domain_admin: Arc::new(tokio::sync::Mutex::new(())),
-            join_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -329,58 +327,31 @@ impl RestState {
 
     /// Hold the domain-admin lock for the whole of a create or an unregister.
     ///
-    /// The engine has no serialization of its own across a same-name
-    /// `domain_add_*` and `domain_remove` (its `domain_remove` doc comment
-    /// records the race and points here): the remove persists the config,
-    /// releases both config locks and only then forgets the watcher entry and
-    /// clears the index rows, so an add of the same name landing inside that
-    /// window has its fresh registration and its freshly-indexed rows wiped
-    /// by the remove's tail. One lock over both handlers closes it for this
-    /// surface, which is the layer that has more than one caller.
+    /// The lock itself lives on the engine ([`Engine::domain_admin`]), which is
+    /// what makes this serialization real rather than surface-local: an
+    /// unregistration over MCP takes the same lock, so a REST create and an
+    /// agent's removal of the same name can no longer interleave. What it does
+    /// NOT close is a bare `domain_add_local`/`domain_add_virtual`/`origin_add`
+    /// racing a removal: those verbs take no lock of their own, and closing
+    /// that needs a per-name lock inside the engine (see
+    /// `Engine::domain_remove`'s known race).
     ///
     /// Deliberately NOT the join fence below. A team-domain create downloads
     /// and indexes a repository inside the request, which can run for
     /// minutes, and fencing co-editing joins for that long would hang every
     /// editor on the instance over a registration that closes no rooms. A
     /// create never sweeps anything, so it has no join window to close.
-    ///
-    /// Serializing "for this surface" is the whole claim: the mutex lives in
-    /// `RestState`, so it does NOT serialize the other callers of the same
-    /// engine verbs - MCP's `add_domain` (and the CLI) reach
-    /// `domain_add_local`/`domain_add_virtual` with no REST state in hand and
-    /// can still race a REST unregister into the engine window above. That is
-    /// accepted: closing it needs the per-name lock inside the engine, and
-    /// the REST surface is the one with more than one concurrent caller.
-    ///
-    /// Lock order where both are taken (unregister): this one, then
-    /// [`RestState::fence_joins`]. Nothing else takes both.
     pub(super) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.domain_admin.lock().await
-    }
-
-    /// Raise the join fence: while this guard lives, no collab upgrade may
-    /// open a room, because [`RestState::join_pass`] is what the upgrade
-    /// route waits on before it joins.
-    ///
-    /// Held by an unregistration across its sweep and the engine's
-    /// `domain_remove`, which is what makes the sweep final rather than a
-    /// snapshot: a join already in flight finishes and inserts its room
-    /// before the guard is granted (so the sweep collects it), and a join
-    /// that arrives afterwards waits, then finds a domain that no longer
-    /// exists and is refused 404. The fence is process-wide rather than
-    /// per-domain because an unregistration is short and a second primitive
-    /// per domain name would buy nothing measurable.
-    pub(super) async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
-        self.join_fence.write().await
+        self.engine.domain_admin().await
     }
 
     /// The pass a collab upgrade holds across its join, so a join and an
-    /// unregistration of the same domain cannot interleave. See
-    /// [`RestState::fence_joins`] for the argument this half completes; the
-    /// guard is dropped as soon as the join returns, never held across the
-    /// socket's life.
+    /// unregistration of the same domain cannot interleave. The fence's other
+    /// half is raised inside [`Engine::unregister_domain`]; see
+    /// [`Engine::fence_joins`] for the argument. The guard is dropped as soon
+    /// as the join returns, never held across the socket's life.
     pub(crate) async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.join_fence.read().await
+        self.engine.join_pass().await
     }
 
     /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.

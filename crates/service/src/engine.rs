@@ -296,6 +296,15 @@ pub enum EngineError {
     /// A content mutation was attempted against a read-only instance.
     #[error("this instance is read-only; content mutations are disabled")]
     ReadOnly,
+    /// The caller is known, may see the thing they addressed, and is not
+    /// allowed to do this to it. Distinct from [`EngineError::UnknownDomain`],
+    /// which is what a caller who may not see it gets: this variant is only
+    /// ever raised about something the caller can already see, so it discloses
+    /// nothing by existing. The message names who *can*, because "forbidden"
+    /// on a domain somebody reads every day is otherwise indistinguishable
+    /// from a bug.
+    #[error("{0}")]
+    Forbidden(String),
     /// An interactive connect action (`connect_with_token`,
     /// `start_device_connect`) was attempted while `CRYSTALLINE_GITHUB_TOKEN`
     /// is set. This machine's identity is fixed by the environment, so there
@@ -720,6 +729,27 @@ pub struct Engine {
     // request and the engine is the only thing the subscriber and the flipper
     // share; see `crate::subscribers`.
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
+    // Serializes a domain registration against a domain removal, for the
+    // whole of each: `Engine::unregister_domain` holds it across its sweep and
+    // its tail, and the REST create holds it across its own registration
+    // (`RestState::domain_admin` delegates here). It lives on the engine
+    // rather than on one surface's state because MCP and REST reach the same
+    // verbs and a lock held by only one of them serializes only that one.
+    // What it does NOT close is the bare `domain_add_*`/`origin_add` verbs,
+    // which take no lock of their own; see `Engine::domain_remove`'s known
+    // race.
+    domain_admin: tokio::sync::Mutex<()>,
+    // The fence a removal raises against new co-editing joins while it sweeps
+    // the domain's rooms. Write-held by `Engine::unregister_domain`, read-held
+    // by each collab join (`RestState::join_pass` delegates here), so a join
+    // and a removal of the same domain cannot interleave.
+    join_fence: tokio::sync::RwLock<()>,
+    // The open co-editing rooms, so a removal can save and close the rooms of
+    // the domain it is about to unregister. A `Weak`, because
+    // `CollabSessions` holds an `Arc<Engine>` and a strong handle here would
+    // be a cycle neither side ever drops; `None` (nothing installed) is every
+    // engine that serves no web surface, which has no rooms to close.
+    collab: std::sync::OnceLock<std::sync::Weak<crate::collab::session::CollabSessions>>,
     // The private-domain resolver every scoped read is filtered through,
     // installed once when the HTTP surface starts (`daemon::http_base`, the
     // one funnel both router builders reach, right after the `AuthStore` it
@@ -1072,6 +1102,9 @@ impl Engine {
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
+            domain_admin: tokio::sync::Mutex::new(()),
+            join_fence: tokio::sync::RwLock::new(()),
+            collab: std::sync::OnceLock::new(),
             domain_access: std::sync::OnceLock::new(),
         }
     }
@@ -1097,6 +1130,54 @@ impl Engine {
     pub fn fail_next_source_reindex(&self) {
         self.fail_next_source_reindex
             .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Install the co-editing registry, so a removal can close the rooms of the
+    /// domain it unregisters.
+    ///
+    /// Held as a `Weak`: the registry owns an `Arc<Engine>`, so a strong handle
+    /// here would be a cycle neither half ever drops. Called once, by
+    /// `RestState::new`, which is the only thing that builds a registry. A
+    /// second call is ignored, for the reason
+    /// [`Engine::set_domain_access`] gives.
+    pub fn set_collab_sessions(&self, sessions: &Arc<crate::collab::session::CollabSessions>) {
+        let _ = self.collab.set(Arc::downgrade(sessions));
+    }
+
+    /// Hold the domain-admin lock for the whole of a registration or a removal.
+    ///
+    /// One lock on the engine rather than one per surface: REST's create takes
+    /// it, [`Engine::unregister_domain`] takes it, and both surfaces reach the
+    /// same verbs, so a lock held by only one of them would serialize only that
+    /// one. See the field for what it does not close.
+    ///
+    /// Lock order where both are taken (a removal): this one, then
+    /// [`Engine::fence_joins`]. Nothing else takes both.
+    pub async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.domain_admin.lock().await
+    }
+
+    /// Raise the join fence: while this guard lives, no collab upgrade may open
+    /// a room, because [`Engine::join_pass`] is what the upgrade route waits on
+    /// before it joins.
+    ///
+    /// Held by a removal across its sweep and the unregistration, which is what
+    /// makes the sweep final rather than a snapshot: a join already in flight
+    /// finishes and inserts its room before the guard is granted (so the sweep
+    /// collects it), and a join that arrives afterwards waits, then finds a
+    /// domain that no longer exists and is refused. Process-wide rather than
+    /// per-domain because a removal is short and a second primitive per domain
+    /// name would buy nothing measurable.
+    pub async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.join_fence.write().await
+    }
+
+    /// The pass a collab upgrade holds across its join, so a join and a removal
+    /// of the same domain cannot interleave. See [`Engine::fence_joins`] for
+    /// the argument this half completes; the guard is dropped as soon as the
+    /// join returns, never held across the socket's life.
+    pub async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.join_fence.read().await
     }
 
     /// Install the private-domain resolver. Called once, when the HTTP surface
@@ -8870,6 +8951,187 @@ impl Engine {
             "manifest_created": manifest_created,
             "registered": is_new,
         }))
+    }
+
+    /// What a caller is told when they may see a domain and may not end it.
+    ///
+    /// One sentence for both surfaces, naming who can rather than saying only
+    /// that the caller cannot: an instance admin always, and for a private
+    /// domain its owner. The owner is never named - who owns a domain is a
+    /// membership fact, and a refusal is not the place to hand it out.
+    fn removal_refusal(name: &str) -> EngineError {
+        EngineError::Forbidden(format!(
+            "unregistering domain '{name}' is for an instance admin, or for the owner of a \
+             private domain; ask an admin to remove it"
+        ))
+    }
+
+    /// Whether `name` is a domain the environment defines, as the conflict both
+    /// surfaces answer with.
+    ///
+    /// An environment-defined domain is immune to unregistration: the variable
+    /// is its source of truth, so no version of this request would succeed and
+    /// the way out is to unset the variable. Spelled once here so a preview and
+    /// the removal itself cannot word it differently.
+    fn env_domain_conflict(&self, name: &str) -> Option<EngineError> {
+        self.overlay.env_domain(name).map(|env| {
+            EngineError::Conflict(format!(
+                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                env.var
+            ))
+        })
+    }
+
+    /// The one gate on ending a domain, for every surface.
+    ///
+    /// Two steps, in this order and for the reason the write gate states:
+    ///
+    /// 1. **A domain this caller may not see is the not-found.** Decided first,
+    ///    so a stranger naming a private domain learns exactly what a stranger
+    ///    naming a domain nobody registered learns. A permission refusal here
+    ///    would be an existence oracle.
+    /// 2. **Then the right, which must be [`DomainRight::Own`].** That is the
+    ///    whole of Jordi's rule, and it falls out of the ladder rather than
+    ///    being restated: an instance admin owns every domain, a private
+    ///    domain's owner owns theirs, and nobody else ever reaches `Own` - a
+    ///    manager stops at `Manage`, and on a shared domain the best a
+    ///    non-admin gets is `Write`. So "owner-of-private or admin, shared
+    ///    domains admins only" is one comparison.
+    ///
+    /// [`Scope::Anonymous`] is refused by an arm of its own rather than by the
+    /// fold. The fold would refuse it too, but only because a resolver happens
+    /// to be installed; nobody in particular does not end a domain on an
+    /// instance that never made anyone authenticate either, and that is a rule
+    /// rather than a consequence.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    /// [`Scope::Anonymous`]: crate::scope::Scope::Anonymous
+    pub async fn require_domain_owner(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        self.require_domain(name, scope).await?;
+        if matches!(scope, crate::scope::Scope::Anonymous) {
+            return Err(Engine::removal_refusal(name));
+        }
+        if self.domain_right(scope, name).await? < crate::scope::DomainRight::Own {
+            return Err(Engine::removal_refusal(name));
+        }
+        Ok(())
+    }
+
+    /// What a removal would end, for a surface that asks before it acts.
+    ///
+    /// `{ domain, kind, engrams, files_kept }` - the three things somebody
+    /// needs in order to answer the question, plus the one that decides how it
+    /// is worded: a file domain's files stay on disk and a virtual domain's
+    /// rows ARE its knowledge. Gated exactly as the removal is, and it raises
+    /// the environment conflict too, so a question is never put about a removal
+    /// that would refuse anyway.
+    pub async fn domain_remove_preview(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.require_domain_owner(name, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(name) {
+            return Err(conflict);
+        }
+        let entry = self.domain_entry(name)?;
+        let store = self.store.lock().await;
+        let stats = store.domain_stats().await.unwrap_or_default();
+        drop(store);
+        let engrams = stats.iter().find(|d| d.name == name).map(|d| d.engrams);
+        Ok(json!({
+            "domain": name,
+            "kind": if entry.is_virtual() { "virtual" } else { "file" },
+            "engrams": engrams,
+            "files_kept": !entry.is_virtual(),
+        }))
+    }
+
+    /// Unregister a domain, gate and ordering included: the one entry point
+    /// every surface calls.
+    ///
+    /// [`Engine::domain_remove`] below is the registry step alone. This is the
+    /// whole of it, and the order of the four steps is not free to rearrange
+    /// (see [`crate::collab::session::CollabSessions::dispose_domain`], which
+    /// records the argument in full):
+    ///
+    /// 1. The gate, [`Engine::require_domain_owner`], before anything moves.
+    /// 2. The join fence goes up, so no socket can open a room in this domain
+    ///    from here on. Without it the sweep would close what is open and a
+    ///    join arriving one instant later would open a fresh room over a domain
+    ///    that is about to vanish.
+    /// 3. The rooms are swept while the domain is STILL registered, so each
+    ///    room's final save lands in the file that stays on disk.
+    /// 4. Only then is the domain unregistered, and only then are its
+    ///    visibility and membership records swept.
+    ///
+    /// **The records go last, and that direction is deliberate.** They live in
+    /// the accounts database and the registration lives in the config file, so
+    /// there is no transaction spanning both and there cannot be one. Sweeping
+    /// first and then failing the unregistration would leave a domain that is
+    /// still registered and now SHARED - visible to everyone, the opposite of
+    /// what its owner asked for. Failing the other way round leaves an acl row
+    /// for a domain nobody has registered, which grants nothing until a domain
+    /// of that name exists again; it is logged, and the residue is that a later
+    /// re-add of the same name comes back private under the old owner rather
+    /// than shared. That is the safe direction, and it is the same shape as the
+    /// store's own domain row, which [`Engine::domain_remove`] also leaves in
+    /// place.
+    ///
+    /// The report is [`Engine::domain_remove`]'s plus `rooms_closed`, so a
+    /// client can say how many co-editing sessions it just ended.
+    pub async fn unregister_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        self.require_domain_owner(name, scope).await?;
+        let _admin = self.domain_admin().await;
+        let _fence = self.fence_joins().await;
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain(name).await,
+            None => 0,
+        };
+        let mut report = self.domain_remove(name).await?;
+        self.forget_domain_records(name).await;
+        if let Value::Object(map) = &mut report {
+            map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
+        }
+        Ok(report)
+    }
+
+    /// Retire the visibility and membership records of a domain that is no
+    /// longer registered.
+    ///
+    /// Best effort, and deliberately not a failure of the removal it follows:
+    /// by the time this runs the domain is gone, and answering with an error
+    /// would tell the caller their removal did not happen when it did. A
+    /// failure is logged and the residue is documented on
+    /// [`Engine::unregister_domain`].
+    ///
+    /// A no-op on an engine with no resolver installed, which is every
+    /// installation with no accounts database: privacy is a membership record,
+    /// and a machine with no accounts has none.
+    async fn forget_domain_records(&self, name: &str) {
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.forget_domain(name).await {
+            tracing::warn!(
+                domain = name,
+                error = format!("{e:#}"),
+                "domain '{name}' was unregistered but its visibility and membership records \
+                 could not be cleared; a domain later re-added under this name will come back \
+                 private under its old owner until an admin makes it shared"
+            );
+        }
     }
 
     /// Unregister a domain: the config entry goes, the watcher and discovery

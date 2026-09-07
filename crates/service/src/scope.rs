@@ -233,6 +233,25 @@ impl DomainAccess {
         Ok(self.resolve(&principal).await?.hidden)
     }
 
+    /// Retire the visibility and membership records of a domain that no longer
+    /// exists.
+    ///
+    /// **The one write on this type, and it is here rather than beside the
+    /// reads by accident of ownership.** Everything else on `DomainAccess`
+    /// answers a question; this ends the records the answers are computed from.
+    /// It lives here because the engine holds exactly one handle onto the
+    /// accounts database - this one - and the removal verb is the engine's, so
+    /// the alternative was handing the engine the whole store. A narrow method
+    /// is the smaller door. It decides nothing: the caller has already decided
+    /// the domain is gone.
+    ///
+    /// Answers whether the domain had an acl row at all, so a caller can tell
+    /// "a private domain's records were retired" from "a shared domain had
+    /// none".
+    pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
+        self.auth.forget_domain(domain).await
+    }
+
     /// Which domains are private, and which of those `scope` may not read.
     ///
     /// Both facts from one read of `domain_acl`, for the caller that needs
