@@ -3499,6 +3499,18 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 21] = [
         Some(false),
         Some(true),
     ),
+    // Destructive where `add_domain` is not: this ends a domain rather than
+    // creating one. Idempotent, because a second call on a name that is already
+    // gone is the ordinary unregistered-domain answer and changes nothing.
+    // Closed-world: unregistering a team domain never touches its repository.
+    (
+        "remove_domain",
+        "Remove domain",
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+    ),
     (
         "share_changes",
         "Share changes",
@@ -3587,7 +3599,7 @@ async fn tool_annotations_match_the_locked_table() {
 async fn annotation_hints_line_up_with_the_gating() {
     use rmcp::ServerHandler;
 
-    // The nine write-gated tools (the six WRITE_TOOLS plus the three
+    // The write-gated tools (the WRITE_TOOLS carrying a row here, plus the three
     // collaboration tools hidden in read-only mode) must each disclaim
     // read-only.
     let rw = annotation_server(false).await;
@@ -3598,6 +3610,7 @@ async fn annotation_hints_line_up_with_the_gating() {
         "split_engram",
         "delete_engram",
         "add_domain",
+        "remove_domain",
         "configure",
         "share_changes",
         "resolve_conflict",
@@ -4203,9 +4216,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 20 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 21 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 20 are visible and on the read-only one where
+/// read-write server where all 21 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.
