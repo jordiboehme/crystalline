@@ -112,6 +112,9 @@ export type IssuedMcpToken = components["schemas"]["IssuedTokenResponse"];
  */
 export type ProvidersResponse = components["schemas"]["ProvidersResponse"];
 
+/** What `POST /auth/oidc/login` answers with: where to navigate to link an identity. */
+export type StartLinkResponse = components["schemas"]["StartLinkResponse"];
+
 /** The single sign-on provider's half of that: whether to draw it, and what to write on it. */
 export type OidcProviderView = components["schemas"]["OidcProviderView"];
 

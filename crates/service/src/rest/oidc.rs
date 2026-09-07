@@ -434,7 +434,7 @@ struct Pending {
     /// proxy the second derivation can differ from the first.
     redirect_uri: RedirectUrl,
     /// The account this sign-in is linking an identity to, when it was started
-    /// with `?link=true` from a signed-in session. `None` is an ordinary sign-in.
+    /// through `POST /auth/oidc/login`. `None` is an ordinary sign-in.
     /// Read by the account-linking task; carried here because the intent
     /// belongs to the request that started the flow, not to the one that
     /// finishes it.
@@ -1155,8 +1155,10 @@ struct StartedSignOn {
                    server-generated nonce, and sets the short-lived \
                    `fluid_oidc_state` cookie that binds the sign-in to this \
                    browser. Public, like the password login: there is no \
-                   session yet. `link=true` links the provider identity to the \
-                   caller's existing account and needs a signed-in session.",
+                   session yet. Linking a provider identity to an existing \
+                   account is the POST on this same path, not a flag here: a \
+                   GET carrying `link=true` is refused with a 400 that says \
+                   so, because a GET could be sent by another origin.",
     responses(
         (
             status = 302,
@@ -1169,15 +1171,9 @@ struct StartedSignOn {
         ),
         (
             status = 400,
-            description = "The request carries no Host header, or one that is \
-                           not a bare host and port, so no redirect uri can be \
-                           derived.",
-            body = ProblemDetail,
-            content_type = "application/problem+json",
-        ),
-        (
-            status = 401,
-            description = "`link=true` on a request with no signed-in session.",
+            description = "`link=true`, which is the POST's job; or a request \
+                           with no Host header, or one that is not a bare host \
+                           and port, so no redirect uri can be derived.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1464,9 +1460,9 @@ pub struct CallbackQuery {
                    account in. The account is the one linked to the token's \
                    `(issuer, sub)` pair, or a fresh one provisioned at \
                    `auth.oidc.default_role`; a matching address never reaches \
-                   an existing account. A sign-in started with `link=true` \
-                   instead ties the identity to the account whose session \
-                   started it, which has to be the session that finishes it \
+                   an existing account. A sign-on started by `POST \
+                   /auth/oidc/login` instead ties the identity to the account \
+                   that started it, which has to be the account finishing it \
                    too. The provider's own error text never reaches this \
                    response.",
     responses(
@@ -1753,7 +1749,7 @@ pub struct OidcClaims {
     /// account is exactly the silent takeover this design refuses.
     pub email: Option<String>,
     /// The account this sign-in was started to link an identity to, from
-    /// `?link=true`. `None` is an ordinary sign-in.
+    /// `POST /auth/oidc/login`. `None` is an ordinary sign-in.
     pub link_for: Option<String>,
 }
 
@@ -1926,8 +1922,9 @@ fn account_is_disabled() -> ApiError {
 /// The seam between the protocol and the accounts database. Three cases, and
 /// the order they are in is the policy:
 ///
-/// 1. A sign-in started to LINK an identity to an account (`?link=true`, which
-///    needs a session to start) ties the pair to the account that started it
+/// 1. A sign-in started to LINK an identity to an account (the POST on the
+///    login path, which needs a session) ties the pair to the account that
+///    started it
 ///    and signs that account in. It never provisions and never moves an
 ///    identity: see [`link_the_started_account`] for the three ways it refuses.
 /// 2. A `(issuer, subject)` pair this instance has seen signs into the account
@@ -2024,9 +2021,9 @@ async fn resolve_oidc_identity(
 /// The rule this whole design is built around is that linking is an explicit
 /// act by the person who owns the account, so the account that started the
 /// link has to be the account that finishes it. `link_for` is written into the
-/// pending record by `/auth/oidc/login`, which refuses `?link=true` without a
-/// session; this checks the other end of the same journey, against the session
-/// the callback actually arrives on:
+/// pending record by `POST /auth/oidc/login`, which refuses without a session;
+/// this checks the other end of the same journey, against the identity the
+/// callback actually arrives with:
 ///
 /// * no live account on the callback - signed out, expired, or revoked while
 ///   the browser was away at the provider - is a 401. There is nobody to link

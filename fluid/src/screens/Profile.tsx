@@ -53,13 +53,18 @@ import {
   revokeMcpToken,
   rotateMcpToken,
 } from "../api/mcpTokens";
-import type { IdentityLink, IssuedMcpToken, McpTokenInfo } from "../api/model";
+import type {
+  IdentityLink,
+  IssuedMcpToken,
+  McpTokenInfo,
+  User,
+} from "../api/model";
 import {
   IDENTITY_LINKS_KEY,
   PROVIDERS_KEY,
   fetchIdentityLinks,
   fetchProviders,
-  ssoLoginUrl,
+  startSsoLink,
   unlinkIdentity,
 } from "../api/sso";
 import { useAuth } from "../auth/AuthContext";
@@ -108,7 +113,7 @@ export default function Profile() {
         </p>
       </header>
       <GithubIdentityCard />
-      <SsoIdentityCard />
+      <SsoIdentityCard user={user} />
       <AgentAccessCard />
     </div>
   );
@@ -171,7 +176,7 @@ function GithubIdentityCard() {
  * back lands on the home screen rather than here, because the callback is the
  * ordinary sign-in path and mints a session the same way.
  */
-function SsoIdentityCard() {
+function SsoIdentityCard({ user }: { user: User }) {
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<Notice | null>(null);
 
@@ -199,15 +204,37 @@ function SsoIdentityCard() {
     },
   });
 
+  const link = useMutation({
+    // Never retried: the POST records a pending link server side, and a second
+    // one would leave a journey nobody finishes taking up a slot.
+    retry: false,
+    mutationFn: startSsoLink,
+    onSuccess: (started) => {
+      // The whole page leaves for the provider. Not a fetch: what follows is a
+      // redirect out and a redirect back, and only a real navigation can carry
+      // somebody to a password field.
+      window.location.assign(started.location);
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
   const links = identities.data?.links ?? [];
   const configured = providers.data?.oidc.enabled === true;
   const providerName = providers.data?.oidc.name ?? "single sign-on";
-  if (!configured && links.length === 0) {
+  // A read that has not landed is not an account with nothing linked, and a
+  // read that FAILED is not one either: saying "no provider identity linked"
+  // to a person whose account signs in through one would be the opposite of
+  // the truth, and it would offer them a link button they must not press. So
+  // the card waits for the answer and shows the failure when there is one.
+  const unknown = identities.isPending || identities.isError;
+  if (!configured && (unknown || links.length === 0)) {
     return null;
   }
   // One identity per provider is the rule, so a configured provider this
   // account has not linked yet is exactly the case the link button is for.
-  const canLink = configured && links.length === 0;
+  const canLink = configured && !unknown && links.length === 0;
 
   return (
     <section
@@ -238,7 +265,22 @@ function SsoIdentityCard() {
         </p>
       )}
 
-      {links.length > 0 ? (
+      {identities.isError && (
+        <p
+          role="alert"
+          className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+        >
+          {problemDetail(identities.error)}
+        </p>
+      )}
+
+      {unknown ? (
+        <p className={MUTED}>
+          {identities.isPending
+            ? "Reading your provider identities"
+            : "This account's provider identities could not be read."}
+        </p>
+      ) : links.length > 0 ? (
         <ul className="flex flex-col gap-2">
           {links.map((link: IdentityLink) => (
             <li
@@ -250,7 +292,7 @@ function SsoIdentityCard() {
                   {link.issuer}
                 </p>
                 <p className={MUTED}>
-                  {linkedByLine(link)} on {formatDay(link.linked_at)}
+                  {linkedByLine(link, user.name)} on {formatDay(link.linked_at)}
                 </p>
               </div>
               <button
@@ -275,9 +317,16 @@ function SsoIdentityCard() {
 
       {canLink && (
         <div>
-          <a href={ssoLoginUrl(true)} className={CONNECT_BUTTON}>
+          <button
+            type="button"
+            disabled={link.isPending}
+            onClick={() => {
+              link.mutate();
+            }}
+            className={CONNECT_BUTTON}
+          >
             Link {providerName}
-          </a>
+          </button>
         </div>
       )}
       {identities.data?.has_password === false && links.length > 0 && (
@@ -291,15 +340,25 @@ function SsoIdentityCard() {
   );
 }
 
-/** Who made one link, in words rather than in the stored token. */
-function linkedByLine(link: IdentityLink): string {
+/**
+ * Who made one link, in words rather than in the stored marker.
+ *
+ * Three markers are known - a first sign-on, the command line, and the account
+ * doing it itself - and anything else is shown as itself rather than folded
+ * into one of them: a fourth writer would otherwise be rendered as a sentence
+ * that is not true.
+ */
+function linkedByLine(link: IdentityLink, self: string): string {
   if (link.linked_by === "jit") {
     return "Linked when this account was created by a first sign-on";
   }
   if (link.linked_by === "cli") {
     return "Linked by an administrator";
   }
-  return "Linked from this profile";
+  if (link.linked_by === self) {
+    return "Linked from this profile";
+  }
+  return `Linked by ${link.linked_by}`;
 }
 
 /** The card proper, for a session that may have an identity of its own. */

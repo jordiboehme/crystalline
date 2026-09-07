@@ -5,7 +5,7 @@
 //! no account name rides the path, because the session already names the
 //! account, so a caller can only ever see and remove its own links. Making a
 //! link is not here at all - it is the sign-on itself, started from
-//! `GET /auth/oidc/login?link=true` and finished at the callback, because an
+//! `POST /auth/oidc/login` and finished at the callback, because an
 //! identity is only linkable once the provider has proved the person holds it.
 //! What this surface adds is the other two halves: reading back what is
 //! linked, and unlinking.

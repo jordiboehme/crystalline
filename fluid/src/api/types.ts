@@ -101,7 +101,7 @@ export interface paths {
         };
         /**
          * Finish a single sign-on the provider sent back.
-         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. A sign-in started with `link=true` instead ties the identity to the account whose session started it, which has to be the session that finishes it too. The provider's own error text never reaches this response.
+         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. A sign-on started by `POST /auth/oidc/login` instead ties the identity to the account that started it, which has to be the account finishing it too. The provider's own error text never reaches this response.
          */
         get: operations["oidc_callback"];
         put?: never;
@@ -121,11 +121,15 @@ export interface paths {
         };
         /**
          * Start a single sign-on against the configured provider.
-         * @description Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. `link=true` links the provider identity to the caller's existing account and needs a signed-in session.
+         * @description Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin.
          */
         get: operations["oidc_login"];
         put?: never;
-        post?: never;
+        /**
+         * Start a single sign-on that links its identity to this account.
+         * @description Starts the same authorization-code flow the GET does, and records that it is for the calling account: the callback ties the provider identity to that account rather than signing in as whoever it turns out to be. Needs a signed-in account and the session's CSRF token, because starting a link is an unsafe act - a GET would be startable by another origin. Answers the authorization endpoint in `location`; navigate the whole page to it. Served on a read-only instance: an identity link is account state rather than knowledge.
+         */
+        post: operations["oidc_start_link"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2164,6 +2168,14 @@ export interface components {
              */
             title?: string | null;
         };
+        /** @description Where to send the browser to link a provider identity to the caller's account. Navigate the whole page to it: what follows is a redirect to the provider and a redirect back, so a background fetch would land nowhere anybody can authenticate. */
+        StartLinkResponse: {
+            /**
+             * @description The provider's authorization endpoint, with PKCE, state and nonce.
+             * @example https://idp.example/authorize?client_id=...
+             */
+            location: string;
+        };
         /** @description A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is. */
         TokenBody: {
             /**
@@ -2633,8 +2645,10 @@ export interface operations {
         parameters: {
             query?: {
                 /**
-                 * @description Link the provider identity to the caller's existing account instead of
-                 *     signing in as whoever it turns out to be. Needs a signed-in session.
+                 * @description Recognized so that a request meaning to link is told where linking
+                 *     lives, rather than quietly started as an ordinary sign-in. Starting a
+                 *     link is `POST /auth/oidc/login`; see [`start_link`] for why it cannot
+                 *     be a GET.
                  */
                 link?: boolean;
             };
@@ -2655,6 +2669,64 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description `link=true`, which is the POST's job; or a request with no Host header, or one that is not a bare host and port, so no redirect uri can be derived. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No provider is configured on this instance. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The provider's discovery document could not be fetched, or it names a tenant-independent issuer. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Too many sign-ins are in flight to start another. Wait a moment and try again. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oidc_start_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Navigate to `location`. */
+            200: {
+                headers: {
+                    /** @description The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StartLinkResponse"];
+                };
+            };
             /** @description The request carries no Host header, or one that is not a bare host and port, so no redirect uri can be derived. */
             400: {
                 headers: {
@@ -2664,8 +2736,17 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description `link=true` on a request with no signed-in session. */
+            /** @description No signed-in account to link to. */
             401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The session's CSRF token was missing or wrong. */
+            403: {
                 headers: {
                     [name: string]: unknown;
                 };

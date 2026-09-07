@@ -811,8 +811,13 @@ describe("the SSO identity card", () => {
     ).not.toBeInTheDocument();
   });
 
-  it("offers the link as a whole-page navigation carrying the link flag", async () => {
-    serveAs("editor", withProvider());
+  it("starts a link with a POST rather than a navigable link", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/auth/oidc/login": () => ({ location: "https://idp.example/auth" }),
+      }),
+    );
     renderApp("/profile");
 
     expect(
@@ -821,13 +826,112 @@ describe("the SSO identity card", () => {
     expect(
       await screen.findByText(/no provider identity linked/i),
     ).toBeInTheDocument();
-    // A link, not a button: the sign-on redirects to the provider and back,
-    // and `link=true` is what makes it link rather than sign somebody in as
-    // whoever the identity turns out to be.
-    expect(screen.getByRole("link", { name: "Link Contoso" })).toHaveAttribute(
-      "href",
-      "/api/v1/auth/oidc/login?link=true",
+    // Never an anchor: the session cookie is SameSite=Lax, so a GET that
+    // started a link could be started by any other origin. A POST cannot be
+    // sent cross-site with the cookie, and `api` attaches the CSRF token.
+    expect(
+      screen.queryByRole("link", { name: /^Link Contoso$/ }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Link Contoso" }));
+
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.some(
+          ([path, init]) =>
+            path === "/auth/oidc/login" && init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+    // Where the browser goes next is the server's answer, navigated to as a
+    // whole page. jsdom cannot follow that, so what is asserted here is the
+    // request; `crates/service/tests/oidc.rs` drives the rest of the journey.
+  });
+
+  it("shows the server's words when a link cannot be started", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/auth/oidc/login": () => {
+          throw new ApiProblem(
+            404,
+            "not found",
+            "this instance has no single sign-on provider configured",
+          );
+        },
+      }),
     );
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Link Contoso" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "this instance has no single sign-on provider configured",
+    );
+  });
+
+  it("never claims nothing is linked while the read is in flight or failed", async () => {
+    // The read never lands. What must NOT appear is the sentence for an
+    // account with nothing linked, which for an account that signs in through
+    // a provider is the opposite of the truth, and the button that would
+    // start a second link beside the one it already holds.
+    let settle: (() => void) | undefined;
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () =>
+          new Promise((resolve) => {
+            settle = () => {
+              resolve({ links: [linkPayload()], has_password: false });
+            };
+          }),
+      }),
+    );
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/reading your provider identities/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no provider identity linked/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link Contoso" })).toBeNull();
+
+    settle?.();
+    expect(await screen.findByText("https://idp.example")).toBeInTheDocument();
+  });
+
+  it("says so when the identity read fails, rather than that there is nothing", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () => {
+          throw new ApiProblem(
+            500,
+            "internal",
+            "the accounts database is busy",
+          );
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "the accounts database is busy",
+    );
+    expect(screen.queryByText(/no provider identity linked/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link Contoso" })).toBeNull();
+  });
+
+  it("names an unfamiliar linker rather than calling it this profile", async () => {
+    serveAs("editor", {
+      "/me/identity-links": () => ({
+        links: [linkPayload({ linked_by: "migration" })],
+        has_password: true,
+      }),
+    });
+    renderApp("/profile");
+
+    expect(await screen.findByText(/linked by migration/i)).toBeInTheDocument();
   });
 
   it("shows a linked identity, who linked it, and unlinks it", async () => {

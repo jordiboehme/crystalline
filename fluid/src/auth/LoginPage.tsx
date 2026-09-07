@@ -43,7 +43,7 @@ import { useId, useState } from "react";
 import { Link, Navigate, useLocation } from "react-router";
 
 import { ApiProblem } from "../api/client";
-import { PROVIDERS_KEY, fetchProviders, ssoLoginUrl } from "../api/sso";
+import { PROVIDERS_KEY, fetchProviders, ssoSignInUrl } from "../api/sso";
 import { BUTTON, FOCUS_RING } from "../components/primitives";
 import { useAuth } from "./AuthContext";
 import { FirstRunSetup } from "./FirstRunSetup";
@@ -296,7 +296,7 @@ export default function LoginPage() {
               <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
             </div>
             <a
-              href={ssoLoginUrl()}
+              href={ssoSignInUrl()}
               className={`py-2 text-center ${BUTTON.secondary}`}
             >
               Sign in with {sso.name}

@@ -3,16 +3,28 @@
  * screen should draw a button for, and which provider identities the signed-in
  * account holds.
  *
- * The sign-in and the linking themselves are NOT fetches. Both are a whole-page
- * navigation to `/api/v1/auth/oidc/login`, because what follows is a redirect
- * to the provider's own domain and a redirect back: a `fetch` would follow that
- * hop invisibly, in the background, and land nowhere a person can type a
- * password into. {@link ssoLoginUrl} is that address, and the only correct way
- * to use it is `window.location.assign` or an ordinary link.
+ * Neither the sign-in nor the linking ENDS in a fetch: what follows either one
+ * is a redirect to the provider's own domain and a redirect back, so the whole
+ * page has to navigate. A background fetch would walk that hop invisibly and
+ * land nowhere anybody can type a password into.
+ *
+ * They start differently, though, and that difference is a security property
+ * rather than a style choice. An ordinary sign-in is a link to
+ * {@link ssoSignInUrl}: it is public, it signs in whoever the provider says,
+ * and there is nothing for another origin to abuse. Starting a LINK ties the
+ * identity to the account already signed in here, so it must not be startable
+ * by another origin - the session cookie is `SameSite=Lax` and would ride a
+ * cross-site top-level navigation. {@link startSsoLink} therefore POSTs, which
+ * carries the CSRF token and which no cross-site form can send with the
+ * cookie, and hands back where to navigate.
  */
 
 import { API_BASE, api, encodeSegment } from "./client";
-import type { IdentityLinksResponse, ProvidersResponse } from "./model";
+import type {
+  IdentityLinksResponse,
+  ProvidersResponse,
+  StartLinkResponse,
+} from "./model";
 
 /** The cache key of the sign-in screen's provider probe. */
 export const PROVIDERS_KEY = ["auth-providers"] as const;
@@ -48,14 +60,24 @@ export async function unlinkIdentity(issuer: string): Promise<void> {
 }
 
 /**
- * Where to send the browser to start a sign-on. `link` turns it into an
- * explicit linking of the provider identity to the account that is already
- * signed in, which is the only way an identity ever reaches an existing
- * account.
- *
- * `link=true` and never `link=1`: the server's query layer reads a bool, and
- * `1` is answered with a 400 that a whole-page navigation has no way to show.
+ * Where to send the browser to sign in with the provider. A plain address, for
+ * a plain link: this is the public way in, and it signs in whoever the
+ * provider turns out to say it is.
  */
-export function ssoLoginUrl(link = false): string {
-  return `${API_BASE}/auth/oidc/login${link ? "?link=true" : ""}`;
+export function ssoSignInUrl(): string {
+  return `${API_BASE}/auth/oidc/login`;
+}
+
+/**
+ * Start a sign-on that links its identity to the account already signed in,
+ * and hand back where to navigate.
+ *
+ * The POST does two things before the browser leaves: it proves the request
+ * came from this app (the CSRF token `api` attaches) and it records, server
+ * side, which account the journey is for. The caller then navigates the whole
+ * page to `location`; nothing is linked until the provider sends the browser
+ * back to the callback, and only ever to the account that started it.
+ */
+export async function startSsoLink(): Promise<StartLinkResponse> {
+  return api<StartLinkResponse>("/auth/oidc/login", { method: "POST" });
 }
