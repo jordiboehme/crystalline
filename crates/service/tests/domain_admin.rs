@@ -587,3 +587,52 @@ async fn github_ready_requires_enabled_and_a_credential() {
     engine.github_disconnect().await.unwrap();
     assert!(!engine.github_ready().await);
 }
+
+/// Issue #67: the listing used to come back in registration order.
+///
+/// A map that preserves insertion order plus a loop over it means the sidebar
+/// showed whatever sequence `add_domain` happened to be called in - not
+/// alphabetical, not by sync time, nothing a reader scanning for a name can
+/// use. Sorted by name here, once, so every consumer of the listing inherits
+/// it: the sidebar, the CLI and the routing prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_domain_listing_is_sorted_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    // Registered in the order somebody happened to add them. `Falcon` and
+    // `falconry` are the pair that pins the comparison: case-insensitive, so
+    // capitalization never sorts a domain away from its neighbours.
+    for name in ["zebra", "mercury", "Falcon", "falconry"] {
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::virtual_domain());
+    }
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+
+    let listing = engine
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let names: Vec<&str> = listing["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Falcon", "falconry", "mercury", "zebra"]);
+}

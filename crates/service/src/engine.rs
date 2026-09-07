@@ -5916,6 +5916,11 @@ impl Engine {
     /// reads it off the listing rather than asking after every domain in it.
     /// That is not the same fact as the one above and it is not a leak of it:
     /// a caller who may not see a domain never gets a row for it to read.
+    ///
+    /// The rows come back sorted by name, case-insensitively. Registration
+    /// order is what the config map preserves and it is meaningless to anybody
+    /// reading the listing, so the order is settled here rather than in each of
+    /// the sidebar, the CLI and the routing prompt.
     pub async fn list_domains(
         &self,
         p: &ListDomainsParams,
@@ -5930,7 +5935,21 @@ impl Engine {
         // Cloned out from behind the lock before any `.await` below, matching
         // the `hosted`/`discovered_domains` convention elsewhere in this file.
         let domains = self.config.read().unwrap().domains.clone();
-        for (name, entry) in domains.iter().filter(|(name, _)| !hidden.contains(*name)) {
+        // Sorted by name rather than left in registration order, which is what
+        // the map preserves and what a reader scanning a sidebar has no use
+        // for. Case-insensitive first, so capitalization never sorts a domain
+        // away from its neighbours, then exact as the tie-break so two names
+        // differing only in case have one settled order.
+        let mut listed: Vec<_> = domains
+            .iter()
+            .filter(|(name, _)| !hidden.contains(*name))
+            .collect();
+        listed.sort_by(|(left, _), (right, _)| {
+            left.to_lowercase()
+                .cmp(&right.to_lowercase())
+                .then_with(|| left.cmp(right))
+        });
+        for (name, entry) in listed {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
             let mut obj = json!({
