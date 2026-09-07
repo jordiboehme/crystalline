@@ -1326,6 +1326,31 @@ async fn membership_is_refused_on_a_shared_domain() {
         .await;
     assert_eq!(refused.status(), 422, "{:?}", refused.text().await);
     assert!(ctx.auth.domain_members("lab").await.unwrap().is_empty());
+
+    // The owner route takes its principal in the BODY, where no path
+    // segment folded it first, so a name that cannot be a login name at all
+    // has to be answered the same way rather than as a server fault.
+    for owner in ["", "  ", "ada lovelace"] {
+        let refused = boss
+            .put_json("/api/v1/domains/lab/owner", json!({"owner": owner}))
+            .await;
+        assert_eq!(
+            refused.status(),
+            422,
+            "an owner of '{owner}' is an unprocessable body: {:?}",
+            refused.text().await
+        );
+    }
+    assert_eq!(
+        ctx.auth
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .expect("lab is private")
+            .owner,
+        "owner",
+        "and nothing was handed on"
+    );
 }
 
 /// A domain can be registered private in one step, owned by whoever created

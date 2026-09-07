@@ -48,8 +48,8 @@ use crystalline_core::config::{GlobalConfig, ShareIdentityMode};
 use tokio::sync::Semaphore;
 
 use super::auth_store::{
-    AuthStore, DEFAULT_OIDC_ROLE, PasswordCheck, Role, SessionMint, User, dummy_verify,
-    normalize_account_name,
+    AuthStore, DEFAULT_OIDC_ROLE, PasswordCheck, RefusalKind, Role, SessionMint, StoreRefusal,
+    User, dummy_verify, normalize_account_name,
 };
 use super::oidc::{FALLBACK_ACCOUNT_NAME, sanitize_account_name};
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
@@ -340,8 +340,9 @@ impl Identity {
     }
 
     /// The account behind the request, when what follows is decided by
-    /// something other than the instance role - today, a private domain's
-    /// membership.
+    /// something other than the instance role: a private domain's membership,
+    /// or a surface that acts only on the caller's own account (its MCP tokens,
+    /// its single sign-on identities).
     ///
     /// [`Identity::require_viewer`] is the whole role check (a domain
     /// invitation is what grants the rest), but its [`Caller::Anonymous`]
@@ -358,7 +359,8 @@ impl Identity {
             Caller::Account(user) => Ok(user),
             Caller::Anonymous => Err(ApiError::unauthorized(
                 "this request is served as the anonymous viewer, which has no \
-                 account to be a member of anything: log in first",
+                 account of its own - nothing to be a member of anything, and \
+                 nothing to hold tokens or identities: log in first",
             )),
         }
     }
@@ -472,13 +474,15 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
             .ensure_user(value, Role::Viewer, state.auth_cfg.max_users)
             .await
             .map_err(|e| {
-                let msg = format!("{e:#}");
-                if msg.contains("auth.max_users") || msg.contains("login name") {
-                    // The header named an identity this instance will not
-                    // provision: the caller cannot fix it, the operator can.
-                    ApiError::forbidden(msg)
-                } else {
-                    ApiError::internal(msg)
+                // The header named an identity this instance will not
+                // provision: the caller cannot fix it, the operator can. Told
+                // apart by kind rather than by substring, so rewording the
+                // store's sentence cannot turn this into a 500.
+                match StoreRefusal::kind_of(&e) {
+                    Some(RefusalKind::CapReached | RefusalKind::InvalidName) => {
+                        ApiError::forbidden(format!("{e:#}"))
+                    }
+                    _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;
         if user.disabled {
@@ -759,16 +763,14 @@ async fn provision_forwarded_user(
             if let Some(user) = state.auth.linked_user(PROXY_ISSUER, subject).await? {
                 return Ok(user);
             }
-            let msg = format!("{err:#}");
-            if msg.contains("auth.max_users") {
-                // The one refusal a caller cannot act on and an operator can.
-                // Unlike the trusted-header path there is no name refusal to
-                // classify here: the subject was normalized before this ran and
-                // the desired name is derived, so both are names by the time the
-                // store sees them.
-                Err(ApiError::forbidden(msg))
-            } else {
-                Err(ApiError::internal(msg))
+            // The one refusal a caller cannot act on and an operator can.
+            // Unlike the trusted-header path there is no name refusal to
+            // classify here: the subject was normalized before this ran and
+            // the desired name is derived, so both are names by the time the
+            // store sees them.
+            match StoreRefusal::kind_of(&err) {
+                Some(RefusalKind::CapReached) => Err(ApiError::forbidden(format!("{err:#}"))),
+                _ => Err(ApiError::internal(format!("{err:#}"))),
             }
         }
     }

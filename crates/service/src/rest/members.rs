@@ -163,14 +163,25 @@ fn store_error(e: anyhow::Error) -> ApiError {
              hand the domain on with PUT /domains/{domain}/owner instead",
         ),
         Some(RefusalKind::NoSuchAccount) => ApiError::unprocessable(NOT_AN_ENABLED_ACCOUNT),
+        // A name that cannot be a login name at all is the same 422
+        // [`principal_key`] answers for a path segment. The routes that take
+        // the principal in the PATH fold it there and never reach this arm;
+        // `PUT /domains/{domain}/owner` takes it in the BODY, where nothing
+        // folded it first, so a malformed owner used to arrive here
+        // unclassified and answer 500 against its own documented 422. The
+        // store's words are the ones `principal_key` forwards, and they name
+        // the shape a login name has and no account, so they are not an oracle.
+        Some(RefusalKind::InvalidName) => ApiError::unprocessable(format!("{e}")),
         // No membership statement can refuse for those reasons - they are the
-        // identity-link surface's own - so they fall in with the server's
-        // problems rather than being given a status here that would be a
-        // guess.
+        // identity-link and MCP-token surfaces' own - so they fall in with the
+        // server's problems rather than being given a status here that would be
+        // a guess.
         Some(
             RefusalKind::LastCredential
             | RefusalKind::IdentityAlreadyLinked
-            | RefusalKind::IssuerAlreadyHeld,
+            | RefusalKind::IssuerAlreadyHeld
+            | RefusalKind::NoSuchToken
+            | RefusalKind::CapReached,
         )
         | None => ApiError::internal(format!("{e:#}")),
     }

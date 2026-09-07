@@ -32,8 +32,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 
-use super::auth::{Caller, Identity};
-use super::auth_store::{IdentityLink, RefusalKind, StoreRefusal, User};
+use super::auth::Identity;
+use super::auth_store::{IdentityLink, RefusalKind, StoreRefusal};
 use super::{ApiError, ApiPath, ProblemDetail, RestState};
 
 /// What `GET /me/identity-links` answers with.
@@ -51,23 +51,6 @@ pub struct IdentityLinksResponse {
     /// `crystalline users passwd` gives it one.
     #[schema(example = true)]
     pub has_password: bool,
-}
-
-/// The account behind the request, which is the only one this surface acts
-/// for.
-///
-/// [`Identity::require_viewer`] is the whole role check - every account may
-/// hold identities - but it hands back a [`Caller`], and the anonymous variant
-/// of that is not an account: there is nobody whose links could be listed. That
-/// case is 401 rather than 403, because logging in is what fixes it.
-fn require_own_account(identity: &Identity) -> Result<User, ApiError> {
-    match identity.require_viewer()? {
-        Caller::Account(user) => Ok(user),
-        Caller::Anonymous => Err(ApiError::unauthorized(
-            "this request is served as the anonymous viewer, which has no \
-             account and so holds no single sign-on identities: log in first",
-        )),
-    }
 }
 
 /// Turn a store failure into a status.
@@ -122,7 +105,7 @@ pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
 ) -> Result<Json<IdentityLinksResponse>, ApiError> {
-    let user = require_own_account(&identity)?;
+    let user = identity.require_account()?;
     let links = state
         .auth
         .identity_links(&user.name)
@@ -198,7 +181,7 @@ pub async fn unlink(
     identity: Identity,
     ApiPath(issuer): ApiPath<String>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_own_account(&identity)?;
+    let user = identity.require_account()?;
     // A segment that is not an issuer at all names no link, which is what the
     // 404 below says. Answered here rather than by the store, whose own
     // refusal for a blank value is a plain error this surface would have to

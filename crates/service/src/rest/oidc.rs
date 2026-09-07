@@ -2135,14 +2135,14 @@ async fn resolve_oidc_identity(
                 }
                 return Ok(user);
             }
-            let message = format!("{err:#}");
-            if message.contains("auth.max_users") {
-                // The caller cannot fix this and the operator can, so the
-                // words that name the setting are the useful ones. Same
-                // treatment as the trusted-header path's cap refusal.
-                Err(ApiError::forbidden(message))
-            } else {
-                Err(ApiError::internal(message))
+            // The caller cannot fix this and the operator can, so the words
+            // that name the setting are the useful ones. Same treatment as the
+            // trusted-header path's cap refusal, and told apart the same way:
+            // by kind, so rewording the store's sentence cannot turn a 403 into
+            // a 500.
+            match StoreRefusal::kind_of(&err) {
+                Some(RefusalKind::CapReached) => Err(ApiError::forbidden(format!("{err:#}"))),
+                _ => Err(ApiError::internal(format!("{err:#}"))),
             }
         }
     }

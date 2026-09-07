@@ -34,8 +34,8 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 
-use super::auth::{Caller, Identity, NoStore, no_store};
-use super::auth_store::{McpTokenInfo, User};
+use super::auth::{Identity, NoStore, no_store};
+use super::auth_store::{McpTokenInfo, RefusalKind, StoreRefusal};
 use super::{ApiError, ApiJson, ApiPath, ProblemDetail, RestState};
 
 /// What `POST /me/mcp-tokens` takes: what the token is for, so a row in the
@@ -101,24 +101,6 @@ impl From<super::auth_store::IssuedMcpToken> for IssuedTokenResponse {
     }
 }
 
-/// The account behind the request, which is the only thing this surface can
-/// act for.
-///
-/// [`Identity::require_viewer`] is the whole role check - every account may
-/// hold tokens - but it hands back a [`Caller`], and the anonymous variant of
-/// that is not an account: there is nobody to issue a token to and nobody
-/// whose tokens could be listed. That case is 401 rather than 403, in this
-/// surface's own words, because logging in is exactly what fixes it.
-fn require_own_account(identity: &Identity) -> Result<User, ApiError> {
-    match identity.require_viewer()? {
-        Caller::Account(user) => Ok(user),
-        Caller::Anonymous => Err(ApiError::unauthorized(
-            "this request is served as the anonymous viewer, which has no \
-             account and so holds no MCP tokens: log in first",
-        )),
-    }
-}
-
 /// Turn a store failure into a status. Two of them are worth naming, and they
 /// are deliberately kept apart:
 ///
@@ -135,17 +117,17 @@ fn require_own_account(identity: &Identity) -> Result<User, ApiError> {
 /// the phrases account editing produces and documents a branch order that
 /// exists for a collision between two of them. Nothing is gained by teaching
 /// it a second vocabulary.
+///
+/// Classified by [`RefusalKind`] rather than by substring, so a reworded
+/// message cannot turn either of these into a 500.
 fn store_error(e: anyhow::Error) -> ApiError {
-    let detail = format!("{e:#}");
-    if detail.contains("no such mcp token") {
-        return ApiError::not_found(TOKEN_NOT_FOUND);
-    }
-    if detail.contains("no such user") {
-        return ApiError::unauthorized(
+    match StoreRefusal::kind_of(&e) {
+        Some(RefusalKind::NoSuchToken) => ApiError::not_found(TOKEN_NOT_FOUND),
+        Some(RefusalKind::NoSuchAccount) => ApiError::unauthorized(
             "the account this request was made as no longer exists: log in again",
-        );
+        ),
+        _ => ApiError::internal(format!("{e:#}")),
     }
-    ApiError::internal(detail)
 }
 
 /// What naming an id that is not one of the caller's tokens is told, in one
@@ -191,7 +173,7 @@ pub async fn list(
     State(state): State<RestState>,
     identity: Identity,
 ) -> Result<Json<Vec<McpTokenInfo>>, ApiError> {
-    let user = require_own_account(&identity)?;
+    let user = identity.require_account()?;
     Ok(Json(
         state
             .auth
@@ -263,7 +245,7 @@ pub async fn issue(
     identity: Identity,
     ApiJson(body): ApiJson<IssueBody>,
 ) -> Result<(NoStore, Json<IssuedTokenResponse>), ApiError> {
-    let user = require_own_account(&identity)?;
+    let user = identity.require_account()?;
     let label = check_label(&body.label)?;
     let issued = state
         .auth
@@ -322,7 +304,7 @@ pub async fn rotate(
     identity: Identity,
     ApiPath(id): ApiPath<i64>,
 ) -> Result<(NoStore, Json<IssuedTokenResponse>), ApiError> {
-    let user = require_own_account(&identity)?;
+    let user = identity.require_account()?;
     let issued = state
         .auth
         .rotate_mcp_token(&user.name, id)
@@ -378,7 +360,7 @@ pub async fn revoke(
     identity: Identity,
     ApiPath(id): ApiPath<i64>,
 ) -> Result<StatusCode, ApiError> {
-    let user = require_own_account(&identity)?;
+    let user = identity.require_account()?;
     let revoked = state
         .auth
         .revoke_mcp_token(&user.name, id)

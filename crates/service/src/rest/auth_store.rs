@@ -150,13 +150,18 @@ fn role_from_db(s: &str) -> Role {
 pub fn normalize_account_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        bail!("a user name cannot be empty");
+        return Err(refuse(
+            RefusalKind::InvalidName,
+            "a user name cannot be empty".to_string(),
+        ));
     }
     if trimmed.chars().any(char::is_whitespace) {
-        bail!(
+        return Err(refuse(
+            RefusalKind::InvalidName,
             "a login name cannot contain whitespace: pick a space-free name \
              and put the readable form in the display name"
-        );
+                .to_string(),
+        ));
     }
     Ok(trimmed.to_lowercase())
 }
@@ -559,7 +564,11 @@ pub enum RefusalKind {
     OwnerIsNotAMember,
     /// The principal names no account, or names one that is disabled. ONE
     /// variant for both on purpose: a surface that cannot read the user list
-    /// must not be handed a probe for which of the two it is.
+    /// must not be handed a probe for which of the two it is. Also what the
+    /// token verbs raise when the account they are acting FOR is gone, which
+    /// the self-service surface answers 401 to: the caller's own account
+    /// disappeared between the session resolving and the statement running, and
+    /// logging in again is what says so.
     NoSuchAccount,
     /// The `(issuer, subject)` pair is already linked, to this account or to
     /// another one. The message names the account that holds it, for the
@@ -574,6 +583,18 @@ pub enum RefusalKind {
     /// it would leave nobody able to sign in. See
     /// [`AuthStore::unlink_identity`].
     LastCredential,
+    /// No MCP token with that id belongs to the account that asked. One
+    /// variant for "never existed" and "not yours" together, so an id cannot be
+    /// probed for through the difference.
+    NoSuchToken,
+    /// `auth.max_users` is reached, so no further account is provisioned. The
+    /// caller cannot act on it and an operator can, which is why it is told
+    /// apart from a server fault.
+    CapReached,
+    /// The name given cannot be a login name at all - empty, or carrying
+    /// whitespace. A bad request rather than a fault, on the surfaces that can
+    /// be handed one.
+    InvalidName,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
@@ -1592,10 +1613,13 @@ impl AuthStore {
                 _ => 0,
             };
             if count >= cap {
-                bail!(
-                    "refusing to provision '{name}': the account cap is reached \
-                     (auth.max_users = {cap}). Remove unused accounts or raise the cap"
-                );
+                return Err(refuse(
+                    RefusalKind::CapReached,
+                    format!(
+                        "refusing to provision '{name}': the account cap is reached \
+                         (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                    ),
+                ));
             }
         }
         self.conn
@@ -1861,10 +1885,13 @@ impl AuthStore {
                 _ => 0,
             };
             if count >= cap {
-                bail!(
-                    "refusing to provision an account for this sign-in: the account cap is \
-                     reached (auth.max_users = {cap}). Remove unused accounts or raise the cap"
-                );
+                return Err(refuse(
+                    RefusalKind::CapReached,
+                    format!(
+                        "refusing to provision an account for this sign-in: the account cap is \
+                         reached (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                    ),
+                ));
             }
             let name = self.free_account_name(&base).await?;
             self.conn
@@ -2319,7 +2346,10 @@ impl AuthStore {
                 )
                 .await?;
             if exists.is_none() {
-                bail!("no such user: '{user}'");
+                return Err(refuse(
+                    RefusalKind::NoSuchAccount,
+                    format!("no such user: '{user}'"),
+                ));
             }
             self.conn
                 .execute(
@@ -2482,7 +2512,10 @@ impl AuthStore {
                 )
                 .await?;
             let Some(row) = row else {
-                bail!("no such mcp token '{id}' for user '{user}'");
+                return Err(refuse(
+                    RefusalKind::NoSuchToken,
+                    format!("no such mcp token '{id}' for user '{user}'"),
+                ));
             };
             label = cell_text(&row, 0).unwrap_or_default();
             self.conn
