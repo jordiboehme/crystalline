@@ -579,6 +579,100 @@ fn v009_stays_quiet_when_no_changed_file_carries_a_date() {
     assert!(!fired(&report).contains(&"V009"), "{:?}", fired(&report));
 }
 
+/// A retired engram carrying `observations`, each written as the body bullet
+/// it was parsed from so the body and the facts agree.
+fn retired_with(id: i64, permalink: &str, observations: &[(usize, &str)]) -> EngramFacts {
+    let mut f = fact(id, permalink);
+    f.status = "superseded".to_string();
+    f.body = observations
+        .iter()
+        .map(|(_, text)| format!("- [fact] {text}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    f.observations = observations
+        .iter()
+        .map(|(line, text)| FactObservation {
+            line: *line,
+            text: (*text).to_string(),
+        })
+        .collect();
+    f
+}
+
+#[test]
+fn v010_names_observations_that_survive_in_no_live_engram() {
+    let retired = retired_with(
+        1,
+        "mix-b-decision",
+        &[
+            (7, "Run the coolant loop on glycol mix B"),
+            (8, "The loop needs a 40 minute purge before a mix swap"),
+        ],
+    );
+    let mut carried = fact(2, "purge-procedure");
+    carried.body =
+        "## Observations\n\n- [fact] The loop needs a 40 minute purge before a mix swap\n"
+            .to_string();
+
+    let report = detect(&input(vec![retired, carried]));
+    let finding = only(&report, "V010");
+    assert_eq!(finding.permalink, "mix-b-decision");
+    assert_eq!(finding.family, Family::Temporal);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.line, Some(7));
+    assert!(
+        finding.evidence.contains("glycol mix B"),
+        "the missing bullet is quoted: {}",
+        finding.evidence
+    );
+    assert!(
+        !finding.evidence.contains("40 minute purge"),
+        "the carried bullet is not a finding: {}",
+        finding.evidence
+    );
+    assert_eq!(finding.fix, "split_engram observations=7");
+}
+
+#[test]
+fn v010_is_quiet_when_every_observation_was_carried_forward() {
+    // Case, spacing and the tags trailing the live bullet all differ; the
+    // normalized text is what has to survive, not the bytes.
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let mut carried = fact(2, "mix-c-decision");
+    carried.body = "- [decision]   RUN the loop   on glycol mix b #coolant #cooling\n".to_string();
+
+    let report = detect(&input(vec![retired, carried]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_is_quiet_once_the_split_landed() {
+    // The split already happened, so what is left in the retired engram is
+    // what expired, on purpose. The archive records that intent as the pair
+    // `split_engram` writes, and the rule reads it.
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let mut sweep = input(vec![retired, fact(2, "purge-procedure")]);
+    sweep.graph.edges = vec![rel(1, 2, "split_into"), rel(2, 1, "derived_from")];
+
+    let report = detect(&sweep);
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_never_speaks_about_a_live_engram() {
+    let mut live = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    live.status = "stable".to_string();
+    let report = detect(&input(vec![live]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_scopes_an_acknowledgment_to_the_missing_bullets() {
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let report = detect(&input(vec![retired]));
+    assert_eq!(only(&report, "V010").scope, "run the loop on glycol mix b");
+}
+
 // ---------------------------------------------------------------------------
 // V1xx - structural integrity
 // ---------------------------------------------------------------------------
@@ -709,6 +803,21 @@ fn v103_flags_a_one_sided_reciprocal() {
     assert_eq!(finding.class, Class::Mechanical);
     assert_eq!(finding.priority, 35);
     assert_eq!(finding.fix, "append `- summarized_by [[release summary]]`");
+}
+
+#[test]
+fn v103_flags_a_one_sided_split_pair() {
+    // The new engram declares `derived_from`, so the source it was split out
+    // of owes it a `split_into`. The finding attaches to the source, which is
+    // the engram missing the line.
+    let mut sweep = input(vec![fact(1, "purge-procedure"), fact(2, "mix-b-decision")]);
+    sweep.graph.edges = vec![rel(1, 2, "derived_from")];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V103");
+    assert_eq!(finding.permalink, "mix-b-decision");
+    assert_eq!(finding.class, Class::Mechanical);
+    assert_eq!(finding.fix, "append `- split_into [[purge procedure]]`");
 }
 
 #[test]
@@ -1307,8 +1416,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_twenty_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 20);
+fn the_catalog_carries_twenty_one_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 21);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -1350,8 +1459,8 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
     assert_eq!(
         ids,
         vec![
-            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V101", "V102",
-            "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
+            "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
+            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
         ]
     );
     for rule in RULES {
@@ -1633,7 +1742,7 @@ fn scope_is_sorted_deduplicated_and_empty_where_identity_is_the_engram() {
         "engineering/alpha".to_string(),
         "engineering/beta".to_string(),
     ];
-    for rule in ["V101", "V102", "V103", "V107", "V201", "V202"] {
+    for rule in ["V010", "V101", "V102", "V103", "V107", "V201", "V202"] {
         assert_eq!(
             scope_for(rule, unsorted.clone()),
             "engineering/alpha, engineering/beta",
@@ -1664,7 +1773,7 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // empty-scope arm, which is the safe default, and this pins that the
     // catalog and the scope function are read together.
     let scoped = [
-        "V007", "V008", "V101", "V102", "V103", "V107", "V201", "V202",
+        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V201", "V202",
     ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);

@@ -174,9 +174,16 @@ pub const SHARE_STALE_DAYS: i64 = 7;
 
 /// The reciprocal relation pairs `V103` checks, forward first. A resolved
 /// forward edge without its converse is a half-wired relation.
-pub const RECIPROCAL_PAIRS: [(&str, &str); 2] = [
+///
+/// The split pair reads the same way round as the other two: the engram that
+/// was split out declares `derived_from` pointing at its source, so the source
+/// is the engram that owes the `split_into` back-link and the finding attaches
+/// there. `split_engram` writes both halves at once, so a one-sided split pair
+/// only ever comes from a link somebody wrote by hand.
+pub const RECIPROCAL_PAIRS: [(&str, &str); 3] = [
     ("supersedes", "superseded_by"),
     ("summarizes", "summarized_by"),
+    ("derived_from", "split_into"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -269,7 +276,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 20] = [
+pub const RULES: [RuleInfo; 21] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -332,6 +339,13 @@ pub const RULES: [RuleInfo; 20] = [
         base: 40,
         summary: "unshared work aging",
         instruction: "Knowledge written here has not reached the team's copy. Propose sharing it with share_changes (the CLI verb is `crystalline origin share`) so the domain owner can review it and the team's archive stays current, and wait for a yes. Sharing publishes somebody's work under review, so it is never done unasked. A generated folder listing never counts as a reason to share.",
+    },
+    RuleInfo {
+        id: "V010",
+        family: Family::Temporal,
+        base: 55,
+        summary: "carry-forward gap",
+        instruction: "A retired engram holds observations that appear in no live engram of its domain, so whatever still holds in them retires with it. Read them. Move the ones that still hold into their own engram with split_engram, which writes the derived_from and split_into pair for you, or acknowledge the drop with evolve_ack when they expired along with the rest. The comparison is on text alone and never on meaning, so a fact somebody carried forward in different words looks missing here.",
     },
     RuleInfo {
         id: "V101",
@@ -430,7 +444,8 @@ const SCOPE_SEPARATOR: &str = ", ";
 /// One match for the whole catalog, deliberately. The rules that carry a scope
 /// pass their material in and this decides the shape:
 ///
-/// - `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
+/// - `V010` (the normalized text of the observations that survive nowhere),
+///   `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
 ///   counterparts), `V107` (the missing attachment paths), `V201` (the cluster
 ///   members) and `V202` (the colliding titles) are **sets**, so the parts are
 ///   sorted and deduplicated before joining: reordering the links in a body must
@@ -443,7 +458,7 @@ const SCOPE_SEPARATOR: &str = ", ";
 ///   looks like next time.
 fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
     match rule {
-        "V101" | "V102" | "V103" | "V107" | "V201" | "V202" => {
+        "V010" | "V101" | "V102" | "V103" | "V107" | "V201" | "V202" => {
             parts.sort();
             parts.dedup();
             parts.join(SCOPE_SEPARATOR)
@@ -501,6 +516,22 @@ impl AckCounts {
     }
 }
 
+/// One observation bullet as `V010` reads it: where it sits and what it says.
+///
+/// The text is the parser's own [`crystalline_core::Observation::content`],
+/// which already has the `[category]` token and the trailing `#tags` taken off,
+/// so the rule compares what the bullet asserts rather than how it was
+/// decorated. Normalizing is the detector's job, not the assembler's, so the
+/// fact stays the verbatim line a reader would recognize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactObservation {
+    /// The one-based line in the source file, the number `read_engram` reports
+    /// and `split_engram` accepts.
+    pub line: usize,
+    /// The observation's content, tags and category already stripped.
+    pub text: String,
+}
+
 /// Everything the rules read about one engram, resolved once by the engine so
 /// no detector ever touches a store or a file.
 ///
@@ -551,6 +582,10 @@ pub struct EngramFacts {
     pub verified_on: Option<NaiveDate>,
     /// The body text, frontmatter excluded.
     pub body: String,
+    /// The engram's top-level observation bullets, in file order. `V010` is
+    /// the only rule that reads them: every other rule that looks at content
+    /// looks at [`EngramFacts::body`].
+    pub observations: Vec<FactObservation>,
     /// The approximate token count, `body.chars() / 4`, the same estimate
     /// verify's `Q002` uses.
     pub tokens: usize,
@@ -611,6 +646,7 @@ impl EngramFacts {
             stale_on: None,
             verified_on: None,
             body: String::new(),
+            observations: Vec::new(),
             tokens: 0,
             token_budget: DEFAULT_TOKEN_BUDGET,
             inbound: 0,
@@ -1360,7 +1396,122 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
     }
 
     detect_aging(input, report);
+    detect_carry_forward(input, graph, report);
     detect_unshared(input, report);
+}
+
+/// `V010`: a retired engram whose observations survive nowhere current.
+///
+/// Validity is set per engram rather than per bullet, so an engram that mixed
+/// lifecycles takes its still-valid facts down with it when the one fact that
+/// expired retires the whole file. This rule is what notices that: for every
+/// retired engram, the observations whose text appears in no live engram of the
+/// same domain.
+///
+/// **Text only, never meaning.** Both sides go through
+/// [`crystalline_core::similarity::normalize`] - ASCII case folded, punctuation
+/// turned into spaces, whitespace runs collapsed - and the needle is then looked
+/// for inside the haystack with a space on either end, so a bullet matches a
+/// run of whole words and `mix b` does not find itself inside `mix boron`. The
+/// needle is the parsed observation content, which already has the `[category]`
+/// token and the trailing `#tags` off it; the haystack is the whole body of
+/// each live engram, so a fact carried forward as prose counts as carried
+/// forward just as much as one carried forward as a bullet. A fact reworded on
+/// its way into the successor looks missing here, which the instruction says
+/// out loud: the fix for a false positive is one `evolve_ack`.
+///
+/// **One quiet condition, and it is the archive's own record.** A retired
+/// engram that declares a resolved `split_into` has already been through this:
+/// somebody moved the surviving facts out, and what is left is the part that
+/// expired on purpose. Reporting it again would fight the split that the rule
+/// asks for. Retirement with a successor is deliberately NOT a quiet condition:
+/// a successor that failed to carry the facts forward is exactly the case this
+/// rule exists to catch.
+///
+/// One finding per engram rather than per bullet: the fix is a single
+/// `split_engram` call naming the lines, so a queue row per line would be one
+/// action split into many.
+fn detect_carry_forward(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
+    let live: Vec<String> = input
+        .engrams
+        .iter()
+        .filter(|f| !f.is_retired())
+        .map(|f| format!(" {} ", normalize(&f.body)))
+        .collect();
+
+    for fact in &input.engrams {
+        if !fact.is_retired() || fact.observations.is_empty() {
+            continue;
+        }
+        if graph.has_outbound_rel(fact.id, "split_into") {
+            continue;
+        }
+        let missing: Vec<(&FactObservation, String)> = fact
+            .observations
+            .iter()
+            .filter_map(|o| {
+                let needle = normalize(&o.text);
+                if needle.is_empty() {
+                    return None;
+                }
+                let padded = format!(" {needle} ");
+                live.iter()
+                    .all(|body| !body.contains(&padded))
+                    .then_some((o, needle))
+            })
+            .collect();
+        let Some((first, _)) = missing.first() else {
+            continue;
+        };
+        let count = missing.len();
+        let lines = missing
+            .iter()
+            .map(|(o, _)| o.line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let evidence = join_semis(
+            missing
+                .iter()
+                .map(|(o, _)| format!("line {}: `{}`", o.line, ellipsize(&o.text)))
+                .chain(std::iter::once(format!(
+                    "status={}; matched as text never as meaning",
+                    fact.status
+                ))),
+        );
+        report.findings.push(
+            Finding::about("V010", fact)
+                .with(
+                    Class::Judgment,
+                    format!(
+                        "{count} observation(s) appear in no live engram of {}",
+                        fact.domain
+                    ),
+                    evidence,
+                    format!("split_engram observations={lines}"),
+                )
+                .at_line(Some(first.line))
+                // The bullets themselves, so acknowledging this drop says
+                // nothing about the next observation that goes missing.
+                .scoped(missing.into_iter().map(|(_, needle)| needle)),
+        );
+    }
+}
+
+/// An observation's text for an evidence cell: whole when it is short, cut at
+/// a word boundary with an ellipsis when it is not, so one long bullet never
+/// takes a queue row apart.
+fn ellipsize(text: &str) -> String {
+    const MAX: usize = 80;
+    let text = text.trim();
+    if text.chars().count() <= MAX {
+        return text.replace(';', ",");
+    }
+    let cut: String = text.chars().take(MAX).collect();
+    let head = match cut.rsplit_once(' ') {
+        Some((head, _)) => head,
+        None => cut.as_str(),
+    };
+    format!("{}...", head.replace(';', ","))
 }
 
 /// `V009`: substantive work that has sat unshared in a team domain past
@@ -2200,7 +2351,12 @@ fn join_semis(items: impl Iterator<Item = impl std::fmt::Display>) -> String {
 /// parser's line walker is crate-private, so the fence tracking is mirrored
 /// here, including its rule that a closing fence must match the opening
 /// character, be at least as long and carry nothing after it.
-fn content_line_count(body: &str) -> usize {
+///
+/// Public because `V106` is not its only reader: `split_engram` refuses a
+/// selection that would leave the source below [`MIN_CONTENT_LINES`], and that
+/// refusal has to count lines exactly the way the rule that would flag the
+/// result counts them.
+pub fn content_line_count(body: &str) -> usize {
     let mut fence: Option<(char, usize)> = None;
     let mut count = 0usize;
     for raw in body.split('\n') {
