@@ -640,14 +640,23 @@ function MemberRow({
             <select
               id={selectId}
               value={member.level}
-              disabled={relevelPending || disabledReason !== undefined}
+              disabled={relevelPending}
+              // `aria-disabled`, not `disabled`: a read-only instance is a
+              // certainty rather than a passing loading state (`relevelPending`
+              // stays native), and a select taken fully out of the tab order
+              // could never announce the reason it carries. See
+              // `Layout.tsx`'s own `ShareChanges` for the same call.
+              aria-disabled={disabledReason !== undefined}
               aria-describedby={
                 disabledReason !== undefined ? reasonId : undefined
               }
               onChange={(event) => {
+                if (disabledReason !== undefined) {
+                  return;
+                }
                 onRelevel(event.target.value as MemberLevel);
               }}
-              className={FIELD}
+              className={`${FIELD} aria-disabled:cursor-default aria-disabled:opacity-50`}
             >
               {LEVELS.map((level) => (
                 <option key={level} value={level}>
@@ -746,20 +755,32 @@ function InviteForm({
           autoComplete="off"
           placeholder="login name"
           value={principal}
+          // Read-only rather than disabled: there is no press to guard here,
+          // and a native `readOnly` input refuses edits on its own while
+          // staying in the tab order and announcing the reason - unlike
+          // `disabled`, which would also take it out of the tab order for no
+          // reason this field needs.
+          readOnly={disabledReason !== undefined}
+          aria-describedby={disabledReason !== undefined ? reasonId : undefined}
           onChange={(event) => {
             setPrincipal(event.target.value);
           }}
-          className={`w-40 ${FIELD}`}
+          className={`w-40 ${FIELD} read-only:cursor-default read-only:opacity-50`}
         />
       </Field>
       <Field id={levelField} label="Level">
         <select
           id={levelField}
           value={level}
+          aria-disabled={disabledReason !== undefined}
+          aria-describedby={disabledReason !== undefined ? reasonId : undefined}
           onChange={(event) => {
+            if (disabledReason !== undefined) {
+              return;
+            }
             setLevel(event.target.value as MemberLevel);
           }}
-          className={FIELD}
+          className={`${FIELD} aria-disabled:cursor-default aria-disabled:opacity-50`}
         >
           {LEVELS.map((option) => (
             <option key={option} value={option}>
@@ -770,9 +791,13 @@ function InviteForm({
       </Field>
       <button
         type="submit"
-        disabled={disabled}
+        // `aria-disabled`, not `disabled`: `onSubmit` above already guards
+        // the press (`if (trimmed === "" || disabled) return`), so the only
+        // thing a native `disabled` attribute would add here is removing the
+        // button from the tab order and silencing the reason it carries.
+        aria-disabled={disabled}
         aria-describedby={disabledReason !== undefined ? reasonId : undefined}
-        className={BUTTON.primary}
+        className={`${BUTTON.primary} aria-disabled:bg-slate-200 aria-disabled:text-slate-500 dark:aria-disabled:bg-slate-800 dark:aria-disabled:text-slate-500`}
       >
         {assigning ? "Assign manager" : "Invite"}
       </button>
@@ -838,7 +863,17 @@ function DestructiveAction({
   const name = ariaLabel ?? label;
   const confirmName = confirmAriaLabel ?? confirmLabel;
   const reasonId = useId();
+  // `aria-disabled`, not `disabled`, on both buttons below: `disabled` takes
+  // a control out of the tab order entirely, so a keyboard user could never
+  // land on it, let alone hear the reason `aria-describedby` attaches to it.
+  // This repo already ruled on exactly this trade in `Layout.tsx`'s own
+  // `ShareChanges` - reachable by pointer and by keyboard, says it will not
+  // act, and does not, because the press is guarded as well as the face.
   const disabled = pending || disabledReason !== undefined;
+  const confirmDisabled =
+    pending ||
+    disabledReason !== undefined ||
+    (requireValue && value.trim() === "");
 
   function abandon() {
     setConfirming(false);
@@ -872,11 +907,14 @@ function DestructiveAction({
         aria-label={name}
         aria-expanded={confirming}
         aria-describedby={disabledReason !== undefined ? reasonId : undefined}
-        disabled={disabled}
+        aria-disabled={disabled}
         onClick={() => {
+          if (disabled) {
+            return;
+          }
           setConfirming(true);
         }}
-        className={BUTTON.destructive}
+        className={`${BUTTON.destructive} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
       >
         {label}
       </button>
@@ -892,14 +930,20 @@ function DestructiveAction({
             type="button"
             autoFocus={children === undefined}
             aria-label={confirmName}
-            disabled={pending || (requireValue && value.trim() === "")}
+            aria-describedby={
+              disabledReason !== undefined ? reasonId : undefined
+            }
+            aria-disabled={confirmDisabled}
             onClick={() => {
+              if (confirmDisabled) {
+                return;
+              }
               setConfirming(false);
               const confirmed = value;
               setValue("");
               onConfirm(confirmed);
             }}
-            className={BUTTON.destructive}
+            className={`${BUTTON.destructive} aria-disabled:cursor-default aria-disabled:opacity-50 aria-disabled:hover:bg-transparent dark:aria-disabled:hover:bg-transparent`}
           >
             {confirmLabel}
           </button>

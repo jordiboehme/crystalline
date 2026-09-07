@@ -697,7 +697,12 @@ describe("the members card", () => {
     ).toBeNull();
   });
 
-  it("disables its five mutation controls on a read-only instance, with the reason as their accessible description", async () => {
+  it("keeps its five disabled controls in the tab order and inert, rather than removed from it, on a read-only instance", async () => {
+    // `aria-disabled`, not the native `disabled` attribute: a control taken
+    // fully out of the tab order can never be landed on by a keyboard user,
+    // so the reason `aria-describedby` attaches to it could never be heard.
+    // This repo already ruled on exactly this trade in `Layout.tsx`'s own
+    // `ShareChanges`.
     serve(
       {
         "/auth/me": () =>
@@ -721,16 +726,123 @@ describe("the members card", () => {
 
     const reason =
       "This instance is read only, so nothing here can be changed.";
-    const controls = [
-      within(card).getByRole("button", { name: "Share with everyone" }),
-      within(card).getByRole("button", { name: "Transfer ownership" }),
-      within(card).getByRole("combobox", { name: "Level for mem" }),
-      within(card).getByRole("button", { name: "Remove mem" }),
-      within(card).getByRole("button", { name: "Invite" }),
-    ];
-    for (const control of controls) {
-      expect(control).toBeDisabled();
+    const visibility = within(card).getByRole("button", {
+      name: "Share with everyone",
+    });
+    const transfer = within(card).getByRole("button", {
+      name: "Transfer ownership",
+    });
+    const relevel = within(card).getByRole("combobox", {
+      name: "Level for mem",
+    });
+    const remove = within(card).getByRole("button", { name: "Remove mem" });
+    const invite = within(card).getByRole("button", { name: "Invite" });
+    for (const control of [visibility, transfer, relevel, remove, invite]) {
+      expect(control).not.toBeDisabled();
+      expect(control).toHaveAttribute("aria-disabled", "true");
       expect(control).toHaveAccessibleDescription(reason);
+      // Still reachable: the whole point of `aria-disabled` over `disabled`.
+      control.focus();
+      expect(control).toHaveFocus();
     }
+
+    const before = apiMock.mock.calls.length;
+    await userEvent.click(visibility);
+    await userEvent.click(transfer);
+    await userEvent.selectOptions(relevel, "manager");
+    await userEvent.click(remove);
+    await userEvent.click(invite);
+    // A guarded press is a press that does nothing: none of the five reached
+    // the network, and the two confirm-pattern controls never even opened
+    // their second step.
+    expect(apiMock.mock.calls.length).toBe(before);
+    expect(
+      within(card).queryByRole("button", {
+        name: "Confirm share with everyone",
+      }),
+    ).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Confirm transfer" }),
+    ).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Confirm remove mem" }),
+    ).toBeNull();
+    expect(relevel).toHaveValue("editor");
+  });
+
+  it("marks the invite form's account field read-only and its level picker inert too, not just the submit button", async () => {
+    serve(
+      {
+        "/auth/me": () =>
+          meResponse({
+            user: userFixture({ name: "boss", role: "admin" }),
+            read_only: true,
+          }),
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private", members: [] }),
+      },
+      "boss",
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    const reason =
+      "This instance is read only, so nothing here can be changed.";
+    const account = within(card).getByLabelText("Account");
+    const level = within(card).getByRole("combobox", { name: "Level" });
+
+    // Read-only, not disabled: a plain text field needs no guarded press, so
+    // the native `readonly` attribute already refuses edits on its own while
+    // keeping the field focusable and its reason announced.
+    expect(account).toHaveAttribute("readonly");
+    expect(account).toHaveAccessibleDescription(reason);
+    expect(level).toHaveAttribute("aria-disabled", "true");
+    expect(level).toHaveAccessibleDescription(reason);
+
+    account.focus();
+    expect(account).toHaveFocus();
+    level.focus();
+    expect(level).toHaveFocus();
+
+    await userEvent.type(account, "x");
+    expect(account).toHaveValue("");
+    await userEvent.selectOptions(level, "manager");
+    expect(level).toHaveValue("viewer");
+  });
+
+  it("clears the typed owner and returns focus to Transfer ownership after Escape", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private", members: [] }),
+      },
+      "ada",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    const trigger = within(card).getByRole("button", {
+      name: "Transfer ownership",
+    });
+    await userEvent.click(trigger);
+    const field = within(card).getByLabelText("New owner");
+    await userEvent.type(field, "newowner");
+    expect(field).toHaveValue("newowner");
+
+    await userEvent.keyboard("{Escape}");
+    expect(
+      within(card).queryByRole("button", { name: "Confirm transfer" }),
+    ).not.toBeInTheDocument();
+    expect(trigger).toHaveFocus();
+
+    // Reopening finds the field empty: `abandon()` cleared the typed value,
+    // not only the confirm step, on this - the `children` - path of the
+    // shared confirm, same as it always has on the childless one.
+    await userEvent.click(trigger);
+    expect(within(card).getByLabelText("New owner")).toHaveValue("");
   });
 });
