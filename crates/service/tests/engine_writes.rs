@@ -1181,14 +1181,14 @@ async fn split_counts_a_line_named_twice_once() {
 ///
 /// The source no longer holds the moved bullets at that point, so deleting the
 /// engram that does hold them is the one outcome the verb must never produce.
-/// The failure is armed through `Engine::fail_next_source_reindex`, the file's
+/// The failure is armed through `Engine::fail_next_source_edit`, the engine's
 /// one test seam, because the window it stands in for - a store or IO fault
 /// after an atomic rename - is not reachable from a test any other way.
 #[tokio::test]
 async fn split_keeps_both_files_when_the_reindex_fails_after_the_source_was_written() {
     let (tmp, engine, _) = bundle_fixture().await;
     let lines = observation_lines(&engine, "coolant-bundle", &["40 minute purge", "12 bar"]).await;
-    engine.fail_next_source_reindex();
+    engine.fail_next_source_edit();
 
     let err = engine
         .split_engram(&SplitParams {
@@ -1240,7 +1240,7 @@ async fn split_keeps_both_files_when_the_reindex_fails_after_the_source_was_writ
 async fn the_reindex_seam_fires_once() {
     let (_tmp, engine, _) = bundle_fixture().await;
     let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
-    engine.fail_next_source_reindex();
+    engine.fail_next_source_edit();
     engine
         .split_engram(&SplitParams {
             domain: "eng".to_string(),
@@ -1268,4 +1268,88 @@ async fn the_reindex_seam_fires_once() {
         })
         .await
         .expect("the seam is spent");
+}
+
+/// The other half of the same invariant, on the other storage kind: a virtual
+/// source's edit is one store transaction, so a compare-and-swap conflict
+/// leaves the stored bytes exactly as they were and the new engram must be
+/// taken back out again.
+///
+/// The seam arms a token nothing can match, so the conflict is the store's own
+/// rather than a fabricated error: `upsert_engram_checked` refuses, the
+/// transaction rolls back, and what the caller sees is the `Conflict` a
+/// concurrent edit really produces.
+#[tokio::test]
+async fn a_virtual_split_that_loses_the_compare_and_swap_is_a_conflict_with_no_orphan() {
+    let (_tmp, engine) = engine_fixture().await;
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Scratch Bundle".to_string(),
+            content: "# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["ops".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    let before = engine
+        .engram_text("scratch", "scratch-bundle")
+        .await
+        .unwrap();
+    let line = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "scratch-bundle".to_string(),
+                domain: Some("scratch".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap()["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["content"].as_str().unwrap().contains("wardroom"))
+        .unwrap()["line"]
+        .as_u64()
+        .unwrap() as usize;
+
+    engine.fail_next_source_edit();
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "scratch".to_string(),
+            identifier: "scratch-bundle".to_string(),
+            title: "Register Location".to_string(),
+            folder: None,
+            observations: vec![line],
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("the compare and swap refused");
+
+    // The conflict the store raised, not an internal fault, so the caller knows
+    // to re-read and retry rather than to call somebody.
+    let message = format!("{err}");
+    assert!(message.contains("stale edit"), "{message}");
+    assert!(!message.contains("neither was undone"), "{message}");
+
+    // The source is byte-identical and the new engram is gone: the rollback
+    // still fires on this side of the write.
+    let after = engine
+        .engram_text("scratch", "scratch-bundle")
+        .await
+        .unwrap();
+    assert_eq!(after.content, before.content);
+    assert!(
+        engine
+            .engram_text("scratch", "register-location")
+            .await
+            .is_err(),
+        "the new engram was taken back out"
+    );
 }

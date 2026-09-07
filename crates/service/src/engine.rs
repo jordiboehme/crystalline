@@ -617,9 +617,9 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
-    // The one test seam in this file: when armed, the reindex that follows a
-    // source rewrite fails once. See `Engine::fail_next_source_reindex`.
-    fail_next_source_reindex: std::sync::atomic::AtomicBool,
+    // The one test seam in this file: when armed, the next source edit fails on
+    // its far side, once. See `Engine::fail_next_source_edit`.
+    fail_next_source_edit: std::sync::atomic::AtomicBool,
     // The effective `skills.serve` value, snapshotted while this engine is
     // built and never re-read. See `Engine::skills_serve` for why it is frozen
     // and `Engine::with_env_overlay` for why the snapshot is taken twice.
@@ -1082,7 +1082,7 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
-            fail_next_source_reindex: std::sync::atomic::AtomicBool::new(false),
+            fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             skills_serve,
             instance_id: String::new(),
             label: String::new(),
@@ -1109,26 +1109,34 @@ impl Engine {
         }
     }
 
-    /// Arm a one-shot failure of the reindex that follows a source rewrite.
+    /// Arm a one-shot failure of the next source edit, on its far side.
     ///
-    /// A test seam, and the only one in this file. The window it opens - the
-    /// source's bytes are on disk and the index has not caught up - is reachable
-    /// in production from a store fault or an IO fault after an atomic rename,
-    /// and from nothing a test can arrange: the rename either happens or does
-    /// not, and every input-shaped failure of the reindex is refused earlier by
-    /// [`Engine::plan_split`]. It exists because
-    /// [`Engine::split_engram_as`] must never undo its own new engram once that
-    /// window is open, and an invariant nothing exercises is an invariant that
-    /// rots.
+    /// A test seam, and the only one in this file. It stands for one thing - a
+    /// fault at the moment the source's bytes are committed - and each storage
+    /// kind answers that differently, which is the whole point of arming it:
     ///
-    /// Nothing in the daemon, the CLI or the MCP surface calls this, and the
-    /// branch that reads it is one relaxed swap per source edit - the single
-    /// site that reads the flag. It is consumed by the next source edit on any
-    /// domain rather than by the next split, so arm it immediately before the
-    /// call under test.
+    /// - a **file** domain fails the reindex that follows the rename, so the
+    ///   bytes are already on disk and nothing may be undone;
+    /// - a **virtual** domain is handed a compare-and-swap token nothing can
+    ///   match, so the store raises its own conflict and rolls the transaction
+    ///   back, exactly as a concurrent edit would, and the caller may undo
+    ///   whatever it wrote first.
+    ///
+    /// Neither is reachable from a test any other way: a rename either happens
+    /// or does not, a real concurrent edit cannot be timed to land between one
+    /// call's read and its write, and every input-shaped failure of the reindex
+    /// is refused earlier by [`Engine::plan_split`]. The seam exists because
+    /// [`Engine::split_engram_as`] must never undo its own new engram once the
+    /// source has been rewritten, and must still undo it when the source is
+    /// untouched, and an invariant nothing exercises is an invariant that rots.
+    ///
+    /// Nothing in the daemon, the CLI or the MCP surface calls this, and the two
+    /// branches that read it are one relaxed swap each, one per storage kind. It
+    /// is consumed by the next source edit on any domain rather than by the next
+    /// split, so arm it immediately before the call under test.
     #[doc(hidden)]
-    pub fn fail_next_source_reindex(&self) {
-        self.fail_next_source_reindex
+    pub fn fail_next_source_edit(&self) {
+        self.fail_next_source_edit
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -3528,10 +3536,16 @@ impl Engine {
     /// moved observations, so deleting the engram that does hold them is the
     /// one outcome this verb must never produce. `apply_source_edit_staged`
     /// reports which side of the write it failed on
-    /// ([`SourceEditFailure::wrote`]), and on the far side both files are kept
-    /// and the error names them and says the index heals on the next sync. What
-    /// is left then is a correct pair of files with a stale index row for the
-    /// source, which a sync, a watcher tick or `reindex` repairs.
+    /// ([`SourceEditFailure::wrote`]), and on the far side both engrams are
+    /// kept and the error names them and says the source's index row may be
+    /// stale. What is left then is a correct pair with a stale index row for
+    /// the source, which a sync, a watcher tick or `reindex` repairs.
+    ///
+    /// **Only a file domain can reach that state.** A virtual source is edited
+    /// inside one store transaction that rolls back on any error, so a failure
+    /// there is always the untouched case: a concurrent edit comes back as the
+    /// `Conflict` it is and the new engram is taken back out, with the stored
+    /// bytes exactly as they were.
     ///
     /// **A moved section takes its relation bullets with it**, since a section
     /// moves as text. That can leave a relation the source declared one-sided;
@@ -3608,7 +3622,7 @@ impl Engine {
                 // observations live in the new engram and nowhere else.
                 // Deleting it here is the one thing that would lose them.
                 return Err(EngineError::Internal(format!(
-                    "the split wrote both engrams but the index update for '{}' failed: {}.                      Both files are on disk ({} and {}) and neither was undone; the index row                      for '{}' is stale until the next sync or reindex picks it up",
+                    "the split wrote both engrams but the index update for '{}' failed: {}. Both are kept and neither was undone ({} and {}); the index row for '{}' may be stale until the next sync or reindex picks it up",
                     desc.permalink, failure.error, desc.path, new_path, desc.permalink
                 )));
             }
@@ -4175,7 +4189,7 @@ impl Engine {
                 // source's bytes untouched.
                 write_file(&abs, &edited).map_err(SourceEditFailure::before)?;
                 if self
-                    .fail_next_source_reindex
+                    .fail_next_source_edit
                     .swap(false, std::sync::atomic::Ordering::Relaxed)
                 {
                     return Err(SourceEditFailure::after(EngineError::Internal(
@@ -4208,14 +4222,26 @@ impl Engine {
                 let edited = touch_generated(&edited, actor, now_offset());
                 let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
+                // The seam, on this arm: a token nothing can match, so the
+                // store raises its own compare-and-swap conflict and rolls the
+                // transaction back. See `Engine::fail_next_source_edit`.
+                let expected = if self
+                    .fail_next_source_edit
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    "0".repeat(64)
+                } else {
+                    expected
+                };
                 let store = self.store.lock().await;
-                // Conservative rather than exact, and the one place the two
-                // storage kinds differ here: the compare and swap and the
-                // indexing happen inside one call, so a failure cannot be
-                // placed on either side of it from out here. A virtual source
-                // that refuses is therefore never undone by a caller, which
-                // costs a duplicate engram in the case a file domain would have
-                // cleaned up.
+                // Every failure here is a `before`, and that is exact rather
+                // than generous: `index_markdown` runs the compare and swap,
+                // the chunking and the reference resolution inside one store
+                // transaction and rolls it back on any error, so a virtual
+                // source that refuses still holds the bytes it held. A
+                // concurrent edit therefore comes back as the `Conflict` it is
+                // and the caller may undo whatever it wrote first, which is the
+                // failure that actually happens in the field.
                 self.index_markdown(
                     &*store,
                     desc.domain_id,
@@ -4226,7 +4252,7 @@ impl Engine {
                     true,
                 )
                 .await
-                .map_err(SourceEditFailure::after)?;
+                .map_err(SourceEditFailure::before)?;
             }
         }
 
