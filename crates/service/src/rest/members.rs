@@ -60,7 +60,7 @@ use axum::http::StatusCode;
 
 use super::auth::Identity;
 use super::auth_store::{
-    DomainMember, MemberLevel, MembershipRefusal, RefusalKind, normalize_account_name,
+    DomainMember, MemberLevel, StoreRefusal, RefusalKind, normalize_account_name,
 };
 use super::{
     ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only, require_domain_read,
@@ -153,7 +153,7 @@ const NOT_AN_ENABLED_ACCOUNT: &str = "that name is not an enabled account on thi
 /// Anything else is this server's problem and stays a 500 with the store's own
 /// words.
 fn store_error(e: anyhow::Error) -> ApiError {
-    match MembershipRefusal::kind_of(&e) {
+    match StoreRefusal::kind_of(&e) {
         Some(RefusalKind::NotPrivate) => ApiError::conflict(
             "this domain is shared, so it has no membership: make it private \
              first (PUT /domains/{domain}/visibility)",
@@ -163,7 +163,11 @@ fn store_error(e: anyhow::Error) -> ApiError {
              hand the domain on with PUT /domains/{domain}/owner instead",
         ),
         Some(RefusalKind::NoSuchAccount) => ApiError::unprocessable(NOT_AN_ENABLED_ACCOUNT),
-        None => ApiError::internal(format!("{e:#}")),
+        // No membership statement can refuse for that reason - it is the
+        // identity-link surface's own - so it falls in with the server's
+        // problems rather than being given a status here that would be a
+        // guess.
+        Some(RefusalKind::LastCredential) | None => ApiError::internal(format!("{e:#}")),
     }
 }
 

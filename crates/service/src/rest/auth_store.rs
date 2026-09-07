@@ -228,6 +228,13 @@ pub struct IdentityLink {
 /// first sign-in creates the account it links.
 pub const LINKED_BY_JIT: &str = "jit";
 
+/// What `crystalline users link` records as the linker. The machine operator
+/// is not a signed-in account, so there is no name to write: what the row can
+/// honestly say is that somebody at the command line did it, which is exactly
+/// the distinction the profile card draws between a link a person made for
+/// themselves and one an administrator made for them.
+pub const LINKED_BY_CLI: &str = "cli";
+
 /// How many suffixed names a provisioning tries before it gives up. Reached
 /// only when a thousand accounts already hold every variant of one name, which
 /// is a configuration problem rather than a collision.
@@ -411,9 +418,9 @@ const VISIBILITY_PRIVATE: &str = "private";
 /// resolving as a user of the same name.
 const PRINCIPAL_USER: &str = "user";
 
-/// Why a membership change was refused, as a value rather than as prose.
+/// Why the store refused a change, as a value rather than as prose.
 ///
-/// The three refusals below are the caller's doing rather than the server's,
+/// The refusals below are the caller's doing rather than the server's,
 /// and the surfaces above have to tell them apart in order to answer with the
 /// right status. They used to be told apart by matching substrings of the
 /// message, which meant any rewording here silently turned a 409 into a 500 -
@@ -421,10 +428,10 @@ const PRINCIPAL_USER: &str = "user";
 /// who should not have them (an account that does not exist and one that is
 /// disabled are the same answer to anybody who cannot read the user list).
 ///
-/// So the classification travels as a type. [`MembershipRefusal`] carries the
+/// So the classification travels as a type. [`StoreRefusal`] carries the
 /// message as its `Display`, unchanged, so `{e:#}` still renders exactly what
 /// it always did for a log line or an operator-facing surface, while
-/// [`MembershipRefusal::kind_of`] gives a caller the decision without reading
+/// [`StoreRefusal::kind_of`] gives a caller the decision without reading
 /// prose. What each surface then SAYS is its own business: the CLI is the
 /// machine operator and prints the detail, the REST membership routes collapse
 /// the account arm to one word-for-word answer.
@@ -439,17 +446,22 @@ pub enum RefusalKind {
     /// variant for both on purpose: a surface that cannot read the user list
     /// must not be handed a probe for which of the two it is.
     NoSuchAccount,
+    /// The identity being unlinked is the last way into its account: there is
+    /// no password to fall back on and no other identity linked, so removing
+    /// it would leave nobody able to sign in. See
+    /// [`AuthStore::unlink_identity`].
+    LastCredential,
 }
 
 /// A refused membership change: [`RefusalKind`] plus the sentence the store
 /// would have printed.
 #[derive(Debug)]
-pub struct MembershipRefusal {
+pub struct StoreRefusal {
     kind: RefusalKind,
     message: String,
 }
 
-impl MembershipRefusal {
+impl StoreRefusal {
     /// What kind of refusal this is.
     pub fn kind(&self) -> RefusalKind {
         self.kind
@@ -463,22 +475,38 @@ impl MembershipRefusal {
     pub fn kind_of(error: &anyhow::Error) -> Option<RefusalKind> {
         error
             .chain()
-            .find_map(|e| e.downcast_ref::<MembershipRefusal>())
+            .find_map(|e| e.downcast_ref::<StoreRefusal>())
             .map(|refusal| refusal.kind)
     }
 }
 
-impl std::fmt::Display for MembershipRefusal {
+impl std::fmt::Display for StoreRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.message)
     }
 }
 
-impl std::error::Error for MembershipRefusal {}
+impl std::error::Error for StoreRefusal {}
 
-/// Build one, as the error type the membership statements return.
+/// Build one, as the error type the store's refusing statements return.
 fn refuse(kind: RefusalKind, message: String) -> anyhow::Error {
-    anyhow::Error::new(MembershipRefusal { kind, message })
+    anyhow::Error::new(StoreRefusal { kind, message })
+}
+
+/// What every surface says when an unlink would take away the last way into an
+/// account: what would happen, and the one command that gives the account a
+/// second way in first.
+///
+/// One sentence, written here, forwarded verbatim by the REST route and by the
+/// CLI. The account it names is always the caller's own on the web surface and
+/// the one an operator typed on the command line, so naming it is not a probe
+/// for anybody.
+fn last_credential_message(user: &str) -> String {
+    format!(
+        "this is the only way into account '{user}': it has no password, so unlinking its last \
+         identity would leave nobody able to sign in - give it a password first with \
+         `crystalline users passwd {user}`"
+    )
 }
 
 /// The visibility record of one private domain. A row exists only for a domain
@@ -1440,19 +1468,78 @@ impl AuthStore {
     /// Keyed on `(issuer, user)` rather than on the subject: the person
     /// unlinking knows which provider they want gone, and by construction they
     /// hold at most one identity there.
+    ///
+    /// Refused with [`RefusalKind::LastCredential`] when the link being removed
+    /// is the account's last way in - no password hash and no other identity -
+    /// because an account provisioned by a first sign-on has no password by
+    /// construction, so unlinking it would leave a live account nobody can
+    /// reach. The rule lives here rather than in each surface, so the profile
+    /// card, the REST route and the CLI cannot disagree about it. The one way
+    /// past it is [`AuthStore::unlink_identity_force`].
     pub async fn unlink_identity(&self, issuer: &str, user: &str) -> Result<bool> {
+        self.unlink(issuer, user, false).await
+    }
+
+    /// [`AuthStore::unlink_identity`] with the last-way-in guard bypassed, for
+    /// the operator repairing an account whose provider re-issued its subject:
+    /// the stale identity has to go before the new one can be linked, and the
+    /// account is genuinely unreachable in between. Never reachable from the
+    /// web surface, where the person doing it would be stranding themselves.
+    pub async fn unlink_identity_force(&self, issuer: &str, user: &str) -> Result<bool> {
+        self.unlink(issuer, user, true).await
+    }
+
+    /// The two above. The read of what else the account has to sign in with
+    /// and the delete share one `BEGIN IMMEDIATE`: two concurrent unlinks of
+    /// an account's two identities would otherwise both see a second way in
+    /// and leave none.
+    async fn unlink(&self, issuer: &str, user: &str, force: bool) -> Result<bool> {
         let issuer = identity_value(issuer, "issuer")?;
         let user = normalize_account_name(user)?;
         let _guard = self.guard.lock().await;
-        let changed = self
-            .conn
-            .execute(
-                "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
-                vec![Value::Text(issuer), Value::Text(user.clone())],
-            )
+        self.begin_immediate()
             .await
             .with_context(|| format!("unlinking an identity from user '{user}'"))?;
-        Ok(changed > 0)
+        let result = async {
+            if !force
+                && self.link_at(&issuer, &user).await?
+                && self.link_count(&user).await? <= 1
+                && !self.password_present(&user).await?
+            {
+                return Err(refuse(
+                    RefusalKind::LastCredential,
+                    last_credential_message(&user),
+                ));
+            }
+            let changed = self
+                .conn
+                .execute(
+                    "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                    vec![
+                        Value::Text(issuer.clone()),
+                        Value::Text(user.to_string()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("unlinking an identity from user '{user}'"))?;
+            Ok(changed > 0)
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Whether `user` has a local password to sign in with.
+    ///
+    /// A read of its own rather than a byproduct of
+    /// [`AuthStore::check_password`], whose [`PasswordCheck::NoHash`]
+    /// deliberately collapses "no hash" with "no such account": here the two
+    /// have to be one answer for a different reason - a name that is nobody
+    /// has no password either - but the caller is asking about an account it
+    /// already holds, and about whether unlinking would strand it.
+    pub async fn has_password(&self, name: &str) -> Result<bool> {
+        let name = normalize_account_name(name)?;
+        let _guard = self.guard.lock().await;
+        self.password_present(&name).await
     }
 
     /// Every identity linked to one account, by issuer.
@@ -2766,6 +2853,54 @@ impl AuthStore {
     /// Drop every identity linked to one account. Called inside the removal
     /// transaction: a link that outlived its account would hand the next
     /// account to claim the name somebody else's sign-on.
+    /// Whether `user` holds a link at `issuer`. Callers hold the lock and are
+    /// inside a transaction.
+    async fn link_at(&self, issuer: &str, user: &str) -> Result<bool> {
+        Ok(self
+            .query_first(
+                "SELECT 1 FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                vec![
+                    Value::Text(issuer.to_string()),
+                    Value::Text(user.to_string()),
+                ],
+            )
+            .await?
+            .is_some())
+    }
+
+    /// How many identities `user` holds, across every issuer. Callers hold the
+    /// lock and are inside a transaction.
+    async fn link_count(&self, user: &str) -> Result<i64> {
+        let row = self
+            .query_first(
+                "SELECT COUNT(*) FROM identity_link WHERE user = ?1",
+                vec![Value::Text(user.to_string())],
+            )
+            .await?;
+        Ok(match row.as_ref().map(|row| row.get_value(0)) {
+            Some(Ok(Value::Integer(count))) => count,
+            _ => 0,
+        })
+    }
+
+    /// Whether the account row for `name` carries a password hash. Callers
+    /// hold the lock; the two transactional callers are inside one.
+    ///
+    /// The hash itself is never read out: what comes back is the one bit the
+    /// question needs, so no caller can grow a habit of holding one.
+    async fn password_present(&self, name: &str) -> Result<bool> {
+        let row = self
+            .query_first(
+                "SELECT pass_hash IS NOT NULL AND pass_hash <> '' FROM users WHERE name = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?;
+        Ok(matches!(
+            row.as_ref().map(|row| row.get_value(0)),
+            Some(Ok(Value::Integer(present))) if present != 0
+        ))
+    }
+
     async fn delete_identity_links_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(
@@ -5149,7 +5284,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            MembershipRefusal::kind_of(&shared),
+            StoreRefusal::kind_of(&shared),
             Some(RefusalKind::NotPrivate)
         );
         assert!(
@@ -5159,7 +5294,7 @@ mod tests {
 
         let no_owner = store.transfer_domain("lab", "mem").await.unwrap_err();
         assert_eq!(
-            MembershipRefusal::kind_of(&no_owner),
+            StoreRefusal::kind_of(&no_owner),
             Some(RefusalKind::NotPrivate)
         );
 
@@ -5172,7 +5307,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            MembershipRefusal::kind_of(&owner),
+            StoreRefusal::kind_of(&owner),
             Some(RefusalKind::OwnerIsNotAMember)
         );
         assert!(format!("{owner:#}").contains("owns domain"), "{owner:#}");
@@ -5182,7 +5317,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            MembershipRefusal::kind_of(&ghost),
+            StoreRefusal::kind_of(&ghost),
             Some(RefusalKind::NoSuchAccount)
         );
 
@@ -5196,7 +5331,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(
-            MembershipRefusal::kind_of(&disabled),
+            StoreRefusal::kind_of(&disabled),
             Some(RefusalKind::NoSuchAccount),
             "an existing-but-disabled account is not a kind of its own"
         );
@@ -5211,7 +5346,7 @@ mod tests {
             .upsert_domain_member("lab", "  ", MemberLevel::Editor, "owner")
             .await
             .unwrap_err();
-        assert_eq!(MembershipRefusal::kind_of(&malformed), None);
+        assert_eq!(StoreRefusal::kind_of(&malformed), None);
     }
 
     #[tokio::test]
@@ -5580,6 +5715,203 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    /// An account provisioned by a sign-on has no password, so its identity
+    /// link is the only way into it: unlinking the last one is refused, in
+    /// words that name the command which gives it a second way in.
+    #[tokio::test]
+    async fn unlinking_the_last_way_into_an_account_is_refused() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        let err = store
+            .unlink_identity("https://idp.example", "ada")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("crystalline users passwd"),
+            "the refusal teaches the way out: {message}"
+        );
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::LastCredential),
+            "the refusal travels as a type, not as prose"
+        );
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "a refused unlink removes nothing"
+        );
+    }
+
+    /// The rule is about the last way IN, not about the last link: an account
+    /// with a password may unlink everything, and an account with two
+    /// identities may unlink one of them.
+    #[tokio::test]
+    async fn a_second_way_in_is_what_makes_an_unlink_allowed() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity("https://idp.example", "ada")
+                .await
+                .unwrap(),
+            "a password is the other way in"
+        );
+
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-2",
+                "grace",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .link_identity("https://other.example", "sub-9", "grace", "grace")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity("https://idp.example", "grace")
+                .await
+                .unwrap(),
+            "the other identity is the other way in"
+        );
+        let err = store
+            .unlink_identity("https://other.example", "grace")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::LastCredential),
+            "the one that is left is the last way in"
+        );
+    }
+
+    /// An unlink that removes nothing is not a refusal: the account keeps
+    /// whatever it had, so there is nothing to protect it from.
+    #[tokio::test]
+    async fn an_unlink_at_an_issuer_holding_no_link_is_a_no_op() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .unlink_identity("https://elsewhere.example", "ada")
+                .await
+                .unwrap(),
+            "there was no link at that issuer to remove"
+        );
+    }
+
+    /// The admin repair: an operator whose provider re-issued its subjects
+    /// unlinks the stale identity and links the new one, which needs a way
+    /// past the guard. Forcing it is the only way, and it does strand the
+    /// account until the link is remade.
+    #[tokio::test]
+    async fn a_forced_unlink_is_the_admin_repair() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "old-sub",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity_force("https://idp.example", "ada")
+                .await
+                .unwrap()
+        );
+        assert!(store.identity_links("ada").await.unwrap().is_empty());
+        store
+            .link_identity("https://idp.example", "new-sub", "ada", LINKED_BY_CLI)
+            .await
+            .unwrap();
+        let found = store
+            .linked_user("https://idp.example", "new-sub")
+            .await
+            .unwrap()
+            .expect("the repaired pair names the account");
+        assert_eq!(found.name, "ada");
+        assert_eq!(
+            store.identity_links("ada").await.unwrap()[0].linked_by,
+            LINKED_BY_CLI
+        );
+    }
+
+    /// Whether an account has a local password, which is what the unlink rule
+    /// and the profile card both turn on. A name that is nobody has none.
+    #[tokio::test]
+    async fn a_password_is_reported_without_being_read_back() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "grace",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(store.has_password("ada").await.unwrap());
+        assert!(!store.has_password("grace").await.unwrap());
+        assert!(!store.has_password("nobody").await.unwrap());
+        store.set_password("grace", "correct horse").await.unwrap();
+        assert!(
+            store.has_password("grace").await.unwrap(),
+            "`users passwd` is what gives a provisioned account a second way in"
         );
     }
 
