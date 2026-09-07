@@ -20,6 +20,16 @@
  * The MCP half is the opposite direction: the server hands the secret to the
  * card, exactly once, on issue and on rotate. See {@link AgentAccessCard} for
  * where that secret lives and how it leaves.
+ *
+ * A third card appears only on an instance with single sign-on configured, or
+ * on an account that already holds an identity: the provider identity this
+ * account signs in with. It is the one card whose primary action leaves the
+ * app - linking is a whole sign-on against the provider, because nothing short
+ * of one proves the identity is the caller's - and the one whose refusal is
+ * load bearing: an account with no password cannot give up its last identity,
+ * since that would leave an account nobody can sign in to. The server owns
+ * that rule and says so in its own words, which name the command that gives
+ * the account a password first.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -43,7 +53,15 @@ import {
   revokeMcpToken,
   rotateMcpToken,
 } from "../api/mcpTokens";
-import type { IssuedMcpToken, McpTokenInfo } from "../api/model";
+import type { IdentityLink, IssuedMcpToken, McpTokenInfo } from "../api/model";
+import {
+  IDENTITY_LINKS_KEY,
+  PROVIDERS_KEY,
+  fetchIdentityLinks,
+  fetchProviders,
+  ssoLoginUrl,
+  unlinkIdentity,
+} from "../api/sso";
 import { useAuth } from "../auth/AuthContext";
 import {
   BUTTON,
@@ -90,6 +108,7 @@ export default function Profile() {
         </p>
       </header>
       <GithubIdentityCard />
+      <SsoIdentityCard />
       <AgentAccessCard />
     </div>
   );
@@ -135,6 +154,152 @@ function GithubIdentityCard() {
       )}
     </section>
   );
+}
+
+/**
+ * The single sign-on identity this account signs in with.
+ *
+ * Absent entirely when there is nothing to say - no provider configured and no
+ * link held - because a card explaining a feature this instance does not have
+ * is noise on the one screen that is about this account. An account that still
+ * holds a link from a provider an operator has since turned off keeps the card,
+ * so the link is visible and can be given up.
+ *
+ * Linking is a link, not a button: it navigates the whole page to the sign-on,
+ * which redirects to the provider and back. A fetch would follow that hop in
+ * the background and land nowhere anybody can type a password into. What comes
+ * back lands on the home screen rather than here, because the callback is the
+ * ordinary sign-in path and mints a session the same way.
+ */
+function SsoIdentityCard() {
+  const queryClient = useQueryClient();
+  const [notice, setNotice] = useState<Notice | null>(null);
+
+  const providers = useQuery({
+    queryKey: PROVIDERS_KEY,
+    queryFn: fetchProviders,
+    retry: false,
+  });
+  const identities = useQuery({
+    queryKey: IDENTITY_LINKS_KEY,
+    queryFn: fetchIdentityLinks,
+  });
+
+  const unlink = useMutation({
+    mutationFn: (issuer: string) => unlinkIdentity(issuer),
+    onSuccess: () => {
+      setNotice({ kind: "done", text: "The identity is unlinked." });
+      void queryClient.invalidateQueries({ queryKey: IDENTITY_LINKS_KEY });
+    },
+    onError: (error: Error) => {
+      // Including the refusal that keeps an account reachable, whose words
+      // name `crystalline users passwd`. A house message pasted over it would
+      // leave somebody stuck with no idea what to do next.
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
+  const links = identities.data?.links ?? [];
+  const configured = providers.data?.oidc.enabled === true;
+  const providerName = providers.data?.oidc.name ?? "single sign-on";
+  if (!configured && links.length === 0) {
+    return null;
+  }
+  // One identity per provider is the rule, so a configured provider this
+  // account has not linked yet is exactly the case the link button is for.
+  const canLink = configured && links.length === 0;
+
+  return (
+    <section
+      aria-labelledby="sso-identity"
+      className="flex flex-col gap-4 rounded border border-slate-200 p-4 dark:border-slate-800"
+    >
+      <div>
+        <h2 id="sso-identity" className="text-section">
+          SSO identity
+        </h2>
+        <p className={`mt-1 ${MUTED}`}>
+          The provider identity you sign in with. Linking one is deliberate:
+          nobody is ever put into this account because an address happened to
+          match.
+        </p>
+      </div>
+
+      {notice && (
+        <p
+          role={notice.kind === "problem" ? "alert" : "status"}
+          className={
+            notice.kind === "problem"
+              ? "rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+              : "rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+          }
+        >
+          {notice.text}
+        </p>
+      )}
+
+      {links.length > 0 ? (
+        <ul className="flex flex-col gap-2">
+          {links.map((link: IdentityLink) => (
+            <li
+              key={link.issuer}
+              className="flex flex-wrap items-center justify-between gap-3 rounded border border-slate-200 px-3 py-2 dark:border-slate-800"
+            >
+              <div className="min-w-0">
+                <p className="truncate text-sm text-slate-900 dark:text-slate-100">
+                  {link.issuer}
+                </p>
+                <p className={MUTED}>
+                  {linkedByLine(link)} on {formatDay(link.linked_at)}
+                </p>
+              </div>
+              <button
+                type="button"
+                disabled={unlink.isPending}
+                onClick={() => {
+                  unlink.mutate(link.issuer);
+                }}
+                className={DANGER_BUTTON}
+              >
+                Unlink
+              </button>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className={MUTED}>
+          This account has no provider identity linked, so it signs in with its
+          password.
+        </p>
+      )}
+
+      {canLink && (
+        <div>
+          <a href={ssoLoginUrl(true)} className={CONNECT_BUTTON}>
+            Link {providerName}
+          </a>
+        </div>
+      )}
+      {identities.data?.has_password === false && links.length > 0 && (
+        <p className={MUTED}>
+          This account has no password, so this identity is its only way in.
+          Giving it up is refused until an administrator sets a password with{" "}
+          <code>crystalline users passwd</code>.
+        </p>
+      )}
+    </section>
+  );
+}
+
+/** Who made one link, in words rather than in the stored token. */
+function linkedByLine(link: IdentityLink): string {
+  if (link.linked_by === "jit") {
+    return "Linked when this account was created by a first sign-on";
+  }
+  if (link.linked_by === "cli") {
+    return "Linked by an administrator";
+  }
+  return "Linked from this profile";
 }
 
 /** The card proper, for a session that may have an identity of its own. */

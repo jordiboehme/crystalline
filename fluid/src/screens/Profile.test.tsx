@@ -86,9 +86,35 @@ function serveAs(
       "/domains": domainsResponse,
       "/me/github-identity": () => identityPayload(),
       "/me/mcp-tokens": () => [],
+      // The default is an instance with no provider and an account with no
+      // link, which is the shape in which the SSO card is not there at all.
+      "/auth/providers": () => ({ local: true, oidc: { enabled: false } }),
+      "/me/identity-links": () => ({ links: [], has_password: true }),
       ...routes,
     }),
   );
+}
+
+/** An instance with a provider configured, for the SSO card's own tests. */
+function withProvider(routes: Record<string, Answer> = {}) {
+  return {
+    "/auth/providers": () => ({
+      local: true,
+      oidc: { enabled: true, name: "Contoso" },
+    }),
+    ...routes,
+  };
+}
+
+/** One link, as the listing hands it back. */
+function linkPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    issuer: "https://idp.example",
+    subject: "sub-1",
+    linked_at: "2026-09-01T09:12:44Z",
+    linked_by: "ada",
+    ...overrides,
+  };
 }
 
 /** Every call the app made to the personal identity surface. */
@@ -769,5 +795,123 @@ describe("the agent access card", () => {
     expect(JSON.stringify(client.getMutationCache().getAll())).not.toContain(
       "cmt_deadbeef",
     );
+  });
+});
+
+describe("the SSO identity card", () => {
+  it("is absent when there is no provider and no identity to show", async () => {
+    serveAs("editor");
+    renderApp("/profile");
+
+    // The GitHub card is the marker that the screen finished rendering, so
+    // the absence below is an absence rather than a race.
+    await screen.findByRole("heading", { name: "GitHub identity" });
+    expect(
+      screen.queryByRole("heading", { name: "SSO identity" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("offers the link as a whole-page navigation carrying the link flag", async () => {
+    serveAs("editor", withProvider());
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "SSO identity" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText(/no provider identity linked/i),
+    ).toBeInTheDocument();
+    // A link, not a button: the sign-on redirects to the provider and back,
+    // and `link=true` is what makes it link rather than sign somebody in as
+    // whoever the identity turns out to be.
+    expect(screen.getByRole("link", { name: "Link Contoso" })).toHaveAttribute(
+      "href",
+      "/api/v1/auth/oidc/login?link=true",
+    );
+  });
+
+  it("shows a linked identity, who linked it, and unlinks it", async () => {
+    let links = [linkPayload({ linked_by: "jit" })];
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () => ({ links, has_password: true }),
+        "/me/identity-links/https%3A%2F%2Fidp.example": () => {
+          links = [];
+          return undefined;
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    expect(await screen.findByText("https://idp.example")).toBeInTheDocument();
+    expect(screen.getByText(/created by a first sign-on/i)).toBeInTheDocument();
+    // With one identity already held, there is nothing to link: one identity
+    // per provider is the rule.
+    expect(
+      screen.queryByRole("link", { name: "Link Contoso" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Unlink" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "The identity is unlinked.",
+    );
+    expect(
+      await screen.findByText(/no provider identity linked/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when the last way in cannot be given up", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () => ({
+          links: [linkPayload({ linked_by: "jit" })],
+          has_password: false,
+        }),
+        "/me/identity-links/https%3A%2F%2Fidp.example": () => {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "this is the only way into account 'ada': it has no password, so unlinking " +
+              "its last identity would leave nobody able to sign in - give it a password " +
+              "first with `crystalline users passwd ada`",
+          );
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    // The card says so before anybody presses anything, and the refusal says
+    // it again in the server's own sentence.
+    expect(
+      await screen.findByText(/this identity is its only way in/i),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Unlink" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "crystalline users passwd ada",
+    );
+    expect(screen.getByText("https://idp.example")).toBeInTheDocument();
+  });
+
+  it("keeps showing a link whose provider was turned off, so it can be given up", async () => {
+    serveAs("editor", {
+      "/me/identity-links": () => ({
+        links: [linkPayload({ linked_by: "cli" })],
+        has_password: true,
+      }),
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "SSO identity" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/linked by an administrator/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unlink" })).toBeInTheDocument();
   });
 });

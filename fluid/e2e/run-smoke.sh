@@ -98,6 +98,13 @@ FLUID_E2E_OUTSIDER_PASSWORD="${FLUID_E2E_OUTSIDER_PASSWORD:-outsider-password}"
 # own text - a domain whose name carried it could not be told apart from a
 # domain wearing it.
 FLUID_E2E_PRIVATE_DOMAIN="${FLUID_E2E_PRIVATE_DOMAIN:-smoke-vault}"
+# The label the single sign-on button wears, which is the whole of what the
+# sso spec asserts. The provider it names is never contacted: the button is a
+# link, the spec only reads it, and discovery does not happen until somebody
+# follows one - so a configured issuer that resolves to nothing is exactly
+# right here.
+FLUID_E2E_SSO_NAME="${FLUID_E2E_SSO_NAME:-Contoso}"
+export FLUID_E2E_SSO_NAME
 export FLUID_E2E_USER FLUID_E2E_PASSWORD FLUID_E2E_DOMAIN
 export FLUID_E2E_PEER FLUID_E2E_PEER_PASSWORD
 export FLUID_E2E_OUTSIDER FLUID_E2E_OUTSIDER_PASSWORD
@@ -199,8 +206,20 @@ echo "smoke: registering the fixture domains"
 #
 # `env` execs, so the pid recorded here is the daemon's own and the trap above
 # signals the daemon rather than a wrapper around it.
+# The single sign-on block, through the environment rather than the config
+# file: all six keys are read once when the HTTP surface starts, so this is the
+# whole of what makes `/api/v1/auth/providers` report a provider and the login
+# screen draw its button. Nothing here can reach the issuer, and nothing tries:
+# the spec reads the button, and only following it would fetch discovery.
+oidc_env=(
+    "CRYSTALLINE_AUTH_OIDC_ISSUER=https://idp.example/realm"
+    "CRYSTALLINE_AUTH_OIDC_CLIENT_ID=fluid-smoke"
+    "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET=fluid-smoke-secret"
+    "CRYSTALLINE_AUTH_OIDC_NAME=$FLUID_E2E_SSO_NAME"
+)
+
 echo "smoke: starting the daemon on $DAEMON_ADDR"
-"${isolated[@]}" "$bin" serve --http "$DAEMON_ADDR" > "$run_dir/daemon.log" 2>&1 &
+"${isolated[@]}" "${oidc_env[@]}" "$bin" serve --http "$DAEMON_ADDR" > "$run_dir/daemon.log" 2>&1 &
 daemon_pid=$!
 
 # The same probe an external monitor makes, so a daemon that answers here is a

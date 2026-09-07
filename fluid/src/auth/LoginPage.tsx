@@ -22,6 +22,14 @@
  * route, same gem, same wordmark: the door does not move because the instance
  * is new, and once the first admin exists the wizard is gone for good.
  *
+ * When the instance has a single sign-on provider configured, its button sits
+ * under the credentials form rather than above it: local accounts are what
+ * this instance is built on and single sign-on is layered over them, and the
+ * form is what a first-run admin and every account created here uses. The
+ * button is a plain link, not a fetch - what follows is a redirect to the
+ * provider's own domain and a redirect back, and a background fetch would
+ * follow that hop invisibly and land nowhere anybody can type a password into.
+ *
  * The one rule worth stating: when the server refuses, its own `detail` is
  * what is shown, word for word. That text is product copy written where the
  * decision was made ("the name or password is wrong" is deliberately one
@@ -30,11 +38,12 @@
  * sometimes say something untrue.
  */
 
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQuery } from "@tanstack/react-query";
 import { useId, useState } from "react";
 import { Link, Navigate, useLocation } from "react-router";
 
 import { ApiProblem } from "../api/client";
+import { PROVIDERS_KEY, fetchProviders, ssoLoginUrl } from "../api/sso";
 import { BUTTON, FOCUS_RING } from "../components/primitives";
 import { useAuth } from "./AuthContext";
 import { FirstRunSetup } from "./FirstRunSetup";
@@ -74,6 +83,22 @@ export default function LoginPage() {
   // or the home screen for someone who came here directly.
   const from = (location.state as FromLocation | null)?.from;
   const destination = from ? `${from.pathname}${from.search}${from.hash}` : "/";
+
+  // Which ways in this instance offers. Read on this screen only, and never
+  // retried into a wall: an instance with no provider answers the same shape
+  // with `enabled: false`, and an answer that never arrives simply leaves the
+  // card as the credentials form it has always been.
+  const providers = useQuery({
+    queryKey: PROVIDERS_KEY,
+    queryFn: fetchProviders,
+    retry: false,
+  });
+  // The label is optional on the wire (a disabled provider has none), so the
+  // enabled case reads it with a fallback rather than a cast: a button that
+  // said "Sign in with null" would be worse than a generic one.
+  const sso = providers.data?.oidc.enabled
+    ? { name: providers.data.oidc.name ?? "single sign-on" }
+    : null;
 
   const attempt = useMutation({
     // Named so the expired-session recovery in the query layer leaves it
@@ -253,6 +278,30 @@ export default function LoginPage() {
               Log in
             </button>
           </form>
+        )}
+
+        {/*
+          The other way in, when there is one. A link rather than a button
+          because it navigates the whole page, and labelled with the
+          provider's own name so somebody who was told "sign in with Contoso"
+          reads the word they were told.
+        */}
+        {sso && !firstRun && (
+          <div className="mt-6 flex flex-col gap-3">
+            <div className="flex items-center gap-3">
+              <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
+              <span className="text-caption text-slate-500 dark:text-slate-400">
+                or
+              </span>
+              <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
+            </div>
+            <a
+              href={ssoLoginUrl()}
+              className={`py-2 text-center ${BUTTON.secondary}`}
+            >
+              Sign in with {sso.name}
+            </a>
+          </div>
         )}
 
         {capabilities.anonymous && (

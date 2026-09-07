@@ -101,7 +101,7 @@ export interface paths {
         };
         /**
          * Finish a single sign-on the provider sent back.
-         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. The provider's own error text never reaches this response.
+         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. A sign-in started with `link=true` instead ties the identity to the account whose session started it, which has to be the session that finishes it too. The provider's own error text never reaches this response.
          */
         get: operations["oidc_callback"];
         put?: never;
@@ -969,6 +969,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/me/identity-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The single sign-on identities the caller's account holds.
+         * @description Every signed-in account has this surface, viewers included. A row carries the issuer, the provider's stable subject, when the link was made and who made it - `jit` for a link a first sign-on created along with its account, `cli` for one an administrator made, otherwise the account that linked it to itself. `has_password` says whether the account has a second way in, which is what decides whether the last link may be given up. Served on a read-only instance: an identity link is account state rather than knowledge.
+         */
+        get: operations["list_my_identity_links"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/identity-links/{issuer}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unlink one single sign-on identity from the caller's account.
+         * @description Removes the identity this account holds at that issuer. A later sign-on from it then provisions a new account rather than reaching this one. Refused with 409 when it is this account's last way in - no password and no other identity - because unlinking would leave an account nobody can sign in to; the refusal names `crystalline users passwd`, which is what gives the account a password first. An administrator can force it from the command line, for the repair where a provider re-issued its subjects.
+         */
+        delete: operations["unlink_my_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/me/mcp-tokens": {
         parameters: {
             query?: never;
@@ -1648,6 +1688,49 @@ export interface components {
              * @example octo
              */
             user?: string | null;
+        };
+        /**
+         * @description One identity an external provider asserts, tied to one account.
+         *
+         *     `(issuer, subject)` is the durable key: a username, an address and a
+         *     display name are all mutable presentation data, and none of them may move
+         *     an account. An account may hold several links (one per issuer), and a link
+         *     points at exactly one account.
+         */
+        IdentityLink: {
+            /**
+             * @description The provider that asserts this identity, as its ID tokens spell it.
+             * @example https://login.microsoftonline.com/<tenant>/v2.0
+             */
+            issuer: string;
+            /**
+             * @description When the link was made, RFC 3339.
+             * @example 2026-09-07T09:14:22Z
+             */
+            linked_at: string;
+            /**
+             * @description Who made it: the account that linked it, an admin's name, or `jit` for
+             *     a link a first sign-in created along with its account.
+             * @example jit
+             */
+            linked_by: string;
+            /**
+             * @description The provider's stable identifier for the person.
+             * @example 0f8fad5b-d9cb-469f-a165-70867728950e
+             */
+            subject: string;
+        };
+        /** @description The single sign-on identities this account holds, and whether it has a password to fall back on. The two together are what the profile card needs: an account with no password and one identity cannot unlink it, because that link is its only way in. */
+        IdentityLinksResponse: {
+            /**
+             * @description Whether this account can also sign in with a password. False for an
+             *     account a first sign-on provisioned, which has none until
+             *     `crystalline users passwd` gives it one.
+             * @example true
+             */
+            has_password: boolean;
+            /** @description Every identity this account holds, by issuer. */
+            links: components["schemas"]["IdentityLink"][];
         };
         /** @description A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again. */
         IssueBody: {
@@ -2499,7 +2582,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description The provider refused, the state did not match, or the ID token did not validate. One message for every way this can fail. */
+            /** @description The provider refused, the state did not match, the ID token did not validate, or a link was finished after its session was signed out. One message for every way the protocol can fail. */
             401: {
                 headers: {
                     [name: string]: unknown;
@@ -2526,7 +2609,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The sign-in was started to link an identity to an account, which this build cannot do yet. Nothing was linked and no account was created. */
+            /** @description The sign-in was started to link an identity and could not be: it was finished on another account's session, the identity belongs to another account (which is never named), or this account already holds one at that provider. Nothing was linked and no account was created. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -6266,6 +6349,101 @@ export interface operations {
             };
             /** @description The body is JSON but not a token, the token is empty, GitHub refused it, or this account's name cannot address a credential. */
             422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_my_identity_links: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This account's links. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinksResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one: the anonymous viewer has no account. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    unlink_my_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The provider's issuer url, percent-encoded as one path segment. */
+                issuer: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The link is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account holds no identity at that issuer. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description That link is the account's last way in. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

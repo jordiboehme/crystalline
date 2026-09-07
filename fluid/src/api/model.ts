@@ -105,6 +105,28 @@ export type IssueMcpTokenBody = components["schemas"]["IssueBody"];
  */
 export type IssuedMcpToken = components["schemas"]["IssuedTokenResponse"];
 
+/**
+ * Which ways into this instance exist, for the sign-in screen to draw. Public:
+ * it is read before anybody is signed in, and it carries the button's label
+ * and no configuration beyond it.
+ */
+export type ProvidersResponse = components["schemas"]["ProvidersResponse"];
+
+/** The single sign-on provider's half of that: whether to draw it, and what to write on it. */
+export type OidcProviderView = components["schemas"]["OidcProviderView"];
+
+/**
+ * One provider identity an account holds. The pair of issuer and subject is
+ * the durable key; `linked_by` says who made it - `jit` for a link a first
+ * sign-on created with its account, `cli` for one an administrator made,
+ * otherwise the account that linked it to itself.
+ */
+export type IdentityLink = components["schemas"]["IdentityLink"];
+
+/** What `GET /me/identity-links` answers with: the links, and whether a password backs them up. */
+export type IdentityLinksResponse =
+  components["schemas"]["IdentityLinksResponse"];
+
 /** What `GET /domains/{domain}/members` answers with: who owns and is invited into a domain. */
 export type MembersResponse = components["schemas"]["MembersResponse"];
 

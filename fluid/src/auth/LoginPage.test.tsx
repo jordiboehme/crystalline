@@ -79,6 +79,43 @@ describe("the login screen", () => {
     expect(screen.getByRole("heading", { name: "Fluid" })).toBeVisible();
   });
 
+  it("offers the provider's own button beside the credentials form", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp("/login");
+
+    // Labelled with the provider's own name, so somebody told "sign in with
+    // Contoso" reads the word they were told. A link rather than a button:
+    // what follows is a redirect to the provider's own domain and a redirect
+    // back, which a background fetch would walk invisibly.
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+    // And the local form is still the way in it always was: single sign-on is
+    // layered over local accounts, never in place of them.
+    expect(screen.getByLabelText("Name")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Log in" })).toBeVisible();
+  });
+
+  it("draws no provider button on an instance that has none", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({ local: true, oidc: { enabled: false } }),
+    });
+
+    renderApp("/login");
+
+    await screen.findByLabelText("Name");
+    expect(screen.queryByRole("link", { name: /sign in with/i })).toBeNull();
+  });
+
   it("shows the server's own words when the credentials are refused", async () => {
     serve({
       "/auth/me": () => meResponse(),
