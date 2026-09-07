@@ -852,6 +852,13 @@ pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
 /// stop it.
 const GONE_OAUTH_CLIENT: &str = "a client that is no longer registered";
 
+/// What [`redirect_host`] shows for a redirect uri that names no host at all.
+/// A `javascript:` or `data:` uri parses, carries no host and is entirely
+/// attacker-chosen text; the consent screen and the grant card label that
+/// field as the address a person is asked to recognize, so a uri with no host
+/// says so rather than being allowed to write the line itself.
+const NO_REDIRECT_HOST: &str = "an address with no host";
+
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
 const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at";
 
@@ -2571,9 +2578,41 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Delete every grant whose refresh window has closed, and report how
+    /// many went. Runs at every registration and at daemon start, immediately
+    /// **before** [`AuthStore::prune_oauth_clients`].
+    ///
+    /// A grant past `refresh_expires_at` can never work again: the rotation
+    /// lookup excludes it, its access token died an hour into those thirty
+    /// days, and a token that was never rotated cannot match the replay
+    /// lookup. Nothing else would ever delete it, so without this the table
+    /// grows with every re-authorization, the account's grant card lists
+    /// connections that cannot work, and - the reason the order matters - each
+    /// dead row holds its registration against the client prune's
+    /// `NOT EXISTS`, which is exactly the abandoned registration that prune
+    /// exists to collect.
+    ///
+    /// Expiry is the statement's comparison, like every other one here.
+    pub async fn prune_oauth_grants(&self) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE refresh_expires_at < ?1",
+                vec![Value::Integer(now)],
+            )
+            .await
+            .context("pruning expired oauth grants")?;
+        Ok(removed as usize)
+    }
+
     /// Delete every registration that has been idle for
     /// [`OAUTH_CLIENT_UNUSED_SECS`] and holds no grant, and report how many
-    /// went. Runs at every registration and at daemon start.
+    /// went. Runs at every registration and at daemon start, immediately
+    /// **after** [`AuthStore::prune_oauth_grants`] - a registration whose only
+    /// grant is dead is only collectable once that grant is gone, so the two
+    /// prunes in that order collect an abandoned client in one pass.
     ///
     /// The `NOT EXISTS` is the load-bearing half: a registration somebody is
     /// connected through is kept however old it is, because deleting it would
@@ -2642,6 +2681,12 @@ impl AuthStore {
     ) -> Result<IssuedOauthGrant> {
         let user = normalize_account_name(user)?;
         let resource = normalize_resource(resource);
+        // The empty string is not an audience. Refused here and refused again
+        // at the read, so the two halves of the check can never agree on
+        // nothing - not even if an origin derivation upstream produced one.
+        if resource.is_empty() {
+            bail!("an oauth grant needs a resource to be issued for");
+        }
         let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
         let refresh_token = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
         let now = chrono::Utc::now();
@@ -2772,7 +2817,6 @@ impl AuthStore {
                     )
                     .await
                     .context("rotating an oauth grant")?;
-                tracing::debug!(grant = id, client = %client_id, "rotated an oauth grant");
                 outcome = RefreshOutcome::Rotated(IssuedOauthGrant {
                     id,
                     access_token: access_token.clone(),
@@ -2788,8 +2832,12 @@ impl AuthStore {
                 )
                 .await?;
             if let Some(row) = replayed {
+                // Fails closed, unlike the rotate branch's matching decode: a
+                // grant this store has just proven compromised must not be
+                // left alive by a row it could not read. The whole transaction
+                // rolls back and the caller sees the error.
                 let Ok(Value::Integer(id)) = row.get_value(0) else {
-                    return Ok(());
+                    bail!("an oauth grant row has an unreadable id");
                 };
                 self.conn
                     .execute(
@@ -2798,17 +2846,28 @@ impl AuthStore {
                     )
                     .await
                     .context("revoking a replayed oauth grant")?;
-                tracing::info!(
-                    grant = id,
-                    client = %client_id,
-                    "a replayed refresh token revoked an oauth grant"
-                );
                 outcome = RefreshOutcome::Replayed { grant: id };
             }
             Ok(())
         }
         .await;
         self.finish(result).await?;
+        // Both lines are emitted after the commit, never inside the
+        // transaction body. A rollback - a disk error, a busy timeout against
+        // the CLI holding the write lock - must not leave an audit record
+        // claiming a revocation that did not happen, and a revocation is the
+        // one thing here worth an audit record at all.
+        match &outcome {
+            RefreshOutcome::Rotated(grant) => {
+                tracing::debug!(grant = grant.id, client = %client_id, "rotated an oauth grant");
+            }
+            RefreshOutcome::Replayed { grant } => tracing::info!(
+                grant = *grant,
+                client = %client_id,
+                "a replayed refresh token revoked an oauth grant"
+            ),
+            RefreshOutcome::Unknown => {}
+        }
         Ok(outcome)
     }
 
@@ -2831,6 +2890,11 @@ impl AuthStore {
     pub async fn oauth_access_user(&self, token: &str, resource: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
         let resource = normalize_resource(resource);
+        // See `issue_oauth_grant`: nothing opens the empty resource, whatever
+        // a row happens to hold.
+        if resource.is_empty() {
+            return Ok(None);
+        }
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
         self.conn
@@ -2883,6 +2947,12 @@ impl AuthStore {
     /// resolves its tokens, so it has to stay listed to stay revocable. It
     /// shows [`GONE_OAUTH_CLIENT`] where the name would be rather than
     /// dropping out of the one screen that can stop it.
+    ///
+    /// A grant past its refresh window is left out, in the statement: it can
+    /// no longer work by any path, so listing it would show a person a
+    /// connection they cannot act on and cannot tell from a live one.
+    /// [`AuthStore::prune_oauth_grants`] removes the rows; this is what keeps
+    /// the card honest in between.
     pub async fn list_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
         let user = normalize_account_name(user)?;
         let _guard = self.guard.lock().await;
@@ -2893,8 +2963,12 @@ impl AuthStore {
                         g.created_at, g.last_used, g.refresh_expires_at
                  FROM oauth_grants g
                  LEFT JOIN oauth_clients c ON c.client_id = g.client_id
-                 WHERE g.user = ?1 ORDER BY g.created_at DESC, g.id DESC",
-                vec![Value::Text(user.clone())],
+                 WHERE g.user = ?1 AND g.refresh_expires_at > ?2
+                 ORDER BY g.created_at DESC, g.id DESC",
+                vec![
+                    Value::Text(user.clone()),
+                    Value::Integer(chrono::Utc::now().timestamp()),
+                ],
             )
             .await
             .with_context(|| format!("listing oauth grants for user '{user}'"))?;
@@ -3805,22 +3879,28 @@ fn cell_text(row: &Row, idx: usize) -> Option<String> {
     }
 }
 
-/// 32 bytes from the OS CSPRNG, lowercase hex. Used for both the session token
-/// and the CSRF token.
-fn random_hex() -> String {
-    let mut bytes = [0u8; 32];
+/// `N` bytes from the OS CSPRNG, lowercase hex. The single entropy source
+/// behind every random value this file mints, so an audit of "where does the
+/// randomness come from" reads one function rather than one per family.
+fn random_hex_bytes<const N: usize>() -> String {
+    let mut bytes = [0u8; N];
     OsRng.fill_bytes(&mut bytes);
     crystalline_index::hex_lower(&bytes)
 }
 
-/// 16 bytes from the OS CSPRNG, lowercase hex: the random half of a client id.
-/// Half the width of [`random_hex`] on purpose - a client id is a public
-/// identifier that authorizes nothing by itself, and 128 random bits is
-/// already far past guessing.
+/// 32 bytes, 64 hex characters: the random half of every credential here - a
+/// session token, its CSRF token, an MCP token, and an OAuth access and
+/// refresh token.
+fn random_hex() -> String {
+    random_hex_bytes::<32>()
+}
+
+/// 16 bytes, 32 hex characters: the random half of an OAuth client id. Half
+/// the width of [`random_hex`] on purpose - a client id is a public identifier
+/// that authorizes nothing by itself, and 128 random bits is already far past
+/// guessing.
 fn random_id_hex() -> String {
-    let mut bytes = [0u8; 16];
-    OsRng.fill_bytes(&mut bytes);
-    crystalline_index::hex_lower(&bytes)
+    random_hex_bytes::<16>()
 }
 
 /// A resource identifier as the audience check compares it: trimmed, with at
@@ -3847,15 +3927,20 @@ pub(crate) fn normalize_resource(resource: &str) -> String {
 /// Display only. Whether a redirect uri is acceptable, and whether the one
 /// presented at the token endpoint matches the registration, are decisions
 /// made against the registered uris themselves - never against this string.
-/// A uri that does not parse is shown as it was written rather than hidden.
+///
+/// A uri that names no host - one that does not parse, or a `javascript:` or
+/// `data:` uri, which parse and carry none - reads as [`NO_REDIRECT_HOST`]
+/// rather than being echoed. Registration validation should make both
+/// unreachable; this is the last line before attacker-chosen text lands in a
+/// field a person reads as the address they are being asked to recognize.
 pub(crate) fn redirect_host(uri: &str) -> String {
     let Ok(parsed) = openidconnect::url::Url::parse(uri) else {
-        return uri.to_string();
+        return NO_REDIRECT_HOST.to_string();
     };
     match (parsed.host_str(), parsed.port()) {
         (Some(host), Some(port)) => format!("{host}:{port}"),
         (Some(host), None) => host.to_string(),
-        (None, _) => uri.to_string(),
+        (None, _) => NO_REDIRECT_HOST.to_string(),
     }
 }
 
@@ -7639,6 +7724,201 @@ mod tests {
             !printed.contains(secret),
             "the outcome redacts what it wraps: {printed}"
         );
+    }
+
+    /// A grant past its refresh window can never work again: no rotation, no
+    /// replay, and its access token died an hour into the thirty days. So it
+    /// is neither a connection to show a person nor a row to keep - and while
+    /// it is kept, it pins its registration against the client prune, which is
+    /// what makes the ordering of the two prunes load bearing.
+    #[tokio::test]
+    async fn an_expired_grant_is_pruned_and_never_listed_as_a_connection() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let live = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let dead = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        close_refresh_window(&store, dead.id).await;
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "a grant that cannot work again is not a connection anybody can act on"
+        );
+        assert_eq!(listed[0].id, live.id);
+        assert_eq!(store.prune_oauth_grants().await.unwrap(), 1);
+        assert_eq!(count_rows(&store, "oauth_grants").await, 1);
+        assert!(
+            store
+                .oauth_access_user(&live.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "the prune left the live grant alone"
+        );
+
+        // A registration abandoned after one connection: its dead grant holds
+        // it against the client prune until the grant prune runs first.
+        let abandoned = store
+            .register_oauth_client("Abandoned", None, &["https://gone.example/cb".to_string()])
+            .await
+            .unwrap();
+        let stranded = store
+            .issue_oauth_grant("ada", &abandoned.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        close_refresh_window(&store, stranded.id).await;
+        // Age *both* registrations past the window, so what keeps the first
+        // one is its live grant rather than its freshness - which is the
+        // property the last assertion is about.
+        for id in [&abandoned.client_id, &client.client_id] {
+            store
+                .conn
+                .execute(
+                    "UPDATE oauth_clients SET created_at = '2020-01-01T00:00:00+00:00'
+                     WHERE client_id = ?1",
+                    vec![Value::Text(id.clone())],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            0,
+            "while the dead grant is there it pins the registration"
+        );
+        assert_eq!(store.prune_oauth_grants().await.unwrap(), 1);
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "and the registration goes in the same pass, once its grant has"
+        );
+        assert!(
+            store
+                .oauth_client(&client.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the registration somebody is still connected through stays, \
+             old as it is, because its live grant is what holds it"
+        );
+    }
+
+    /// Close a grant's refresh window through the connection, the only way to
+    /// reach an expiry the store owns.
+    async fn close_refresh_window(store: &AuthStore, id: i64) {
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = 1 WHERE id = ?1",
+                vec![Value::Integer(id)],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The observable consequence of taking the write lock before the lookup:
+    /// one refresh token presented twice rotates once and then replays, at the
+    /// same registration. Two clients racing one token reach the same two
+    /// answers in the same order, because the second only ever sees
+    /// post-commit state.
+    #[tokio::test]
+    async fn presenting_one_refresh_token_twice_rotates_then_replays() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let first = store
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, RefreshOutcome::Rotated(_)),
+            "the first presentation rotates, got {first:?}"
+        );
+        match store
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { grant } => assert_eq!(grant, issued.id),
+            other => panic!("the second presentation is a replay, got {other:?}"),
+        }
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// The host on the consent screen and the grant card is a fact a person is
+    /// asked to recognize, so a uri that names no host must not get to write
+    /// that line itself.
+    #[test]
+    fn a_redirect_uri_with_no_host_never_shows_its_own_text() {
+        assert_eq!(redirect_host("https://client.example/cb"), "client.example");
+        assert_eq!(
+            redirect_host("http://127.0.0.1:33418/callback"),
+            "127.0.0.1:33418"
+        );
+        for uri in [
+            "javascript:alert(1)",
+            "data:text/html,<b>your bank</b>",
+            "not a url at all",
+        ] {
+            assert_eq!(
+                redirect_host(uri),
+                NO_REDIRECT_HOST,
+                "a uri with no host says so rather than speaking for itself: {uri}"
+            );
+        }
+    }
+
+    /// The empty string is not an audience. Refusing it at both ends means the
+    /// two halves of the check cannot agree on nothing and let a token
+    /// through, even if an origin derivation upstream ever produced one.
+    #[tokio::test]
+    async fn an_empty_resource_is_refused_on_both_sides() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        for resource in ["", "/", "   "] {
+            assert!(
+                store
+                    .issue_oauth_grant("ada", &client.client_id, resource)
+                    .await
+                    .is_err(),
+                "a grant with no audience is refused: {resource:?}"
+            );
+        }
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET resource = '' WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap();
+        for resource in ["", "/"] {
+            assert!(
+                store
+                    .oauth_access_user(&issued.access_token, resource)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "an empty origin opens nothing, whatever a row holds: {resource:?}"
+            );
+        }
     }
 
     /// A grant whose registration vanished stays listable, so it stays
