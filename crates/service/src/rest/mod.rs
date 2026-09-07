@@ -450,10 +450,14 @@ pub fn router(state: RestState) -> Router {
         // here. Registered before the domain sub-paths for readability only;
         // axum's router is order-independent.
         .route("/domains/{domain}", delete(domains_admin::remove))
-        // Whether a domain is private. Admin only in both directions, and
-        // deliberately NOT a manage-level verb: making a domain private
-        // transfers ownership to the caller, so a manager who could call it
-        // could seize a domain they were invited to administer. See
+        // Whether a domain is private, and the two directions are gated
+        // differently. PRIVATIZING is admin only: it hands the domain to the
+        // caller, so a shared domain would otherwise be seized by whoever
+        // asked first. RE-SHARING is served to the domain's own OWNER as well
+        // as to an admin - they already see everything in it. A manager does
+        // neither: it invites people and changes their levels, and deciding
+        // who holds a domain is not one domain's administration to settle.
+        // The split is documented in full on
         // [`domains_admin::set_visibility`].
         .route(
             "/domains/{domain}/visibility",

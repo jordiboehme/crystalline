@@ -138,7 +138,7 @@ fn role_from_db(s: &str) -> Role {
 ///
 /// `to_lowercase` is full Unicode case folding, matching the convention
 /// `crates/index` already uses for domain and tag names.
-fn normalize_name(name: &str) -> Result<String> {
+pub fn normalize_account_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
         bail!("a user name cannot be empty");
@@ -355,6 +355,76 @@ const VISIBILITY_PRIVATE: &str = "private";
 /// resolving as a user of the same name.
 const PRINCIPAL_USER: &str = "user";
 
+/// Why a membership change was refused, as a value rather than as prose.
+///
+/// The three refusals below are the caller's doing rather than the server's,
+/// and the surfaces above have to tell them apart in order to answer with the
+/// right status. They used to be told apart by matching substrings of the
+/// message, which meant any rewording here silently turned a 409 into a 500 -
+/// and, worse, invited a surface to forward the store's own words to somebody
+/// who should not have them (an account that does not exist and one that is
+/// disabled are the same answer to anybody who cannot read the user list).
+///
+/// So the classification travels as a type. [`MembershipRefusal`] carries the
+/// message as its `Display`, unchanged, so `{e:#}` still renders exactly what
+/// it always did for a log line or an operator-facing surface, while
+/// [`MembershipRefusal::kind_of`] gives a caller the decision without reading
+/// prose. What each surface then SAYS is its own business: the CLI is the
+/// machine operator and prints the detail, the REST membership routes collapse
+/// the account arm to one word-for-word answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The domain is shared, so it has no membership and no owner.
+    NotPrivate,
+    /// The principal named owns the domain, and an owner holds no membership
+    /// row: the row could only ever say less than the truth.
+    OwnerIsNotAMember,
+    /// The principal names no account, or names one that is disabled. ONE
+    /// variant for both on purpose: a surface that cannot read the user list
+    /// must not be handed a probe for which of the two it is.
+    NoSuchAccount,
+}
+
+/// A refused membership change: [`RefusalKind`] plus the sentence the store
+/// would have printed.
+#[derive(Debug)]
+pub struct MembershipRefusal {
+    kind: RefusalKind,
+    message: String,
+}
+
+impl MembershipRefusal {
+    /// What kind of refusal this is.
+    pub fn kind(&self) -> RefusalKind {
+        self.kind
+    }
+
+    /// The kind of membership refusal inside `error`, if it is one.
+    ///
+    /// Walks the whole source chain rather than downcasting the outermost
+    /// error, so a caller that added its own context on the way up does not
+    /// hide the classification.
+    pub fn kind_of(error: &anyhow::Error) -> Option<RefusalKind> {
+        error
+            .chain()
+            .find_map(|e| e.downcast_ref::<MembershipRefusal>())
+            .map(|refusal| refusal.kind)
+    }
+}
+
+impl std::fmt::Display for MembershipRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for MembershipRefusal {}
+
+/// Build one, as the error type the membership statements return.
+fn refuse(kind: RefusalKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(MembershipRefusal { kind, message })
+}
+
 /// The visibility record of one private domain. A row exists only for a domain
 /// somebody made private; an absent row is the default, shared visibility,
 /// which is why turning privacy off deletes the row rather than rewriting it.
@@ -368,7 +438,7 @@ pub struct DomainAcl {
     /// so folding here would conflate two distinct registrations).
     pub domain: String,
     /// The account that owns this domain: the login name, folded by
-    /// [`normalize_name`] like every other account reference.
+    /// [`normalize_account_name`] like every other account reference.
     pub owner: String,
 }
 
@@ -376,7 +446,7 @@ pub struct DomainAcl {
 /// whom and when.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct DomainMember {
-    /// The member's login name, folded by [`normalize_name`].
+    /// The member's login name, folded by [`normalize_account_name`].
     pub principal: String,
     /// What this member may do here.
     pub level: MemberLevel,
@@ -392,7 +462,7 @@ pub struct DomainMember {
 /// otherwise left exactly as given.
 ///
 /// Deliberately *not* lowercased, which is where this parts company with
-/// [`normalize_name`]. A domain name is a key in the engine's own domain map
+/// [`normalize_account_name`]. A domain name is a key in the engine's own domain map
 /// (`Engine::domain_entry` does an exact `HashMap` lookup), so `Lab` and `lab`
 /// are two different registrations there; folding them together here would let
 /// a privacy record written for one hide the other, or - worse - let a lookup
@@ -694,7 +764,7 @@ impl AuthStore {
     }
 
     /// Add an account with a password. The name is folded by
-    /// [`normalize_name`], so `Ada` and `ada` are the same account. Errors if
+    /// [`normalize_account_name`], so `Ada` and `ada` are the same account. Errors if
     /// the name is already taken; the primary key is the guard, so two racing
     /// writers cannot both win.
     pub async fn add_user(
@@ -705,7 +775,7 @@ impl AuthStore {
         role: Role,
         password: &str,
     ) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -759,12 +829,12 @@ impl AuthStore {
     /// the statement, the `WHERE NOT EXISTS` is decided by whichever writer
     /// holds the write lock, exactly like [`NOT_LAST_ADMIN`].
     ///
-    /// The name is folded by [`normalize_name`] like every other path, and a
+    /// The name is folded by [`normalize_account_name`] like every other path, and a
     /// name that will not fold is refused before anything is written, so a typo
     /// does not consume the one slot there is. The password is hashed outside
     /// the lock, as in [`AuthStore::add_user`]: argon2 is CPU, not database.
     pub async fn add_first_admin(&self, name: &str, display: &str, password: &str) -> Result<bool> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -814,7 +884,7 @@ impl AuthStore {
     ///
     /// [`NoHash`]: PasswordCheck::NoHash
     pub async fn check_password(&self, name: &str, password: &str) -> Result<PasswordCheck> {
-        let Ok(name) = normalize_name(name) else {
+        let Ok(name) = normalize_account_name(name) else {
             return Ok(PasswordCheck::NoHash);
         };
         // Scoped so the lock is released before the argon2 verify below.
@@ -856,7 +926,7 @@ impl AuthStore {
     /// before the change can survive it, and a refused change (an account that
     /// is not there) revokes nothing.
     pub async fn set_password(&self, name: &str, password: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -901,7 +971,7 @@ impl AuthStore {
     /// installation cannot be locked out over the network - only deliberately,
     /// on the machine that holds this file.
     pub async fn set_role_force(&self, name: &str, role: Role) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         let changed = self
             .conn
@@ -926,7 +996,7 @@ impl AuthStore {
     /// print. No last-admin guard applies - a display name changes nothing
     /// about what the account may do.
     pub async fn set_display(&self, name: &str, display: Option<&str>) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let display = display
             .map(str::trim)
             .filter(|d| !d.is_empty())
@@ -963,7 +1033,7 @@ impl AuthStore {
     /// re-enabling never is, so the `?2 = 0` arm short-circuits the guard. A
     /// refused disabling rolls back, sessions included.
     pub async fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         self.begin_immediate()
             .await
@@ -1031,7 +1101,7 @@ impl AuthStore {
     /// two concurrent removals cannot both observe the other admin and both
     /// succeed. A refusal rolls the session delete back with everything else.
     pub async fn remove_user(&self, name: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -1073,7 +1143,7 @@ impl AuthStore {
     /// first, in the same `BEGIN IMMEDIATE` transaction, for the resurrection
     /// reasons the guarded remove documents.
     pub async fn remove_user_force(&self, name: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -1099,7 +1169,7 @@ impl AuthStore {
     }
 
     /// One account by name, or `None` when there is none. The name is folded
-    /// by [`normalize_name`] like every other lookup, so `Ada` finds `ada`.
+    /// by [`normalize_account_name`] like every other lookup, so `Ada` finds `ada`.
     ///
     /// A pure existence-and-details read, with none of
     /// [`AuthStore::session_user`]'s stamping: the caller is asking whether a
@@ -1108,7 +1178,7 @@ impl AuthStore {
     /// from a real account with nothing in it - `crystalline users mcp-token
     /// ghsot --list` must say "no such user" rather than "holds no tokens".
     pub async fn user(&self, name: &str) -> Result<Option<User>> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         Ok(self
             .query_first(
@@ -1146,7 +1216,7 @@ impl AuthStore {
     /// `role` applies at creation only. A later [`AuthStore::set_role`] by an
     /// admin sticks instead of being reverted on the account's next request.
     ///
-    /// The name is folded by [`normalize_name`], which matters most here: a
+    /// The name is folded by [`normalize_account_name`], which matters most here: a
     /// header value of `Ada` must resolve to the existing `ada` rather than
     /// mint a second account at the default role, which would silently undo a
     /// disable or a demotion. The display name keeps the casing as sent.
@@ -1164,7 +1234,7 @@ impl AuthStore {
     /// stopping *unbounded* minting, not enforcing an exact ceiling.
     pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
         let display = name.trim().to_string();
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         let exists = self
             .query_first(
@@ -1232,7 +1302,7 @@ impl AuthStore {
     /// CLI could delete the account between the two and leave this session
     /// stranded, to be inherited by the next account to claim the name.
     pub async fn create_session(&self, name: &str, ttl_secs: i64) -> Result<Session> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
@@ -1292,7 +1362,7 @@ impl AuthStore {
     /// a cookie - which is why [`AuthStore::newest_session_csrf`] exists: the
     /// trusted-header path resolves the token by identity, not by cookie.
     pub async fn ensure_session(&self, name: &str, ttl_secs: i64) -> Result<SessionMint> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let now = chrono::Utc::now().timestamp();
         let token = random_hex();
         let csrf = random_hex();
@@ -1366,7 +1436,7 @@ impl AuthStore {
     /// where the cookie is the identity and its own session's token is the one
     /// that must match.
     pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
         self.live_csrf(&name, now).await
@@ -1557,7 +1627,7 @@ impl AuthStore {
     /// inherited by the next account to claim the name (`mcp_tokens` carries no
     /// foreign key, so nothing else would stop the insert from landing).
     pub async fn issue_mcp_token(&self, user: &str, label: &str) -> Result<IssuedMcpToken> {
-        let user = normalize_name(user)?;
+        let user = normalize_account_name(user)?;
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -1660,10 +1730,10 @@ impl AuthStore {
     }
 
     /// Every MCP token `user` holds, newest first, never carrying the token
-    /// itself. `user` is folded by [`normalize_name`] like every other lookup
+    /// itself. `user` is folded by [`normalize_account_name`] like every other lookup
     /// keyed on a login name.
     pub async fn list_mcp_tokens(&self, user: &str) -> Result<Vec<McpTokenInfo>> {
-        let user = normalize_name(user)?;
+        let user = normalize_account_name(user)?;
         let _guard = self.guard.lock().await;
         let mut rows = self
             .conn
@@ -1698,7 +1768,7 @@ impl AuthStore {
     /// account, deliberately indistinguishable so a caller cannot probe another
     /// account's token ids.
     pub async fn revoke_mcp_token(&self, user: &str, id: i64) -> Result<bool> {
-        let user = normalize_name(user)?;
+        let user = normalize_account_name(user)?;
         let _guard = self.guard.lock().await;
         let changed = self
             .conn
@@ -1716,7 +1786,7 @@ impl AuthStore {
     /// exists, or neither change happened. Errors if `id` does not name a token
     /// owned by `user`.
     pub async fn rotate_mcp_token(&self, user: &str, id: i64) -> Result<IssuedMcpToken> {
-        let user = normalize_name(user)?;
+        let user = normalize_account_name(user)?;
         let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
         let hash = token_hash(&token);
         let created_at = chrono::Utc::now().to_rfc3339();
@@ -1836,7 +1906,7 @@ impl AuthStore {
         owner: &str,
     ) -> Result<()> {
         let domain = normalize_domain(domain)?;
-        let owner = normalize_name(owner)?;
+        let owner = normalize_account_name(owner)?;
         let now = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -1913,7 +1983,7 @@ impl AuthStore {
     /// [`DomainRight`]: crate::scope::DomainRight
     pub async fn transfer_domain(&self, domain: &str, new_owner: &str) -> Result<()> {
         let domain = normalize_domain(domain)?;
-        let new_owner = normalize_name(new_owner)?;
+        let new_owner = normalize_account_name(new_owner)?;
         let now = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -1921,7 +1991,10 @@ impl AuthStore {
             .with_context(|| format!("transferring domain '{domain}'"))?;
         let result = async {
             if self.acl_of(&domain).await?.is_none() {
-                bail!("domain '{domain}' is not private, so it has no owner to transfer");
+                return Err(refuse(
+                    RefusalKind::NotPrivate,
+                    format!("domain '{domain}' is not private, so it has no owner to transfer"),
+                ));
             }
             self.require_live_user(&new_owner).await?;
             self.conn
@@ -2014,7 +2087,7 @@ impl AuthStore {
         added_by: &str,
     ) -> Result<()> {
         let domain = normalize_domain(domain)?;
-        let principal = normalize_name(principal)?;
+        let principal = normalize_account_name(principal)?;
         let added_by = added_by.trim().to_string();
         if added_by.is_empty() {
             bail!("recording a membership needs an actor to record it as");
@@ -2026,16 +2099,22 @@ impl AuthStore {
             .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
         let result = async {
             let Some(acl) = self.acl_of(&domain).await? else {
-                bail!(
-                    "domain '{domain}' is not private, so it has no membership: \
-                     make it private first"
-                );
+                return Err(refuse(
+                    RefusalKind::NotPrivate,
+                    format!(
+                        "domain '{domain}' is not private, so it has no membership: \
+                         make it private first"
+                    ),
+                ));
             };
             if acl.owner == principal {
-                bail!(
-                    "'{principal}' owns domain '{domain}': \
-                     the owner already holds every level"
-                );
+                return Err(refuse(
+                    RefusalKind::OwnerIsNotAMember,
+                    format!(
+                        "'{principal}' owns domain '{domain}': \
+                         the owner already holds every level"
+                    ),
+                ));
             }
             self.require_live_user(&principal).await?;
             self.conn
@@ -2076,7 +2155,7 @@ impl AuthStore {
     /// can tell "removed" from "was never a member" without a second read.
     pub async fn remove_domain_member(&self, domain: &str, principal: &str) -> Result<bool> {
         let domain = normalize_domain(domain)?;
-        let principal = normalize_name(principal)?;
+        let principal = normalize_account_name(principal)?;
         let _guard = self.guard.lock().await;
         let changed = self
             .conn
@@ -2133,7 +2212,7 @@ impl AuthStore {
     /// domains are not in here (an owner holds no membership row); the caller
     /// reads ownership from the acl rows it already has.
     pub async fn memberships_of(&self, user: &str) -> Result<Vec<(String, MemberLevel)>> {
-        let user = normalize_name(user)?;
+        let user = normalize_account_name(user)?;
         let _guard = self.guard.lock().await;
         let mut rows = self
             .conn
@@ -2177,7 +2256,7 @@ impl AuthStore {
     /// and here it would hand a private domain to a stranger.
     ///
     /// The empty string is the "owned by nobody" marker because
-    /// [`normalize_name`] can never produce it, so no live account can ever
+    /// [`normalize_account_name`] can never produce it, so no live account can ever
     /// match it. The domain stays private and its members keep their levels;
     /// what it loses is an owner, which leaves it administered by instance
     /// admins alone until one runs [`AuthStore::transfer_domain`]. Choosing a
@@ -2209,10 +2288,20 @@ impl AuthStore {
                 vec![Value::Text(name.to_string())],
             )
             .await?;
+        // Both arms carry the SAME kind. The two states are told apart in the
+        // message, for the operator-facing surfaces that may see it, and never
+        // by the type - so a surface that collapses them cannot accidentally
+        // grow a branch that does not.
         match row {
-            None => bail!("no such user: '{name}'"),
+            None => Err(refuse(
+                RefusalKind::NoSuchAccount,
+                format!("no such user: '{name}'"),
+            )),
             Some(row) if matches!(row.get_value(0), Ok(Value::Integer(i)) if i != 0) => {
-                bail!("user '{name}' is disabled: enable the account first")
+                Err(refuse(
+                    RefusalKind::NoSuchAccount,
+                    format!("user '{name}' is disabled: enable the account first"),
+                ))
             }
             Some(_) => Ok(()),
         }
@@ -2275,7 +2364,7 @@ impl AuthStore {
     /// nothing was written either way - so it does not need to share the
     /// statement's transaction.
     async fn update_guarded(&self, sql: &str, name: &str, value: Value, verb: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         let changed = self
             .conn
@@ -3431,7 +3520,7 @@ mod tests {
     }
 
     /// Login names are space-free: the readable form belongs in the display name.
-    /// Enforced in normalize_name so every path - add, ensure, verify, edit -
+    /// Enforced in normalize_account_name so every path - add, ensure, verify, edit -
     /// refuses the same way.
     #[tokio::test]
     async fn a_name_with_internal_whitespace_is_rejected_on_every_path() {
@@ -3464,12 +3553,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_name_trims_folds_and_rejects_empty() {
-        assert_eq!(normalize_name("  AdA  ").unwrap(), "ada");
-        assert_eq!(normalize_name("Ada").unwrap(), "ada");
-        assert!(normalize_name("").is_err());
-        assert!(normalize_name("   ").is_err());
-        assert!(normalize_name("ada lovelace").is_err());
+    fn normalize_account_name_trims_folds_and_rejects_empty() {
+        assert_eq!(normalize_account_name("  AdA  ").unwrap(), "ada");
+        assert_eq!(normalize_account_name("Ada").unwrap(), "ada");
+        assert!(normalize_account_name("").is_err());
+        assert!(normalize_account_name("   ").is_err());
+        assert!(normalize_account_name("ada lovelace").is_err());
     }
 
     #[tokio::test]
@@ -4617,6 +4706,89 @@ mod tests {
             1,
             "and the people invited into it keep their levels"
         );
+    }
+
+    /// Every membership refusal carries its kind as a TYPE, and its own
+    /// sentence as the message.
+    ///
+    /// The pin that lets `rest::members` classify by value: matching prose
+    /// meant a rewording here silently turned a 409 into a 500. Both halves
+    /// are asserted - the kind, which the surface decides on, and the
+    /// message, which the operator-facing surfaces still print - so neither
+    /// can be dropped in favour of the other.
+    #[tokio::test]
+    async fn every_membership_refusal_carries_its_kind_and_its_words() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+
+        let shared = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            MembershipRefusal::kind_of(&shared),
+            Some(RefusalKind::NotPrivate)
+        );
+        assert!(
+            format!("{shared:#}").contains("is not private"),
+            "{shared:#}"
+        );
+
+        let no_owner = store.transfer_domain("lab", "mem").await.unwrap_err();
+        assert_eq!(
+            MembershipRefusal::kind_of(&no_owner),
+            Some(RefusalKind::NotPrivate)
+        );
+
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let owner = store
+            .upsert_domain_member("lab", "owner", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            MembershipRefusal::kind_of(&owner),
+            Some(RefusalKind::OwnerIsNotAMember)
+        );
+        assert!(format!("{owner:#}").contains("owns domain"), "{owner:#}");
+
+        let ghost = store
+            .upsert_domain_member("lab", "ghost", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            MembershipRefusal::kind_of(&ghost),
+            Some(RefusalKind::NoSuchAccount)
+        );
+
+        // A disabled account is the SAME kind as one that does not exist. The
+        // two are told apart only in the message, which is what lets a surface
+        // that must not distinguish them answer with one word-for-word reply
+        // and be sure it has no second branch.
+        store.set_disabled("mem", true).await.unwrap();
+        let disabled = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            MembershipRefusal::kind_of(&disabled),
+            Some(RefusalKind::NoSuchAccount),
+            "an existing-but-disabled account is not a kind of its own"
+        );
+        assert!(
+            format!("{disabled:#}").contains("is disabled"),
+            "{disabled:#}"
+        );
+
+        // And a failure that is not one of the three carries no kind at all,
+        // so the surfaces keep answering 500 for what is genuinely theirs.
+        let malformed = store
+            .upsert_domain_member("lab", "  ", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(MembershipRefusal::kind_of(&malformed), None);
     }
 
     #[tokio::test]

@@ -2546,7 +2546,7 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             // standing shared - which is the opposite of what was asked for.
             // `--private` requires `--owner` at the clap level, so the pair is
             // either both present or both absent.
-            let owner = match (private, owner) {
+            let closing = match (private, owner) {
                 (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
                 _ => None,
             };
@@ -2556,14 +2556,19 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
                 is_virtual,
                 origin,
                 branch,
-                config,
+                config.clone(),
                 db,
                 no_sync,
                 json,
             )
             .await?;
-            if let Some(owner) = owner {
-                members::close_new_domain(&name, &owner, json).await?;
+            if let Some(owner) = closing {
+                // The name is re-resolved against the config the registration
+                // just wrote rather than trusted as typed, which is what the
+                // REST path does by reading the engine's own report: a name
+                // the registry does not hold must not get an acl row, whatever
+                // the command line said.
+                members::close_new_domain(&name, &owner, config.as_deref(), json).await?;
             }
             Ok(())
         }),

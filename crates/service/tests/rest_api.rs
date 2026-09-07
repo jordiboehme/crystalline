@@ -863,7 +863,7 @@ async fn a_disabled_account_is_refused_on_the_trusted_header() {
 }
 
 /// A trusted-header value with internal whitespace cannot normalize into a
-/// login name (see `auth_store::normalize_name`). Before this task that
+/// login name (see `auth_store::normalize_account_name`). Before this task that
 /// refusal fell through the generic `anyhow` conversion and answered `500`;
 /// the caller cannot fix the proxy's header, so it must be a `403` naming the
 /// problem, not an opaque server error.

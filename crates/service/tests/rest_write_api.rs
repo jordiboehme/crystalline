@@ -1881,10 +1881,20 @@ fn write_ops() -> Vec<WriteOp> {
         },
         // Visibility, in the direction that changes nothing on a domain that
         // is already shared: the allowed leg answers 204 and the domain stays
-        // reachable for every row below it. Admin only in BOTH directions -
-        // making a domain private transfers it to the caller - and refused on
-        // a read-only instance like every other mutation here: the membership
-        // records are not knowledge, but what they decide is who may read it.
+        // reachable for every row below it.
+        //
+        // What this row measures is the RE-SHARE direction against a SHARED
+        // domain, where the answer coincides with admin-only for a reason that
+        // is not the role gate: re-sharing needs `DomainRight::Own`, and on a
+        // shared domain nobody holds that but an instance admin, so an
+        // instance viewer and an instance editor are both refused by the right
+        // rather than by a role. The real two-direction policy - privatizing
+        // is admin only, re-sharing is the owner's or an admin's, a manager
+        // does neither - is pinned in `rest_visibility.rs`
+        // (`the_owner_re_shares_and_only_an_admin_closes_a_domain`), which is
+        // where a fixture with an owner exists. Refused on a read-only
+        // instance like every other mutation here: the membership records are
+        // not knowledge, but what they decide is who may read it.
         WriteOp {
             method: Method::PUT,
             path: "/api/v1/domains/eng/visibility",

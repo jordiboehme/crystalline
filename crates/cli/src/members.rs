@@ -92,16 +92,46 @@ pub async fn check_private_owner(owner: &str) -> Result<String> {
 /// Close a freshly registered domain, naming `owner`. Called only after the
 /// registration reported success.
 ///
+/// The name is resolved against the registry the registration just wrote,
+/// rather than taken as typed. That is the same rule the REST path follows by
+/// reading the resulting name out of the engine's own report: an acl row for a
+/// name the registry does not hold is the orphan record every verb here exists
+/// to prevent, and the two surfaces must not differ on it the day `domain add`
+/// learns to derive a name it was not given.
+///
+/// **No rollback here, unlike the REST path, and deliberately.** The web
+/// surface unregisters the domain when this write fails, because the browser
+/// has no other way to finish the job and a half-made state would sit there
+/// invisible. At a terminal there is a person who was just told what happened
+/// and has both next steps in the error - close it by hand, or unregister it -
+/// and who may well prefer to keep a domain that registered correctly. The
+/// realistic failure is gone before this point anyway:
+/// [`check_private_owner`] resolved the account before the registration
+/// started.
+///
 /// Under `--json` the confirmation goes to STDERR, the convention
 /// `crate::users`' token printing already follows: the registration itself
 /// already wrote one JSON document to stdout, and a second one after it would
 /// leave a piped stdout holding two, which is not a JSON document at all.
-pub async fn close_new_domain(domain: &str, owner: &str, json: bool) -> Result<()> {
+pub async fn close_new_domain(
+    domain: &str,
+    owner: &str,
+    config: Option<&Path>,
+    json: bool,
+) -> Result<()> {
+    let domain = &require_registered(domain, config)?;
     let store = store().await?;
     store
         .set_domain_visibility(domain, true, owner)
         .await
-        .with_context(|| format!("making domain '{domain}' private"))?;
+        .with_context(|| {
+            format!(
+                "domain '{domain}' is registered and SHARED: making it private failed. \
+                 Close it with `crystalline domain visibility {domain} private --owner \
+                 {}`, or drop it with `crystalline domain remove {domain}`",
+                owner.trim().to_lowercase()
+            )
+        })?;
     let line = format!(
         "Domain '{domain}' is private, owned by '{}'. Only its owner, the \
          accounts invited into it and instance admins see it.",

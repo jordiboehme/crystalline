@@ -1069,7 +1069,7 @@ const ACTOR_JOIN_WORD: &str = "for";
 /// this runs, so a client naming itself `x for ada` arrives here as
 /// `x-for-ada` - byte-identical to what an authenticated ada session composes,
 /// on an instance where nobody authenticated at all. An account name cannot
-/// contain whitespace (the auth store's `normalize_name` refuses it), so the
+/// contain whitespace (the auth store's `normalize_account_name` refuses it), so the
 /// join is the only way that shape arises honestly, and this is what keeps it
 /// that way. A client that genuinely has `for` as a hyphen-separated word in
 /// its name loses that word and keeps the rest.

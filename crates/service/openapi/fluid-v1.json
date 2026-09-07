@@ -6624,7 +6624,7 @@
           },
           "principal": {
             "type": "string",
-            "description": "The member's login name, folded by [`normalize_name`]."
+            "description": "The member's login name, folded by [`normalize_account_name`]."
           }
         }
       },

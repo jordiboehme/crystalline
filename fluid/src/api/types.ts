@@ -1500,7 +1500,7 @@ export interface components {
             added_by: string;
             /** @description What this member may do here. */
             level: components["schemas"]["MemberLevel"];
-            /** @description The member's login name, folded by [`normalize_name`]. */
+            /** @description The member's login name, folded by [`normalize_account_name`]. */
             principal: string;
         };
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */

@@ -1048,6 +1048,20 @@ async fn a_member_leaves_a_domain_without_asking_a_manager() {
     // Not a manager, so evicting somebody else is refused...
     let refused = mem.delete("/api/v1/domains/lab/members/out").await;
     assert_eq!(refused.status(), 403);
+    // ...and so is inviting, which is the route that GRANTS access and so the
+    // one whose refusal matters most. `mem` is an instance editor here, so
+    // this can only be the membership level talking.
+    let refused = mem
+        .put_json(
+            "/api/v1/domains/lab/members/out",
+            json!({"level": "manager"}),
+        )
+        .await;
+    assert_eq!(
+        refused.status(),
+        403,
+        "an editor-level member does not hand out levels"
+    );
     // ...and leaving is not.
     let left = mem.delete("/api/v1/domains/lab/members/MEM").await;
     assert_eq!(
@@ -1230,4 +1244,183 @@ async fn a_domain_can_be_created_private_and_belongs_to_its_creator() {
     assert!(ctx.auth.domain_visibility("attic").await.unwrap().is_none());
     let listed = out.get_json("/api/v1/domains").await.to_string();
     assert!(listed.contains("attic"), "{listed}");
+}
+
+/// The most valuable cell of this task's policy, asserted rather than inferred
+/// from a shared helper: a logged-in STRANGER's mutations on a private domain
+/// answer 404, not 403.
+///
+/// A 403 would confirm the domain exists, which is the whole of what a private
+/// domain keeps. Each of the three is byte-compared against the answer a name
+/// nobody registered gets, so the two cannot drift into differing wording
+/// either.
+#[tokio::test]
+async fn a_stranger_mutating_a_hidden_domain_gets_the_unregistered_answer() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
+
+    let out = ctx.as_user("out").await;
+
+    let hidden = out
+        .put_json(
+            "/api/v1/domains/lab/members/mem",
+            json!({"level": "editor"}),
+        )
+        .await;
+    let status = hidden.status();
+    let hidden = hidden.text().await.unwrap();
+    assert_eq!(status, 404, "{hidden}");
+    let missing = out
+        .put_json(
+            "/api/v1/domains/ghost/members/mem",
+            json!({"level": "editor"}),
+        )
+        .await;
+    assert_eq!(missing.status(), 404);
+    assert_eq!(
+        hidden.replace("lab", "ghost"),
+        missing.text().await.unwrap()
+    );
+
+    let hidden = out.delete("/api/v1/domains/lab/members/mem").await;
+    let status = hidden.status();
+    let hidden = hidden.text().await.unwrap();
+    assert_eq!(status, 404, "{hidden}");
+    let missing = out.delete("/api/v1/domains/ghost/members/mem").await;
+    assert_eq!(missing.status(), 404);
+    assert_eq!(
+        hidden.replace("lab", "ghost"),
+        missing.text().await.unwrap()
+    );
+
+    let hidden = out
+        .put_json("/api/v1/domains/lab/owner", json!({"owner": "out"}))
+        .await;
+    let status = hidden.status();
+    let hidden = hidden.text().await.unwrap();
+    assert_eq!(status, 404, "{hidden}");
+    let missing = out
+        .put_json("/api/v1/domains/ghost/owner", json!({"owner": "out"}))
+        .await;
+    assert_eq!(missing.status(), 404);
+    assert_eq!(
+        hidden.replace("lab", "ghost"),
+        missing.text().await.unwrap()
+    );
+
+    // Nothing was written by any of them.
+    assert_eq!(
+        ctx.auth.domain_members("lab").await.unwrap().len(),
+        1,
+        "the viewer invited by the fixture is still the only member"
+    );
+    assert_eq!(
+        ctx.auth
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner,
+        "owner"
+    );
+}
+
+/// The owner cannot be named as a principal on the INVITE route either: a
+/// membership row for the owner could only ever say less than the truth.
+///
+/// The DELETE side of this is refused by the handler and is tested beside the
+/// leave; this side is the store's own refusal, which is what the brief asked
+/// the route to carry, and it reaches the caller as a 409 rather than as the
+/// 500 an unclassified store failure would be.
+#[tokio::test]
+async fn the_owner_cannot_be_invited_into_the_domain_it_owns() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
+
+    for who in ["mgr", "boss"] {
+        let caller = ctx.as_user(who).await;
+        let refused = caller
+            .put_json(
+                "/api/v1/domains/lab/members/owner",
+                json!({"level": "viewer"}),
+            )
+            .await;
+        let status = refused.status();
+        let body = refused.text().await.unwrap();
+        assert_eq!(status, 409, "as {who}: {body}");
+        assert!(
+            body.contains("owner"),
+            "the refusal names the route that changes who that is: {body}"
+        );
+    }
+    assert_eq!(
+        ctx.auth
+            .domain_members("lab")
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.principal.as_str())
+            .collect::<Vec<_>>(),
+        vec!["mgr"],
+        "nothing was written"
+    );
+}
+
+/// An invite naming an account this instance does not have, and one naming a
+/// disabled account, are answered with the SAME words.
+///
+/// A domain manager is not an instance admin and cannot read `GET /users`, so
+/// a refusal that said which of the two it was would be an account-existence
+/// oracle assembled out of error messages: invite a name, read the answer,
+/// learn whether somebody by that name has an account here and whether it is
+/// switched off.
+#[tokio::test]
+async fn an_invite_never_says_whether_an_account_exists() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
+    // `mem` exists and is switched off; `ghost` was never an account.
+    ctx.auth.set_disabled("mem", true).await.unwrap();
+
+    let mgr = ctx.as_user("mgr").await;
+    let mut answers = Vec::new();
+    for principal in ["ghost", "mem"] {
+        let refused = mgr
+            .put_json(
+                &format!("/api/v1/domains/lab/members/{principal}"),
+                json!({"level": "editor"}),
+            )
+            .await;
+        let status = refused.status();
+        let body = refused.text().await.unwrap();
+        assert_eq!(status, 422, "for {principal}: {body}");
+        assert!(
+            !body.contains(principal),
+            "the answer does not even echo the name asked about: {body}"
+        );
+        assert!(
+            !body.contains("disabled") && !body.contains("no such user"),
+            "and never the store's own words: {body}"
+        );
+        answers.push(body);
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "an account that does not exist and one that is disabled are one answer"
+    );
+    assert!(ctx.auth.domain_members("lab").await.unwrap().len() == 1);
+
+    // The same collapse on the transfer route, which resolves an account too.
+    let boss = ctx.as_user("boss").await;
+    let mut answers = Vec::new();
+    for owner in ["ghost", "mem"] {
+        let refused = boss
+            .put_json("/api/v1/domains/lab/owner", json!({"owner": owner}))
+            .await;
+        assert_eq!(refused.status(), 422);
+        answers.push(refused.text().await.unwrap());
+    }
+    assert_eq!(answers[0], answers[1]);
 }

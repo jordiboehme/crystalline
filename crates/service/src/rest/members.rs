@@ -59,7 +59,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 
 use super::auth::Identity;
-use super::auth_store::{DomainMember, MemberLevel};
+use super::auth_store::{
+    DomainMember, MemberLevel, MembershipRefusal, RefusalKind, normalize_account_name,
+};
 use super::{
     ApiError, ApiJson, ApiPath, ProblemDetail, RestState, refuse_read_only, require_domain_read,
 };
@@ -113,6 +115,21 @@ pub struct OwnerBody {
     pub owner: String,
 }
 
+/// What a principal that names no enabled account is told, in one place.
+///
+/// **One answer for two states, deliberately.** The store knows whether a name
+/// belongs to nobody or to a disabled account, and says which in its own
+/// message. This surface must not repeat that: a domain MANAGER is not an
+/// instance admin and cannot read `GET /users`, so forwarding the store's words
+/// would hand them a probe for which login names exist on this instance and
+/// which of those are switched off - an account-existence oracle built out of
+/// an error message. The operator-facing surfaces that may legitimately know
+/// (the `crystalline` CLI, which is the machine owner, and the admin user
+/// screens) read the store's own text; this route says only that the name is
+/// not something it can invite.
+const NOT_AN_ENABLED_ACCOUNT: &str = "that name is not an enabled account on this instance: check it with an \
+     administrator, who can see the account list";
+
 /// Turn a membership store failure into a status.
 ///
 /// Three of the store's refusals are the caller's doing rather than this
@@ -125,28 +142,41 @@ pub struct OwnerBody {
 ///   say *less* than the truth), so naming it is a 409 too, with the transfer
 ///   route as the way to change who that is;
 /// * a principal that is not an existing, enabled account is an unprocessable
-///   body: the name is well-formed and there is nobody behind it.
+///   body: the name is well-formed and there is nobody behind it. This arm
+///   answers [`NOT_AN_ENABLED_ACCOUNT`] and never the store's own words.
+///
+/// The classification is [`RefusalKind`], read off the error as a TYPE. It was
+/// substring matching over the store's prose, which meant a rewording in
+/// `auth_store.rs` would silently turn one of these 409s into a 500 - and
+/// tempted this function into forwarding `{e:#}` on the one arm that must not.
 ///
 /// Anything else is this server's problem and stays a 500 with the store's own
 /// words.
 fn store_error(e: anyhow::Error) -> ApiError {
-    let detail = format!("{e:#}");
-    if detail.contains("is not private") {
-        return ApiError::conflict(
+    match MembershipRefusal::kind_of(&e) {
+        Some(RefusalKind::NotPrivate) => ApiError::conflict(
             "this domain is shared, so it has no membership: make it private \
              first (PUT /domains/{domain}/visibility)",
-        );
-    }
-    if detail.contains("owns domain") {
-        return ApiError::conflict(
+        ),
+        Some(RefusalKind::OwnerIsNotAMember) => ApiError::conflict(
             "that account owns this domain and already holds every level: \
              hand the domain on with PUT /domains/{domain}/owner instead",
-        );
+        ),
+        Some(RefusalKind::NoSuchAccount) => ApiError::unprocessable(NOT_AN_ENABLED_ACCOUNT),
+        None => ApiError::internal(format!("{e:#}")),
     }
-    if detail.contains("no such user") || detail.contains("is disabled") {
-        return ApiError::unprocessable(detail);
-    }
-    ApiError::internal(detail)
+}
+
+/// The login name a path segment addresses, folded exactly as the store folds
+/// it, or the 422 that says the segment names no login name at all.
+///
+/// Shared by the two routes that take a `{principal}` so that the comparison
+/// they make against the caller's own name, and against the owner's, is
+/// against the value the store would key on rather than against a second
+/// spelling of the folding rule. The refusal names the shape a login name has
+/// and no account, so it is not an oracle.
+fn principal_key(principal: &str) -> Result<String, ApiError> {
+    normalize_account_name(principal).map_err(|e| ApiError::unprocessable(format!("{e}")))
 }
 
 /// The gate every mutation here opens with, in the order the refusals have to
@@ -384,6 +414,7 @@ pub async fn set_member(
     ApiJson(body): ApiJson<MemberBody>,
 ) -> Result<StatusCode, ApiError> {
     let actor = require_right(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
+    let principal = principal_key(&principal)?;
     state
         .auth
         .upsert_domain_member(&domain, &principal, body.level, &actor)
@@ -461,20 +492,33 @@ pub async fn remove_member(
     let actor = identity.require_account()?;
     require_domain_read(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
-    // The store folds a login name to lowercase; a path segment is whatever
-    // was typed. Compare on the folded form, or `DELETE /members/ADA` by
-    // `ada` would be read as an eviction and refused for a caller who is
-    // simply leaving.
-    let principal_key = principal.trim().to_ascii_lowercase();
-    let leaving = principal_key == actor.name;
+    // The store folds a login name; a path segment is whatever was typed.
+    // Compare on the folded form, or `DELETE /members/ADA` by `ada` would be
+    // read as an eviction and refused for a caller who is simply leaving - and
+    // fold it with the STORE's own function rather than a second spelling of
+    // the rule, since the values this is compared against (the caller's own
+    // name, and the owner's) are the store's.
+    let principal = principal_key(&principal)?;
+    let leaving = principal == actor.name;
     if !leaving {
         refuse_below(&state, &identity, &domain, DomainRight::Manage, "manager").await?;
     }
     // `remove_domain_member` deletes a row and asks no questions, so both
     // refusals below are this handler's own. The store's own privacy check
     // lives on the invite path, where a row would be *created*.
+    //
+    // These two reads sit OUTSIDE the delete's statement, unlike the invite
+    // path's, whose checks share one `BEGIN IMMEDIATE` with its write. Both
+    // outcomes of losing that race are benign and neither can widen access: a
+    // domain made shared in between has had every membership row deleted
+    // already, so the delete removes nothing and answers 404; a transfer in
+    // between has dropped the incoming owner's row for the same reason, so the
+    // owner check cannot be raced into deleting one. A store method that did
+    // the owner check and the delete together would buy a better *message*,
+    // not a better guarantee, so it is not worth the second spelling of the
+    // rule.
     let acl = require_private(&state, &domain, "membership to remove").await?;
-    if acl.owner == principal_key {
+    if acl.owner == principal {
         return Err(ApiError::conflict(
             "that account owns this domain, so it holds no membership row: \
              hand the domain on with PUT /domains/{domain}/owner instead",
