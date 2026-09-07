@@ -83,6 +83,10 @@ pub struct GlobalConfig {
     /// working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<IndexConfig>,
+    /// Capture-time advisory settings. Absent means the advisory is on, so
+    /// every existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureConfig>,
     /// Write-provenance settings. Absent means the actor recorded on a write
     /// is derived from the connected client, so every existing config keeps
     /// working untouched.
@@ -236,6 +240,17 @@ impl GlobalConfig {
     /// setting never applies to them.
     pub fn index_files(&self) -> bool {
         self.index.as_ref().and_then(|i| i.files).unwrap_or(true)
+    }
+
+    /// Whether a write or content edit receipt carries the `similar`
+    /// advisory, from `capture.similar`. Absent config or an absent key means
+    /// on (true): the advisory is the write telling the writer what it
+    /// already knew.
+    pub fn capture_similar(&self) -> bool {
+        self.capture
+            .as_ref()
+            .and_then(|c| c.similar)
+            .unwrap_or(true)
     }
 
     /// The configured actor recorded as `generated.by` on every write, from
@@ -645,6 +660,15 @@ pub struct IndexConfig {
     /// on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<bool>,
+}
+
+/// Capture-time advisory configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CaptureConfig {
+    /// Whether a write or content edit receipt carries the `similar` list of
+    /// the nearest existing engrams. Absent means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar: Option<bool>,
 }
 
 /// The `identity` block: who Crystalline records as the writer of an engram.

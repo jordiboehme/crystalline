@@ -10,9 +10,9 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    AuthConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting,
-    IdentityConfig, IndexConfig, OidcConfig, ResponseFormat, SearchConfig, ServiceConfig,
-    ShareIdentityMode, SkillsConfig, SkillsServe,
+    AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig,
+    HttpSetting, IdentityConfig, IndexConfig, OidcConfig, ResponseFormat, SearchConfig,
+    ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
@@ -347,6 +347,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: index_files_effective,
         },
         SettingSpec {
+            key: "capture.similar",
+            doc: "Attach the nearest existing engrams to every write_engram and content edit_engram receipt as a similar list with guidance to merge, supersede, link or ignore them (default true); false switches the advisory off everywhere, MCP and Fluid alike",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            secret: false,
+            apply: set_capture_similar,
+            clear: clear_capture_similar,
+            effective: capture_similar_effective,
+        },
+        SettingSpec {
             key: "identity.actor",
             doc: "Who is recorded as the writer of an engram (generated.by), for example team-bot/1.0 or human:jordi; unset means the connected client is used",
             kind: SettingKind::String,
@@ -647,6 +657,15 @@ fn drop_search_if_empty(config: &mut GlobalConfig) {
 fn drop_index_if_empty(config: &mut GlobalConfig) {
     if config.index.as_ref() == Some(&IndexConfig::default()) {
         config.index = None;
+    }
+}
+
+/// Drop the `capture` block once every field in it has been cleared, so an
+/// unset config round-trips to exactly the pre-feature shape (no empty
+/// `capture: {}` line).
+fn drop_capture_if_empty(config: &mut GlobalConfig) {
+    if config.capture.as_ref() == Some(&CaptureConfig::default()) {
+        config.capture = None;
     }
 }
 
@@ -1319,6 +1338,33 @@ fn index_files_effective(config: &GlobalConfig) -> (String, bool) {
     (config.index_files().to_string(), is_default)
 }
 
+// --- capture.similar --------------------------------------------------------
+
+fn set_capture_similar(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "capture.similar must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .capture
+        .get_or_insert_with(CaptureConfig::default)
+        .similar = Some(parsed);
+    Ok(())
+}
+
+fn clear_capture_similar(config: &mut GlobalConfig) {
+    if let Some(c) = config.capture.as_mut() {
+        c.similar = None;
+    }
+    drop_capture_if_empty(config);
+}
+
+fn capture_similar_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.capture.as_ref().and_then(|c| c.similar).is_none();
+    (config.capture_similar().to_string(), is_default)
+}
+
 // --- identity.actor ---------------------------------------------------------
 
 fn set_identity_actor(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1845,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirty_four_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_five_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1869,6 +1915,7 @@ mod tests {
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
+                "capture.similar",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -1944,6 +1991,7 @@ mod tests {
                     "CRYSTALLINE_SEARCH_RETIRED_WEIGHT".to_string()
                 ),
                 ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
+                ("capture.similar", "CRYSTALLINE_CAPTURE_SIMILAR".to_string()),
                 ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
                 (
                     "auth.trusted_header",
@@ -2005,6 +2053,7 @@ mod tests {
         assert!(change_note("search.salience_weight", &no_env).is_none());
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
+        assert!(change_note("capture.similar", &no_env).is_none());
         assert!(change_note("identity.actor", &no_env).is_none());
         // The effective value is snapshotted at engine construction
         // (`Engine::skills_serve`), so a write really does wait for the next
@@ -2473,7 +2522,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 34);
+        assert_eq!(views.len(), 35);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2497,6 +2546,7 @@ mod tests {
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
+                "capture.similar",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
@@ -2607,15 +2657,19 @@ mod tests {
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let identity_actor = &views[20];
+        let capture_similar = &views[20];
+        assert_eq!(capture_similar.value, "true");
+        assert_eq!(capture_similar.source, SettingSource::Default);
+
+        let identity_actor = &views[21];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[21];
+        let trusted_header = &views[22];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[22];
+        let anonymous = &views[23];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -2914,6 +2968,22 @@ mod tests {
         let err = apply(&mut cfg, "index.files", "sometimes").unwrap_err();
         assert!(err.to_string().contains("index.files"), "{err}");
         assert!(cfg.index.is_none(), "a rejected value must not be written");
+    }
+
+    // --- capture.similar --------------------------------------------------------
+
+    #[test]
+    fn capture_similar_round_trips_and_defaults_on() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.capture_similar(), "absent means on");
+        apply(&mut cfg, "capture.similar", "false").unwrap();
+        assert!(!cfg.capture_similar());
+        let (value, is_default) = capture_similar_effective(&cfg);
+        assert_eq!((value.as_str(), is_default), ("false", false));
+        assert!(apply(&mut cfg, "capture.similar", "maybe").is_err());
+        unset(&mut cfg, "capture.similar").unwrap();
+        assert!(cfg.capture.is_none(), "an unset block is dropped whole");
+        assert!(cfg.capture_similar());
     }
 
     // --- domains_root ----------------------------------------------------------
