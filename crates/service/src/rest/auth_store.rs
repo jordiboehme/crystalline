@@ -285,7 +285,7 @@ pub struct McpTokenInfo {
 /// may not flip the domain back to shared, and it may not hand the domain to
 /// someone else: those two stay with the owner (and with an admin), which is
 /// what keeps "who can see this at all" a decision the owner made.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum MemberLevel {
     /// Read only: this domain is visible and searchable, nothing more.
@@ -374,7 +374,7 @@ pub struct DomainAcl {
 
 /// One membership row: who was invited to a private domain, at what level, by
 /// whom and when.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
 pub struct DomainMember {
     /// The member's login name, folded by [`normalize_name`].
     pub principal: String,
@@ -4581,6 +4581,42 @@ mod tests {
             ""
         );
         assert!(store.memberships_of("owner").await.unwrap().is_empty());
+    }
+
+    /// The forced removal takes the same step. `remove_user_force` runs the
+    /// same four cleanups the guarded remove does, and this is the one of them
+    /// that widens rather than narrows if it is ever dropped: a private domain
+    /// left naming a departed account would hand it to whoever next signs up
+    /// under that login name. The guarded path is pinned above; a `--force`
+    /// removal is exactly the path an operator reaches for when the account
+    /// being removed is the last admin, so it must not be the one that leaks.
+    #[tokio::test]
+    async fn force_removing_a_user_also_leaves_its_domains_owned_by_nobody() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.remove_user_force("owner").await.unwrap();
+        let acl = store
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .expect("the domain stays private when its owner is forced out");
+        assert_eq!(
+            acl.owner, "",
+            "owned by nobody, exactly as the guarded removal leaves it"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "and the people invited into it keep their levels"
+        );
     }
 
     #[tokio::test]

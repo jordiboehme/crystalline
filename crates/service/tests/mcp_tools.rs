@@ -312,6 +312,44 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     assert_eq!(names, sorted, "tools/list is ordered by name");
 }
 
+/// No agent administers a private domain.
+///
+/// The identity plan's own line: agents INHERIT visibility - an MCP session
+/// acts as the account whose token it carries, and every read and write it
+/// makes is already filtered by that account's memberships - and they do not
+/// hand it out. Inviting somebody into a domain, changing a level, handing a
+/// domain on and deciding whether a domain is private at all are decisions a
+/// person makes, over REST or at the `crystalline` CLI.
+///
+/// Pinned as a property of the whole list rather than as five absent names,
+/// because the failure mode is a LATER task adding a membership verb because
+/// it was convenient, not somebody re-adding one of today's names. Both the
+/// default install and the collaboration-enabled list are checked: the gated
+/// surface is where such a tool would most plausibly land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_administers_a_domains_membership() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    call(
+        client.peer(),
+        "configure",
+        json!({"set": {"github.enabled": "true"}}),
+    )
+    .await
+    .unwrap();
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    for tool in &tools.tools {
+        let name = tool.name.to_string();
+        for word in ["member", "invite", "visibility", "private"] {
+            assert!(
+                !name.contains(word),
+                "'{name}' looks like a membership verb: agents inherit what \
+                 they may see and never administer it"
+            );
+        }
+    }
+}
+
 /// Turning collaboration on adds exactly the five tools it enables, and takes
 /// them away again when it goes back off.
 ///

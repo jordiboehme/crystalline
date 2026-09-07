@@ -17,6 +17,7 @@ mod github_identity;
 mod github_settings;
 mod graph;
 mod mcp_tokens;
+mod members;
 mod users_api;
 
 use std::sync::Arc;
@@ -93,6 +94,10 @@ use crate::scope::{DomainAccess, DomainRight};
         domains_admin::create,
         domains_admin::remove,
         domains_admin::set_visibility,
+        members::list,
+        members::set_member,
+        members::remove_member,
+        members::set_owner,
         domains_admin::sync_status,
         domains_admin::sync_now,
         domains_admin::sync_summary,
@@ -155,6 +160,11 @@ use crate::scope::{DomainAccess, DomainRight};
         domains::SaveManifestBody,
         domains_admin::CreateDomainBody,
         domains_admin::VisibilityBody,
+        MemberLevel,
+        DomainMember,
+        members::MembersResponse,
+        members::MemberBody,
+        members::OwnerBody,
         domains_admin::ShareBody,
         domains_admin::WithdrawBody,
         domains_admin::ResolveBody,
@@ -449,6 +459,19 @@ pub fn router(state: RestState) -> Router {
             "/domains/{domain}/visibility",
             put(domains_admin::set_visibility),
         )
+        // Who may reach a private domain. The listing is open to anyone who
+        // may see the domain at all (a viewer-level member sees who else is
+        // here); inviting, re-levelling and evicting need `Manage`, with the
+        // one exception that a member may always remove ITSELF; and handing
+        // the domain on needs `Own`. Every one of them answers 404 for a
+        // domain the caller may not see, exactly as an unregistered name
+        // does. See [`members`].
+        .route("/domains/{domain}/members", get(members::list))
+        .route(
+            "/domains/{domain}/members/{principal}",
+            put(members::set_member).delete(members::remove_member),
+        )
+        .route("/domains/{domain}/owner", put(members::set_owner))
         // Admin only as well. The GET is a pure read and stays served on a
         // read-only instance; the POST is a pull that writes, and does not.
         .route(

@@ -18,6 +18,7 @@ mod cmd;
 mod doctor;
 mod hook;
 mod install;
+mod members;
 mod receipt;
 mod render;
 mod users;
@@ -868,6 +869,15 @@ enum DomainCommand {
         /// indexes what it downloads.
         #[arg(long)]
         no_sync: bool,
+        /// Register the domain private: only its owner, the accounts invited
+        /// into it and instance admins see it at all. Needs --owner, and needs
+        /// web accounts to exist (`crystalline users add`).
+        #[arg(long, requires = "owner")]
+        private: bool,
+        /// The account that owns the domain, with --private. It must already
+        /// exist and be enabled.
+        #[arg(long, value_name = "ACCOUNT")]
+        owner: Option<String>,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -925,6 +935,110 @@ enum DomainCommand {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Who may reach a private domain: list the members, invite one at a
+    /// level, or remove one. The machine operator administers every domain,
+    /// so these commands need no web role and are not refused by one.
+    Members {
+        /// The registered domain.
+        domain: String,
+        #[command(subcommand)]
+        command: MembersCommand,
+    },
+    /// Make a domain private, owned by one account, or share it with every
+    /// account again. Private is the personal domain: only its owner, the
+    /// accounts invited into it and instance admins see it at all. Sharing it
+    /// again forgets who was invited. The machine operator administers every
+    /// domain.
+    Visibility {
+        /// The registered domain.
+        domain: String,
+        /// private: closed to its owner and the invited. default: shared with
+        /// every account again.
+        #[arg(value_enum)]
+        visibility: VisibilityArg,
+        /// The account that owns the domain once it is private. Required with
+        /// `private`, and meaningless with `default`.
+        #[arg(long, value_name = "ACCOUNT")]
+        owner: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Hand a private domain to a different account. The old owner keeps
+    /// nothing: invite them back if they should stay. The machine operator
+    /// administers every domain.
+    Transfer {
+        /// The registered domain. It must already be private.
+        domain: String,
+        /// The account to hand it to. It must exist and be enabled.
+        new_owner: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum MembersCommand {
+    /// List who owns the domain and who is invited into it.
+    List {
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Invite an account, or move one to a different level.
+    Add {
+        /// The account's login name.
+        user: String,
+        /// What that account may do here. Defaults to viewer (read only).
+        #[arg(long, value_enum, default_value_t = LevelArg::Viewer)]
+        level: LevelArg,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Remove a membership. The owner is not a member; hand the domain on
+    /// with `crystalline domain transfer` instead.
+    Remove {
+        /// The account's login name.
+        user: String,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+}
+
+/// The two visibilities `domain visibility` accepts. `default` rather than
+/// `shared` because that is what it restores: a domain nobody made private.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum VisibilityArg {
+    /// Only the owner, the invited accounts and instance admins see it.
+    Private,
+    /// Every account sees it, which is how a domain starts out.
+    Default,
+}
+
+/// The membership levels `domain members add` accepts, mirroring
+/// `crystalline_service::rest::MemberLevel` so clap validates the value and
+/// lists it in `--help`.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LevelArg {
+    /// Read only: the domain is visible and searchable, nothing more.
+    Viewer,
+    /// Everything a viewer may do, plus writing and editing its engrams.
+    Editor,
+    /// Everything an editor may do, plus managing this domain's membership.
+    Manager,
+}
+
+impl From<LevelArg> for crystalline_service::rest::MemberLevel {
+    fn from(arg: LevelArg) -> crystalline_service::rest::MemberLevel {
+        match arg {
+            LevelArg::Viewer => crystalline_service::rest::MemberLevel::Viewer,
+            LevelArg::Editor => crystalline_service::rest::MemberLevel::Editor,
+            LevelArg::Manager => crystalline_service::rest::MemberLevel::Manager,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -2423,11 +2537,35 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
             origin,
             branch,
             no_sync,
+            private,
+            owner,
             config,
-        } => on_runtime(move || {
+        } => on_runtime(move || async move {
+            // The owner is resolved BEFORE anything is registered, so a name
+            // nobody has an account for cannot leave a registered domain
+            // standing shared - which is the opposite of what was asked for.
+            // `--private` requires `--owner` at the clap level, so the pair is
+            // either both present or both absent.
+            let owner = match (private, owner) {
+                (true, Some(owner)) => Some(members::check_private_owner(&owner).await?),
+                _ => None,
+            };
             domain_add_dispatch(
-                name, path, is_virtual, origin, branch, config, db, no_sync, json,
+                name.clone(),
+                path,
+                is_virtual,
+                origin,
+                branch,
+                config,
+                db,
+                no_sync,
+                json,
             )
+            .await?;
+            if let Some(owner) = owner {
+                members::close_new_domain(&name, &owner, json).await?;
+            }
+            Ok(())
         }),
         DomainCommand::List { config } => on_runtime_current_thread(move || async move {
             cmd::domain_list(config.as_deref(), db.as_deref(), json).await
@@ -2453,6 +2591,20 @@ fn run_domain(command: DomainCommand, db: Option<PathBuf>, json: bool) -> anyhow
         DomainCommand::Remove { name, config } => {
             on_runtime(move || domain_remove_dispatch(name, config, json))
         }
+        DomainCommand::Members { domain, command } => {
+            on_runtime(move || members::run(domain, command, json))
+        }
+        DomainCommand::Visibility {
+            domain,
+            visibility,
+            owner,
+            config,
+        } => on_runtime(move || members::visibility(domain, visibility, owner, config, json)),
+        DomainCommand::Transfer {
+            domain,
+            new_owner,
+            config,
+        } => on_runtime(move || members::transfer(domain, new_owner, config, json)),
     }
 }
 

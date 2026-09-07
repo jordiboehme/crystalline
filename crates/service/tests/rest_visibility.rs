@@ -104,6 +104,13 @@ impl SessionClient {
             .await
             .unwrap()
     }
+
+    async fn delete(&self, path: &str) -> reqwest::Response {
+        self.request(reqwest::Method::DELETE, path)
+            .send()
+            .await
+            .unwrap()
+    }
 }
 
 /// Two file domains - `open`, shared, and `lab`, which the tests make private -
@@ -574,12 +581,15 @@ async fn the_evolve_queue_names_no_hidden_domain() {
     assert_eq!(ghost.status(), 404);
 }
 
-/// Only an admin decides whether a domain is private - not a manager, and not
-/// the domain's own owner - because making a domain private transfers it to
-/// the caller, and a verb that hands over a domain cannot be one a domain's
-/// own administration may reach.
+/// The two directions of the visibility verb are two different decisions.
+///
+/// CLOSING a shared domain is the instance's: it hands the domain to whoever
+/// called, so a shared domain would otherwise be taken by whoever asked first.
+/// OPENING a private one is its owner's, or an admin's: the owner already sees
+/// everything in it, and opening what they closed takes nothing from anybody.
+/// A manager may do neither - that is where a manager's authority ends.
 #[tokio::test]
-async fn only_an_admin_changes_a_domains_visibility() {
+async fn the_owner_re_shares_and_only_an_admin_closes_a_domain() {
     let ctx = RestCtx::two_domains().await;
     ctx.make_private("lab", "owner").await;
     ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
@@ -594,16 +604,6 @@ async fn only_an_admin_changes_a_domains_visibility() {
         "a manager invites and changes levels, and never changes visibility"
     );
 
-    let owner = ctx.as_user("owner").await;
-    let refused = owner
-        .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
-        .await;
-    assert_eq!(
-        refused.status(),
-        403,
-        "and neither does the owner: the instance owns this decision"
-    );
-
     let out = ctx.as_user("out").await;
     let stranger = out
         .put_json("/api/v1/domains/lab/visibility", json!({"private": true}))
@@ -611,12 +611,23 @@ async fn only_an_admin_changes_a_domains_visibility() {
     assert_eq!(
         stranger.status(),
         403,
-        "a stranger is refused by the role gate, which runs first and says \
-         nothing about which domains exist"
+        "a stranger closing a domain is refused by the role gate, which runs \
+         first and says nothing about which domains exist"
+    );
+    let stranger = out
+        .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
+        .await;
+    assert_eq!(
+        stranger.status(),
+        404,
+        "and opening one they cannot see is the answer an unregistered name \
+         gets: this direction has to resolve the owner, so it must not confirm \
+         the domain exists"
     );
 
-    let boss = ctx.as_user("boss").await;
-    let opened = boss
+    // The owner opens what the owner closed.
+    let owner = ctx.as_user("owner").await;
+    let opened = owner
         .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
         .await;
     assert_eq!(opened.status(), 204, "{:?}", opened.text().await);
@@ -625,18 +636,39 @@ async fn only_an_admin_changes_a_domains_visibility() {
         listed.contains("lab"),
         "the domain is shared again for everyone: {listed}"
     );
+    assert!(
+        ctx.auth.memberships_of("mgr").await.unwrap().is_empty(),
+        "opening a domain forgot who was invited into it"
+    );
 
-    // Closing it again names the caller as its owner and forgets the old
-    // membership list.
+    // And cannot close it again: a shared domain has no owner, so there is
+    // nobody but the instance to ask.
+    let refused = owner
+        .put_json("/api/v1/domains/lab/visibility", json!({"private": true}))
+        .await;
+    assert_eq!(
+        refused.status(),
+        403,
+        "closing a shared domain would hand it to the caller, so it stays the \
+         instance's decision"
+    );
+
+    let boss = ctx.as_user("boss").await;
     let closed = boss
         .put_json("/api/v1/domains/lab/visibility", json!({"private": true}))
         .await;
     assert_eq!(closed.status(), 204);
     let listed = out.get_json("/api/v1/domains").await.to_string();
     assert!(!listed.contains("lab"), "{listed}");
-    assert!(
-        ctx.auth.memberships_of("mgr").await.unwrap().is_empty(),
-        "opening a domain forgot who was invited into it"
+    assert_eq!(
+        ctx.auth
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner,
+        "boss",
+        "closing a domain names the caller as its owner"
     );
 }
 
@@ -880,4 +912,321 @@ async fn a_sweep_with_nothing_visible_refuses_rather_than_widening() {
     let owner = ctx.as_user("owner").await;
     let swept = owner.get_json("/api/v1/evolve").await.to_string();
     assert!(swept.contains("lab"), "{swept}");
+}
+
+/// The manager pin, from the plan: a manager invites and re-levels, and the
+/// same manager cannot change what the domain's visibility is.
+#[tokio::test]
+async fn manager_invites_but_cannot_change_visibility() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mgr", MemberLevel::Manager).await;
+
+    let mgr = ctx.as_user("mgr").await;
+    let invited = mgr
+        .put_json(
+            "/api/v1/domains/lab/members/out",
+            json!({"level": "editor"}),
+        )
+        .await;
+    assert_eq!(invited.status(), 204, "{:?}", invited.text().await);
+    assert_eq!(
+        ctx.auth.memberships_of("out").await.unwrap(),
+        vec![("lab".to_string(), MemberLevel::Editor)]
+    );
+
+    // The same person, one route over.
+    let refused = mgr
+        .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
+        .await;
+    assert_eq!(refused.status(), 403);
+    let refused = mgr
+        .put_json("/api/v1/domains/lab/owner", json!({"owner": "mgr"}))
+        .await;
+    assert_eq!(
+        refused.status(),
+        403,
+        "and cannot hand the domain to itself either"
+    );
+
+    let owner = ctx.as_user("owner").await;
+    let opened = owner
+        .put_json("/api/v1/domains/lab/visibility", json!({"private": false}))
+        .await;
+    assert_eq!(opened.status(), 204, "{:?}", opened.text().await);
+}
+
+/// Who may read the member list: everybody who can see the domain, and nobody
+/// else. A stranger is answered exactly as for a domain nobody registered.
+#[tokio::test]
+async fn the_member_list_is_served_to_members_and_hidden_from_strangers() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
+
+    // A viewer-level member sees who else is here: this is what the domain
+    // card draws, and being invited is what earns it.
+    let mem = ctx.as_user("mem").await;
+    let listed = mem.get_json("/api/v1/domains/lab/members").await;
+    assert_eq!(listed["owner"], json!("owner"));
+    assert_eq!(listed["visibility"], json!("private"));
+    assert_eq!(listed["members"][0]["principal"], json!("mem"));
+    assert_eq!(listed["members"][0]["level"], json!("viewer"));
+    assert_eq!(listed["members"].as_array().unwrap().len(), 1);
+
+    // A stranger gets the answer an unregistered name gets, word for word.
+    let out = ctx.as_user("out").await;
+    let hidden = out.get_text("/api/v1/domains/lab/members", 404).await;
+    let missing = out.get_text("/api/v1/domains/ghost/members", 404).await;
+    assert_eq!(hidden.replace("lab", "ghost"), missing);
+
+    // A shared domain answers honestly rather than refusing: no owner, no
+    // members, because membership decides nothing while a domain is shared.
+    let shared = out.get_json("/api/v1/domains/open/members").await;
+    assert_eq!(shared["owner"], json!(null));
+    assert_eq!(shared["visibility"], json!("shared"));
+    assert!(shared["members"].as_array().unwrap().is_empty());
+}
+
+/// The anonymous tier reads the member listing of what it can already read,
+/// and finds no private domain there.
+///
+/// The listing is the one route on this surface that does not demand an
+/// account, and this is why: an instance serving `auth.anonymous` serves that
+/// caller the domain list, search and every engram in a shared domain, so a
+/// member listing that alone answered 401 would break a card whose every other
+/// call succeeds. Nothing is given away by serving it - a shared domain has no
+/// owner and no members, and a private one is absent.
+#[tokio::test]
+async fn the_anonymous_viewer_reads_a_shared_member_listing_and_no_private_one() {
+    let ctx = RestCtx::anonymous_instance().await;
+    ctx.make_private("lab", "owner").await;
+
+    let nobody = ctx.as_anonymous();
+    let shared = nobody.get_json("/api/v1/domains/open/members").await;
+    assert_eq!(shared["visibility"], json!("shared"));
+    assert_eq!(shared["owner"], json!(null));
+    assert!(shared["members"].as_array().unwrap().is_empty());
+
+    let hidden = nobody.get_text("/api/v1/domains/lab/members", 404).await;
+    let missing = nobody.get_text("/api/v1/domains/ghost/members", 404).await;
+    assert_eq!(hidden.replace("lab", "ghost"), missing);
+
+    // And it administers nothing: every mutation tells it to log in, which is
+    // exactly what would change the answer.
+    let refused = nobody
+        .put_json(
+            "/api/v1/domains/lab/members/mem",
+            json!({"level": "editor"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 401);
+    assert_eq!(
+        nobody
+            .delete("/api/v1/domains/lab/members/mem")
+            .await
+            .status(),
+        401
+    );
+    let refused = nobody
+        .put_json("/api/v1/domains/lab/owner", json!({"owner": "mem"}))
+        .await;
+    assert_eq!(refused.status(), 401);
+}
+
+/// A member may always remove itself. Leaving is not an administrative act,
+/// and the domain closes behind them.
+#[tokio::test]
+async fn a_member_leaves_a_domain_without_asking_a_manager() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
+    ctx.add_member("lab", "out", MemberLevel::Viewer).await;
+
+    let mem = ctx.as_user("mem").await;
+    // Not a manager, so evicting somebody else is refused...
+    let refused = mem.delete("/api/v1/domains/lab/members/out").await;
+    assert_eq!(refused.status(), 403);
+    // ...and leaving is not.
+    let left = mem.delete("/api/v1/domains/lab/members/MEM").await;
+    assert_eq!(
+        left.status(),
+        204,
+        "the login name is folded, so the path segment's case cannot turn a \
+         departure into an eviction: {:?}",
+        left.text().await
+    );
+    assert!(ctx.auth.memberships_of("mem").await.unwrap().is_empty());
+    // And the domain is gone from behind them.
+    let gone = mem.get("/api/v1/domains/lab/members").await;
+    assert_eq!(gone.status(), 404);
+
+    // The owner is not a membership row and is refused with the route that
+    // does change who it is.
+    let owner = ctx.as_user("owner").await;
+    let refused = owner.delete("/api/v1/domains/lab/members/owner").await;
+    assert_eq!(refused.status(), 409);
+    assert!(
+        refused.text().await.unwrap().contains("owner"),
+        "the refusal names the route that hands the domain on"
+    );
+
+    // A name that is not a member of this domain is a plain 404.
+    let missing = owner.delete("/api/v1/domains/lab/members/mem").await;
+    assert_eq!(missing.status(), 404);
+}
+
+/// Handing a domain on: the admin does it, and the old owner keeps nothing.
+#[tokio::test]
+async fn an_admin_transfers_a_domain_and_the_old_owner_becomes_a_stranger() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Editor).await;
+
+    let boss = ctx.as_user("boss").await;
+    let handed = boss
+        .put_json("/api/v1/domains/lab/owner", json!({"owner": "mem"}))
+        .await;
+    assert_eq!(handed.status(), 204, "{:?}", handed.text().await);
+    assert_eq!(
+        ctx.auth
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner,
+        "mem"
+    );
+    assert!(
+        ctx.auth.memberships_of("mem").await.unwrap().is_empty(),
+        "the new owner's editor row is gone: it could only say less"
+    );
+
+    // The old owner is a stranger now, and the domain is answered as one
+    // nobody registered.
+    let owner = ctx.as_user("owner").await;
+    assert_eq!(owner.get("/api/v1/domains/lab/members").await.status(), 404);
+    let listed = owner.get_json("/api/v1/domains").await.to_string();
+    assert!(!listed.contains("lab"), "{listed}");
+
+    // Unless the new owner invites them back.
+    let mem = ctx.as_user("mem").await;
+    let invited = mem
+        .put_json(
+            "/api/v1/domains/lab/members/owner",
+            json!({"level": "viewer"}),
+        )
+        .await;
+    assert_eq!(invited.status(), 204, "{:?}", invited.text().await);
+    let back = owner.get_json("/api/v1/domains/lab/members").await;
+    assert_eq!(back["owner"], json!("mem"));
+    assert_eq!(back["members"][0]["principal"], json!("owner"));
+}
+
+/// A domain whose owner's account was removed has no owner at all, and the
+/// listing says so rather than showing an empty name. Only an admin can reach
+/// it, which is the fail-closed answer the resolver already gives.
+#[tokio::test]
+async fn a_domain_whose_owner_was_removed_reports_no_owner() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    ctx.add_member("lab", "mem", MemberLevel::Editor).await;
+    ctx.auth.remove_user("owner").await.unwrap();
+
+    let boss = ctx.as_user("boss").await;
+    let listed = boss.get_json("/api/v1/domains/lab/members").await;
+    assert_eq!(
+        listed["owner"],
+        json!(null),
+        "no owner, rather than an account whose name is empty: {listed}"
+    );
+    assert_eq!(listed["visibility"], json!("private"));
+    assert_eq!(listed["members"][0]["principal"], json!("mem"));
+
+    // And an admin can hand it to somebody, which is how it gets an owner
+    // again.
+    let handed = boss
+        .put_json("/api/v1/domains/lab/owner", json!({"owner": "mem"}))
+        .await;
+    assert_eq!(handed.status(), 204, "{:?}", handed.text().await);
+}
+
+/// Membership means nothing on a shared domain, so every mutation is refused
+/// there - and named as a conflict with the domain's current state rather than
+/// as a permission problem, since making it private is what comes first.
+#[tokio::test]
+async fn membership_is_refused_on_a_shared_domain() {
+    let ctx = RestCtx::two_domains().await;
+    let boss = ctx.as_user("boss").await;
+
+    let refused = boss
+        .put_json(
+            "/api/v1/domains/open/members/mem",
+            json!({"level": "editor"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 409, "{:?}", refused.text().await);
+    let refused = boss.delete("/api/v1/domains/open/members/mem").await;
+    assert_eq!(refused.status(), 409);
+    let refused = boss
+        .put_json("/api/v1/domains/open/owner", json!({"owner": "mem"}))
+        .await;
+    assert_eq!(refused.status(), 409);
+
+    // And a principal nobody has an account for is an unprocessable body, not
+    // a row left waiting for somebody to claim the name.
+    ctx.make_private("lab", "owner").await;
+    let refused = boss
+        .put_json(
+            "/api/v1/domains/lab/members/ghost",
+            json!({"level": "editor"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 422, "{:?}", refused.text().await);
+    assert!(ctx.auth.domain_members("lab").await.unwrap().is_empty());
+}
+
+/// A domain can be registered private in one step, owned by whoever created
+/// it. That is the personal-private-domain case: an account makes itself a
+/// domain nobody else can see, without a second call that would leave it
+/// shared in between.
+#[tokio::test]
+async fn a_domain_can_be_created_private_and_belongs_to_its_creator() {
+    let ctx = RestCtx::two_domains().await;
+    let boss = ctx.as_user("boss").await;
+
+    let created = boss
+        .post_json(
+            "/api/v1/domains",
+            json!({"mode": "virtual", "name": "vault", "private": true}),
+        )
+        .await;
+    assert_eq!(created.status(), 201, "{:?}", created.text().await);
+    assert_eq!(
+        ctx.auth
+            .domain_visibility("vault")
+            .await
+            .unwrap()
+            .unwrap()
+            .owner,
+        "boss",
+        "the creator owns it"
+    );
+
+    let out = ctx.as_user("out").await;
+    let listed = out.get_json("/api/v1/domains").await.to_string();
+    assert!(!listed.contains("vault"), "{listed}");
+    assert_eq!(out.get("/api/v1/domains/vault/members").await.status(), 404);
+
+    // The default is unchanged: a domain created without the flag is shared.
+    let created = boss
+        .post_json(
+            "/api/v1/domains",
+            json!({"mode": "virtual", "name": "attic"}),
+        )
+        .await;
+    assert_eq!(created.status(), 201, "{:?}", created.text().await);
+    assert!(ctx.auth.domain_visibility("attic").await.unwrap().is_none());
+    let listed = out.get_json("/api/v1/domains").await.to_string();
+    assert!(listed.contains("attic"), "{listed}");
 }

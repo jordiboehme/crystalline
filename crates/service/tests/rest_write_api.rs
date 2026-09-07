@@ -126,6 +126,13 @@ async fn serve(opts: Options) -> Fixture {
     auth.add_user("tina", "Tina", None, Role::Viewer, "tinapw")
         .await
         .unwrap();
+    // One more nobody logs in as, and one this matrix keeps to itself: the
+    // two membership rows name it as the `{principal}` path segment, and
+    // `canonicalize` maps it back. It cannot be `mark` or `tina`, which
+    // canonicalize already maps to the user-admin routes' `{name}`.
+    auth.add_user("pat", "Pat", None, Role::Editor, "patpw")
+        .await
+        .unwrap();
 
     let router = http_router(
         engine,
@@ -1786,7 +1793,7 @@ async fn a_read_only_instance_refuses_user_mutations() {
 
     assert_eq!(
         fx.auth.list_users().await.unwrap().len(),
-        5,
+        6,
         "nothing above changed anything"
     );
 }
@@ -1880,6 +1887,37 @@ fn write_ops() -> Vec<WriteOp> {
             method: Method::PUT,
             path: "/api/v1/domains/eng/visibility",
             body: Some(serde_json::json!({"private": false})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        // The three membership mutations. `eng` is SHARED in this fixture, so
+        // the gate they are being measured for is the domain right rather
+        // than a membership row: an instance viewer resolves to `Read` there
+        // and an instance editor to `Write`, both below the `Manage` these
+        // need, so both are refused; an admin resolves to `Own` and gets
+        // through to the store, which answers 409 because a shared domain has
+        // no membership - "anything but 401/403", which is what the allowed
+        // leg asserts. Refused on a read-only instance like every other
+        // mutation here: the membership records are not knowledge, but what
+        // they decide is who may read it.
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/members/pat",
+            body: Some(serde_json::json!({"level": "editor"})),
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/domains/eng/members/pat",
+            body: None,
+            min_role: Role::Admin,
+            read_only_exempt: false,
+        },
+        WriteOp {
+            method: Method::PUT,
+            path: "/api/v1/domains/eng/owner",
+            body: Some(serde_json::json!({"owner": "pat"})),
             min_role: Role::Admin,
             read_only_exempt: false,
         },
@@ -2302,6 +2340,9 @@ fn canonicalize(path: &str) -> String {
             "eng" | "scrap" => "{domain}",
             "alpha" => "{permalink}",
             "mark" | "tina" => "{name}",
+            // The membership rows' target account. Kept apart from the two
+            // above because it collapses to a different template.
+            "pat" => "{principal}",
             // The share-surface rows: one proposal number and one conflict id.
             "1" => "{number}",
             "abc12345" => "{id}",
@@ -2341,7 +2382,7 @@ fn canonicalize(path: &str) -> String {
 ///   creates the first account, before which no session and so no CSRF token
 ///   can exist - and `check_csrf` exempts it by path exactly as it exempts
 ///   login. It cannot be driven from this matrix either: every fixture here
-///   has five accounts, so every leg of every row would see the same 410 and
+///   has six accounts, so every leg of every row would see the same 410 and
 ///   assert nothing about roles or CSRF. Its auth story - the 410 once any
 ///   account exists, the loopback-or-token gate, the CSRF exemption and the
 ///   read-only carve-out - is pinned by `tests/rest_setup_api.rs` instead,

@@ -19,6 +19,7 @@ use super::{
     require_domain_read, require_domain_write,
 };
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
+use crate::scope::DomainRight;
 
 /// The caller, when they may drive this instance's share surfaces - the status
 /// report, the preview, the share, a withdrawal, and reading or resolving a
@@ -102,6 +103,12 @@ pub struct CreateDomainBody {
     #[serde(default)]
     #[schema(example = "domains/eng")]
     pub path: Option<String>,
+    /// Register the domain private, owned by the calling account. Applies to
+    /// every mode; defaults to false, which is a domain the whole instance
+    /// shares.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub private: bool,
 }
 
 /// A domain name that is safe as a path segment under the domains root, in
@@ -292,7 +299,7 @@ pub async fn create(
     identity: Identity,
     ApiJson(body): ApiJson<CreateDomainBody>,
 ) -> Result<Response, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     // Serialized against a concurrent unregister of the same name: see
     // [`RestState::domain_admin`] for the engine-level race this closes.
@@ -359,13 +366,61 @@ pub async fn create(
         }
     };
     match report {
-        Ok(report) => Ok((StatusCode::CREATED, Json(report)).into_response()),
+        Ok(report) => {
+            if body.private {
+                close_new_domain(&state, &report, caller.name()).await?;
+            }
+            Ok((StatusCode::CREATED, Json(report)).into_response())
+        }
         // A taken name (or an already-registered folder) is a conflict on
         // this surface, as on engram create; the generic From keeps 422 for
         // MCP's classification.
         Err(EngineError::Conflict(detail)) => Err(ApiError::conflict(detail)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Close a freshly registered domain, naming its creator as the owner.
+///
+/// The order is the whole point and it is the opposite of the visibility
+/// route's: there the domain exists and the acl row is the new thing, here the
+/// acl row is written for a domain this request has just registered. Writing
+/// it first would mint a record for a name that might never become a domain -
+/// the orphan the registry check on `set_visibility` exists to prevent.
+///
+/// A failure here leaves a REGISTERED domain that is not private, which is
+/// visible to everybody - the opposite of what was asked for - so the
+/// registration is rolled back rather than left standing, and the error names
+/// both halves. Best effort on the rollback itself: if that fails too, the
+/// message still says what state the instance is in, which is the one thing an
+/// operator needs in order to finish the job by hand.
+async fn close_new_domain(state: &RestState, report: &Value, owner: &str) -> Result<(), ApiError> {
+    // The engine's own report is the authority on the resulting name: the
+    // github mode defaults it from the repository, so the request body cannot
+    // be trusted to say what was registered.
+    let name = report
+        .get("domain")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApiError::internal(
+                "the domain was registered but its report does not name it, so \
+                 it could not be made private",
+            )
+        })?
+        .to_string();
+    let Err(e) = state.auth.set_domain_visibility(&name, true, owner).await else {
+        return Ok(());
+    };
+    let rolled_back = state.engine.domain_remove(&name).await.is_ok();
+    Err(ApiError::internal(format!(
+        "domain '{name}' could not be made private: {e:#}{}",
+        if rolled_back {
+            "; the registration was rolled back, so nothing was left shared"
+        } else {
+            "; it is REGISTERED AND SHARED - unregister it or make it private \
+             from the `crystalline` CLI on the server"
+        }
+    )))
 }
 
 /// A mode-mismatched field is a 422 up front, not silently ignored.
@@ -1876,12 +1931,20 @@ pub struct VisibilityBody {
 /// `PUT /domains/{domain}/visibility` - make a domain private, or share it
 /// with the whole instance again.
 ///
-/// **Admin only, in both directions, and deliberately not a manage-level
-/// verb.** Making a domain private hands it an owner - the account that made
-/// the call - and drops that account's own membership row, so a manager who
-/// could call this could take a domain they were merely invited to manage.
-/// Inviting people and changing their levels is a manager's job; deciding
-/// whether a domain is private at all is the instance's.
+/// **The two directions are not the same decision, and they are not gated the
+/// same way.**
+///
+/// Making a domain PRIVATE is admin only. It hands the domain an owner - the
+/// account that made the call - and drops that account's own membership row,
+/// so a shared domain would be *taken* by whoever asked first. There is no
+/// owner on a shared domain to ask, so the instance decides.
+///
+/// Making a domain SHARED again is the owner's to make, or an admin's. The
+/// domain already has an owner, that owner already sees everything in it, and
+/// opening what they closed takes nothing from anybody who was not already
+/// dependent on their goodwill. A MANAGER may do neither: both directions
+/// decide who holds the domain, and inviting people and changing their levels
+/// is where a manager's authority ends (see [`super::members`]).
 ///
 /// The name is resolved against the ENGINE's registry before the accounts
 /// database is touched. The visibility records are keyed by domain name and
@@ -1903,16 +1966,18 @@ pub struct VisibilityBody {
     tag = "domains",
     operation_id = "set_domain_visibility",
     summary = "Make a domain private, or share it with the instance again.",
-    description = "Admin only, in both directions. Making a domain private \
-                   gives it an owner - the calling account - and hides it from \
-                   every account that is not invited into it: a domain nobody \
-                   may see is answered exactly as a domain nobody registered, \
-                   so a stranger's request for it is a 404 rather than a \
-                   403.\n\nA manager may invite people and change their levels \
-                   and may NOT call this: making a domain private transfers \
-                   ownership to the caller, so the verb belongs to the \
-                   instance rather than to one domain's \
-                   administration.\n\nMaking a domain shared again forgets its \
+    description = "Making a domain PRIVATE is admin only: it gives the domain \
+                   an owner - the calling account - and hides it from every \
+                   account that is not invited into it. A domain nobody may \
+                   see is answered exactly as a domain nobody registered, so a \
+                   stranger's request for it is a 404 rather than a \
+                   403.\n\nMaking a domain SHARED again is served to the \
+                   domain's own owner as well as to an admin: they already see \
+                   everything in it, and opening what they closed takes \
+                   nothing from anybody.\n\nA manager may do neither. It may \
+                   invite people and change their levels; deciding who holds \
+                   the domain is not one domain's administration to \
+                   settle.\n\nMaking a domain shared again forgets its \
                    membership list.",
     params(("domain" = String, Path, description = "The registered domain.")),
     request_body = VisibilityBody,
@@ -1926,16 +1991,17 @@ pub struct VisibilityBody {
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may not make this change - not an admin \
+                           when privatizing, neither the owner nor an admin \
+                           when re-sharing - the request did not echo its CSRF \
+                           token, this instance is read-only, or the \
+                           trusted-header identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 404,
-            description = "No such domain.",
+            description = "No such domain, or none this caller may see.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1947,18 +2013,53 @@ pub async fn set_visibility(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<VisibilityBody>,
 ) -> Result<StatusCode, ApiError> {
-    let caller = identity.require_admin()?;
+    if body.private {
+        let caller = identity.require_admin()?;
+        refuse_read_only(&state)?;
+        // The registry check, before anything is written to the accounts
+        // database. An admin sees every domain, so the scope here only ever
+        // refuses a name nobody registered - which is exactly what it is for.
+        // It runs AFTER the role gate on purpose: a non-admin is refused
+        // without a lookup, so this direction cannot be used to ask whether a
+        // hidden domain exists.
+        state
+            .engine
+            .require_domain(&domain, &identity.scope())
+            .await?;
+        state
+            .auth
+            .set_domain_visibility(&domain, true, caller.name())
+            .await
+            .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    // Re-sharing: the owner or an admin. The domain gate comes FIRST here,
+    // because this direction has to resolve who the owner is before it can
+    // answer, and a stranger asking about a hidden domain must get the 404 an
+    // unregistered name gets rather than a 403 that confirms it exists. It
+    // also runs ahead of the read-only refusal, the ordering
+    // [`refuse_read_only`] documents, so that answer does not move with a
+    // setting the caller can observe.
+    let caller = identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
     refuse_read_only(&state)?;
-    // The registry check, before anything is written to the accounts
-    // database. An admin sees every domain, so the scope here only ever
-    // refuses a name nobody registered - which is exactly what it is for.
-    state
-        .engine
-        .require_domain(&domain, &identity.scope())
-        .await?;
+    let right = state
+        .access
+        .right(&identity.scope(), &domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Own {
+        return Err(ApiError::forbidden(format!(
+            "your membership on this domain is {}, and only its owner or an \
+             instance admin may share it with everyone again",
+            super::member_level_word(right)
+        )));
+    }
     state
         .auth
-        .set_domain_visibility(&domain, body.private, caller.name())
+        .set_domain_visibility(&domain, false, caller.name.as_str())
         .await
         .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
     Ok(StatusCode::NO_CONTENT)

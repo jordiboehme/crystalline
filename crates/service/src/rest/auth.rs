@@ -226,6 +226,30 @@ impl Identity {
         self.require(Role::Viewer)
     }
 
+    /// The account behind the request, when what follows is decided by
+    /// something other than the instance role - today, a private domain's
+    /// membership.
+    ///
+    /// [`Identity::require_viewer`] is the whole role check (a domain
+    /// invitation is what grants the rest), but its [`Caller::Anonymous`]
+    /// variant is not an account: the membership records are keyed on login
+    /// names, so an identity with none can only ever resolve to
+    /// [`crate::scope::DomainRight::None`] on a private domain. That case is
+    /// 401 rather than 403, for the reason [`Identity::require_admin`] answers
+    /// 401 to it too - logging in is exactly what fixes it - and answering it
+    /// here rather than one check later is what keeps the anonymous tier's
+    /// answer on these routes the same 401 every other write on this surface
+    /// gives it.
+    pub fn require_account(&self) -> Result<User, ApiError> {
+        match self.require_viewer()? {
+            Caller::Account(user) => Ok(user),
+            Caller::Anonymous => Err(ApiError::unauthorized(
+                "this request is served as the anonymous viewer, which has no \
+                 account to be a member of anything: log in first",
+            )),
+        }
+    }
+
     /// The caller, when the request may mutate content. 403 for a viewer
     /// account, 401 for the anonymous viewer and for no identity at all:
     /// anonymous identities can NEVER write, whatever the deployment mode,

@@ -467,6 +467,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who owns this domain and who is invited into it.
+         * @description Served to any account that may see the domain, which on a private one means its owner, its members at every level, and instance admins. A caller who may not see the domain is answered 404, exactly as for a domain nobody registered.
+         *
+         *     A shared domain answers `shared` with no owner and no members: membership only decides anything while a domain is private.
+         */
+        get: operations["list_domain_members"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/members/{principal}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Invite an account to a private domain, or change its level.
+         * @description Needs manager access on the domain: its own manager, its owner, or an instance admin. The same call invites and re-levels, since both state what the membership should be.
+         *
+         *     Refused on a shared domain (409): membership only decides anything while a domain is private. The owner cannot be named here either - it already holds every level - and an account that does not exist, or is disabled, is a 422 rather than a row waiting for somebody to claim the name.
+         */
+        put: operations["set_domain_member"];
+        post?: never;
+        /**
+         * Remove a membership, or leave a domain.
+         * @description Needs manager access on the domain - its manager, its owner, or an instance admin - OR that the principal is the caller itself, which is how a member leaves.
+         *
+         *     Refused on a shared domain (409), which has no membership to remove. The owner cannot be removed here: hand the domain on with `PUT /domains/{domain}/owner` first. A name that is not a member of this domain is a 404.
+         */
+        delete: operations["remove_domain_member"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/move": {
         parameters: {
             query?: never;
@@ -483,6 +533,28 @@ export interface paths {
          *     The permalink rides in the body for the same reason `RetireBody`'s does: the engram route's wildcard cannot be followed by an action segment.
          */
         post: operations["move_engram"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/owner": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Hand a private domain to a different account.
+         * @description The domain's owner or an instance admin. A manager may not: handing a domain on decides who holds it, which is the same reason a manager may not change visibility.
+         *
+         *     The old owner keeps nothing - they are a stranger to the domain afterwards unless the new owner invites them back. The new owner's own membership row, if it had one, is dropped, since an owner already holds every level. Refused on a shared domain (409), which has no owner to hand on.
+         */
+        put: operations["set_domain_owner"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -669,9 +741,11 @@ export interface paths {
         get?: never;
         /**
          * Make a domain private, or share it with the instance again.
-         * @description Admin only, in both directions. Making a domain private gives it an owner - the calling account - and hides it from every account that is not invited into it: a domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.
+         * @description Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.
          *
-         *     A manager may invite people and change their levels and may NOT call this: making a domain private transfers ownership to the caller, so the verb belongs to the instance rather than to one domain's administration.
+         *     Making a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.
+         *
+         *     A manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.
          *
          *     Making a domain shared again forgets its membership list.
          */
@@ -1364,6 +1438,13 @@ export interface components {
              */
             path?: string | null;
             /**
+             * @description Register the domain private, owned by the calling account. Applies to
+             *     every mode; defaults to false, which is a domain the whole instance
+             *     shares.
+             * @example false
+             */
+            private?: boolean;
+            /**
              * @description owner/name; github mode only.
              * @example acme/knowledge
              */
@@ -1403,6 +1484,24 @@ export interface components {
              * @example decision
              */
             type?: string | null;
+        };
+        /**
+         * @description One membership row: who was invited to a private domain, at what level, by
+         *     whom and when.
+         */
+        DomainMember: {
+            /** @description RFC 3339, when this row was last written. */
+            added_at: string;
+            /**
+             * @description Who added or last changed this row. An audit field, stored as given:
+             *     it is usually a login name but may name a non-account actor, the same
+             *     latitude the identity-link plan gives `linked_by`.
+             */
+            added_by: string;
+            /** @description What this member may do here. */
+            level: components["schemas"]["MemberLevel"];
+            /** @description The member's login name, folded by [`normalize_name`]. */
+            principal: string;
         };
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
         GithubIdentityResponse: {
@@ -1651,6 +1750,41 @@ export interface components {
              */
             version: string;
         };
+        /** @description The level to invite this account at, or to move it to: `viewer` reads, `editor` writes, `manager` also administers the membership. */
+        MemberBody: {
+            /** @description viewer | editor | manager */
+            level: components["schemas"]["MemberLevel"];
+        };
+        /**
+         * @description What a member may do on one private domain. Ordered least to most
+         *     privileged, exactly as [`Role`] is, and deliberately a separate ladder: an
+         *     account's instance role says what it may do on the installation, this says
+         *     what it may do on one domain somebody invited it to.
+         *
+         *     `Manager` is the level that may invite and change other members' levels. It
+         *     may not flip the domain back to shared, and it may not hand the domain to
+         *     someone else: those two stay with the owner (and with an admin), which is
+         *     what keeps "who can see this at all" a decision the owner made.
+         * @enum {string}
+         */
+        MemberLevel: "viewer" | "editor" | "manager";
+        /** @description Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private. */
+        MembersResponse: {
+            /** @description Everyone invited, by name. Empty for a shared domain. */
+            members: components["schemas"]["DomainMember"][];
+            /**
+             * @description The account that owns this domain, or `null`: a shared domain has no
+             *     owner, and a private one whose owner's account was removed has none
+             *     either.
+             * @example ada
+             */
+            owner?: string | null;
+            /**
+             * @description `private` or `shared`.
+             * @example private
+             */
+            visibility: string;
+        };
         /** @description Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move. */
         MoveBody: {
             /**
@@ -1668,6 +1802,14 @@ export interface components {
              * @example notes/beta
              */
             permalink: string;
+        };
+        /** @description The account to hand this private domain to. It must be an existing, enabled account; its own membership row, if it had one, is dropped, since an owner holds every level already. */
+        OwnerBody: {
+            /**
+             * @description The new owner's login name.
+             * @example ada
+             */
+            owner: string;
         };
         /** @description The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves. */
         PasswordBody: {
@@ -4189,6 +4331,187 @@ export interface operations {
             };
         };
     };
+    list_domain_members: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The domain's owner and members. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MembersResponse"];
+                };
+            };
+            /** @description No identity. The anonymous viewer, where `auth.anonymous` allows one, is served: it sees the shared domains it can already read, and no private one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /** @description The account's login name. */
+                principal: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemberBody"];
+            };
+        };
+        responses: {
+            /** @description The account is a member at that level. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is shared, or the principal owns it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An unknown level, or a principal that names no enabled account. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    remove_domain_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /** @description The account's login name. */
+                principal: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description That account is no longer a member. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is neither a manager here nor the principal itself, the request did not echo its CSRF token, or this instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, none this caller may see, or an account that is not a member of it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is shared, or the principal owns it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     move_engram: {
         parameters: {
             query?: never;
@@ -4283,6 +4606,85 @@ export interface operations {
                 };
             };
             /** @description The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_owner: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OwnerBody"];
+            };
+        };
+        responses: {
+            /** @description The domain has that owner now. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller neither owns this domain nor is an admin, the request did not echo its CSRF token, or this instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is shared, so it has no owner. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The owner names no enabled account. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -5100,7 +5502,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may not make this change - not an admin when privatizing, neither the owner nor an admin when re-sharing - the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -5109,7 +5511,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description No such domain. */
+            /** @description No such domain, or none this caller may see. */
             404: {
                 headers: {
                     [name: string]: unknown;
