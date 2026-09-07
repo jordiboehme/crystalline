@@ -442,6 +442,7 @@ fn read_only_daemon_reports_hides_and_refuses() {
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "evolve_engrams",
     ] {
@@ -950,7 +951,7 @@ fn http_smoke_initialize_list_and_search() {
     // it, so the count here is the default one rather than every tool this
     // server implements (see crystalline-service's mcp_collab suite for the
     // full gating matrix).
-    assert_eq!(tools.len(), 18, "a default install's tools over HTTP");
+    assert_eq!(tools.len(), 19, "a default install's tools over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");

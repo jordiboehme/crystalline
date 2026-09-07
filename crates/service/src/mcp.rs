@@ -273,16 +273,17 @@ use serde_json::{Value, json};
 use crystalline_core::{CrystallineUrl, SKILL_ASSETS};
 use crystalline_remote::RemoteError;
 
-/// The tools hidden in read-only mode: the four content-mutating engram tools
+/// The tools hidden in read-only mode: the five content-mutating engram tools
 /// plus `add_domain`, which creates a domain (writing config, and files for a
 /// local domain). In read-only mode they are hidden from `list_tools` and
 /// `get_tool`, while their routes stay registered so a client that calls one by
 /// name still reaches the engine guard and gets the read-only error rather than
 /// a bare "tool not found".
-const WRITE_TOOLS: [&str; 5] = [
+const WRITE_TOOLS: [&str; 6] = [
     "write_engram",
     "edit_engram",
     "move_engram",
+    "split_engram",
     "delete_engram",
     "add_domain",
 ];
@@ -1600,6 +1601,37 @@ impl McpServer {
             .await
             .map_err(to_error)
             .and_then(ok_moved)
+    }
+
+    #[tool(
+        name = "split_engram",
+        title = "Split engram",
+        description = "Split an engram: move part of it into a new engram of its own, in one step, when a bundle mixes lifecycles. Split before you retire. Validity is set per engram rather than per bullet, so when one fact in an engram stops holding while the rest still does, move the facts that still hold out with this tool and retire only what remains - never retire the bundle whole and re-type its surviving facts into the successor, which loses their history and repeats the copy on every later expiry. Use it too when an engram grew a second topic that deserves its own engram, and whenever an evolve_engrams V010 carry-forward-gap finding names it. Select what moves with observations (the one-based line numbers read_engram reports for each observation bullet) or with sections (heading paths such as '## Notes' or '## API > ### Auth', which move with every deeper subsection under them), or both; at least one is required. The new engram is written with the moved content, the source's tags and type, status stable and no validity window - the facts moving out are the ones that still hold - plus a '- derived_from [[Source]]' relation, and the source gets '- split_into [[New]]' back so the pair resolves from both ends and stays out of the one-sided-relation finding. Pass folder to file the new engram under a topic prefix, as write_engram does. Both writes are guarded by expected_checksum (from read_engram) and land together or not at all: a source that changed since your read refuses the split and nothing is created. Refused when the selection would leave the source under the verify minimum of three content lines, which is the case where the answer is to retire the whole engram rather than split it.",
+        annotations(
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
+    )]
+    async fn split_engram(
+        &self,
+        Parameters(p): Parameters<SplitParams>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // One domain, because a split writes twice inside it: the new engram
+        // lands in the source's domain, so the source's gate is the whole gate.
+        if let Some(refusal) = self
+            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
+            .await?
+        {
+            return refuse(refusal);
+        }
+        self.engine
+            .split_engram_as(&p, acting_actor(&ctx).as_deref())
+            .await
+            .map_err(to_error)
+            .and_then(ok_split)
     }
 
     #[tool(
@@ -3310,6 +3342,24 @@ fn ok_moved(value: Value) -> Result<CallToolResult, ErrorData> {
         let domain = to.get("domain").and_then(Value::as_str)?;
         let permalink = to.get("permalink").and_then(Value::as_str)?;
         Some(engram_link(domain, permalink, permalink))
+    })();
+    let mut result = ok(value)?;
+    result.content.extend(link);
+    Ok(result)
+}
+
+/// [`ok`] for a `split_engram` result, with the link pointing at the engram the
+/// split created: the one of the two the caller has not read yet.
+fn ok_split(value: Value) -> Result<CallToolResult, ErrorData> {
+    let link = (|| {
+        let domain = value.get("domain").and_then(Value::as_str)?;
+        let new = value.get("new")?;
+        let permalink = new.get("permalink").and_then(Value::as_str)?;
+        let title = new
+            .get("title")
+            .and_then(Value::as_str)
+            .unwrap_or(permalink);
+        Some(engram_link(domain, permalink, title))
     })();
     let mut result = ok(value)?;
     result.content.extend(link);

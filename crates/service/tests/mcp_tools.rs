@@ -279,6 +279,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
         "recent_activity",
         "search_engrams",
         "skills",
+        "split_engram",
         "validate_engrams",
         "vocabulary",
         "write_engram",
@@ -302,7 +303,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
             "{hidden} must be withheld while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 18, "every tool, exactly once: {names:?}");
+    assert_eq!(names.len(), 19, "every tool, exactly once: {names:?}");
 
     // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
     // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`

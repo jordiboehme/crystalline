@@ -541,7 +541,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         .collect();
     assert_eq!(
         names.len(),
-        18,
+        19,
         "a default install's tools, the `skills` surface among them: {names:?}"
     );
     let mut sorted = names.clone();
@@ -646,7 +646,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
             .as_array()
             .unwrap()
             .len(),
-        18
+        19
     );
 
     // **Task 9 moved this assertion, deliberately.** The same shape at
@@ -657,7 +657,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // revision matches, which
     // `a_version_we_do_not_serve_is_refused_at_the_http_handshake` pins in both
     // of its shapes. Here the era is served: statelessly, with its caching
-    // hints, and with the same 18 tools every other client of this instance is
+    // hints, and with the same 19 tools every other client of this instance is
     // served (GitHub is off here, so the five collaboration tools are withheld
     // from every era alike).
     // `tests/mcp_modern_era.rs` is where the rest of that surface lives.
@@ -680,7 +680,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         head_of(&era)
     );
     let era_result = &payload(&era)["result"];
-    assert_eq!(era_result["tools"].as_array().unwrap().len(), 18);
+    assert_eq!(era_result["tools"].as_array().unwrap().len(), 19);
     assert_eq!(era_result["resultType"], "complete");
     assert_eq!(era_result["ttlMs"], 0);
     assert_eq!(era_result["cacheScope"], "public");

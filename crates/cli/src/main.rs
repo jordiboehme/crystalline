@@ -450,6 +450,38 @@ enum Command {
         #[arg(long)]
         config: Option<PathBuf>,
     },
+    /// Split part of an engram into a new engram of its own, wiring the
+    /// derived_from and split_into pair between them. The move to make when
+    /// one fact in an engram stops holding while the rest still does: split
+    /// first, then retire what remains.
+    Split {
+        /// A bare permalink, title or crystalline:// URL. Without the scheme
+        /// the identifier is domain-relative: never prefix it with a domain
+        /// name.
+        identifier: String,
+        /// The engram's domain. The new engram lands in the same domain.
+        domain: String,
+        /// The new engram's title.
+        title: String,
+        /// Observation bullets to move, by the line numbers `crystalline read`
+        /// reports. Repeat the flag or pass a comma-separated list.
+        #[arg(long)]
+        observation: Option<String>,
+        /// A section to move, by heading path (`## Notes`). Repeat the flag for
+        /// several.
+        #[arg(long)]
+        section: Vec<String>,
+        /// A domain-relative subfolder for the new engram.
+        #[arg(long)]
+        folder: Option<String>,
+        /// The checksum from a prior read; the split is refused as a conflict
+        /// if the source changed since. Omit for last-write-wins.
+        #[arg(long)]
+        expected_checksum: Option<String>,
+        /// Load the global config from this file instead of the default path.
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Delete an engram.
     Delete {
         /// A bare permalink, title or crystalline:// URL. Without the scheme
@@ -1504,9 +1536,12 @@ fn main() -> anyhow::Result<()> {
             | Command::Evolve { .. }
             | Command::Vocabulary { .. }),
         ) => on_runtime_current_thread(move || run_data(cmd, cli.db, cli.json)),
-        Some(cmd @ (Command::Write { .. } | Command::Edit { .. } | Command::Move { .. })) => {
-            on_runtime(move || run_data(cmd, cli.db, cli.json))
-        }
+        Some(
+            cmd @ (Command::Write { .. }
+            | Command::Edit { .. }
+            | Command::Move { .. }
+            | Command::Split { .. }),
+        ) => on_runtime(move || run_data(cmd, cli.db, cli.json)),
         Some(Command::Delete {
             identifier,
             domain,
@@ -1580,6 +1615,27 @@ fn split_commas(s: Option<String>) -> Option<Vec<String>> {
             .map(str::to_string)
             .collect()
     })
+}
+
+/// The observation line numbers `crystalline split` was given, from a
+/// comma-separated or space-separated list. A token that is not a line number
+/// is an error rather than a silently dropped selection: a split that moved
+/// fewer bullets than the caller named is the one outcome worth failing for.
+fn split_lines(raw: Option<String>) -> anyhow::Result<Option<Vec<usize>>> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let mut lines = Vec::new();
+    for token in raw
+        .split([',', ' '])
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+    {
+        lines.push(token.parse::<usize>().map_err(|_| {
+            anyhow::anyhow!("--observation takes line numbers, and '{token}' is not one")
+        })?);
+    }
+    Ok(Some(lines))
 }
 
 fn opt_vec(v: Vec<String>) -> Option<Vec<String>> {
@@ -2355,6 +2411,28 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
             }),
             config,
         ),
+        Command::Split {
+            identifier,
+            domain,
+            title,
+            observation,
+            section,
+            folder,
+            expected_checksum,
+            config,
+        } => (
+            "split_engram",
+            json!({
+                "identifier": identifier,
+                "domain": domain,
+                "title": title,
+                "observations": split_lines(observation)?,
+                "sections": section,
+                "folder": folder,
+                "expected_checksum": expected_checksum,
+            }),
+            config,
+        ),
         Command::Search {
             query,
             domain,
@@ -2522,8 +2600,8 @@ where
 /// read-only verbs (status, search, read, recent, context, domain list): they
 /// never need worker-pool concurrency, so `current_thread` skips spinning up a
 /// pool multi_thread always creates, even for a one-shot command that awaits
-/// one thing at a time. Kept off the four content-mutating data commands
-/// (write, edit, move, delete) and everything else that touches the daemon,
+/// one thing at a time. Kept off the five content-mutating data commands
+/// (write, edit, move, split, delete) and everything else that touches the daemon,
 /// sync, reindex, import or embed, which stay on [`on_runtime`].
 fn on_runtime_current_thread<F, Fut>(make: F) -> anyhow::Result<()>
 where

@@ -268,6 +268,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V004", // 65
             "V105", // 60
             "V006", // 58, base 50 plus the human-authored boost
+            "V010", // 55
             "V101", // 55
             "V202", // 55
             "V102", // 50
@@ -278,8 +279,8 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V003", // 25
         ]
     );
-    assert_eq!(v["total"], 15);
-    assert_eq!(v["count"], 15);
+    assert_eq!(v["total"], 16);
+    assert_eq!(v["count"], 16);
     assert_eq!(v["engrams_scanned"], 19);
     assert_eq!(v["unparsed"], 0);
     assert_eq!(v["scope"]["today"], TODAY);
@@ -296,7 +297,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(
         v["families"],
         serde_json::json!([
-            { "family": "temporal", "findings": 6 },
+            { "family": "temporal", "findings": 7 },
             { "family": "structure", "findings": 6 },
             { "family": "redundancy", "findings": 3 },
         ])
@@ -304,7 +305,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 
     // The prose instruction rides the legend once per rule, never a row.
     let actions = v["actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 15);
+    assert_eq!(actions.len(), 16);
     assert_eq!(actions[0]["rule"], "V001");
     assert!(
         actions
@@ -373,7 +374,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 async fn paging_walks_the_same_ranked_queue() {
     let (_tmp, engine) = fixture().await;
     let mut walked: Vec<String> = Vec::new();
-    for page in 1..=3 {
+    for page in 1..=4 {
         let v = sweep(
             &engine,
             TODAY,
@@ -384,10 +385,14 @@ async fn paging_walks_the_same_ranked_queue() {
             },
         )
         .await;
-        assert_eq!(v["total"], 15);
+        assert_eq!(v["total"], 16);
         assert_eq!(v["limit"], 5);
         assert_eq!(v["page"], page);
-        assert_eq!(v["count"], 5, "fifteen findings fill three whole pages");
+        assert_eq!(
+            v["count"],
+            if page == 4 { 1 } else { 5 },
+            "sixteen findings fill three whole pages and one more row"
+        );
         for (i, row) in v["queue"].as_array().unwrap().iter().enumerate() {
             assert_eq!(row["n"].as_u64().unwrap() as usize, (page - 1) * 5 + i + 1);
         }
@@ -417,7 +422,7 @@ async fn paging_walks_the_same_ranked_queue() {
         },
     )
     .await;
-    assert_eq!(past["total"], 15);
+    assert_eq!(past["total"], 16);
     assert_eq!(past["count"], 0);
     assert!(past["queue"].as_array().unwrap().is_empty());
 }
@@ -425,7 +430,8 @@ async fn paging_walks_the_same_ranked_queue() {
 /// The `today` override moves the temporal comparisons and nothing else, which
 /// is what makes a run reproducible. Evaluated before every planted date, the
 /// age and window rules go silent while the structural and redundancy rules are
-/// unchanged.
+/// unchanged - and so are the three temporal rules that compare no date at all
+/// (`V004`, `V005` and `V010`, which read the graph and the text).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_today_override_moves_only_the_temporal_rules() {
     let (_tmp, engine) = fixture().await;
@@ -444,7 +450,7 @@ async fn the_today_override_moves_only_the_temporal_rules() {
     assert_eq!(
         fired,
         vec![
-            "V004", "V005", "V101", "V102", "V103", "V105", "V106", "V201", "V202", "V203"
+            "V004", "V005", "V010", "V101", "V102", "V103", "V105", "V106", "V201", "V202", "V203"
         ]
     );
     assert_eq!(v["scope"]["today"], BEFORE_EVERYTHING);
@@ -482,9 +488,9 @@ async fn family_and_rule_filters_narrow_the_queue() {
     .await;
     assert_eq!(
         rules(&temporal),
-        vec!["V005", "V001", "V002", "V004", "V006", "V003"]
+        vec!["V005", "V001", "V002", "V004", "V006", "V010", "V003"]
     );
-    assert_eq!(temporal["total"], 6);
+    assert_eq!(temporal["total"], 7);
     assert_eq!(
         temporal["scope"]["families"],
         serde_json::json!(["temporal"])
@@ -638,7 +644,7 @@ async fn an_unreadable_engram_is_counted_rather_than_aborting_the_sweep() {
     .await;
     assert_eq!(v["unparsed"], 1);
     assert_eq!(v["engrams_scanned"], 18);
-    assert_eq!(v["total"], 14);
+    assert_eq!(v["total"], 15);
     assert!(!rules(&v).contains(&"V106".to_string()));
 }
 

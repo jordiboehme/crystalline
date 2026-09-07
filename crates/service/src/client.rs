@@ -1280,6 +1280,11 @@ pub(crate) async fn dispatch_engine(
                 .move_engram(&decode::<MoveParams>(args)?, &Scope::Unrestricted)
                 .await?
         }
+        "split_engram" => {
+            engine
+                .split_engram_as(&decode::<SplitParams>(args)?, Some(CLI_ACTOR))
+                .await?
+        }
         "delete_engram" => engine.delete_engram(&decode::<DeleteParams>(args)?).await?,
         "search_engrams" => {
             engine
