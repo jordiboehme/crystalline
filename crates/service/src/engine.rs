@@ -1165,6 +1165,31 @@ impl Engine {
         Ok(self.hidden_domains(scope).await?.unwrap_or_default())
     }
 
+    /// [`Engine::hidden_for`] and the set of private domain names, from one
+    /// read of the visibility records.
+    ///
+    /// For the one caller that needs both: a domain listing subtracts the
+    /// hidden names and then marks each row it kept private or shared. Asking
+    /// for the two separately would sweep the same table twice for one answer.
+    ///
+    /// An engine with no resolver installed - a one-shot CLI command, the
+    /// embedded stdio stack, a test engine - answers with two empty sets:
+    /// there is no accounts database on those, so no domain has ever been made
+    /// private through one.
+    async fn visibility_for(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok((HashSet::new(), HashSet::new()));
+        };
+        let visibility = access
+            .visibility(scope)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok((visibility.private, visibility.hidden.unwrap_or_default()))
+    }
+
     /// The domain list a scoped store query is given: the caller's own filter
     /// with the hidden names subtracted, or - when the caller named none and
     /// something is hidden - every domain the store holds minus those.
@@ -5434,12 +5459,17 @@ impl Engine {
     /// A domain `scope` may not see is absent from the listing, not marked as
     /// withheld: this is the index a caller routes by, and a name in it is the
     /// whole of what a private domain keeps.
+    ///
+    /// Each row it does keep carries `private`, so a client that draws a badge
+    /// reads it off the listing rather than asking after every domain in it.
+    /// That is not the same fact as the one above and it is not a leak of it:
+    /// a caller who may not see a domain never gets a row for it to read.
     pub async fn list_domains(
         &self,
         p: &ListDomainsParams,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        let hidden = self.hidden_for(scope).await?;
+        let (private, hidden) = self.visibility_for(scope).await?;
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
@@ -5459,6 +5489,15 @@ impl Engine {
                 "observations": s.map(|d| d.observations),
                 "relations": s.map(|d| d.relations),
                 "last_sync": s.and_then(|d| d.last_sync.clone()),
+                // Whether this domain is private, so a client badges the row it
+                // already has instead of asking after each one. Every domain a
+                // caller may not read was dropped above, so this only ever says
+                // "private" about a domain that caller can already see.
+                //
+                // False on an installation with no accounts database, which is
+                // every domain on it: privacy is a membership record, and a
+                // machine with no accounts has none.
+                "private": private.contains(name),
             });
             // In a shared database a file domain names its current host so an
             // agent and an operator see who syncs what; `hosted_here` is true when

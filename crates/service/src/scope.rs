@@ -163,6 +163,25 @@ pub struct DomainAccess {
     auth: Arc<AuthStore>,
 }
 
+/// What one read of the visibility records says: which domains are private,
+/// and which of those the asking scope may not read.
+///
+/// The two sets answer two different questions and only one of them is a
+/// secret. `private` is a property of the domain, true for every private
+/// domain on the instance whoever is asking; `hidden` is a property of the
+/// caller, and carries [`DomainAccess::hidden_domains`]' own meaning
+/// unchanged, `None` for the machine owner and otherwise the names to
+/// subtract. A listing subtracts `hidden` first and marks what is left from
+/// `private`, so no row it keeps was ever a name this caller may not learn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DomainVisibility {
+    /// Every private domain on the instance, by name.
+    pub private: HashSet<String>,
+    /// The private domains this scope may not read, or `None` for no
+    /// filtering at all.
+    pub hidden: Option<HashSet<String>>,
+}
+
 impl DomainAccess {
     /// Wrap the accounts store. Cheap: this holds a handle and no state of its
     /// own, so every answer is read fresh and a membership change takes effect
@@ -201,19 +220,59 @@ impl DomainAccess {
     /// holds only the accounts store, so it cannot enumerate the registered
     /// domains, and a method named for the complement of what it returns is
     /// how an inverted filter ships.)
+    ///
+    /// Half of [`DomainAccess::visibility`], and the half nearly every caller
+    /// wants. The machine owner is still answered without reading anything at
+    /// all: this is the filter on every scoped read, and the one scope that
+    /// filters nothing must not pay a query to be told so.
     pub async fn hidden_domains(&self, scope: &Scope) -> Result<Option<HashSet<String>>> {
         let principal = self.principal(scope).await?;
         if matches!(principal, Principal::Unrestricted) {
             return Ok(None);
         }
+        Ok(self.resolve(&principal).await?.hidden)
+    }
+
+    /// Which domains are private, and which of those `scope` may not read.
+    ///
+    /// Both facts from one read of `domain_acl`, for the caller that needs
+    /// them together: a domain listing marks each row it kept private or
+    /// shared and drops the hidden ones, and doing that through
+    /// [`DomainAccess::hidden_domains`] plus a second reader would be two
+    /// sweeps of the same table for one answer.
+    ///
+    /// `private` is filled for every scope, the machine owner included, and
+    /// that is the one thing this answers that `hidden_domains` does not:
+    /// whether a domain is private is not a secret from anybody who can see
+    /// the domain at all, and the machine owner sees all of them.
+    pub async fn visibility(&self, scope: &Scope) -> Result<DomainVisibility> {
+        let principal = self.principal(scope).await?;
+        self.resolve(&principal).await
+    }
+
+    /// The whole visibility fold, over an already-resolved principal.
+    ///
+    /// One read of `domain_acl` and, for an account, one read of its own
+    /// membership list - instead of one read per private domain. The decision
+    /// is still [`decide`], given the same three inputs
+    /// [`DomainAccess::right`] gives it, which is what keeps the bulk answer
+    /// and the per-domain one from drifting apart.
+    async fn resolve(&self, principal: &Principal) -> Result<DomainVisibility> {
         let acls = self.auth.private_domains().await?;
-        if acls.is_empty() {
-            return Ok(Some(HashSet::new()));
+        let private: HashSet<String> = acls.iter().map(|acl| acl.domain.clone()).collect();
+        if matches!(principal, Principal::Unrestricted) {
+            return Ok(DomainVisibility {
+                private,
+                hidden: None,
+            });
         }
-        // One read of this caller's whole membership list instead of one read
-        // per private domain. The decision below is still `decide`, given the
-        // same three inputs `right` gives it.
-        let levels: HashMap<String, MemberLevel> = match &principal {
+        if acls.is_empty() {
+            return Ok(DomainVisibility {
+                private,
+                hidden: Some(HashSet::new()),
+            });
+        }
+        let levels: HashMap<String, MemberLevel> = match principal {
             Principal::Account { name, .. } => {
                 self.auth.memberships_of(name).await?.into_iter().collect()
             }
@@ -222,11 +281,14 @@ impl DomainAccess {
         let mut hidden = HashSet::new();
         for acl in &acls {
             let level = levels.get(&acl.domain).copied();
-            if decide(&principal, Some(acl), level) < DomainRight::Read {
+            if decide(principal, Some(acl), level) < DomainRight::Read {
                 hidden.insert(acl.domain.clone());
             }
         }
-        Ok(Some(hidden))
+        Ok(DomainVisibility {
+            private,
+            hidden: Some(hidden),
+        })
     }
 
     /// Resolve a scope against the accounts table.

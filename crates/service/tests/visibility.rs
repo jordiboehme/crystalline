@@ -193,6 +193,53 @@ async fn a_hidden_domain_is_absent_from_search_list_and_read() {
     );
 }
 
+/// Every row of the listing says whether that domain is private, so a client
+/// draws the badge off the index it already has rather than a second read per
+/// domain.
+///
+/// Read by everyone who can see `lab` at all - a member, the owner, an admin
+/// and the machine owner - because the fact is not a secret from anybody the
+/// domain is already listed to. A stranger is not in that cast: `lab` is absent
+/// from their listing entirely, which is the stronger answer this file's first
+/// test pins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_listed_domain_says_whether_it_is_private() {
+    let (_tmp, engine) = fixture().await;
+    for (who, scope) in [
+        ("mem", user("mem")),
+        ("owner", user("owner")),
+        ("boss", admin("boss")),
+        ("the machine owner", Scope::Unrestricted),
+    ] {
+        let listed = engine
+            .list_domains(&ListDomainsParams::default(), &scope)
+            .await
+            .unwrap();
+        assert_eq!(
+            private_flag(&listed, "lab"),
+            Some(true),
+            "{who} sees `lab` marked private: {listed}"
+        );
+        assert_eq!(
+            private_flag(&listed, "open"),
+            Some(false),
+            "{who} sees `open` marked shared: {listed}"
+        );
+    }
+}
+
+/// The `private` flag of one row of a domain listing, or `None` when the
+/// listing does not name that domain at all.
+fn private_flag(listed: &serde_json::Value, domain: &str) -> Option<bool> {
+    listed
+        .get("domains")?
+        .as_array()?
+        .iter()
+        .find(|row| row.get("name").and_then(|n| n.as_str()) == Some(domain))?
+        .get("private")?
+        .as_bool()
+}
+
 /// An invitation is what makes the difference, not the shape of the request:
 /// the member and the owner read exactly what the stranger cannot - and so does
 /// an instance admin, who is never a member of anything.

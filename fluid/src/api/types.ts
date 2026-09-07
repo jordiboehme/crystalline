@@ -2910,6 +2910,7 @@ export interface operations {
                      *           "name": "eng",
                      *           "observations": 12,
                      *           "path": "/Users/ada/Documents/Crystalline/eng",
+                     *           "private": false,
                      *           "relations": 3,
                      *           "when_to_use": [
                      *             "Route here for eng questions."

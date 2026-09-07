@@ -60,5 +60,5 @@ pub use mcp_gate::{
 };
 pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
-pub use scope::{DomainAccess, DomainRight, Scope};
+pub use scope::{DomainAccess, DomainRight, DomainVisibility, Scope};
 pub use stub::{DegradedServer, StubStatus};

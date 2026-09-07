@@ -53,6 +53,7 @@ use crate::params::{BrowseParams, ListDomainsParams};
                     "observations": 12,
                     "relations": 3,
                     "last_sync": "2026-08-05T09:14:22Z",
+                    "private": false,
                     "when_to_use": ["Route here for eng questions."]
                 }]
             }),
