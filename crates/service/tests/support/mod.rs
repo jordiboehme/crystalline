@@ -1032,6 +1032,89 @@ impl EmbeddingProvider for CountingEmbedder {
     }
 }
 
+/// The marker words that decide an engram's axis under [`TopicEmbedder`].
+pub const TOPICS: [&[&str]; 3] = [
+    &["retry", "retries", "backoff", "queue", "dead-letter", "ttl"],
+    &["docking", "clamp", "clamps", "thrust", "seats", "bay"],
+    &["token", "login", "session", "auth", "cookie", "csrf"],
+];
+
+/// A deterministic provider that embeds by topic: every marker word adds to
+/// its topic's axis, everything else lands on a fourth "none" axis when no
+/// marker appears at all. Two texts about one topic are identical vectors;
+/// texts about different topics are orthogonal; a manifest or a random note
+/// is orthogonal to every topic. That is what makes "a neighbour appears" and
+/// "the receipt stays quiet" both assertable, where a hash-bucket provider
+/// makes unrelated prose look alike.
+pub struct TopicEmbedder;
+
+impl TopicEmbedder {
+    pub fn embed_one(text: &str) -> Vec<f32> {
+        let mut v = [0f32; 4];
+        for word in text
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|w| !w.is_empty())
+        {
+            let w = word.to_lowercase();
+            for (axis, words) in TOPICS.iter().enumerate() {
+                if words.contains(&w.as_str()) {
+                    v[axis] += 1.0;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return vec![0.0, 0.0, 0.0, 1.0];
+        }
+        v.iter().map(|x| x / norm).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for TopicEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+/// A provider that answers like [`TopicEmbedder`] after sleeping `delay`, for
+/// the probe timeout path.
+pub struct SleepyEmbedder {
+    pub delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for SleepyEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        tokio::time::sleep(self.delay).await;
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
 // --- tracing capture --------------------------------------------------------
 
 /// Every `tracing` event emitted while this is the thread's default

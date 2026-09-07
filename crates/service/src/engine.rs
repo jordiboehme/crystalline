@@ -41,8 +41,8 @@ use crystalline_index::{
     Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES,
     RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
     SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
-    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, retired_factor,
-    rule_info, salience_prior, scan_domain, scan_paths,
+    is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
+    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -57,6 +57,10 @@ use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
 use crate::poller;
 use crate::settings;
+use crate::similar::{
+    self, SIMILAR_BACKLOG_POLL, SIMILAR_BACKLOG_WAIT, SIMILAR_LIMIT, SIMILAR_PAGE, SIMILAR_TIMEOUT,
+    SimilarEngram, SimilarProbe,
+};
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
@@ -5589,6 +5593,163 @@ impl Engine {
             "count": page.items.len(),
             "hits": serde_json::to_value(&page.items).unwrap_or(Value::Null),
         }))
+    }
+
+    /// The nearest current engrams to `probe_text` that `scope` may see: the
+    /// retrieval behind the write receipt's `similar` list.
+    ///
+    /// Vector-only on purpose - prose never goes through the lexical parser,
+    /// where parentheses and AND/OR/NOT in an ordinary sentence read as
+    /// operators. The mode is settled the way search settles it, so with no
+    /// provider or no active embeddings for this model the answer is empty
+    /// rather than a text search in disguise. `exclude` is the engram that was
+    /// just written, matched on domain and permalink; the retirement set is
+    /// dropped after the page comes back, which is why the page is one wider
+    /// than the list. Ranking only: no score leaves this function.
+    pub async fn similar_engrams(
+        &self,
+        probe_text: &str,
+        exclude: Option<(&str, &str)>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Vec<SimilarEngram>> {
+        let Some(provider) = self.provider() else {
+            return Ok(Vec::new());
+        };
+        let hidden = self.hidden_for(scope).await?;
+        let domains = match self.scoped_domains(&[], &hidden).await? {
+            ScopedDomains::AsAsked => None,
+            ScopedDomains::Only(domains) => Some(domains),
+            ScopedDomains::Nothing => return Ok(Vec::new()),
+        };
+        let effective = {
+            let store = self.store.lock().await;
+            self.effective_mode(&*store, SearchMode::Semantic, true, true)
+                .await?
+        };
+        if !matches!(effective, SearchMode::Semantic) {
+            return Ok(Vec::new());
+        }
+        let vecs = provider
+            .embed_queries(&[probe_text.to_string()])
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let Some(embedding) = vecs.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let query = SearchQuery {
+            domains,
+            mode: SearchMode::Semantic,
+            query_embedding: Some(embedding),
+            active_model: Some(self.model_id.clone()),
+            // Pure cosine order: the fade would only reorder hits this drops.
+            retired_weight: Some(1.0),
+            limit: SIMILAR_PAGE,
+            page: 1,
+            ..SearchQuery::default()
+        };
+        let page = {
+            let store = self.store.lock().await;
+            store.search(&query).await?
+        };
+        Ok(page
+            .items
+            .into_iter()
+            .filter(|hit| !is_retired_status(&hit.status))
+            .filter(|hit| exclude.is_none_or(|(d, p)| !(hit.domain == d && hit.permalink == p)))
+            .take(SIMILAR_LIMIT)
+            .map(|hit| SimilarEngram {
+                domain: hit.domain,
+                permalink: hit.permalink,
+                title: hit.title,
+                status: hit.status,
+                engram_type: hit.engram_type,
+            })
+            .collect())
+    }
+
+    /// Put the neighbours advisory on a write receipt, or leave it alone.
+    ///
+    /// Runs after the write has landed and can neither fail nor delay it past
+    /// [`SIMILAR_TIMEOUT`]: every failure - no provider, no embeddings, a
+    /// store error, the clock - is a debug line and an unchanged receipt. Off
+    /// when `capture.similar` is off. The probe first waits, briefly, for the
+    /// embed worker to drain what was just written, so a capture made a moment
+    /// ago can be a neighbour of this one.
+    ///
+    /// The receipt must already name the engram that landed, as top-level
+    /// string `domain` and `permalink` keys: they are what the advisory
+    /// excludes itself by, and what an edit looks its title up from. A receipt
+    /// shaped any other way is left untouched.
+    pub async fn attach_similar(
+        &self,
+        receipt: &mut Value,
+        probe: SimilarProbe<'_>,
+        scope: &crate::scope::Scope,
+    ) {
+        if !self.config.read().unwrap().capture_similar() {
+            return;
+        }
+        let (Some(domain), Some(permalink)) = (
+            receipt
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            receipt
+                .get("permalink")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ) else {
+            return;
+        };
+        let work = async {
+            let text = match probe {
+                SimilarProbe::Write {
+                    title,
+                    description,
+                    body,
+                } => similar::write_probe_text(title, description, body),
+                SimilarProbe::Markdown { text } => similar::markdown_probe_text(text),
+                SimilarProbe::Edit { new_text } => {
+                    let title = {
+                        let store = self.store.lock().await;
+                        store
+                            .find_engram(&domain, &permalink)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|d| d.title)
+                    };
+                    title.and_then(|t| similar::edit_probe_text(&t, new_text))
+                }
+            };
+            let Some(text) = text else {
+                return Ok(Vec::new());
+            };
+            self.await_embed_backlog(SIMILAR_BACKLOG_WAIT).await;
+            self.similar_engrams(&text, Some((&domain, &permalink)), scope)
+                .await
+        };
+        match tokio::time::timeout(SIMILAR_TIMEOUT, work).await {
+            Ok(Ok(found)) => similar::attach(receipt, &found),
+            Ok(Err(e)) => tracing::debug!("similar probe skipped: {e}"),
+            Err(_) => tracing::debug!("similar probe cut at {SIMILAR_TIMEOUT:?}"),
+        }
+    }
+
+    /// Wait, at most `budget`, for the embed worker to clear the backlog.
+    /// Without a worker there is nothing to wait for and no wait happens.
+    async fn await_embed_backlog(&self, budget: std::time::Duration) {
+        if self.embed_tx.is_none() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match self.embedding_backlog().await {
+                Ok(0) | Err(_) => return,
+                Ok(_) if tokio::time::Instant::now() >= deadline => return,
+                Ok(_) => tokio::time::sleep(SIMILAR_BACKLOG_POLL).await,
+            }
+        }
     }
 
     async fn effective_mode(
