@@ -102,20 +102,27 @@ const MCP_SESSION_ID: &str = "mcp-session-id";
 
 /// Which identity opened which session, for the life of this process.
 ///
-/// Kept here rather than in rmcp's session manager so the whole identity
-/// decision is one place: the manager's job is protocol state, and a binding it
-/// held would be a second rule to keep in step with this one. Entries are
-/// created when the transport hands back a new session id and dropped when a
-/// session is terminated, so the map tracks the manager's own sessions rather
-/// than growing past them.
+/// The decision itself is kept here rather than in rmcp's session manager, so
+/// the whole identity rule is one place: the manager's job is protocol state,
+/// and a binding it held would be a second rule to keep in step with this one.
+/// What the manager does own is the *end* of a session, and it ends one on three
+/// paths - a client `DELETE`, the 300 second idle keep-alive, and a worker
+/// error - all of which funnel through `SessionManager::close_session` (rmcp
+/// 3.2.0 `tower.rs:1331` for the latter two, `:2073` for the DELETE). So the map
+/// is handed to the session-manager wrapper as well and released from there,
+/// which is what actually keeps it in step with rmcp's own sessions rather than
+/// growing one permanent entry per connection that ever went idle.
+///
+/// Shared by every clone of the gate and by that wrapper, so it is constructed
+/// once, before either, and both are handed the same handle.
 #[derive(Default)]
-struct SessionOwners(Mutex<HashMap<String, String>>);
+pub struct SessionOwners(Mutex<HashMap<String, String>>);
 
 impl SessionOwners {
     /// The account that opened `session`, if this process minted it. `None`
     /// means no claim is on record - an id from a previous process, or one
     /// nothing ever issued - and the transport answers those itself.
-    fn owner(&self, session: &str) -> Option<String> {
+    pub(crate) fn owner(&self, session: &str) -> Option<String> {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -126,16 +133,18 @@ impl SessionOwners {
     /// Record the identity a freshly minted session belongs to. Idempotent: a
     /// response that echoes an existing id can only have passed the mismatch
     /// check, so it rewrites the same name.
-    fn claim(&self, session: String, name: String) {
+    pub(crate) fn claim(&self, session: String, name: String) {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session, name);
     }
 
-    /// Forget a terminated session, so the map does not outlive the transport's
-    /// own.
-    fn release(&self, session: &str) {
+    /// Forget an ended session. Called from the session-manager wrapper on
+    /// every path rmcp ends one, and again from the gate's own `DELETE` branch,
+    /// which is a fast path rather than a second rule: removing an entry twice
+    /// is removing it once.
+    pub fn release(&self, session: &str) {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -162,12 +171,14 @@ pub struct McpGate<S> {
 impl<S> McpGate<S> {
     /// Wrap `inner`. `auth` is `Some` only when `auth.mcp` is on; the daemon
     /// resolves that once, when the HTTP surface starts, like every other
-    /// `auth.*` key.
-    pub fn new(inner: S, auth: Option<Arc<AuthStore>>) -> McpGate<S> {
+    /// `auth.*` key. `sessions` is the same handle the session-manager wrapper
+    /// holds, which is why it is passed in rather than made here: the manager
+    /// has to exist before the transport does, and the transport before this.
+    pub fn new(inner: S, auth: Option<Arc<AuthStore>>, sessions: Arc<SessionOwners>) -> McpGate<S> {
         McpGate {
             inner,
             auth,
-            sessions: Arc::new(SessionOwners::default()),
+            sessions,
         }
     }
 }
@@ -306,9 +317,11 @@ where
                     if let Some(session) = minted_session(&response) {
                         sessions.claim(session, name);
                     }
-                    // A terminated session's id can be minted again by nothing,
-                    // but the claim would outlive the transport's own state, so
-                    // it goes when the transport says the session is gone.
+                    // rmcp has already called `close_session` by the time it
+                    // answers a DELETE (`tower.rs:2073`), so the wrapper has
+                    // released this claim already; doing it again here costs a
+                    // map lookup and means the release does not depend on which
+                    // side of that ordering a future rmcp lands on.
                     if terminating
                         && response.status().is_success()
                         && let Some(session) = &named
@@ -431,7 +444,11 @@ mod tests {
     async fn an_authenticated_request_carries_its_account_into_the_transport() {
         let (_tmp, store, admin, editor) = store_with_two_agents().await;
         let seen = Arc::new(std::sync::Mutex::new(None));
-        let mut gate = McpGate::new(CapturingService(seen.clone()), Some(store.clone()));
+        let mut gate = McpGate::new(
+            CapturingService(seen.clone()),
+            Some(store.clone()),
+            Arc::new(SessionOwners::default()),
+        );
 
         let response =
             tower_service::Service::call(&mut gate, request_with(Some(&format!("Bearer {admin}"))))
@@ -481,7 +498,11 @@ mod tests {
     #[tokio::test]
     async fn with_the_gate_off_requests_pass_and_carry_no_identity() {
         let seen = Arc::new(std::sync::Mutex::new(None));
-        let mut gate = McpGate::new(CapturingService(seen.clone()), None);
+        let mut gate = McpGate::new(
+            CapturingService(seen.clone()),
+            None,
+            Arc::new(SessionOwners::default()),
+        );
         let response = tower_service::Service::call(&mut gate, request_with(None))
             .await
             .unwrap();

@@ -139,7 +139,10 @@ const ERA: &str = "2026-07-28";
 /// A modern-era `tools/list`: the era's two required `_meta` keys in the body
 /// and the SEP-2243 standard headers beside them, which is the shape that
 /// reaches the transport without ever touching a session.
-async fn post_stateless_tools_list(addr: &std::net::SocketAddr, token: &str) -> reqwest::Response {
+async fn post_stateless_tools_list(
+    addr: &std::net::SocketAddr,
+    token: Option<&str>,
+) -> reqwest::Response {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
         "id": 7,
@@ -156,17 +159,17 @@ async fn post_stateless_tools_list(addr: &std::net::SocketAddr, token: &str) -> 
         }
     })
     .to_string();
-    reqwest::Client::new()
+    let mut request = reqwest::Client::new()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
         .header("accept", "application/json, text/event-stream")
         .header("mcp-protocol-version", ERA)
         .header("mcp-method", "tools/list")
-        .header("authorization", format!("Bearer {token}"))
-        .body(body)
-        .send()
-        .await
-        .unwrap()
+        .body(body);
+    if let Some(token) = token {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    request.send().await.unwrap()
 }
 
 /// The `notifications/initialized` a client sends straight after a successful
@@ -407,10 +410,10 @@ async fn a_session_is_bound_to_the_identity_that_opened_it() {
         ended.status()
     );
     let stale = post_on_session(&addr, &session, &bob).await;
-    assert_ne!(
+    assert_eq!(
         stale.status(),
-        403,
-        "with the session gone there is no claim left to violate"
+        404,
+        "with the claim released the transport answers for its own vanished session"
     );
 }
 
@@ -426,7 +429,7 @@ async fn a_stateless_request_from_another_identity_is_untouched_by_the_binding()
     assert_eq!(handshake.status(), 200);
     drop(handshake);
 
-    let stateless = post_stateless_tools_list(&addr, &bob).await;
+    let stateless = post_stateless_tools_list(&addr, Some(&bob)).await;
     assert_eq!(
         stateless.status(),
         200,
@@ -464,5 +467,26 @@ async fn a_revoked_token_is_refused_on_the_session_it_opened() {
     assert!(
         body["error"].as_str().unwrap().contains("Agent access"),
         "the ordinary teaching text answers it"
+    );
+}
+
+/// The refusal does not depend on the shape of the request: a modern-era
+/// (2026-07-28) request carries its own `_meta` and routes statelessly, by far
+/// the most different path through the transport, and it is refused at the same
+/// door with the same bytes as a legacy handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unauthenticated_modern_era_request_is_refused_at_the_same_door() {
+    let (addr, _guard, _store) = serve_with_mcp_auth(true).await;
+    let baseline = post_initialize(&addr, None).await;
+    assert_eq!(baseline.status(), 401);
+    let baseline = baseline.text().await.unwrap();
+
+    let refused = post_stateless_tools_list(&addr, None).await;
+    assert_eq!(refused.status(), 401);
+    assert_eq!(refused.headers()["www-authenticate"], "Bearer");
+    assert_eq!(
+        refused.text().await.unwrap(),
+        baseline,
+        "one refusal, whatever era the request speaks"
     );
 }

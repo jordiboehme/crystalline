@@ -919,14 +919,34 @@ type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
 /// still connecting. That is the honest reading of the name it already has, and
 /// on a modern-only fleet the number stops growing. A figure covering modern
 /// traffic would be a different metric, not a repair of this one.
+///
+/// # Why it also releases session claims
+///
+/// This is the one seam rmcp calls on *every* end of a session:
+/// `close_session` runs from the DELETE handler (`tower.rs:2073`) and from
+/// `spawn_session_worker`'s exit path (`tower.rs:1331`), which is where a
+/// session ended by the 300 second idle keep-alive or by a worker error lands.
+/// The identity gate's claim map has to be released on all three or it grows one
+/// permanent entry per connection that ever went idle, so the map is threaded
+/// through here rather than released only where the gate can see it - see
+/// [`crate::mcp_gate::SessionOwners`].
 pub(crate) struct CountingSessions<M> {
     inner: M,
     created: Arc<AtomicUsize>,
+    sessions: Arc<crate::mcp_gate::SessionOwners>,
 }
 
 impl<M> CountingSessions<M> {
-    fn new(inner: M, created: Arc<AtomicUsize>) -> CountingSessions<M> {
-        CountingSessions { inner, created }
+    fn new(
+        inner: M,
+        created: Arc<AtomicUsize>,
+        sessions: Arc<crate::mcp_gate::SessionOwners>,
+    ) -> CountingSessions<M> {
+        CountingSessions {
+            inner,
+            created,
+            sessions,
+        }
     }
 }
 
@@ -961,6 +981,11 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
         &self,
         id: &SessionId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // Released before the inner manager is asked to close, so the claim is
+        // gone whether or not the close itself errors: a session rmcp has given
+        // up on must not keep refusing a later caller who legitimately gets its
+        // id, and the entry is worthless either way.
+        self.sessions.release(id);
         self.inner.close_session(id)
     }
 
@@ -1251,7 +1276,15 @@ fn http_base(
     // The counter lives here rather than in the factory below, so it counts
     // sessions rather than every construction rmcp asks for; see
     // [`CountingSessions`].
-    let session_manager = Arc::new(CountingSessions::new(session_manager, http_sessions));
+    // Constructed before the session manager, because both the manager wrapper
+    // and the gate hold the same handle: the manager releases a claim on every
+    // path rmcp ends a session, and the gate is what records one.
+    let session_owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+    let session_manager = Arc::new(CountingSessions::new(
+        session_manager,
+        http_sessions,
+        session_owners.clone(),
+    ));
     // The REST state is built only when the API is served. It is not free (it
     // resolves paths and can fail), and building it to then leave it unmounted
     // would mean `service.api=false` could still fail a start over a surface
@@ -1274,7 +1307,7 @@ fn http_base(
     // mounted - a browser navigation is answered by the shell middleware before
     // the gate is ever reached. What is left for the gate is exactly the
     // requests the transport would have served.
-    let service = crate::mcp_gate::McpGate::new(service, mcp_auth);
+    let service = crate::mcp_gate::McpGate::new(service, mcp_auth, session_owners);
     let mut router = axum::Router::new().route("/health", axum::routing::get(health));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
@@ -1847,6 +1880,38 @@ pub(crate) async fn open_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path rmcp ends a session on runs through `close_session`, so
+    /// releasing the identity claim there is what keeps the gate's map in step
+    /// with rmcp's own sessions. A client `DELETE` is one of those paths and is
+    /// covered end to end in `tests/mcp_auth.rs`; the other two - the 300 second
+    /// idle keep-alive and a worker error - are reached from inside
+    /// `spawn_session_worker`, with no seam a test can drive without standing up
+    /// a real session and waiting out a timer that is not on a pausable clock
+    /// from out here. So this drives `close_session` itself, which is the single
+    /// point all three arrive at (rmcp 3.2.0 `tower.rs:1331` and `:2073`).
+    #[tokio::test]
+    async fn closing_a_session_releases_the_identity_that_claimed_it() {
+        use rmcp::transport::streamable_http_server::session::SessionManager;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
+        let owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+        let manager = CountingSessions::new(
+            LocalSessionManager::default(),
+            Arc::new(AtomicUsize::new(0)),
+            owners.clone(),
+        );
+        let (id, _transport) = manager.create_session().await.unwrap();
+        owners.claim(id.to_string(), "ada".to_string());
+        assert_eq!(owners.owner(&id).as_deref(), Some("ada"));
+
+        manager.close_session(&id).await.unwrap();
+        assert_eq!(
+            owners.owner(&id),
+            None,
+            "a session rmcp has given up on leaves no claim behind"
+        );
+    }
 
     // These pin down the exact `--http` semantics containers rely on: a
     // container must bind 0.0.0.0 (not the 127.0.0.1 default) to be reachable
