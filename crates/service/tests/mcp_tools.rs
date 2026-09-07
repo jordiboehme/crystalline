@@ -3715,6 +3715,13 @@ async fn provision_is_listed_when_no_domain_declares_and_refuses_the_mutations()
             text.contains("## Provisioning"),
             "provision {action}'s refusal must name what is missing: {text}"
         );
+        // A stdio session is the machine owner, so the instance-admin gate the
+        // three mutating actions carry over HTTP never fires here: whoever runs
+        // this process already has the config file and the harnesses on disk.
+        assert!(
+            !text.contains("instance admin"),
+            "provision {action} is never role gated over stdio: {text}"
+        );
     }
 }
 

@@ -2033,6 +2033,83 @@ async fn provision_status_hides_a_private_domain_from_the_open_tier_too() {
     );
 }
 
+/// **`provision` allow, deny and apply change this instance, so they need the
+/// instance admin role.**
+///
+/// A decision is written into the same `config.yaml` a `configure set` writes,
+/// and `apply` then runs the harness CLIs on the machine the daemon runs on -
+/// installing skills, commands, agents and MCP server entries into whoever's
+/// harnesses live there. That is the class `add_domain` and `configure` are
+/// gated as, and it was gated nowhere until this test existed: an authenticated
+/// viewer's or editor's agent could do on the server what the two named verbs
+/// refuse it.
+///
+/// `status` is not in the set: it is a read, and it is scoped rather than
+/// refused (see `provision_status_lists_only_the_domains_a_caller_may_see`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_allow_deny_and_apply_need_the_instance_admin_role() {
+    let ctx = mcp_ctx(true).await;
+    let actions = [
+        serde_json::json!({ "action": "allow", "domain": "open" }),
+        serde_json::json!({ "action": "deny", "domain": "open" }),
+        serde_json::json!({ "action": "apply" }),
+    ];
+
+    for who in ["looker", "out"] {
+        let token = ctx.token_for(who).await;
+        let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+        for action in &actions {
+            let refused = session.call_tool("provision", action.clone()).await;
+            assert!(
+                refused.contains("instance admin"),
+                "provision {action} is refused for {who}, and the refusal names \
+                 the role:\n{refused}"
+            );
+        }
+    }
+
+    // An admin passes the role gate and meets the declaration gate instead,
+    // which is the next refusal down and proves the first one is behind it
+    // rather than in front of everybody.
+    let boss = ctx.token_for("boss").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&boss)).await;
+    for action in &actions {
+        let answer = session.call_tool("provision", action.clone()).await;
+        assert!(
+            !answer.contains("instance admin"),
+            "an admin is not refused by the role gate:\n{answer}"
+        );
+        assert!(
+            answer.contains("## Provisioning"),
+            "and reaches the declaration gate below it:\n{answer}"
+        );
+    }
+}
+
+/// The tier below: with `auth.mcp` off there is nobody to hold a role, and the
+/// open tier keeps exactly the powers it had. The gate reads the setting that
+/// creates that tier rather than the absence of an identity, so this is the
+/// carve-out and not an accident of nobody being there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn provision_is_not_role_gated_on_the_open_tier() {
+    let ctx = mcp_ctx(false).await;
+    let session = McpTestSession::open(&ctx.addr, None).await;
+    let answer = session
+        .call_tool(
+            "provision",
+            serde_json::json!({ "action": "allow", "domain": "open" }),
+        )
+        .await;
+    assert!(
+        !answer.contains("instance admin"),
+        "the open tier is not role gated:\n{answer}"
+    );
+    assert!(
+        answer.contains("## Provisioning"),
+        "and meets the declaration gate as it always did:\n{answer}"
+    );
+}
+
 /// **The aggregate collaboration verbs answer over the caller's own domains.**
 ///
 /// `origin_status` and `update_domain` both take an optional domain, and with

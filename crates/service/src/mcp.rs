@@ -1347,7 +1347,16 @@ impl McpServer {
     }
 
     /// The gate on changing what this instance IS: which domains are
-    /// registered on it, and how it is configured.
+    /// registered on it, how it is configured, and which of the artifacts its
+    /// domains ship are installed into the harnesses on the machine it runs
+    /// on.
+    ///
+    /// Three verbs pass through here: [`McpServer::add_domain`], a `configure`
+    /// that sets, unsets or connects, and `provision` in its `allow`, `deny`
+    /// and `apply` actions - the last because a decision is written into the
+    /// same `config.yaml` a `configure set` writes and `apply` then runs the
+    /// harness CLIs on the server. A `provision` `status` is a read and is
+    /// scoped rather than gated.
     ///
     /// Three answers, and each is a rule rather than a consequence:
     ///
@@ -2464,6 +2473,19 @@ impl McpServer {
                 ));
             }
         };
+        // Then the role, because allow, deny and apply change what this
+        // instance IS: each writes a provisioning decision into the same
+        // `config.yaml` that `configure set` edits, and `apply` reconciles
+        // artifacts into the harnesses on the machine the daemon runs on. That
+        // is the class [`McpServer::refuse_instance_change`] gates, so it is
+        // gated here too rather than merely being absent from the list of
+        // verbs somebody remembered. `status` is a read and stays open, scoped
+        // to the domains this caller may see like every other listing.
+        if !matches!(action, ProvisionAction::Status)
+            && let Some(refusal) = self.refuse_instance_change(&self.scope_of(&ctx))
+        {
+            return refuse(refusal);
+        }
         // The declaration gate, which used to hide this tool from the listing
         // and now refuses the actions it would make pointless. `status` is
         // deliberately not one of them: it answers an empty report, which is
