@@ -1904,7 +1904,7 @@ fn presentation_text(value: &str) -> Option<String> {
 /// The account name a provisioning falls back to when a provider sends
 /// nothing usable to derive one from. Uniquified like any other name, so a
 /// second such person becomes `sso-user-2`.
-const FALLBACK_ACCOUNT_NAME: &str = "sso-user";
+pub(super) const FALLBACK_ACCOUNT_NAME: &str = "sso-user";
 
 /// How long a derived name may be before it is cut. Long enough for a full
 /// `firstname.lastname`, short enough that a provider cannot make this
@@ -1944,7 +1944,7 @@ fn derive_account_name(claims: &OidcClaims) -> String {
 /// `@`, quotes, control characters - replaced by a single `-`. Runs collapse
 /// and the ends are trimmed, so `"Ada Lovelace (Contoso)"` becomes
 /// `ada-lovelace-contoso` rather than something with edges.
-fn sanitize_account_name(raw: &str) -> Option<String> {
+pub(super) fn sanitize_account_name(raw: &str) -> Option<String> {
     let mut out = String::new();
     for ch in raw.trim().to_lowercase().chars() {
         if ch.is_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {

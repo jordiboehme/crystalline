@@ -81,7 +81,7 @@ export interface paths {
          *     mutations, whether it has any accounts at all, whether this session may
          *     drive the share surfaces, and which server version it is talking to, so a
          *     mismatched UI can say so instead of failing later.
-         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
+         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.
          */
         get: operations["get_me"];
         put?: never;
@@ -1865,10 +1865,10 @@ export interface components {
              *     belongs.
              *
              *     Null only for the anonymous viewer, which has no account and can never
-             *     write; a trusted-header identity is given a session here on the first
-             *     call and handed that same session's token on every later one, so every
-             *     identity that can mutate anything carries a token. See the `check_csrf`
-             *     rule.
+             *     write; an identity a proxy asserts (`auth.trusted_header` or
+             *     `auth.proxy_headers`) is given a session here on the first call and
+             *     handed that same session's token on every later one, so every identity
+             *     that can mutate anything carries a token. See the `check_csrf` rule.
              *
              *     Handing the token back on a `GET` is safe for the same reason handing it
              *     back from login is: no CORS layer exists on this surface, so another
@@ -2470,7 +2470,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The trusted-header identity names a disabled account. */
+            /** @description The identity a proxy asserted names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2521,7 +2521,7 @@ export interface operations {
                     "application/json": components["schemas"]["LogoutResponse"];
                 };
             };
-            /** @description The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the trusted-header identity names a disabled account. */
+            /** @description The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the identity a proxy asserted names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2546,7 +2546,7 @@ export interface operations {
                 headers: {
                     /** @description `no-store`. Always set: this answer names the caller and carries their CSRF token, and a shared cache is allowed to store a GET 200 heuristically, which behind an SSO proxy would hand the next user the previous one's identity. */
                     "cache-control"?: string;
-                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from a trusted-header identity whose account holds none; a later probe reuses that session and sets no cookie. */
+                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from an identity a proxy asserted (`auth.trusted_header` or `auth.proxy_headers`) whose account holds none; a later probe reuses that session and sets no cookie. */
                     "set-cookie"?: string;
                     [name: string]: unknown;
                 };
@@ -2554,7 +2554,7 @@ export interface operations {
                     "application/json": components["schemas"]["MeResponse"];
                 };
             };
-            /** @description The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one. */
+            /** @description The identity a proxy asserted names a disabled account, or its headers arrived in a shape this instance will not believe. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one. */
             403: {
                 headers: {
                     [name: string]: unknown;

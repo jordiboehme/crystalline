@@ -1235,6 +1235,157 @@ async fn an_absent_presentation_header_never_clears_what_is_stored() {
     assert_eq!(me["user"]["email"], "ada@example.test");
 }
 
+/// A header that arrived more than once is refused rather than resolved by
+/// arrival order. This is the misconfiguration the trust boundary is most
+/// likely to be half-satisfied on: a proxy that appends its own `Remote-User`
+/// instead of replacing the client's copy would otherwise hand whoever won the
+/// ordering a session, with nothing anywhere saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_auth_header_that_arrived_twice_is_refused() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let doubled = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-User", "mallory")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doubled.status(), 403);
+    assert_eq!(
+        doubled.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = doubled.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("more than once"),
+        "the refusal must name what the proxy has to fix: {body}"
+    );
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "and neither name was provisioned"
+    );
+
+    // A presentation header is the same tell, even beside a single user header.
+    let doubled_email = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Email", "ada@example.test")
+        .header("Remote-Email", "mallory@example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doubled_email.status(), 403);
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "a refused request provisions nothing"
+    );
+}
+
+/// A forwarded value that cannot be a login name is refused `403` naming why,
+/// rather than a `500` or an account nobody can address. The same answer the
+/// trusted-header mode gives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_user_that_cannot_be_a_login_name_is_refused() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada lovelace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("whitespace"),
+        "the message must be actionable, not opaque: {body}"
+    );
+    assert!(fixture.auth.list_users().await.unwrap().is_empty());
+}
+
+/// The quartet is matched the way HTTP names are compared, so a proxy that
+/// spells them `REMOTE-USER` is understood. The constants are lowercase and
+/// the header map folds; this is what says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_forward_auth_headers_are_matched_whatever_their_case() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("REMOTE-USER", "ada")
+        .header("Remote-NAME", "Ada Lovelace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let me: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(me["user"]["name"], "ada");
+    assert_eq!(me["user"]["display"], "Ada Lovelace");
+}
+
+/// The login name a forwarded identity gets is derived the way a sign-on's is:
+/// sanitized down to something addressable and cut to a bounded length, while
+/// the identity link keeps the proxy's spelling, because that is the durable
+/// key and only the account name has to be a name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_name_is_derived_and_bounded_like_a_sign_ons() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let pathlike = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada/../bob")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pathlike.status(), 200);
+    let me: serde_json::Value = pathlike.json().await.unwrap();
+    let name = me["user"]["name"].as_str().unwrap().to_string();
+    assert!(
+        !name.contains('/'),
+        "an account name has to be addressable through /api/v1/users/{{name}}: {name}"
+    );
+    let links = fixture.auth.identity_links(&name).await.unwrap();
+    assert_eq!(
+        links[0].subject, "ada/../bob",
+        "the link keeps the proxy's spelling: that is the key it will send again"
+    );
+
+    let long = "l".repeat(200);
+    let oversized = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", long.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), 200);
+    let me: serde_json::Value = oversized.json().await.unwrap();
+    let name = me["user"]["name"].as_str().unwrap().to_string();
+    assert!(
+        name.chars().count() <= 60,
+        "a header value is not a name budget: {name}"
+    );
+    let links = fixture.auth.identity_links(&name).await.unwrap();
+    assert_eq!(
+        links[0].subject, long,
+        "and the key is still the whole value"
+    );
+}
+
 /// Both header modes at once is a configuration nobody can mean, so the daemon
 /// refuses to start on it rather than picking one silently.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

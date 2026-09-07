@@ -276,8 +276,11 @@ pub struct RestState {
 impl RestState {
     /// Assemble the state, resolving and validating the auth settings out of
     /// the engine's config. Fails when `auth.trusted_header` is not a usable
-    /// HTTP header name: the HTTP surface then refuses to come up, naming the
-    /// setting, rather than serving with a header that silently never matches.
+    /// HTTP header name, and when both header modes are configured at once:
+    /// the HTTP surface then refuses to come up, naming the settings, rather
+    /// than serving with a header that silently never matches or with two
+    /// answers to one question. The daemon itself keeps running and keeps
+    /// serving MCP over its socket; see `daemon::run`.
     pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>) -> anyhow::Result<RestState> {
         let config = engine.config();
         let auth_cfg = AuthCfg::resolve(&config)?;

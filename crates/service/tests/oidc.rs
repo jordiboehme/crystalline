@@ -2266,3 +2266,49 @@ async fn a_configured_redirect_uri_goes_out_instead_of_the_derived_one() {
         "the request's own address is not what was registered: {sent}"
     );
 }
+
+/// The configured address is what the token exchange repeats, not only what the
+/// authorization request carries. A provider matches the two byte for byte and
+/// refuses the exchange otherwise, so this is the property the key exists for:
+/// the browser comes back to the public address a proxy fronts, and the code is
+/// redeemed against that same string rather than one re-derived from the Host
+/// this process was actually reached at.
+#[tokio::test]
+async fn a_configured_redirect_uri_is_repeated_at_the_token_exchange() {
+    let idp = FakeIdp::start().await;
+    let configured = "https://kb.example.test/api/v1/auth/oidc/callback";
+    let ctx = RestCtx::with_redirect_uri(&idp.issuer(), configured).await;
+
+    let start = ctx.get(&ctx.url("/auth/oidc/login"), &[]).await;
+    assert_eq!(start.status(), 302);
+    let cookies = cookies_from(&start);
+    let bounced = ctx.client.get(location(&start)).send().await.unwrap();
+    assert_eq!(bounced.status(), 302);
+    let landed = location(&bounced);
+    assert!(
+        landed.starts_with(configured),
+        "the provider sends the browser to the registered address: {landed}"
+    );
+
+    // The proxy in front is what turns that public address into a request this
+    // process sees, so the callback arrives here carrying the same code.
+    let query = landed.split_once('?').expect("a code and a state").1;
+    let done = ctx
+        .get(
+            &format!("{}?{}", ctx.url("/auth/oidc/callback"), query),
+            &cookies,
+        )
+        .await;
+    assert_eq!(
+        done.status(),
+        302,
+        "the exchange sent the configured address, so the provider took it"
+    );
+    assert_eq!(location(&done), "/");
+    assert!(
+        cookies_from(&done)
+            .iter()
+            .any(|(name, _)| name == "fluid_session"),
+        "and the sign-in completed into a session"
+    );
+}

@@ -423,7 +423,7 @@ pub async fn run_serve(
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
-                        "HTTP endpoint for {addr} could not start ({err}); MCP over the socket is unaffected"
+                        "HTTP endpoint for {addr} could not be built ({err:#}); this is the configuration it was built from rather than the address, and MCP over the socket is unaffected"
                     );
                     return;
                 }
