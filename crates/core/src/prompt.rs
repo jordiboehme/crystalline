@@ -390,8 +390,10 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 
 /// The behavior rules an agent follows when working with this server's tools,
 /// one string per rule, without the leading `- ` and without a trailing
-/// newline. The read-only set drops the four content-mutating tools and the
-/// capture language; the read-write set names them.
+/// newline. The read-only set drops the four content-mutating tools this block
+/// names and the capture language; the read-write set names them. Four rather
+/// than every write verb on the surface: `split_engram` is taught by the skills
+/// rather than here, so the routing block stays inside its truncation budget.
 ///
 /// This is the single source of the rule set: [`render_routing_body`] renders
 /// it as the Behavior block of both onboarding renderers, and the MCP
@@ -756,7 +758,8 @@ mod tests {
             text.contains("read-only and curated externally"),
             "read-only line expected:\n{text}"
         );
-        // None of the four content-mutating tool names appear anywhere.
+        // None of the four content-mutating tool names this block writes
+        // appear anywhere.
         for tool in [
             "write_engram",
             "edit_engram",

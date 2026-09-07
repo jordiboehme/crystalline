@@ -880,6 +880,49 @@ pub fn prepend_body(source: &str, content: &str) -> String {
 mod tests {
     use super::*;
 
+    /// A document whose body lines are numbered in the assertions below, with
+    /// the frontmatter taking lines 1 through 5 so a range that reached into it
+    /// would be obvious.
+    const SECTIONED: &str = "---\ntype: engram\ntitle: T\npermalink: t\n---\n\n# T\n\n## A\n\nUnder A.\n\n### B\n\nUnder B.\n\n## C\n\nUnder C.\n";
+
+    #[test]
+    fn a_section_range_carries_its_subsections_and_stops_at_the_next_peer() {
+        // `## A` starts on line 9 and runs to just before `## C` on line 17,
+        // taking `### B` with it.
+        assert_eq!(section_line_range(SECTIONED, "## A").unwrap(), (9, 17));
+        // The subsection addressed on its own is only its own lines.
+        assert_eq!(
+            section_line_range(SECTIONED, "## A > ### B").unwrap(),
+            (13, 17)
+        );
+    }
+
+    #[test]
+    fn a_heading_inside_a_fence_neither_starts_nor_ends_a_section() {
+        let fenced = "---\ntype: engram\ntitle: T\npermalink: t\n---\n\n## A\n\n```\n## Not a heading\n```\n\nStill under A.\n\n## C\n\nUnder C.\n";
+        assert_eq!(section_line_range(fenced, "## A").unwrap(), (7, 15));
+        assert!(section_line_range(fenced, "## Not a heading").is_err());
+    }
+
+    #[test]
+    fn the_last_section_runs_to_the_end_with_or_without_a_final_newline() {
+        // Terminated: the exclusive end is one past the last line, which is the
+        // empty string after the final newline.
+        assert_eq!(section_line_range(SECTIONED, "## C").unwrap(), (17, 20));
+        // Unterminated: the last line ends the file rather than starting a new
+        // one, so the exclusive end is one past it all the same.
+        let unterminated = SECTIONED.trim_end_matches('\n');
+        assert_eq!(section_line_range(unterminated, "## C").unwrap(), (17, 20));
+    }
+
+    #[test]
+    fn a_path_that_resolves_to_nothing_is_an_error_rather_than_a_guess() {
+        assert!(matches!(
+            section_line_range(SECTIONED, "## Missing"),
+            Err(EditError::SectionNotFound { .. })
+        ));
+    }
+
     #[test]
     fn flow_scalar_leaves_the_common_actor_and_instant_forms_bare() {
         for value in [

@@ -466,7 +466,7 @@ enum Command {
         /// Observation bullets to move, by the line numbers `crystalline read`
         /// reports. Repeat the flag or pass a comma-separated list.
         #[arg(long)]
-        observation: Option<String>,
+        observation: Vec<String>,
         /// A section to move, by heading path (`## Notes`). Repeat the flag for
         /// several.
         #[arg(long)]
@@ -1617,17 +1617,23 @@ fn split_commas(s: Option<String>) -> Option<Vec<String>> {
     })
 }
 
-/// The observation line numbers `crystalline split` was given, from a
-/// comma-separated or space-separated list. A token that is not a line number
-/// is an error rather than a silently dropped selection: a split that moved
-/// fewer bullets than the caller named is the one outcome worth failing for.
-fn split_lines(raw: Option<String>) -> anyhow::Result<Option<Vec<usize>>> {
-    let Some(raw) = raw else {
+/// The observation line numbers `crystalline split` was given: every
+/// occurrence of `--observation`, each of which may itself carry a
+/// comma-separated or space-separated list. Repeating the flag adds to the
+/// selection rather than replacing it, which is what its help text promises and
+/// what the neighbouring `--section` does.
+///
+/// A token that is not a line number is an error rather than a silently dropped
+/// selection: a split that moved fewer bullets than the caller named is the one
+/// outcome worth failing for.
+fn split_observation_lines(raw: &[String]) -> anyhow::Result<Option<Vec<usize>>> {
+    if raw.is_empty() {
         return Ok(None);
-    };
+    }
     let mut lines = Vec::new();
     for token in raw
-        .split([',', ' '])
+        .iter()
+        .flat_map(|one| one.split([',', ' ']))
         .map(str::trim)
         .filter(|t| !t.is_empty())
     {
@@ -2426,7 +2432,7 @@ async fn run_data(command: Command, db: Option<PathBuf>, json: bool) -> anyhow::
                 "identifier": identifier,
                 "domain": domain,
                 "title": title,
-                "observations": split_lines(observation)?,
+                "observations": split_observation_lines(&observation)?,
                 "sections": section,
                 "folder": folder,
                 "expected_checksum": expected_checksum,

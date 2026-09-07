@@ -3356,7 +3356,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 21] = [
     (
         "write_engram",
         "Capture engram",
@@ -3384,6 +3384,14 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
     (
         "move_engram",
         "Move engram",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+    ),
+    (
+        "split_engram",
+        "Split engram",
         Some(false),
         Some(true),
         Some(false),
@@ -3576,7 +3584,7 @@ async fn tool_annotations_match_the_locked_table() {
 async fn annotation_hints_line_up_with_the_gating() {
     use rmcp::ServerHandler;
 
-    // The eight write-gated tools (the five WRITE_TOOLS plus the three
+    // The nine write-gated tools (the six WRITE_TOOLS plus the three
     // collaboration tools hidden in read-only mode) must each disclaim
     // read-only.
     let rw = annotation_server(false).await;
@@ -3584,6 +3592,7 @@ async fn annotation_hints_line_up_with_the_gating() {
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "add_domain",
         "configure",

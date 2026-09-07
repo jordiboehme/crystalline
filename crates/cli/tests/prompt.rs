@@ -79,7 +79,7 @@ fn prompt_text_read_only_matches_snapshot() {
 
     let text = String::from_utf8(output).unwrap();
     // The read-only variant drops the write-tools line and names none of the
-    // four content-mutating tools.
+    // four content-mutating tools the block names.
     for tool in [
         "write_engram",
         "edit_engram",

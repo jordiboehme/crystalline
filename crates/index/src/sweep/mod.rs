@@ -1433,27 +1433,50 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
 /// One finding per engram rather than per bullet: the fix is a single
 /// `split_engram` call naming the lines, so a queue row per line would be one
 /// action split into many.
+///
+/// **What it costs.** Nothing at all in a domain with no retired engram
+/// carrying observations, which is checked before anything is normalized. Past
+/// that, one normalized copy of the domain's live bodies plus a set of their
+/// normalized observation texts, and then one hash lookup per retired bullet -
+/// so a bullet carried forward as a bullet is O(1). Only a bullet that misses
+/// that set is scanned against the corpus, which bounds the substring work at
+/// (bullets carried as prose or missing entirely) x (corpus bytes).
 fn detect_carry_forward(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
-    let live: Vec<String> = input
+    // Nothing retired that carries observations means nothing to compare
+    // against, so the corpus is never built. A domain with no retirements is
+    // the common case and pays nothing for this rule.
+    let subjects: Vec<&EngramFacts> = input
         .engrams
         .iter()
-        .filter(|f| !f.is_retired())
-        .map(|f| format!(" {} ", normalize(&f.body)))
+        .filter(|f| {
+            f.is_retired()
+                && !f.observations.is_empty()
+                && !graph.has_outbound_rel(f.id, "split_into")
+        })
         .collect();
+    if subjects.is_empty() {
+        return;
+    }
 
-    for fact in &input.engrams {
-        if !fact.is_retired() || fact.observations.is_empty() {
-            continue;
-        }
-        if graph.has_outbound_rel(fact.id, "split_into") {
-            continue;
-        }
+    // Two haystacks, cheapest first. A bullet carried forward as a bullet - the
+    // ordinary case, and what `split_engram` itself writes - is answered by one
+    // hash lookup. Only a bullet that misses that set reaches the substring
+    // scan, which is where a fact carried forward inside prose is found and
+    // which costs (missing bullets) x (corpus bytes).
+    let mut carried: BTreeSet<String> = BTreeSet::new();
+    let mut live: Vec<String> = Vec::new();
+    for fact in input.engrams.iter().filter(|f| !f.is_retired()) {
+        carried.extend(fact.observations.iter().map(|o| normalize(&o.text)));
+        live.push(format!(" {} ", normalize(&fact.body)));
+    }
+
+    for fact in subjects {
         let missing: Vec<(&FactObservation, String)> = fact
             .observations
             .iter()
             .filter_map(|o| {
                 let needle = normalize(&o.text);
-                if needle.is_empty() {
+                if needle.is_empty() || carried.contains(&needle) {
                     return None;
                 }
                 let padded = format!(" {needle} ");

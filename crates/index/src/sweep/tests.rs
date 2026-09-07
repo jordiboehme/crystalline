@@ -646,6 +646,35 @@ fn v010_is_quiet_when_every_observation_was_carried_forward() {
 }
 
 #[test]
+fn v010_is_quiet_when_a_live_bullet_carries_the_same_text() {
+    // The other haystack: the live engram's own observations, matched as whole
+    // normalized texts rather than scanned for inside its body. This is the
+    // shape `split_engram` itself writes, so it is the one that has to be free.
+    let retired = retired_with(1, "mix-b-decision", &[(7, "Run the loop on glycol mix B")]);
+    let mut carried = retired_with(2, "mix-c-decision", &[(9, "Run the loop on glycol MIX b")]);
+    carried.status = "stable".to_string();
+    // Nothing to find in the body text, so a hit can only come from the set.
+    carried.body = short_body(3);
+
+    let report = detect(&input(vec![retired, carried]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v010_never_builds_a_corpus_for_a_domain_with_nothing_retired() {
+    // Behaviorally the same silence as any other quiet case; pinned separately
+    // because the early return it stands on is what keeps the rule free in the
+    // common domain.
+    let mut live = fact(1, "mix-c-decision");
+    live.observations = vec![FactObservation {
+        line: 7,
+        text: "Run the loop on glycol mix C".to_string(),
+    }];
+    let report = detect(&input(vec![live, fact(2, "purge-procedure")]));
+    assert!(!fired(&report).contains(&"V010"), "{:?}", fired(&report));
+}
+
+#[test]
 fn v010_is_quiet_once_the_split_landed() {
     // The split already happened, so what is left in the retired engram is
     // what expired, on purpose. The archive records that intent as the pair

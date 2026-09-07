@@ -915,6 +915,9 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
         .collect();
     assert_eq!(lines.len(), 2, "two bullets are about the purge: {read}");
 
+    // The flag repeats, one line per occurrence, which is what its help text
+    // promises: a second --observation adds to the selection rather than
+    // replacing the first.
     let out = bin()
         .args([
             "split",
@@ -922,7 +925,9 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
             "eng",
             "Purge Procedure",
             "--observation",
-            &lines.join(","),
+            &lines[0],
+            "--observation",
+            &lines[1],
             "--json",
             "--config",
         ])
@@ -939,7 +944,10 @@ fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
     let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(receipt["new"]["permalink"], "purge-procedure");
     assert_eq!(receipt["source"]["permalink"], "coolant-bundle");
-    assert_eq!(receipt["moved_observations"], 2);
+    assert_eq!(
+        receipt["moved_observations"], 2,
+        "both occurrences of --observation moved a bullet"
+    );
 
     // Both halves, read back through the CLI: the content moved and the pair
     // points both ways.
