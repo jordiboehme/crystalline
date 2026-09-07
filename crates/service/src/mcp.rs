@@ -1326,7 +1326,7 @@ impl McpServer {
             .require_domain(domain, scope)
             .await
             .map_err(to_error)?;
-        if matches!(scope, Scope::Anonymous) && !self.engine.config().auth_mcp() {
+        if matches!(scope, Scope::Anonymous) && !self.engine.auth_mcp() {
             return Ok(None);
         }
         let right = self
@@ -1583,12 +1583,13 @@ impl McpServer {
         // domain, which the first gate already passed, so the second call is a
         // no-op there rather than a case to skip - and a skip is how a check
         // goes missing when the two spellings stop coinciding.
-        let destination = p
-            .destination_domain
-            .as_deref()
-            .map(str::trim)
-            .filter(|d| !d.is_empty())
-            .unwrap_or(&p.domain);
+        //
+        // Read exactly as `Engine::move_engram` reads it, untrimmed and
+        // unfiltered, the way the REST move route reads it too: a gate that
+        // normalizes what the verb does not is gating a different string from
+        // the one that gets written to, which is the same disagreement between
+        // the gate and the engine that this gate exists to end.
+        let destination = p.destination_domain.as_deref().unwrap_or(&p.domain);
         for end in [p.domain.as_str(), destination] {
             if let Some(refusal) = self.refuse_unwritable(end, &scope).await? {
                 return refuse(refusal);

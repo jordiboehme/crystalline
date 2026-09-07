@@ -2116,3 +2116,122 @@ async fn a_mismatched_identifier_and_domain_names_no_other_domain() {
         "nothing moved"
     );
 }
+
+/// **A padded domain name is the same call, and it is answered the same way.**
+///
+/// `destination_domain` is a plain string with no normalizer between the
+/// surface and the verb, so `"open "` and `"open"` are two different domains as
+/// far as the engine is concerned and one of them is registered. A gate that
+/// trimmed it would pass the call (the trimmed spelling is a domain this caller
+/// may write) and hand the untrimmed one to a lookup that answers with every
+/// registered domain on the instance, private ones included - a full
+/// enumeration out of one trailing space.
+///
+/// The gate reads the field the way the verb reads it, and the lookup behind it
+/// is scoped, so the answer is the ordinary unregistered-domain answer over the
+/// caller's own visible set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_padded_destination_domain_is_answered_like_a_missing_one() {
+    let ctx = mcp_ctx(true).await;
+    // A stranger with nothing but its instance role: it may write `open`, and
+    // `lab` does not exist for it.
+    let token = ctx.token_for("out").await;
+    let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
+
+    let padded = session
+        .call_tool(
+            "move_engram",
+            serde_json::json!({
+                "identifier": "open-note",
+                "domain": "open",
+                "destination": "y.md",
+                "destination_domain": "open ",
+            }),
+        )
+        .await;
+
+    // The control: a name nobody registered, asked by the same caller in the
+    // same session. The padded spelling has to answer exactly this.
+    let missing = session
+        .call_tool(
+            "move_engram",
+            serde_json::json!({
+                "identifier": "open-note",
+                "domain": "open",
+                "destination": "y.md",
+                "destination_domain": "ghost",
+            }),
+        )
+        .await;
+    assert!(
+        missing.contains("not registered") && !missing.contains("lab"),
+        "the control is the unregistered answer over the visible set:\n{missing}"
+    );
+
+    assert!(
+        padded.contains("not registered"),
+        "a padded name is refused as unregistered:\n{padded}"
+    );
+    assert!(
+        !padded.contains("lab"),
+        "and never names the domain this caller may not see:\n{padded}"
+    );
+    // And the whole of it, not only the two strings the assertions above pick
+    // out: the JSON-RPC payload of the padded call is the payload of the
+    // missing-name call with the name substituted, so there is nothing else in
+    // it either. The payload rather than the raw response, because the frame
+    // around it carries a per-response SSE event id that is not what this test
+    // is about.
+    let payload = |raw: &str| {
+        raw.lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or_else(|| panic!("no JSON-RPC payload in:\n{raw}"))
+            .to_string()
+    };
+    assert_eq!(
+        payload(&padded).replace("open ", "ghost"),
+        payload(&missing),
+        "a padded name is answered exactly as a name nobody registered"
+    );
+    assert!(
+        std::fs::read_to_string(ctx.path("open", "open-note.md")).is_ok()
+            && !ctx.path("open", "y.md").exists(),
+        "and nothing moved"
+    );
+}
+
+/// The auth-off leg of
+/// [`the_aggregate_origin_verbs_answer_over_visible_domains_only`]: with
+/// `auth.mcp` off there is nobody to be, and the tier that has no accounts is
+/// the one where a filter regression is least likely to be noticed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_aggregate_origin_verbs_hide_a_private_team_domain_from_the_open_tier() {
+    let ctx = mcp_ctx_with(false, false, true).await;
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+    let session = McpTestSession::open(&ctx.addr, None).await;
+
+    let status = session
+        .call_tool("origin_status", serde_json::json!({}))
+        .await;
+    assert!(
+        status.contains("connection"),
+        "the verb answers rather than refusing:\n{status}"
+    );
+    assert!(
+        !status.contains("lab") && !status.contains("acme"),
+        "and names no private team domain:\n{status}"
+    );
+
+    let pulled = session
+        .call_tool("update_domain", serde_json::json!({}))
+        .await;
+    assert!(
+        !pulled.contains("lab"),
+        "the sweep pull names none of it either:\n{pulled}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "and nothing was pulled into it"
+    );
+}

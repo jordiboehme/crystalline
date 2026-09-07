@@ -1369,6 +1369,14 @@ impl Engine {
         self.config.read().unwrap().github_enabled()
     }
 
+    /// Whether the MCP endpoint authenticates (`auth.mcp`), read the same cheap
+    /// way as [`Engine::github_enabled`]. This is the setting that creates the
+    /// legacy open tier, and a write gate reads it once per write, so it must
+    /// not clone the whole config to get at one bool.
+    pub fn auth_mcp(&self) -> bool {
+        self.config.read().unwrap().auth_mcp()
+    }
+
     /// Whose GitHub identity a share on this instance runs as, read live from
     /// the effective config: `instance` (the default, one credential does
     /// everything) or `personal` (the acting identity's own).
@@ -4087,15 +4095,22 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        // Resolved once, before anything is written, and used only for the
-        // inbound rewrite below.
+        // Resolved once, before anything is written, and used twice below: to
+        // look the destination up, and to bound the inbound rewrite.
         let hidden = self.hidden_for(scope).await?;
         let (src, src_source) = self.resolve_in(&p.identifier, &p.domain).await?;
         let dest_domain = p
             .destination_domain
             .clone()
             .unwrap_or_else(|| p.domain.clone());
-        let dest_source = self.content_source(&dest_domain)?;
+        // Scoped, and that is load bearing rather than tidy. This lookup raises
+        // the one error that names every registered domain, and a surface gate
+        // above it can only check the spelling it normalizes: a padded or empty
+        // `destination_domain` passes a gate that trims or skips it and arrives
+        // here verbatim. Resolving it against the caller's own visible set
+        // closes that for every spelling, present and future, instead of asking
+        // one more pair of normalizers to agree.
+        let dest_source = self.content_source_scoped(&dest_domain, &hidden)?;
         let dest_rel = normalize_md(&p.destination);
         if dest_rel.is_empty() {
             return Err(EngineError::Invalid("destination path is empty".into()));
@@ -8145,6 +8160,14 @@ impl Engine {
         // make a stranger's call retire a hidden domain's installed artifacts -
         // worse than the disclosure it would close - so those keep the whole
         // config and only their report is narrowed.
+        //
+        // One consequence of narrowing `Status` at the input, recorded because
+        // it is a choice rather than an accident: a hidden domain's artifacts
+        // fall out of the desired set with it, so its installed files read back
+        // as orphaned or drifted in that caller's `harnesses` counts. Numbers
+        // only - `HarnessStatus` carries no name - and the alternative is
+        // computing the harness rows over a config the caller may not see,
+        // which trades a count nobody acts on for the disclosure this closes.
         let hidden = self.hidden_for(scope).await?;
         let install_receipt = crystalline_core::provision::install_receipt_path()
             .map_err(|e| EngineError::Internal(e.to_string()))?;
@@ -8246,12 +8269,33 @@ impl Engine {
         let mut value = apply_report_json(&report);
         // The reconcile ran over the whole machine, as it must; the report goes
         // back to one caller, so it names only the domains that caller may see.
-        // `pending` is the only array here that carries a domain name.
+        // Two of the three arrays carry a domain name and both are narrowed
+        // here. `harnesses[].actions[].target` is the third and carries none -
+        // its keys are `{kind}/{rel}` built from the artifact's own filename.
         if let Some(pending) = value["pending"].as_array_mut() {
             pending.retain(|entry| {
                 entry["domain"]
                     .as_str()
                     .is_none_or(|name| !hidden.contains(name))
+            });
+        }
+        // `notices` is free prose, so it is filtered by what the prose does
+        // rather than by a field: every notice that names a domain writes it
+        // between backticks (the virtual-domain skip, the unsupported-kind
+        // skip, both collision notices, the foreign-file keep and the
+        // already-registered MCP server), so a backtick-anchored match drops
+        // exactly those and leaves a notice about a visible domain that merely
+        // happens to contain the hidden name as a substring. Anchored rather
+        // than bare on purpose: a bare match would silence a visible domain's
+        // own collision notice whenever a hidden domain's name appeared inside
+        // one of the file names it reports.
+        if let Some(notices) = value["notices"].as_array_mut() {
+            notices.retain(|notice| {
+                notice.as_str().is_none_or(|text| {
+                    !hidden
+                        .iter()
+                        .any(|name| text.contains(&format!("`{name}`")))
+                })
             });
         }
         Ok(value)

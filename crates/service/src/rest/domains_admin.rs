@@ -918,16 +918,19 @@ pub async fn sync_summary(
         return Err(github_off_conflict());
     }
     let aggregate = state.engine.origin_status(None, &identity.scope()).await?;
-    // This one route enumerates domains rather than addressing one, so the
-    // filtering happens here, on the aggregate: `origin_status` walks the
-    // registry and knows nothing about who is asking. A team domain the
-    // caller may not see is absent from the rows AND from the errors - a
-    // failure naming a domain would name it just as well as a success.
+    // This one route enumerates domains rather than addressing one, and a team
+    // domain the caller may not see must be absent from the rows AND from the
+    // errors - a failure naming a domain would name it just as well as a
+    // success. `origin_status` now takes the caller's scope and skips those
+    // domains before it probes anything, so nothing is fetched for a domain
+    // nobody may read and the aggregate arrives already narrowed. (The ctl and
+    // stdio paths are the machine owner and pass `Scope::Unrestricted`, which
+    // is what they always were.)
     //
-    // The probe for such a domain still ran, which costs a request nobody
-    // reads; the alternative is a scope parameter on the origin family, which
-    // would reach the ctl and stdio paths that are the machine owner and have
-    // no scope to pass.
+    // The filter below therefore has nothing left to remove on any input this
+    // route can produce. It stays as belt and braces: it is the last thing
+    // between a regression in the engine sweep and a private domain's name in
+    // a response, and it costs one pass over a short array.
     let hidden = state
         .engine
         .hidden_domains(&identity.scope())

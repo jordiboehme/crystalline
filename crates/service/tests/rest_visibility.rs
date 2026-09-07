@@ -504,6 +504,28 @@ async fn a_move_is_gated_at_both_ends() {
         .await;
     assert_eq!(out_of_hidden.status(), 404);
 
+    // A spelling the gate above skips and the engine does not: an empty
+    // `destination_domain` is not a domain the gate has to check, but the verb
+    // reads it as a domain name all the same and looks it up. That lookup
+    // raises the one error that lists every registered domain, so it has to be
+    // scoped where it happens rather than in front of it - a gate can only ever
+    // check the spellings it thinks of.
+    let empty_destination = out
+        .post_json(
+            "/api/v1/domains/open/move",
+            json!({"permalink": "alpha", "destination": "alpha", "destination_domain": ""}),
+        )
+        .await;
+    let detail = empty_destination.text().await.unwrap();
+    assert!(
+        detail.contains("not registered"),
+        "the empty name is refused as unregistered:\n{detail}"
+    );
+    assert!(
+        !detail.contains("lab"),
+        "and the registered set it lists is the caller's own:\n{detail}"
+    );
+
     // Nothing moved.
     let boss = ctx.as_user("boss").await;
     boss.get_text("/api/v1/domains/open/engrams/alpha", 200)
