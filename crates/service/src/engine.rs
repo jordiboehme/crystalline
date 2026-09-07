@@ -5989,10 +5989,16 @@ impl Engine {
     /// That is not the same fact as the one above and it is not a leak of it:
     /// a caller who may not see a domain never gets a row for it to read.
     ///
-    /// The rows come back sorted by name, case-insensitively. Registration
-    /// order is what the config map preserves and it is meaningless to anybody
-    /// reading the listing, so the order is settled here rather than in each of
-    /// the sidebar, the CLI and the routing prompt.
+    /// The rows come back sorted by name, case-insensitively, so the sidebar
+    /// and the CLI inherit one order rather than settling it three times.
+    /// Registration order is what the config map preserves and it is
+    /// meaningless to anybody reading the listing.
+    ///
+    /// The routing prompt sorts the same way and by the same comparison, in
+    /// [`crystalline_core::generate_prompt_unscoped`], rather than through this
+    /// call: it builds its block from the config directly. The two are the same
+    /// index seen twice - once at session start, once when an agent asks again
+    /// mid-session - so they agree.
     pub async fn list_domains(
         &self,
         p: &ListDomainsParams,

@@ -17,10 +17,12 @@
 //! are pure functions of their inputs (the config file and the MANIFESTs on
 //! disk). No timestamps, process IDs, environment variables or other
 //! environment-dependent values ever enter the output, and no unordered
-//! iteration (a hash map, a hash set) drives ordering. Domain order comes
-//! from the config's own registered order: `generate_prompt` filters it
-//! through a sorted inclusion set and reorders preferred-first, while
-//! `generate_prompt_unscoped` emits that registered order verbatim.
+//! iteration (a hash map, a hash set) drives ordering. `generate_prompt`
+//! filters the config's registered order through a sorted inclusion set and
+//! reorders preferred-first, while `generate_prompt_unscoped` sorts by name,
+//! case-insensitively - the same comparison the domain listing applies, so the
+//! onboarding block served at session start and the same index re-fetched
+//! mid-session present the domains in one order.
 //! `render_json` relies on `serde_json`'s stable field order. Identical
 //! config plus identical on-disk MANIFESTs must render byte-identical output
 //! every time, whether rendered twice in one process or by two separate
@@ -167,7 +169,15 @@ pub fn generate_prompt_unscoped(
 ) -> PromptOutput {
     let mut domains = Vec::with_capacity(global.domains.len());
     let mut warnings = Vec::new();
-    for (name, entry) in &global.domains {
+    // Sorted by name, case-insensitively, the same comparison the domain
+    // listing applies. The config map preserves registration order, which is
+    // meaningless to a reader; more to the point, the onboarding block served
+    // at session start and the same index re-fetched mid-session through
+    // `list_domains` are two views of one thing and must not disagree about
+    // the order they present it in.
+    let mut registered: Vec<_> = global.domains.iter().collect();
+    registered.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
+    for (name, entry) in registered {
         let (bullets, warning) = if entry.is_virtual() {
             virtual_routing_bullets(name, virtual_bullets.get(name))
         } else {
@@ -823,12 +833,41 @@ mod tests {
     fn unscoped_ignores_prompt_rules_and_marks_nothing_preferred() {
         let (_tmp, global) = fixture_with_prompt_rules();
         let output = generate_prompt_unscoped(&global, &BTreeMap::new());
-        // Every registered domain is present in config order, `beta` included
-        // despite the include-only rule that would drop it in the scoped path.
+        // Every registered domain is present, `beta` included despite the
+        // include-only rule that would drop it in the scoped path.
         let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta"]);
         // No workspace means no preferred reorder: nothing is ever preferred.
         assert!(output.domains.iter().all(|d| !d.preferred));
+    }
+
+    /// The onboarding block is in the same order the domain listing is.
+    ///
+    /// Registration order is what the config map preserves and it means
+    /// nothing to a reader; worse, the block served at session start and the
+    /// index an agent re-fetches mid-session through `list_domains` are two
+    /// views of one thing, and two orders would read as two answers.
+    #[test]
+    fn unscoped_sorts_the_domains_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut domains = indexmap::IndexMap::new();
+        // Registered in the order somebody happened to add them. `Falcon` and
+        // `falconry` are the pair that pins the comparison as case-insensitive
+        // rather than byte-wise.
+        for name in ["zebra", "mercury", "Falcon", "falconry"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("MANIFEST.md"), manifest_source(&["when routing"])).unwrap();
+            domains.insert(name.to_string(), DomainEntry::file(root));
+        }
+        let global = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+
+        let output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Falcon", "falconry", "mercury", "zebra"]);
     }
 
     #[test]
