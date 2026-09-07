@@ -1368,10 +1368,28 @@ impl AuthStore {
     /// an account by address or by username: matching either of those would be
     /// the silent takeover this design refuses, and an API that cannot express
     /// it cannot grow it by accident.
+    ///
+    /// The read drops any link whose account no longer exists, the same sweep
+    /// [`AuthStore::session_user`] and [`AuthStore::mcp_token_user`] apply to
+    /// their own tables. `identity_link` carries no foreign key, and both
+    /// removal paths delete the links inside the transaction that deletes the
+    /// account, so nothing here is supposed to write one; but a link is a
+    /// credential, and an orphaned one is exactly what would be inherited by
+    /// the next account to take that login name - a stranger's provider
+    /// identity signing into somebody else's account. Clearing it on sight
+    /// makes that unrecoverable rather than dormant.
     pub async fn linked_user(&self, issuer: &str, subject: &str) -> Result<Option<User>> {
         let issuer = identity_value(issuer, "issuer")?;
         let subject = identity_value(subject, "subject")?;
         let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM identity_link
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.user)",
+                (),
+            )
+            .await
+            .context("pruning orphaned identity links")?;
         Ok(self
             .query_first(
                 &format!(
@@ -5309,6 +5327,99 @@ mod tests {
         assert_eq!(links[0].subject, "sub-1");
         assert_eq!(links[0].linked_by, "jit");
         assert!(!links[0].linked_at.is_empty());
+    }
+
+    /// A link whose account is gone is swept the moment it is looked up,
+    /// rather than left dormant for the next account to take the name.
+    ///
+    /// The direct analogue of
+    /// `an_orphaned_session_row_is_swept_rather_than_inherited`, and for the
+    /// same reason: an identity link is a credential, and a dormant one signs
+    /// a stranger into whoever next holds that login name.
+    #[tokio::test]
+    async fn an_orphaned_identity_link_is_swept_rather_than_inherited() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                Some("Ada"),
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        // Delete only the account row. Both removal paths are transactional
+        // and sweep the links themselves, so this is the state a differently
+        // built binary writing the same file, a hand edit, or a future
+        // deletion path that forgets the sweep would leave behind.
+        store
+            .conn
+            .execute(
+                "DELETE FROM users WHERE name = ?1",
+                vec![Value::Text("ada".to_string())],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .add_user("ada", "Ada The Second", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the orphan must have been swept, not left dormant"
+        );
+        assert!(
+            store.identity_links("ada").await.unwrap().is_empty(),
+            "and the account that took the name inherits nothing"
+        );
+    }
+
+    /// The engine enforces both constraints, not only `insert_link`'s checks:
+    /// a raw duplicate pair and a second identity for one account at one
+    /// issuer are both refused by the database itself.
+    #[tokio::test]
+    async fn the_database_itself_refuses_a_duplicate_pair_and_a_second_identity() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let insert = |subject: &str, user: &str| {
+            store.conn.execute(
+                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    Value::Text("https://idp.example".to_string()),
+                    Value::Text(subject.to_string()),
+                    Value::Text(user.to_string()),
+                    Value::Text("2026-09-07T00:00:00Z".to_string()),
+                    Value::Text("test".to_string()),
+                ],
+            )
+        };
+        insert("sub-1", "ada").await.unwrap();
+        assert!(
+            insert("sub-1", "ada").await.is_err(),
+            "the primary key on (issuer, subject) is the engine's, not ours"
+        );
+        assert!(
+            insert("sub-2", "ada").await.is_err(),
+            "and one account holds one identity per issuer, by unique index"
+        );
     }
 
     /// A name already taken is uniquified rather than joined, and the

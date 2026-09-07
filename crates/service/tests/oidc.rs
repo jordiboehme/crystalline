@@ -627,6 +627,12 @@ impl RestCtx {
     }
 
     async fn build(oidc: Option<OidcConfig>) -> RestCtx {
+        RestCtx::build_capped(oidc, None).await
+    }
+
+    /// The same instance with `auth.max_users` set, so the cap a provisioning
+    /// has to respect can actually be reached in a test.
+    async fn build_capped(oidc: Option<OidcConfig>, max_users: Option<u32>) -> RestCtx {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("eng");
         std::fs::create_dir_all(&dir).unwrap();
@@ -641,7 +647,7 @@ impl RestCtx {
                 trusted_header: None,
                 anonymous: None,
                 mcp: None,
-                max_users: None,
+                max_users,
                 oidc,
             }),
             service: Some(ServiceConfig {
@@ -1527,6 +1533,12 @@ async fn a_disabled_account_cannot_sign_on() {
 
     let refused = ctx.sign_in().await;
     assert_eq!(refused.status(), 403);
+    assert!(
+        !cookies_from(&refused)
+            .iter()
+            .any(|(name, _)| name == "fluid_session"),
+        "a refused sign-in mints nothing"
+    );
     let body = refused.text().await.unwrap();
     assert!(body.contains("this account is disabled"), "{body}");
 }
@@ -1558,4 +1570,72 @@ async fn link_intent_is_refused_rather_than_provisioned() {
         ctx.user("ada").await.expect("the account survives").role,
         Role::Admin
     );
+}
+
+/// The account cap is respected, and the refusal is the operator-facing 403
+/// that names the setting rather than a 500.
+///
+/// The status is what this pins: the mapping reads the store's own sentence,
+/// so a reworded cap message would silently turn an operator's 403 into an
+/// unexplained server error, and nothing else in the suite would notice.
+#[tokio::test]
+async fn a_sign_in_past_the_account_cap_is_refused_in_the_operators_words() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::build_capped(
+        Some(OidcConfig {
+            issuer: Some(idp.issuer()),
+            client_id: Some(CLIENT_ID.to_string()),
+            client_secret: Some(CLIENT_SECRET.to_string()),
+            name: Some("Contoso".to_string()),
+            scopes: None,
+            default_role: None,
+        }),
+        Some(1),
+    )
+    .await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+
+    let refused = ctx.sign_in().await;
+    assert_eq!(refused.status(), 403);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("auth.max_users"), "{body}");
+    assert!(
+        ctx.user("ada.lovelace").await.is_none(),
+        "a refused provisioning leaves no account behind"
+    );
+}
+
+/// A provider cannot write invisible direction-flipping characters into the
+/// account list an operator makes privilege decisions in.
+///
+/// The display name is the provider's to restate, so it is stored as sent -
+/// except for the characters that are not text at all. `Ada` with a
+/// right-to-left override in front of a suffix renders as something else
+/// entirely in a table, and the same trick in a login name is what turns a
+/// user list into an unreliable place to decide who gets admin.
+#[tokio::test]
+async fn control_characters_never_reach_a_stored_name() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.set_user(IdpUser {
+        subject: "sub-4".to_string(),
+        preferred_username: Some("ada\u{202e}nimda".to_string()),
+        name: Some("Ada\u{202e}ecalevoL\u{7}".to_string()),
+        email: Some("ada\u{200f}@example.test".to_string()),
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+
+    let user = ctx
+        .user("adanimda")
+        .await
+        .expect("the derived name drops the override");
+    assert_eq!(user.display, "AdaecalevoL");
+    assert_eq!(user.email.as_deref(), Some("ada@example.test"));
+    for stored in [user.name.as_str(), user.display.as_str()] {
+        assert!(
+            !stored.chars().any(|ch| ch.is_control() || ch == '\u{202e}'),
+            "{stored:?} still carries a character that is not text"
+        );
+    }
 }

@@ -1575,10 +1575,7 @@ impl OidcClaims {
     /// Read the five claims this layer cares about out of a validated ID
     /// token.
     fn from_id_token(claims: &CoreIdTokenClaims, link_for: Option<String>) -> OidcClaims {
-        let text = |value: &str| {
-            let value = value.trim();
-            (!value.is_empty()).then(|| value.to_string())
-        };
+        let text = |value: &str| presentation_text(value);
         OidcClaims {
             issuer: claims.issuer().as_str().to_string(),
             subject: claims.subject().as_str().to_string(),
@@ -1637,6 +1634,38 @@ impl OidcClaims {
         }
         filled
     }
+}
+
+/// One presentation claim as this layer will store it: trimmed, stripped of
+/// the characters that are not text, and `None` when nothing is left.
+///
+/// Blank becomes absent so the resolver never has to tell `""` apart from a
+/// claim the provider did not send. The stripping is the other half: a display
+/// name and a derived login name both end up in the account list an operator
+/// makes privilege decisions in, and a right-to-left override or a zero width
+/// joiner in one of them renders as a name that is not the name that was
+/// stored. A provider is trusted to assert who somebody is, not to write
+/// direction changes into an admin's table. Every other character the provider
+/// sends survives, including every script: this removes control and formatting
+/// codepoints, never letters.
+fn presentation_text(value: &str) -> Option<String> {
+    let cleaned: String = value
+        .chars()
+        .filter(|ch| {
+            // Cc, plus the Cf ranges that reorder or hide what follows them.
+            !ch.is_control()
+                && !matches!(
+                    ch,
+                    '\u{00ad}'
+                        | '\u{200b}'..='\u{200f}'
+                        | '\u{202a}'..='\u{202e}'
+                        | '\u{2060}'..='\u{206f}'
+                        | '\u{feff}'
+                )
+        })
+        .collect();
+    let trimmed = cleaned.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// The account name a provisioning falls back to when a provider sends
@@ -2324,6 +2353,36 @@ mod tests {
                 super::super::auth_store::normalize_account_name(&derived).unwrap(),
                 derived,
                 "{raw:?} derived a name the store would have folded further"
+            );
+        }
+    }
+
+    /// A presentation claim keeps every letter and loses everything that is
+    /// not text. The second half matters as much as the first: stripping is
+    /// about direction changes and invisible joiners, never about scripts.
+    #[test]
+    fn presentation_claims_lose_only_the_characters_that_are_not_text() {
+        assert_eq!(
+            presentation_text("Ada\u{202e}ecalevoL").as_deref(),
+            Some("AdaecalevoL"),
+            "a right-to-left override never reaches a stored name"
+        );
+        assert_eq!(presentation_text("  Ada  ").as_deref(), Some("Ada"));
+        assert_eq!(
+            presentation_text("Ada\u{7}\u{200b}Lovelace").as_deref(),
+            Some("AdaLovelace")
+        );
+        assert_eq!(
+            presentation_text("\u{200b}\u{feff}\u{00ad}").as_deref(),
+            None,
+            "a claim of nothing but formatting is a claim of nothing"
+        );
+        assert_eq!(presentation_text("   ").as_deref(), None);
+        for kept in ["Ada Lovelace", "Ада Лавлейс", "愛達", "josé", "\u{3a9}"] {
+            assert_eq!(
+                presentation_text(kept).as_deref(),
+                Some(kept),
+                "{kept:?} is text and must survive untouched"
             );
         }
     }
