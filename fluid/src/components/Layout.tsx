@@ -1255,7 +1255,18 @@ function DomainLink({ domain }: { domain: DomainSummary }) {
         }`
       }
     >
-      <span className="truncate">{domain.name}</span>
+      {/*
+        The name and its badge travel together on the left, so the count stays
+        pinned to the right edge whether or not a badge is there. Inside the
+        link rather than beside it, unlike the home card and the domain
+        screen: the whole row is the target here, and a chip hanging outside
+        it would be the one part of the row that does not take a click. The
+        link then reads "lab private 12", which is the row said out loud.
+      */}
+      <span className="flex min-w-0 items-baseline gap-1.5">
+        <span className="truncate">{domain.name}</span>
+        {domain.private && <Chip variant="accent">private</Chip>}
+      </span>
       {domain.engrams !== null && (
         <span className="text-xs text-slate-500 tabular-nums dark:text-slate-400">
           {domain.engrams}

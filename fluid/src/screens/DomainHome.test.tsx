@@ -275,20 +275,57 @@ describe("the domain screen", () => {
 
   it("wears a private badge beside its name when the domain is private, and none when it is shared", async () => {
     serve({
-      "/domains/eng/members": () => ({
-        owner: "ada",
-        visibility: "private",
-        members: [],
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            private: true,
+            when_to_use: ["Route here for eng questions."],
+          },
+        ],
       }),
     });
 
     renderApp("/d/eng");
 
-    // A sibling of the heading rather than inside it, off the same read
-    // `MembersCard` makes below - `GET /domains` itself names no domain's
-    // visibility - so the heading's own accessible name stays exactly "eng".
+    // A sibling of the heading rather than inside it, off the listing every
+    // other chip on this header draws from, so the heading's own accessible
+    // name stays exactly "eng".
     const heading = await screen.findByRole("heading", { name: "eng" });
     expect(heading).toBeVisible();
+    await waitFor(() => {
+      expect(heading.parentElement).toHaveTextContent("private");
+    });
+  });
+
+  it("wears the badge even when the membership read never lands", async () => {
+    // The badge is the listing's answer, not the membership card's: a
+    // members read that fails takes the card down with it and leaves the
+    // header saying exactly what it said before.
+    serve({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          {
+            name: "eng",
+            kind: "file",
+            engrams: 4,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+      "/domains/eng/members": () => {
+        throw new ApiProblem(500, "internal", "the accounts store is down");
+      },
+    });
+
+    renderApp("/d/eng");
+
+    const heading = await screen.findByRole("heading", { name: "eng" });
     await waitFor(() => {
       expect(heading.parentElement).toHaveTextContent("private");
     });

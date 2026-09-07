@@ -250,6 +250,36 @@ describe("the layout", () => {
     expect(screen.queryByRole("button", { name: /^Domain:/ })).toBeNull();
   });
 
+  it("badges a private domain in the sidebar and leaves a shared one plain", async () => {
+    serveSignedIn({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          {
+            name: "lab",
+            kind: "file",
+            engrams: 2,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/");
+
+    const domains = await screen.findByRole("navigation", { name: "Domains" });
+    const lab = await within(domains).findByRole("link", { name: /^lab/ });
+    expect(lab).toHaveTextContent("private");
+    // The badge rides on the listing's own field, so a row that does not say
+    // it is private wears nothing - the same as a row from a server that
+    // never heard of the field.
+    expect(
+      within(domains).getByRole("link", { name: /^eng/ }),
+    ).not.toHaveTextContent("private");
+  });
+
   it("says what went wrong instead of emptying the sidebar", async () => {
     serveSignedIn({
       "/domains": () => {

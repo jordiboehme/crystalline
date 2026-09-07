@@ -33,7 +33,6 @@ import {
   fetchDomainEngrams,
   hasFilters,
 } from "../api/engrams";
-import { fetchMembers, membersKey } from "../api/members";
 import { fetchTags, vocabularyKey } from "../api/vocabulary";
 import type { TagCount } from "../api/vocabulary";
 import { useAuth } from "../auth/AuthContext";
@@ -102,17 +101,6 @@ export default function DomainHome() {
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
   });
-  // The same read `MembersCard` makes below, cached under the same key: this
-  // is a cache hit rather than a second request, and what it buys here is
-  // the one fact worth wearing beside the domain's own name - a badge the
-  // engine's own listing cannot carry yet, since `GET /domains` names no
-  // domain's visibility (see the members read for why the card, not this
-  // header, is the source of truth for everything else).
-  const members = useQuery({
-    queryKey: membersKey(domain),
-    queryFn: () => fetchMembers(domain),
-  });
-
   // A domain nobody registered is a wrong address, not an empty shelf. The
   // tree is what says so: a 404 from the manifest also means a domain that
   // simply has not been introduced yet.
@@ -227,16 +215,16 @@ export default function DomainHome() {
             accessible name stays exactly the domain's name, and the badge is
             a separate piece of content beside it rather than text silently
             appended to what a screen reader announces as the page's title.
-            `GET /domains` names no domain's visibility, so this rides on
-            `MembersCard`'s own read (cached under the same key, so this
-            costs nothing extra) rather than on the listing every other chip
-            here draws from. A domain nobody has made private answers
-            "shared" and draws nothing, the same way a kind-less domain draws
-            no chip either.
+            Off the listing every other chip here draws from, which is the
+            same read the sidebar and the home cards badge from: one fact,
+            one source, and a header that cannot disagree with the two places
+            that named this domain on the way here. It used to ride on
+            `MembersCard`'s membership read, which said the same thing a
+            request later and only once that request had landed. A domain
+            nobody has made private draws nothing, the same way a kind-less
+            domain draws no chip either.
           */}
-          {members.data?.visibility === "private" && (
-            <Chip variant="accent">private</Chip>
-          )}
+          {summary?.private === true && <Chip variant="accent">private</Chip>}
         </div>
         {summary && (
           <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
