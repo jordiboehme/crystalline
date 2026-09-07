@@ -16,6 +16,7 @@ mod files;
 mod github_identity;
 mod github_settings;
 mod graph;
+mod mcp_tokens;
 mod users_api;
 
 use std::sync::Arc;
@@ -139,6 +140,10 @@ use crate::engine::Engine;
         github_identity::connect,
         github_identity::token,
         github_identity::disconnect,
+        mcp_tokens::list,
+        mcp_tokens::issue,
+        mcp_tokens::rotate,
+        mcp_tokens::revoke,
     ),
     components(schemas(
         ProblemDetail,
@@ -176,6 +181,9 @@ use crate::engine::Engine;
         github_settings::GithubStatusResponse,
         github_settings::GithubPendingView,
         github_identity::GithubIdentityResponse,
+        McpTokenInfo,
+        mcp_tokens::IssueBody,
+        mcp_tokens::IssuedTokenResponse,
     )),
 )]
 struct ApiDoc;
@@ -582,6 +590,22 @@ pub fn router(state: RestState) -> Router {
             post(github_identity::connect),
         )
         .route("/me/github-identity/token", put(github_identity::token))
+        // The other half of the same self-service idea: the tokens this
+        // account's AGENTS authenticate with when `auth.mcp` is on. Open to
+        // every signed-in account, viewers included - an agent acts as the
+        // account that issued its token, so a viewer's agent is read-only by
+        // construction - and to no anonymous caller, which has no account to
+        // issue for. No name in the path, for the reason the identity routes
+        // above carry none: the session already names the account, so a
+        // caller can only ever reach its own. The listing is a pure read and
+        // stays served on a read-only instance; the three mutations are
+        // refused there like every other write here.
+        .route(
+            "/me/mcp-tokens",
+            get(mcp_tokens::list).post(mcp_tokens::issue),
+        )
+        .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
+        .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.

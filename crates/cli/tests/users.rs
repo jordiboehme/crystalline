@@ -545,6 +545,98 @@ fn users_add_works_while_another_process_holds_the_auth_db() {
     );
 }
 
+/// The MCP token verb end to end: issue, list, rotate, revoke.
+///
+/// The token itself is asserted on twice over - the prefix and the shape - and
+/// the teaching line is asserted verbatim, because it is what tells the
+/// operator where the token goes; the MCP gate's own refusal names the same
+/// header, so the two must keep saying the same thing.
+#[test]
+fn mcp_token_is_issued_once_then_listed_rotated_and_revoked() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "editor", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let out = users_ok(home.path(), &["mcp-token", "ada", "--label", "ci"], None);
+    let token = out
+        .split_whitespace()
+        .find(|word| word.starts_with("cmt_"))
+        .unwrap_or_else(|| panic!("the token is printed: {out}"))
+        .to_string();
+    assert_eq!(
+        token.len(),
+        68,
+        "the prefix plus 64 hex characters: {token}"
+    );
+    assert!(token[4..].chars().all(|c| c.is_ascii_hexdigit()), "{token}");
+    assert!(
+        out.contains(
+            "Add it to the agent's MCP registration as header \
+             'Authorization: Bearer <token>'."
+        ),
+        "the token is useless without knowing where it goes: {out}"
+    );
+    assert!(out.contains("ci"), "the label is confirmed: {out}");
+
+    let listed = users_ok(home.path(), &["mcp-token", "ada", "--list"], None);
+    assert!(listed.contains("ci"), "the one token is listed: {listed}");
+    assert!(listed.contains("never"), "never presented yet: {listed}");
+    assert!(
+        !listed.contains(&token) && !listed.contains("cmt_"),
+        "and never the token itself, which is stored only as a hash: {listed}"
+    );
+    let id = listed
+        .lines()
+        .nth(1)
+        .and_then(|row| row.split_whitespace().next())
+        .expect("the listing has a row")
+        .to_string();
+
+    let rotated = users_ok(home.path(), &["mcp-token", "ada", "--rotate", &id], None);
+    let fresh = rotated
+        .split_whitespace()
+        .find(|word| word.starts_with("cmt_"))
+        .unwrap_or_else(|| panic!("the replacement is printed: {rotated}"));
+    assert_ne!(fresh, token, "rotation mints a new secret");
+    let listed = users_ok(home.path(), &["mcp-token", "ada", "--list"], None);
+    assert!(listed.contains("ci"), "keeping the label: {listed}");
+    let new_id = listed
+        .lines()
+        .nth(1)
+        .and_then(|row| row.split_whitespace().next())
+        .expect("the listing has a row")
+        .to_string();
+    assert_ne!(new_id, id, "under a new id: {listed}");
+
+    // The retired id is gone, and saying so is the point: a revoke that
+    // silently did nothing would leave a live token behind.
+    let refused = users_err(home.path(), &["mcp-token", "ada", "--revoke", &id], None);
+    assert!(refused.contains("holds no MCP token"), "{refused}");
+
+    users_ok(
+        home.path(),
+        &["mcp-token", "ada", "--revoke", &new_id],
+        None,
+    );
+    let listed = users_ok(home.path(), &["mcp-token", "ada", "--list"], None);
+    assert!(
+        listed.contains("holds no MCP tokens"),
+        "the account is back to none: {listed}"
+    );
+}
+
+/// A token is minted against an account, so a mistyped name is refused rather
+/// than stranding a row nothing can resolve.
+#[test]
+fn an_mcp_token_for_an_unknown_account_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    let err = users_err(home.path(), &["mcp-token", "ghost"], None);
+    assert!(err.contains("no such user"), "{err}");
+}
+
 /// The spawned holder, killed when this goes out of scope.
 ///
 /// Every path between the spawn and the orderly stop can panic - a failing

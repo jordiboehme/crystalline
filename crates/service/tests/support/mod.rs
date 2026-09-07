@@ -107,6 +107,10 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/me/github-identity",
     "POST /api/v1/me/github-identity/connect",
     "PUT /api/v1/me/github-identity/token",
+    "GET /api/v1/me/mcp-tokens",
+    "POST /api/v1/me/mcp-tokens",
+    "POST /api/v1/me/mcp-tokens/{id}/rotate",
+    "DELETE /api/v1/me/mcp-tokens/{id}",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.

@@ -3504,4 +3504,31 @@ mod tests {
         assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
         assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
     }
+
+    /// The one unhashed copy of a live credential must never be one
+    /// `tracing::debug!` or one failed assertion away from a log file, while
+    /// the id and the label - the parts that make such a line useful - still
+    /// print. Asserted on the random half rather than on the whole token: the
+    /// redaction keeps the [`MCP_TOKEN_PREFIX`], so `!contains(&issued.token)`
+    /// would pass even if the secret leaked in pieces.
+    #[tokio::test]
+    async fn an_issued_token_never_prints_its_secret() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "laptop").await.unwrap();
+        let secret = issued
+            .token
+            .strip_prefix(MCP_TOKEN_PREFIX)
+            .expect("a token carries the prefix");
+        let text = format!("{issued:?}");
+        assert!(!text.contains(secret), "the secret is redacted: {text}");
+        assert!(text.contains("redacted"), "and says so: {text}");
+        assert!(
+            text.contains("laptop") && text.contains(&issued.id.to_string()),
+            "while the id and label still print: {text}"
+        );
+    }
 }

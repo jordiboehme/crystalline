@@ -4452,6 +4452,252 @@
         }
       }
     },
+    "/api/v1/me/mcp-tokens": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The caller's own MCP tokens, newest first.",
+        "description": "Every signed-in account has this, viewers included: an agent acts as the account that issued its token, so a viewer's agent is read-only by construction. The rows carry the label, when the token was issued and when it was last presented - never the token, which exists in the clear only in the reply that issued it. A pure read, served even on a read-only instance.",
+        "operationId": "list_my_mcp_tokens",
+        "responses": {
+          "200": {
+            "description": "This account's tokens.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpTokenInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: the anonymous viewer has no account and so holds no tokens.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Issue an MCP token for the caller's own account.",
+        "description": "Every signed-in account may issue one, viewers included. The reply is the only place the token is ever readable: only its hash is stored, so a lost token is revoked and replaced rather than looked up. Send it from the agent's MCP registration as `Authorization: Bearer <token>`. Refused on a read-only instance, where `crystalline users mcp-token <name>` on the machine that holds the database is the way to issue one.",
+        "operationId": "issue_my_mcp_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedTokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The label is empty.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/mcp-tokens/{id}": {
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Revoke one of the caller's own MCP tokens.",
+        "description": "The token stops resolving at once: the next request carrying it is refused at the door. Only the caller's own tokens can be named - any other id is 404, the same answer an unknown one gets, so another account's tokens cannot be probed for.",
+        "operationId": "revoke_my_mcp_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "One of the caller's own token ids.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The token is gone."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No token of the caller's carries that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/mcp-tokens/{id}/rotate": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Replace one of the caller's MCP tokens with a fresh one.",
+        "description": "The old secret stops working and the new one exists in the same step, so a token that may have leaked is replaced without a window in which the agent holds none. The label rides along and the reply carries a new `id`. Only the caller's own tokens can be named: any other id is 404, so another account's cannot be probed for.",
+        "operationId": "rotate_my_mcp_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "One of the caller's own token ids.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The new token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedTokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No token of the caller's carries that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/openapi.json": {
       "get": {
         "tags": [
@@ -6100,6 +6346,47 @@
           }
         }
       },
+      "IssueBody": {
+        "type": "object",
+        "description": "A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again.",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "What this token is for. Required and non-empty: an unlabeled row is\none nobody dares revoke.",
+            "example": "laptop"
+          }
+        }
+      },
+      "IssuedTokenResponse": {
+        "type": "object",
+        "description": "A freshly issued MCP token. `token` is shown here and nowhere else, ever: only its hash is stored. Send it as `Authorization: Bearer <token>` from the agent's MCP registration.",
+        "required": [
+          "id",
+          "token",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, used to rotate or revoke this token later.",
+            "example": 3
+          },
+          "label": {
+            "type": "string",
+            "description": "The label it was issued under, echoed so the reply is self-describing.",
+            "example": "laptop"
+          },
+          "token": {
+            "type": "string",
+            "description": "The token itself, this once.",
+            "example": "cmt_1f3c..."
+          }
+        }
+      },
       "LoginBody": {
         "type": "object",
         "description": "What `POST /auth/login` takes.",
@@ -6149,6 +6436,37 @@
           "ok": {
             "type": "boolean",
             "description": "Always true."
+          }
+        }
+      },
+      "McpTokenInfo": {
+        "type": "object",
+        "description": "One row of an account's MCP token list, for a management UI or CLI. Never\ncarries the token itself - only the hash is stored, so there is nothing to\nshow back after issuance.",
+        "required": [
+          "id",
+          "label",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339, when this token was issued."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, used to revoke or rotate this token."
+          },
+          "label": {
+            "type": "string",
+            "description": "The caller-chosen label."
+          },
+          "last_used": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339, when this token last resolved a request. `None` if it has\nnever been used."
           }
         }
       },

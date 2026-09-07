@@ -757,6 +757,30 @@ enum UsersCommand {
         #[arg(long)]
         force: bool,
     },
+    /// Issue an MCP token for an account, or manage the ones it already
+    /// holds. An agent authenticates with one of these when `auth.mcp` is on,
+    /// sending it as `Authorization: Bearer <token>`, and acts as this account
+    /// for as long as it does. The token is printed once and never again: only
+    /// its hash is stored, so a lost one is revoked and replaced.
+    McpToken {
+        /// The account the token belongs to.
+        name: String,
+        /// What the token is for, shown in the listing. Defaults to `cli`.
+        #[arg(long, conflicts_with_all = ["list", "revoke", "rotate"])]
+        label: Option<String>,
+        /// List this account's tokens instead of issuing one. Never shows a
+        /// token: there is nothing left to show after issuance.
+        #[arg(long, conflicts_with_all = ["revoke", "rotate"])]
+        list: bool,
+        /// Revoke one of this account's tokens by id. It stops working at
+        /// once.
+        #[arg(long, value_name = "ID", conflicts_with = "rotate")]
+        revoke: Option<i64>,
+        /// Replace one of this account's tokens by id, keeping its label: the
+        /// old secret stops working and the new one is printed.
+        #[arg(long, value_name = "ID")]
+        rotate: Option<i64>,
+    },
     /// Delete an account and every session it holds. Removing the last
     /// enabled admin is refused.
     Remove {
