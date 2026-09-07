@@ -475,6 +475,12 @@ impl PendingStore {
         self.records.len()
     }
 
+    /// How many entries the chronological order holds, live or spent.
+    #[cfg(test)]
+    fn order_len(&self) -> usize {
+        self.order.len()
+    }
+
     /// Remember `pending` under `state`, forgetting whatever has expired and,
     /// if the map is still full, the oldest records past [`MIN_EVICT_AGE`].
     /// Refuses when the map is full of records younger than that: a flood
@@ -519,10 +525,19 @@ impl PendingStore {
     }
 
     /// Forget every record older than [`PENDING_TTL`], from the front of the
-    /// chronological order until the first one that is still live.
+    /// chronological order until the first one that is still live, and drop
+    /// the spent entries met on the way.
+    ///
+    /// The spent ones matter for the bound: a sign-in started and taken at
+    /// once (a login, then a callback whose exchange fails) never fills the
+    /// map, so the eviction loop never runs, and without this the order would
+    /// keep its entry for the full TTL at the cost of two cheap requests.
+    /// Completions are roughly first in, first out, so popping spent entries
+    /// from the front keeps the order close to the map.
     fn purge_expired(&mut self, now: Instant) {
-        while let Some((started, _)) = self.order.front() {
-            if now.duration_since(*started) < PENDING_TTL {
+        while let Some((started, key)) = self.order.front() {
+            let spent = !self.records.contains_key(key);
+            if !spent && now.duration_since(*started) < PENDING_TTL {
                 break;
             }
             let (_, key) = self.order.pop_front().expect("checked just above");
@@ -1128,8 +1143,9 @@ pub struct LoginQuery {
         ),
         (
             status = 400,
-            description = "The request carries no Host header, so no redirect \
-                           uri can be derived.",
+            description = "The request carries no Host header, or one that is \
+                           not a bare host and port, so no redirect uri can be \
+                           derived.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1190,8 +1206,16 @@ pub async fn login(
     } else {
         None
     };
-    let redirect_uri = RedirectUrl::new(absolute_url(&headers, CALLBACK_PATH)?).map_err(|err| {
+    let redirect_uri = absolute_url(&headers, CALLBACK_PATH).inspect_err(|_| {
+        // The 400 an operator debugging a proxy most wants to see in the log.
+        refused(
+            "redirect uri could not be derived from the Host header",
+            &client.settings.issuer,
+        );
+    })?;
+    let redirect_uri = RedirectUrl::new(redirect_uri).map_err(|err| {
         tracing::debug!("the derived redirect uri is not a url: {err}");
+        refused("derived redirect uri is not a url", &client.settings.issuer);
         ApiError::bad_request(
             "the address this instance was reached at cannot be turned into a redirect uri",
         )
@@ -2101,10 +2125,6 @@ mod tests {
         assert!(claims.lacks_presentation_claims());
     }
 
-    /// The pending map is something an unauthenticated caller can add to, so
-    /// its bounds are the ones worth pinning: a record is single use, the map
-    /// has a ceiling, and the ceiling cannot be used to push a real sign-in
-    /// out from under someone mid-consent.
     /// Why a take missed, without asking `Pending` - which holds the PKCE
     /// verifier and the nonce - to implement `Debug` for the sake of a test.
     fn miss(taken: Result<Pending, StateMiss>) -> StateMiss {
@@ -2114,6 +2134,10 @@ mod tests {
         }
     }
 
+    /// The pending map is something an unauthenticated caller can add to, so
+    /// its bounds are the ones worth pinning: a record is single use, the map
+    /// has a ceiling, and the ceiling cannot be used to push a real sign-in
+    /// out from under someone mid-consent.
     #[test]
     fn a_flood_of_sign_ins_cannot_evict_one_that_started_moments_ago() {
         let mut store = PendingStore::default();
@@ -2204,6 +2228,34 @@ mod tests {
             )
             .unwrap();
         assert_eq!(miss(store.take("late")), StateMiss::Expired);
+    }
+
+    /// The chronological order is bounded by the cap too, not only the map:
+    /// a caller who starts a sign-in and spends it at once (a login, then a
+    /// callback whose exchange fails) leaves the map empty and would otherwise
+    /// leave an entry in the order for the full ten minutes, growing it by
+    /// two cheap unauthenticated requests per entry.
+    #[test]
+    fn spending_sign_ins_does_not_grow_the_order_past_the_cap() {
+        let mut store = PendingStore::default();
+        let record = || Pending {
+            nonce: Nonce::new("n".to_string()),
+            verifier: PkceCodeVerifier::new("v".repeat(43)),
+            redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
+            link_for: None,
+            started: Instant::now(),
+        };
+        for i in 0..(MAX_PENDING * 2) {
+            let state = format!("cycle-{i}");
+            store.insert(state.clone(), record()).unwrap();
+            assert!(store.take(&state).is_ok());
+        }
+        assert_eq!(store.len(), 0);
+        assert!(
+            store.order_len() <= MAX_PENDING,
+            "spent entries piled up in the order: {}",
+            store.order_len()
+        );
     }
 
     /// `common`, `organizations` and `consumers` are refused where the

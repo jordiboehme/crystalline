@@ -2572,7 +2572,7 @@ export interface operations {
                 };
                 content?: never;
             };
-            /** @description The request carries no Host header, so no redirect uri can be derived. */
+            /** @description The request carries no Host header, or one that is not a bare host and port, so no redirect uri can be derived. */
             400: {
                 headers: {
                     [name: string]: unknown;

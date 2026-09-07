@@ -1223,16 +1223,22 @@ async fn a_wrong_audience_and_an_expired_token_are_refused() {
 
     // And the control: with both knobs back, the same browser signs in.
     idp.expire_tokens_after(300);
-    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(ctx.sign_in().await.status(), 302);
 }
 
 /// Every answer the callback gives is marked uncacheable, the refusals
-/// included: a 401 or a 501 is heuristically cacheable and carries the state
+/// included: a 401 or a 409 is heuristically cacheable and carries the state
 /// cookie's deletion, and nothing on this route should be served from a cache.
+/// Both legs drive an error tail, since the success path always carried
+/// `no-store` and would pin nothing: the protocol refusal before the seam,
+/// and the identity refusal after it.
 #[tokio::test]
 async fn every_callback_answer_is_uncacheable() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
 
     let cache_control = |response: &reqwest::Response| {
         response
@@ -1248,9 +1254,14 @@ async fn every_callback_answer_is_uncacheable() {
     assert_eq!(refused.status(), 401);
     assert!(cache_control(&refused).contains("no-store"), "{refused:?}");
 
-    let seam = ctx.sign_in().await;
-    assert_eq!(seam.status(), 501);
-    assert!(cache_control(&seam).contains("no-store"), "{seam:?}");
+    let past_the_seam = ctx
+        .sign_in_from("/auth/oidc/login?link=true", &session)
+        .await;
+    assert_eq!(past_the_seam.status(), 409);
+    assert!(
+        cache_control(&past_the_seam).contains("no-store"),
+        "{past_the_seam:?}"
+    );
 }
 
 /// A provider that keeps the presentation claims out of the ID token - Authelia
@@ -1262,7 +1273,7 @@ async fn presentation_claims_missing_from_the_id_token_are_filled_from_userinfo(
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
 
-    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(ctx.sign_in().await.status(), 302);
     assert_eq!(
         idp.userinfo_hits(),
         0,
@@ -1270,7 +1281,7 @@ async fn presentation_claims_missing_from_the_id_token_are_filled_from_userinfo(
     );
 
     idp.keep_presentation_claims_out_of_the_id_token();
-    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(ctx.sign_in().await.status(), 302);
     assert_eq!(
         idp.userinfo_hits(),
         1,
@@ -1311,10 +1322,16 @@ async fn an_unreachable_userinfo_endpoint_does_not_block_the_sign_in() {
 
     assert_eq!(
         ctx.sign_in().await.status(),
-        501,
-        "the flow reached the seam"
+        302,
+        "the flow reached the seam and signed in"
     );
     assert_eq!(idp.userinfo_hits(), 0);
+    // With no presentation claim from either source, provisioning falls back
+    // to its generic name rather than refusing: the identity is the subject.
+    assert!(
+        ctx.user("sso-user").await.is_some(),
+        "an account was provisioned under the fallback name"
+    );
     assert!(
         logs.lines()
             .iter()
