@@ -699,13 +699,15 @@ async fn the_sync_summary_lists_only_visible_team_domains() {
 
 /// A cross-domain move reaches past the two domains it names: it gathers every
 /// inbound reference to the engram, across domains, and rewrites the bare ones
-/// into the prefixed form. The private domain holds a bare reference to the
-/// moving engram, and `links_rewritten` being 1 here is what says that branch
-/// actually ran - the caller, a stranger to that domain, caused a write inside
-/// it (the accepted trade in the plan's ruling (d)).
+/// into the prefixed form - but only inside domains the mover may see. The
+/// private domain holds a bare reference to the moving engram, and
+/// `links_rewritten` being 0 here is what says the rewrite did NOT run inside
+/// it: a stranger's move leaves a hidden domain's files untouched (its members
+/// see the dangling link as an unresolved-link finding), and the count names
+/// visible rewrites only.
 ///
-/// What must NOT happen is the disclosure: the receipt carries a count and
-/// nothing else about the referrer - no domain name, no title, no path.
+/// What must NOT happen either is the disclosure: the receipt carries a count
+/// and nothing else about the referrer - no domain name, no title, no path.
 #[tokio::test]
 async fn a_cross_domain_move_receipt_names_no_hidden_domain() {
     let ctx = RestCtx::two_domains().await;
@@ -722,8 +724,8 @@ async fn a_cross_domain_move_receipt_names_no_hidden_domain() {
     let receipt = moved.text().await.unwrap();
     let receipt_json: serde_json::Value = serde_json::from_str(&receipt).unwrap();
     assert_eq!(
-        receipt_json["links_rewritten"], 1,
-        "the rewrite branch ran, inside the private domain: {receipt}"
+        receipt_json["links_rewritten"], 0,
+        "the rewrite must not run inside the private domain: {receipt}"
     );
     assert!(
         !receipt.contains("lab") && !receipt.contains("Secret"),
