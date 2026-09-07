@@ -1278,13 +1278,20 @@ fn http_base(
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
+    let config = engine.config();
     // `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
     // off there is nowhere for them to live, so the refusal happens here
     // rather than waiting for `RestState::new` below, which never runs when
     // `api` is false.
-    if engine.config().auth_oauth() && !api {
+    let oauth = config.auth_oauth();
+    if oauth && !api {
         anyhow::bail!("auth.oauth needs service.api: its endpoints live under /api/v1");
     }
+    // What this instance calls itself, resolved once with the other startup
+    // settings: the audience the gate checks an OAuth access token against and
+    // the origin the two well-known documents publish, which have to be one
+    // answer or a client is sent somewhere its token does not work.
+    let origin_rule = crate::rest::OriginRule::from_config(&config);
 
     // Every HTTP caller is answered through a resolved scope, so the engine
     // gets the resolver the moment the store behind it exists. Installed here,
@@ -1335,8 +1342,20 @@ fn http_base(
     // mounted - a browser navigation is answered by the shell middleware before
     // the gate is ever reached. What is left for the gate is exactly the
     // requests the transport would have served.
-    let service = crate::mcp_gate::McpGate::new(service, mcp_auth, session_owners);
-    let mut router = axum::Router::new().route("/health", axum::routing::get(health));
+    let mut service = crate::mcp_gate::McpGate::new(service, mcp_auth, session_owners);
+    if oauth {
+        service = service.with_oauth(origin_rule.clone());
+    }
+    // The two well-known documents are root documents by specification, so they
+    // are declared here beside `/health` rather than under the `/api/v1` nest -
+    // and declared whether or not `auth.oauth` is on, answering `404` while it
+    // is off. Mounting them conditionally would leave the paths to whatever is
+    // behind them, which is the app shell for a browser's `Accept` and this
+    // gate's own `401` for an API client's; neither reads as "there is no OAuth
+    // here". See `rest::oauth`.
+    let mut router = axum::Router::new()
+        .route("/health", axum::routing::get(health))
+        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
     }

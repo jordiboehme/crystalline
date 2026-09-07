@@ -35,7 +35,8 @@ use crystalline_service::rest::{AuthStore, Role};
 use tokio::sync::Mutex;
 
 /// A real temp-directory domain synced into an in-memory store, with
-/// `auth.mcp` set to `mcp_auth` and `auth.proxy_headers` to `proxy_headers`.
+/// `auth.mcp` set to `mcp_auth`, `auth.proxy_headers` to `proxy_headers`,
+/// `auth.oauth` to `oauth` and `auth.oidc.redirect_uri` to `redirect_uri`.
 /// Modelled on the other service integration suites' engine builders; the
 /// response format is pinned to plain JSON so no assertion here has to account
 /// for TOON framing.
@@ -43,9 +44,17 @@ use tokio::sync::Mutex;
 /// The forward-auth mode is a parameter so a test can prove it opens no door
 /// here: this gate resolves personal MCP tokens and reads nothing else,
 /// whatever a proxy in front says about the person.
+///
+/// `redirect_uri` is set on its own, with no issuer and no client beside it, on
+/// purpose: single sign-on stays off (the relying party refuses a half
+/// configured block), and the origin rule still reads the key, because it is
+/// the one place an operator behind a Host-rewriting proxy has already written
+/// this instance's public address.
 async fn build_engine_with(
     mcp_auth: bool,
     proxy_headers: bool,
+    oauth: bool,
+    redirect_uri: Option<&str>,
 ) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
@@ -66,6 +75,11 @@ async fn build_engine_with(
     cfg.auth = Some(AuthConfig {
         mcp: Some(mcp_auth),
         proxy_headers: proxy_headers.then_some(true),
+        oauth: oauth.then_some(true),
+        oidc: redirect_uri.map(|uri| crystalline_core::config::OidcConfig {
+            redirect_uri: Some(uri.to_string()),
+            ..crystalline_core::config::OidcConfig::default()
+        }),
         ..AuthConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -88,16 +102,35 @@ async fn build_engine_with(
 async fn serve_with_mcp_auth(
     mcp_auth: bool,
 ) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
-    serve_with_mcp_auth_and(mcp_auth, false).await
+    serve_with_mcp_auth_and(mcp_auth, false, false).await
+}
+
+/// [`serve_with_mcp_auth`] with `auth.oauth` on beside the gate, which is the
+/// only combination the setting allows: the tokens OAuth issues are checked at
+/// that gate, so `auth.oauth` without `auth.mcp` refuses to start.
+async fn serve_with_oauth() -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
+    serve_with_mcp_auth_and(true, false, true).await
 }
 
 /// [`serve_with_mcp_auth`] on an instance that also trusts the forward-auth
-/// `Remote-*` headers.
+/// `Remote-*` headers, and serves OAuth when `oauth` is set.
 async fn serve_with_mcp_auth_and(
     mcp_auth: bool,
     proxy_headers: bool,
+    oauth: bool,
 ) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
-    let (tmp, engine) = build_engine_with(mcp_auth, proxy_headers).await;
+    serve_with(mcp_auth, proxy_headers, oauth, None).await
+}
+
+/// The whole of what the suite can configure, for the two tests that need the
+/// `auth.oidc.redirect_uri` override.
+async fn serve_with(
+    mcp_auth: bool,
+    proxy_headers: bool,
+    oauth: bool,
+    redirect_uri: Option<&str>,
+) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
+    let (tmp, engine) = build_engine_with(mcp_auth, proxy_headers, oauth, redirect_uri).await;
     let store = Arc::new(
         AuthStore::open(&tmp.path().join("web-auth.db"))
             .await
@@ -2261,7 +2294,7 @@ async fn the_aggregate_origin_verbs_hide_a_private_team_domain_from_the_open_tie
 /// quartet is refused in the identical words a bare one is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_headers_are_no_way_past_the_mcp_gate() {
-    let (addr, _tmp, _store) = serve_with_mcp_auth_and(true, true).await;
+    let (addr, _tmp, _store) = serve_with_mcp_auth_and(true, true, false).await;
     let refused = reqwest::Client::new()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
@@ -2692,4 +2725,451 @@ async fn a_virtual_domain_needs_purge_over_mcp_and_the_refusal_names_it() {
         "with purge it lands:\n{removed}"
     );
     assert!(!still_registered(&ctx, "mind").await);
+}
+
+// --- OAuth access tokens at the same door --------------------------------
+//
+// With `auth.oauth` on, a hosted MCP client reaches this instance without a
+// person pasting a token into it: it discovers the two well-known documents,
+// registers, is consented to and from then on presents an access token this
+// server minted. The gate is where that token is checked, and it is checked
+// the way a personal MCP token is - one lookup, one identity, one refusal -
+// with one addition the resource-server rules require: the token has to have
+// been minted for the origin this request arrived at.
+
+/// A registration and one live grant for `user`, bound to `resource`. The
+/// registration's redirect uri is the address Claude's hosted surfaces use, so
+/// the fixture looks like the client this exists for.
+async fn oauth_grant_for(
+    store: &AuthStore,
+    user: &str,
+    resource: &str,
+) -> crystalline_service::rest::IssuedOauthGrant {
+    let client = store
+        .register_oauth_client(
+            "a hosted client",
+            None,
+            &["https://claude.ai/api/mcp/auth_callback".to_string()],
+        )
+        .await
+        .unwrap();
+    store
+        .issue_oauth_grant(user, &client.client_id, resource)
+        .await
+        .unwrap()
+}
+
+/// The origin an ordinary request to `addr` arrives at, which is what a grant
+/// has to be minted for: loopback, so the scheme is plain `http`, and the port
+/// is part of it because the `Host` header carries it.
+fn origin_of(addr: &std::net::SocketAddr) -> String {
+    format!("http://{addr}")
+}
+
+/// Wind a grant's access token past its expiry, through a second connection to
+/// the same accounts database.
+///
+/// There is no API for it and there should not be: an hour is not a thing a
+/// caller sets. The store's own suite does this the same way against its own
+/// connection; here the daemon holds the file open, which is what the shared
+/// WAL coordination this builder asks for is for.
+async fn expire_access_token(path: &std::path::Path, grant: i64) {
+    let name = path.to_string_lossy().to_string();
+    let db = match turso::Builder::new_local(&name)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+    {
+        Ok(db) => db,
+        Err(_) => turso::Builder::new_local(&name).build().await.unwrap(),
+    };
+    let conn = db.connect().unwrap();
+    conn.execute(
+        "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+        vec![turso::Value::Integer(grant)],
+    )
+    .await
+    .unwrap();
+}
+
+/// GET a path on the endpoint with `accept`, which is the whole of what
+/// decides who answers an unknown path: the UI's SPA rung claims `text/html`
+/// and the transport is behind everything else.
+async fn get_with_accept(
+    addr: &std::net::SocketAddr,
+    path: &str,
+    accept: Option<&str>,
+) -> reqwest::Response {
+    let mut request = reqwest::Client::new().get(format!("http://{addr}{path}"));
+    if let Some(accept) = accept {
+        request = request.header("accept", accept);
+    }
+    request.send().await.unwrap()
+}
+
+/// **An OAuth access token opens a session as the account that consented**,
+/// and the session belongs to that account rather than to the credential kind.
+///
+/// The last part is the whole reason the binding is stated in terms of the
+/// account: ada's browser consented once and her harness holds an OAuth token,
+/// but ada is still ada, so her personal MCP token continues the session her
+/// OAuth token opened. Bob's perfectly good token does not.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_access_token_opens_a_session_as_its_account() {
+    let (addr, _guard, store) = serve_with_oauth().await;
+    let (ada_mcp, bob_mcp) = two_agents(&store).await;
+    let grant = oauth_grant_for(&store, "ada", &origin_of(&addr)).await;
+
+    let handshake = post_initialize_with_token(&addr, Some(&grant.access_token)).await;
+    assert_eq!(handshake.status(), 200, "an OAuth token opens a session");
+    let session = minted_session(&handshake);
+    drop(handshake);
+
+    let continued = post_on_session(&addr, &session, &grant.access_token).await;
+    assert!(
+        continued.status().is_success(),
+        "and goes on using it: {}",
+        continued.status()
+    );
+    drop(continued);
+
+    let same_account = post_on_session(&addr, &session, &ada_mcp).await;
+    assert!(
+        same_account.status().is_success(),
+        "the binding is on the account, not on which credential opened it: {}",
+        same_account.status()
+    );
+    drop(same_account);
+
+    let other_account = post_on_session(&addr, &session, &bob_mcp).await;
+    assert_eq!(
+        other_account.status(),
+        403,
+        "and it is still a binding: another account may not borrow the session"
+    );
+}
+
+/// **Every refused OAuth presentation gets the identical refusal**, the same
+/// property the personal tokens have and for the same reason: a refusal that
+/// told an unknown token from a wrong-audience one would say whether a stolen
+/// credential was minted here.
+///
+/// The audience case is the one this wave adds. A token minted for another
+/// deployment of this server is a live, unexpired, unrevoked credential of a
+/// real account - and it is refused here in the bytes an invented one gets.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_revoked_or_foreign_audience_oauth_token_gets_the_identical_refusal() {
+    let (addr, guard, store) = serve_with_oauth().await;
+    let origin = origin_of(&addr);
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+
+    // Minted for another deployment: everything about it is live except the
+    // audience.
+    let foreign = oauth_grant_for(&store, "ada", "https://knowledge.example").await;
+    // Revoked after the fact, the way a person revokes a connected client.
+    let revoked = oauth_grant_for(&store, "ada", &origin).await;
+    assert!(store.revoke_oauth_grant("ada", revoked.id).await.unwrap());
+    // Past its hour.
+    let expired = oauth_grant_for(&store, "ada", &origin).await;
+    expire_access_token(&guard.path().join("web-auth.db"), expired.id).await;
+    // A live grant whose account is then disabled.
+    let disabled = oauth_grant_for(&store, "ada", &origin).await;
+    store.set_disabled("ada", true).await.unwrap();
+
+    let baseline = post_initialize(&addr, None).await;
+    assert_eq!(baseline.status(), 401);
+    let challenge = baseline.headers()["www-authenticate"]
+        .to_str()
+        .unwrap()
+        .to_string();
+    let baseline = baseline.text().await.unwrap();
+
+    let presentations = [
+        (
+            "a foreign audience",
+            format!("Bearer {}", foreign.access_token),
+        ),
+        (
+            "a revoked grant",
+            format!("Bearer {}", revoked.access_token),
+        ),
+        (
+            "an expired access token",
+            format!("Bearer {}", expired.access_token),
+        ),
+        (
+            "a disabled account",
+            format!("Bearer {}", disabled.access_token),
+        ),
+        (
+            "an access token nothing ever issued",
+            format!("Bearer coa_{}", "0".repeat(64)),
+        ),
+        // The reverse of the prefix routing: an MCP token's shape carrying
+        // something no MCP token ever was.
+        (
+            "an MCP token nothing ever issued",
+            format!("Bearer cmt_{}", "0".repeat(64)),
+        ),
+    ];
+    for (what, presentation) in presentations {
+        let resp = post_initialize(&addr, Some(&presentation)).await;
+        assert_eq!(resp.status(), 401, "{what} must be refused");
+        assert_eq!(
+            resp.headers()["www-authenticate"].to_str().unwrap(),
+            challenge,
+            "{what} gets the same challenge as a bare request"
+        );
+        assert_eq!(
+            resp.text().await.unwrap(),
+            baseline,
+            "{what} must be byte-identical to the no-header refusal"
+        );
+    }
+
+    // And re-enabling hands the connection back, so none of the above was the
+    // grant being quietly destroyed.
+    store.set_disabled("ada", false).await.unwrap();
+    let ok = post_initialize_with_token(&addr, Some(&disabled.access_token)).await;
+    assert_eq!(ok.status(), 200);
+}
+
+/// **With `auth.oauth` on the refusal points at the protected-resource
+/// document**, which is how a hosted client discovers there is an
+/// authorization server to talk to at all; with it off the challenge is the
+/// bare `Bearer` it always was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn with_oauth_on_the_refusal_points_at_the_resource_metadata() {
+    let (addr, _guard, _store) = serve_with_oauth().await;
+    let refused = post_initialize(&addr, None).await;
+    assert_eq!(refused.status(), 401);
+    assert_eq!(
+        refused.headers()["www-authenticate"].to_str().unwrap(),
+        format!("Bearer resource_metadata=\"http://{addr}/.well-known/oauth-protected-resource\""),
+        "the challenge names the document on this origin"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    let text = body["error"].as_str().unwrap();
+    assert!(
+        text.contains("Agent access"),
+        "the token remedy is still taught: {text}"
+    );
+    assert!(
+        text.contains("OAuth"),
+        "and so is the one this wave adds: {text}"
+    );
+
+    let (addr, _guard, _store) = serve_with_mcp_auth(true).await;
+    let refused = post_initialize(&addr, None).await;
+    assert_eq!(refused.status(), 401);
+    assert_eq!(
+        refused.headers()["www-authenticate"],
+        "Bearer",
+        "with OAuth off nothing points at metadata that is not served"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        !body["error"].as_str().unwrap().contains("OAuth"),
+        "and the teaching text does not offer a door that is closed"
+    );
+}
+
+/// **An OAuth access token is refused while `auth.oauth` is off**, and the
+/// personal token beside it still works.
+///
+/// The store can hold a grant whatever the setting says - the setting is read
+/// when the HTTP surface starts, and turning OAuth off must stop the tokens it
+/// issued from resolving without anybody having to sweep the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_token_is_refused_while_oauth_is_off() {
+    let (addr, _guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let grant = oauth_grant_for(&store, "ada", &origin_of(&addr)).await;
+    let mcp = store.issue_mcp_token("ada", "agent").await.unwrap().token;
+
+    let refused = post_initialize_with_token(&addr, Some(&grant.access_token)).await;
+    assert_eq!(
+        refused.status(),
+        401,
+        "a coa_ token is not a credential on an instance that serves no OAuth"
+    );
+    assert_eq!(refused.headers()["www-authenticate"], "Bearer");
+    drop(refused);
+
+    let ok = post_initialize_with_token(&addr, Some(&mcp)).await;
+    assert_eq!(ok.status(), 200, "and the personal token is untouched");
+}
+
+/// **Both well-known documents name this origin, and neither exists while
+/// `auth.oauth` is off.**
+///
+/// The 404 is asserted for a browser's `Accept` as well as an API client's,
+/// because those are answered by different rungs of the router: with the paths
+/// declared unconditionally neither the SPA shell nor the MCP gate can claim
+/// them, and "there is no OAuth here" is one answer whoever asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_well_known_documents_name_this_origin_and_vanish_when_off() {
+    let (addr, _guard, _store) = serve_with_oauth().await;
+    let origin = origin_of(&addr);
+
+    let resource = get_with_accept(&addr, "/.well-known/oauth-protected-resource", None).await;
+    assert_eq!(resource.status(), 200);
+    let resource: serde_json::Value = resource.json().await.unwrap();
+    assert_eq!(
+        resource,
+        serde_json::json!({
+            "resource": origin,
+            "authorization_servers": [origin],
+            "bearer_methods_supported": ["header"],
+            "resource_name": "Crystalline",
+        }),
+        "the protected-resource document is exactly these four members"
+    );
+
+    let server = get_with_accept(&addr, "/.well-known/oauth-authorization-server", None).await;
+    assert_eq!(server.status(), 200);
+    let server: serde_json::Value = server.json().await.unwrap();
+    assert_eq!(
+        server,
+        serde_json::json!({
+            "issuer": origin,
+            // The three endpoints live under the API mount, so the document
+            // has to spell that prefix: a client sent to the origin root would
+            // land on the MCP transport.
+            "authorization_endpoint": format!("{origin}/api/v1/oauth/authorize"),
+            "token_endpoint": format!("{origin}/api/v1/oauth/token"),
+            "registration_endpoint": format!("{origin}/api/v1/oauth/register"),
+            "response_types_supported": ["code"],
+            "grant_types_supported": ["authorization_code", "refresh_token"],
+            "code_challenge_methods_supported": ["S256"],
+            "token_endpoint_auth_methods_supported": ["none"],
+            "authorization_response_iss_parameter_supported": true,
+        }),
+        "the authorization-server document is exactly these members"
+    );
+
+    let (addr, _guard, _store) = serve_with_mcp_auth(true).await;
+    for path in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+    ] {
+        for accept in [None, Some("application/json"), Some("text/html")] {
+            let resp = get_with_accept(&addr, path, accept).await;
+            assert_eq!(
+                resp.status(),
+                404,
+                "{path} must not exist with auth.oauth off, whatever {accept:?} asks for"
+            );
+        }
+    }
+}
+
+/// **The `auth.oidc.redirect_uri` override names the resource**, in both
+/// documents and in the audience the gate checks.
+///
+/// That key is the one place an operator behind a Host-rewriting proxy has
+/// already written this instance's public address, so a deployment whose `Host`
+/// arrives as the upstream's `127.0.0.1:port` still publishes - and mints
+/// tokens for - the address a person types into their client.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_configured_public_address_is_the_resource_a_token_is_minted_for() {
+    let (addr, _guard, store) = serve_with(
+        true,
+        false,
+        true,
+        Some("https://knowledge.example/api/v1/auth/oidc/callback"),
+    )
+    .await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+
+    let resource = get_with_accept(&addr, "/.well-known/oauth-protected-resource", None).await;
+    let resource: serde_json::Value = resource.json().await.unwrap();
+    assert_eq!(resource["resource"], "https://knowledge.example");
+    assert_eq!(
+        resource["authorization_servers"],
+        serde_json::json!(["https://knowledge.example"])
+    );
+    let server = get_with_accept(&addr, "/.well-known/oauth-authorization-server", None).await;
+    let server: serde_json::Value = server.json().await.unwrap();
+    assert_eq!(server["issuer"], "https://knowledge.example");
+    assert_eq!(
+        server["authorization_endpoint"],
+        "https://knowledge.example/api/v1/oauth/authorize"
+    );
+
+    // The challenge follows the same rule, so a client reads the metadata off
+    // the public address rather than off the upstream's.
+    let refused = post_initialize(&addr, None).await;
+    assert_eq!(
+        refused.headers()["www-authenticate"].to_str().unwrap(),
+        "Bearer resource_metadata=\"https://knowledge.example/.well-known/oauth-protected-resource\""
+    );
+    drop(refused);
+
+    // And the audience is that address: a token minted for the address the
+    // request literally arrived at is refused, one minted for the configured
+    // origin is served, and one trailing slash is not a different resource.
+    let derived = oauth_grant_for(&store, "ada", &origin_of(&addr)).await;
+    let refused = post_initialize_with_token(&addr, Some(&derived.access_token)).await;
+    assert_eq!(refused.status(), 401, "the Host is not the audience here");
+    drop(refused);
+
+    let configured = oauth_grant_for(&store, "ada", "https://knowledge.example/").await;
+    let ok = post_initialize_with_token(&addr, Some(&configured.access_token)).await;
+    assert_eq!(ok.status(), 200, "and the configured origin is");
+}
+
+/// **A write by an OAuth-authenticated agent records the account that
+/// consented**, in the same `<client>-for-<account>` shape a personal token
+/// produces.
+///
+/// The composition is not told which credential opened the session: both arms
+/// of the gate resolve to one `McpIdentity`, which is what makes the provenance
+/// on disk mean "this person's agent wrote it" whichever way the person
+/// connected their harness.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_oauth_authenticated_agents_write_records_the_account_it_acts_for() {
+    let (addr, guard, store) = serve_with_oauth().await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    // `raw_post` sends `Host: 127.0.0.1` with no port, which is the origin this
+    // conversation arrives at and therefore the audience its token needs.
+    let grant = oauth_grant_for(&store, "ada", "http://127.0.0.1").await;
+
+    let session = McpTestSession::open(&addr, Some(&grant.access_token)).await;
+    let answer = session
+        .call_tool(
+            "write_engram",
+            serde_json::json!({
+                "domain": "eng",
+                "title": "Oauth Trace",
+                "content": "- [fact] traced",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the write must be served, not refused:\n{answer}"
+    );
+
+    let written = std::fs::read_to_string(guard.path().join("eng").join("oauth-trace.md")).unwrap();
+    assert!(
+        written.contains("for-ada"),
+        "generated.by names the account that consented: {written}"
+    );
+    assert!(
+        written.contains("mcp-auth-test"),
+        "and still names the client that asked: {written}"
+    );
 }

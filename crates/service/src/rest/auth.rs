@@ -1753,6 +1753,55 @@ pub(super) fn forwarded_https(headers: &HeaderMap) -> bool {
             })
 }
 
+/// The origin this request says it arrived at: scheme, host and port, no path
+/// and no trailing slash.
+///
+/// Not a fact about the process - a fact about how the caller got here. Two
+/// surfaces rest on it and both need the same answer. The single sign-on
+/// callback address is built from it ([`super::oidc`]'s `absolute_url`), and it
+/// has to be registered with the provider in exactly the spelling the token
+/// exchange later repeats. And it is the OAuth resource identifier
+/// ([`super::OriginRule`]): the audience an access token is minted for and
+/// checked against, so a token minted for another deployment of this server
+/// cannot be replayed at this one.
+///
+/// The `Host` is untrusted input that ends up inside a url, so it is refused
+/// unless it is a bare host with an optional port. A browser sends the real
+/// host, so this only ever refuses a hand-made request - but a value that could
+/// open a path, a query or a userinfo component is not one to interpolate.
+///
+/// The scheme follows the same rule the session cookie's `Secure` flag does
+/// ([`cookie_needs_secure`]): a forwarded `https` anywhere in the chain, or any
+/// `Host` that is not loopback, means this instance is reached over TLS. The
+/// two agreeing is deliberate - an instance that thought itself public enough
+/// to protect a cookie and private enough to publish an `http` address would be
+/// wrong about one of them.
+pub(crate) fn request_origin(headers: &HeaderMap) -> Result<String, ApiError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "this request carries no Host header, so the address this instance was reached \
+                 at cannot be worked out",
+            )
+        })?;
+    if !super::oidc::host_is_well_formed(host) {
+        return Err(ApiError::bad_request(
+            "this request's Host header is not a host name or address with an optional port, so \
+             the address this instance was reached at cannot be worked out",
+        ));
+    }
+    let scheme = if forwarded_https(headers) || !is_loopback_request(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    Ok(format!("{scheme}://{host}"))
+}
+
 /// Whether the `Host` the client asked for names this machine.
 pub(super) fn is_loopback_request(headers: &HeaderMap) -> bool {
     headers

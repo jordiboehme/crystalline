@@ -19,6 +19,7 @@ mod graph;
 mod identity_links;
 mod mcp_tokens;
 mod members;
+mod oauth;
 mod oidc;
 mod users_api;
 
@@ -36,6 +37,10 @@ pub use auth_store::*;
 pub use error::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
     if_none_match_matches, precondition_failed,
+};
+pub use oauth::{
+    AUTHORIZATION_SERVER_PATH, AUTHORIZE_PATH, OauthServer, OriginRule, PROTECTED_RESOURCE_PATH,
+    REGISTER_PATH, TOKEN_PATH, resource_metadata_url, well_known_routes,
 };
 pub use oidc::{OidcClaims, OidcClient, OidcSettings};
 
@@ -245,6 +250,11 @@ pub struct RestState {
     pub access: Arc<DomainAccess>,
     /// The auth settings as of startup. See [`AuthCfg`].
     pub auth_cfg: AuthCfg,
+    /// The OAuth surface, when `auth.oauth` is on. `None` is every instance
+    /// that has not turned it on, and the routes read this option rather than
+    /// the setting, so a running daemon serves the tier it came up in. See
+    /// [`oauth`].
+    pub oauth: Option<Arc<OauthServer>>,
     /// The single sign-on relying party, when `auth.oidc` names a usable
     /// provider. `None` is an instance with local accounts only, which is
     /// every instance until someone configures one. Resolved at startup with
@@ -279,6 +289,7 @@ impl RestState {
         let config = engine.config();
         let auth_cfg = AuthCfg::resolve(&config)?;
         let oidc = OidcClient::new(&config)?;
+        let oauth = OauthServer::new(&config);
         let collab = crate::collab::session::CollabSessions::new(engine.clone());
         // The engine closes co-editing rooms itself when it unregisters a
         // domain, whichever surface asked for the removal, so it needs the
@@ -288,6 +299,7 @@ impl RestState {
         Ok(RestState {
             collab,
             engine,
+            oauth,
             oidc,
             access: Arc::new(DomainAccess::new(auth.clone())),
             auth,

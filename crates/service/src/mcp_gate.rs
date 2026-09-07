@@ -18,13 +18,32 @@
 //!
 //! # Why there is exactly one refusal
 //!
-//! No header, the wrong scheme, a token that is not an MCP token's shape, one
-//! that was never issued, one that was revoked, one whose account was disabled:
-//! all of them get the identical status, headers and body. Distinguishing them
-//! would hand an attacker an oracle telling them which half of a guess landed,
-//! and the honest cases (an expired token, a disabled colleague) are better
-//! served by the teaching text, which names where a working token comes from.
-//! `tests/mcp_auth.rs` asserts the refusals are byte-identical.
+//! No header, the wrong scheme, a token that is not one of ours in shape, one
+//! that was never issued, one that was revoked, one whose account was disabled,
+//! and - where `auth.oauth` is on - an OAuth access token that expired or was
+//! minted for another deployment of this server: all of them get the identical
+//! status, headers and body. Distinguishing them would hand an attacker an
+//! oracle telling them which half of a guess landed, and the honest cases (an
+//! expired token, a disabled colleague) are better served by the teaching text,
+//! which names where a working credential comes from. `tests/mcp_auth.rs`
+//! asserts the refusals are byte-identical.
+//!
+//! The refusal is a function of this instance's configuration and of the
+//! request's own `Host`, and of nothing else. With `auth.oauth` on it carries
+//! the OAuth teaching text and points at the protected-resource document on the
+//! origin the request arrived at, which is how a hosted client discovers there
+//! is an authorization server to talk to; with it off it is the plain `Bearer`
+//! challenge it always was. What never varies is the part a prober controls:
+//! for one `Host`, every rejected credential gets the same bytes.
+//!
+//! # Why an OAuth token is checked against this request's origin
+//!
+//! An access token is audience bound (RFC 8707): it was minted for one resource
+//! identifier, and this server's identifier is the origin its transport is
+//! served from. So the gate derives that origin per request and hands it to the
+//! store, which makes the audience a condition of the lookup statement rather
+//! than a branch a future edit could forget. A token for another deployment is
+//! a live credential of a real account, and it opens nothing here.
 //!
 //! # Why a session is bound to the identity that opened it
 //!
@@ -50,7 +69,7 @@ use std::task::{Context, Poll};
 use axum::extract::Request;
 use axum::response::{IntoResponse, Response};
 
-use crate::rest::{AuthStore, MCP_TOKEN_PREFIX, Role};
+use crate::rest::{AuthStore, MCP_TOKEN_PREFIX, OAUTH_ACCESS_PREFIX, OriginRule, Role};
 
 /// The account a request authenticated as, inserted into the request
 /// extensions the transport hands on. rmcp copies the remaining
@@ -70,14 +89,34 @@ pub struct McpIdentity {
     pub admin: bool,
 }
 
+/// The teaching text both refusals share, as a macro rather than a constant
+/// because `concat!` takes literals: the OAuth refusal below is this text plus
+/// one sentence, and a second copy of it is a sentence that drifts.
+macro_rules! mcp_auth_required {
+    () => {
+        "This instance requires agents to authenticate: send 'Authorization: \
+Bearer <your MCP token>'. A signed-in user issues one in Fluid under profile > \
+Agent access, or an admin runs 'crystalline users mcp-token <name>'. Add the \
+header to this server's entry in your harness's MCP registration."
+    };
+}
+
 /// What an agent refused at the door is told, which is the whole of the
 /// remedy: the header to send, the two places a token comes from, and where in
 /// its own configuration the header belongs.
-pub const MCP_AUTH_REQUIRED: &str = "This instance requires agents to \
-authenticate: send 'Authorization: Bearer <your MCP token>'. A signed-in user \
-issues one in Fluid under profile > Agent access, or an admin runs \
-'crystalline users mcp-token <name>'. Add the header to this server's entry in \
-your harness's MCP registration.";
+pub const MCP_AUTH_REQUIRED: &str = mcp_auth_required!();
+
+/// The same, on an instance that also serves OAuth: a harness that speaks it
+/// needs no token pasted anywhere, and the challenge beside this body says
+/// where the metadata is. Named as the alternative rather than described, so an
+/// agent reading only this knows there are two doors and which one it can open
+/// unaided.
+pub const MCP_AUTH_REQUIRED_OAUTH: &str = concat!(
+    mcp_auth_required!(),
+    " This instance also serves OAuth for MCP clients: a harness that speaks \
+it connects by signing in through this server instead, with no token pasted \
+anywhere - see the 'WWW-Authenticate' header for where its metadata lives."
+);
 
 /// What a caller is told when the gate could not reach the account store at
 /// all. Deliberately not [`MCP_AUTH_REQUIRED`]: nothing is wrong with the
@@ -163,6 +202,11 @@ impl SessionOwners {
 pub struct McpGate<S> {
     inner: S,
     auth: Option<Arc<AuthStore>>,
+    /// How this instance names itself, when `auth.oauth` is on: the audience an
+    /// OAuth access token has to have been minted for, and the origin the
+    /// refusal's metadata pointer is built on. `None` is OAuth off, and then
+    /// nothing here so much as recognizes an access token's prefix.
+    oauth: Option<OriginRule>,
     /// Shared across every clone, because the mount sites clone the gate and a
     /// session opened through one path is reused through another.
     sessions: Arc<SessionOwners>,
@@ -178,21 +222,65 @@ impl<S> McpGate<S> {
         McpGate {
             inner,
             auth,
+            oauth: None,
             sessions,
         }
     }
+
+    /// Also accept OAuth access tokens, minted for the origin `origin` derives.
+    ///
+    /// Inert when the gate is off: with no store there is nothing to resolve a
+    /// token through, so an origin rule here would only be a challenge pointing
+    /// at documents on an instance that authenticates nobody. `AuthCfg::resolve`
+    /// already refuses `auth.oauth` without `auth.mcp`, so this is the second
+    /// of two locks on the same door rather than the only one.
+    pub fn with_oauth(mut self, origin: OriginRule) -> McpGate<S> {
+        self.oauth = self.auth.is_some().then_some(origin);
+        self
+    }
+}
+
+/// The credential a request presents and which door it belongs to. The prefix
+/// decides, before any hashing: an OAuth access token is never looked up as a
+/// personal MCP token and a personal MCP token is never looked up as an OAuth
+/// one, so neither can be resolved without its own rule - the audience check in
+/// particular, which only the OAuth arm carries.
+enum Presented {
+    /// A personal MCP token, [`MCP_TOKEN_PREFIX`].
+    Mcp(String),
+    /// An OAuth access token, [`OAUTH_ACCESS_PREFIX`].
+    Oauth(String),
+}
+
+/// What the `401` says, which is a function of this instance's configuration
+/// and - for the pointer alone - of whether the request's own `Host` could be
+/// read at all.
+enum Challenge {
+    /// `auth.oauth` off: the plain `Bearer` challenge and the token-only text.
+    TokenOnly,
+    /// `auth.oauth` on: the OAuth teaching text, and the metadata pointer when
+    /// there was an origin to build one on. A malformed `Host` drops the
+    /// pointer and nothing else - the body stays what this instance's
+    /// configuration says it is, so no rejected credential can be told from
+    /// another by it.
+    Oauth(Option<String>),
 }
 
 /// The credential a request presents, if it presents one in a shape worth
 /// asking the store about.
 ///
 /// The scheme is matched case-insensitively (RFC 9110 makes it so, and clients
-/// do send `bearer`), and the [`MCP_TOKEN_PREFIX`] check is a cheap local
-/// refusal for anything that is plainly not one of ours - a session cookie
-/// pasted into the wrong field, a GitHub token, an API key from another
-/// service. It saves the database round trip; it never changes the answer,
-/// because everything it rejects would have failed to resolve anyway.
-fn presented_token(request: &Request) -> Option<String> {
+/// do send `bearer`), and the prefix check is a cheap local refusal for
+/// anything that is plainly not one of ours - a session cookie pasted into the
+/// wrong field, a GitHub token, an API key from another service. It saves the
+/// database round trip; it never changes the answer, because everything it
+/// rejects would have failed to resolve anyway.
+///
+/// `oauth` is whether this instance serves OAuth at all. With it off an access
+/// token is not a credential here, whoever minted it: the setting is read when
+/// the HTTP surface starts, so turning OAuth off stops every token it ever
+/// issued from opening anything, without anybody having to sweep a table.
+fn presented_token(request: &Request, oauth: bool) -> Option<Presented> {
     let raw = request
         .headers()
         .get(axum::http::header::AUTHORIZATION)?
@@ -203,19 +291,42 @@ fn presented_token(request: &Request) -> Option<String> {
         return None;
     }
     let credential = credential.trim();
-    if credential.is_empty() || !credential.starts_with(MCP_TOKEN_PREFIX) {
-        return None;
+    if credential.starts_with(MCP_TOKEN_PREFIX) {
+        return Some(Presented::Mcp(credential.to_string()));
     }
-    Some(credential.to_string())
+    if oauth && credential.starts_with(OAUTH_ACCESS_PREFIX) {
+        return Some(Presented::Oauth(credential.to_string()));
+    }
+    None
 }
 
 /// The one refusal, built fresh per request so nothing about it can be
 /// accidentally shared with a response that carries a body.
-fn refusal() -> Response {
+///
+/// The `resource_metadata` parameter is what a hosted MCP client reads on a
+/// `401` before it does anything else: it names the protected-resource document
+/// on this origin, which names the authorization server, which is how a client
+/// gets from "refused" to "registered and consented" with no human pasting
+/// anything. RFC 9728 spells the parameter as a quoted url, and the origin it
+/// is built on has already been through the same well-formedness check the
+/// address of this instance always is, so there is nothing left in it that
+/// could close the quotes.
+fn refusal(challenge: Challenge) -> Response {
+    let (value, body) = match challenge {
+        Challenge::TokenOnly => ("Bearer".to_string(), MCP_AUTH_REQUIRED),
+        Challenge::Oauth(None) => ("Bearer".to_string(), MCP_AUTH_REQUIRED_OAUTH),
+        Challenge::Oauth(Some(origin)) => (
+            format!(
+                "Bearer resource_metadata=\"{}\"",
+                crate::rest::resource_metadata_url(&origin)
+            ),
+            MCP_AUTH_REQUIRED_OAUTH,
+        ),
+    };
     (
         axum::http::StatusCode::UNAUTHORIZED,
-        [(axum::http::header::WWW_AUTHENTICATE, "Bearer")],
-        axum::Json(serde_json::json!({ "error": MCP_AUTH_REQUIRED })),
+        [(axum::http::header::WWW_AUTHENTICATE, value)],
+        axum::Json(serde_json::json!({ "error": body })),
     )
         .into_response()
 }
@@ -289,13 +400,38 @@ where
             return Box::pin(async move { Ok(inner.call(request).await?.into_response()) });
         };
         let sessions = self.sessions.clone();
+        let oauth = self.oauth.clone();
         Box::pin(async move {
-            let Some(token) = presented_token(&request) else {
-                return Ok(refusal());
+            // The origin this request arrived at, derived once and used twice:
+            // as the audience an OAuth token must have been minted for, and as
+            // the address the refusal's metadata pointer is built on. Nothing
+            // to derive with OAuth off, and a malformed `Host` leaves it
+            // `None`, which refuses every OAuth token and drops the pointer.
+            let origin = oauth
+                .as_ref()
+                .and_then(|rule| rule.origin(request.headers()).ok());
+            let challenge = || match &oauth {
+                Some(_) => Challenge::Oauth(origin.clone()),
+                None => Challenge::TokenOnly,
             };
-            // One lookup, which is also what stamps `last_used` so a token list
-            // in Fluid can show when an agent last connected.
-            match auth.mcp_token_user(&token).await {
+            let Some(presented) = presented_token(&request, oauth.is_some()) else {
+                return Ok(refusal(challenge()));
+            };
+            // One lookup, whichever door the credential came through, and it is
+            // also what stamps `last_used` so a token list or a connected-client
+            // list in Fluid can show when an agent last connected.
+            let resolved = match (&presented, &origin) {
+                (Presented::Mcp(token), _) => auth.mcp_token_user(token).await,
+                (Presented::Oauth(token), Some(origin)) => {
+                    auth.oauth_access_user(token, origin).await
+                }
+                // No origin is no audience, and an audience-bound credential
+                // with nothing to check the audience against resolves to
+                // nobody. The store is never asked, so nothing about this can
+                // be read as the token being unknown either.
+                (Presented::Oauth(_), None) => Ok(None),
+            };
+            match resolved {
                 Ok(Some(user)) => {
                     let named = session_of(&request);
                     // A revoked or rotated token never reaches here at all: it
@@ -330,11 +466,13 @@ where
                     }
                     Ok(response)
                 }
-                Ok(None) => Ok(refusal()),
+                Ok(None) => Ok(refusal(challenge())),
                 Err(error) => {
                     // Never the token itself, at any level: the store holds
                     // only its hash, and this is the one place a live one is in
-                    // hand.
+                    // hand. Both doors fail this way, so a store that cannot be
+                    // read never reads as a bad credential whichever kind was
+                    // presented.
                     tracing::error!(
                         error = %format!("{error:#}"),
                         "MCP gate could not read the account store"
@@ -359,17 +497,33 @@ mod tests {
         builder.body(axum::body::Body::empty()).unwrap()
     }
 
+    /// The credential a presentation carries, as a plain string, or `None`
+    /// when nothing about it was worth a lookup. The variant is asserted
+    /// separately where it matters.
+    fn credential(presented: &Option<Presented>) -> Option<&str> {
+        match presented {
+            Some(Presented::Mcp(token) | Presented::Oauth(token)) => Some(token),
+            None => None,
+        }
+    }
+
     #[test]
     fn only_a_bearer_presentation_of_an_mcp_token_reaches_the_store() {
         let live = format!("{MCP_TOKEN_PREFIX}{}", "a".repeat(64));
         assert_eq!(
-            presented_token(&request_with(Some(&format!("Bearer {live}")))),
-            Some(live.clone()),
+            credential(&presented_token(
+                &request_with(Some(&format!("Bearer {live}"))),
+                false
+            )),
+            Some(live.as_str()),
             "the ordinary presentation"
         );
         assert_eq!(
-            presented_token(&request_with(Some(&format!("bearer {live}")))),
-            Some(live.clone()),
+            credential(&presented_token(
+                &request_with(Some(&format!("bearer {live}"))),
+                false
+            )),
+            Some(live.as_str()),
             "schemes are case-insensitive on the wire"
         );
         for rejected in [
@@ -380,12 +534,95 @@ mod tests {
             Some(&format!("Basic {live}") as &str),
             Some(&live as &str),
         ] {
-            assert_eq!(
-                presented_token(&request_with(rejected)),
-                None,
+            assert!(
+                presented_token(&request_with(rejected), false).is_none(),
                 "must not reach the store: {rejected:?}"
             );
         }
+    }
+
+    /// **The prefix decides which door a credential belongs to, and OAuth's
+    /// only exists while `auth.oauth` is on.**
+    ///
+    /// This is the audience hole in miniature. An access token resolved as a
+    /// personal MCP token would skip the check that it was minted for this
+    /// origin, and a personal token resolved as an access token would be
+    /// checked against an audience it never carried; neither lookup can be
+    /// reached from the other's prefix, and that is what this pins.
+    #[test]
+    fn each_prefix_reaches_only_its_own_door_and_oauth_only_while_it_is_on() {
+        let mcp = format!("{MCP_TOKEN_PREFIX}{}", "a".repeat(64));
+        let access = format!("{OAUTH_ACCESS_PREFIX}{}", "b".repeat(64));
+
+        assert!(
+            matches!(
+                presented_token(&request_with(Some(&format!("Bearer {mcp}"))), true),
+                Some(Presented::Mcp(_))
+            ),
+            "an MCP token is never looked up as an OAuth one, whatever the setting says"
+        );
+        assert!(
+            matches!(
+                presented_token(&request_with(Some(&format!("Bearer {access}"))), true),
+                Some(Presented::Oauth(token)) if token == access
+            ),
+            "and an access token is never looked up as an MCP one"
+        );
+        assert!(
+            presented_token(&request_with(Some(&format!("Bearer {access}"))), false).is_none(),
+            "with OAuth off an access token is not a credential here at all"
+        );
+        // A refresh token is not an access token: it is spent at the token
+        // endpoint and never presented at this door.
+        assert!(
+            presented_token(
+                &request_with(Some(&format!("Bearer cor_{}", "c".repeat(64)))),
+                true
+            )
+            .is_none()
+        );
+    }
+
+    /// **The refusal is a function of the configuration and of nothing a
+    /// prober can vary but the `Host`.**
+    ///
+    /// With OAuth on the body is the same text whether or not an origin could
+    /// be derived, so a malformed `Host` drops the pointer and nothing else;
+    /// with OAuth off nothing points at metadata this instance does not serve.
+    #[test]
+    fn the_challenge_follows_the_setting_and_the_body_never_varies_with_the_credential() {
+        let plain = refusal(Challenge::TokenOnly);
+        assert_eq!(plain.status(), axum::http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            plain.headers()[axum::http::header::WWW_AUTHENTICATE],
+            "Bearer"
+        );
+
+        let pointed = refusal(Challenge::Oauth(Some(
+            "https://knowledge.example".to_string(),
+        )));
+        assert_eq!(
+            pointed.headers()[axum::http::header::WWW_AUTHENTICATE],
+            "Bearer resource_metadata=\"https://knowledge.example/.well-known/oauth-protected-resource\""
+        );
+        assert_eq!(
+            refusal(Challenge::Oauth(None)).headers()[axum::http::header::WWW_AUTHENTICATE],
+            "Bearer",
+            "a Host that names no origin drops the pointer rather than inventing one"
+        );
+
+        assert!(
+            MCP_AUTH_REQUIRED_OAUTH.starts_with(MCP_AUTH_REQUIRED),
+            "the OAuth refusal teaches the token remedy too: {MCP_AUTH_REQUIRED_OAUTH}"
+        );
+        assert!(
+            MCP_AUTH_REQUIRED_OAUTH.contains("OAuth"),
+            "and names the door a harness can open unaided: {MCP_AUTH_REQUIRED_OAUTH}"
+        );
+        assert!(
+            !MCP_AUTH_REQUIRED.contains("OAuth"),
+            "while the plain one offers no door that is closed: {MCP_AUTH_REQUIRED}"
+        );
     }
 
     /// An inner service that records the request it was handed and answers
@@ -516,6 +753,25 @@ mod tests {
                 .is_none(),
             "the open tier must not manufacture an identity"
         );
+    }
+
+    /// **An origin rule on a gate with no store opens nothing.**
+    ///
+    /// `AuthCfg::resolve` already refuses `auth.oauth` without `auth.mcp`, so
+    /// this combination should be unreachable; the gate fails closed anyway,
+    /// because an OAuth rule on an open tier would be a challenge pointing at
+    /// documents on an instance that authenticates nobody.
+    #[test]
+    fn with_the_gate_off_an_origin_rule_opens_no_door() {
+        let gate = McpGate::new(
+            CapturingService(Arc::new(std::sync::Mutex::new(None))),
+            None,
+            Arc::new(SessionOwners::default()),
+        )
+        .with_oauth(OriginRule::from_config(
+            &crystalline_core::config::GlobalConfig::default(),
+        ));
+        assert!(gate.oauth.is_none());
     }
 
     /// The teaching text is what an agent has to act on unaided, so it names

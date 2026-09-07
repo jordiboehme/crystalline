@@ -1083,35 +1083,15 @@ fn sso_is_off() -> ApiError {
 /// provider in that exact spelling, and the token exchange has to repeat it
 /// byte for byte. Derived once in [`login`] and stored in the pending record
 /// rather than derived again in [`callback`].
+///
+/// The origin half is [`super::auth::request_origin`], shared with the OAuth
+/// resource identifier: this instance has one public address, and two rules for
+/// deriving it would be two addresses the day they disagreed.
 fn absolute_url(headers: &HeaderMap, path: &str) -> Result<String, ApiError> {
-    let host = headers
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|host| !host.is_empty())
-        .ok_or_else(|| {
-            ApiError::bad_request(
-                "this request carries no Host header, so the address to send the identity \
-                 provider back to cannot be worked out",
-            )
-        })?;
-    // The header is untrusted input that ends up inside a url. A browser sends
-    // the real host, so this only ever refuses a hand-made request, but a
-    // value that could open a path, a query or a userinfo component is not one
-    // to interpolate.
-    if !host_is_well_formed(host) {
-        return Err(ApiError::bad_request(
-            "this request's Host header is not a host name or address with an optional port, \
-             so it cannot be part of the address to send the identity provider back to",
-        ));
-    }
-    let scheme =
-        if super::auth::forwarded_https(headers) || !super::auth::is_loopback_request(headers) {
-            "https"
-        } else {
-            "http"
-        };
-    Ok(format!("{scheme}://{host}/api/v1{path}"))
+    Ok(format!(
+        "{}/api/v1{path}",
+        super::auth::request_origin(headers)?
+    ))
 }
 
 /// Whether `host` is a bare host and optional port: a name of letters, digits,
@@ -1119,7 +1099,11 @@ fn absolute_url(headers: &HeaderMap, path: &str) -> Result<String, ApiError> {
 /// then nothing but `:` and up to five digits. Deliberately conservative -
 /// no underscores, no percent-encoding, nothing a url parser would read as
 /// anything but a host.
-fn host_is_well_formed(host: &str) -> bool {
+///
+/// `pub(super)` because [`super::auth::request_origin`] applies it: the whole
+/// point of the check is that one rule decides what may be interpolated into
+/// this instance's own address, and both callers build one.
+pub(super) fn host_is_well_formed(host: &str) -> bool {
     let (name, port) = match host.strip_prefix('[') {
         Some(rest) => {
             let Some((address, tail)) = rest.split_once(']') else {
