@@ -160,7 +160,10 @@ const editorHighlight = HighlightStyle.define([
   { tag: tags.url, color: "var(--color-sky-700)" },
   { tag: tags.comment, color: "var(--color-slate-500)" },
   { tag: tags.keyword, color: "var(--color-sky-700)" },
-  { tag: tags.string, color: "var(--color-emerald-700)" },
+  // The accent, not a stock swatch: strings read the same color here as
+  // `.hljs-string` does in the rendered view, so a fenced code block does
+  // not change hue when the same text moves from editing to reading.
+  { tag: tags.string, color: "var(--color-accent-700)" },
   { tag: tags.number, color: "var(--color-amber-700)" },
   { tag: tags.meta, color: "var(--color-slate-500)" },
   { tag: tags.processingInstruction, color: "var(--color-slate-400)" },
