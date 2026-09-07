@@ -22,12 +22,12 @@
 //! written here before it reaches a caller. The provider's own words go to
 //! `tracing` at `debug` and nowhere else.
 //!
-//! **What this module does NOT do is decide who the claims are.** The callback
-//! ends at [`resolve_oidc_identity`], which is the seam the JIT provisioning
-//! task fills: matching an `(issuer, subject)` pair to an account, and creating
-//! one when there is no match, is a decision about the accounts database rather
-//! than about the protocol, and keeping it behind one function is what keeps
-//! this file about the protocol.
+//! **Who the claims are is decided in one place.** The callback ends at
+//! [`resolve_oidc_identity`], which matches the `(issuer, subject)` pair to an
+//! account and provisions one when there is no match. Keeping that behind a
+//! single function is what keeps the rest of this file about the protocol, and
+//! it is why "an address never reaches an account" is a property of one
+//! function rather than a habit spread over a handler.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -51,7 +51,7 @@ use openidconnect::{
 use tokio::sync::{Mutex, RwLock};
 
 use super::auth::Identity;
-use super::auth_store::{Role, User};
+use super::auth_store::{DEFAULT_OIDC_ROLE, Role, User};
 use super::{ApiError, ApiQuery, ProblemDetail, RestState};
 
 /// The route that starts a sign-in, relative to the `/api/v1` mount.
@@ -208,10 +208,12 @@ impl OidcSettings {
         // Guaranteed parseable by the settings layer, which stores the
         // canonical spelling of a role it already parsed. An environment
         // variable can still carry anything, so an unreadable value falls back
-        // to the least privileged role rather than refusing the whole block.
+        // to the default rather than refusing the whole block. That default is
+        // named once, in `auth_store`, and the settings registry renders the
+        // same constant as the key's unset value.
         let default_role = trimmed(&block.default_role)
             .and_then(|raw| raw.parse::<Role>().ok())
-            .unwrap_or(Role::Viewer);
+            .unwrap_or(DEFAULT_OIDC_ROLE);
         Some(OidcSettings {
             issuer,
             client_id: ClientId::new(client_id),
@@ -807,8 +809,11 @@ pub struct CallbackQuery {
                    the server-side record, exchanges the code with the client \
                    secret and the PKCE verifier, validates the ID token \
                    (issuer, audience, expiry, signature, nonce) and signs the \
-                   account in. The provider's own error text never reaches \
-                   this response.",
+                   account in. The account is the one linked to the token's \
+                   `(issuer, sub)` pair, or a fresh one provisioned at \
+                   `auth.oidc.default_role`; a matching address never reaches \
+                   an existing account. The provider's own error text never \
+                   reaches this response.",
     responses(
         (
             status = 302,
@@ -835,9 +840,17 @@ pub struct CallbackQuery {
             content_type = "application/problem+json",
         ),
         (
-            status = 501,
-            description = "The claims validated but this build cannot yet turn \
-                           them into an account.",
+            status = 403,
+            description = "The identity names a disabled account, or a new \
+                           account would pass `auth.max_users`.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 409,
+            description = "The sign-in was started to link an identity to an \
+                           account, which this build cannot do yet. Nothing \
+                           was linked and no account was created.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1076,33 +1089,163 @@ impl OidcClaims {
     }
 }
 
+/// The account name a provisioning falls back to when a provider sends
+/// nothing usable to derive one from. Uniquified like any other name, so a
+/// second such person becomes `sso-user-2`.
+const FALLBACK_ACCOUNT_NAME: &str = "sso-user";
+
+/// How long a derived name may be before it is cut. Long enough for a full
+/// `firstname.lastname`, short enough that a provider cannot make this
+/// instance's user list unreadable. The uniquifying suffix is added after the
+/// cut, so a name can end up a few characters longer.
+const MAX_DERIVED_NAME: usize = 60;
+
+/// The login name a first sign-in provisions, derived from what the provider
+/// sent.
+///
+/// `preferred_username` first, the address's local part second, a generic name
+/// last. Every candidate is sanitized and the first one that survives wins, so
+/// a provider that sends `preferred_username: "!!!"` falls through to the
+/// address rather than provisioning a name made of punctuation.
+///
+/// The result is a *hint*: the store folds it again and uniquifies it against
+/// the names already taken. Nothing about this function is a lookup key - it
+/// decides what a new account is called, never which account a sign-in lands
+/// in.
+fn derive_account_name(claims: &OidcClaims) -> String {
+    let local_part = claims
+        .email
+        .as_deref()
+        .and_then(|address| address.split('@').next());
+    [claims.preferred_username.as_deref(), local_part]
+        .into_iter()
+        .flatten()
+        .find_map(sanitize_account_name)
+        .unwrap_or_else(|| FALLBACK_ACCOUNT_NAME.to_string())
+}
+
+/// Fold one candidate into something that can be a login name, or `None` when
+/// nothing usable is left.
+///
+/// Lowercased (the store folds names anyway, so this only makes the derivation
+/// visible), alphanumerics and `.`, `-`, `_` kept, everything else - spaces,
+/// `@`, quotes, control characters - replaced by a single `-`. Runs collapse
+/// and the ends are trimmed, so `"Ada Lovelace (Contoso)"` becomes
+/// `ada-lovelace-contoso` rather than something with edges.
+fn sanitize_account_name(raw: &str) -> Option<String> {
+    let mut out = String::new();
+    for ch in raw.trim().to_lowercase().chars() {
+        if ch.is_alphanumeric() || ch == '.' || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+        if out.chars().count() >= MAX_DERIVED_NAME {
+            break;
+        }
+    }
+    let trimmed = out.trim_matches(|ch| ch == '-' || ch == '.' || ch == '_');
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+/// What a sign-in into a disabled account is told, in the words the rest of
+/// this surface uses for a disabled account.
+fn account_is_disabled() -> ApiError {
+    ApiError::forbidden("this account is disabled")
+}
+
 /// Turn validated claims into the account this sign-in is for.
 ///
-/// **The seam between the protocol and the accounts database, and it is not
-/// filled yet.** Everything above this line is about OpenID Connect and is
-/// finished; matching `(issuer, subject)` to an account, provisioning one at
-/// `auth.oidc.default_role` when there is no match, and honouring
-/// [`OidcClaims::link_for`] are decisions about accounts, and they land with
-/// the provisioning task that owns the `identity_link` table.
+/// The seam between the protocol and the accounts database. Three cases, and
+/// the order they are in is the policy:
 ///
-/// Until then this refuses in the one shape a half-built feature honestly can:
-/// the sign-in got all the way through validation, and the instance cannot
-/// finish it. The signature is what the next task replaces the body of, so
-/// nothing above has to move.
-async fn resolve_oidc_identity(_state: &RestState, claims: OidcClaims) -> Result<User, ApiError> {
-    tracing::debug!(
-        "an oidc sign-in validated for subject '{}' at issuer '{}' with no identity resolver to \
-         hand it to",
-        claims.subject,
-        claims.issuer
-    );
-    Err(ApiError {
-        status: StatusCode::NOT_IMPLEMENTED,
-        title: "Sign-in cannot be completed",
-        detail: "this build validates a single sign-on but cannot yet turn it into an account"
-            .to_string(),
-        token_required: None,
-    })
+/// 1. A sign-in started to LINK an identity to an account somebody is already
+///    signed in as is refused here, before anything is written. Linking is an
+///    explicit act with its own route and its own rules; provisioning a second
+///    account for a person who asked to link would be the opposite of what
+///    they asked for.
+/// 2. A `(issuer, subject)` pair this instance has seen signs into the account
+///    it is linked to. Its role, its login name and its disabled state are
+///    untouched: the provider asserts who somebody is, never what they may do
+///    here. Only the display name and the address refresh, because those are
+///    the provider's to restate.
+/// 3. Anything else is a person this instance has never seen, and gets a fresh
+///    account at `auth.oidc.default_role` with a derived name and a stored
+///    link.
+///
+/// What is deliberately absent is a fourth case. A matching address or a
+/// matching username is NOT a match: an account is reached by an identity link
+/// or not at all, so a provider that will hand anybody an `email` claim cannot
+/// hand anybody somebody else's account.
+async fn resolve_oidc_identity(state: &RestState, claims: OidcClaims) -> Result<User, ApiError> {
+    if claims.link_for.is_some() {
+        tracing::debug!("a link-intent sign-in arrived before linking exists");
+        return Err(ApiError::conflict(
+            "linking a single sign-on identity to an existing account is not available on this \
+             build yet - this sign-in was not linked and no account was created",
+        ));
+    }
+    let settings = &state.oidc.as_ref().ok_or_else(sso_is_off)?.settings;
+    if let Some(user) = state
+        .auth
+        .linked_user(&claims.issuer, &claims.subject)
+        .await?
+    {
+        if user.disabled {
+            return Err(account_is_disabled());
+        }
+        // Presentation only, and only what was actually sent: an ID token that
+        // carries no `name` this time is not a person who lost their name.
+        return Ok(state
+            .auth
+            .refresh_presentation(
+                &user.name,
+                claims.display.as_deref(),
+                claims.email.as_deref(),
+            )
+            .await?);
+    }
+    let derived = derive_account_name(&claims);
+    match state
+        .auth
+        .provision_linked_user(
+            &claims.issuer,
+            &claims.subject,
+            &derived,
+            claims.display.as_deref(),
+            claims.email.as_deref(),
+            settings.default_role(),
+            state.auth_cfg.max_users,
+        )
+        .await
+    {
+        Ok(user) => Ok(user),
+        Err(err) => {
+            // Two first sign-ins for one subject can race: both miss the
+            // lookup, one provisions and the other's link is refused. The
+            // loser reads the winner's account rather than answering an error
+            // for a sign-in that did work.
+            if let Some(user) = state
+                .auth
+                .linked_user(&claims.issuer, &claims.subject)
+                .await?
+            {
+                if user.disabled {
+                    return Err(account_is_disabled());
+                }
+                return Ok(user);
+            }
+            let message = format!("{err:#}");
+            if message.contains("auth.max_users") {
+                // The caller cannot fix this and the operator can, so the
+                // words that name the setting are the useful ones. Same
+                // treatment as the trusted-header path's cap refusal.
+                Err(ApiError::forbidden(message))
+            } else {
+                Err(ApiError::internal(message))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1355,6 +1498,109 @@ mod tests {
             store.0.len() <= MAX_PENDING,
             "the pending map grew past its cap: {}",
             store.0.len()
+        );
+    }
+
+    /// Claims carrying just the two fields a derivation reads.
+    fn naming_claims(preferred: Option<&str>, email: Option<&str>) -> OidcClaims {
+        OidcClaims {
+            issuer: "https://idp.example".to_string(),
+            subject: "sub-1".to_string(),
+            preferred_username: preferred.map(str::to_string),
+            display: None,
+            email: email.map(str::to_string),
+            link_for: None,
+        }
+    }
+
+    /// The derivation, candidate by candidate: `preferred_username` first, the
+    /// address's local part second, a generic name last, and a candidate that
+    /// sanitizes to nothing falls through to the next one instead of winning.
+    #[test]
+    fn an_account_name_is_derived_from_the_first_usable_claim() {
+        let name = |preferred, email| derive_account_name(&naming_claims(preferred, email));
+        assert_eq!(name(Some("Ada.Lovelace"), None), "ada.lovelace");
+        assert_eq!(
+            name(Some("Ada Lovelace (Contoso)"), None),
+            "ada-lovelace-contoso",
+            "spaces and punctuation collapse to single separators, with no edges"
+        );
+        assert_eq!(
+            name(None, Some("Grace.Hopper@example.test")),
+            "grace.hopper",
+            "the address's local part, never the whole address"
+        );
+        assert_eq!(
+            name(Some("!!!"), Some("grace@example.test")),
+            "grace",
+            "a candidate that sanitizes to nothing falls through"
+        );
+        assert_eq!(
+            name(None, None),
+            FALLBACK_ACCOUNT_NAME,
+            "a provider that sends neither still gets a name"
+        );
+        assert_eq!(
+            name(Some("   "), Some("@example.test")),
+            FALLBACK_ACCOUNT_NAME,
+            "and so does one that sends both, emptily"
+        );
+        assert_eq!(
+            name(Some("ADA"), Some("someone.else@example.test")),
+            "ada",
+            "the username wins over the address, folded"
+        );
+    }
+
+    /// A name cannot be made unreadable, or unbounded, by what a provider
+    /// sends.
+    #[test]
+    fn a_derived_name_is_bounded_and_free_of_separators_at_the_edges() {
+        let long = "a".repeat(200);
+        let derived = derive_account_name(&naming_claims(Some(&long), None));
+        assert_eq!(derived.chars().count(), MAX_DERIVED_NAME);
+        for raw in [
+            "--ada--",
+            "..ada..",
+            "__ada__",
+            "  ada  ",
+            "\u{0007}ada\u{0007}",
+        ] {
+            assert_eq!(
+                derive_account_name(&naming_claims(Some(raw), None)),
+                "ada",
+                "{raw:?} should fold to a bare name"
+            );
+        }
+        // Whatever comes out is a name the store will accept, which is the
+        // property the provisioning path depends on.
+        for raw in ["Ada Lovelace", "!!!", "  ", "a/b\\c", &long] {
+            let derived = derive_account_name(&naming_claims(Some(raw), None));
+            assert_eq!(
+                super::super::auth_store::normalize_account_name(&derived).unwrap(),
+                derived,
+                "{raw:?} derived a name the store would have folded further"
+            );
+        }
+    }
+
+    /// The unset default is one constant, and it is the one the settings
+    /// registry renders as this key's default.
+    #[test]
+    fn the_unset_default_role_is_the_shared_constant() {
+        let mut oidc = complete();
+        oidc.default_role = None;
+        let settings = OidcSettings::resolve(&config_with(oidc)).unwrap();
+        assert_eq!(settings.default_role(), DEFAULT_OIDC_ROLE);
+        let mut unset = complete();
+        unset.default_role = None;
+        assert_eq!(
+            crate::settings::snapshot(&config_with(unset), &crate::overlay::EnvOverlay::default())
+                .iter()
+                .find(|row| row.key == "auth.oidc.default_role")
+                .map(|row| row.value.clone()),
+            Some(DEFAULT_OIDC_ROLE.as_str().to_string()),
+            "the registry renders the same default this resolves to"
         );
     }
 }

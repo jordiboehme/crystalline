@@ -115,6 +115,15 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// The role an account provisioned from a single sign-on is created at when
+/// `auth.oidc.default_role` is unset.
+///
+/// One definition for the whole workspace: the settings registry renders it as
+/// the key's unset value, and the relying party provisions at it. A promise
+/// made in two places is a promise that can drift, and this is the promise the
+/// documentation makes to an operator who never sets the key.
+pub const DEFAULT_OIDC_ROLE: Role = Role::Viewer;
+
 /// Read a role back out of a database row. An unrecognized value can only come
 /// from a hand-edited or corrupted file, so it resolves to the least
 /// privileged role rather than failing the whole read: an unreadable row must
@@ -152,6 +161,21 @@ pub fn normalize_account_name(name: &str) -> Result<String> {
     Ok(trimmed.to_lowercase())
 }
 
+/// Fold one half of an identity key: trimmed, and never empty.
+///
+/// Deliberately NOT lowercased, unlike an account name. An issuer url and a
+/// provider's subject are opaque strings the provider chose, compared byte for
+/// byte by every OpenID Connect implementation there is; folding their case
+/// here would make two distinct subjects the same person on any provider whose
+/// identifiers are case sensitive.
+fn identity_value(value: &str, what: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("an identity {what} cannot be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// One account. Carries no password material, so it is safe to hand to a
 /// handler and serialize into a response.
 #[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
@@ -176,6 +200,38 @@ pub struct User {
     #[schema(example = "2026-08-08T09:14:22Z")]
     pub last_seen: Option<String>,
 }
+
+/// One identity an external provider asserts, tied to one account.
+///
+/// `(issuer, subject)` is the durable key: a username, an address and a
+/// display name are all mutable presentation data, and none of them may move
+/// an account. An account may hold several links (one per issuer), and a link
+/// points at exactly one account.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct IdentityLink {
+    /// The provider that asserts this identity, as its ID tokens spell it.
+    #[schema(example = "https://login.microsoftonline.com/<tenant>/v2.0")]
+    pub issuer: String,
+    /// The provider's stable identifier for the person.
+    #[schema(example = "0f8fad5b-d9cb-469f-a165-70867728950e")]
+    pub subject: String,
+    /// When the link was made, RFC 3339.
+    #[schema(example = "2026-09-07T09:14:22Z")]
+    pub linked_at: String,
+    /// Who made it: the account that linked it, an admin's name, or `jit` for
+    /// a link a first sign-in created along with its account.
+    #[schema(example = "jit")]
+    pub linked_by: String,
+}
+
+/// What [`AuthStore::provision_linked_user`] records as the linker when a
+/// first sign-in creates the account it links.
+pub const LINKED_BY_JIT: &str = "jit";
+
+/// How many suffixed names a provisioning tries before it gives up. Reached
+/// only when a thousand accounts already hold every variant of one name, which
+/// is a configuration problem rather than a collision.
+const MAX_NAME_ATTEMPTS: usize = 1000;
 
 /// What checking a password found, kept apart by how much work each one costs.
 ///
@@ -560,6 +616,17 @@ CREATE TABLE IF NOT EXISTS domain_member (
 );
 CREATE INDEX IF NOT EXISTS domain_member_principal
     ON domain_member (principal_kind, principal);
+CREATE TABLE IF NOT EXISTS identity_link (
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    user TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    linked_by TEXT NOT NULL,
+    PRIMARY KEY (issuer, subject)
+);
+CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
+CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
+    ON identity_link (issuer, user);
 ";
 
 /// Prefix every MCP token is minted with, so a token is recognizable at a
@@ -1111,6 +1178,7 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.delete_identity_links_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1153,6 +1221,7 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.delete_identity_links_of(&name).await?;
             self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
@@ -1290,6 +1359,243 @@ impl AuthStore {
         .await?
         .map(|row| user_from_row(&row))
         .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
+    }
+
+    /// The account an external provider's `(issuer, subject)` pair names, or
+    /// `None` when this instance has never seen that pair.
+    ///
+    /// The one lookup a sign-on does. It deliberately cannot be asked to find
+    /// an account by address or by username: matching either of those would be
+    /// the silent takeover this design refuses, and an API that cannot express
+    /// it cannot grow it by accident.
+    pub async fn linked_user(&self, issuer: &str, subject: &str) -> Result<Option<User>> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let subject = identity_value(subject, "subject")?;
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                &format!(
+                    "SELECT {USER_COLUMNS_JOINED} FROM identity_link l
+                     JOIN users u ON u.name = l.user
+                     WHERE l.issuer = ?1 AND l.subject = ?2"
+                ),
+                vec![Value::Text(issuer), Value::Text(subject)],
+            )
+            .await?
+            .map(|row| user_from_row(&row)))
+    }
+
+    /// Tie an external identity to an existing account. An explicit act, which
+    /// is the whole policy: a sign-on never lands in an account it was not
+    /// linked to, and linking is done by the person who is signed in or by an
+    /// admin.
+    ///
+    /// Refused when the pair is already linked (to any account, this one
+    /// included), when the account already holds an identity at this issuer,
+    /// and when the name is nobody or a disabled account. All three checks run
+    /// inside the same `BEGIN IMMEDIATE` transaction as the insert, so what
+    /// they saw is what the insert sees.
+    pub async fn link_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+        user: &str,
+        linked_by: &str,
+    ) -> Result<()> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let subject = identity_value(subject, "subject")?;
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("linking an identity to user '{user}'"))?;
+        let result = async {
+            self.require_live_user(&user).await?;
+            self.insert_link(&issuer, &subject, &user, linked_by).await
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Drop the identity `user` holds at `issuer`. `true` when there was one.
+    ///
+    /// Keyed on `(issuer, user)` rather than on the subject: the person
+    /// unlinking knows which provider they want gone, and by construction they
+    /// hold at most one identity there.
+    pub async fn unlink_identity(&self, issuer: &str, user: &str) -> Result<bool> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                vec![Value::Text(issuer), Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("unlinking an identity from user '{user}'"))?;
+        Ok(changed > 0)
+    }
+
+    /// Every identity linked to one account, by issuer.
+    pub async fn identity_links(&self, user: &str) -> Result<Vec<IdentityLink>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT issuer, subject, linked_at, linked_by FROM identity_link
+                 WHERE user = ?1 ORDER BY issuer",
+                vec![Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("reading the identity links of user '{user}'"))?;
+        let mut links = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("reading the identity links of user '{user}'"))?
+        {
+            links.push(IdentityLink {
+                issuer: cell_text(&row, 0).unwrap_or_default(),
+                subject: cell_text(&row, 1).unwrap_or_default(),
+                linked_at: cell_text(&row, 2).unwrap_or_default(),
+                linked_by: cell_text(&row, 3).unwrap_or_default(),
+            });
+        }
+        Ok(links)
+    }
+
+    /// Create an account for an identity nobody has seen before, and link it,
+    /// as one transaction.
+    ///
+    /// `desired_name` is a *hint*: it is folded, and a name already taken is
+    /// uniquified with `-2`, `-3` and so on rather than joined. Joining would
+    /// hand a stranger whose provider happens to call them `ada` whatever the
+    /// local `ada` may do, which is exactly the takeover the `(issuer,
+    /// subject)` rule exists to prevent.
+    ///
+    /// The account is created with no password hash: it signs in through its
+    /// provider, and there is no local credential to guess.
+    ///
+    /// One `BEGIN IMMEDIATE` for the cap check, the name search, the insert
+    /// and the link. Two first sign-ins racing therefore produce one account
+    /// and one link, rather than an orphan account whose link lost.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn provision_linked_user(
+        &self,
+        issuer: &str,
+        subject: &str,
+        desired_name: &str,
+        display: Option<&str>,
+        email: Option<&str>,
+        role: Role,
+        cap: usize,
+    ) -> Result<User> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let subject = identity_value(subject, "subject")?;
+        let base = normalize_account_name(desired_name)?;
+        let display = display
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let email = email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("provisioning an account for a single sign-on")?;
+        let result = async {
+            let count = match self
+                .query_first("SELECT COUNT(*) FROM users", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            };
+            if count >= cap {
+                bail!(
+                    "refusing to provision an account for this sign-in: the account cap is \
+                     reached (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                );
+            }
+            let name = self.free_account_name(&base).await?;
+            self.conn
+                .execute(
+                    "INSERT INTO users
+                         (name, display, email, role, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.clone().unwrap_or_else(|| name.clone())),
+                        match &email {
+                            Some(value) => Value::Text(value.clone()),
+                            None => Value::Null,
+                        },
+                        Value::Text(role.as_str().to_string()),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("provisioning user '{name}'"))?;
+            self.insert_link(&issuer, &subject, &name, LINKED_BY_JIT)
+                .await?;
+            self.query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .map(|row| user_from_row(&row))
+            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Refresh what an account shows: its display name and its address, and
+    /// nothing else. Returns the account as it now stands, read back in the
+    /// same call so a caller never has to guess what it wrote.
+    ///
+    /// A `None` leaves the stored value alone: an ID token that carries no
+    /// `name` this time says nothing about the person's name, and must never
+    /// be read as "they no longer have one". Role, disabled state and login
+    /// name are untouched by construction - they are not presentation data,
+    /// and a provider does not get to move them.
+    pub async fn refresh_presentation(
+        &self,
+        name: &str,
+        display: Option<&str>,
+        email: Option<&str>,
+    ) -> Result<User> {
+        let name = normalize_account_name(name)?;
+        let text = |value: Option<&str>| match value.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => Value::Text(value.to_string()),
+            None => Value::Null,
+        };
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users
+                 SET display = COALESCE(?2, display), email = COALESCE(?3, email)
+                 WHERE name = ?1",
+                vec![Value::Text(name.clone()), text(display), text(email)],
+            )
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        self.query_first(
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+            vec![Value::Text(name.clone())],
+        )
+        .await?
+        .map(|row| user_from_row(&row))
+        .ok_or_else(|| anyhow!("no such user: '{name}'"))
     }
 
     /// Issue a session for an existing account, valid for `ttl_secs` from now.
@@ -2354,6 +2660,105 @@ impl AuthStore {
         Ok(())
     }
 
+    /// The two conflict checks and the insert that make one link, with no
+    /// lock taken and no transaction opened.
+    ///
+    /// Both public linking paths call this after taking the guard and opening
+    /// their own transaction, because neither the guard (a `tokio` mutex) nor
+    /// a turso transaction is reentrant: a method calling the other public
+    /// method would deadlock on the first and be refused on the second.
+    async fn insert_link(
+        &self,
+        issuer: &str,
+        subject: &str,
+        user: &str,
+        linked_by: &str,
+    ) -> Result<()> {
+        let pair = vec![
+            Value::Text(issuer.to_string()),
+            Value::Text(subject.to_string()),
+        ];
+        if let Some(row) = self
+            .query_first(
+                "SELECT user FROM identity_link WHERE issuer = ?1 AND subject = ?2",
+                pair.clone(),
+            )
+            .await?
+        {
+            let holder = cell_text(&row, 0).unwrap_or_default();
+            bail!("this identity is already linked to account '{holder}': an admin can move it");
+        }
+        if self
+            .query_first(
+                "SELECT subject FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                vec![
+                    Value::Text(issuer.to_string()),
+                    Value::Text(user.to_string()),
+                ],
+            )
+            .await?
+            .is_some()
+        {
+            bail!(
+                "account '{user}' already holds an identity at this provider: unlink that one \
+                 first"
+            );
+        }
+        self.conn
+            .execute(
+                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    Value::Text(issuer.to_string()),
+                    Value::Text(subject.to_string()),
+                    Value::Text(user.to_string()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(linked_by.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("linking an identity to user '{user}'"))?;
+        Ok(())
+    }
+
+    /// The first free account name from `base`, `base-2`, `base-3` and so on.
+    /// Called inside a transaction, so the name it found is still free when
+    /// the insert beside it runs.
+    async fn free_account_name(&self, base: &str) -> Result<String> {
+        for attempt in 1..=MAX_NAME_ATTEMPTS {
+            let candidate = if attempt == 1 {
+                base.to_string()
+            } else {
+                format!("{base}-{attempt}")
+            };
+            if self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(candidate.clone())],
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+        }
+        bail!("refusing to provision an account: every name from '{base}' on is taken")
+    }
+
+    /// Drop every identity linked to one account. Called inside the removal
+    /// transaction: a link that outlived its account would hand the next
+    /// account to claim the name somebody else's sign-on.
+    async fn delete_identity_links_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM identity_link WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the identity links of user '{name}'"))?;
+        Ok(())
+    }
+
     /// Run a single-column update against one account, failing when the account
     /// does not exist, for a statement carrying the [`NOT_LAST_ADMIN`] guard:
     /// zero rows changed then has a second possible meaning, that the edit was
@@ -2402,14 +2807,14 @@ impl AuthStore {
     /// Commit when the body succeeded, roll back when it did not. The rollback
     /// is best-effort: the body's error is what the caller needs to see, and
     /// an abandoned transaction is released when the connection drops anyway.
-    async fn finish(&self, result: Result<()>) -> Result<()> {
+    async fn finish<T>(&self, result: Result<T>) -> Result<T> {
         match result {
-            Ok(()) => {
+            Ok(value) => {
                 self.conn
                     .execute("COMMIT", ())
                     .await
                     .context("committing an auth database transaction")?;
-                Ok(())
+                Ok(value)
             }
             Err(e) => {
                 let _ = self.conn.execute("ROLLBACK", ()).await;
@@ -4850,5 +5255,287 @@ mod tests {
         assert_eq!(normalize_domain("  lab ").unwrap(), "lab");
         assert_eq!(normalize_domain("My Domain").unwrap(), "My Domain");
         assert!(normalize_domain("   ").is_err());
+    }
+
+    // --- identity links ---------------------------------------------------
+
+    /// An account provisioned from an identity is found back by that
+    /// identity, and by nothing else.
+    #[tokio::test]
+    async fn a_provisioned_identity_is_found_back_by_its_pair() {
+        let (_dir, store) = store().await;
+        let user = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                Some("Ada Lovelace"),
+                Some("ada@example.test"),
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(user.name, "ada");
+        assert_eq!(user.display, "Ada Lovelace");
+        assert_eq!(user.email.as_deref(), Some("ada@example.test"));
+        assert_eq!(user.role, Role::Viewer);
+
+        let found = store
+            .linked_user("https://idp.example", "sub-1")
+            .await
+            .unwrap()
+            .expect("the pair names the account");
+        assert_eq!(found.name, "ada");
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-2")
+                .await
+                .unwrap()
+                .is_none(),
+            "another subject at the same issuer is another person"
+        );
+        assert!(
+            store
+                .linked_user("https://other.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the same subject at another issuer is another person"
+        );
+        let links = store.identity_links("ada").await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].issuer, "https://idp.example");
+        assert_eq!(links[0].subject, "sub-1");
+        assert_eq!(links[0].linked_by, "jit");
+        assert!(!links[0].linked_at.is_empty());
+    }
+
+    /// A name already taken is uniquified rather than joined, and the
+    /// suffixes keep counting.
+    #[tokio::test]
+    async fn provisioning_uniquifies_a_taken_name() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        let second = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "Ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.name, "ada-2");
+        let third = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-2",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.name, "ada-3");
+        assert_eq!(
+            store.user("ada").await.unwrap().unwrap().role,
+            Role::Admin,
+            "the account that held the name is untouched"
+        );
+    }
+
+    /// Provisioning honours the account cap, and refuses in words that name
+    /// the setting.
+    #[tokio::test]
+    async fn provisioning_refuses_past_the_account_cap() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        let err = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "grace",
+                None,
+                None,
+                Role::Viewer,
+                1,
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("auth.max_users"), "{message}");
+        assert!(store.user("grace").await.unwrap().is_none());
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused provisioning leaves no link behind"
+        );
+    }
+
+    /// A pair belongs to one account, and an account holds one identity per
+    /// issuer. Both refusals name what is in the way.
+    #[tokio::test]
+    async fn a_pair_links_once_and_an_account_holds_one_identity_per_issuer() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .add_user("grace", "Grace", None, Role::Editor, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+
+        let err = store
+            .link_identity("https://idp.example", "sub-1", "grace", "grace")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already linked"), "{err:#}");
+
+        let err = store
+            .link_identity("https://idp.example", "sub-2", "ada", "ada")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already holds"), "{err:#}");
+
+        // A second issuer is a second identity, and that is allowed.
+        store
+            .link_identity("https://other.example", "sub-2", "ada", "ada")
+            .await
+            .unwrap();
+        assert_eq!(store.identity_links("ada").await.unwrap().len(), 2);
+        assert!(store.identity_links("grace").await.unwrap().is_empty());
+    }
+
+    /// Linking refuses a name that is nobody, so a link can never point at an
+    /// account that does not exist.
+    #[tokio::test]
+    async fn an_identity_cannot_be_linked_to_a_name_that_is_nobody() {
+        let (_dir, store) = store().await;
+        let err = store
+            .link_identity("https://idp.example", "sub-1", "ghost", "admin")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no such user"), "{err:#}");
+    }
+
+    /// Unlinking removes the link and says whether there was one.
+    #[tokio::test]
+    async fn unlinking_reports_whether_it_removed_anything() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity("https://idp.example", "ada")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .unlink_identity("https://idp.example", "ada")
+                .await
+                .unwrap(),
+            "the second unlink had nothing to remove"
+        );
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Removing an account takes its identity links with it, so the pair
+    /// cannot resurrect a deleted account on the next sign-in.
+    #[tokio::test]
+    async fn removing_an_account_takes_its_identity_links() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .add_user("grace", "Grace", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-2", "grace", "grace")
+            .await
+            .unwrap();
+
+        store.remove_user("ada").await.unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.remove_user_force("grace").await.unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Presentation data refreshes, and an absent claim clears nothing.
+    #[tokio::test]
+    async fn refreshing_presentation_never_clears_what_was_not_sent() {
+        let (_dir, store) = store().await;
+        store
+            .add_user(
+                "ada",
+                "Ada",
+                Some("ada@example.test"),
+                Role::Editor,
+                "correct horse",
+            )
+            .await
+            .unwrap();
+        let refreshed = store
+            .refresh_presentation("ada", Some("Ada L"), Some("new@example.test"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.display, "Ada L");
+        assert_eq!(refreshed.email.as_deref(), Some("new@example.test"));
+        assert_eq!(refreshed.role, Role::Editor, "presentation moves no role");
+
+        let untouched = store.refresh_presentation("ada", None, None).await.unwrap();
+        assert_eq!(untouched.display, "Ada L");
+        assert_eq!(untouched.email.as_deref(), Some("new@example.test"));
     }
 }

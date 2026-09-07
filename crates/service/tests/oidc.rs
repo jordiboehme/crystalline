@@ -30,7 +30,7 @@ use crystalline_core::config::{
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
-use crystalline_service::rest::AuthStore;
+use crystalline_service::rest::{AuthStore, Role};
 
 mod support;
 
@@ -39,6 +39,10 @@ mod support;
 /// any body or log line it might turn up in.
 const CLIENT_ID: &str = "crystalline-test-client";
 const CLIENT_SECRET: &str = "shhh-this-is-the-oidc-client-secret";
+
+/// The password every local account in this file is created with. Local
+/// accounts exist here to be the thing a sign-on must NOT land in.
+const LOCAL_PASSWORD: &str = "correct horse battery staple";
 
 /// The first key the fake provider signs with, and the one it rotates to.
 const KEY_ONE: &str = include_str!("fixtures/oidc/test-idp-key.pem");
@@ -429,20 +433,27 @@ struct RestCtx {
     addr: SocketAddr,
     client: reqwest::Client,
     _tmp: tempfile::TempDir,
-    _auth: Arc<AuthStore>,
+    /// The accounts database the instance serves from, so a test can ask what
+    /// a sign-in actually wrote rather than infer it from a response.
+    auth: Arc<AuthStore>,
 }
 
 impl RestCtx {
     /// The production router over an engine whose `auth.oidc` block names
     /// `issuer`, with the shared client id and secret.
     async fn with_oidc(issuer: &str) -> RestCtx {
+        RestCtx::with_oidc_role(issuer, None).await
+    }
+
+    /// The same instance with `auth.oidc.default_role` set to `role`.
+    async fn with_oidc_role(issuer: &str, role: Option<&str>) -> RestCtx {
         RestCtx::build(Some(OidcConfig {
             issuer: Some(issuer.to_string()),
             client_id: Some(CLIENT_ID.to_string()),
             client_secret: Some(CLIENT_SECRET.to_string()),
             name: Some("Contoso".to_string()),
             scopes: None,
-            default_role: None,
+            default_role: role.map(str::to_string),
         }))
         .await
     }
@@ -523,12 +534,40 @@ impl RestCtx {
                 .build()
                 .unwrap(),
             _tmp: tmp,
-            _auth: auth,
+            auth,
         }
     }
 
     fn url(&self, path: &str) -> String {
         format!("http://{}/api/v1{path}", self.addr)
+    }
+
+    /// One account as the store holds it, or `None` when the name is nobody.
+    async fn user(&self, name: &str) -> Option<crystalline_service::rest::User> {
+        self.auth.user(name).await.unwrap()
+    }
+
+    /// An account created the local way: a name, a password and a role that a
+    /// sign-on must never inherit.
+    async fn create_local_user(&self, name: &str, email: &str, role: Role) {
+        self.auth
+            .add_user(name, name, Some(email), role, LOCAL_PASSWORD)
+            .await
+            .unwrap();
+    }
+
+    /// Sign a local account in and hand back the cookies it holds, so a test
+    /// can drive a route that needs a session.
+    async fn local_login(&self, name: &str) -> Vec<(String, String)> {
+        let response = self
+            .client
+            .post(self.url("/auth/login"))
+            .json(&serde_json::json!({ "name": name, "password": LOCAL_PASSWORD }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200, "the local login should succeed");
+        cookies_from(&response)
     }
 
     /// A GET carrying `cookies`, which the caller collects by hand because the
@@ -550,9 +589,16 @@ impl RestCtx {
     /// back and answer the callback. Returns the callback's response and the
     /// cookies the browser was holding when it made that request.
     async fn sign_in(&self) -> reqwest::Response {
-        let start = self.get(&self.url("/auth/oidc/login"), &[]).await;
+        self.sign_in_from("/auth/oidc/login", &[]).await
+    }
+
+    /// The same walk from a chosen start, carrying `held` (a session cookie,
+    /// say) on every hop this instance sees.
+    async fn sign_in_from(&self, path: &str, held: &[(String, String)]) -> reqwest::Response {
+        let start = self.get(&self.url(path), held).await;
         assert_eq!(start.status(), 302, "the sign-in should redirect out");
-        let cookies = cookies_from(&start);
+        let mut cookies = held.to_vec();
+        cookies.extend(cookies_from(&start));
         let authorize = location(&start);
         let bounced = self.client.get(&authorize).send().await.unwrap();
         assert_eq!(bounced.status(), 302, "the provider should redirect back");
@@ -588,14 +634,9 @@ fn location(response: &reqwest::Response) -> String {
 
 /// The whole flow, hop by hop: the authorization request carries PKCE S256, a
 /// state and a nonce; the provider sends a code back; the callback exchanges
-/// it and validates the token.
-///
-/// It stops at 501 rather than at a session, and that is the assertion: the
-/// protocol is finished and the identity resolver is not. When the
-/// provisioning task fills `resolve_oidc_identity`, this test's expected
-/// status moves to 302 and everything above it stays where it is.
+/// it, validates the token, provisions the account and mints a session.
 #[tokio::test]
-async fn a_full_code_flow_validates_and_reaches_the_identity_seam() {
+async fn a_full_code_flow_signs_in_and_mints_a_session() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
 
@@ -618,11 +659,16 @@ async fn a_full_code_flow_validates_and_reaches_the_identity_seam() {
     let bounced = ctx.client.get(&authorize).send().await.unwrap();
     assert_eq!(bounced.status(), 302);
     let done = ctx.get(&location(&bounced), &cookies).await;
-    assert_eq!(
-        done.status(),
-        501,
-        "the token validated and the flow reached the identity seam"
+    assert_eq!(done.status(), 302, "the sign-in completes");
+    assert_eq!(location(&done), "/", "the browser lands on the application");
+    let minted = cookies_from(&done);
+    assert!(
+        minted.iter().any(|(name, _)| name == "fluid_session"),
+        "the callback mints a session: {minted:?}"
     );
+    // And it is a session the instance actually honours.
+    let me = ctx.get(&ctx.url("/auth/me"), &minted).await;
+    assert_eq!(me.status(), 200, "the minted session is live");
 
     // The scopes the settings layer defaults to actually went out, beside the
     // `openid` the library adds itself.
@@ -665,14 +711,14 @@ async fn jwks_rotation_is_survived_by_exactly_one_refetch() {
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
 
-    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(ctx.sign_in().await.status(), 302);
     let after_first = idp.jwks_fetches();
     assert_eq!(after_first, 1, "discovery fetched the key set once");
 
     idp.rotate_keys();
     assert_eq!(
         ctx.sign_in().await.status(),
-        501,
+        302,
         "the second sign-in validates against the rotated key"
     );
     assert_eq!(
@@ -682,7 +728,7 @@ async fn jwks_rotation_is_survived_by_exactly_one_refetch() {
     );
 
     // A third sign-in on the now-cached rotated key costs nothing more.
-    assert_eq!(ctx.sign_in().await.status(), 501);
+    assert_eq!(ctx.sign_in().await.status(), 302);
     assert_eq!(idp.jwks_fetches(), after_first + 1);
 }
 
@@ -704,7 +750,7 @@ async fn a_callback_is_single_use_and_bound_to_its_browser() {
     assert_eq!(stolen.status(), 401);
 
     // With the cookie it works once...
-    assert_eq!(ctx.get(&callback, &cookies).await.status(), 501);
+    assert_eq!(ctx.get(&callback, &cookies).await.status(), 302);
     // ...and the record is spent, so a replay finds nothing.
     assert_eq!(ctx.get(&callback, &cookies).await.status(), 401);
 }
@@ -759,7 +805,7 @@ async fn the_client_secret_never_reaches_a_response_or_a_log() {
     let done = ctx.get(&location(&bounced), &cookies).await;
     assert_eq!(
         done.status(),
-        501,
+        302,
         "the exchange succeeded, so the secret was accepted"
     );
     assert!(!done.text().await.unwrap().contains(CLIENT_SECRET));
@@ -778,11 +824,11 @@ async fn the_client_secret_never_reaches_a_response_or_a_log() {
     );
 }
 
-/// The claims the identity layer will consume are read off the token: the
-/// subject is the key, and the three presentation claims come through.
+/// The claims the identity layer consumes are read off the token and land in
+/// the account: the username is derived from `preferred_username`, and the
+/// display name and address come through as they were sent.
 #[tokio::test]
 async fn the_claims_the_identity_layer_needs_are_carried_through() {
-    let (logs, _guard) = support::capture_logs();
     let idp = FakeIdp::start().await;
     let ctx = RestCtx::with_oidc(&idp.issuer()).await;
     idp.set_user(IdpUser {
@@ -791,14 +837,14 @@ async fn the_claims_the_identity_layer_needs_are_carried_through() {
         name: Some("Ada L".to_string()),
         email: Some("new@example.test".to_string()),
     });
-    assert_eq!(ctx.sign_in().await.status(), 501);
-    // The seam logs what it was handed, which is the only observation point
-    // there is until the resolver behind it exists.
-    assert!(
-        logs.any_contains("sub-9") && logs.any_contains(&idp.issuer()),
-        "the seam was handed the issuer and the subject: {:?}",
-        logs.lines()
-    );
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    let user = ctx
+        .user("ada.lovelace")
+        .await
+        .expect("the derived name is the folded preferred_username");
+    assert_eq!(user.display, "Ada L");
+    assert_eq!(user.email.as_deref(), Some("new@example.test"));
+    assert!(!user.disabled);
 }
 
 /// An instance with no provider configured says so on all three routes, and
@@ -918,4 +964,185 @@ async fn a_slow_provider_does_not_serialize_concurrent_sign_ins() {
     );
     assert_eq!(first.status(), 302);
     assert_eq!(second.status(), 302);
+}
+
+// --- provisioning and the identity key --------------------------------------
+
+/// The first sign-in provisions an account; the second lands in the same one
+/// even though the provider has renamed the person since. `(issuer, sub)` is
+/// the key, and a username is presentation data that follows the rename
+/// rather than moving the account.
+#[tokio::test]
+async fn first_sign_in_provisions_and_second_reuses_despite_renames() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.set_user(IdpUser {
+        subject: "sub-1".to_string(),
+        preferred_username: Some("Ada.Lovelace".to_string()),
+        name: Some("Ada".to_string()),
+        email: Some("ada@example.test".to_string()),
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    let provisioned = ctx.user("ada.lovelace").await.expect("provisioned");
+    assert_eq!(provisioned.display, "Ada");
+    assert_eq!(provisioned.role, Role::Viewer);
+
+    idp.set_user(IdpUser {
+        subject: "sub-1".to_string(),
+        preferred_username: Some("Countess".to_string()),
+        name: Some("Ada L".to_string()),
+        email: Some("new@example.test".to_string()),
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert!(
+        ctx.user("countess").await.is_none(),
+        "the subject is the key, not the username"
+    );
+    let same = ctx.user("ada.lovelace").await.expect("the same account");
+    assert_eq!(same.display, "Ada L", "the display name follows the rename");
+    assert_eq!(
+        same.email.as_deref(),
+        Some("new@example.test"),
+        "the address is presentation data and follows too"
+    );
+    assert_eq!(
+        same.role,
+        Role::Viewer,
+        "a returning sign-in changes no role"
+    );
+}
+
+/// An address that matches an existing account links nothing: the sign-on
+/// provisions its own fresh account at the default role, and the account it
+/// shares an address with is untouched.
+#[tokio::test]
+async fn matching_email_never_links_silently() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    idp.set_user(IdpUser {
+        subject: "sub-9".to_string(),
+        preferred_username: Some("ada2".to_string()),
+        name: Some("Ada".to_string()),
+        email: Some("ada@example.test".to_string()),
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+
+    let jit = ctx.user("ada2").await.expect("a fresh account");
+    assert_eq!(
+        jit.role,
+        Role::Viewer,
+        "a fresh viewer account, never the admin's"
+    );
+    let local = ctx.user("ada").await.expect("the local account survives");
+    assert_eq!(local.role, Role::Admin, "the admin is untouched");
+    assert!(
+        ctx.auth.identity_links("ada").await.unwrap().is_empty(),
+        "the account sharing the address was linked to nothing"
+    );
+    let links = ctx.auth.identity_links("ada2").await.unwrap();
+    assert_eq!(links.len(), 1, "the fresh account holds the link");
+    assert_eq!(links[0].subject, "sub-9");
+    assert_eq!(links[0].linked_by, "jit");
+}
+
+/// A derived username that is already taken is uniquified rather than
+/// colliding with, or silently joining, the account holding it.
+#[tokio::test]
+async fn username_collisions_uniquify() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "x@example.test", Role::Editor)
+        .await;
+    idp.set_user(IdpUser {
+        subject: "sub-2".to_string(),
+        preferred_username: Some("Ada".to_string()),
+        name: Some("Ada Two".to_string()),
+        email: None,
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    let fresh = ctx.user("ada-2").await.expect("the uniquified name");
+    assert_eq!(fresh.display, "Ada Two");
+    assert_eq!(
+        ctx.user("ada").await.expect("the local account").role,
+        Role::Editor,
+        "the account that held the name is untouched"
+    );
+}
+
+/// A provider that sends no `preferred_username` still gets a readable
+/// account name: the address's local part, and never the raw address.
+#[tokio::test]
+async fn a_missing_preferred_username_falls_back_to_the_address() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    idp.set_user(IdpUser {
+        subject: "sub-3".to_string(),
+        preferred_username: None,
+        name: Some("Grace Hopper".to_string()),
+        email: Some("Grace.Hopper@example.test".to_string()),
+    });
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert!(ctx.user("grace.hopper").await.is_some());
+    assert!(
+        ctx.user("grace.hopper@example.test").await.is_none(),
+        "an address is not a login name"
+    );
+}
+
+/// `auth.oidc.default_role` is what a provisioned account is created at.
+#[tokio::test]
+async fn the_configured_default_role_is_what_is_provisioned() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc_role(&idp.issuer(), Some("editor")).await;
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    assert_eq!(
+        ctx.user("ada.lovelace").await.expect("provisioned").role,
+        Role::Editor
+    );
+}
+
+/// A disabled account is refused at the callback, in the words the rest of
+/// the surface uses for a disabled account, and its sign-in mints nothing.
+#[tokio::test]
+async fn a_disabled_account_cannot_sign_on() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    assert_eq!(ctx.sign_in().await.status(), 302);
+    ctx.auth.set_disabled("ada.lovelace", true).await.unwrap();
+
+    let refused = ctx.sign_in().await;
+    assert_eq!(refused.status(), 403);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("this account is disabled"), "{body}");
+}
+
+/// Link intent is refused rather than provisioned: a sign-in started with
+/// `?link=true` must never create a second account for the person who is
+/// already signed in, and it must never link one either until the task that
+/// owns linking lands.
+#[tokio::test]
+async fn link_intent_is_refused_rather_than_provisioned() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+    ctx.create_local_user("ada", "ada@example.test", Role::Admin)
+        .await;
+    let session = ctx.local_login("ada").await;
+
+    let refused = ctx
+        .sign_in_from("/auth/oidc/login?link=true", &session)
+        .await;
+    assert_eq!(refused.status(), 409);
+    let body = refused.text().await.unwrap();
+    assert!(body.contains("linking"), "{body}");
+
+    assert!(
+        ctx.user("ada.lovelace").await.is_none(),
+        "a link attempt provisions nothing"
+    );
+    assert_eq!(
+        ctx.user("ada").await.expect("the account survives").role,
+        Role::Admin
+    );
 }

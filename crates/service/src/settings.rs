@@ -1629,7 +1629,9 @@ fn clear_oidc_default_role(config: &mut GlobalConfig) {
 fn oidc_default_role_effective(config: &GlobalConfig) -> (String, bool) {
     match config.auth_oidc().and_then(|o| o.default_role.as_ref()) {
         Some(role) => (role.clone(), false),
-        None => (Role::Viewer.as_str().to_string(), true),
+        // The same constant the relying party provisions at, so what this key
+        // says it does when unset and what a sign-in then does cannot drift.
+        None => (crate::rest::DEFAULT_OIDC_ROLE.as_str().to_string(), true),
     }
 }
 

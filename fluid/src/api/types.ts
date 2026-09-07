@@ -101,7 +101,7 @@ export interface paths {
         };
         /**
          * Finish a single sign-on the provider sent back.
-         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The provider's own error text never reaches this response.
+         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. The provider's own error text never reaches this response.
          */
         get: operations["oidc_callback"];
         put?: never;
@@ -2508,6 +2508,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description The identity names a disabled account, or a new account would pass `auth.max_users`. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
             /** @description No provider is configured on this instance. */
             404: {
                 headers: {
@@ -2517,8 +2526,8 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The claims validated but this build cannot yet turn them into an account. */
-            501: {
+            /** @description The sign-in was started to link an identity to an account, which this build cannot do yet. Nothing was linked and no account was created. */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
