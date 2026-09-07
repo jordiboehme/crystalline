@@ -1223,18 +1223,25 @@ impl<'a> Graph<'a> {
 
     /// The `[[Target]]` text that addresses `id` from inside `domain`: bare
     /// when both sit in the same domain, prefixed when they do not.
+    ///
+    /// By permalink, which is what every relation the engine writes for itself
+    /// now names. A title is prose and may carry a colon, and `[[...]]` reads
+    /// the first colon as a cross-domain prefix (issue #65), so a suggestion
+    /// spelled with a title is a suggestion to write a link that may not
+    /// resolve. This is the surface that tells an agent how to wire a relation
+    /// by hand, so it prescribes the spelling that always works.
     fn link_text(&self, id: EngramId, domain: &str) -> String {
-        let (d, title) = if let Some(f) = self.facts.get(&id.0) {
-            (f.domain.as_str(), f.title.as_str())
+        let (d, permalink) = if let Some(f) = self.facts.get(&id.0) {
+            (f.domain.as_str(), f.permalink.as_str())
         } else if let Some(n) = self.nodes.get(&id.0) {
-            (n.domain.as_str(), n.title.as_str())
+            (n.domain.as_str(), n.permalink.as_str())
         } else {
             return format!("id {}", id.0);
         };
         if d == domain {
-            format!("[[{title}]]")
+            format!("[[{permalink}]]")
         } else {
-            format!("[[{d}:{title}]]")
+            format!("[[{d}:{permalink}]]")
         }
     }
 

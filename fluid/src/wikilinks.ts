@@ -15,6 +15,16 @@
  * a claim the app cannot back. Parsed and unresolved is the one honest negative,
  * and it is drawn as such.
  *
+ * A reference is labelled with the title of the engram it lands on, not with
+ * the text inside its brackets. Those are usually the same string and the
+ * difference is the point when they are not: every relation the engine writes
+ * for itself names the permalink, because a permalink is the stable identity
+ * and never carries a colon, and a reader of a retired engram should still see
+ * "Log: Weekly Garden Notes" rather than `log-weekly`. The file carries the
+ * address, a person keeps seeing the name. Nothing is invented: the title comes
+ * from the graph node the link resolved to, so a reference with no address yet
+ * is not labelled at all - it is the prose it was written as.
+ *
  * One thing the bracket text cannot settle on its own, and the server's
  * resolver cannot either: `[[Log: Weekly Garden Notes]]` splits exactly like
  * `[[ops:Runbook]]`, and only the domain registry says which of the two words
@@ -173,10 +183,18 @@ export function buildWikilinkResolver(
   }
 
   // Where the neighbors live, by title and by permalink, since a wikilink may
-  // be written as either.
-  const located = new Map<string, { domain: string; permalink: string }>();
+  // be written as either. The title rides along because it is what a reader is
+  // shown for whichever of the two the link was written with.
+  const located = new Map<
+    string,
+    { domain: string; permalink: string; title: string }
+  >();
   for (const node of graph?.nodes ?? []) {
-    const where = { domain: node.domain, permalink: node.permalink };
+    const where = {
+      domain: node.domain,
+      permalink: node.permalink,
+      title: node.title,
+    };
     for (const name of [node.title, node.permalink]) {
       // Keyed through the same function the lookup uses, so the two can never
       // disagree about what a key is.
@@ -215,7 +233,12 @@ export function buildWikilinkResolver(
         return {
           kind: "resolved",
           href: engramRoute(where.domain, where.permalink),
-          label: target.target,
+          // The engram's own title, falling back to the bracket text for a node
+          // that carries none. A link written by title is labelled with that
+          // title in its canonical spelling; a link written by permalink is
+          // labelled with the title too, which is the whole reason the engine
+          // may write the address without costing a reader the name.
+          label: where.title === "" ? target.target : where.title,
         };
       }
     }

@@ -4856,3 +4856,73 @@ parity!(
     clear_domain_takes_attachments_with_it,
     clear_domain_clears_attachments
 );
+
+/// Issue #65 at the index: an engram whose own title's first word ends in a
+/// colon.
+///
+/// `[[Log: Weekly Garden Notes]]` splits like `[[domain:Target]]`, because the
+/// parser is domain-agnostic and nothing inside the brackets says which it is.
+/// Resolution is where the registry can settle it: a prefix no domain answers
+/// to means the whole bracket text is a title at home. A prefix that does name
+/// a domain is untouched, and an unregistered prefix matching nothing at home
+/// stays unresolved rather than being softened into a hit.
+async fn colon_title_resolution(store: &dyn Store) {
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "how to restart\n"),
+    );
+    sync_domain(store, "ops", other).await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The title is quoted, because a bare `title: Log: Weekly Garden Notes` is
+    // not YAML at all - which is a small reminder of why the colon is a
+    // problem worth solving rather than forbidding.
+    write(
+        root,
+        "log-weekly.md",
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    );
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- superseded_by [[Log: Weekly Garden Notes]]\n- cites [[ops:Runbook]]\n- blocks [[Ledger: Nobody Wrote This]]\n\nProse about [[Log: Weekly Garden Notes]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
+    let refs = store.outbound_refs(alpha).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| (r.to_domain.as_deref(), r.to_target.as_str(), r.resolved))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Nothing is registered as `Log`, so the whole bracket text is the
+            // title of the engram beside it.
+            (Some("Log"), "Weekly Garden Notes", true),
+            // `ops` is a domain, so the prefix keeps its meaning.
+            (Some("ops"), "Runbook", true),
+            // `Ledger` is no domain either, and no engram here is titled
+            // `Ledger: Nobody Wrote This`. A second reading is a second
+            // question, not a softer answer.
+            (Some("Ledger"), "Nobody Wrote This", false),
+            // The prose wikilink is the same target through the other table.
+            (Some("Log"), "Weekly Garden Notes", true),
+        ]
+    );
+}
+parity!(
+    a_colon_in_a_title_resolves_at_home_on_both_backends,
+    colon_title_resolution
+);

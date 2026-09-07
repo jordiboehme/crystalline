@@ -3369,8 +3369,14 @@ impl Engine {
         // The permalink, not the title. A title is prose and may carry a
         // colon, which `[[...]]` parses as a cross-domain prefix (issue #65);
         // a permalink is the stable identity and never carries one. Fluid goes
-        // on rendering the title, which it reads off the engram it lands on.
+        // on rendering the title, which it reads off the engram the link lands
+        // on rather than off the bracket text.
+        //
+        // The title comes along only to recognize the bullet a previous
+        // retirement wrote in the older spelling, so re-retiring an engram
+        // that already declares its successor by title appends nothing.
         let successor_permalink = successor.as_ref().map(|(d, _)| d.permalink.clone());
+        let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
 
         // -- target: status, optional valid_to, optional superseded_by line --
         match &source {
@@ -3391,6 +3397,7 @@ impl Engine {
                     &p.status,
                     valid_to,
                     successor_permalink.as_deref(),
+                    successor_title.as_deref(),
                     &actor,
                 );
                 let edited = Self::enforce_temporal(edited)?;
@@ -3417,6 +3424,7 @@ impl Engine {
                     &p.status,
                     valid_to,
                     successor_permalink.as_deref(),
+                    successor_title.as_deref(),
                     &actor,
                 );
                 let edited = Self::enforce_temporal(edited)?;
@@ -3442,6 +3450,11 @@ impl Engine {
         // -- successor: reciprocal supersedes line, appended once --
         if let Some((succ_desc, succ_source)) = &successor {
             let line = format!("- supersedes [[{}]]", desc.permalink);
+            // Recognized in either spelling, for the reason `declares` gives:
+            // a successor wired by an older retirement carries the title form.
+            let already = |current: &str| {
+                Self::declares(current, "supersedes", &desc.permalink, Some(&desc.title))
+            };
             match succ_source {
                 ContentSource::File { root } => {
                     let abs = join_rel(root, &succ_desc.path);
@@ -3456,7 +3469,7 @@ impl Engine {
                             path: abs.display().to_string(),
                             source,
                         })?;
-                    if !current.contains(&line) {
+                    if !already(&current) {
                         let edited =
                             touch_generated(&append_body(&current, &line), &actor, now_offset());
                         write_file(&abs, &edited)?;
@@ -3478,7 +3491,7 @@ impl Engine {
                                 ))
                             })?
                     };
-                    if !current.contains(&line) {
+                    if !already(&current) {
                         let edited =
                             touch_generated(&append_body(&current, &line), &actor, now_offset());
                         let stamp = virtual_stamp(&edited);
@@ -3524,6 +3537,7 @@ impl Engine {
         status: &str,
         valid_to: Option<NaiveDate>,
         successor_permalink: Option<&str>,
+        successor_title: Option<&str>,
         actor: &str,
     ) -> String {
         let mut edited = set_frontmatter_field(current, "status", status);
@@ -3533,11 +3547,28 @@ impl Engine {
         }
         if let Some(permalink) = successor_permalink {
             let line = format!("- superseded_by [[{permalink}]]");
-            if !current.contains(&line) {
+            if !Self::declares(current, "superseded_by", permalink, successor_title) {
                 edited = append_body(&edited, &line);
             }
         }
         touch_generated(&edited, actor, now_offset())
+    }
+
+    /// Whether the text already declares this relation to this engram, in
+    /// either spelling.
+    ///
+    /// The engine writes the permalink form now and wrote the title form
+    /// before, so an archive holds both and a re-retirement must recognize the
+    /// one it finds rather than appending a second bullet saying what the first
+    /// already says. Exact on both, because both are spellings the engine
+    /// itself produced: this recognizes its own past output, it does not try to
+    /// parse what a person may have typed.
+    fn declares(current: &str, rel_type: &str, permalink: &str, title: Option<&str>) -> bool {
+        let mut forms = vec![format!("- {rel_type} [[{permalink}]]")];
+        if let Some(title) = title {
+            forms.push(format!("- {rel_type} [[{title}]]"));
+        }
+        forms.iter().any(|line| current.contains(line.as_str()))
     }
 
     /// Move part of an engram into a new one, in a single guided step: the
@@ -3659,10 +3690,15 @@ impl Engine {
 
         // By permalink, for the reason `derived_from` above is: a title is
         // prose and may carry a colon that `[[...]]` reads as a cross-domain
-        // prefix (issue #65). The title is the fallback for the one case that
-        // has no permalink to name - a receipt whose shape changed under this
-        // code, which the rollback below reports rather than acts on.
-        let back_link = new_permalink.clone().unwrap_or_else(|| title.clone());
+        // prefix (issue #65). The fallback for the one case with no permalink
+        // to name - a receipt whose shape changed under this code, which the
+        // rollback below reports rather than acts on - is the slug of the
+        // title, which is what the capture path would have derived anyway, and
+        // never the title itself: that would write the very shape this change
+        // is about.
+        let back_link = new_permalink
+            .clone()
+            .unwrap_or_else(|| crystalline_core::slugify(&title));
         let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
         let edited = self
             .apply_source_edit_staged(&desc, &source, Some(&checksum), &actor, move |_| {
@@ -5980,11 +6016,7 @@ impl Engine {
             .iter()
             .filter(|(name, _)| !hidden.contains(*name))
             .collect();
-        listed.sort_by(|(left, _), (right, _)| {
-            left.to_lowercase()
-                .cmp(&right.to_lowercase())
-                .then_with(|| left.cmp(right))
-        });
+        listed.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
         for (name, entry) in listed {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);

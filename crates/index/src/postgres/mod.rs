@@ -95,7 +95,7 @@ use crate::store::{
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
     InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
     RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, folder_slash, page_window,
+    build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -874,7 +874,7 @@ impl Store for PostgresStore {
         }
 
         for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
             for rel in batch {
                 params.push(Param::Int(engram_id));
                 params.push(Param::Int(domain.0));
@@ -882,26 +882,28 @@ impl Store for PostgresStore {
                 params.push(Param::Text(rel.rel_type.clone()));
                 params.push(Param::Text(rel.to_target.clone()));
                 params.push(Param::TextOpt(rel.to_domain.clone()));
+                params.push(Param::Text(rel.to_raw.clone()));
             }
             let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) VALUES {}",
-                value_rows(6, batch.len(), Some("NULL"))
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(7, batch.len(), Some("NULL"))
             );
             exec(&mut *c, &sql, params).await?;
         }
 
         for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 5);
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
             for link in batch {
                 params.push(Param::Int(engram_id));
                 params.push(Param::Int(domain.0));
                 params.push(Param::Int(link.line as i64));
                 params.push(Param::Text(link.to_target.clone()));
                 params.push(Param::TextOpt(link.to_domain.clone()));
+                params.push(Param::Text(link.to_raw.clone()));
             }
             let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) VALUES {}",
-                value_rows(5, batch.len(), Some("NULL"))
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
             );
             exec(&mut *c, &sql, params).await?;
         }
@@ -1083,19 +1085,13 @@ impl Store for PostgresStore {
 
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
         // One statement. Target domain is `to_domain` when set, else the
-        // relation's own domain. Prefer a permalink match, then a title match.
-        let tgt_dom = "COALESCE((SELECT d.id FROM domain d WHERE d.name = relation.to_domain), relation.domain_id)";
-        let by_perma = format!(
-            "(SELECT e.id FROM engram e WHERE e.permalink = relation.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
-        let by_title = format!(
-            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(relation.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
+        // relation's own domain. Prefer a permalink match, then a title match,
+        // then the whole bracket text at home - see `reference_match`.
         let sql = format!(
-            "UPDATE relation SET to_id = COALESCE({by_perma}, {by_title}) \
+            "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = $1 \
-             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = relation.to_target AND e.domain_id = {tgt_dom}) \
-                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(relation.to_target) AND e.domain_id = {tgt_dom}))"
+             AND {resolved} IS NOT NULL",
+            resolved = reference_match("relation")
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1107,22 +1103,13 @@ impl Store for PostgresStore {
     }
 
     async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
-        // The wikilink twin of resolve_pending_relations over the `link` table.
-        // Target domain is `to_domain` when set, else the link's own domain.
-        // Prefer a permalink match, then a title match. Links carry no rel_type.
-        let tgt_dom =
-            "COALESCE((SELECT d.id FROM domain d WHERE d.name = link.to_domain), link.domain_id)";
-        let by_perma = format!(
-            "(SELECT e.id FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
-        let by_title = format!(
-            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
+        // The wikilink twin of resolve_pending_relations over the `link` table,
+        // matching by the same rule. Links carry no rel_type.
         let sql = format!(
-            "UPDATE link SET to_id = COALESCE({by_perma}, {by_title}) \
+            "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = $1 \
-             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom}) \
-                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom}))"
+             AND {resolved} IS NOT NULL",
+            resolved = reference_match("link")
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))

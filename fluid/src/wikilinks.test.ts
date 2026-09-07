@@ -39,7 +39,16 @@ function detail() {
           target: { domain: "Log", target: "Weekly Garden Notes" },
         },
       ],
-      relations: [],
+      relations: [
+        // The shape the engine writes for itself: the successor named by its
+        // permalink, because a permalink cannot be misread as a domain prefix.
+        {
+          line: 4,
+          relType: "superseded_by",
+          resolved: true,
+          target: { domain: null, target: "notes/beta" },
+        },
+      ],
     },
     "eng",
     "alpha",
@@ -154,6 +163,19 @@ describe("the wikilink resolver", () => {
     // The negative is known from the detail payload alone, so it is drawn
     // straight away rather than waiting on a request that cannot change it.
     expect(resolve("Ghost")).toEqual({ kind: "unresolved" });
+  });
+
+  it("labels a link written by permalink with the engram's title", () => {
+    const resolve = buildWikilinkResolver(detail(), graph(), DOMAINS);
+
+    // The file carries the address and a reader keeps seeing the name. This is
+    // what lets the engine write the stable identity into a relation without
+    // costing anybody the title.
+    expect(resolve("notes/beta")).toEqual({
+      kind: "resolved",
+      href: "/d/eng/e/notes/beta",
+      label: "Beta",
+    });
   });
 
   it("says nothing about bracket text the server never parsed as a reference", () => {

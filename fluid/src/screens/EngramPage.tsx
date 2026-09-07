@@ -416,11 +416,17 @@ export default function EngramPage() {
  * One direction of the supersedes chain.
  *
  * Both halves of it, because either end may be the one that wrote the relation
- * down: this engram saying `- superseded_by [[Beta]]`, or Beta saying
- * `- supersedes [[Alpha]]` from its own side. Only the first is in this
+ * down: this engram saying `- superseded_by [[beta]]`, or Beta saying
+ * `- supersedes [[alpha]]` from its own side. Only the first is in this
  * engram's payload, so the second is read off the inbound edges of the graph,
  * where the direction is inverted: an inbound `supersedes` means the other
  * engram replaced this one, which is this engram's `superseded_by`.
+ *
+ * Both halves are labelled with the successor's title. The engine writes these
+ * bullets by permalink - the stable identity, and the one spelling that cannot
+ * be misread as a cross-domain prefix - so the outbound half takes its label
+ * from the resolution rather than from the bracket text, which is where the
+ * inbound half has always taken it from.
  *
  * An engram whose successor states it from both sides appears once, because
  * both halves key by the same address.
@@ -437,7 +443,12 @@ function chain(
     .map((relation) => {
       const resolution = resolve(innerOf(relation.target));
       return {
-        label: relation.target.target,
+        // The bracket text only until the graph places it: a permalink is a
+        // worse name than a title and a better one than nothing.
+        label:
+          resolution?.kind === "resolved"
+            ? resolution.label
+            : relation.target.target,
         href: resolution?.kind === "resolved" ? resolution.href : null,
         state: referenceState(resolution, relation.resolved),
       };

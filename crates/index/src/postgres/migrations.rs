@@ -66,6 +66,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram attachments",
         sql: SCHEMA_V8,
     },
+    Migration {
+        version: 9,
+        label: "raw reference text",
+        sql: SCHEMA_V9,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -288,6 +293,25 @@ CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
 // its own table so the metadata listing never drags a blob through the row
 // cache. `size` is the byte length and `modified` an RFC 3339 instant, matching
 // the temporal columns' text form.
+// The bracket text a reference was written with, kept beside the split of it.
+//
+// `LinkTarget::parse` is domain-agnostic: it splits `[[Log: Weekly Garden
+// Notes]]` into a domain and a target exactly as it splits `[[ops:Runbook]]`,
+// because nothing inside the brackets says which is which. Only the registry
+// can tell them apart, and telling them apart means looking the whole original
+// string up as a title - which `to_target` and `to_domain` have by then lost
+// the whitespace of. So it is stored.
+//
+// Nullable, and deliberately not backfilled: a row written before this
+// migration has no bracket text to recover, and there is no expression over
+// `to_domain || to_target` that reconstructs it (the colon was trimmed around).
+// Such a row resolves exactly as it does today - the fallback compares against
+// NULL, which is never true - until the next reindex of its engram rewrites it.
+const SCHEMA_V9: &str = r#"
+ALTER TABLE relation ADD COLUMN IF NOT EXISTS to_raw TEXT;
+ALTER TABLE link ADD COLUMN IF NOT EXISTS to_raw TEXT;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

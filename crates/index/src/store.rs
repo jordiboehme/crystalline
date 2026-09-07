@@ -60,6 +60,47 @@ pub struct ObservationRecord {
     pub context: Option<String>,
 }
 
+/// The SQL expression that resolves one reference row to an engram id, or to
+/// NULL when nothing answers to it.
+///
+/// One rule, shared by both backends and by both reference tables, because a
+/// second copy of it would be a second answer to "does this link resolve".
+/// `table` is `relation` or `link`; every construct here is spelled the same in
+/// both dialects, so only the caller's bind placeholder differs.
+///
+/// Three readings, in the order [`crystalline_core::address::resolve`] tries
+/// them: the target as a permalink in the target domain, the target as a title
+/// there, and - only when the row names a domain nobody registered - the whole
+/// bracket text as a permalink and then a title in the row's OWN domain.
+///
+/// That third reading is what makes an engram titled `Log: Weekly Garden Notes`
+/// reachable. The parser splits that into a domain and a target exactly as it
+/// splits `ops:Runbook`, because nothing inside the brackets says which it is,
+/// and only the registry can settle it. It stays a second question rather than
+/// a softer answer: a prefix that does name a domain never reaches it, and a
+/// row written before `to_raw` existed compares against NULL, which is never
+/// true, so it resolves exactly as it did before until its engram is reindexed.
+pub(crate) fn reference_match(table: &str) -> String {
+    let target_domain = format!(
+        "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
+    );
+    let unregistered = format!(
+        "{table}.to_domain IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
+    );
+    format!(
+        "COALESCE(\
+         (SELECT e.id FROM engram e WHERE e.permalink = {table}.to_target \
+          AND e.domain_id = {target_domain} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE lower(e.title) = lower({table}.to_target) \
+          AND e.domain_id = {target_domain} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {unregistered} AND e.permalink = {table}.to_raw \
+          AND e.domain_id = {table}.domain_id LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {unregistered} AND lower(e.title) = lower({table}.to_raw) \
+          AND e.domain_id = {table}.domain_id LIMIT 1))"
+    )
+}
+
 /// One relation bullet, ready to index. `to_id` is filled by
 /// [`Store::resolve_pending_relations`] once the target exists.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +113,15 @@ pub struct RelationRecord {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The bracket text exactly as it was written, colon and all.
+    ///
+    /// Kept beside the split because the split is domain-agnostic and can be
+    /// wrong: `[[Log: Weekly Garden Notes]]` and `[[ops:Runbook]]` are the same
+    /// shape, and only the registry tells them apart. Resolution reads this
+    /// when the prefix names no registered domain, and it is the only thing
+    /// that can - `to_domain` and `to_target` have by then lost the whitespace
+    /// the colon was trimmed around.
+    pub to_raw: String,
 }
 
 /// One prose wikilink, treated as a direct link edge.
@@ -83,6 +133,15 @@ pub struct LinkRecord {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The bracket text exactly as it was written, colon and all.
+    ///
+    /// Kept beside the split because the split is domain-agnostic and can be
+    /// wrong: `[[Log: Weekly Garden Notes]]` and `[[ops:Runbook]]` are the same
+    /// shape, and only the registry tells them apart. Resolution reads this
+    /// when the prefix names no registered domain, and it is the only thing
+    /// that can - `to_domain` and `to_target` have by then lost the whitespace
+    /// the colon was trimmed around.
+    pub to_raw: String,
 }
 
 /// A fully prepared engram row plus its child rows and file stamp. Built from a
@@ -196,6 +255,7 @@ impl EngramRecord {
                 rel_type: r.rel_type.clone(),
                 to_target: r.target.target.clone(),
                 to_domain: r.target.domain.clone(),
+                to_raw: r.target.raw.clone(),
             })
             .collect();
         let links = engram
@@ -205,6 +265,7 @@ impl EngramRecord {
                 line: l.line,
                 to_target: l.target.target.clone(),
                 to_domain: l.target.domain.clone(),
+                to_raw: l.target.raw.clone(),
             })
             .collect();
 

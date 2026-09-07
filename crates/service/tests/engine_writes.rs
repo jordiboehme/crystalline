@@ -532,6 +532,49 @@ async fn split_links_by_permalink_so_a_colon_in_a_title_cannot_break_the_pair() 
     }
 }
 
+/// A re-retirement recognizes the bullet the older engine wrote.
+///
+/// The pair used to be wired by title and is wired by permalink now, so an
+/// archive holds both spellings. Recognizing only the new one would append a
+/// second bullet saying exactly what the first already says, every time
+/// somebody re-ran a retirement.
+#[tokio::test]
+async fn a_re_retirement_recognizes_a_supersede_bullet_written_by_title() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/beta.md"),
+        "---\ntype: engram\ntitle: Beta\npermalink: beta\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Beta\n\nThe sharper rule.\n\n- supersedes [[Alpha]]\n",
+    )
+    .unwrap();
+    // Alpha as an older retirement left it: already retired, already declaring
+    // its successor, in the title spelling.
+    let alpha_path = tmp.path().join("eng/alpha.md");
+    let alpha_before = std::fs::read_to_string(&alpha_path)
+        .unwrap()
+        .replace("status: stable", "status: superseded")
+        + "\n- superseded_by [[Beta]]\n";
+    std::fs::write(&alpha_path, &alpha_before).unwrap();
+    engine.sync(None).await.unwrap();
+
+    engine
+        .retire_engram(&RetireParams {
+            domain: "eng".to_string(),
+            identifier: "alpha".to_string(),
+            status: "superseded".to_string(),
+            successor: Some("beta".to_string()),
+            valid_to: None,
+        })
+        .await
+        .unwrap();
+
+    let alpha = std::fs::read_to_string(&alpha_path).unwrap();
+    assert_eq!(alpha.matches("- superseded_by [[").count(), 1, "{alpha}");
+    assert!(alpha.contains("- superseded_by [[Beta]]"), "{alpha}");
+    let beta = std::fs::read_to_string(tmp.path().join("eng/beta.md")).unwrap();
+    assert_eq!(beta.matches("- supersedes [[").count(), 1, "{beta}");
+    assert!(beta.contains("- supersedes [[Alpha]]"), "{beta}");
+}
+
 #[tokio::test]
 async fn retirement_validates_status_successor_and_date() {
     let (_tmp, engine) = engine_fixture().await;

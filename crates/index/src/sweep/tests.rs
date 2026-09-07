@@ -730,7 +730,9 @@ fn v101_flags_a_live_reference_to_retired_knowledge() {
             .evidence
             .contains("replaced by engineering/fresh-guide")
     );
-    assert_eq!(finding.fix, "repoint at [[fresh guide]]");
+    // By permalink: the suggestion is a link an agent will paste, and a
+    // title carrying a colon would paste a link that does not resolve.
+    assert_eq!(finding.fix, "repoint at [[fresh-guide]]");
 }
 
 #[test]
@@ -831,7 +833,7 @@ fn v103_flags_a_one_sided_reciprocal() {
     assert_eq!(finding.permalink, "raw-transcript");
     assert_eq!(finding.class, Class::Mechanical);
     assert_eq!(finding.priority, 35);
-    assert_eq!(finding.fix, "append `- summarized_by [[release summary]]`");
+    assert_eq!(finding.fix, "append `- summarized_by [[release-summary]]`");
 }
 
 #[test]
@@ -846,7 +848,7 @@ fn v103_flags_a_one_sided_split_pair() {
     let finding = only(&report, "V103");
     assert_eq!(finding.permalink, "mix-b-decision");
     assert_eq!(finding.class, Class::Mechanical);
-    assert_eq!(finding.fix, "append `- split_into [[purge procedure]]`");
+    assert_eq!(finding.fix, "append `- split_into [[purge-procedure]]`");
 }
 
 #[test]
