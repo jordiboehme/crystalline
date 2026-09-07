@@ -787,6 +787,49 @@ pub fn replace_section(
     ))
 }
 
+/// The one-based line range a section occupies, its heading line included and
+/// every deeper subsection with it: `(start, end)` with `end` exclusive.
+///
+/// The read-only counterpart of [`replace_section`], for a caller that has to
+/// take a section out of a document rather than rewrite it in place, and that
+/// is addressing the rest of the document by line as well. Sharing the heading
+/// walker with the section edits is the point: a caller that scanned for
+/// headings itself would disagree with them about a `#` inside a fenced code
+/// block, and about which section a path resolves to.
+///
+/// The range never reaches into the frontmatter, because the walker starts at
+/// the body.
+pub fn section_line_range(source: &str, path: &str) -> Result<(usize, usize), EditError> {
+    let headings = heading_spans(source);
+    let p = resolve_path(&headings, path).ok_or_else(|| EditError::SectionNotFound {
+        path: path.to_string(),
+    })?;
+    let start = headings[p].line_start;
+    let end_idx = section_end_index(&headings, p);
+    let end = headings
+        .get(end_idx)
+        .map(|h| h.line_start)
+        .unwrap_or(source.len());
+    // A boundary always sits at the first byte of a line, so "the number of
+    // lines that end before it, plus one" is that line's number and, read as
+    // an exclusive end, is exactly right. The one exception is a source with
+    // no final newline, whose last byte ends a line rather than starting one.
+    let at_unterminated_end = end == source.len() && !source.ends_with('\n');
+    Ok((
+        line_at(source, start),
+        line_at(source, end) + usize::from(at_unterminated_end),
+    ))
+}
+
+/// The one-based line the byte at `offset` sits on.
+fn line_at(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1
+}
+
 /// Insert content immediately before a section's heading line.
 pub fn insert_before_section(source: &str, path: &str, content: &str) -> Result<String, EditError> {
     let headings = heading_spans(source);

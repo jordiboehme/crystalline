@@ -8,7 +8,9 @@ use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, Servic
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::Scope;
-use crystalline_service::params::{DeleteParams, ReadParams, RetireParams, SaveParams};
+use crystalline_service::params::{
+    DeleteParams, ReadParams, RetireParams, SaveParams, SplitParams,
+};
 use tokio::sync::Mutex;
 
 const ALPHA: &str = "---\ntype: engram\ntitle: Alpha\npermalink: alpha\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-01-01\n---\n\n# Alpha\n\nA rule about alpha.\n";
@@ -796,5 +798,308 @@ async fn text_at_path_reports_what_is_there_and_nothing_when_it_is_gone() {
             .await
             .unwrap()
             .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// split_engram
+// ---------------------------------------------------------------------------
+
+/// A five-observation bundle that mixes lifecycles: two facts about the purge
+/// outlive the mix decision they were written beside. The shape `split_engram`
+/// exists for.
+const BUNDLE: &str = "---\ntype: decision\ntitle: Coolant Bundle\npermalink: coolant-bundle\ntags:\n  - coolant\n  - cooling\nstatus: stable\nrecorded_at: 2026-01-01\nvalid_to: 2026-08-01\n---\n\n# Coolant Bundle\n\n## Observations\n\n- [decision] Run the coolant loop on glycol mix B\n- [fact] The loop needs a 40 minute purge before a mix swap\n- [fact] The purge pump is rated for 12 bar\n- [gotcha] Mix B runs hot above 80 percent load\n- [convention] Log every mix swap in the ship register\n\n## Notes\n\nMix B was chosen when the fleet still ran the old pumps.\n";
+
+/// The bundle on disk in `eng`, synced, with the checksum of what was written.
+async fn bundle_fixture() -> (tempfile::TempDir, Arc<Engine>, String) {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(tmp.path().join("eng/coolant-bundle.md"), BUNDLE).unwrap();
+    engine.sync(None).await.unwrap();
+    let (checksum, _) = checksum_of(&engine, "eng", "coolant-bundle").await;
+    (tmp, engine, checksum)
+}
+
+/// The one-based lines of the observations whose text contains `needle`, read
+/// back exactly the way `read_engram` reports them to a caller.
+async fn observation_lines(engine: &Engine, identifier: &str, needles: &[&str]) -> Vec<usize> {
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: identifier.to_string(),
+                domain: Some("eng".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let observations = read["observations"].as_array().unwrap().clone();
+    needles
+        .iter()
+        .map(|needle| {
+            observations
+                .iter()
+                .find(|o| o["content"].as_str().unwrap_or_default().contains(needle))
+                .unwrap_or_else(|| panic!("no observation mentions {needle}"))["line"]
+                .as_u64()
+                .unwrap() as usize
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn split_moves_the_selected_observations_and_wires_the_pair_both_ways() {
+    let (tmp, engine, checksum) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["40 minute purge", "12 bar"]).await;
+
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: lines.clone(),
+            sections: Vec::new(),
+            expected_checksum: Some(checksum),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["source"]["permalink"], "coolant-bundle");
+    assert_eq!(receipt["new"]["permalink"], "purge-procedure");
+    assert_eq!(receipt["new"]["title"], "Purge Procedure");
+    assert_eq!(receipt["moved_observations"], 2);
+    assert_eq!(receipt["moved_sections"], 0);
+
+    // The new engram, re-read from disk: the moved bullets verbatim, the
+    // source's tags, a stable status, no window it inherited from the bundle.
+    let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md")).unwrap();
+    assert!(new.contains("- [fact] The loop needs a 40 minute purge before a mix swap"));
+    assert!(new.contains("- [fact] The purge pump is rated for 12 bar"));
+    assert!(new.contains("- derived_from [[Coolant Bundle]]"));
+    assert!(new.contains("status: stable"), "{new}");
+    assert!(
+        new.contains("- coolant") && new.contains("- cooling"),
+        "{new}"
+    );
+    assert!(
+        !new.contains("valid_to"),
+        "the moved facts carry no window: {new}"
+    );
+    assert!(
+        !new.contains("glycol mix B"),
+        "only the selection moved: {new}"
+    );
+
+    // The source keeps what was not selected and gains the back-link.
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(!source.contains("40 minute purge"), "{source}");
+    assert!(!source.contains("12 bar"), "{source}");
+    assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
+    assert!(source.contains("- [convention] Log every mix swap in the ship register"));
+    assert!(
+        source.contains("- split_into [[Purge Procedure]]"),
+        "{source}"
+    );
+
+    // Both halves resolve: each engram's relation points at an engram that is
+    // really there, which is what keeps V103 quiet about the pair.
+    for (identifier, rel_type) in [
+        ("coolant-bundle", "split_into"),
+        ("purge-procedure", "derived_from"),
+    ] {
+        let read = engine
+            .read_engram(
+                &ReadParams {
+                    identifier: identifier.to_string(),
+                    domain: Some("eng".to_string()),
+                },
+                &Scope::Unrestricted,
+            )
+            .await
+            .unwrap();
+        let relation = read["relations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rel_type"] == rel_type)
+            .unwrap_or_else(|| panic!("{identifier} declares {rel_type}"));
+        assert_eq!(relation["resolved"], true, "{identifier} {rel_type}");
+    }
+}
+
+#[tokio::test]
+async fn split_refuses_a_stale_checksum_and_writes_nothing() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: Some("deadbeef".to_string()),
+        })
+        .await
+        .expect_err("a stale checksum is refused");
+    assert!(format!("{err}").contains("stale"), "{err}");
+
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap(),
+        BUNDLE,
+        "the source is byte-identical"
+    );
+    assert!(
+        !tmp.path().join("eng/purge-procedure.md").exists(),
+        "nothing was created"
+    );
+}
+
+#[tokio::test]
+async fn split_moves_a_section_by_heading_path() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Mix B Background".to_string(),
+            folder: Some("history".to_string()),
+            observations: Vec::new(),
+            sections: vec!["## Notes".to_string()],
+            expected_checksum: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["moved_sections"], 1);
+    assert_eq!(receipt["new"]["path"], "history/mix-b-background.md");
+
+    let new = std::fs::read_to_string(tmp.path().join("eng/history/mix-b-background.md")).unwrap();
+    assert!(new.contains("## Notes"), "{new}");
+    assert!(new.contains("Mix B was chosen when the fleet still ran the old pumps."));
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(!source.contains("## Notes"), "{source}");
+    assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
+}
+
+#[tokio::test]
+async fn split_refuses_a_selection_that_would_leave_the_source_a_stub() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(
+        &engine,
+        "coolant-bundle",
+        &[
+            "glycol mix B",
+            "40 minute purge",
+            "12 bar",
+            "80 percent load",
+            "ship register",
+        ],
+    )
+    .await;
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Everything".to_string(),
+            folder: None,
+            observations: lines,
+            sections: vec!["## Notes".to_string()],
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("a split that empties the source is refused");
+    let message = format!("{err}");
+    assert!(message.contains("retire"), "the fix is named: {message}");
+    assert!(
+        !tmp.path().join("eng/everything.md").exists(),
+        "nothing was created"
+    );
+}
+
+#[tokio::test]
+async fn split_refuses_an_empty_selection() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Nothing".to_string(),
+            folder: None,
+            observations: Vec::new(),
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("a split with nothing selected is refused");
+    assert!(format!("{err}").contains("observations"), "{err}");
+}
+
+#[tokio::test]
+async fn split_works_on_a_virtual_domain_too() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scratch".to_string(),
+            title: "Scratch Bundle".to_string(),
+            content: "# Scratch Bundle\n\n- [fact] The gate closes at 22:00\n- [fact] The night crew logs the closing\n- [fact] The register lives in the wardroom\n".to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["ops".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "scratch-bundle".to_string(),
+                domain: Some("scratch".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let line = read["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["content"].as_str().unwrap().contains("wardroom"))
+        .unwrap()["line"]
+        .as_u64()
+        .unwrap() as usize;
+
+    let receipt = engine
+        .split_engram(&SplitParams {
+            domain: "scratch".to_string(),
+            identifier: "scratch-bundle".to_string(),
+            title: "Register Location".to_string(),
+            folder: None,
+            observations: vec![line],
+            sections: Vec::new(),
+            expected_checksum: Some(read["checksum"].as_str().unwrap().to_string()),
+        })
+        .await
+        .unwrap();
+    assert_eq!(receipt["moved_observations"], 1);
+
+    let new = engine
+        .engram_text("scratch", "register-location")
+        .await
+        .unwrap();
+    assert!(new.content.contains("The register lives in the wardroom"));
+    assert!(new.content.contains("- derived_from [[Scratch Bundle]]"));
+    let source = engine
+        .engram_text("scratch", "scratch-bundle")
+        .await
+        .unwrap();
+    assert!(!source.content.contains("wardroom"), "{}", source.content);
+    assert!(
+        source
+            .content
+            .contains("- split_into [[Register Location]]")
     );
 }

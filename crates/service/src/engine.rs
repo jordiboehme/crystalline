@@ -14,7 +14,7 @@
 //! reprocesses it (the idempotency guard, see `research/single-instance-ipc.md`).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,11 +37,12 @@ use crystalline_core::{
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
-    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, Family, FileStamp,
-    Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES, RecentFilter, SearchMode,
-    SearchQuery, ShareFacts, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, FactObservation,
+    Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES,
+    RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
+    SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
+    order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank, retired_factor,
+    rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -2093,34 +2094,15 @@ impl Engine {
 
     // --- write ---------------------------------------------------------------
 
-    /// Create or overwrite an engram, then index it. A file domain writes the
-    /// markdown file first (files-are-truth) then reindexes it from disk; a
-    /// virtual domain builds the markdown in memory and indexes it straight into
-    /// the database, touching no filesystem.
-    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
-        self.write_engram_as(p, None).await
-    }
-
-    /// [`Engine::write_engram`] with the writer's identity: `client` is the
-    /// caller's own idea of who is writing (an MCP client's
-    /// `clientname/version` from the initialize handshake, or the CLI's process
-    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
-    /// setting before it lands in the engram's `generated.by`.
-    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        let actor = self.actor(client);
-        let source = self.content_source(&p.domain)?;
-        let engram_type = p
-            .engram_type
-            .clone()
-            .unwrap_or_else(|| "engram".to_string());
-        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
-        let tags = p.tags.clone();
-
-        let folder = p.folder.clone().unwrap_or_default();
-        let title_slug = slugify(&p.title);
+    /// Where an engram titled `title` under `folder` would be written: the
+    /// domain-relative path and the permalink it will answer to.
+    ///
+    /// One function because two verbs create engrams - [`Engine::write_engram`]
+    /// and [`Engine::split_engram`] - and a second copy of these screens is a
+    /// second chance to leave one of them out.
+    fn engram_destination(folder: Option<&str>, title: &str) -> Result<(String, String)> {
+        let folder = folder.map(str::to_string).unwrap_or_default();
+        let title_slug = slugify(title);
         if title_slug.is_empty() {
             return Err(EngineError::Invalid(
                 "title does not slugify to a permalink; provide a title with letters or digits"
@@ -2152,6 +2134,36 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&rel)));
         }
         let permalink = slugify(&rel);
+        Ok((rel, permalink))
+    }
+
+    /// Create or overwrite an engram, then index it. A file domain writes the
+    /// markdown file first (files-are-truth) then reindexes it from disk; a
+    /// virtual domain builds the markdown in memory and indexes it straight into
+    /// the database, touching no filesystem.
+    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
+        self.write_engram_as(p, None).await
+    }
+
+    /// [`Engine::write_engram`] with the writer's identity: `client` is the
+    /// caller's own idea of who is writing (an MCP client's
+    /// `clientname/version` from the initialize handshake, or the CLI's process
+    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
+    /// setting before it lands in the engram's `generated.by`.
+    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let actor = self.actor(client);
+        let source = self.content_source(&p.domain)?;
+        let engram_type = p
+            .engram_type
+            .clone()
+            .unwrap_or_else(|| "engram".to_string());
+        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
+        let tags = p.tags.clone();
+
+        let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title)?;
 
         // The whole existence-check-then-write, for a file domain, under that
         // file's lock: the check and the write it authorizes must be one step,
@@ -3363,6 +3375,198 @@ impl Engine {
             }
         }
         touch_generated(&edited, actor, now_offset())
+    }
+
+    /// Move part of an engram into a new one, in a single guided step: the
+    /// selected observations and sections leave the source, land in a new
+    /// engram carrying the source's tags and a `stable` status, and the two are
+    /// wired together with `derived_from` on the new engram and `split_into` on
+    /// the source.
+    ///
+    /// The verb behind "split before you retire". Validity is set per engram
+    /// rather than per bullet, so an engram that bundles facts with different
+    /// lifecycles has to give up its still-valid facts when the one fact that
+    /// expired retires the file. Doing that by hand is a write, two edits and a
+    /// pair of links, with every step a chance to lose a bullet; this is that
+    /// sequence as one call, and `V010` is the sweep rule that finds the
+    /// engrams needing it.
+    pub async fn split_engram(&self, p: &SplitParams) -> Result<Value> {
+        self.split_engram_as(p, None).await
+    }
+
+    /// [`Engine::split_engram`] with the splitting identity, resolved by
+    /// [`Engine::actor`] and stamped into both engrams' `generated` block.
+    ///
+    /// **Everything that can be refused is refused before anything is
+    /// written**: the source resolves inside the domain the request named (see
+    /// [`Engine::resolve_in`]), its checksum is compared, every selected line is
+    /// checked to be an observation the source really carries, every section
+    /// path is resolved, and the remainder is measured against verify's `Q001`
+    /// minimum so a split can never quietly empty an engram. Only then does the
+    /// new engram get written, and only then the source edited.
+    ///
+    /// **The two writes land together or not at all.** The new engram goes
+    /// first, because the failure that leaves the knowledge in two places is
+    /// survivable and the one that leaves it in none is not. The source edit
+    /// then carries the checksum of the text this call planned against, so a
+    /// concurrent edit refuses it rather than dropping somebody's work; when it
+    /// refuses, the new engram is deleted again and the caller gets the
+    /// conflict with the archive exactly as it was.
+    ///
+    /// **What the new engram inherits, and what it does not.** The moved
+    /// content, the source's tags and the source's `type` carry over, because
+    /// splitting a guide into two guides is what a reader expects. The
+    /// lifecycle does not: the new engram is `stable` with no validity window,
+    /// since the facts being moved out are the ones that still hold. Nothing
+    /// else from the source's frontmatter follows it.
+    pub async fn split_engram_as(&self, p: &SplitParams, client: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let actor = self.actor(client);
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
+        let content = self.load_content(&source, &desc).await?;
+        let checksum = sha256_hex(content.as_bytes());
+        if let Some(expected) = p.expected_checksum.as_deref()
+            && expected != checksum
+        {
+            return Err(EngineError::Conflict(stale_edit_message(
+                expected, &checksum,
+            )));
+        }
+        let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let plan = Self::plan_split(&content, &engram, p, &desc.permalink)?;
+
+        // The new engram, written through the ordinary capture path so the
+        // permalink screens, the collision refusal and the provenance stamp are
+        // the ones every other new engram gets.
+        let body = format!(
+            "# {}\n\n{}\n\n- derived_from [[{}]]",
+            p.title.trim(),
+            plan.moved,
+            desc.title
+        );
+        let created = self
+            .write_engram_as(
+                &WriteParams {
+                    domain: p.domain.clone(),
+                    title: p.title.clone(),
+                    content: body,
+                    folder: p.folder.clone(),
+                    engram_type: Some(engram.frontmatter.engram_type.clone()),
+                    tags: engram.frontmatter.tags.clone(),
+                    status: Some("stable".to_string()),
+                    metadata: None,
+                    overwrite: false,
+                },
+                client,
+            )
+            .await?;
+
+        let remaining = append_body(&plan.remaining, &format!("- split_into [[{}]]", p.title));
+        let edited = self
+            .apply_source_edit(&desc, &source, Some(&checksum), &actor, move |_| {
+                Ok(remaining)
+            })
+            .await;
+        if let Err(e) = edited {
+            // The source is untouched, so the new engram is knowledge the
+            // archive now holds twice. Take it back, and report the conflict
+            // rather than the cleanup: what the caller has to act on is that
+            // the source moved under them.
+            let _ = self
+                .delete_engram(&DeleteParams {
+                    identifier: created["permalink"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    domain: p.domain.clone(),
+                    expected_checksum: None,
+                })
+                .await;
+            return Err(e);
+        }
+
+        Ok(json!({
+            "domain": desc.domain,
+            "source": {
+                "permalink": desc.permalink,
+                "path": desc.path,
+                "title": desc.title,
+            },
+            "new": {
+                "permalink": created["permalink"],
+                "path": created["path"],
+                "title": p.title,
+            },
+            "moved_observations": plan.observations,
+            "moved_sections": plan.sections,
+        }))
+    }
+
+    /// Work out what a split would move and what it would leave, or refuse.
+    /// Pure text over the parsed source, so every refusal happens before the
+    /// first write.
+    fn plan_split(
+        content: &str,
+        engram: &Engram,
+        p: &SplitParams,
+        permalink: &str,
+    ) -> Result<SplitPlan> {
+        let mut moving: BTreeSet<usize> = BTreeSet::new();
+        for line in &p.observations {
+            if !engram.observations.iter().any(|o| o.line == *line) {
+                return Err(EngineError::Invalid(format!(
+                    "line {line} is not an observation bullet on '{permalink}'; \
+                     read_engram reports the line of every observation it carries"
+                )));
+            }
+            moving.insert(*line);
+        }
+        for path in &p.sections {
+            let (start, end) =
+                crystalline_core::emit::section_line_range(content, path).map_err(section_err)?;
+            moving.extend(start..end);
+        }
+        if moving.is_empty() {
+            return Err(EngineError::Invalid(
+                "split_engram needs something to move: pass observations (the line numbers \
+                 read_engram reports) or sections (heading paths such as '## Notes')"
+                    .into(),
+            ));
+        }
+
+        let mut moved: Vec<&str> = Vec::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for (i, line) in content.split('\n').enumerate() {
+            if moving.contains(&(i + 1)) {
+                moved.push(line);
+            } else {
+                kept.push(line);
+            }
+        }
+        let remaining = kept.join("\n");
+        // Measured on the knowledge that would be left, before the
+        // `split_into` line is appended: a bookkeeping relation is not what
+        // makes an engram worth keeping.
+        let left = parse_engram(&remaining)
+            .map(|e| crystalline_index::content_line_count(&e.body))
+            .unwrap_or(0);
+        if left < crystalline_index::MIN_CONTENT_LINES {
+            return Err(EngineError::Invalid(format!(
+                "that selection would leave '{permalink}' with {left} content line(s), under the \
+                 {} verify rule Q001 requires; move less, or retire the whole engram instead of \
+                 splitting it",
+                crystalline_index::MIN_CONTENT_LINES
+            )));
+        }
+
+        Ok(SplitPlan {
+            moved: moved.join("\n").trim_matches('\n').to_string(),
+            remaining,
+            observations: p.observations.len(),
+            sections: p.sections.len(),
+        })
     }
 
     // --- read ----------------------------------------------------------------
@@ -6731,6 +6935,16 @@ impl Engine {
                     .map(str::to_string),
                 asset_refs: crystalline_core::find_asset_refs(&engram.body),
                 acks: ack_entries(fm),
+                // The parser's own bullets, so `V010` compares what an
+                // observation asserts rather than re-deriving it from the body.
+                observations: engram
+                    .observations
+                    .iter()
+                    .map(|o| FactObservation {
+                        line: o.line,
+                        text: o.content.clone(),
+                    })
+                    .collect(),
                 body: engram.body,
             });
         }
@@ -12059,6 +12273,20 @@ fn host_refusal(name: &str, host: &DomainHost) -> String {
         "domain '{name}' is hosted by instance {} (last heartbeat {}); this instance serves it read-from-database only. Pass --take-over to migrate hosting here.",
         host.instance_id, host.heartbeat_at
     )
+}
+
+/// What a split resolved to: the text leaving the source, the text staying and
+/// how much of each kind of thing moved.
+struct SplitPlan {
+    /// The selected lines, in source order, with surrounding blank lines
+    /// trimmed off.
+    moved: String,
+    /// The source with those lines gone, frontmatter and all.
+    remaining: String,
+    /// How many observation bullets the caller selected.
+    observations: usize,
+    /// How many sections the caller selected.
+    sections: usize,
 }
 
 fn section_err(e: crystalline_core::emit::EditError) -> EngineError {

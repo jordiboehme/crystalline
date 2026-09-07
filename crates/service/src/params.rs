@@ -181,6 +181,39 @@ pub struct RetireParams {
     pub valid_to: Option<String>,
 }
 
+/// Parameters for `split_engram`, the atomic move of part of an engram into a
+/// new one.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SplitParams {
+    /// The source engram's domain. The new engram lands in the same domain.
+    pub domain: String,
+    /// The source engram: a bare permalink, title or `crystalline://` URL,
+    /// domain-relative.
+    pub identifier: String,
+    /// The new engram's title. Slugified into its permalink, as write_engram
+    /// slugifies one.
+    pub title: String,
+    /// A domain-relative subfolder for the new engram. Defaults to the domain
+    /// root, whatever folder the source sits in.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// The observation bullets to move, by the one-based line numbers
+    /// read_engram reports. Every line must be an observation bullet on the
+    /// source.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub observations: Vec<usize>,
+    /// The sections to move, by heading path (`## API > ### Auth`), the same
+    /// form edit_engram accepts. A section moves with its heading and every
+    /// deeper subsection under it.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub sections: Vec<String>,
+    /// The checksum from a prior read of the source, guarding the split
+    /// against a change since that read: both writes are refused as a conflict
+    /// if the source changed. Omit for last-write-wins.
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
+}
+
 /// Parameters for `move_engram`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct MoveParams {
