@@ -608,6 +608,9 @@ pub struct Engine {
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    // The one test seam in this file: when armed, the reindex that follows a
+    // source rewrite fails once. See `Engine::fail_next_source_reindex`.
+    fail_next_source_reindex: std::sync::atomic::AtomicBool,
     // The effective `skills.serve` value, snapshotted while this engine is
     // built and never re-read. See `Engine::skills_serve` for why it is frozen
     // and `Engine::with_env_overlay` for why the snapshot is taken twice.
@@ -1049,6 +1052,7 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            fail_next_source_reindex: std::sync::atomic::AtomicBool::new(false),
             skills_serve,
             instance_id: String::new(),
             label: String::new(),
@@ -1070,6 +1074,29 @@ impl Engine {
             list_subscribers: Arc::default(),
             domain_access: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Arm a one-shot failure of the reindex that follows a source rewrite.
+    ///
+    /// A test seam, and the only one in this file. The window it opens - the
+    /// source's bytes are on disk and the index has not caught up - is reachable
+    /// in production from a store fault or an IO fault after an atomic rename,
+    /// and from nothing a test can arrange: the rename either happens or does
+    /// not, and every input-shaped failure of the reindex is refused earlier by
+    /// [`Engine::plan_split`]. It exists because
+    /// [`Engine::split_engram_as`] must never undo its own new engram once that
+    /// window is open, and an invariant nothing exercises is an invariant that
+    /// rots.
+    ///
+    /// Nothing in the daemon, the CLI or the MCP surface calls this, and the
+    /// branch that reads it is one relaxed swap per source edit - the single
+    /// site that reads the flag. It is consumed by the next source edit on any
+    /// domain rather than by the next split, so arm it immediately before the
+    /// call under test.
+    #[doc(hidden)]
+    pub fn fail_next_source_reindex(&self) {
+        self.fail_next_source_reindex
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Install the private-domain resolver. Called once, when the HTTP surface
@@ -3405,21 +3432,29 @@ impl Engine {
     /// minimum so a split can never quietly empty an engram. Only then does the
     /// new engram get written, and only then the source edited.
     ///
-    /// **The new engram goes first, and a failed source edit takes it back
-    /// out.** First because the failure that leaves the knowledge in two places
-    /// is survivable and the one that leaves it in none is not. The source edit
-    /// carries the checksum of the text this call planned against, so a
-    /// concurrent edit refuses it rather than dropping somebody's work; when it
-    /// refuses, the new engram is deleted again and the caller gets the
-    /// conflict with the archive exactly as it was.
+    /// **The new engram goes first, and a failed source edit takes it back out
+    /// only while the source is untouched.** First because the failure that
+    /// leaves the knowledge in two places is survivable and the one that leaves
+    /// it in none is not. The source edit carries the checksum of the text this
+    /// call planned against, so a concurrent edit refuses it rather than
+    /// dropping somebody's work; a refusal before the source's bytes change -
+    /// that conflict, a read that fails, a write the filesystem refuses -
+    /// deletes the new engram again and hands the caller the failure with the
+    /// archive exactly as it was.
     ///
-    /// One residue, stated rather than papered over, the same way
-    /// [`Engine::retire_engram_as`] states its own: the source edit writes the
-    /// file and then reindexes it, so a failure between those two leaves the
-    /// source edited on disk with a `split_into` naming an engram this call has
-    /// just deleted. Nothing here rolls that back. It is a dangling link rather
-    /// than lost knowledge - the bullets are in the source, where they started
-    /// - and the evolve sweep raises it as `V102` on the next run.
+    /// **Once the source has been rewritten, nothing is undone**, and that is
+    /// the invariant rather than an omission: the source no longer holds the
+    /// moved observations, so deleting the engram that does hold them is the
+    /// one outcome this verb must never produce. `apply_source_edit_staged`
+    /// reports which side of the write it failed on
+    /// ([`SourceEditFailure::wrote`]), and on the far side both files are kept
+    /// and the error names them and says the index heals on the next sync. What
+    /// is left then is a correct pair of files with a stale index row for the
+    /// source, which a sync, a watcher tick or `reindex` repairs.
+    ///
+    /// **A moved section takes its relation bullets with it**, since a section
+    /// moves as text. That can leave a relation the source declared one-sided;
+    /// the evolve sweep raises it as `V103` and the fix is one append.
     ///
     /// **What the new engram inherits, and what it does not.** The moved
     /// content, the source's tags and the source's `type` carry over, because
@@ -3445,20 +3480,22 @@ impl Engine {
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let plan = Self::plan_split(&content, &engram, p, &desc.permalink)?;
 
+        // One trimmed title everywhere: the heading, the link the source gets
+        // and the receipt all name the engram the same way.
+        let title = p.title.trim().to_string();
+
         // The new engram, written through the ordinary capture path so the
         // permalink screens, the collision refusal and the provenance stamp are
         // the ones every other new engram gets.
         let body = format!(
-            "# {}\n\n{}\n\n- derived_from [[{}]]",
-            p.title.trim(),
-            plan.moved,
-            desc.title
+            "# {title}\n\n{}\n\n- derived_from [[{}]]",
+            plan.moved, desc.title
         );
         let created = self
             .write_engram_as(
                 &WriteParams {
                     domain: p.domain.clone(),
-                    title: p.title.clone(),
+                    title: title.clone(),
                     content: body,
                     folder: p.folder.clone(),
                     engram_type: Some(engram.frontmatter.engram_type.clone()),
@@ -3470,29 +3507,50 @@ impl Engine {
                 client,
             )
             .await?;
+        // Where the capture path put it, which is also what the rollback below
+        // has to address. Absent means the receipt shape changed under this
+        // code: the rollback is skipped and said out loud rather than run
+        // against an empty identifier, which would delete nothing and report
+        // nothing.
+        let new_permalink = created["permalink"].as_str().map(str::to_string);
+        let new_path = created["path"].as_str().unwrap_or_default().to_string();
 
-        let remaining = append_body(&plan.remaining, &format!("- split_into [[{}]]", p.title));
+        let remaining = append_body(&plan.remaining, &format!("- split_into [[{title}]]"));
         let edited = self
-            .apply_source_edit(&desc, &source, Some(&checksum), &actor, move |_| {
+            .apply_source_edit_staged(&desc, &source, Some(&checksum), &actor, move |_| {
                 Ok(remaining)
             })
             .await;
-        if let Err(e) = edited {
+        if let Err(failure) = edited {
+            if failure.wrote {
+                // The source's bytes are the edited ones, so the moved
+                // observations live in the new engram and nowhere else.
+                // Deleting it here is the one thing that would lose them.
+                return Err(EngineError::Internal(format!(
+                    "the split wrote both engrams but the index update for '{}' failed: {}.                      Both files are on disk ({} and {}) and neither was undone; the index row                      for '{}' is stale until the next sync or reindex picks it up",
+                    desc.permalink, failure.error, desc.path, new_path, desc.permalink
+                )));
+            }
             // The source is untouched, so the new engram is knowledge the
-            // archive now holds twice. Take it back, and report the conflict
-            // rather than the cleanup: what the caller has to act on is that
-            // the source moved under them.
-            let _ = self
-                .delete_engram(&DeleteParams {
-                    identifier: created["permalink"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string(),
-                    domain: p.domain.clone(),
-                    expected_checksum: None,
-                })
-                .await;
-            return Err(e);
+            // archive now holds twice. Take it back, and report the underlying
+            // failure rather than the cleanup: what the caller has to act on is
+            // that the source moved under them.
+            match new_permalink {
+                Some(permalink) => {
+                    let _ = self
+                        .delete_engram(&DeleteParams {
+                            identifier: permalink,
+                            domain: p.domain.clone(),
+                            expected_checksum: None,
+                        })
+                        .await;
+                }
+                None => tracing::warn!(
+                    receipt = %created,
+                    "split rollback skipped: the capture receipt named no permalink"
+                ),
+            }
+            return Err(failure.error);
         }
 
         Ok(json!({
@@ -3505,7 +3563,7 @@ impl Engine {
             "new": {
                 "permalink": created["permalink"],
                 "path": created["path"],
-                "title": p.title,
+                "title": title,
             },
             "moved_observations": plan.observations,
             "moved_sections": plan.sections,
@@ -3522,6 +3580,11 @@ impl Engine {
         permalink: &str,
     ) -> Result<SplitPlan> {
         let mut moving: BTreeSet<usize> = BTreeSet::new();
+        // Both counts answer the same question - how many distinct things
+        // moved - so both are collected as sets: a line named twice moves once,
+        // and two paths that resolve to the same heading move one section.
+        let mut observations: BTreeSet<usize> = BTreeSet::new();
+        let mut sections: BTreeSet<(usize, usize)> = BTreeSet::new();
         for line in &p.observations {
             if !engram.observations.iter().any(|o| o.line == *line) {
                 return Err(EngineError::Invalid(format!(
@@ -3530,11 +3593,13 @@ impl Engine {
                 )));
             }
             moving.insert(*line);
+            observations.insert(*line);
         }
         for path in &p.sections {
             let (start, end) =
                 crystalline_core::emit::section_line_range(content, path).map_err(section_err)?;
             moving.extend(start..end);
+            sections.insert((start, end));
         }
         if moving.is_empty() {
             return Err(EngineError::Invalid(
@@ -3569,16 +3634,11 @@ impl Engine {
             )));
         }
 
-        // The counts report what moved, not what was asked for: a line named
-        // twice moves once, and the receipt says so.
-        let mut lines: Vec<usize> = p.observations.clone();
-        lines.sort_unstable();
-        lines.dedup();
         Ok(SplitPlan {
             moved: moved.join("\n").trim_matches('\n').to_string(),
             remaining,
-            observations: lines.len(),
-            sections: p.sections.len(),
+            observations: observations.len(),
+            sections: sections.len(),
         })
     }
 
@@ -3978,14 +4038,41 @@ impl Engine {
     where
         F: FnOnce(&str) -> Result<String>,
     {
+        self.apply_source_edit_staged(desc, source, expected_checksum, actor, apply)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Engine::apply_source_edit`], reporting whether the source's bytes were
+    /// already replaced when it failed.
+    ///
+    /// One caller needs that, and only one: [`Engine::split_engram_as`] writes a
+    /// second engram before this runs and may only take that engram back while
+    /// the source is provably untouched. No error kind answers the question -
+    /// the reindex that follows the rename reads the file back and raises the
+    /// same `Io` a refused write raises - so the stage is reported by the code
+    /// that knows it rather than guessed from the error afterwards.
+    async fn apply_source_edit_staged<F>(
+        &self,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+        expected_checksum: Option<&str>,
+        actor: &str,
+        apply: F,
+    ) -> std::result::Result<(), SourceEditFailure>
+    where
+        F: FnOnce(&str) -> Result<String>,
+    {
         match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                    path: abs.display().to_string(),
-                    source,
+                let current = std::fs::read_to_string(&abs).map_err(|source| {
+                    SourceEditFailure::before(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    })
                 })?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
@@ -3993,38 +4080,61 @@ impl Engine {
                 if let Some(expected) = expected_checksum {
                     let found = sha256_hex(current.as_bytes());
                     if found != expected {
-                        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+                        return Err(SourceEditFailure::before(EngineError::Conflict(
+                            stale_edit_message(expected, &found),
+                        )));
                     }
                 }
-                let edited = apply(&current)?;
+                let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, now_offset());
-                let edited = Self::enforce_temporal(edited)?;
-                write_file(&abs, &edited)?;
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                // The last step that can fail with the file as it was:
+                // `write_bytes` renames a sibling temp into place, and a rename
+                // either happens or does not, so a refusal here leaves the
+                // source's bytes untouched.
+                write_file(&abs, &edited).map_err(SourceEditFailure::before)?;
+                if self
+                    .fail_next_source_reindex
+                    .swap(false, std::sync::atomic::Ordering::Relaxed)
+                {
+                    return Err(SourceEditFailure::after(EngineError::Internal(
+                        "reindex failed (test seam)".to_string(),
+                    )));
+                }
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
-                    .await?;
+                    .await
+                    .map_err(SourceEditFailure::after)?;
             }
             ContentSource::Virtual => {
                 let current = {
                     let store = self.store.lock().await;
                     store
                         .engram_content(desc.domain_id, &desc.path)
-                        .await?
+                        .await
+                        .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
                         .ok_or_else(|| {
-                            EngineError::NotFound(format!(
+                            SourceEditFailure::before(EngineError::NotFound(format!(
                                 "no content stored for '{}' in domain '{}'",
                                 desc.permalink, desc.domain
-                            ))
+                            )))
                         })?
                 };
                 let expected = expected_checksum
                     .map(str::to_string)
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = apply(&current)?;
+                let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, now_offset());
-                let edited = Self::enforce_temporal(edited)?;
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
                 let store = self.store.lock().await;
+                // Conservative rather than exact, and the one place the two
+                // storage kinds differ here: the compare and swap and the
+                // indexing happen inside one call, so a failure cannot be
+                // placed on either side of it from out here. A virtual source
+                // that refuses is therefore never undone by a caller, which
+                // costs a duplicate engram in the case a file domain would have
+                // cleaned up.
                 self.index_markdown(
                     &*store,
                     desc.domain_id,
@@ -4034,7 +4144,8 @@ impl Engine {
                     Some(&expected),
                     true,
                 )
-                .await?;
+                .await
+                .map_err(SourceEditFailure::after)?;
             }
         }
 
@@ -12288,6 +12399,39 @@ fn host_refusal(name: &str, host: &DomainHost) -> String {
     )
 }
 
+/// A source edit that failed, and whether the source may already carry the new
+/// bytes when it did.
+///
+/// The flag is the whole point of the type. [`Engine::split_engram_as`] writes a
+/// second engram before it edits the source, and it may only take that engram
+/// back while the source is provably as it was; once the source has been
+/// rewritten, deleting the new engram is what would lose the moved
+/// observations, since the source no longer holds them.
+struct SourceEditFailure {
+    /// Whether the source's stored bytes may already be the edited ones.
+    wrote: bool,
+    /// The failure itself, reported to the caller unchanged.
+    error: EngineError,
+}
+
+impl SourceEditFailure {
+    /// A failure with the source still as it was: the read, the checksum
+    /// compare, the edit itself, the temporal enforcement or a refused write.
+    fn before(error: EngineError) -> SourceEditFailure {
+        SourceEditFailure {
+            wrote: false,
+            error,
+        }
+    }
+
+    /// A failure with the source's bytes already replaced, or possibly
+    /// replaced: the reindex that follows a file write, and any failure of the
+    /// virtual store call that both swaps and indexes.
+    fn after(error: EngineError) -> SourceEditFailure {
+        SourceEditFailure { wrote: true, error }
+    }
+}
+
 /// What a split resolved to: the text leaving the source, the text staying and
 /// how much of each kind of thing moved.
 struct SplitPlan {
@@ -12296,9 +12440,14 @@ struct SplitPlan {
     moved: String,
     /// The source with those lines gone, frontmatter and all.
     remaining: String,
-    /// How many distinct observation bullets moved.
+    /// How many distinct observation bullets moved. A bullet that also sits
+    /// inside a moved section is counted here as well, since the caller named
+    /// it both ways.
     observations: usize,
-    /// How many sections the caller selected.
+    /// How many distinct sections moved: line ranges rather than paths, so two
+    /// spellings of one heading count once. A path naming a subsection of
+    /// another moved section is a different range and counts separately, which
+    /// is the honest answer to "how many sections did you name that moved".
     sections: usize,
 }
 

@@ -1175,3 +1175,97 @@ async fn split_counts_a_line_named_twice_once() {
         "the receipt counts what moved"
     );
 }
+
+/// The invariant the rollback must not break: once the source's bytes have been
+/// replaced, the new engram stays, whatever fails next.
+///
+/// The source no longer holds the moved bullets at that point, so deleting the
+/// engram that does hold them is the one outcome the verb must never produce.
+/// The failure is armed through `Engine::fail_next_source_reindex`, the file's
+/// one test seam, because the window it stands in for - a store or IO fault
+/// after an atomic rename - is not reachable from a test any other way.
+#[tokio::test]
+async fn split_keeps_both_files_when_the_reindex_fails_after_the_source_was_written() {
+    let (tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["40 minute purge", "12 bar"]).await;
+    engine.fail_next_source_reindex();
+
+    let err = engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Procedure".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("the reindex failed after the write");
+
+    // The error names both files and says what is stale.
+    let message = format!("{err}");
+    assert!(message.contains("coolant-bundle.md"), "{message}");
+    assert!(message.contains("purge-procedure.md"), "{message}");
+    assert!(message.contains("sync"), "{message}");
+
+    // Both files are on disk, and between them they hold every bullet: the
+    // moved ones in the new engram, the rest in the source.
+    let new = std::fs::read_to_string(tmp.path().join("eng/purge-procedure.md"))
+        .expect("the new engram was NOT taken back out");
+    assert!(new.contains("- [fact] The loop needs a 40 minute purge before a mix swap"));
+    assert!(new.contains("- [fact] The purge pump is rated for 12 bar"));
+    let source = std::fs::read_to_string(tmp.path().join("eng/coolant-bundle.md")).unwrap();
+    assert!(source.contains("- [decision] Run the coolant loop on glycol mix B"));
+    assert!(
+        source.contains("- split_into [[Purge Procedure]]"),
+        "{source}"
+    );
+    assert!(!source.contains("40 minute purge"), "{source}");
+
+    // And the index catches up on the next sync, with nothing lost.
+    engine.sync(None).await.unwrap();
+    let reread = engine.engram_text("eng", "coolant-bundle").await.unwrap();
+    assert_eq!(reread.content, source);
+    assert!(
+        engine.engram_text("eng", "purge-procedure").await.is_ok(),
+        "the new engram is indexed too"
+    );
+}
+
+/// The seam is one-shot, so an ordinary split right after an armed one behaves
+/// exactly as it always does. Without this the seam could latch and silently
+/// change every later write in a process.
+#[tokio::test]
+async fn the_reindex_seam_fires_once() {
+    let (_tmp, engine, _) = bundle_fixture().await;
+    let lines = observation_lines(&engine, "coolant-bundle", &["12 bar"]).await;
+    engine.fail_next_source_reindex();
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Purge Pump Rating".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect_err("armed");
+    engine.sync(None).await.unwrap();
+
+    let lines = observation_lines(&engine, "coolant-bundle", &["80 percent load"]).await;
+    engine
+        .split_engram(&SplitParams {
+            domain: "eng".to_string(),
+            identifier: "coolant-bundle".to_string(),
+            title: "Mix B Heat Margin".to_string(),
+            folder: None,
+            observations: lines,
+            sections: Vec::new(),
+            expected_checksum: None,
+        })
+        .await
+        .expect("the seam is spent");
+}

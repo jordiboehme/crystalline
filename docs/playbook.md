@@ -549,8 +549,11 @@ register rule still hold. Split those out first, then retire the rest.
 *The agent reads the engram to see which line each observation sits on, then
 makes one `split_engram` call: the source, a title for the new engram and the
 lines that move.* Everything the call can refuse it refuses before it writes a
-byte, and if the edit to the old note fails after the new engram has landed, the
-new engram is taken back out again:
+byte, and if the edit to the old note fails before that note has changed, the
+new engram is taken back out again. Once the old note has been rewritten
+nothing is undone: the moved bullets live in the new engram by then, so a
+failure after that point keeps both files and says which one the index has yet
+to catch up with.
 
 ```markdown
 ---
