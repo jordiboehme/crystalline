@@ -1,16 +1,23 @@
 /**
- * The profile screen, which is one card: the GitHub identity this account
- * shares as.
+ * The profile screen, which is two cards: the GitHub identity this account
+ * shares as, and the MCP tokens an agent authenticates the daemon with, acting
+ * as this account.
  *
- * What is pinned here is what somebody about to share has to be able to trust:
+ * The GitHub half pins what somebody about to share has to be able to trust:
  * that both ways in are on offer, that the device flow shows the code and where
  * to type it, that a token typed in is sent once and left nowhere, that the
  * connected card names the account and since when, and that a refusal - a
  * viewer's, or a sign-in somebody else already started - is the server's own
  * sentence rather than a house message pasted over it.
+ *
+ * The agent access half pins the opposite direction: that the card is offered
+ * to a viewer exactly as it is to an editor and never gated by an instance's
+ * read-only setting, that a freshly issued or rotated secret is shown exactly
+ * once and gone from the DOM the moment its dialog is dismissed, and that the
+ * listing never carries the secret at all.
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -72,6 +79,7 @@ function serveAs(
       "/auth/me": () => meResponse({ user: userFixture({ role }), ...me }),
       "/domains": domainsResponse,
       "/me/github-identity": () => identityPayload(),
+      "/me/mcp-tokens": () => [],
       ...routes,
     }),
   );
@@ -341,6 +349,207 @@ describe("the profile screen", () => {
     ).not.toBeInTheDocument();
     expect(
       await screen.findByText(/nothing here can be connected or disconnected/i),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("the agent access card", () => {
+  it("lists the caller's own tokens, never a secret", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 1,
+          label: "laptop",
+          created_at: "2026-08-29T09:12:44Z",
+          last_used: "2026-09-01T10:00:00Z",
+        },
+        {
+          id: 2,
+          label: "ci",
+          created_at: "2026-08-20T00:00:00Z",
+          last_used: null,
+        },
+      ],
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent access" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+    expect(screen.getByText("2026-08-29")).toBeInTheDocument();
+    expect(screen.getByText("ci")).toBeInTheDocument();
+    expect(screen.getByText("Never")).toBeInTheDocument();
+    expect(screen.queryByText(/cmt_/)).not.toBeInTheDocument();
+  });
+
+  it("says so when no token has been issued yet", async () => {
+    serveAs("viewer");
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/no tokens issued yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("is offered to a viewer too, since an agent acts as its user", async () => {
+    serveAs("viewer");
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent access" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Issue token" }),
+    ).toBeInTheDocument();
+  });
+
+  it("issues a token, reveals it exactly once, and never again after it is dismissed", async () => {
+    let tokens: Record<string, unknown>[] = [];
+    serveAs("editor", {
+      "/me/mcp-tokens": (_path, init) => {
+        if (init?.method === "POST") {
+          tokens = [
+            {
+              id: 9,
+              label: "laptop",
+              created_at: "2026-09-07T00:00:00Z",
+              last_used: null,
+            },
+          ];
+          return { id: 9, label: "laptop", token: "cmt_deadbeef" };
+        }
+        return tokens;
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+
+    await waitFor(() => {
+      expect(sentBody("/me/mcp-tokens", "POST")).toEqual({ label: "laptop" });
+    });
+    // The field clears once the server took the label, the same rule the
+    // GitHub token field above follows.
+    await waitFor(() => {
+      expect(field).toHaveValue("");
+    });
+
+    const dialog = await screen.findByRole("dialog", { name: "laptop" });
+    expect(within(dialog).getByText("cmt_deadbeef")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        (_text, node) =>
+          node?.textContent ===
+          "Add this as header Authorization: Bearer cmt_deadbeef to the crystalline entry in your agent's MCP registration.",
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+    // Dismissed, and gone from the DOM for good - the secret is held nowhere
+    // this screen could show it back from.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("cmt_deadbeef")).not.toBeInTheDocument();
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+  });
+
+  it("rotates a token and reveals the fresh secret", async () => {
+    const listing = [
+      {
+        id: 3,
+        label: "laptop",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+      },
+    ];
+    serveAs("editor", {
+      "/me/mcp-tokens": () => listing,
+      "/me/mcp-tokens/3/rotate": () => ({
+        id: 3,
+        label: "laptop",
+        token: "cmt_freshbeef",
+      }),
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Rotate laptop" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", { name: "laptop" });
+    expect(within(dialog).getByText("cmt_freshbeef")).toBeInTheDocument();
+  });
+
+  it("revokes a token behind a two-step confirm", async () => {
+    let listing = [
+      {
+        id: 5,
+        label: "laptop",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+      },
+    ];
+    const revoked = vi.fn(() => {
+      listing = [];
+    });
+    serveAs("editor", {
+      "/me/mcp-tokens": () => listing,
+      "/me/mcp-tokens/5": (_path, init) => {
+        if (init?.method === "DELETE") {
+          revoked();
+        }
+        return undefined;
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke laptop" }),
+    );
+    expect(revoked).not.toHaveBeenCalled();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke laptop" }),
+    );
+    await waitFor(() => {
+      expect(revoked).toHaveBeenCalled();
+    });
+    expect(
+      await screen.findByText(/no tokens issued yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("offers issue, rotate and revoke on a read-only instance too, since a token is account state rather than knowledge", async () => {
+    serveAs(
+      "editor",
+      {
+        "/me/mcp-tokens": () => [
+          {
+            id: 1,
+            label: "laptop",
+            created_at: "2026-08-01T00:00:00Z",
+            last_used: null,
+          },
+        ],
+      },
+      { read_only: true },
+    );
+    renderApp("/profile");
+
+    // The read-only setting protects the knowledge base; it says nothing
+    // about a token, which is unrelated to it - every control here is drawn.
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+    expect(screen.getByLabelText("Label")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Issue token" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Rotate laptop" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Revoke laptop" }),
     ).toBeInTheDocument();
   });
 });

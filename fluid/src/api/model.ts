@@ -88,3 +88,19 @@ export type ValidateFinding = components["schemas"]["ValidateFinding"];
 
 /** What `POST /validate` answers with. */
 export type ValidateResponse = components["schemas"]["ValidateResponse"];
+
+/**
+ * One row of the caller's own MCP token list: label, when it was issued, when
+ * it last resolved a request. Never the token itself - only its hash is
+ * stored, so there is nothing to show back after issuance.
+ */
+export type McpTokenInfo = components["schemas"]["McpTokenInfo"];
+
+/** What `POST /me/mcp-tokens` takes. */
+export type IssueMcpTokenBody = components["schemas"]["IssueBody"];
+
+/**
+ * What issuing or rotating an MCP token answers with: the secret, readable
+ * here and nowhere else, ever.
+ */
+export type IssuedMcpToken = components["schemas"]["IssuedTokenResponse"];
