@@ -3359,7 +3359,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 21] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 22] = [
     (
         "write_engram",
         "Capture engram",
