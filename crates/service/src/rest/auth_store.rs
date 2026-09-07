@@ -276,6 +276,135 @@ pub struct McpTokenInfo {
     pub last_used: Option<String>,
 }
 
+/// What a member may do on one private domain. Ordered least to most
+/// privileged, exactly as [`Role`] is, and deliberately a separate ladder: an
+/// account's instance role says what it may do on the installation, this says
+/// what it may do on one domain somebody invited it to.
+///
+/// `Manager` is the level that may invite and change other members' levels. It
+/// may not flip the domain back to shared, and it may not hand the domain to
+/// someone else: those two stay with the owner (and with an admin), which is
+/// what keeps "who can see this at all" a decision the owner made.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberLevel {
+    /// Read only: this domain is visible and searchable, nothing more.
+    Viewer,
+    /// Everything a viewer may do, plus writing and editing its engrams.
+    Editor,
+    /// Everything an editor may do, plus managing this domain's membership.
+    Manager,
+}
+
+impl MemberLevel {
+    /// The wire and database spelling, which is also what [`serde`] emits.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberLevel::Viewer => "viewer",
+            MemberLevel::Editor => "editor",
+            MemberLevel::Manager => "manager",
+        }
+    }
+}
+
+impl std::fmt::Display for MemberLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MemberLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<MemberLevel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "viewer" => Ok(MemberLevel::Viewer),
+            "editor" => Ok(MemberLevel::Editor),
+            "manager" => Ok(MemberLevel::Manager),
+            other => Err(anyhow!(
+                "unknown membership level '{other}': expected viewer, editor or manager"
+            )),
+        }
+    }
+}
+
+/// Read a membership level back out of a database row. Same contract as
+/// [`role_from_db`]: an unrecognized value can only come from a hand-edited or
+/// corrupted file, so it resolves to the least privileged level rather than
+/// failing the read. An unreadable row must never fail open.
+fn member_level_from_db(s: &str) -> MemberLevel {
+    s.parse().unwrap_or(MemberLevel::Viewer)
+}
+
+/// The one value the `domain_acl.visibility` column is ever written with.
+///
+/// The column is an enum of one on purpose: a later release can add a second
+/// visibility without a migration. Until one exists, *any* row in `domain_acl`
+/// means the domain is private and an absent row means it is shared, so this
+/// build never has to guess what an unknown value would have meant - it treats
+/// every row as the strictest state it knows, which is the only safe direction
+/// for an authorization record.
+const VISIBILITY_PRIVATE: &str = "private";
+
+/// The one `domain_member.principal_kind` this release writes or reads.
+///
+/// Decision 4 of the identity plan keeps the column (and its place in the
+/// primary key) so a group principal can be added later without schema
+/// surgery. Every statement here filters on it, so the day a `group` row
+/// exists it is invisible to the user-principal paths rather than silently
+/// resolving as a user of the same name.
+const PRINCIPAL_USER: &str = "user";
+
+/// The visibility record of one private domain. A row exists only for a domain
+/// somebody made private; an absent row is the default, shared visibility,
+/// which is why turning privacy off deletes the row rather than rewriting it.
+///
+/// There is no `visibility` field: see [`VISIBILITY_PRIVATE`] for why the
+/// column exists anyway.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DomainAcl {
+    /// The domain name, stored exactly as the caller registered it (trimmed,
+    /// never case folded: the engine keys its domain map on the literal name,
+    /// so folding here would conflate two distinct registrations).
+    pub domain: String,
+    /// The account that owns this domain: the login name, folded by
+    /// [`normalize_name`] like every other account reference.
+    pub owner: String,
+}
+
+/// One membership row: who was invited to a private domain, at what level, by
+/// whom and when.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DomainMember {
+    /// The member's login name, folded by [`normalize_name`].
+    pub principal: String,
+    /// What this member may do here.
+    pub level: MemberLevel,
+    /// Who added or last changed this row. An audit field, stored as given:
+    /// it is usually a login name but may name a non-account actor, the same
+    /// latitude the identity-link plan gives `linked_by`.
+    pub added_by: String,
+    /// RFC 3339, when this row was last written.
+    pub added_at: String,
+}
+
+/// Fold a supplied domain name to the form this store keys on: trimmed, and
+/// otherwise left exactly as given.
+///
+/// Deliberately *not* lowercased, which is where this parts company with
+/// [`normalize_name`]. A domain name is a key in the engine's own domain map
+/// (`Engine::domain_entry` does an exact `HashMap` lookup), so `Lab` and `lab`
+/// are two different registrations there; folding them together here would let
+/// a privacy record written for one hide the other, or - worse - let a lookup
+/// for one miss the record protecting it.
+fn normalize_domain(domain: &str) -> Result<String> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        bail!("a domain name cannot be empty");
+    }
+    Ok(trimmed.to_string())
+}
+
 /// The users and sessions database. Open one per process that needs it: the
 /// daemon holds one for the lifetime of `serve`, the `crystalline users` CLI
 /// opens one for the length of a single command.
@@ -344,6 +473,23 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
     last_used TEXT
 );
 CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (user);
+CREATE TABLE IF NOT EXISTS domain_acl (
+    domain TEXT PRIMARY KEY,
+    visibility TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS domain_member (
+    domain TEXT NOT NULL,
+    principal_kind TEXT NOT NULL DEFAULT 'user',
+    principal TEXT NOT NULL,
+    level TEXT NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (domain, principal_kind, principal)
+);
+CREATE INDEX IF NOT EXISTS domain_member_principal
+    ON domain_member (principal_kind, principal);
 ";
 
 /// Prefix every MCP token is minted with, so a token is recognizable at a
@@ -861,10 +1007,11 @@ impl AuthStore {
         self.finish(result).await
     }
 
-    /// Delete an account and every session it holds. Errors if there is no
+    /// Delete an account and everything keyed on its name: its sessions, its
+    /// MCP tokens and its private-domain memberships. Errors if there is no
     /// such account.
     ///
-    /// The two deletes are one `BEGIN IMMEDIATE` transaction, sessions first.
+    /// The deletes are one `BEGIN IMMEDIATE` transaction, sessions first.
     /// Both details are load-bearing, because a session row that outlives its
     /// account is not merely garbage: `session_user` resolves a token by
     /// joining `sessions` to `users`, so once a new account claims the freed
@@ -893,6 +1040,7 @@ impl AuthStore {
         let result = async {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
+            self.delete_memberships_of(&name).await?;
             let changed = self
                 .conn
                 .execute(
@@ -920,9 +1068,9 @@ impl AuthStore {
     }
 
     /// [`AuthStore::remove_user`] without the last-admin guard, for
-    /// `users remove --force`. Sessions still go first, in the same
-    /// `BEGIN IMMEDIATE` transaction, for the resurrection reasons the guarded
-    /// remove documents.
+    /// `users remove --force`. Sessions, tokens and memberships still go
+    /// first, in the same `BEGIN IMMEDIATE` transaction, for the resurrection
+    /// reasons the guarded remove documents.
     pub async fn remove_user_force(&self, name: &str) -> Result<()> {
         let name = normalize_name(name)?;
         let key = vec![Value::Text(name.clone())];
@@ -933,6 +1081,7 @@ impl AuthStore {
         let result = async {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
+            self.delete_memberships_of(&name).await?;
             let changed = self
                 .conn
                 .execute("DELETE FROM users WHERE name = ?1", key)
@@ -1616,6 +1765,420 @@ impl AuthStore {
         // see `issue_mcp_token`'s matching comment.
         let id = self.conn.last_insert_rowid();
         Ok(IssuedMcpToken { id, token, label })
+    }
+
+    /// The visibility record of one domain: `Some` when it is private, `None`
+    /// when it is shared, which is every domain nobody ever made private.
+    ///
+    /// The lookup is exact on the trimmed name ([`normalize_domain`]), so it
+    /// answers for the same string the engine keys its domain map on.
+    pub async fn domain_visibility(&self, domain: &str) -> Result<Option<DomainAcl>> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        self.acl_of(&domain).await
+    }
+
+    /// [`AuthStore::domain_visibility`] without the lock or the folding, for
+    /// the methods that already hold both.
+    async fn acl_of(&self, domain: &str) -> Result<Option<DomainAcl>> {
+        let row = self
+            .query_first(
+                "SELECT domain, owner FROM domain_acl WHERE domain = ?1",
+                vec![Value::Text(domain.to_string())],
+            )
+            .await
+            .with_context(|| format!("reading the visibility of domain '{domain}'"))?;
+        Ok(row.map(|row| DomainAcl {
+            domain: cell_text(&row, 0).unwrap_or_default(),
+            owner: cell_text(&row, 1).unwrap_or_default(),
+        }))
+    }
+
+    /// Make `domain` private, owned by `owner`, or make it shared again.
+    ///
+    /// `private = true` writes (or replaces) the acl row and leaves any
+    /// existing membership alone, so changing the owner of an already-private
+    /// domain does not empty it. `private = false` deletes the acl row *and*
+    /// every membership row for the domain: membership only means anything
+    /// while a domain is private, and leaving the rows behind would silently
+    /// restore them if the domain were ever made private again by somebody
+    /// else.
+    ///
+    /// `owner` must name an existing, enabled account. An acl row pointing at
+    /// nobody would be a domain only an admin could ever reach, with no way to
+    /// invite anyone into it, which is a state no caller can have meant.
+    ///
+    /// Both halves run in one `BEGIN IMMEDIATE` transaction, for the reason
+    /// [`AuthStore::issue_mcp_token`] documents: the owner check and the write
+    /// must see the same users table, and the two deletes must not be
+    /// separable by another writer.
+    ///
+    /// Turning privacy off on a domain that was never private is a no-op
+    /// rather than an error - the caller asked for a state that already holds.
+    pub async fn set_domain_visibility(
+        &self,
+        domain: &str,
+        private: bool,
+        owner: &str,
+    ) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let owner = normalize_name(owner)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("setting the visibility of domain '{domain}'"))?;
+        let result = async {
+            if !private {
+                self.delete_members_of_domain(&domain).await?;
+                self.conn
+                    .execute(
+                        "DELETE FROM domain_acl WHERE domain = ?1",
+                        vec![Value::Text(domain.clone())],
+                    )
+                    .await
+                    .with_context(|| format!("making domain '{domain}' shared"))?;
+                return Ok(());
+            }
+            self.require_live_user(&owner).await?;
+            // Delete then insert rather than an upsert clause: two plain
+            // statements inside the transaction that already serializes them,
+            // with no dependence on which conflict syntax the embedded
+            // database supports.
+            self.conn
+                .execute(
+                    "DELETE FROM domain_acl WHERE domain = ?1",
+                    vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("making domain '{domain}' private"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO domain_acl (domain, visibility, owner, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(VISIBILITY_PRIVATE.to_string()),
+                        Value::Text(owner.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("making domain '{domain}' private"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Hand a private domain to a different owner.
+    ///
+    /// The new owner must be an existing, enabled account, and the domain must
+    /// already be private: there is no owner to transfer on a shared domain,
+    /// and inventing one here would make a domain private as a side effect of
+    /// a transfer.
+    ///
+    /// A membership row for the new owner is dropped in the same transaction.
+    /// The owner already holds every level (see [`DomainRight`] in
+    /// `crate::scope`), so leaving one behind would be a row that says less
+    /// than the truth and would come back to life the moment the domain is
+    /// transferred away again.
+    ///
+    /// [`DomainRight`]: crate::scope::DomainRight
+    pub async fn transfer_domain(&self, domain: &str, new_owner: &str) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let new_owner = normalize_name(new_owner)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("transferring domain '{domain}'"))?;
+        let result = async {
+            if self.acl_of(&domain).await?.is_none() {
+                bail!("domain '{domain}' is not private, so it has no owner to transfer");
+            }
+            self.require_live_user(&new_owner).await?;
+            self.conn
+                .execute(
+                    "UPDATE domain_acl SET owner = ?2, updated_at = ?3 WHERE domain = ?1",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(new_owner.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("transferring domain '{domain}'"))?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(new_owner.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("transferring domain '{domain}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Everyone invited to `domain`, by name. The owner is deliberately absent:
+    /// it is a property of the domain, not a membership row, and it is read
+    /// from [`AuthStore::domain_visibility`].
+    pub async fn domain_members(&self, domain: &str) -> Result<Vec<DomainMember>> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT principal, level, added_by, added_at FROM domain_member
+                 WHERE domain = ?1 AND principal_kind = ?2 ORDER BY principal",
+                vec![
+                    Value::Text(domain.clone()),
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing the members of domain '{domain}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing the members of domain '{domain}'"))?
+        {
+            out.push(DomainMember {
+                principal: cell_text(&row, 0).unwrap_or_default(),
+                level: member_level_from_db(&cell_text(&row, 1).unwrap_or_default()),
+                added_by: cell_text(&row, 2).unwrap_or_default(),
+                added_at: cell_text(&row, 3).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Invite `principal` to `domain` at `level`, or change the level it is
+    /// already there at. `added_by` is recorded as given: it is an audit field,
+    /// usually the acting account's name.
+    ///
+    /// Three things are refused, all inside the one transaction that also does
+    /// the write so none of them can be raced past:
+    ///
+    /// * a domain that is not private, because a membership row there would
+    ///   grant nothing and mean nothing (see `crate::scope`, where every
+    ///   caller's right on a shared domain comes from its instance role);
+    /// * a principal that is not an existing, enabled account, so a typo is
+    ///   reported instead of leaving a row waiting for someone to claim that
+    ///   name later;
+    /// * the domain's own owner, which is the one row that could only ever
+    ///   *reduce* what its holder may do.
+    pub async fn upsert_domain_member(
+        &self,
+        domain: &str,
+        principal: &str,
+        level: MemberLevel,
+        added_by: &str,
+    ) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let principal = normalize_name(principal)?;
+        let added_by = added_by.trim().to_string();
+        let now = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
+        let result = async {
+            let Some(acl) = self.acl_of(&domain).await? else {
+                bail!(
+                    "domain '{domain}' is not private, so it has no membership:                      make it private first"
+                );
+            };
+            if acl.owner == principal {
+                bail!(
+                    "'{principal}' owns domain '{domain}':                      the owner already holds every level"
+                );
+            }
+            self.require_live_user(&principal).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(principal.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO domain_member
+                         (domain, principal_kind, principal, level, added_by, added_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(principal.clone()),
+                        Value::Text(level.as_str().to_string()),
+                        Value::Text(added_by.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Remove one membership. Returns whether a row was deleted, so a caller
+    /// can tell "removed" from "was never a member" without a second read.
+    pub async fn remove_domain_member(&self, domain: &str, principal: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let principal = normalize_name(principal)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM domain_member
+                 WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                vec![
+                    Value::Text(domain.clone()),
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(principal.clone()),
+                ],
+            )
+            .await
+            .with_context(|| format!("removing '{principal}' from domain '{domain}'"))?;
+        Ok(changed > 0)
+    }
+
+    /// Every private domain, by name. This is the whole input to the
+    /// visibility filter: a domain absent from this list is visible to
+    /// everyone who may reach the instance at all.
+    pub async fn private_domains(&self) -> Result<Vec<DomainAcl>> {
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query("SELECT domain, owner FROM domain_acl ORDER BY domain", ())
+            .await
+            .context("listing the private domains")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.context("listing the private domains")? {
+            out.push(DomainAcl {
+                domain: cell_text(&row, 0).unwrap_or_default(),
+                owner: cell_text(&row, 1).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every private domain `user` is a member of, with the level. Owned
+    /// domains are not in here (an owner holds no membership row); the caller
+    /// reads ownership from the acl rows it already has.
+    pub async fn memberships_of(&self, user: &str) -> Result<Vec<(String, MemberLevel)>> {
+        let user = normalize_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT domain, level FROM domain_member
+                 WHERE principal_kind = ?1 AND principal = ?2 ORDER BY domain",
+                vec![
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(user.clone()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing the memberships of '{user}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing the memberships of '{user}'"))?
+        {
+            let Some(domain) = cell_text(&row, 0) else {
+                continue;
+            };
+            out.push((
+                domain,
+                member_level_from_db(&cell_text(&row, 1).unwrap_or_default()),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Fail unless `name` is an existing account that is not disabled. Called
+    /// inside a transaction, so what it checked is what the write beside it
+    /// sees.
+    ///
+    /// A disabled account is refused rather than accepted: it cannot sign in,
+    /// so granting it access would be a row nobody can use today and a
+    /// surprise the day the account is re-enabled.
+    async fn require_live_user(&self, name: &str) -> Result<()> {
+        let row = self
+            .query_first(
+                "SELECT disabled FROM users WHERE name = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?;
+        match row {
+            None => bail!("no such user: '{name}'"),
+            Some(row) if matches!(row.get_value(0), Ok(Value::Integer(i)) if i != 0) => {
+                bail!("user '{name}' is disabled: enable the account first")
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Drop every membership row of one domain. Callers hold the lock and are
+    /// inside a transaction.
+    async fn delete_members_of_domain(&self, domain: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_member WHERE domain = ?1",
+                vec![Value::Text(domain.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the members of domain '{domain}'"))?;
+        Ok(())
+    }
+
+    /// Drop every membership row `name` holds, wherever it holds one.
+    ///
+    /// Called from both removal paths for the reason
+    /// `a_readded_name_does_not_inherit_the_old_holders_session` pins for
+    /// sessions: `domain_member` carries no foreign key, so a row left behind
+    /// would be inherited by the next account to claim the same login name -
+    /// here that would hand a stranger read access to a private domain. The
+    /// belt to [`AuthStore::mcp_token_user`]'s suspenders, one table over.
+    ///
+    /// Deliberately not called by [`AuthStore::set_disabled`]: disabling is
+    /// reversible and `crate::scope` already refuses a disabled account at
+    /// resolve time, so re-enabling must hand the memberships back rather than
+    /// force every invitation to be issued again.
+    ///
+    /// An acl row this account *owns* is deliberately left alone: picking a
+    /// successor owner is a decision this store cannot make, and the domain
+    /// staying reachable by an admin (who may transfer it) is the safe state.
+    async fn delete_memberships_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_member WHERE principal_kind = ?1 AND principal = ?2",
+                vec![
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(name.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("removing the memberships of user '{name}'"))?;
+        Ok(())
     }
 
     /// Run a single-column update against one account, failing when the account
@@ -3568,5 +4131,346 @@ mod tests {
             text.contains("laptop") && text.contains(&issued.id.to_string()),
             "while the id and label still print: {text}"
         );
+    }
+
+    /// The membership cast every test below shares: two accounts that own or
+    /// join things and one that never does.
+    async fn members_cast(store: &AuthStore) {
+        for (name, role) in [
+            ("owner", Role::Editor),
+            ("mem", Role::Viewer),
+            ("out", Role::Editor),
+        ] {
+            store
+                .add_user(name, name, None, role, "pw12345678")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_domain_is_shared_until_somebody_makes_it_private() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        assert!(store.domain_visibility("lab").await.unwrap().is_none());
+        assert!(store.private_domains().await.unwrap().is_empty());
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let acl = store.domain_visibility("lab").await.unwrap().unwrap();
+        assert_eq!(acl.domain, "lab");
+        assert_eq!(acl.owner, "owner");
+        assert_eq!(
+            store.private_domains().await.unwrap(),
+            vec![DomainAcl {
+                domain: "lab".into(),
+                owner: "owner".into()
+            }]
+        );
+        // The name is trimmed but never folded: the engine keys its domain map
+        // on the literal name.
+        assert!(store.domain_visibility("  lab  ").await.unwrap().is_some());
+        assert!(store.domain_visibility("Lab").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_domain_acl_needs_a_live_owner() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        let err = store
+            .set_domain_visibility("lab", true, "ghost")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such user"), "{err}");
+        store.set_disabled("mem", true).await.unwrap();
+        let err = store
+            .set_domain_visibility("lab", true, "mem")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("disabled"), "{err}");
+        assert!(
+            store.domain_visibility("lab").await.unwrap().is_none(),
+            "a refused call writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn making_a_domain_shared_again_takes_its_members_with_it() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        assert_eq!(store.domain_members("lab").await.unwrap().len(), 1);
+        store
+            .set_domain_visibility("lab", false, "owner")
+            .await
+            .unwrap();
+        assert!(store.domain_visibility("lab").await.unwrap().is_none());
+        assert!(
+            store.domain_members("lab").await.unwrap().is_empty(),
+            "the members go with the acl, so making it private again does not \
+             restore somebody else's invitations"
+        );
+        assert!(store.memberships_of("mem").await.unwrap().is_empty());
+        // Asking for a state that already holds is not an error.
+        store
+            .set_domain_visibility("lab", false, "owner")
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn changing_the_owner_of_a_private_domain_keeps_its_members() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap();
+        store
+            .set_domain_visibility("lab", true, "out")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "out"
+        );
+        assert_eq!(store.domain_members("lab").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transfer_domain_swaps_the_owner_and_drops_its_member_row() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "out", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.transfer_domain("lab", "mem").await.unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "mem"
+        );
+        let members = store.domain_members("lab").await.unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| m.principal.as_str())
+                .collect::<Vec<_>>(),
+            vec!["out"],
+            "the new owner's membership row is gone: it could only say less"
+        );
+        assert!(store.memberships_of("mem").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_domain_refuses_a_shared_domain_and_a_dead_owner() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        let err = store
+            .transfer_domain("lab", "mem")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not private"), "{err}");
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let err = store
+            .transfer_domain("lab", "ghost")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such user"), "{err}");
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "owner",
+            "a refused transfer leaves the owner alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_is_upserted_and_removed_by_name() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "MEM", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+            .await
+            .unwrap();
+        let members = store.domain_members("lab").await.unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "an upsert replaces rather than duplicates"
+        );
+        assert_eq!(members[0].principal, "mem", "the name is folded");
+        assert_eq!(members[0].level, MemberLevel::Manager);
+        assert_eq!(members[0].added_by, "owner");
+        assert!(!members[0].added_at.is_empty());
+        assert_eq!(
+            store.memberships_of("Mem").await.unwrap(),
+            vec![("lab".to_string(), MemberLevel::Manager)]
+        );
+        assert!(store.remove_domain_member("lab", "mem").await.unwrap());
+        assert!(
+            !store.remove_domain_member("lab", "mem").await.unwrap(),
+            "removing what is not there reports itself rather than erroring"
+        );
+        assert!(store.domain_members("lab").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn membership_refuses_a_shared_domain_a_stranger_and_the_owner() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        let err = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not private"), "{err}");
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let err = store
+            .upsert_domain_member("lab", "ghost", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such user"), "{err}");
+        let err = store
+            .upsert_domain_member("lab", "owner", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already holds every level"), "{err}");
+        store.set_disabled("mem", true).await.unwrap();
+        let err = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("disabled"), "{err}");
+        assert!(store.domain_members("lab").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_takes_its_memberships_with_it() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .add_user("boss", "boss", None, Role::Admin, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "out", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.remove_user("mem").await.unwrap();
+        store.remove_user_force("out").await.unwrap();
+        assert!(
+            store.domain_members("lab").await.unwrap().is_empty(),
+            "a re-added name must not inherit the old holder's access"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_membership_tables_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        {
+            let store = AuthStore::open(&path).await.unwrap();
+            members_cast(&store).await;
+            store
+                .set_domain_visibility("lab", true, "owner")
+                .await
+                .unwrap();
+            store
+                .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+                .await
+                .unwrap();
+        }
+        // The schema is idempotent DDL, so opening the same file again applies
+        // it a second time and must change nothing.
+        let store = AuthStore::open(&path).await.unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "owner"
+        );
+        assert_eq!(
+            store.memberships_of("mem").await.unwrap(),
+            vec![("lab".to_string(), MemberLevel::Manager)]
+        );
+    }
+
+    #[test]
+    fn member_levels_round_trip_through_text_and_json() {
+        for level in [
+            MemberLevel::Viewer,
+            MemberLevel::Editor,
+            MemberLevel::Manager,
+        ] {
+            assert_eq!(level.to_string().parse::<MemberLevel>().unwrap(), level);
+            assert_eq!(
+                serde_json::to_string(&level).unwrap(),
+                format!("\"{}\"", level.as_str())
+            );
+        }
+        assert_eq!(
+            " Manager ".parse::<MemberLevel>().unwrap(),
+            MemberLevel::Manager
+        );
+        assert!("owner".parse::<MemberLevel>().is_err());
+        assert_eq!(
+            member_level_from_db("nonsense"),
+            MemberLevel::Viewer,
+            "an unreadable row never fails open"
+        );
+    }
+
+    #[test]
+    fn a_domain_name_is_trimmed_and_never_empty() {
+        assert_eq!(normalize_domain("  lab ").unwrap(), "lab");
+        assert_eq!(normalize_domain("My Domain").unwrap(), "My Domain");
+        assert!(normalize_domain("   ").is_err());
     }
 }

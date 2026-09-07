@@ -1255,6 +1255,9 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// route; `None` closes the token path, which is what a loopback bind wants.
 /// `mcp_auth` is the store the identity gate resolves agent tokens through,
 /// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
+///
+/// Also where the engine is handed its private-domain resolver, since this is
+/// the one place an accounts store and the engine meet on every HTTP path.
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -1266,6 +1269,15 @@ fn http_base(
 ) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+
+    // Every HTTP caller is answered through a resolved scope, so the engine
+    // gets the resolver the moment the store behind it exists. Installed here,
+    // in the one function both router builders funnel through, rather than at
+    // either call site: a router built without it would serve private domains
+    // to anybody who could reach the port. It is a no-op on a second call, so
+    // an integration test that builds two routers over one engine keeps the
+    // first store.
+    engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
 
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be

@@ -25,6 +25,7 @@ pub mod overlay;
 pub mod params;
 mod poller;
 pub mod rest;
+pub mod scope;
 pub mod settings;
 pub mod stub;
 pub mod subscribers;
@@ -59,4 +60,5 @@ pub use mcp_gate::{
 };
 pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
+pub use scope::{DomainAccess, DomainRight, Scope};
 pub use stub::{DegradedServer, StubStatus};

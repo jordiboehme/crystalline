@@ -716,6 +716,20 @@ pub struct Engine {
     // request and the engine is the only thing the subscriber and the flipper
     // share; see `crate::subscribers`.
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
+    // The private-domain resolver every scoped read is filtered through,
+    // installed once when the HTTP surface starts (`daemon::http_base`, the
+    // one funnel both router builders reach, right after the `AuthStore` it
+    // wraps exists).
+    //
+    // A `OnceLock` rather than a field on the constructor because the engine
+    // is built long before - and often without - an accounts database: a
+    // one-shot CLI command, the embedded stdio MCP stack and every test engine
+    // never install one, and `Engine::hidden_domains` answers `None` for them,
+    // which is the same answer the `Scope::Unrestricted` those surfaces pass
+    // would have produced anyway. Set once and never replaced, so a second
+    // router built over one engine keeps the first store rather than silently
+    // swapping the authority mid-flight.
+    domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
 }
 
 /// One identity's cached GitHub credential for one host: the resolved store
@@ -1015,7 +1029,42 @@ impl Engine {
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
+            domain_access: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the private-domain resolver. Called once, when the HTTP surface
+    /// starts and the accounts store it reads exists.
+    ///
+    /// A second call is ignored rather than refused: the surfaces that build a
+    /// router are the only callers, and an engine that already knows how to
+    /// resolve a scope must not have that authority replaced by a later,
+    /// possibly different, store.
+    pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
+        let _ = self.domain_access.set(access);
+    }
+
+    /// The private domains `scope` may not see, or `None` for no filtering at
+    /// all.
+    ///
+    /// `None` in two cases, which are the same case in practice: no resolver is
+    /// installed (a one-shot CLI command, the embedded stdio stack, a test
+    /// engine - all of which are the machine owner), or the scope is
+    /// [`Scope::Unrestricted`]. Everything else gets a set to subtract, empty
+    /// on an installation where nobody has made a domain private.
+    ///
+    /// [`Scope::Unrestricted`]: crate::scope::Scope::Unrestricted
+    pub async fn hidden_domains(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<HashSet<String>>> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        access
+            .hidden_domains(scope)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
     }
 
     /// Turn on shared-database collaboration for this engine by giving it a
