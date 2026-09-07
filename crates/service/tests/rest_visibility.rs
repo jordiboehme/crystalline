@@ -125,7 +125,14 @@ impl RestCtx {
     /// membership), `mgr` (instance editor, manager membership) and `boss`
     /// (instance admin).
     async fn two_domains() -> RestCtx {
-        RestCtx::build(false).await
+        RestCtx::build(false, false).await
+    }
+
+    /// The same domains on an instance serving the anonymous viewer tier, so
+    /// the one identity that carries no account at all can be put to the same
+    /// questions the accounts are.
+    async fn anonymous_instance() -> RestCtx {
+        RestCtx::build(false, true).await
     }
 
     /// The same two domains, both carrying a GitHub origin, on an instance
@@ -135,16 +142,16 @@ impl RestCtx {
     /// it. Nothing here connects: the status read reports local state and says
     /// the connection is absent.
     async fn two_team_domains() -> RestCtx {
-        RestCtx::build(true).await
+        RestCtx::build(true, false).await
     }
 
-    async fn build(team: bool) -> RestCtx {
+    async fn build(team: bool, anonymous: bool) -> RestCtx {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let mut cfg = GlobalConfig {
             auth: Some(AuthConfig {
                 trusted_header: None,
-                anonymous: Some(false),
+                anonymous: Some(anonymous),
                 mcp: None,
                 max_users: None,
             }),
@@ -165,7 +172,9 @@ impl RestCtx {
                 vec![(
                     "Secret",
                     "secret",
-                    "- cites [[open:Alpha]]\n- relates_to [[Nowhere At All]]".to_string(),
+                    "- cites [[open:Alpha]]\n- relates_to [[Nowhere At All]]\n\nAnd a \
+                     bare [[Alpha]] besides.\n"
+                        .to_string(),
                 )],
             ),
         ];
@@ -262,6 +271,14 @@ impl RestCtx {
             .upsert_domain_member(domain, account, level, "owner")
             .await
             .unwrap();
+    }
+
+    /// The anonymous viewer: no cookie, no CSRF token, no account.
+    fn as_anonymous(&self) -> SessionClient {
+        SessionClient {
+            addr: self.addr,
+            session: None,
+        }
     }
 
     async fn as_user(&self, name: &str) -> SessionClient {
@@ -682,15 +699,13 @@ async fn the_sync_summary_lists_only_visible_team_domains() {
 
 /// A cross-domain move reaches past the two domains it names: it gathers every
 /// inbound reference to the engram, across domains, and rewrites the bare ones
-/// into the prefixed form. The private domain holds one of those references
-/// here, so the receipt is where it could surface - and it must not, in any
-/// form. `links_rewritten` is a count and nothing in the answer names a domain
-/// but the two ends of the move.
+/// into the prefixed form. The private domain holds a bare reference to the
+/// moving engram, and `links_rewritten` being 1 here is what says that branch
+/// actually ran - the caller, a stranger to that domain, caused a write inside
+/// it (the accepted trade in the plan's ruling (d)).
 ///
-/// (The reference in this fixture is written prefixed, which the rewrite skips,
-/// so no file inside the private domain is touched by this particular move.
-/// What is pinned is the receipt's shape, which is the same whichever branch
-/// the rewrite takes.)
+/// What must NOT happen is the disclosure: the receipt carries a count and
+/// nothing else about the referrer - no domain name, no title, no path.
 #[tokio::test]
 async fn a_cross_domain_move_receipt_names_no_hidden_domain() {
     let ctx = RestCtx::two_domains().await;
@@ -705,8 +720,162 @@ async fn a_cross_domain_move_receipt_names_no_hidden_domain() {
         .await;
     assert_eq!(moved.status(), 200, "{:?}", moved.text().await);
     let receipt = moved.text().await.unwrap();
+    let receipt_json: serde_json::Value = serde_json::from_str(&receipt).unwrap();
+    assert_eq!(
+        receipt_json["links_rewritten"], 1,
+        "the rewrite branch ran, inside the private domain: {receipt}"
+    );
     assert!(
         !receipt.contains("lab") && !receipt.contains("Secret"),
         "the referrer inside the private domain is not named: {receipt}"
     );
+}
+
+/// The domain a route gates is the one in its path - and an identifier in the
+/// body must not be able to name another one. The absolute
+/// `crystalline://<domain>/<permalink>` form overrides the domain hint
+/// wherever it is accepted, so a write that resolved it would act on a domain
+/// nobody gated: a move that carries an engram OUT of a private domain, a
+/// supersede pair written into a private engram's file, an `evolve_ack`
+/// stamped into one, and - success against not-found - an existence oracle
+/// for any permalink in it.
+///
+/// Refused for every caller, the admin included: the rule is that a write
+/// resolves inside the domain its request named, not that some callers may
+/// cross. An admin who wants the private domain addresses it by path, where
+/// the gate serves them.
+#[tokio::test]
+async fn an_absolute_identifier_cannot_reach_another_domain() {
+    let ctx = RestCtx::two_domains().await;
+    ctx.make_private("lab", "owner").await;
+    // A member who may read the private domain and not write it: the case
+    // where the caller can see the name and still must not act on it.
+    ctx.add_member("lab", "mem", MemberLevel::Viewer).await;
+
+    let hidden = "crystalline://lab/secret";
+    for name in ["out", "mem", "boss"] {
+        let client = ctx.as_user(name).await;
+
+        // A move OUT of the private domain, addressed through a domain the
+        // caller may write.
+        let moved = client
+            .post_json(
+                "/api/v1/domains/open/move",
+                json!({"permalink": hidden, "destination": "stolen"}),
+            )
+            .await;
+        assert_eq!(moved.status(), 404, "move as {name}");
+
+        // A supersede pair wired into the private engram's file.
+        let retired = client
+            .post_json(
+                "/api/v1/domains/open/retire",
+                json!({"permalink": "alpha", "status": "superseded", "successor": hidden}),
+            )
+            .await;
+        assert_eq!(retired.status(), 404, "retire as {name}");
+
+        // Both acknowledgment verbs, which edit the engram they name.
+        let acked = client
+            .post_json(
+                "/api/v1/domains/open/evolve/ack",
+                json!({"permalink": hidden, "rule": "V006"}),
+            )
+            .await;
+        assert_eq!(acked.status(), 404, "ack as {name}");
+        let unacked = client
+            .request(reqwest::Method::DELETE, "/api/v1/domains/open/evolve/ack")
+            .json(&json!({"permalink": hidden, "rule": "V006"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(unacked.status(), 404, "unack as {name}");
+    }
+
+    // Nothing moved, nothing was written into either engram, and the refusals
+    // above were not an oracle: a permalink nobody wrote answers the same way
+    // one that exists does.
+    let boss = ctx.as_user("boss").await;
+    let secret = boss.get_json("/api/v1/domains/lab/engrams/secret").await;
+    assert!(
+        !secret["content"].as_str().unwrap().contains("supersedes"),
+        "{secret}"
+    );
+    assert!(secret["frontmatter"]["evolve_ack"].is_null(), "{secret}");
+    let alpha = boss.get_json("/api/v1/domains/open/engrams/alpha").await;
+    assert_eq!(alpha["frontmatter"]["status"], "stable", "{alpha}");
+    let ghost = boss
+        .post_json(
+            "/api/v1/domains/open/move",
+            json!({"permalink": "crystalline://lab/nobody-wrote-this", "destination": "x"}),
+        )
+        .await;
+    assert_eq!(ghost.status(), 404);
+
+    // The same-domain absolute form still writes: what is refused is crossing
+    // domains, not the absolute form itself.
+    let same_domain = boss
+        .post_json(
+            "/api/v1/domains/open/retire",
+            json!({"permalink": "crystalline://open/alpha", "status": "deprecated"}),
+        )
+        .await;
+    assert_eq!(same_domain.status(), 200, "{:?}", same_domain.text().await);
+}
+
+/// The anonymous viewer tier, end to end: an identity with no account behind
+/// it sees what is shared and no private domain, and is refused an addressed
+/// read of one in the words a name nobody registered gets.
+#[tokio::test]
+async fn the_anonymous_viewer_sees_no_private_domain() {
+    let ctx = RestCtx::anonymous_instance().await;
+    ctx.make_private("lab", "owner").await;
+
+    let nobody = ctx.as_anonymous();
+    let listed = nobody.get_json("/api/v1/domains").await.to_string();
+    assert!(listed.contains("open"), "{listed}");
+    assert!(!listed.contains("lab"), "{listed}");
+
+    let hidden = nobody
+        .get_text("/api/v1/domains/lab/engrams/secret", 404)
+        .await;
+    let missing = nobody
+        .get_text("/api/v1/domains/ghost/engrams/secret", 404)
+        .await;
+    assert_eq!(hidden.replace("lab", "ghost"), missing);
+
+    // And a write is refused without ever confirming the domain: an anonymous
+    // identity never writes, whatever `auth.anonymous` allows it to read.
+    let refused = nobody
+        .post_json(
+            "/api/v1/domains/lab/engrams",
+            json!({"title": "Nope", "content": "x"}),
+        )
+        .await;
+    assert_eq!(refused.status(), 404);
+}
+
+/// The branch of the sweep shim that must never widen: with every domain
+/// private and the caller a member of none of them, an empty domain filter
+/// cannot be handed to a verb that reads one as "sweep everything".
+#[tokio::test]
+async fn a_sweep_with_nothing_visible_refuses_rather_than_widening() {
+    let ctx = RestCtx::two_domains().await;
+    for domain in ["open", "lab", "spare"] {
+        ctx.make_private(domain, "owner").await;
+    }
+
+    let out = ctx.as_user("out").await;
+    let refused = out.get("/api/v1/evolve").await;
+    let status = refused.status();
+    let body = refused.text().await.unwrap();
+    assert_eq!(status, 404, "{body}");
+    for domain in ["open", "lab", "spare"] {
+        assert!(!body.contains(domain), "and it names none of them: {body}");
+    }
+
+    // The owner still sweeps its own.
+    let owner = ctx.as_user("owner").await;
+    let swept = owner.get_json("/api/v1/evolve").await.to_string();
+    assert!(swept.contains("lab"), "{swept}");
 }

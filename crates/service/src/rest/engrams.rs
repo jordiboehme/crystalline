@@ -1076,9 +1076,11 @@ pub async fn retire(
     ApiPath(domain): ApiPath<String>,
     ApiJson(body): ApiJson<RetireBody>,
 ) -> Result<Json<Value>, ApiError> {
-    // The successor a retirement wires rides in the same domain by
-    // construction (the engine resolves it there), so this domain is the only
-    // one a retirement can touch.
+    // This domain is the only one a retirement can touch: the successor it
+    // wires is held to it by `Engine::resolve_in`, which refuses an absolute
+    // identifier naming another domain. Without that rule the domain here
+    // would be a hint the body could override, and the gate would be gating
+    // the wrong name.
     let caller = require_domain_write(&state, &identity, &domain).await?;
     let value = state
         .engine
@@ -1209,10 +1211,13 @@ pub async fn move_action(
     // would - the destination is named in the body rather than the path, but
     // it is a domain name either way, and naming one is not a way to learn
     // that it exists.
+    //
+    // Read exactly as the engine reads it, untrimmed: a gate that trimmed
+    // what the verb does not would be gating a different string from the one
+    // that gets written to.
     if let Some(destination) = body
         .destination_domain
         .as_deref()
-        .map(str::trim)
         .filter(|d| !d.is_empty() && *d != domain)
     {
         require_domain_write(&state, &identity, destination).await?;

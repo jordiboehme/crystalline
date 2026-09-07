@@ -1805,6 +1805,56 @@ impl Engine {
             .await
     }
 
+    /// [`Engine::resolve`] for a call that has already named the domain it acts
+    /// on: an identifier may not move the call to a different one.
+    ///
+    /// Every write verb takes a `domain` beside its identifier, and every
+    /// surface gates on THAT name - the REST layer resolves the caller's rights
+    /// for it before the verb runs, and an MCP tool call is gated the same way.
+    /// The absolute `crystalline://` form, though, overrides the domain hint
+    /// wherever it is accepted ([`Engine::resolve_scoped`]'s first branch), so
+    /// a write that resolved it would act on a domain nobody gated: a move out
+    /// of a private domain into a readable one, a superseded pair written into
+    /// a private engram's file, an `evolve_ack` stamped into one. The reads
+    /// are safe because they resolve through the scoped resolver and a hidden
+    /// domain is simply absent from it; the writes have no scope to resolve
+    /// with, and this is the boundary that makes one not needed.
+    ///
+    /// So the rule is the narrow one that costs nothing legitimate: on a call
+    /// that names a domain, an absolute identifier naming a DIFFERENT one is
+    /// refused. The same-domain absolute form still resolves, and a bare
+    /// permalink or title is domain-relative as it always was. The refusal is
+    /// the [`EngineError::NotFound`] a missing engram produces, built from the
+    /// caller's own words, so it discloses nothing about whether that domain
+    /// exists at all - a hidden domain, an unregistered one and a permalink
+    /// nobody wrote are one answer.
+    ///
+    /// The comparison is exact. Domain names are matched exactly everywhere
+    /// else in this engine (the registry is a map keyed by the name as
+    /// written), so folding case here would be this one place disagreeing with
+    /// the lookup it stands in front of.
+    ///
+    /// **The completeness claim this buys**, which the surfaces above rely on:
+    /// a write verb resolves only inside the domain its parameters name, so
+    /// gating those names - `domain`, plus `destination_domain` on a move,
+    /// which are the only domain-valued fields any write parameter carries -
+    /// gates the whole call.
+    async fn resolve_in(
+        &self,
+        identifier: &str,
+        domain: &str,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
+        if let Some(url) = CrystallineUrl::parse(identifier)
+            && url.domain != domain
+        {
+            return Err(EngineError::NotFound(format!(
+                "no engram '{}' in domain '{}'",
+                url.permalink, url.domain
+            )));
+        }
+        self.resolve(identifier, Some(domain)).await
+    }
+
     /// [`Engine::resolve`] with the domains the caller may not see subtracted.
     ///
     /// A hidden domain resolves as an empty one rather than as a refusal: the
@@ -2233,7 +2283,7 @@ impl Engine {
                     .into(),
             ));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         // A reserved name never resolves to an engram today (sync skips both),
         // so this is defence in depth rather than a reachable branch: the
         // generated `index.md` is derived from its folder and would be
@@ -3071,8 +3121,12 @@ impl Engine {
     /// status is checked against [`Self::RETIREMENT_STATUSES`], the
     /// successor rule (required for `superseded`, refused otherwise) is
     /// enforced, `valid_to` is parsed and, when a successor is named, it is
-    /// resolved in the same domain so a missing successor is `NotFound`
-    /// before the target is touched. The target is then written first, and
+    /// resolved before the target is touched, so a missing successor is
+    /// `NotFound` rather than a half-written pair. That resolution goes
+    /// through [`Engine::resolve_in`], which is what actually holds the
+    /// successor to this domain: the absolute `crystalline://` form overrides
+    /// a domain hint wherever it is accepted, so "the same domain" is a rule
+    /// enforced there rather than a property of passing the name in. The target is then written first, and
     /// only then the successor's reciprocal `- supersedes [[..]]` line
     /// (appended only when not already present, so a repeat call is
     /// idempotent). A failure on the successor write leaves the target
@@ -3118,12 +3172,12 @@ impl Engine {
             .transpose()?;
 
         let actor = self.actor(client);
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
 
         // Resolved before the target is touched: a missing successor must
         // never leave the target half-retired.
         let successor = match &p.successor {
-            Some(identifier) => Some(self.resolve(identifier, Some(&p.domain)).await?),
+            Some(identifier) => Some(self.resolve_in(identifier, &p.domain).await?),
             None => None,
         };
         // A successor that resolves to the target itself would append a
@@ -3317,7 +3371,7 @@ impl Engine {
     /// Deliberately thin - [`Engine::read_engram`] resolves references and
     /// builds hints this caller never reads.
     pub async fn engram_text(&self, domain: &str, identifier: &str) -> Result<EngramText> {
-        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let (desc, source) = self.resolve_in(identifier, domain).await?;
         let content = self.load_content(&source, &desc).await?;
         let checksum = sha256_hex(content.as_bytes());
         Ok(EngramText {
@@ -3653,7 +3707,7 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let actor = self.actor(client);
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         // An `evolve_ack` assignment is the one set_frontmatter key whose value
         // the server completes rather than takes: the scope comes from running
         // detection over this engram's domain, which needs the store and so
@@ -4068,7 +4122,7 @@ impl Engine {
         // Resolved once, before anything is written, and used only for the
         // inbound rewrite below.
         let hidden = self.hidden_for(scope).await?;
-        let (src, src_source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (src, src_source) = self.resolve_in(&p.identifier, &p.domain).await?;
         let dest_domain = p
             .destination_domain
             .clone()
@@ -4623,7 +4677,7 @@ impl Engine {
                 "deleted": true,
             }));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         // Held across the comparison and the removal, so a guarded delete
         // cannot check a file that a concurrent save then rewrites underneath
         // it. See `Engine::write_lock`.
@@ -4732,7 +4786,7 @@ impl Engine {
                 "attachment": true,
             }));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         let content = self.load_content(&source, &desc).await?;
         let attachments = self.previewable_attachments(&desc, &content).await;
         Ok(json!({
@@ -6374,7 +6428,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let (desc, _) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, _) = self.resolve_in(&p.identifier, &p.domain).await?;
         Ok(json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
@@ -6517,7 +6571,7 @@ impl Engine {
             return Err(EngineError::Invalid(unknown_rule_message(&rule)));
         }
         let actor = self.actor(client);
-        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let (desc, source) = self.resolve_in(identifier, domain).await?;
         // Checked before the write so an engram carrying no such entry answers
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block.

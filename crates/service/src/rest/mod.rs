@@ -701,8 +701,18 @@ async fn wrong_method() -> ApiError {
     ApiError::method_not_allowed()
 }
 
-/// Refuse a mutation on a read-only instance, ahead of every other check that
-/// would otherwise touch the store, the config or a credential.
+/// Refuse a mutation on a read-only instance, ahead of every check that reads
+/// the config, a credential or the domain's content.
+///
+/// The one thing that may run before it is the domain gate below, and on four
+/// routes it does ([`files::write`], [`files::remove`] and the two evolve
+/// acknowledgments): a domain the caller may not see must answer the 404 an
+/// unregistered name answers, on a read-only instance exactly as on a writable
+/// one, and it cannot do that from behind a 403 that names the instance's
+/// mode. It costs two membership reads on a request that was going to be
+/// refused; it buys an answer that does not vary with a setting the caller can
+/// observe. The routes that kept the old order are the ones where both checks
+/// answer 403 anyway, so nothing there is worth reordering.
 ///
 /// One spelling for every admin module rather than one per module, so a
 /// read-only instance answers the same way whichever settings surface was
