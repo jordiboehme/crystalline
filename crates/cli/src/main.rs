@@ -782,6 +782,45 @@ enum UsersCommand {
         #[arg(long, value_name = "ID")]
         rotate: Option<i64>,
     },
+    /// Tie a single sign-on identity to an existing account, so that person
+    /// signs in through the provider and lands in this account. The durable
+    /// key is the pair of issuer and subject, never an address: an identity
+    /// reaches an account because somebody said so here, or because that
+    /// account's own first sign-on created it.
+    ///
+    /// This is the administrator's half of linking. The other half is the
+    /// person doing it themselves, from their profile in the web UI, which is
+    /// the way that does not need anybody to read a subject off a provider's
+    /// console.
+    Link {
+        /// The account to link the identity to. It must already exist.
+        name: String,
+        /// The provider's issuer url, exactly as its ID tokens spell it.
+        #[arg(long)]
+        issuer: String,
+        /// The provider's stable identifier for the person (the `sub` claim).
+        #[arg(long)]
+        subject: String,
+    },
+    /// Take away the identity an account holds at one provider. A sign-in
+    /// from it then provisions a new account rather than reaching this one.
+    ///
+    /// The repair for a provider that re-issued its subjects (an Entra tenant
+    /// re-registration, say): unlink the stale identity, then `link` the new
+    /// subject to the same account.
+    Unlink {
+        /// The account to take the identity away from.
+        name: String,
+        /// The provider's issuer url.
+        #[arg(long)]
+        issuer: String,
+        /// Unlink even when it is the account's last way in - no password and
+        /// no other identity. The account is then unreachable until it is
+        /// given a password or linked again, which is exactly the gap the
+        /// re-registration repair passes through.
+        #[arg(long)]
+        force: bool,
+    },
     /// Delete an account and every session it holds. Removing the last
     /// enabled admin is refused.
     Remove {

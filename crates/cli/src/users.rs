@@ -19,7 +19,7 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, Result, bail};
 
-use crystalline_service::rest::{AuthStore, Role, User};
+use crystalline_service::rest::{AuthStore, LINKED_BY_CLI, Role, User};
 
 use crate::UsersCommand;
 
@@ -158,6 +158,61 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 let label = label.unwrap_or_else(|| "cli".to_string());
                 let issued = store.issue_mcp_token(&name, &label).await?;
                 print_issued_token(&issued, &stored_name(&name), json, None);
+            }
+        }
+        UsersCommand::Link {
+            name,
+            issuer,
+            subject,
+        } => {
+            store
+                .link_identity(&issuer, &subject, &name, LINKED_BY_CLI)
+                .await?;
+            println!(
+                "Linked subject '{}' at {} to '{}'. A sign-in with that identity now lands \
+                 in this account.",
+                subject.trim(),
+                issuer.trim(),
+                stored_name(&name)
+            );
+        }
+        UsersCommand::Unlink {
+            name,
+            issuer,
+            force,
+        } => {
+            // The store owns the last-way-in rule, so `--force` is the only
+            // thing decided here: which of its two entry points to call. The
+            // refusal, when it comes, is the store's own sentence, which names
+            // `crystalline users passwd`.
+            let removed = if force {
+                store.unlink_identity_force(&issuer, &name).await?
+            } else {
+                store.unlink_identity(&issuer, &name).await?
+            };
+            if !removed {
+                bail!(
+                    "'{}' holds no identity at {}",
+                    stored_name(&name),
+                    issuer.trim()
+                );
+            }
+            println!(
+                "Unlinked '{}' from {}. A sign-in from it now provisions a new account.",
+                stored_name(&name),
+                issuer.trim()
+            );
+            // Only reachable with --force, since that is the only way past the
+            // guard, and worth saying out loud: the operator has just made an
+            // account nobody can sign in to, on purpose, and either link step
+            // or a password ends that.
+            if store.identity_links(&name).await?.is_empty() && !store.has_password(&name).await? {
+                println!(
+                    "'{}' now has no way in at all: link an identity again, or give it a \
+                     password with `crystalline users passwd {}`.",
+                    stored_name(&name),
+                    stored_name(&name)
+                );
             }
         }
         UsersCommand::Remove { name, force } => {
