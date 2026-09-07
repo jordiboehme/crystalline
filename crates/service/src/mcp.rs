@@ -1005,9 +1005,12 @@ pub(crate) fn mcp_account(ctx: &RequestContext<RoleServer>) -> Option<String> {
 const UNKNOWN_CLIENT: &str = "agent";
 
 /// The join, and the cost of it in kept characters once the engine has folded
-/// its spaces into hyphens: `-for-`.
+/// its spaces into hyphens: `-for-`. [`ACTOR_JOIN_WORD`] is the same word as
+/// [`without_the_join`] has to recognize it, once the fold has made it a
+/// hyphen-separated segment of its own.
 const ACTOR_JOIN: &str = " for ";
 const ACTOR_JOIN_CHARS: usize = 5;
+const ACTOR_JOIN_WORD: &str = "for";
 
 /// The client half with any join in it taken out, so the composed shape is
 /// something only this server can produce.
@@ -1017,12 +1020,34 @@ const ACTOR_JOIN_CHARS: usize = 5;
 /// `x-for-ada` - byte-identical to what an authenticated ada session composes,
 /// on an instance where nobody authenticated at all. An account name cannot
 /// contain whitespace (the auth store's `normalize_name` refuses it), so the
-/// join is the only way that shape arises honestly, and collapsing the run is
-/// what keeps it that way. A client that genuinely has `-for-` in its name
-/// loses those five characters and keeps the rest.
+/// join is the only way that shape arises honestly, and this is what keeps it
+/// that way. A client that genuinely has `for` as a hyphen-separated word in
+/// its name loses that word and keeps the rest.
+///
+/// **Structural rather than textual, because a text substitution can be
+/// layered around.** Deleting the `-for-` runs one pass at a time leaves the
+/// runs that pass created: `x-for-for-ada` has two overlapping joins, a single
+/// non-overlapping left-to-right pass consumes the first and re-joins its
+/// neighbours, and `x-for-ada` comes out the other side - the very bytes the
+/// deletion exists to prevent. So the half is taken apart on its separator
+/// instead: every segment that is the join word is dropped, empty runs
+/// collapse with them, and what is rejoined cannot contain `-for-` at any
+/// position or multiplicity, because a `-` in the result is only ever a
+/// separator this function put there between two segments that are not the
+/// word.
+///
+/// The comparison is ASCII case-insensitive even though `sanitize_actor` does
+/// not lowercase and the server's own join is always lowercase, so `x-FOR-ada`
+/// is not literally the composed bytes. Provenance gets read by people, and a
+/// reader scanning for who a write was made for does not spell-check the case;
+/// dropping it costs a client the word `for` in some capitalization and buys
+/// the field a rule with no near misses in it.
 fn without_the_join(sanitized_client: &str) -> String {
-    let stripped = sanitized_client.replace("-for-", "-");
-    stripped.trim_matches('-').to_string()
+    sanitized_client
+        .split('-')
+        .filter(|segment| !segment.is_empty() && !segment.eq_ignore_ascii_case(ACTOR_JOIN_WORD))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// The actor a write records: the client that asked, and - when the call
@@ -3530,6 +3555,52 @@ mod tests {
     use rmcp::model::ErrorCode;
 
     use super::*;
+
+    /// **The join is the server's word, at any position and any multiplicity.**
+    ///
+    /// The rule this pins is structural: whatever a client calls itself, the
+    /// half that reaches the composition cannot contain `-for-`, so the shape
+    /// `<client>-for-<account>` on disk can only have been written by a server
+    /// that resolved an account. The `x-for-for-ada` case is the one a textual
+    /// deletion gets wrong - one non-overlapping pass consumes the first join
+    /// and re-joins its neighbours into a second one.
+    #[test]
+    fn no_client_name_survives_carrying_the_join() {
+        for (client, expected) in [
+            // The straightforward attempt, and the layered one.
+            ("x-for-ada", "x-ada"),
+            ("x-for-for-ada", "x-ada"),
+            ("x-for-for-for-ada", "x-ada"),
+            // Case is not a hiding place, even though the server's own join is
+            // always lowercase.
+            ("x-FOR-ada", "x-ada"),
+            ("x-For-ada", "x-ada"),
+            // The join at either end is not a join, and goes all the same.
+            ("for-ada", "ada"),
+            ("x-for", "x"),
+            // Empty runs collapse with the words that made them, so a doubled
+            // separator cannot smuggle one back in either.
+            ("x-for--ada", "x-ada"),
+            ("x--for--ada", "x-ada"),
+            // A name that is nothing but the word leaves nothing, which
+            // `acting_actor` reads as no client at all.
+            ("for", ""),
+            ("for-for", ""),
+            // `for` inside a word is a word, not the join, and is untouched.
+            ("waiting-forever/1.0", "waiting-forever/1.0"),
+            ("xfor-ada", "xfor-ada"),
+            ("x-fora-ada", "x-fora-ada"),
+            // The ordinary case pays nothing.
+            ("claude-code/2.0", "claude-code/2.0"),
+        ] {
+            let stripped = without_the_join(client);
+            assert_eq!(stripped, expected, "stripping {client}");
+            assert!(
+                !stripped.contains("-for-"),
+                "no client half may carry the join: {client} -> {stripped}"
+            );
+        }
+    }
 
     /// One `inputResponses` map holding `value` under the `confirm` key.
     fn responses(value: Value) -> Option<rmcp::model::InputResponses> {

@@ -992,30 +992,93 @@ async fn a_long_client_name_is_cut_and_the_account_still_lands_whole() {
 async fn an_unauthenticated_client_cannot_write_the_composed_shape() {
     let (addr, guard, _store) = serve_with_mcp_auth(false).await;
 
-    let session = McpTestSession::open_as(&addr, None, "claude-code for ada").await;
+    // The plain attempt, the same attempt spelled so that deleting one join
+    // would create another, the whitespace form the sanitizer folds into the
+    // hyphenated one, and the capitalized one. None of them may land the
+    // shape, whatever route it took to get here.
+    for (index, client) in [
+        "claude-code for ada",
+        "x-for-for-ada",
+        "x for for ada",
+        "x-FOR-ada",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let title = format!("Forged Trace {index}");
+        let session = McpTestSession::open_as(&addr, None, client).await;
+        let answer = session
+            .call_tool(
+                "write_engram",
+                serde_json::json!({
+                    "domain": "eng",
+                    "title": title,
+                    "content": "- [fact] traced",
+                }),
+            )
+            .await;
+        assert!(
+            answer.contains("\"result\""),
+            "the open tier still serves the write for {client}:\n{answer}"
+        );
+
+        let written = std::fs::read_to_string(
+            guard
+                .path()
+                .join("eng")
+                .join(format!("forged-trace-{index}.md")),
+        )
+        .unwrap();
+        assert!(
+            !written.contains("-for-"),
+            "the join is the server's word, not the client's ({client}): {written}"
+        );
+    }
+
+    let first =
+        std::fs::read_to_string(guard.path().join("eng").join("forged-trace-0.md")).unwrap();
+    assert!(
+        first.contains("claude-code"),
+        "the rest of the name a client chose is still its own: {first}"
+    );
+}
+
+/// **A client whose whole name is the join word composes as the stand-in**,
+/// not as a bare account.
+///
+/// `for` sanitizes to itself and then loses its one segment, so there is no
+/// client half left. The composition is always two halves - `agent for ada` -
+/// because `ada` alone would read as a client calling itself ada, and would
+/// drop the one fact the composition exists to record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_that_is_only_the_join_word_composes_as_the_stand_in() {
+    let (addr, guard, store) = serve_with_mcp_auth(true).await;
+    store
+        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+        .await
+        .unwrap();
+    let token = store.issue_mcp_token("ada", "t").await.unwrap().token;
+
+    let session = McpTestSession::open_as(&addr, Some(&token), "for").await;
     let answer = session
         .call_tool(
             "write_engram",
             serde_json::json!({
                 "domain": "eng",
-                "title": "Forged Trace",
+                "title": "Stand In Trace",
                 "content": "- [fact] traced",
             }),
         )
         .await;
     assert!(
         answer.contains("\"result\""),
-        "the open tier still serves the write:\n{answer}"
+        "the write must be served, not refused:\n{answer}"
     );
 
     let written =
-        std::fs::read_to_string(guard.path().join("eng").join("forged-trace.md")).unwrap();
+        std::fs::read_to_string(guard.path().join("eng").join("stand-in-trace.md")).unwrap();
     assert!(
-        !written.contains("-for-"),
-        "the join is the server's word, not the client's: {written}"
-    );
-    assert!(
-        written.contains("claude-code"),
-        "the rest of the name a client chose is still its own: {written}"
+        written.contains("agent-for-ada"),
+        "an unnamed client still records that an agent acted for ada: {written}"
     );
 }
