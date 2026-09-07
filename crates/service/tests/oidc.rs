@@ -653,6 +653,7 @@ impl RestCtx {
                 name: Some("Contoso".to_string()),
                 scopes: None,
                 default_role: None,
+                redirect_uri: None,
             }),
             None,
             Some(header.to_string()),
