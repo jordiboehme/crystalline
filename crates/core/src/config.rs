@@ -686,7 +686,7 @@ pub struct AuthConfig {
 /// person can keep editing rather than a file that refuses to load; the
 /// relying party is what insists on a complete set before it offers the
 /// button.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct OidcConfig {
     /// The provider's issuer url, the one discovery appends
     /// `/.well-known/openid-configuration` to. Tenant-specific where the
@@ -716,6 +716,34 @@ pub struct OidcConfig {
     /// `viewer`, `editor` or `admin`. Absent means the least privileged one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_role: Option<String>,
+}
+
+/// What a credential renders as wherever a config is displayed instead of
+/// its value: whether one is configured, and nothing more. The settings
+/// registry, the environment overlay and this module's own `Debug` impls all
+/// share it, so a secret reads the same in `config show`, in `doctor` and in
+/// a log line.
+pub const SECRET_DISPLAY: &str = "(set)";
+
+/// Hand-written so the client secret cannot reach a log line or a panic
+/// message through a careless `{:?}`: the struct that holds the credential
+/// masks it unconditionally rather than trusting every future caller (a
+/// relying-party struct that derives `Debug`, say) to remember not to print
+/// it. Every other field renders as-is, so the render stays diagnosable.
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| SECRET_DISPLAY),
+            )
+            .field("name", &self.name)
+            .field("scopes", &self.scopes)
+            .field("default_role", &self.default_role)
+            .finish()
+    }
 }
 
 /// Service configuration.
@@ -1164,6 +1192,34 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one place a config's own `Debug` is load bearing: the client
+    /// secret is masked, the rest of the block is not, and the whole config
+    /// inherits the mask because the derived impls above it delegate here.
+    #[test]
+    fn the_oidc_debug_render_masks_the_client_secret_and_nothing_else() {
+        let cfg = GlobalConfig {
+            auth: Some(AuthConfig {
+                oidc: Some(OidcConfig {
+                    issuer: Some("https://login.example.com/v2.0".into()),
+                    client_id: Some("app-1234".into()),
+                    client_secret: Some("hunter2".into()),
+                    ..OidcConfig::default()
+                }),
+                ..AuthConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains(SECRET_DISPLAY), "{rendered}");
+        assert!(rendered.contains("app-1234"), "{rendered}");
+        assert!(rendered.contains("login.example.com"), "{rendered}");
+
+        let unset = format!("{:?}", OidcConfig::default());
+        assert!(unset.contains("client_secret: None"), "{unset}");
+    }
 
     #[test]
     fn github_stacks_defaults_true_and_reads_the_key() {

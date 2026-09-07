@@ -21,10 +21,20 @@ use crate::overlay::EnvOverlay;
 use crate::rest::Role;
 
 /// What a credential-carrying setting renders as instead of its value:
-/// whether one is configured, and nothing more. Shared with
-/// [`crate::overlay::EnvOverlay::active_overrides`] so a secret reads the same
-/// wherever it is displayed.
-pub const SECRET_DISPLAY: &str = "(set)";
+/// whether one is configured, and nothing more. The core marker, re-exported
+/// so [`crate::overlay::EnvOverlay::active_overrides`] and the config's own
+/// `Debug` render a secret the same way wherever it is displayed.
+pub use crystalline_core::config::SECRET_DISPLAY;
+
+/// Whether a settings key carries a credential, so nothing may render its
+/// value. Read off the registry, where [`SettingSpec::secret`] is declared
+/// beside the key it belongs to: one flag makes a value invisible in
+/// `config show`, the `configure` tool, `crystalline doctor` and the
+/// overlay's `Debug` alike, and a key the registry does not know is not a
+/// secret.
+pub fn is_secret_key(key: &str) -> bool {
+    registry().iter().any(|s| s.key == key && s.secret)
+}
 
 /// An error applying, resetting or looking up a setting. The message is
 /// actionable and safe to show an agent or a terminal as-is.
@@ -76,6 +86,13 @@ pub struct SettingSpec {
     /// starts (a running daemon keeps reading its old value), as opposed to
     /// one a running daemon picks up immediately. Drives [`change_note`].
     pub startup_effective: bool,
+    /// Whether the value is a credential. A secret setting is stored like any
+    /// other, but every display of it goes through [`SettingSpec::display`]
+    /// and renders [`SECRET_DISPLAY`] instead of the value: an operator learns
+    /// whether one is configured, and nothing more. Declared here, beside the
+    /// key, so masking is one flag rather than a hand-written `effective`
+    /// per key and a matching list somewhere else.
+    pub secret: bool,
     /// Parse and validate a string value, then write it into `config`.
     apply: fn(&mut GlobalConfig, &str) -> Result<(), SettingsError>,
     /// Reset this setting to its default, removing it from `config` (and its
@@ -87,6 +104,19 @@ pub struct SettingSpec {
 }
 
 impl SettingSpec {
+    /// The value to show for this setting and whether it is a default: the
+    /// effective value, masked to [`SECRET_DISPLAY`] when the setting is a
+    /// secret and something is configured. The only path from a config to a
+    /// rendered value, which is what makes [`SettingSpec::secret`] sufficient.
+    pub fn display(&self, config: &GlobalConfig) -> (String, bool) {
+        let (value, is_default) = (self.effective)(config);
+        if self.secret && !value.is_empty() {
+            (SECRET_DISPLAY.to_string(), is_default)
+        } else {
+            (value, is_default)
+        }
+    }
+
     /// The environment variable this setting maps to, mechanically derived
     /// from its key: `github.enabled` becomes `CRYSTALLINE_GITHUB_ENABLED`.
     /// Unused before the environment overlay lands; kept beside the key it
@@ -121,6 +151,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The default root folder new file domains are created under (default ~/Documents/Crystalline)",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_domains_root,
             clear: clear_domains_root,
             effective: domains_root_effective,
@@ -130,6 +161,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Turn GitHub team collaboration on or off",
             kind: SettingKind::Bool,
             startup_effective: false,
+            secret: false,
             apply: set_enabled,
             clear: clear_enabled,
             effective: enabled_effective,
@@ -139,6 +171,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Stack a new proposal on the open one when sharing again, where the forge serves stacked pull requests (default true); false keeps a single proposal per domain, updated in place",
             kind: SettingKind::Bool,
             startup_effective: false,
+            secret: false,
             apply: set_stacks,
             clear: clear_stacks,
             effective: stacks_effective,
@@ -148,6 +181,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Whose GitHub identity shares run under: instance (default) uses the one connected token for everything; personal requires each person to connect their own GitHub identity for sharing, while pulling stays on the instance token",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_share_identity,
             clear: clear_share_identity,
             effective: share_identity_effective,
@@ -157,6 +191,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The crystalline account whose connected GitHub identity agent shares over HTTP MCP run under when share_identity is personal; unset means those shares are refused",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_agent_identity,
             clear: clear_agent_identity,
             effective: agent_identity_effective,
@@ -166,6 +201,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How often the daemon polls GitHub for changes, in seconds (minimum 60)",
             kind: SettingKind::U64,
             startup_effective: false,
+            secret: false,
             apply: set_poll_secs,
             clear: clear_poll_secs,
             effective: poll_secs_effective,
@@ -175,6 +211,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The GitHub API base url, for a GitHub Enterprise Server instance",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_api_url,
             clear: clear_api_url,
             effective: api_url_effective,
@@ -184,6 +221,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "A self-hosted OAuth App client id, overriding the embedded default",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_oauth_client_id,
             clear: clear_oauth_client_id,
             effective: oauth_client_id_effective,
@@ -193,6 +231,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve knowledge read-only, hiding every tool that writes (applies at the next daemon start)",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_read_only,
             clear: clear_read_only,
             effective: read_only_effective,
@@ -202,6 +241,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The HTTP endpoint: on at 127.0.0.1:7411 by default; false turns it off, true spells the default, or bind a host:port address; the serve --http flag wins when given (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_http,
             clear: clear_http,
             effective: http_effective,
@@ -211,6 +251,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve the embedded Fluid web UI on the HTTP endpoint (default true); false serves the API and MCP only, the shape a separate Fluid deployment fronts. Read once when the HTTP surface starts",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_ui,
             clear: clear_ui,
             effective: ui_effective,
@@ -220,6 +261,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve the JSON API under /api/v1 on the HTTP endpoint (default true); false also disables the web UI, leaving MCP and /health only. Read once when the HTTP surface starts",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_api,
             clear: clear_api,
             effective: api_effective,
@@ -229,6 +271,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Comma-separated Host header values the HTTP transport accepts (DNS-rebinding guard); loopback is always allowed and a single * allows any Host; the serve --allowed-host flag wins when given (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_allowed_hosts,
             clear: clear_allowed_hosts,
             effective: allowed_hosts_effective,
@@ -238,6 +281,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How list-shaped MCP tool results are encoded: toon (token-efficient, default) or json",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_response_format,
             clear: clear_response_format,
             effective: response_format_effective,
@@ -247,6 +291,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a stdio session spawned by a harness this machine's install receipt already onboarded with session hooks, which has the skills as files already; true always serves them, false never does. Applies at the next daemon start",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_skills_serve,
             clear: clear_skills_serve,
             effective: skills_serve_effective,
@@ -256,15 +301,17 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Which storage backend serves the derived index, turso or postgres (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_database_backend,
             clear: clear_database_backend,
             effective: database_backend_effective,
         },
         SettingSpec {
             key: "database.url",
-            doc: "The Postgres connection URL (or a file-path override for the embedded backend); applies at the next daemon start",
+            doc: "The Postgres connection URL (or a file-path override for the embedded backend); a credential when it carries a password, so it is only ever shown as (set) and never echoed back (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: true,
             apply: set_database_url,
             clear: clear_database_url,
             effective: database_url_effective,
@@ -274,6 +321,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How strongly a salient engram is lifted in hybrid ranking, 0.0 to 1.0 (default 0.15); a soft prior that reorders within a relevance band and never filters",
             kind: SettingKind::F64,
             startup_effective: false,
+            secret: false,
             apply: set_salience_weight,
             clear: clear_salience_weight,
             effective: salience_weight_effective,
@@ -283,6 +331,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The ranking multiplier for engrams whose status is deprecated, superseded, archived or legacy, 0.0 to 1.0 (default 0.6, 1.0 disables); a soft fade that reorders results and never filters",
             kind: SettingKind::F64,
             startup_effective: false,
+            secret: false,
             apply: set_retired_weight,
             clear: clear_retired_weight,
             effective: retired_weight_effective,
@@ -292,6 +341,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Keep a generated index.md in every folder of a file domain, so the knowledge navigates statically without Crystalline (default true)",
             kind: SettingKind::Bool,
             startup_effective: false,
+            secret: false,
             apply: set_index_files,
             clear: clear_index_files,
             effective: index_files_effective,
@@ -301,6 +351,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Who is recorded as the writer of an engram (generated.by), for example team-bot/1.0 or human:jordi; unset means the connected client is used",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_identity_actor,
             clear: clear_identity_actor,
             effective: identity_actor_effective,
@@ -310,6 +361,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The request header a trusted reverse proxy sets to name the authenticated user, for example X-Forwarded-User; unset means no header is believed (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_trusted_header,
             clear: clear_trusted_header,
             effective: trusted_header_effective,
@@ -319,6 +371,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve requests that carry no identity at all (default false) (applies at the next daemon start)",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_anonymous,
             clear: clear_anonymous,
             effective: anonymous_effective,
@@ -328,6 +381,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Require every MCP connection over HTTP to authenticate with a personal MCP token (issue one in Fluid under profile > Agent access); off means the legacy open HTTP tier (applies at the next daemon start)",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_mcp,
             clear: clear_mcp,
             effective: mcp_effective,
@@ -337,6 +391,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How many accounts trusted-header provisioning may mint in total (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_max_users,
             clear: clear_max_users,
             effective: max_users_effective,
@@ -346,6 +401,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The single sign-on provider's issuer url, the one discovery appends /.well-known/openid-configuration to, for example https://login.microsoftonline.com/<your-tenant-id>/v2.0; unset means SSO is off and only the local accounts sign in (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_oidc_issuer,
             clear: clear_oidc_issuer,
             effective: oidc_issuer_effective,
@@ -355,15 +411,17 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The client id (application id) the single sign-on provider issued for this Crystalline instance (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_oidc_client_id,
             clear: clear_oidc_client_id,
             effective: oidc_client_id_effective,
         },
         SettingSpec {
             key: "auth.oidc.client_secret",
-            doc: "The client secret that goes with auth.oidc.client_id; a credential, so it is only ever shown as (set) and never echoed back - CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET supplies it instead where secrets stay out of the config file (applies at the next daemon start)",
+            doc: "The client secret that goes with auth.oidc.client_id; a credential, so it is only ever shown as (set) and never echoed back - prefer supplying it through CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET, which keeps it out of the config file and out of the shell history a value typed at config set lands in (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: true,
             apply: set_oidc_client_secret,
             clear: clear_oidc_client_secret,
             effective: oidc_client_secret_effective,
@@ -373,6 +431,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The single sign-on provider's display name, the label on the sign-in button; unset means the generic wording (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_oidc_name,
             clear: clear_oidc_name,
             effective: oidc_name_effective,
@@ -382,6 +441,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The scopes requested at authorization, space separated; unset means the standard set (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_oidc_scopes,
             clear: clear_oidc_scopes,
             effective: oidc_scopes_effective,
@@ -391,6 +451,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The role an account provisioned through single sign-on is created at: viewer, editor or admin; unset means viewer, the least privileged one (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_oidc_default_role,
             clear: clear_oidc_default_role,
             effective: oidc_default_role_effective,
@@ -424,10 +485,10 @@ pub fn snapshot(file: &GlobalConfig, overlay: &EnvOverlay) -> Vec<SettingView> {
     registry()
         .iter()
         .map(|spec| {
-            let (value, _) = (spec.effective)(&effective);
+            let (value, _) = spec.display(&effective);
             let source = if overlay.overrides_key(spec.key) {
                 SettingSource::Env
-            } else if (spec.effective)(file).1 {
+            } else if spec.display(file).1 {
                 SettingSource::Default
             } else {
                 SettingSource::Config
@@ -1441,6 +1502,15 @@ fn oidc_effective(
     }
 }
 
+/// Clear one `auth.oidc.*` field, then drop the block (and the `auth` block
+/// above it) if that emptied it. The write-side twin of [`oidc_effective`].
+fn clear_oidc(config: &mut GlobalConfig, field: fn(&mut OidcConfig) -> &mut Option<String>) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        *field(o) = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
 fn set_oidc_issuer(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
     let issuer = oidc_value("auth.oidc.issuer", value)?;
     // The tenant-independent Entra discovery template is the one wrong value
@@ -1459,10 +1529,7 @@ fn set_oidc_issuer(config: &mut GlobalConfig, value: &str) -> Result<(), Setting
 }
 
 fn clear_oidc_issuer(config: &mut GlobalConfig) {
-    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
-        o.issuer = None;
-    }
-    drop_oidc_if_empty(config);
+    clear_oidc(config, |o| &mut o.issuer);
 }
 
 fn oidc_issuer_effective(config: &GlobalConfig) -> (String, bool) {
@@ -1476,10 +1543,7 @@ fn set_oidc_client_id(config: &mut GlobalConfig, value: &str) -> Result<(), Sett
 }
 
 fn clear_oidc_client_id(config: &mut GlobalConfig) {
-    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
-        o.client_id = None;
-    }
-    drop_oidc_if_empty(config);
+    clear_oidc(config, |o| &mut o.client_id);
 }
 
 fn oidc_client_id_effective(config: &GlobalConfig) -> (String, bool) {
@@ -1493,21 +1557,14 @@ fn set_oidc_client_secret(config: &mut GlobalConfig, value: &str) -> Result<(), 
 }
 
 fn clear_oidc_client_secret(config: &mut GlobalConfig) {
-    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
-        o.client_secret = None;
-    }
-    drop_oidc_if_empty(config);
+    clear_oidc(config, |o| &mut o.client_secret);
 }
 
-/// The one setting whose effective value is not its value. A client secret
-/// that reaches a snapshot reaches `config show`, the `configure` tool result
-/// and `doctor`, so what is rendered is [`SECRET_DISPLAY`] and never the
-/// secret: an operator learns whether one is configured, and nothing more.
+/// Raw like every sibling: the registry entry is `secret: true`, and
+/// [`SettingSpec::display`] is what turns this into [`SECRET_DISPLAY`]
+/// before it reaches `config show`, the `configure` tool result or `doctor`.
 fn oidc_client_secret_effective(config: &GlobalConfig) -> (String, bool) {
-    match config.auth_oidc().and_then(|o| o.client_secret.as_ref()) {
-        Some(_) => (SECRET_DISPLAY.to_string(), false),
-        None => (String::new(), true),
-    }
+    oidc_effective(config, |o| o.client_secret.as_ref())
 }
 
 fn set_oidc_name(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1517,10 +1574,7 @@ fn set_oidc_name(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsE
 }
 
 fn clear_oidc_name(config: &mut GlobalConfig) {
-    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
-        o.name = None;
-    }
-    drop_oidc_if_empty(config);
+    clear_oidc(config, |o| &mut o.name);
 }
 
 fn oidc_name_effective(config: &GlobalConfig) -> (String, bool) {
@@ -1538,10 +1592,7 @@ fn set_oidc_scopes(config: &mut GlobalConfig, value: &str) -> Result<(), Setting
 }
 
 fn clear_oidc_scopes(config: &mut GlobalConfig) {
-    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
-        o.scopes = None;
-    }
-    drop_oidc_if_empty(config);
+    clear_oidc(config, |o| &mut o.scopes);
 }
 
 fn oidc_scopes_effective(config: &GlobalConfig) -> (String, bool) {
@@ -1563,10 +1614,7 @@ fn set_oidc_default_role(config: &mut GlobalConfig, value: &str) -> Result<(), S
 }
 
 fn clear_oidc_default_role(config: &mut GlobalConfig) {
-    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
-        o.default_role = None;
-    }
-    drop_oidc_if_empty(config);
+    clear_oidc(config, |o| &mut o.default_role);
 }
 
 fn oidc_default_role_effective(config: &GlobalConfig) -> (String, bool) {
@@ -2962,6 +3010,82 @@ mod tests {
             !yaml.contains("auth"),
             "an emptied auth block must not round-trip into the yaml: {yaml}"
         );
+    }
+
+    // --- secrets ------------------------------------------------------------
+
+    /// Every key the registry flags as a secret is invisible on every display
+    /// path, and the flag is the only thing that makes it so: a value is
+    /// applied, then looked for in the snapshot and in the overlay's doctor
+    /// listing and `Debug`. Registry-driven, so the next credential-shaped
+    /// key is covered by setting its flag and nothing else.
+    #[test]
+    fn every_secret_key_is_masked_on_every_display_path() {
+        let secrets: Vec<&SettingSpec> = registry().iter().filter(|s| s.secret).collect();
+        assert_eq!(
+            secrets.iter().map(|s| s.key).collect::<Vec<_>>(),
+            vec!["database.url", "auth.oidc.client_secret"],
+        );
+
+        for spec in secrets {
+            assert!(is_secret_key(spec.key), "{}", spec.key);
+            let marker = format!("marker-{}", spec.key.replace('.', "-"));
+
+            // Unset: empty and a default, so `(set)` really means set.
+            let unset = snapshot(&GlobalConfig::default(), &EnvOverlay::default())
+                .into_iter()
+                .find(|v| v.key == spec.key)
+                .unwrap();
+            assert_eq!(unset.value, "", "{}", spec.key);
+            assert_eq!(unset.source, SettingSource::Default, "{}", spec.key);
+
+            // Set in the file: masked, stored, and the marker is nowhere.
+            let mut config = GlobalConfig::default();
+            apply(&mut config, spec.key, &marker).unwrap();
+            let views = snapshot(&config, &EnvOverlay::default());
+            let view = views.iter().find(|v| v.key == spec.key).unwrap();
+            assert_eq!(view.value, SECRET_DISPLAY, "{}", spec.key);
+            assert_eq!(view.source, SettingSource::Config, "{}", spec.key);
+            assert!(
+                !views.iter().any(|v| v.value.contains(&marker)),
+                "{} leaked into the snapshot",
+                spec.key
+            );
+            assert_eq!(spec.display(&config).0, SECRET_DISPLAY);
+
+            // Set by the environment: masked in the snapshot, in doctor's
+            // override listing and in the overlay's own render.
+            let overlay = EnvOverlay::from_vars([(spec.env_var(), marker.clone())]).unwrap();
+            let view = snapshot(&GlobalConfig::default(), &overlay)
+                .into_iter()
+                .find(|v| v.key == spec.key)
+                .unwrap();
+            assert_eq!(view.value, SECRET_DISPLAY, "{}", spec.key);
+            assert_eq!(view.source, SettingSource::Env, "{}", spec.key);
+            let (_, _, shown) = overlay
+                .active_overrides()
+                .into_iter()
+                .find(|(_, key, _)| key == spec.key)
+                .unwrap();
+            assert_eq!(shown, SECRET_DISPLAY, "{}", spec.key);
+            let rendered = format!("{overlay:?}");
+            assert!(!rendered.contains(&marker), "{rendered}");
+        }
+    }
+
+    /// A key that is not flagged shows its value, so the flag is not
+    /// accidentally masking everything.
+    #[test]
+    fn a_plain_key_is_not_a_secret_and_shows_its_value() {
+        assert!(!is_secret_key("auth.oidc.client_id"));
+        assert!(!is_secret_key("no.such.key"));
+        let mut config = GlobalConfig::default();
+        apply(&mut config, "auth.oidc.client_id", "app-1234").unwrap();
+        let view = snapshot(&config, &EnvOverlay::default())
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_id")
+            .unwrap();
+        assert_eq!(view.value, "app-1234");
     }
 
     // --- auth.oidc.* --------------------------------------------------------

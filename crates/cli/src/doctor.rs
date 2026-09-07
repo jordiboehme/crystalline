@@ -180,7 +180,9 @@ pub struct GithubDoctor {
 /// filtered to drop `domain.*` and `github.token` rows: those get the richer
 /// dedicated [`EnvironmentDoctor::domains`] and
 /// [`EnvironmentDoctor::github_token`] fields instead, so the flat list never
-/// duplicates them. `database.url` already arrives masked as `"(set)"`.
+/// duplicates them. A credential-carrying key already arrives masked as
+/// `"(set)"` (see `EnvOverlay::active_overrides`, which reads the registry's
+/// secret flag).
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvOverride {
     /// The environment variable, for example `CRYSTALLINE_DATABASE_BACKEND`.
@@ -188,7 +190,8 @@ pub struct EnvOverride {
     /// The settings registry key it overrides, for example
     /// `database.backend`.
     pub key: String,
-    /// The overridden value, masked to `"(set)"` for `database.url`.
+    /// The overridden value, masked to `"(set)"` for a credential-carrying
+    /// key.
     pub value: String,
 }
 
@@ -210,9 +213,9 @@ pub struct EnvDomainReport {
 /// for visibility: never counted as a problem, and never present at all
 /// (`None`) when the environment overlay carries nothing (mirroring how
 /// [`DoctorReport::github`] is absent when collaboration is off). No value
-/// here is a secret: `database.url` and the GitHub token are masked exactly
-/// as [`EnvOverlay::active_overrides`] masks them, and the token itself is
-/// reduced to a boolean.
+/// here is a secret: every credential-carrying key and the GitHub token are
+/// masked exactly as [`EnvOverlay::active_overrides`] masks them, and the
+/// token itself is reduced to a boolean.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnvironmentDoctor {
     /// The `CRYSTALLINE_CONFIG` value, when set. A path, never a secret.

@@ -147,23 +147,16 @@ pub struct EnvOverlay {
 /// more likely to reach a log line or a test failure message via `Debug` than
 /// via any deliberate print, so the secret is masked unconditionally rather
 /// than trusting every future caller to remember not to print it.
-/// Whether a settings key carries a credential, so nothing may render its
-/// value: a database url with a password in it and the single sign-on client
-/// secret. Both are shown as [`settings::SECRET_DISPLAY`] instead, in
-/// `crystalline doctor`, in this type's `Debug` and anywhere else an override
-/// is listed.
-fn is_secret_key(key: &str) -> bool {
-    matches!(key, "database.url" | "auth.oidc.client_secret")
-}
-
 /// The settings pairs with every credential value replaced, for `Debug`. An
 /// overlay reaches a log line or a panic message as a whole struct, and a
-/// secret must not ride along when it does.
+/// secret must not ride along when it does. Which keys are credentials is
+/// the registry's call ([`settings::is_secret_key`]), so this list never
+/// drifts from what `config show` masks.
 fn redacted_settings(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
     pairs
         .iter()
         .map(|(key, value)| {
-            let shown = if is_secret_key(key) {
+            let shown = if settings::is_secret_key(key) {
                 settings::SECRET_DISPLAY
             } else {
                 value.as_str()
@@ -399,7 +392,7 @@ impl EnvOverlay {
             .settings
             .iter()
             .map(|(key, value)| {
-                let display = if is_secret_key(key) {
+                let display = if settings::is_secret_key(key) {
                     settings::SECRET_DISPLAY.to_string()
                 } else {
                     value.clone()
