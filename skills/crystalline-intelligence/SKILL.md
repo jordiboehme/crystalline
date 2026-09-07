@@ -17,6 +17,8 @@ On a shared instance that block may be a count rather than a list, or may name f
 
 A domain the account you connected as is not a member of is not there for you at all: it is absent from `list_domains` and from every search, and naming it directly answers exactly as naming a domain nobody ever registered. Read a "not registered" answer as "not yours to see or not there, and you cannot tell which" - never as a cue to create it with `add_domain`, and never as a bug to report. Ask the person you are working with for access instead.
 
+The same rule governs ending a domain. `remove_domain` unregisters one - the counterpart to `add_domain`, and what to call when someone says a domain is finished rather than telling them to open a terminal - and on your own machine you may remove any of them. On a shared instance it takes an instance admin or, for a private domain, its owner; anything else is refused with text naming who can, which is an answer to relay rather than a call to retry. It never deletes a file domain's markdown, and it refuses a virtual domain (whose engrams are only in the database) until you pass `purge: true`, so confirm the loss with the user first.
+
 A write is a second question, answered separately. Where you may read a domain but not change it, the refusal names the level you hold on it (`viewer`, for instance) and needs an upgrade rather than a retry: relay it and ask, rather than trying another verb or another phrasing of the same write.
 
 ## Recall before you answer

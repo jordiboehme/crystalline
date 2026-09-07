@@ -864,6 +864,7 @@ Hard-won knowledge is worth the review.
 | To do this | Say to your agent |
 |---|---|
 | Commission a domain | "Create a new Crystalline domain called ship-ops for everything about the ship." |
+| Retire a whole domain | "We are done with the shuttle-ops domain - unregister it, the files can stay." |
 | Capture a fact | "Remember this: the port clamp sticks in the cold." |
 | Recall, scoped | "What do we know about docking?" |
 | Recall, everywhere | "Any single points of failure we should worry about?" |
