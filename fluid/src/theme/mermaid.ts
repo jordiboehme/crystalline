@@ -7,11 +7,11 @@
  * mermaid is this function rather than two literals that drift apart.
  *
  * `base` is the only built-in theme that honours `themeVariables`: `default`
- * and `dark` ignore them and draw in mermaid's own purple, beside an app that
- * is teal everywhere else. The variables below are the app's tokens by value,
- * taken from the accent and slate ramps in `index.css` - mermaid reads its
- * configuration as data before anything is in the document, so a CSS variable
- * would reach it as the literal string `var(--color-accent-700)`.
+ * and `dark` ignore them and draw in mermaid's own purple, a different shade
+ * than the app's own accent. The variables below are the app's tokens by
+ * value, taken from the accent and slate ramps in `index.css` - mermaid
+ * reads its configuration as data before anything is in the document, so a
+ * CSS variable would reach it as the literal string `var(--color-accent-700)`.
  *
  * `suppressErrorRendering` is not a preference. Mermaid's default on a parse
  * failure is to append its own error graphic to `document.body`, outside
@@ -36,12 +36,12 @@ import type { MermaidConfig } from "mermaid";
  * `tertiaryTextColor`, which is the channel inversion of `tertiaryColor`:
  * inverting the dark scheme's `#0f172a` gives the warm cream `#f0e8d5`, so
  * subgraph and cluster titles would be the one thing on the page that is not
- * teal or slate. `arrowheadColor` derives the same way `titleColor` does, but
+ * accent or slate. `arrowheadColor` derives the same way `titleColor` does, but
  * more directly - `this.arrowheadColor = this.arrowheadColor ||
  * invert_default(this.background)` inverts `background` itself rather than
  * routing through `tertiaryColor`, landing on that same warm cream for the
  * dark scheme's `#0f172a`, so every arrowhead in a flowchart or user journey
- * would read as the one non-teal, non-slate mark on the page - the wart this
+ * would read as the one non-accent, non-slate mark on the page - the wart this
  * file pins shut by naming it to match `lineColor` per scheme. Naming all
  * four is what closes that: overrides are applied again AFTER the derivation
  * pass, so a named variable always wins.
@@ -55,9 +55,9 @@ const VARIABLES = {
   dark: {
     darkMode: true,
     background: "#0f172a",
-    primaryColor: "#134e4a",
+    primaryColor: "#2a1f5f",
     primaryTextColor: "#e2e8f0",
-    primaryBorderColor: "#2dd4bf",
+    primaryBorderColor: "#978bd3",
     lineColor: "#64748b",
     arrowheadColor: "#64748b",
     secondaryColor: "#1e293b",
@@ -69,9 +69,9 @@ const VARIABLES = {
   },
   light: {
     background: "#ffffff",
-    primaryColor: "#ccfbf1",
+    primaryColor: "#ece8f9",
     primaryTextColor: "#0f172a",
-    primaryBorderColor: "#0f766e",
+    primaryBorderColor: "#45388c",
     lineColor: "#475569",
     arrowheadColor: "#475569",
     secondaryColor: "#f1f5f9",

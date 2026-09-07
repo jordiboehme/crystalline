@@ -77,7 +77,7 @@ export function graphStylesheet(dark: boolean): StylesheetJson {
       // neutral geometry, in the accent every other screen uses to say "here".
       selector: `node.${ANCHOR_CLASS}`,
       style: {
-        "background-color": dark ? "#2dd4bf" : "#0f766e",
+        "background-color": dark ? "#978bd3" : "#45388c",
         width: 20,
         height: 20,
         "font-weight": "bold",

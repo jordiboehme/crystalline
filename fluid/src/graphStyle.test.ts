@@ -114,12 +114,12 @@ describe("the graph stylesheet", () => {
       styleFor(graphStylesheet(false), `node.${ANCHOR_CLASS}`)[
         "background-color"
       ],
-    ).toBe("#0f766e");
+    ).toBe("#45388c");
     expect(
       styleFor(graphStylesheet(true), `node.${ANCHOR_CLASS}`)[
         "background-color"
       ],
-    ).toBe("#2dd4bf");
+    ).toBe("#978bd3");
   });
 
   it("repaints an instance that is already drawn, without moving it", () => {

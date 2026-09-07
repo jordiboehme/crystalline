@@ -26,5 +26,5 @@
     "noUncheckedIndexedAccess": true,
     "exactOptionalPropertyTypes": true
   },
-  "include": ["src/theme/tokens.test.ts"]
+  "include": ["src/theme/tokens.test.ts", "src/theme.test.ts"]
 }
