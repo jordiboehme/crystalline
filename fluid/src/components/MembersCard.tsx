@@ -41,11 +41,21 @@
  * a wrong address for whoever just acted, the same way `UnregisterDomain`'s
  * own domain becomes one. Both follow that precedent: invalidate the listing
  * every sidebar and switcher draws from, and leave for `/` rather than sit on
- * a page that is about to refuse to load.
+ * a page that is about to refuse to load. Two callers keep the page instead,
+ * because neither actually lost anything: an admin who leaves its own
+ * membership row still holds `Own` on every domain regardless (`decide`
+ * answers `Own` for any admin before it ever looks at the acl), and an owner
+ * who "transfers" the domain to itself changed nothing.
+ *
+ * `capabilities.readOnly` is a certainty this side already holds, unlike a
+ * per-domain right - so the five mutations below are disabled rather than
+ * offered-then-refused, each with the read-only reason as its own accessible
+ * description (`READ_ONLY_REASON`), the same shape `Profile.tsx` gives a
+ * verb a read-only instance will not run.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import type { ReactElement } from "react";
+import type { ReactElement, ReactNode } from "react";
 import { useId, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 
@@ -66,6 +76,18 @@ import { BUTTON, FIELD, Field } from "./primitives";
 
 /** Every level a member can be invited at, or moved to. */
 const LEVELS: MemberLevel[] = ["viewer", "editor", "manager"];
+
+/**
+ * `readOnly` is a certainty this side already holds, straight off the
+ * capability probe - unlike a per-domain right, nothing is gained by
+ * offering a control the client can prove is refused. The five mutations
+ * below are disabled rather than removed, though, and this sentence rides
+ * along as each one's accessible description: a door that will not open is
+ * still the door, shown as one, not vanished the way a merely *derived*
+ * right's absence is.
+ */
+const READ_ONLY_REASON =
+  "This instance is read only, so nothing here can be changed.";
 
 /** Login names are folded to lowercase and trimmed on the way in; compare the same way. */
 function sameAccount(a: string, b: string): boolean {
@@ -121,7 +143,6 @@ export function MembersCard({ domain }: { domain: string }) {
   }
 
   const invite = useMutation({
-    retry: false,
     mutationFn: ({
       principal,
       level,
@@ -139,7 +160,6 @@ export function MembersCard({ domain }: { domain: string }) {
   });
 
   const relevel = useMutation({
-    retry: false,
     mutationFn: ({
       principal,
       level,
@@ -157,11 +177,19 @@ export function MembersCard({ domain }: { domain: string }) {
   });
 
   const remove = useMutation({
-    retry: false,
     mutationFn: (principal: string) => removeMember(domain, principal),
     onSuccess: (_void, principal) => {
       setProblem(null);
-      if (user !== null && sameAccount(principal, user.name)) {
+      // An admin keeps `Own` on every domain regardless of its own row
+      // (`decide` answers `Own` for any admin before it ever looks at the
+      // acl), so an admin leaving its own membership has lost nothing here -
+      // exactly the distinction `transfer`'s own success handler already
+      // draws below.
+      if (
+        !capabilities.canAdminister &&
+        user !== null &&
+        sameAccount(principal, user.name)
+      ) {
         leftTheDomain();
         return;
       }
@@ -173,16 +201,18 @@ export function MembersCard({ domain }: { domain: string }) {
   });
 
   const transfer = useMutation({
-    retry: false,
     mutationFn: (owner: string) => setOwner(domain, owner),
-    onSuccess: () => {
+    onSuccess: (_void, newOwner) => {
       setProblem(null);
       const previousOwner = query.data?.owner ?? null;
       const wasOwner =
         !capabilities.canAdminister &&
         user !== null &&
         previousOwner !== null &&
-        sameAccount(previousOwner, user.name);
+        sameAccount(previousOwner, user.name) &&
+        // Transferring to yourself changes nothing - the same account still
+        // owns it - so this is not the loss the other branch is for.
+        !sameAccount(newOwner, user.name);
       if (wasOwner) {
         leftTheDomain();
         return;
@@ -195,7 +225,6 @@ export function MembersCard({ domain }: { domain: string }) {
   });
 
   const visibility = useMutation({
-    retry: false,
     mutationFn: (makePrivate: boolean) => setVisibility(domain, makePrivate),
     onSuccess: (_void, makePrivate) => {
       setProblem(null);
@@ -235,6 +264,10 @@ export function MembersCard({ domain }: { domain: string }) {
     user?.name ?? null,
   );
   const isPrivate = data.visibility === "private";
+  // `readOnly` is a certainty this side already holds, not a derived right -
+  // see the constant's own doc for why that earns a different treatment
+  // (disabled and explained, never simply offered and left to be refused).
+  const disabledReason = capabilities.readOnly ? READ_ONLY_REASON : undefined;
 
   return (
     <section
@@ -271,6 +304,7 @@ export function MembersCard({ domain }: { domain: string }) {
         isPrivate={isPrivate}
         standing={standing}
         pending={visibility.isPending}
+        disabledReason={disabledReason}
         onChange={(makePrivate) => {
           setProblem(null);
           setNotice(null);
@@ -284,6 +318,7 @@ export function MembersCard({ domain }: { domain: string }) {
             owner={owner}
             standing={standing}
             pending={transfer.isPending}
+            disabledReason={disabledReason}
             onTransfer={(owner) => {
               setProblem(null);
               setNotice(null);
@@ -298,6 +333,7 @@ export function MembersCard({ domain }: { domain: string }) {
             relevelTarget={relevel.variables?.principal}
             removePending={remove.isPending}
             removeTarget={remove.variables}
+            disabledReason={disabledReason}
             onRelevel={(principal, level) => {
               setProblem(null);
               relevel.mutate({ principal, level });
@@ -313,9 +349,10 @@ export function MembersCard({ domain }: { domain: string }) {
               ownerless={owner === null}
               isAdmin={capabilities.canAdminister}
               pending={invite.isPending}
+              disabledReason={disabledReason}
               onInvite={(principal, level) => {
                 setProblem(null);
-                invite.mutate({ principal, level });
+                return invite.mutateAsync({ principal, level });
               }}
             />
           )}
@@ -343,11 +380,13 @@ function VisibilitySection({
   isPrivate,
   standing,
   pending,
+  disabledReason,
   onChange,
 }: {
   isPrivate: boolean;
   standing: MyStanding;
   pending: boolean;
+  disabledReason?: string | undefined;
   onChange: (makePrivate: boolean) => void;
 }) {
   // `standing.own` alone, on both directions: closing a shared domain is
@@ -365,6 +404,7 @@ function VisibilitySection({
         label={label}
         confirmLabel={`Confirm ${label.toLowerCase()}`}
         pending={pending}
+        disabledReason={disabledReason}
         onConfirm={() => {
           onChange(!isPrivate);
         }}
@@ -389,11 +429,13 @@ function OwnerRow({
   owner,
   standing,
   pending,
+  disabledReason,
   onTransfer,
 }: {
   owner: string | null;
   standing: MyStanding;
   pending: boolean;
+  disabledReason?: string | undefined;
   onTransfer: (owner: string) => void;
 }) {
   return (
@@ -406,8 +448,20 @@ function OwnerRow({
       ) : (
         <span>{owner}</span>
       )}
-      {standing.own && owner !== null && (
-        <TransferOwnership pending={pending} onTransfer={onTransfer} />
+      {/*
+        No `owner !== null` clause: `set_owner` needs only `DomainRight::Own`
+        and a private domain - it never inspects the current owner - and on
+        an ownerless domain `standing.own` already reduces to exactly "is an
+        admin", the owner clause of `own` having nothing to match. So this is
+        already admin-or-owner-only without the extra guard, and dropping it
+        is what gives an ownerless private domain a path back to having one.
+      */}
+      {standing.own && (
+        <TransferOwnership
+          pending={pending}
+          disabledReason={disabledReason}
+          onTransfer={onTransfer}
+        />
       )}
     </div>
   );
@@ -416,55 +470,26 @@ function OwnerRow({
 /** Hand the domain to a different account, by typing its login name and confirming. */
 function TransferOwnership({
   pending,
+  disabledReason,
   onTransfer,
 }: {
   pending: boolean;
+  disabledReason?: string | undefined;
   onTransfer: (owner: string) => void;
 }) {
-  const [confirming, setConfirming] = useState(false);
-  const [target, setTarget] = useState("");
-  const trigger = useRef<HTMLButtonElement>(null);
   const fieldId = useId();
-
-  function abandon() {
-    setConfirming(false);
-    setTarget("");
-    trigger.current?.focus();
-  }
-
   return (
-    <span
-      className="inline-flex flex-wrap items-center gap-2"
-      onKeyDown={(event) => {
-        if (event.key === "Escape" && confirming) {
-          event.stopPropagation();
-          abandon();
-        }
-      }}
-      onBlur={(event) => {
-        const next = event.relatedTarget;
-        if (
-          confirming &&
-          next instanceof Node &&
-          !event.currentTarget.contains(next)
-        ) {
-          setConfirming(false);
-        }
+    <DestructiveAction
+      label="Transfer ownership"
+      confirmLabel="Confirm transfer"
+      pending={pending}
+      disabledReason={disabledReason}
+      requireValue
+      onConfirm={(value) => {
+        onTransfer(value.trim());
       }}
     >
-      <button
-        ref={trigger}
-        type="button"
-        aria-expanded={confirming}
-        disabled={pending}
-        onClick={() => {
-          setConfirming(true);
-        }}
-        className={BUTTON.secondary}
-      >
-        Transfer ownership
-      </button>
-      {confirming && (
+      {(value, setValue) => (
         <>
           <label htmlFor={fieldId} className="sr-only">
             New owner
@@ -475,31 +500,15 @@ function TransferOwnership({
             required
             autoComplete="off"
             placeholder="login name"
-            value={target}
+            value={value}
             onChange={(event) => {
-              setTarget(event.target.value);
+              setValue(event.target.value);
             }}
             className={`w-40 ${FIELD}`}
           />
-          <button
-            type="button"
-            disabled={pending || target.trim() === ""}
-            onClick={() => {
-              const owner = target.trim();
-              setConfirming(false);
-              setTarget("");
-              onTransfer(owner);
-            }}
-            className={BUTTON.destructive}
-          >
-            Confirm transfer
-          </button>
-          <button type="button" onClick={abandon} className={BUTTON.secondary}>
-            Cancel
-          </button>
         </>
       )}
-    </span>
+    </DestructiveAction>
   );
 }
 
@@ -512,6 +521,7 @@ function MemberTable({
   relevelTarget,
   removePending,
   removeTarget,
+  disabledReason,
   onRelevel,
   onRemove,
 }: {
@@ -522,6 +532,7 @@ function MemberTable({
   relevelTarget: string | undefined;
   removePending: boolean;
   removeTarget: string | undefined;
+  disabledReason?: string | undefined;
   onRelevel: (principal: string, level: MemberLevel) => void;
   onRemove: (principal: string) => void;
 }) {
@@ -570,6 +581,7 @@ function MemberTable({
                 removePending={
                   removePending && removeTarget === member.principal
                 }
+                disabledReason={disabledReason}
                 onRelevel={(level) => {
                   onRelevel(member.principal, level);
                 }}
@@ -592,6 +604,7 @@ function MemberRow({
   mayRemove,
   relevelPending,
   removePending,
+  disabledReason,
   onRelevel,
   onRemove,
 }: {
@@ -601,10 +614,12 @@ function MemberRow({
   mayRemove: boolean;
   relevelPending: boolean;
   removePending: boolean;
+  disabledReason?: string | undefined;
   onRelevel: (level: MemberLevel) => void;
   onRemove: () => void;
 }) {
   const selectId = useId();
+  const reasonId = useId();
   const removeLabel = isSelf ? "Leave" : "Remove";
   return (
     <tr className="align-top">
@@ -625,7 +640,10 @@ function MemberRow({
             <select
               id={selectId}
               value={member.level}
-              disabled={relevelPending}
+              disabled={relevelPending || disabledReason !== undefined}
+              aria-describedby={
+                disabledReason !== undefined ? reasonId : undefined
+              }
               onChange={(event) => {
                 onRelevel(event.target.value as MemberLevel);
               }}
@@ -637,6 +655,11 @@ function MemberRow({
                 </option>
               ))}
             </select>
+            {disabledReason !== undefined && (
+              <span id={reasonId} className="sr-only">
+                {disabledReason}
+              </span>
+            )}
           </>
         ) : (
           member.level
@@ -651,6 +674,7 @@ function MemberRow({
             ariaLabel={`${removeLabel} ${member.principal}`}
             confirmAriaLabel={`Confirm ${removeLabel.toLowerCase()} ${member.principal}`}
             pending={removePending}
+            disabledReason={disabledReason}
             onConfirm={onRemove}
           />
         )}
@@ -664,12 +688,20 @@ function InviteForm({
   ownerless,
   isAdmin,
   pending,
+  disabledReason,
   onInvite,
 }: {
   ownerless: boolean;
   isAdmin: boolean;
   pending: boolean;
-  onInvite: (principal: string, level: MemberLevel) => void;
+  disabledReason?: string | undefined;
+  /**
+   * Returns the request's own promise rather than firing and forgetting: the
+   * field below clears once this resolves, not once it is merely sent, so a
+   * refusal leaves the typed name on screen to be fixed instead of thrown
+   * away.
+   */
+  onInvite: (principal: string, level: MemberLevel) => Promise<unknown>;
 }) {
   const assigning = ownerless && isAdmin;
   const [principal, setPrincipal] = useState("");
@@ -678,6 +710,8 @@ function InviteForm({
   );
   const nameField = useId();
   const levelField = useId();
+  const reasonId = useId();
+  const disabled = pending || disabledReason !== undefined;
 
   return (
     <form
@@ -685,16 +719,24 @@ function InviteForm({
       onSubmit={(event) => {
         event.preventDefault();
         const trimmed = principal.trim();
-        if (trimmed === "" || pending) {
+        if (trimmed === "" || disabled) {
           return;
         }
-        onInvite(trimmed, level);
-        setPrincipal("");
+        onInvite(trimmed, level)
+          .then(() => {
+            setPrincipal("");
+          })
+          .catch(() => {
+            // Refused: the card above already shows the server's own words,
+            // and the typed name stays so it can be fixed rather than
+            // retyped from scratch.
+          });
       }}
     >
       {assigning && (
         <p className="w-full text-sm text-slate-500 dark:text-slate-400">
-          This domain has no owner. Invite someone as manager to administer it.
+          This domain has no owner. Invite someone as manager to administer it,
+          or transfer ownership to assign one directly.
         </p>
       )}
       <Field id={nameField} label="Account">
@@ -726,9 +768,19 @@ function InviteForm({
           ))}
         </select>
       </Field>
-      <button type="submit" disabled={pending} className={BUTTON.primary}>
+      <button
+        type="submit"
+        disabled={disabled}
+        aria-describedby={disabledReason !== undefined ? reasonId : undefined}
+        className={BUTTON.primary}
+      >
         {assigning ? "Assign manager" : "Invite"}
       </button>
+      {disabledReason !== undefined && (
+        <span id={reasonId} className="sr-only">
+          {disabledReason}
+        </span>
+      )}
     </form>
   );
 }
@@ -741,7 +793,10 @@ function InviteForm({
  * The pattern this repeats to the letter is `Profile.tsx`'s `TokenRow` and
  * `DomainHome.tsx`'s own `UnregisterDomain` - a dialog the browser owns
  * cannot be reached by a test, styled, or dismissed by keyboard the way this
- * can.
+ * can. `TransferOwnership` is built on this one rather than hand-rolling the
+ * same machinery a third time in this file: `children` is the one thing it
+ * needs beyond a plain confirm, an extra control rendered between trigger and
+ * confirm that carries its own value through to `onConfirm`.
  */
 function DestructiveAction({
   label,
@@ -749,6 +804,9 @@ function DestructiveAction({
   ariaLabel,
   confirmAriaLabel,
   pending,
+  disabledReason,
+  requireValue = false,
+  children,
   onConfirm,
 }: {
   label: string;
@@ -762,15 +820,29 @@ function DestructiveAction({
   /** Same reason, for the confirm press. Defaults to `confirmLabel`. */
   confirmAriaLabel?: string;
   pending: boolean;
-  onConfirm: () => void;
+  /**
+   * When set, the trigger is disabled and this is exposed as its accessible
+   * description - a certainty already held, not a right this side is merely
+   * guessing at, so the door is shown shut rather than removed.
+   */
+  disabledReason?: string | undefined;
+  /** Whether the confirm press needs a non-empty `value` before it may fire. */
+  requireValue?: boolean;
+  /** An extra control rendered between trigger and confirm, e.g. a text field. */
+  children?: (value: string, setValue: (value: string) => void) => ReactNode;
+  onConfirm: (value: string) => void;
 }): ReactElement {
   const [confirming, setConfirming] = useState(false);
+  const [value, setValue] = useState("");
   const trigger = useRef<HTMLButtonElement>(null);
   const name = ariaLabel ?? label;
   const confirmName = confirmAriaLabel ?? confirmLabel;
+  const reasonId = useId();
+  const disabled = pending || disabledReason !== undefined;
 
   function abandon() {
     setConfirming(false);
+    setValue("");
     trigger.current?.focus();
   }
 
@@ -799,7 +871,8 @@ function DestructiveAction({
         type="button"
         aria-label={name}
         aria-expanded={confirming}
-        disabled={pending}
+        aria-describedby={disabledReason !== undefined ? reasonId : undefined}
+        disabled={disabled}
         onClick={() => {
           setConfirming(true);
         }}
@@ -807,16 +880,24 @@ function DestructiveAction({
       >
         {label}
       </button>
+      {disabledReason !== undefined && (
+        <span id={reasonId} className="sr-only">
+          {disabledReason}
+        </span>
+      )}
       {confirming && (
         <>
+          {children?.(value, setValue)}
           <button
             type="button"
-            autoFocus
+            autoFocus={children === undefined}
             aria-label={confirmName}
-            disabled={pending}
+            disabled={pending || (requireValue && value.trim() === "")}
             onClick={() => {
               setConfirming(false);
-              onConfirm();
+              const confirmed = value;
+              setValue("");
+              onConfirm(confirmed);
             }}
             className={BUTTON.destructive}
           >

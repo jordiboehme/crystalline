@@ -292,6 +292,22 @@ describe("registering a domain", () => {
     });
   });
 
+  it("tells the truth about who private protects a domain from, instance admins included", async () => {
+    serveAs("admin");
+    renderApp("/users");
+
+    const dialog = await openFromSidebar();
+
+    // Instance admins always see and administer every domain (a locked
+    // global constraint), so "only you" is false the moment a second admin
+    // exists - the caption has to say so.
+    expect(
+      within(dialog).getByText(
+        "Only you and this instance's admins can reach it until you invite somebody else in.",
+      ),
+    ).toBeVisible();
+  });
+
   it("a cached disconnected answer never gates a local registration", async () => {
     // The regression the browser smoke caught: the top bar's share readiness
     // probe fills the GitHub-status cache on every screen, and on a

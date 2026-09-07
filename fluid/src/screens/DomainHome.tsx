@@ -276,10 +276,12 @@ export default function DomainHome() {
         No capability gate here: `GET /members` is served to any account that
         may see the domain at all, and the card itself decides what it may
         offer from what that read says (its own row, the owner, the admin
-        flag) rather than from an instance-wide capability. It draws nothing
-        while the read is in flight or was refused - see its own module
-        doc - so an editor on a domain nobody ever made private sees nothing
-        here at all.
+        flag) rather than from an instance-wide capability. On a shared
+        domain it still draws something for every account there - the shared
+        state, and an admin's own way to close it - so it is page furniture
+        on any domain nobody ever made private, not only on a private one;
+        it draws nothing only while the read is in flight or was refused -
+        see its own module doc.
       */}
       <MembersCard domain={domain} />
 

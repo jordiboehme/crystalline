@@ -233,7 +233,7 @@ describe("the members card", () => {
     expect(within(card).getByText("viewer")).toBeVisible();
   });
 
-  it("renders an ownerless domain honestly, and offers an admin an assign-manager form", async () => {
+  it("renders an ownerless domain honestly, and offers an admin both an assign-manager form and a way to give it an owner", async () => {
     serve(
       {
         "/domains/eng/members": () =>
@@ -249,9 +249,12 @@ describe("the members card", () => {
     expect(
       within(card).getByText(/No owner - removed from the account roster/),
     ).toBeVisible();
+    // `set_owner` needs only `DomainRight::Own` and a private domain - it
+    // never inspects the current owner - so an admin has a path back to a
+    // domain having one at all, not only the assign-manager route.
     expect(
-      within(card).queryByRole("button", { name: "Transfer ownership" }),
-    ).toBeNull();
+      within(card).getByRole("button", { name: "Transfer ownership" }),
+    ).toBeVisible();
     expect(within(card).getByText(/This domain has no owner/)).toBeVisible();
     expect(
       within(card).getByRole("button", { name: "Assign manager" }),
@@ -263,6 +266,33 @@ describe("the members card", () => {
     expect(
       within(card).getByRole("button", { name: "Share with everyone" }),
     ).toBeVisible();
+  });
+
+  it("gives a manager on an ownerless domain neither owner control", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({
+            owner: null,
+            visibility: "private",
+            members: [memberFixture({ principal: "mgr", level: "manager" })],
+          }),
+      },
+      "mgr",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    expect(
+      within(card).queryByRole("button", { name: "Transfer ownership" }),
+    ).toBeNull();
+    expect(
+      within(card).queryByRole("button", { name: "Assign manager" }),
+    ).toBeNull();
+    // It still invites at an ordinary level, the manage right in full.
+    expect(within(card).getByRole("button", { name: "Invite" })).toBeVisible();
   });
 
   it("offers an admin the way to close a shared domain, with the disk-truth caption", async () => {
@@ -320,7 +350,7 @@ describe("the members card", () => {
     ).toBeNull();
   });
 
-  it("invites an account at the level chosen in the form", async () => {
+  it("invites an account at the level chosen in the form, and clears the field once it lands", async () => {
     serve(
       {
         "/domains/eng/members": () =>
@@ -351,10 +381,36 @@ describe("the members card", () => {
         level: "editor",
       });
     });
-    // The form clears once the invite lands, ready for the next one.
+    // The form clears on the invite's own success, not on submit - so this
+    // is the request having landed, not merely having been sent.
     await waitFor(() => {
       expect(within(card).getByLabelText("Account")).toHaveValue("");
     });
+  });
+
+  it("keeps a refused invite's typed name on screen instead of discarding it", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private", members: [] }),
+        "/domains/eng/members/nobody": () => {
+          throw new ApiProblem(422, "unprocessable", "no such account");
+        },
+      },
+      "ada",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    await userEvent.type(within(card).getByLabelText("Account"), "nobody");
+    await userEvent.click(within(card).getByRole("button", { name: "Invite" }));
+
+    // The refusal renders, and the typed name stays so it can be fixed rather
+    // than retyped.
+    expect(await within(card).findByText(/no such account/)).toBeVisible();
+    expect(within(card).getByLabelText("Account")).toHaveValue("nobody");
   });
 
   it("changes a member's level from its row", async () => {
@@ -536,5 +592,145 @@ describe("the members card", () => {
       });
     });
     expect(await screen.findByRole("heading", { name: "Home" })).toBeVisible();
+  });
+
+  it("stays put when an owner transfers a domain to itself, since nothing changed", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({ owner: "ada", visibility: "private", members: [] }),
+        "/domains/eng/owner": (_path, init) => {
+          if (init?.method === "PUT") {
+            return undefined;
+          }
+          throw new ApiProblem(405, "method not allowed", "unexpected method");
+        },
+      },
+      "ada",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Transfer ownership" }),
+    );
+    await userEvent.type(within(card).getByLabelText("New owner"), "ada");
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Confirm transfer" }),
+    );
+
+    await waitFor(() => {
+      expect(sentBody("/domains/eng/owner", "PUT")).toEqual({ owner: "ada" });
+    });
+    // A transfer to the same account the caller already is loses it nothing,
+    // unlike handing the domain to somebody else - so it is not bounced away.
+    expect(await within(card).findByText("ada")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Home" })).toBeNull();
+  });
+
+  it("keeps an admin who is also a member on the page after it leaves, since an admin never lost the domain", async () => {
+    serve(
+      {
+        "/domains/eng/members": () =>
+          membersResponse({
+            owner: "ada",
+            visibility: "private",
+            members: [memberFixture({ principal: "boss", level: "viewer" })],
+          }),
+        "/domains/eng/members/boss": (_path, init) => {
+          if (init?.method === "DELETE") {
+            return undefined;
+          }
+          throw new ApiProblem(405, "method not allowed", "unexpected method");
+        },
+      },
+      "boss",
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Leave boss" }),
+    );
+    await userEvent.click(
+      within(card).getByRole("button", { name: "Confirm leave boss" }),
+    );
+
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.some(
+          ([sent, init]) =>
+            sent === "/domains/eng/members/boss" && init?.method === "DELETE",
+        ),
+      ).toBe(true);
+    });
+    // `decide` answers `Own` for any admin before it ever looks at the acl -
+    // an admin keeps the domain regardless of its own row, unlike a plain
+    // member, so it is not bounced to `/`.
+    expect(await screen.findByText("boss")).toBeVisible();
+    expect(screen.queryByRole("heading", { name: "Home" })).toBeNull();
+  });
+
+  it("draws only the plain shared state for an anonymous viewer of a shared domain", async () => {
+    serve(
+      {
+        "/auth/me": () => meResponse({ anonymous: true }),
+      },
+      "ada",
+      "editor",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    expect(
+      within(card).getByText(
+        "Every account on this instance can read this domain.",
+      ),
+    ).toBeVisible();
+    expect(
+      within(card).queryByRole("button", { name: "Make private" }),
+    ).toBeNull();
+  });
+
+  it("disables its five mutation controls on a read-only instance, with the reason as their accessible description", async () => {
+    serve(
+      {
+        "/auth/me": () =>
+          meResponse({
+            user: userFixture({ name: "boss", role: "admin" }),
+            read_only: true,
+          }),
+        "/domains/eng/members": () =>
+          membersResponse({
+            owner: "ada",
+            visibility: "private",
+            members: [memberFixture({ principal: "mem", level: "editor" })],
+          }),
+      },
+      "boss",
+      "admin",
+    );
+
+    renderApp("/d/eng");
+    const card = await membersCard();
+
+    const reason =
+      "This instance is read only, so nothing here can be changed.";
+    const controls = [
+      within(card).getByRole("button", { name: "Share with everyone" }),
+      within(card).getByRole("button", { name: "Transfer ownership" }),
+      within(card).getByRole("combobox", { name: "Level for mem" }),
+      within(card).getByRole("button", { name: "Remove mem" }),
+      within(card).getByRole("button", { name: "Invite" }),
+    ];
+    for (const control of controls) {
+      expect(control).toBeDisabled();
+      expect(control).toHaveAccessibleDescription(reason);
+    }
   });
 });

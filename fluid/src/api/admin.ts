@@ -289,7 +289,13 @@ export interface CreateDomainBody {
   repo?: string;
   branch?: string;
   path?: string;
-  private?: boolean;
+  // Indexed off the generated schema rather than hand-typed `boolean`: the
+  // `const wire: CreateDomainWireBody = body` check below already catches a
+  // required field going missing or changing shape, but not this one being
+  // dropped from the schema outright (an excess optional field on a
+  // variable, as opposed to an object literal, is not flagged). Indexing it
+  // is what turns that removal into a compile error here too.
+  private?: NonNullable<CreateDomainWireBody["private"]>;
 }
 
 /** What a registration reports back: the name it took, and where it landed. */

@@ -329,7 +329,8 @@ export default function CreateDomainDialogBody({
                 id={`${privateField}-help`}
                 className="text-caption pl-6 text-slate-500 dark:text-slate-400"
               >
-                Only you can reach it until you invite somebody else in.
+                Only you and this instance's admins can reach it until you
+                invite somebody else in.
               </p>
             </div>
 
