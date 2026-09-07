@@ -3547,8 +3547,14 @@ fn remove_domain_question(preview: &Value) -> String {
     let held = match preview["engrams"].as_u64() {
         Some(1) => " holding 1 engram".to_string(),
         Some(n) => format!(" holding {n} engrams"),
-        // The index has no row for it, which is a domain nothing has synced
-        // rather than an empty one; saying so beats claiming a count.
+        // Two different absences, and a question about deleting somebody's
+        // knowledge owes them the difference. An index that could not be read
+        // is a number that exists and is unavailable, so the question says so
+        // instead of falling silent; a plain absence is a domain nothing has
+        // synced, and saying nothing beats claiming a count of zero.
+        None if preview["engrams_unknown"].as_bool().unwrap_or(false) => {
+            " whose engram count could not be read".to_string()
+        }
         None => String::new(),
     };
     let consequence = match kind {
@@ -4274,6 +4280,26 @@ mod tests {
         let unknown = question("file", Value::Null);
         assert!(unknown.contains("domain 'kb'?"), "{unknown}");
         assert!(!unknown.contains("holding"), "{unknown}");
+
+        // A count that could not be read is the other absence, and the
+        // question owes a caller the difference: this one is a number that
+        // exists and is unavailable, not a domain that has synced nothing.
+        let unreadable = remove_domain_question(&json!({
+            "domain": "kb",
+            "kind": "virtual",
+            "engrams": Value::Null,
+            "engrams_unknown": true,
+            "files_kept": false,
+        }));
+        assert!(
+            unreadable.contains("whose engram count could not be read"),
+            "{unreadable}"
+        );
+        assert!(
+            unreadable.contains("cannot be undone"),
+            "and it still spells out what the removal costs: {unreadable}"
+        );
+        assert!(!unreadable.contains("holding"), "{unreadable}");
     }
 
     #[test]

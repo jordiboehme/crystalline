@@ -848,6 +848,42 @@ pub enum ShareActor {
 /// This is a preview-only choice. The share itself always resolves the acting
 /// identity's own credential and refuses without it, in every mode and on every
 /// surface, which is what makes serving the plan a read rather than a loophole.
+/// What a removal knows about how much knowledge is at stake.
+///
+/// The two absent cases are not the same fact, and keeping them apart is the
+/// whole point of the type: a domain the index holds no row for has synced
+/// nothing, while a count that could not be read is a number that exists and is
+/// unavailable. Collapsing them into one `None` is how a purge gate fails open,
+/// and it is what leaves a confirmation question quietly missing the figure it
+/// promises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemovalCount {
+    /// The index answered: this many engrams.
+    Known(i64),
+    /// The index answered and holds no row for this domain.
+    Absent,
+    /// The index could not be read. For a virtual domain this only reaches a
+    /// caller that already set `purge`; without it the unknown count is a
+    /// refusal.
+    Unreadable,
+}
+
+impl RemovalCount {
+    /// The count as a preview reports it: the number, or null for either
+    /// absent case. `engrams_unknown` beside it is what tells them apart.
+    fn as_json(self) -> Value {
+        match self {
+            RemovalCount::Known(n) => Value::from(n),
+            RemovalCount::Absent | RemovalCount::Unreadable => Value::Null,
+        }
+    }
+
+    /// Whether the count is absent because the index could not be read.
+    fn is_unreadable(self) -> bool {
+        matches!(self, RemovalCount::Unreadable)
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewCredential {
     /// The share's own, or the share's own refusal. A caller about to ASK
@@ -9111,37 +9147,45 @@ impl Engine {
         name: &str,
         entry: &DomainEntry,
         purge: bool,
-    ) -> Result<Option<i64>> {
+    ) -> Result<RemovalCount> {
         let store = self.store.lock().await;
         let stats = store.domain_stats().await;
         drop(store);
+        let counted = match &stats {
+            Ok(rows) => match rows.iter().find(|d| d.name == name) {
+                Some(row) => RemovalCount::Known(row.engrams),
+                None => RemovalCount::Absent,
+            },
+            Err(_) => RemovalCount::Unreadable,
+        };
         // The kind first: a file or team domain loses no knowledge here, so a
         // read that failed only costs it the number.
         if !entry.is_virtual() {
-            return Ok(stats
-                .ok()
-                .and_then(|stats| stats.iter().find(|d| d.name == name).map(|d| d.engrams)));
+            return Ok(counted);
         }
-        let engrams = match stats {
-            Ok(stats) => stats.iter().find(|d| d.name == name).map(|d| d.engrams),
-            Err(e) if purge => {
+        match (counted, purge) {
+            (RemovalCount::Unreadable, false) => return Err(Engine::purge_refusal(name, None)),
+            (RemovalCount::Unreadable, true) => {
                 // Already confirmed: the removal proceeds and the receipt is
                 // one number poorer. Logged rather than swallowed silently,
                 // because an index that cannot be swept is worth knowing about.
                 tracing::warn!(
                     domain = name,
-                    error = format!("{e:#}"),
+                    error = stats
+                        .as_ref()
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_default(),
                     "the engram count for '{name}' could not be read; the confirmed removal \
                      proceeds without it"
                 );
-                None
             }
-            Err(_) => return Err(Engine::purge_refusal(name, None)),
-        };
-        if !purge && engrams.is_some_and(|n| n > 0) {
-            return Err(Engine::purge_refusal(name, engrams));
+            (RemovalCount::Known(n), false) if n > 0 => {
+                return Err(Engine::purge_refusal(name, Some(n)));
+            }
+            _ => {}
         }
-        Ok(engrams)
+        Ok(counted)
     }
 
     /// Whether `name` is a domain the environment defines, as the conflict both
@@ -9226,7 +9270,12 @@ impl Engine {
         Ok(json!({
             "domain": name,
             "kind": Engine::removal_kind(&entry),
-            "engrams": engrams,
+            "engrams": engrams.as_json(),
+            // Why the count is absent, so the question can say which: an index
+            // that could not be read is a number that exists and is
+            // unavailable, and it reads nothing like a domain that has synced
+            // nothing yet.
+            "engrams_unknown": engrams.is_unreadable(),
             "files_kept": !entry.is_virtual(),
         }))
     }

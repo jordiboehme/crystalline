@@ -765,6 +765,20 @@ async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_pur
         "and its files are where they were"
     );
 
+    // And on the confirmed path, where the count is a figure in a question
+    // rather than a gate, the preview says the number is missing instead of
+    // letting the question fall silent about how much is at stake.
+    let preview = engine
+        .domain_remove_preview("mind", &Scope::Unrestricted, true)
+        .await
+        .expect("a confirmed removal previews even with the count unavailable");
+    assert_eq!(preview["engrams"], serde_json::Value::Null);
+    assert_eq!(
+        preview["engrams_unknown"],
+        serde_json::json!(true),
+        "the absence has a reason and the preview carries it: {preview}"
+    );
+
     // With the loss already confirmed there is nothing left to ask about, so
     // the same unreadable count no longer stands in the way.
     let purged = engine
