@@ -120,6 +120,7 @@ impl RestCtx {
                 proxy_headers: None,
                 anonymous: Some(true),
                 mcp: None,
+                oauth: None,
                 max_users: None,
                 oidc: None,
             }),

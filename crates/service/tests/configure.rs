@@ -56,7 +56,7 @@ async fn show_lists_every_registry_key_at_its_default() {
 
     let data = engine.configure(&ConfigureAction::Show).await.unwrap();
     let views = settings_of(&data);
-    assert_eq!(views.len(), 33);
+    assert_eq!(views.len(), 34);
     assert!(
         views
             .iter()

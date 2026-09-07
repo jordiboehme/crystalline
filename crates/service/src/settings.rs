@@ -387,6 +387,16 @@ pub fn registry() -> &'static [SettingSpec] {
             effective: mcp_effective,
         },
         SettingSpec {
+            key: "auth.oauth",
+            doc: "Serve OAuth for MCP clients: the well-known metadata, dynamic client registration, authorization with a consent page and a token endpoint, so a hosted client such as Claude.ai connects without a pasted token; requires auth.mcp, since the tokens it issues are checked at that gate (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            secret: false,
+            apply: set_oauth,
+            clear: clear_oauth,
+            effective: oauth_effective,
+        },
+        SettingSpec {
             key: "auth.max_users",
             doc: "How many accounts trusted-header provisioning may mint in total (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
             kind: SettingKind::String,
@@ -1439,6 +1449,28 @@ fn mcp_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_mcp().to_string(), is_default)
 }
 
+// --- auth.oauth -----------------------------------------------------------
+
+fn set_oauth(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("auth.oauth must be true or false, got '{value}'")))?;
+    config.auth.get_or_insert_with(AuthConfig::default).oauth = Some(parsed);
+    Ok(())
+}
+
+fn clear_oauth(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.oauth = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn oauth_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.oauth).is_none();
+    (config.auth_oauth().to_string(), is_default)
+}
+
 // --- auth.proxy_headers -------------------------------------------------------
 
 fn set_proxy_headers(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1813,7 +1845,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_thirty_three_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_four_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1841,6 +1873,7 @@ mod tests {
                 "auth.trusted_header",
                 "auth.anonymous",
                 "auth.mcp",
+                "auth.oauth",
                 "auth.max_users",
                 "auth.proxy_headers",
                 "auth.oidc.issuer",
@@ -1918,6 +1951,7 @@ mod tests {
                 ),
                 ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
                 ("auth.mcp", "CRYSTALLINE_AUTH_MCP".to_string()),
+                ("auth.oauth", "CRYSTALLINE_AUTH_OAUTH".to_string()),
                 ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
                 (
                     "auth.proxy_headers",
@@ -2439,7 +2473,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 33);
+        assert_eq!(views.len(), 34);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -2467,6 +2501,7 @@ mod tests {
                 "auth.trusted_header",
                 "auth.anonymous",
                 "auth.mcp",
+                "auth.oauth",
                 "auth.max_users",
                 "auth.proxy_headers",
                 "auth.oidc.issuer",
@@ -3136,6 +3171,31 @@ mod tests {
         assert!(config.auth_mcp());
         unset(&mut config, "auth.mcp").unwrap();
         assert!(!config.auth_mcp());
+    }
+
+    // --- auth.oauth -----------------------------------------------------------
+
+    #[test]
+    fn auth_oauth_round_trips_and_needs_auth_mcp() {
+        let mut config = GlobalConfig::default();
+        assert!(!config.auth_oauth());
+        apply(&mut config, "auth.oauth", "true").unwrap();
+        assert!(config.auth_oauth());
+        assert_eq!(oauth_effective(&config), ("true".to_string(), false));
+
+        let no_env = EnvOverlay::default();
+        assert!(change_note("auth.oauth", &no_env).is_some());
+
+        let err = crate::rest::AuthCfg::resolve(&config)
+            .expect_err("auth.oauth without auth.mcp must refuse to resolve");
+        assert!(err.to_string().contains("auth.mcp"), "{err}");
+
+        unset(&mut config, "auth.oauth").unwrap();
+        assert!(!config.auth_oauth());
+        assert!(
+            config.auth.is_none(),
+            "the block this key created goes with it"
+        );
     }
 
     // --- auth.proxy_headers ---------------------------------------------------

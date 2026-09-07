@@ -2174,6 +2174,7 @@ mod tests {
                 proxy_headers: None,
                 anonymous: None,
                 mcp: None,
+                oauth: None,
                 max_users: None,
                 oidc: Some(oidc),
             }),

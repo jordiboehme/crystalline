@@ -80,6 +80,7 @@ async fn serve(opts: Options) -> Fixture {
             proxy_headers: None,
             anonymous: Some(opts.anonymous),
             mcp: None,
+            oauth: None,
             max_users: None,
             oidc: None,
         }),

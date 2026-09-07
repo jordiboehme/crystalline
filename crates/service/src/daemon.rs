@@ -1278,6 +1278,14 @@ fn http_base(
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
 
+    // `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
+    // off there is nowhere for them to live, so the refusal happens here
+    // rather than waiting for `RestState::new` below, which never runs when
+    // `api` is false.
+    if engine.config().auth_oauth() && !api {
+        anyhow::bail!("auth.oauth needs service.api: its endpoints live under /api/v1");
+    }
+
     // Every HTTP caller is answered through a resolved scope, so the engine
     // gets the resolver the moment the store behind it exists. Installed here,
     // in the one function both router builders funnel through, rather than at

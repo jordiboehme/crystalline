@@ -30,6 +30,11 @@ struct AuthOptions {
     /// `auth.max_users`: how many accounts trusted-header provisioning may
     /// mint in total. `None` leaves the default cap (100) in place.
     max_users: Option<u32>,
+    /// `auth.oauth`: serve OAuth for MCP clients. Off by default.
+    oauth: bool,
+    /// `service.api`: serve the JSON API under `/api/v1`. `None` leaves the
+    /// default of on in place.
+    api: Option<bool>,
 }
 
 /// Build the same kind of engine the other service integration tests use: a
@@ -55,6 +60,7 @@ async fn build_engine_with(
             proxy_headers: opts.proxy_headers.then_some(true),
             anonymous: Some(opts.anonymous),
             mcp: None,
+            oauth: Some(opts.oauth),
             max_users: opts.max_users,
             oidc: None,
         }),
@@ -99,6 +105,7 @@ async fn build_engine_with(
         .insert("void".to_string(), DomainEntry::virtual_domain());
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
+        api: opts.api,
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -1408,6 +1415,57 @@ async fn both_header_modes_together_refuse_to_serve() {
         .expect_err("a router must not be built on a contradictory auth config");
     let text = format!("{err:#}");
     assert!(text.contains("pick one"), "{text}");
+}
+
+/// `auth.oauth` issues the credential `auth.mcp` checks, so serving OAuth
+/// without the gate it feeds would mint tokens nothing ever verifies. The
+/// combination is refused at startup, the same treatment the two header
+/// modes together get above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_without_mcp_refuses_the_http_endpoint() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            oauth: true,
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built with auth.oauth on and auth.mcp off");
+    let text = format!("{err:#}");
+    assert!(text.contains("auth.mcp"), "{text}");
+}
+
+/// `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
+/// off there is nowhere for them to live, so the combination is refused at
+/// startup before `RestState::new` (which never runs when `service.api` is
+/// off) ever gets a chance to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_without_api_refuses_the_http_endpoint() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            oauth: true,
+            api: Some(false),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built with auth.oauth on and service.api off");
+    let text = format!("{err:#}");
+    assert!(text.contains("service.api"), "{text}");
 }
 
 /// Logout is a mutating request, so it carries the CSRF token the session was

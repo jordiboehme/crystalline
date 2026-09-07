@@ -286,6 +286,12 @@ impl GlobalConfig {
         self.auth.as_ref().and_then(|a| a.mcp).unwrap_or(false)
     }
 
+    /// Whether OAuth is served for MCP clients, from `auth.oauth`. Absent
+    /// config or an absent key means off (false).
+    pub fn auth_oauth(&self) -> bool {
+        self.auth.as_ref().and_then(|a| a.oauth).unwrap_or(false)
+    }
+
     /// `auth.max_users`. Absent config or an absent key means the default cap.
     pub fn auth_max_users(&self) -> usize {
         self.auth
@@ -685,6 +691,13 @@ pub struct AuthConfig {
     /// MCP token. Absent means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mcp: Option<bool>,
+    /// Serve OAuth for MCP clients: the well-known metadata, dynamic client
+    /// registration, authorization with a consent page and a token endpoint,
+    /// so a hosted client such as Claude.ai connects without a pasted token.
+    /// Requires `auth.mcp`, since the tokens it issues are checked at that
+    /// gate. Absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<bool>,
     /// `auth.max_users`. How many accounts trusted-header provisioning may
     /// mint in total; absent means the default of 100. The CLI is never
     /// capped.

@@ -479,6 +479,7 @@ async fn serve<E: RustEmbed + 'static>(opts: Options) -> Server {
             proxy_headers: None,
             anonymous: Some(opts.anonymous),
             mcp: None,
+            oauth: None,
             max_users: None,
             oidc: None,
         }),

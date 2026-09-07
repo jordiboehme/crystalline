@@ -161,6 +161,9 @@ pub struct AuthCfg {
     /// Whether every MCP connection over HTTP requires authentication with a
     /// personal MCP token, from `auth.mcp`.
     pub mcp: bool,
+    /// Whether OAuth is served for MCP clients, from `auth.oauth`. Requires
+    /// `mcp`, since the tokens it issues are checked at that gate.
+    pub oauth: bool,
     /// How many accounts trusted-header provisioning may mint in total, from
     /// `auth.max_users`. Only minting a *new* account is capped; an existing
     /// one always resolves, and the `crystalline users` CLI is never capped.
@@ -175,6 +178,7 @@ impl Default for AuthCfg {
             proxy_role: DEFAULT_OIDC_ROLE,
             anonymous: false,
             mcp: false,
+            oauth: false,
             max_users: crystalline_core::config::DEFAULT_MAX_USERS,
         }
     }
@@ -216,12 +220,21 @@ impl AuthCfg {
             .and_then(|oidc| oidc.default_role.as_deref())
             .and_then(|raw| raw.parse::<Role>().ok())
             .unwrap_or(DEFAULT_OIDC_ROLE);
+        let mcp = config.auth_mcp();
+        let oauth = config.auth_oauth();
+        if oauth && !mcp {
+            anyhow::bail!(
+                "auth.oauth needs auth.mcp: OAuth issues the credential the MCP gate \
+                 checks, and with the gate off nothing would check it"
+            );
+        }
         Ok(AuthCfg {
             trusted_header,
             proxy_headers,
             proxy_role,
             anonymous: config.auth_anonymous(),
-            mcp: config.auth_mcp(),
+            mcp,
+            oauth,
             max_users: config.auth_max_users(),
         })
     }
@@ -1930,6 +1943,7 @@ mod tests {
             proxy_headers: None,
             anonymous: Some(true),
             mcp: None,
+            oauth: None,
             max_users: Some(5),
             oidc: None,
         });
@@ -1943,6 +1957,7 @@ mod tests {
             proxy_headers: None,
             anonymous: None,
             mcp: None,
+            oauth: None,
             max_users: None,
             oidc: None,
         });
