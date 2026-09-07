@@ -835,6 +835,17 @@ pub async fn domain_export(
 /// file is already there: a machine that has never had an account has no
 /// records to retire, and creating an accounts database as a side effect of a
 /// removal would be a surprising thing for this command to do.
+///
+/// **It does open the index, though, and that is a real change from the config
+/// edit this replaced.** The removal clears the domain's engram rows, so it
+/// needs the store the way `write` and `reindex` do: an embedded index file is
+/// created if this machine never had one, and a removal against an unreachable
+/// Postgres fails instead of quietly editing the YAML. The second is the
+/// important one and it is the right answer rather than a cost: in a shared
+/// database the rows are every instance's, so a config-only removal here would
+/// leave the domain live for everybody else while this machine stopped serving
+/// it. The error says so, and names the file an operator can edit by hand if
+/// their database is gone for good.
 pub async fn domain_remove(
     name: &str,
     purge: bool,
@@ -851,8 +862,18 @@ pub async fn domain_remove(
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
+    let config_file = loaded.path.clone();
     let db_path = resolve_db(db)?;
-    let engine = open_standalone(loaded, &db_path, false).await?;
+    let engine = open_standalone(loaded, &db_path, false)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{e:#}\n\nUnregistering a domain clears its rows from the index, so it needs the \
+                 index open. Start the database (or the daemon) and try again; if it is gone for \
+                 good, remove the domain's entry from {} by hand.",
+                config_file.display()
+            )
+        })?;
     if let Ok(auth_path) = crystalline_core::config::web_auth_db_path()
         && auth_path.exists()
     {
