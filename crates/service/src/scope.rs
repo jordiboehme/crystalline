@@ -125,6 +125,14 @@ fn decide(
                 return DomainRight::Own;
             }
             let Some(acl) = acl else {
+                // The `Admin` arm cannot be reached from here today: the
+                // early return above already answered every admin. It is
+                // spelled out rather than folded into a catch-all so this
+                // ladder stays a complete statement of what each instance
+                // role gets on a shared domain, and so that removing or
+                // narrowing that early return changes what an admin gets in
+                // one obvious place instead of silently dropping it to the
+                // wrong rung.
                 return match role {
                     Role::Viewer => DomainRight::Read,
                     Role::Editor => DomainRight::Write,
@@ -458,6 +466,80 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .contains("lab")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_re_added_owner_name_does_not_inherit_the_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        cast(&auth).await;
+        auth.set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        auth.upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        auth.remove_user("owner").await.unwrap();
+        // A different person, sitting down at a login name that was freed.
+        auth.add_user("owner", "owner", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth);
+        assert_eq!(
+            access.right(&user("owner", false), "lab").await.unwrap(),
+            DomainRight::None,
+            "the name is not the person: a re-added account inherits nothing"
+        );
+        assert!(
+            access
+                .hidden_domains(&user("owner", false))
+                .await
+                .unwrap()
+                .unwrap()
+                .contains("lab")
+        );
+        assert_eq!(
+            access.right(&user("boss", true), "lab").await.unwrap(),
+            DomainRight::Own,
+            "an ownerless private domain is administered by admins"
+        );
+        assert_eq!(
+            access.right(&user("mem", false), "lab").await.unwrap(),
+            DomainRight::Write,
+            "and the people invited into it keep their levels"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_scope_that_claims_admin_outranks_the_stored_role() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth = store(&dir).await;
+        cast(&auth).await;
+        auth.set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let access = DomainAccess::new(auth);
+        // `out` is a stored editor and no member of `lab`. The surface that
+        // authenticated the caller is the authority on the admin flag, so a
+        // scope carrying it outranks the row - the one place in this policy
+        // where a scope widens what the database says, pinned here rather than
+        // left to be discovered.
+        assert_eq!(
+            access.right(&user("out", false), "lab").await.unwrap(),
+            DomainRight::None
+        );
+        assert_eq!(
+            access.right(&user("out", true), "lab").await.unwrap(),
+            DomainRight::Own
+        );
+        assert!(
+            access
+                .hidden_domains(&user("out", true))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_empty()
         );
     }
 

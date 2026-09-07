@@ -474,7 +474,7 @@ CREATE TABLE IF NOT EXISTS mcp_tokens (
 );
 CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (user);
 CREATE TABLE IF NOT EXISTS domain_acl (
-    domain TEXT PRIMARY KEY,
+    domain TEXT PRIMARY KEY NOT NULL,
     visibility TEXT NOT NULL,
     owner TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -1041,6 +1041,7 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
                 .execute(
@@ -1082,6 +1083,7 @@ impl AuthStore {
             self.delete_sessions_of(&name).await?;
             self.delete_mcp_tokens_of(&name).await?;
             self.delete_memberships_of(&name).await?;
+            self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
                 .execute("DELETE FROM users WHERE name = ?1", key)
@@ -1788,17 +1790,29 @@ impl AuthStore {
             )
             .await
             .with_context(|| format!("reading the visibility of domain '{domain}'"))?;
+        // The name comes from the caller rather than from the row: this is a
+        // lookup by exact name, so the row's own copy can only agree, and
+        // defaulting an unreadable cell to `""` here would hand back an acl
+        // that names a domain nobody asked about. The owner keeps its default
+        // because `""` is the one value no live account can match, so an
+        // unreadable owner cell reads as owned by nobody - closed, not open.
         Ok(row.map(|row| DomainAcl {
-            domain: cell_text(&row, 0).unwrap_or_default(),
+            domain: domain.to_string(),
             owner: cell_text(&row, 1).unwrap_or_default(),
         }))
     }
 
     /// Make `domain` private, owned by `owner`, or make it shared again.
     ///
-    /// `private = true` writes (or replaces) the acl row and leaves any
+    /// `private = true` writes (or replaces) the acl row and leaves the
     /// existing membership alone, so changing the owner of an already-private
-    /// domain does not empty it. `private = false` deletes the acl row *and*
+    /// domain does not empty it. The one row it does drop is the incoming
+    /// owner's own membership, if it had one: an owner holds every level, so
+    /// the row could now only say less than the truth, and it would come back
+    /// to life the moment the domain is handed on again. This is the same step
+    /// [`AuthStore::transfer_domain`] takes, for the same reason - the two
+    /// paths that change an owner must agree. `private = false` deletes the acl
+    /// row *and*
     /// every membership row for the domain: membership only means anything
     /// while a domain is private, and leaving the rows behind would silently
     /// restore them if the domain were ever made private again by somebody
@@ -1849,6 +1863,18 @@ impl AuthStore {
                 .execute(
                     "DELETE FROM domain_acl WHERE domain = ?1",
                     vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("making domain '{domain}' private"))?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(owner.clone()),
+                    ],
                 )
                 .await
                 .with_context(|| format!("making domain '{domain}' private"))?;
@@ -1962,8 +1988,12 @@ impl AuthStore {
     }
 
     /// Invite `principal` to `domain` at `level`, or change the level it is
-    /// already there at. `added_by` is recorded as given: it is an audit field,
-    /// usually the acting account's name.
+    /// already there at. `added_by` is recorded as given (trimmed): it is an
+    /// audit field, usually the acting account's name, and it is not resolved
+    /// against the users table because a non-account actor may legitimately
+    /// grant membership. It may not be empty, though - a blank "invited by" is
+    /// not an audit trail, and it is what a caller that forgot to pass one
+    /// would write.
     ///
     /// Three things are refused, all inside the one transaction that also does
     /// the write so none of them can be raced past:
@@ -1986,6 +2016,9 @@ impl AuthStore {
         let domain = normalize_domain(domain)?;
         let principal = normalize_name(principal)?;
         let added_by = added_by.trim().to_string();
+        if added_by.is_empty() {
+            bail!("recording a membership needs an actor to record it as");
+        }
         let now = chrono::Utc::now().to_rfc3339();
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -1994,12 +2027,14 @@ impl AuthStore {
         let result = async {
             let Some(acl) = self.acl_of(&domain).await? else {
                 bail!(
-                    "domain '{domain}' is not private, so it has no membership:                      make it private first"
+                    "domain '{domain}' is not private, so it has no membership: \
+                     make it private first"
                 );
             };
             if acl.owner == principal {
                 bail!(
-                    "'{principal}' owns domain '{domain}':                      the owner already holds every level"
+                    "'{principal}' owns domain '{domain}': \
+                     the owner already holds every level"
                 );
             }
             self.require_live_user(&principal).await?;
@@ -2071,8 +2106,23 @@ impl AuthStore {
             .context("listing the private domains")?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await.context("listing the private domains")? {
+            // A row whose name cannot be read fails the whole call rather than
+            // being skipped or defaulted. This list is the *input* to the
+            // visibility filter, so dropping an entry (or defaulting it to
+            // `""`, which is what it used to do) would leave a private domain
+            // hidden from nobody. Skipping is the right answer one table over
+            // in `memberships_of`, where a lost row only ever narrows what its
+            // holder may reach; here it widens, so it must not be silent. The
+            // column is `NOT NULL`, so this is a corrupt file, not a state the
+            // schema permits.
+            let Some(domain) = cell_text(&row, 0) else {
+                bail!(
+                    "the visibility record of a private domain is unreadable: \
+                     refusing to answer rather than serving it to everyone"
+                );
+            };
             out.push(DomainAcl {
-                domain: cell_text(&row, 0).unwrap_or_default(),
+                domain,
                 owner: cell_text(&row, 1).unwrap_or_default(),
             });
         }
@@ -2114,6 +2164,37 @@ impl AuthStore {
         Ok(out)
     }
 
+    /// Un-name `name` as the owner of every private domain it owns, leaving
+    /// each row owned by nobody.
+    ///
+    /// The other half of the removal sweep, and the half that closes the
+    /// resurrection hazard on this table: `domain_acl` carries no foreign key,
+    /// so an owner row that kept a freed login name would hand ownership - read,
+    /// write, membership management and the power to make the domain shared
+    /// again - to whoever is next added under that name. That is the same
+    /// hazard `a_readded_name_does_not_inherit_the_old_holders_session` pins for
+    /// sessions and [`AuthStore::mcp_token_user`] for tokens, one table over,
+    /// and here it would hand a private domain to a stranger.
+    ///
+    /// The empty string is the "owned by nobody" marker because
+    /// [`normalize_name`] can never produce it, so no live account can ever
+    /// match it. The domain stays private and its members keep their levels;
+    /// what it loses is an owner, which leaves it administered by instance
+    /// admins alone until one runs [`AuthStore::transfer_domain`]. Choosing a
+    /// successor is deliberately not done here - that is a product decision,
+    /// and every automatic answer (the removing admin, the senior manager)
+    /// hands somebody a domain nobody gave them.
+    async fn disown_domains_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain_acl SET owner = '' WHERE owner = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("releasing the domains owned by user '{name}'"))?;
+        Ok(())
+    }
+
     /// Fail unless `name` is an existing account that is not disabled. Called
     /// inside a transaction, so what it checked is what the write beside it
     /// sees.
@@ -2139,6 +2220,11 @@ impl AuthStore {
 
     /// Drop every membership row of one domain. Callers hold the lock and are
     /// inside a transaction.
+    ///
+    /// The one statement here that deliberately carries no `principal_kind`
+    /// filter, where every sibling has one: a domain that is no longer private
+    /// has no membership of any kind, so this must sweep a future group row
+    /// too. Not an omission - do not "fix" it.
     async fn delete_members_of_domain(&self, domain: &str) -> Result<()> {
         self.conn
             .execute(
@@ -2164,9 +2250,7 @@ impl AuthStore {
     /// resolve time, so re-enabling must hand the memberships back rather than
     /// force every invitation to be issued again.
     ///
-    /// An acl row this account *owns* is deliberately left alone: picking a
-    /// successor owner is a decision this store cannot make, and the domain
-    /// staying reachable by an admin (who may transfer it) is the safe state.
+    /// Ownership is handled beside this, by [`AuthStore::disown_domains_of`].
     async fn delete_memberships_of(&self, name: &str) -> Result<()> {
         self.conn
             .execute(
@@ -4248,7 +4332,46 @@ mod tests {
             store.domain_visibility("lab").await.unwrap().unwrap().owner,
             "out"
         );
-        assert_eq!(store.domain_members("lab").await.unwrap().len(), 1);
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "an owner change is not an eviction"
+        );
+    }
+
+    #[tokio::test]
+    async fn promoting_a_member_to_owner_drops_the_row_that_now_says_less() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        for name in ["mem", "out"] {
+            store
+                .upsert_domain_member("lab", name, MemberLevel::Viewer, "owner")
+                .await
+                .unwrap();
+        }
+        // The same step `transfer_domain` takes, on the other path that changes
+        // an owner: the two must agree, or a demotion would resurrect a level
+        // the domain has since outgrown.
+        store
+            .set_domain_visibility("lab", true, "mem")
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .domain_members("lab")
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| m.principal.as_str())
+                .collect::<Vec<_>>(),
+            vec!["out"],
+            "the incoming owner's viewer row is gone, everyone else stays"
+        );
+        assert!(store.memberships_of("mem").await.unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -4382,6 +4505,12 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("disabled"), "{err}");
+        let err = store
+            .upsert_domain_member("lab", "out", MemberLevel::Viewer, "  ")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("an actor to record it as"), "{err}");
         assert!(store.domain_members("lab").await.unwrap().is_empty());
     }
 
@@ -4411,6 +4540,47 @@ mod tests {
             store.domain_members("lab").await.unwrap().is_empty(),
             "a re-added name must not inherit the old holder's access"
         );
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_leaves_the_domains_it_owned_owned_by_nobody() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.remove_user("owner").await.unwrap();
+        let acl = store
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .expect("the domain stays private when its owner goes");
+        assert_eq!(
+            acl.owner, "",
+            "owned by nobody: a name no live account can ever hold"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "and the people invited into it keep their levels"
+        );
+        // Re-adding the freed name mints a different person. The resolver half
+        // of this is `a_re_added_owner_name_does_not_inherit_the_domain` in
+        // `crate::scope`; here the record itself must not name them.
+        store
+            .add_user("owner", "owner", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            ""
+        );
+        assert!(store.memberships_of("owner").await.unwrap().is_empty());
     }
 
     #[tokio::test]

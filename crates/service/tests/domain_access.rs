@@ -55,6 +55,18 @@ async fn an_engine_with_no_resolver_filters_nothing() {
     // The embedded stdio stack, a one-shot CLI command and every test engine:
     // no accounts database was ever opened, so there is nothing to filter by
     // and nothing to fail on.
+    //
+    // `Anonymous` and `User` are in this list because the brief's clause is
+    // "None when no access is installed", not "None for the machine owner",
+    // and it is worth being explicit that those two are the fail-open reading
+    // of it: both can only originate from an HTTP surface, and an HTTP surface
+    // always has an `AuthStore`, so an engine that sees one with no resolver
+    // installed is a wiring bug being answered by serving everything. The only
+    // production path is `daemon::http_base`, which both router builders
+    // funnel through and which installs the resolver before it builds
+    // anything. If a later task would rather have that bug fail loudly, this
+    // is the assertion to change: keep `None` for `Unrestricted` and error for
+    // the other two.
     for scope in [Scope::Unrestricted, Scope::Anonymous, user("out")] {
         assert!(
             engine.hidden_domains(&scope).await.unwrap().is_none(),
