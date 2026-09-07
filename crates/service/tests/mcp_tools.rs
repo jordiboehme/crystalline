@@ -1578,6 +1578,84 @@ async fn move_same_domain_and_cross_domain_link_rewrite() {
     assert!(h.root.join("ops/target.md").exists());
 }
 
+/// **A cross-domain move rewrites bare links and nothing else.**
+///
+/// A reference written with a prefix in its brackets - `[[open:Thing]]`, or a
+/// colon title like `[[Log: Weekly Garden Notes]]`, which parses the same way
+/// and resolves by title - carries a `to_target` that is only the text after
+/// the colon. The needle the rewrite builds from it is therefore not what the
+/// file holds, and when the same file also holds a genuinely bare link with
+/// exactly that text, the replace is global: the wrong link gets prefixed and
+/// the receipt counts it as a repair.
+///
+/// So the rewrite skips a reference that named a domain. The colon-titled link
+/// dangles after the move, which is what a link the mover cannot rewrite
+/// honestly does, and the bare link pointing somewhere else is left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_domain_move_never_rewrites_a_link_it_did_not_match() {
+    let h = Harness::new(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // The engram that moves, whose title's first word ends in a colon.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Log: Weekly Garden Notes", "content": "what the garden did" }),
+    )
+    .await
+    .unwrap();
+    // One file linking twice: to the colon title, and to a bare `[[Weekly
+    // Garden Notes]]` - an engram nobody has written yet, which is an ordinary
+    // state and the sweep's business, not the mover's. No engram may carry that
+    // exact title here: one would take the colon-titled link's resolution for
+    // itself, which is a different case from the one this test is about.
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Linker",
+            "content": "see [[Log: Weekly Garden Notes]] and also [[Weekly Garden Notes]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "move_engram",
+        json!({
+            "identifier": "log-weekly-garden-notes",
+            "domain": "eng",
+            "destination": "log-weekly-garden-notes.md",
+            "destination_domain": "ops",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["cross_domain"], json!(true));
+    assert_eq!(
+        out["links_rewritten"],
+        json!(0),
+        "no bare link pointed at the moved engram, so nothing was repaired: {out}"
+    );
+
+    let linker = std::fs::read_to_string(h.root.join("eng/linker.md")).unwrap();
+    assert!(
+        linker.contains("[[Weekly Garden Notes]]"),
+        "the bare link to somebody else is untouched: {linker}"
+    );
+    assert!(
+        !linker.contains("[[ops:Weekly Garden Notes]]"),
+        "and was never rewritten in the moved engram's name: {linker}"
+    );
+    assert!(
+        linker.contains("[[Log: Weekly Garden Notes]]"),
+        "the colon-titled link is left as written: {linker}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn build_context_glob_and_relations() {
     let h = Harness::new(&["eng"]).await;

@@ -813,6 +813,18 @@ pub struct InboundRef {
     pub src_path: String,
     /// The exact target text used in the link.
     pub to_target: String,
+    /// The domain the reference named, when it named one: `Some("open")` for
+    /// `[[open:Thing]]`, `None` for a bare `[[Thing]]`.
+    ///
+    /// Here because `to_target` alone cannot tell the two apart, and a caller
+    /// that rewrites the bracket text has to. The cross-domain move rewrites
+    /// bare links only: for a prefixed one the bracket text on disk is not
+    /// `[[{to_target}]]`, so a needle built from `to_target` either misses it -
+    /// or, when the same file also holds a bare link with that exact text,
+    /// matches the wrong one and reports the rewrite as a success. A colon
+    /// title (`[[Log: Weekly Notes]]`, which resolves by title) reaches that
+    /// loop the same way, since parsing splits it at the colon.
+    pub to_domain: Option<String>,
     /// Whether the reference came from a relation bullet or a prose link.
     pub kind: EdgeKind,
 }

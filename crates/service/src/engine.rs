@@ -4848,6 +4848,22 @@ impl Engine {
             if r.src_domain == dest_domain || r.to_target.contains(':') {
                 continue;
             }
+            // A reference that named a domain in its brackets is not a bare
+            // link and is left alone. The needle below is built from
+            // `to_target`, which is the text AFTER the colon, so for
+            // `[[open:Thing]]` - or for a colon title like
+            // `[[Log: Weekly Notes]]`, which parses the same way and resolves
+            // by title - the file does not hold `[[Thing]]` at that spot. The
+            // usual outcome is a miss and a `continue`; the outcome this guard
+            // exists for is a hit somewhere else in the same file, where a
+            // genuinely bare `[[Thing]]` pointing at something entirely
+            // different would be rewritten and counted as a success. The
+            // unresolved half of `inbound_refs` filters on `to_domain IS NULL`
+            // already; the resolved half cannot, because a reader wants every
+            // reference that points here, so the filter belongs to the rewrite.
+            if r.to_domain.is_some() {
+                continue;
+            }
             // A linking engram in a domain this caller may not see is left
             // exactly as it was: see the scope note on this function.
             if hidden.contains(&r.src_domain) {

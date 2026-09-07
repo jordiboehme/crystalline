@@ -733,6 +733,23 @@ async fn inbound_refs_kinds(store: &dyn Store) {
         EdgeKind::Link,
         "the prose wikilink is a link-kind inbound ref: {refs:?}"
     );
+    // Whether the reference named a domain in its brackets rides along, because
+    // the caller that rewrites bracket text has to tell `[[Hub]]` from
+    // `[[d:Hub]]`: the text on disk differs, and the target text alone is the
+    // same string in both.
+    assert_eq!(
+        refs.iter()
+            .find(|r| r.src_path == "cross.md")
+            .and_then(|r| r.to_domain.clone()),
+        Some("d".to_string()),
+        "a prefixed reference reports the domain it named: {refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .filter(|r| r.src_domain == "d")
+            .all(|r| r.to_domain.is_none()),
+        "and a bare one reports none: {refs:?}"
+    );
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
 

@@ -473,6 +473,78 @@ async fn the_supersede_pair_links_by_permalink_so_a_colon_in_a_title_cannot_brea
     }
 }
 
+/// Issue #65, the half a person writes by hand: `[[Log: Weekly Garden Notes]]`
+/// typed into an engram's prose and into a relation bullet.
+///
+/// The two tests around this one pin the pair the ENGINE writes, which names
+/// permalinks and never carries a colon; this one pins the shape the fix
+/// actually exists for. A prefix naming no registered domain means the whole
+/// bracket text is a title at home, and a live instance resolves references in
+/// SQL rather than in core, so nothing but a read on a synced engine says
+/// whether the rule reached the running server.
+#[tokio::test]
+async fn a_hand_written_colon_title_resolves_through_read_engram() {
+    let (tmp, engine) = engine_fixture().await;
+    std::fs::write(
+        tmp.path().join("eng/log-weekly.md"),
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        tmp.path().join("eng/reader.md"),
+        "---\ntype: engram\ntitle: Reader\npermalink: reader\ntags:\n  - eng\nstatus: stable\nrecorded_at: 2026-02-02\n---\n\n# Reader\n\n- relates_to [[Log: Weekly Garden Notes]]\n\nAnd in prose, [[Log: Weekly Garden Notes]] again.\n",
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let read = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "reader".to_string(),
+                domain: Some("eng".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let relation = read["relations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["rel_type"] == "relates_to")
+        .expect("reader declares relates_to");
+    assert_eq!(
+        relation["resolved"], true,
+        "the hand-written relation resolves: {read}"
+    );
+    let link = read["links"]
+        .as_array()
+        .unwrap()
+        .first()
+        .expect("reader carries a prose link");
+    assert_eq!(
+        link["resolved"], true,
+        "and so does the prose wikilink: {read}"
+    );
+
+    // From the other end: the engram with the colon title is told who points at
+    // it, which is the same rows read from the other side.
+    let target = engine
+        .read_engram(
+            &ReadParams {
+                identifier: "log-weekly".to_string(),
+                domain: Some("eng".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        target["inbound"]["count"].as_u64().unwrap_or(0) >= 2,
+        "both references are counted inbound: {target}"
+    );
+}
+
 /// The same rule on the other pair-writing verb, and the sharper case: the
 /// engram carrying the colon is the SOURCE, so both bullets are affected.
 #[tokio::test]

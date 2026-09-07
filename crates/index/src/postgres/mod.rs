@@ -1433,16 +1433,16 @@ impl Store for PostgresStore {
         // Turso does. Turso keeps the flat positional form because BINARY is
         // already its default.
         let rows = sqlx::query(
-            "SELECT i.name, i.domain_id, i.path, i.to_target, i.kind FROM ( \
+            "SELECT i.name, i.domain_id, i.path, i.to_target, i.kind, i.to_domain FROM ( \
                SELECT d.name AS name, r.domain_id AS domain_id, e.path AS path, \
-                      r.to_target AS to_target, 0::int8 AS kind \
+                      r.to_target AS to_target, 0::int8 AS kind, r.to_domain AS to_domain \
                FROM relation r JOIN engram e ON e.id=r.engram_id \
                     JOIN domain d ON d.id=e.domain_id \
                WHERE r.to_id=$1 \
                   OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
                       AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
                UNION ALL \
-               SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8 \
+               SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8, l.to_domain \
                FROM link l JOIN engram e ON e.id=l.engram_id \
                     JOIN domain d ON d.id=e.domain_id \
                WHERE l.to_id=$1 \
@@ -1464,6 +1464,7 @@ impl Store for PostgresStore {
                 src_domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
                 src_path: cell_text(r, 2).unwrap_or_default(),
                 to_target: cell_text(r, 3).unwrap_or_default(),
+                to_domain: cell_text(r, 5),
                 kind: if cell_i64(r, 4).unwrap_or(0) == 0 {
                     EdgeKind::Relation
                 } else {
