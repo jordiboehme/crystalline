@@ -1531,8 +1531,15 @@ impl Engine {
     /// selected nothing. Search itself deliberately does not resolve its
     /// `domains` filter - an unmatched name there is simply a narrower filter -
     /// and that stays as it is.
-    pub fn require_domain(&self, name: &str) -> Result<()> {
-        self.domain_entry(name)?;
+    ///
+    /// Scoped, and async for it: this raises the one error that names every
+    /// other domain, so an unfiltered answer here would tell a caller asking
+    /// for a domain that does not exist the name of every private domain on the
+    /// instance. A domain the caller may not see is refused as an unregistered
+    /// one, and the set the refusal lists is the visible set.
+    pub async fn require_domain(&self, name: &str, scope: &crate::scope::Scope) -> Result<()> {
+        let hidden = self.hidden_for(scope).await?;
+        self.domain_entry_scoped(name, &hidden)?;
         Ok(())
     }
 

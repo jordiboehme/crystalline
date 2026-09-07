@@ -662,7 +662,10 @@ async fn run_archive(
     // `refuse_read_only` in both handlers - moving it above them would make a
     // read-only instance answer 404 where it answers 403, and let an
     // unauthorized caller learn which domains exist.
-    state.engine.require_domain(domain)?;
+    state
+        .engine
+        .require_domain(domain, &crate::rest::TASK_10_SCOPE)
+        .await?;
     // On the blocking pool, like `build_zip` on the way out: inflating an
     // archive is synchronous CPU work bounded by MAX_TOTAL_BYTES, and running
     // it inline would park a runtime worker for the whole of it. `Bytes` is

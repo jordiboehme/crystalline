@@ -194,7 +194,10 @@ pub async fn list(
     ApiPath(domain): ApiPath<String>,
     ApiQuery(query): ApiQuery<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    state.engine.require_domain(&domain)?;
+    state
+        .engine
+        .require_domain(&domain, &crate::rest::TASK_10_SCOPE)
+        .await?;
     let value = state
         .engine
         .search_engrams_under(

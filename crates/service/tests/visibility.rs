@@ -316,6 +316,29 @@ async fn browsing_a_hidden_domain_is_the_unknown_domain_error() {
             .is_ok(),
         "the member browses it"
     );
+
+    // The bare domain check a surface runs before a domain-addressed read
+    // raises the same error, and it is the one place a single unfiltered answer
+    // would name every private domain at once.
+    let checked = engine
+        .require_domain("nope", &stranger)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !checked.contains("lab"),
+        "the domain check names the visible set and nothing else: {checked}"
+    );
+    assert_eq!(
+        engine
+            .require_domain("lab", &stranger)
+            .await
+            .unwrap_err()
+            .to_string(),
+        checked.replace("'nope'", "'lab'"),
+        "and a hidden domain fails it exactly as an unregistered one"
+    );
+    assert!(engine.require_domain("lab", &user("mem")).await.is_ok());
 }
 
 /// Tag names and their counts are content. An all-domain vocabulary sweep for a
