@@ -632,8 +632,29 @@ mod tests {
             user("out", false),
             user("ghost", false),
         ];
+        let every_private: HashSet<String> = ["lab", "vault", "attic"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
         for scope in &scopes {
             let hidden = access.hidden_domains(scope).await.unwrap();
+            // The third public answer, held against the other two. The module
+            // doc's claim is that none of them can drift apart, and it is only
+            // a claim while something reads them side by side: `visibility`
+            // must say exactly what `hidden_domains` says about who may see
+            // what, and exactly the same private set to everybody, since which
+            // domains are private is a fact about the domains rather than
+            // about the caller. `Scope::Anonymous` is in this cast, which is
+            // how the anonymous tier reaches the new path at all.
+            let seen = access.visibility(scope).await.unwrap();
+            assert_eq!(
+                seen.hidden, hidden,
+                "visibility and hidden_domains disagree for {scope:?}"
+            );
+            assert_eq!(
+                seen.private, every_private,
+                "every scope learns the same private set: {scope:?}"
+            );
             for domain in ["lab", "vault", "attic", "open"] {
                 let right = access.right(scope, domain).await.unwrap();
                 match &hidden {

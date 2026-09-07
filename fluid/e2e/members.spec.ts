@@ -40,6 +40,14 @@ const OUTSIDER_PASSWORD =
 /** The domain the same script registers and closes to `USER`. */
 const DOMAIN = process.env.FLUID_E2E_PRIVATE_DOMAIN ?? "smoke-vault";
 
+/**
+ * The shared fixture domain every account on this instance can read.
+ *
+ * Never asserted about for its own sake: it is the anchor the absence
+ * assertions below need, and nothing else.
+ */
+const SHARED_DOMAIN = process.env.FLUID_E2E_DOMAIN ?? "fluid-smoke";
+
 /** Sign in and land on the home screen, as every spec in this suite does. */
 async function signIn(
   page: Page,
@@ -89,6 +97,24 @@ function badge(within: ReturnType<typeof homeCard>) {
 }
 
 /**
+ * Wait until this browser has a domain listing on screen.
+ *
+ * Every "the private domain is not here" assertion below is a `toHaveCount(0)`,
+ * which succeeds on its first poll - including the poll that runs while the
+ * listing is still in flight, when nothing is there yet and every domain is
+ * equally absent. Anchoring on the shared domain first is what makes those
+ * assertions able to fail: the listing has arrived, this account can read it,
+ * and the private domain is missing from an answer that was actually given.
+ */
+async function listingLoaded(page: Page): Promise<void> {
+  await expect(
+    page
+      .getByRole("navigation", { name: "Domains" })
+      .getByRole("link", { name: new RegExp(`^${SHARED_DOMAIN}`) }),
+  ).toBeVisible();
+}
+
+/**
  * Load the home screen fresh.
  *
  * A real navigation rather than a re-render: the listing is cached for the
@@ -126,6 +152,7 @@ test("an invitation is what makes a private domain visible", async ({
   // name is the whole of what a private domain keeps, so the listing simply
   // does not contain it.
   for (const page of [member, stranger]) {
+    await listingLoaded(page);
     await expect(homeCard(page)).toHaveCount(0);
     await expect(sidebarLink(page)).toHaveCount(0);
   }
@@ -162,6 +189,7 @@ test("an invitation is what makes a private domain visible", async ({
 
   // The account nobody invited is exactly where it was.
   await reloadHome(stranger);
+  await listingLoaded(stranger);
   await expect(homeCard(stranger)).toHaveCount(0);
   await expect(sidebarLink(stranger)).toHaveCount(0);
 
