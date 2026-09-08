@@ -39,10 +39,10 @@ pub use error::{
     if_none_match_matches, precondition_failed,
 };
 pub use oauth::{
-    AUTHORIZATION_SERVER_PATH, AUTHORIZE_PATH, MAX_OAUTH_CLIENTS, OauthError, OauthServer,
-    OriginRule, PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
-    RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
-    well_known_routes,
+    AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
+    MAX_OAUTH_CLIENTS, OauthError, OauthServer, OriginRule, PROTECTED_RESOURCE_PATH, REGISTER_PATH,
+    REGISTRATION_BURST, REGISTRATION_WINDOW, RegistrationLimiter, TOKEN_PATH, redirect_matches,
+    redirect_uri_problem, resource_metadata_url, well_known_routes,
 };
 pub use oidc::{OidcClaims, OidcClient, OidcSettings};
 
@@ -71,7 +71,7 @@ use crate::scope::{DomainAccess, DomainRight};
                        being replaced, and account management needs an \
                        admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
                        `/auth/me`, `/auth/setup`, `/auth/providers`, \
-                       `/oauth/register` and the \
+                       `/oauth/register`, `/oauth/authorize` and the \
                        two `/auth/oidc/*` routes is closed by default: a \
                        request that \
                        carries no identity is answered 401 ahead of routing, so \
@@ -169,6 +169,9 @@ use crate::scope::{DomainAccess, DomainRight};
         mcp_tokens::revoke,
         oidc::start_link,
         oauth::register,
+        oauth::authorize,
+        oauth::authorization,
+        oauth::decide,
         identity_links::list,
         identity_links::unlink,
     ),
@@ -225,6 +228,10 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::RegisterBody,
         oauth::RegisteredClient,
         oauth::OauthErrorBody,
+        oauth::AuthorizationView,
+        oauth::DecisionBody,
+        oauth::Decision,
+        oauth::DecisionResponse,
     )),
 )]
 struct ApiDoc;
@@ -498,6 +505,19 @@ pub fn router(state: RestState) -> Router {
         .route(
             oauth::REGISTER_PATH,
             post(oauth::register).route_layer(DefaultBodyLimit::max(oauth::MAX_REGISTER_BYTES)),
+        // The authorization endpoint, public by path for the reason
+        // registration is: the browser a client sends here may have no session
+        // yet, and Fluid carries it to the login page and back. Nothing is
+        // granted by it - it answers a redirect to the consent screen, which
+        // is where an account appears. See [`oauth::authorize`].
+        .route(oauth::AUTHORIZE_PATH, get(oauth::authorize))
+        // The consent pair, and NOT public: the whole point is that a person
+        // decides, so both verbs need an account (any role), and the POST is
+        // an unsafe request that the guard's CSRF rule covers like every
+        // other.
+        .route(
+            oauth::AUTHORIZATIONS_PATH,
+            get(oauth::authorization).post(oauth::decide),
         )
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route

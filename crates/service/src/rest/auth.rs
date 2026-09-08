@@ -121,7 +121,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// unprotected for it - it authenticates on a single-use state this process
 /// generated, matched against a cookie only the browser that started the
 /// sign-in holds. See [`super::oidc`].
-const PUBLIC_PATHS: [&str; 8] = [
+const PUBLIC_PATHS: [&str; 9] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -134,6 +134,11 @@ const PUBLIC_PATHS: [&str; 8] = [
     // burst limit, a ceiling and a prune, none of which need a caller to be
     // anybody. See `super::oauth::register`.
     super::oauth::REGISTER_PATH,
+    // And a client sends a browser here before that browser has signed in
+    // anywhere either - the consent screen it redirects to is what needs an
+    // account, and it is guarded. Nothing is granted by this route. See
+    // `super::oauth::authorize`.
+    super::oauth::AUTHORIZE_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.

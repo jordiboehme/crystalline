@@ -37,6 +37,15 @@ const PASSWORD: &str = "pw12345678";
 /// client this exists for.
 const HOSTED_REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 
+/// A native client's loopback redirect, registered on one port and presented
+/// on whichever one it managed to bind. See RFC 8252 section 7.3.
+const LOOPBACK_REDIRECT: &str = "http://127.0.0.1:33418/callback";
+
+/// RFC 7636's own example challenge: 43 characters of base64url, which is what
+/// the S256 of any verifier is. The verifier behind it belongs to the token
+/// endpoint; nothing here ever needs it, which is the point of PKCE.
+const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
 /// A running instance and everything a test needs to talk to it.
 struct OauthCtx {
     addr: SocketAddr,
@@ -230,6 +239,75 @@ impl OauthCtx {
             .await
             .unwrap();
     }
+
+    /// `GET /oauth/authorize` with `params` as the query, arrived at the way a
+    /// browser arrives at it: no cookies, and redirects off so the hop is
+    /// asserted rather than walked.
+    async fn authorize(&self, params: &[(&str, &str)]) -> reqwest::Response {
+        let query = params
+            .iter()
+            .map(|(name, value)| format!("{name}={}", encoded(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.client
+            .get(format!("{}?{query}", self.url("/oauth/authorize")))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// A registration and one good authorization request against it, answered
+    /// with the client id and the pending id the consent page is opened on.
+    /// The line most of the flow below starts from.
+    async fn start_authorization(
+        &self,
+        redirect_uri: &str,
+        state: Option<&str>,
+    ) -> (String, String) {
+        let registered = self.register_ok(redirect_uri).await;
+        let client_id = registered["client_id"].as_str().unwrap().to_string();
+        let mut params = vec![
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", redirect_uri),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ];
+        if let Some(state) = state {
+            params.push(("state", state));
+        }
+        let started = self.authorize(&params).await;
+        assert_eq!(
+            started.status(),
+            302,
+            "a good authorization request lands on the consent page"
+        );
+        (client_id, request_id(&location(&started)))
+    }
+
+    /// `GET /oauth/authorizations/{id}`, as `session`'s browser or as nobody.
+    async fn consent(&self, id: &str, session: Option<&Session>) -> reqwest::Response {
+        let mut request = self
+            .client
+            .get(self.url(&format!("/oauth/authorizations/{id}")));
+        if let Some(session) = session {
+            request = request.header("cookie", session.cookie_header());
+        }
+        request.send().await.unwrap()
+    }
+
+    /// `POST /oauth/authorizations/{id}` with the session's CSRF token, which
+    /// is what a browser sends when the person presses a button.
+    async fn decide(&self, id: &str, session: &Session, decision: &str) -> reqwest::Response {
+        self.client
+            .post(self.url(&format!("/oauth/authorizations/{id}")))
+            .header("cookie", session.cookie_header())
+            .header("x-csrf-token", session.csrf.clone())
+            .json(&json!({ "decision": decision }))
+            .send()
+            .await
+            .unwrap()
+    }
 }
 
 /// A signed-in browser: the cookies it holds and the token its unsafe requests
@@ -261,6 +339,62 @@ fn cookies_from(response: &reqwest::Response) -> Vec<(String, String)> {
             let first = value.split(';').next()?;
             let (name, value) = first.split_once('=')?;
             Some((name.trim().to_string(), value.trim().to_string()))
+        })
+        .collect()
+}
+
+/// One refused authorization request: what is wrong with it, the query it
+/// sends, and the RFC 6749 error the client should get back.
+type AuthorizeCase = (&'static str, Vec<(String, String)>, &'static str);
+
+/// One query value, percent-encoded the way a client library sends it.
+fn encoded(value: &str) -> String {
+    percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// Where a redirect sends the browser.
+fn location(response: &reqwest::Response) -> String {
+    response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .expect("a redirect carries a location")
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The `request` parameter of a consent-page location.
+fn request_id(location: &str) -> String {
+    let (page, query) = location
+        .split_once('?')
+        .unwrap_or_else(|| panic!("the consent page is opened with a request id: {location}"));
+    assert_eq!(page, "/authorize", "the consent page is a Fluid route");
+    let id = query_of(query)
+        .remove("request")
+        .unwrap_or_else(|| panic!("no request id in {location}"));
+    assert!(
+        id.len() == 64 && id.chars().all(|c| c.is_ascii_hexdigit()),
+        "a pending authorization is named by 32 random bytes: {id}"
+    );
+    id
+}
+
+/// A query string as its decoded pairs. Percent-decoded, so an assertion reads
+/// the value a client would, not the spelling it travelled in.
+fn query_of(query: &str) -> std::collections::HashMap<String, String> {
+    let query = query.split_once('?').map_or(query, |(_, tail)| tail);
+    query
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter_map(|pair| pair.split_once('='))
+        .map(|(name, value)| {
+            let decode = |raw: &str| {
+                percent_encoding::percent_decode_str(raw)
+                    .decode_utf8()
+                    .unwrap()
+                    .to_string()
+            };
+            (decode(name), decode(value))
         })
         .collect()
 }
@@ -809,4 +943,616 @@ async fn registration_needs_no_session_and_is_not_csrf_exempt() {
         .register(json!({ "redirect_uris": [HOSTED_REDIRECT] }))
         .await;
     assert_eq!(anonymous.status(), 201);
+}
+
+/// **A good authorization request lands on the consent page, and nowhere
+/// else.**
+///
+/// The hinge of the whole flow: the client sends a browser here, this server
+/// checks everything it can check without a person, remembers the request under
+/// an unguessable id and hands the browser to Fluid. Nothing is granted yet -
+/// no code exists, no account has been consulted - which is why the answer is a
+/// redirect to a page and not to the client.
+///
+/// The loopback leg is RFC 8252 section 7.3 at the authorize endpoint: a native
+/// client registers one port and binds another, so the presented uri matches
+/// port-agnostically and the record keeps the PRESENTED one, because that is
+/// where the browser will actually be sent.
+#[tokio::test]
+async fn a_good_authorize_request_lands_on_the_consent_page() {
+    let ctx = OauthCtx::start().await;
+    let registered = ctx.register_ok(HOSTED_REDIRECT).await;
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+    assert!(
+        ctx.auth
+            .oauth_client(&client_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used
+            .is_none(),
+        "a registration that has authorized nothing has never been used"
+    );
+
+    let started = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", "st-1"),
+            ("scope", "openid profile"),
+            ("resource", &ctx.origin()),
+        ])
+        .await;
+    assert_eq!(started.status(), 302);
+    assert_eq!(
+        started
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "the hop that names a pending authorization is never cached"
+    );
+    let id = request_id(&location(&started));
+
+    // The prune clock only moves for a request that got all the way through.
+    assert!(
+        ctx.auth
+            .oauth_client(&client_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used
+            .is_some(),
+        "a good authorization stamps the registration's last use"
+    );
+
+    // A trailing slash on the resource is the same resource, and no `resource`
+    // at all is this one by default: both start a request of their own.
+    for resource in [Some(format!("{}/", ctx.origin())), None] {
+        let mut params = vec![
+            ("response_type", "code"),
+            ("client_id", client_id.as_str()),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ];
+        if let Some(resource) = &resource {
+            params.push(("resource", resource.as_str()));
+        }
+        let response = ctx.authorize(&params).await;
+        assert_eq!(
+            response.status(),
+            302,
+            "resource {resource:?} names this instance"
+        );
+        let other = request_id(&location(&response));
+        assert_ne!(
+            other, id,
+            "every authorization request is remembered on its own"
+        );
+    }
+
+    // RFC 8252 section 7.3: the port moved between registration and use.
+    let moved = "http://127.0.0.1:51902/callback";
+    let native = ctx.register_ok(LOOPBACK_REDIRECT).await;
+    let native_id = native["client_id"].as_str().unwrap().to_string();
+    let started = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &native_id),
+            ("redirect_uri", moved),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ])
+        .await;
+    assert_eq!(
+        started.status(),
+        302,
+        "a loopback client is matched without its port"
+    );
+    let native_request = request_id(&location(&started));
+
+    // And the redirect the decision produces goes to the port the client is
+    // listening on, not the one it registered months ago.
+    ctx.create_user("ada", Role::Viewer).await;
+    let ada = ctx.sign_in("ada").await;
+    let allowed = ctx.decide(&native_request, &ada, "allow").await;
+    assert_eq!(allowed.status(), 200);
+    let body: Value = allowed.json().await.unwrap();
+    let target = body["location"].as_str().unwrap().to_string();
+    assert!(
+        target.starts_with(&format!("{moved}?")),
+        "the browser goes to the uri the client presented: {target}"
+    );
+}
+
+/// **A client this server does not know, or a redirect uri it did not
+/// register, is answered here rather than redirected.**
+///
+/// The one rule that cannot be relaxed: an authorization error is only ever
+/// sent to a redirect uri that a registration named, because sending it
+/// anywhere else is an open redirect with an OAuth error attached, and the
+/// browser arriving here is a person's. So these four refusals are rendered as
+/// this surface's problem detail, with no `Location` at all.
+#[tokio::test]
+async fn a_bad_client_or_redirect_uri_is_answered_without_redirecting() {
+    let ctx = OauthCtx::start().await;
+    let registered = ctx.register_ok(HOSTED_REDIRECT).await;
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+
+    let refused: Vec<(&str, Vec<(&str, &str)>)> = vec![
+        (
+            "no client id at all",
+            vec![
+                ("response_type", "code"),
+                ("redirect_uri", HOSTED_REDIRECT),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+            ],
+        ),
+        (
+            "a client id nothing registered",
+            vec![
+                ("response_type", "code"),
+                ("client_id", "coc_0000000000000000000000000000dead"),
+                ("redirect_uri", HOSTED_REDIRECT),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+            ],
+        ),
+        (
+            "a redirect uri this client never registered",
+            vec![
+                ("response_type", "code"),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://evil.example/collect"),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+            ],
+        ),
+        (
+            "a redirect uri with the right host and the wrong path",
+            vec![
+                ("response_type", "code"),
+                ("client_id", &client_id),
+                ("redirect_uri", "https://claude.ai/api/mcp/elsewhere"),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+            ],
+        ),
+        (
+            "no redirect uri at all",
+            vec![
+                ("response_type", "code"),
+                ("client_id", &client_id),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+            ],
+        ),
+    ];
+
+    for (what, params) in refused {
+        let response = ctx.authorize(&params).await;
+        assert_eq!(response.status(), 400, "{what}");
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json"),
+            "{what} is rendered for the person at the browser"
+        );
+        assert!(
+            response.headers().get(reqwest::header::LOCATION).is_none(),
+            "{what} must not redirect anywhere"
+        );
+    }
+
+    // A loopback uri the registration did not name is refused too: only the
+    // port is forgiven, never the host or the path.
+    ctx.register_ok(LOOPBACK_REDIRECT).await;
+    let response = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", "http://127.0.0.1:51902/callback"),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ])
+        .await;
+    assert_eq!(
+        response.status(),
+        400,
+        "another client's loopback uri is not this client's"
+    );
+}
+
+/// **Everything else is the client's problem, so it goes back to the client -
+/// with `state` and with `iss`.**
+///
+/// Once the redirect uri is one the client registered, this server can talk to
+/// the client rather than to the person, and RFC 6749 section 4.1.2.1 says it
+/// must. `iss` is the 2026-07-28 era's own requirement (RFC 9207): a client
+/// talking to two authorization servers tells their answers apart by it, and
+/// without it a mix-up attack is undetectable.
+///
+/// PKCE is the load-bearing case. This server registers public clients only, so
+/// the code is the whole credential; `plain` would make the challenge worth as
+/// much as the code it protects, and no challenge at all would make an
+/// intercepted code enough on its own.
+#[tokio::test]
+async fn a_missing_pkce_or_foreign_resource_redirects_with_an_error_and_iss() {
+    let ctx = OauthCtx::start().await;
+    let registered = ctx.register_ok(HOSTED_REDIRECT).await;
+    let client_id = registered["client_id"].as_str().unwrap().to_string();
+    let base = |extra: &[(&str, &str)]| {
+        let mut params = vec![
+            ("response_type".to_string(), "code".to_string()),
+            ("client_id".to_string(), client_id.clone()),
+            ("redirect_uri".to_string(), HOSTED_REDIRECT.to_string()),
+            ("state".to_string(), "st ate&=?".to_string()),
+        ];
+        for (name, value) in extra {
+            params.push((name.to_string(), value.to_string()));
+        }
+        params
+    };
+
+    let cases: Vec<AuthorizeCase> = vec![
+        ("no code challenge at all", base(&[]), "invalid_request"),
+        (
+            "a plain challenge, which protects nothing",
+            base(&[
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "plain"),
+            ]),
+            "invalid_request",
+        ),
+        (
+            "a challenge with no method named",
+            base(&[("code_challenge", CHALLENGE)]),
+            "invalid_request",
+        ),
+        (
+            "a challenge that is not 43 to 128 unreserved characters",
+            base(&[
+                ("code_challenge", "short"),
+                ("code_challenge_method", "S256"),
+            ]),
+            "invalid_request",
+        ),
+        (
+            "a resource that is some other server",
+            base(&[
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+                ("resource", "https://knowledge.example"),
+            ]),
+            "invalid_target",
+        ),
+        (
+            "a response type this server does not answer",
+            {
+                let mut params = base(&[
+                    ("code_challenge", CHALLENGE),
+                    ("code_challenge_method", "S256"),
+                ]);
+                params[0].1 = "token".to_string();
+                params
+            },
+            "unsupported_response_type",
+        ),
+    ];
+
+    for (what, params, expected) in cases {
+        let borrowed: Vec<(&str, &str)> = params
+            .iter()
+            .map(|(name, value)| (&name[..], &value[..]))
+            .collect();
+        let response = ctx.authorize(&borrowed).await;
+        assert_eq!(response.status(), 302, "{what}");
+        let target = location(&response);
+        assert!(
+            target.starts_with(&format!("{HOSTED_REDIRECT}?")),
+            "{what} goes back to the client: {target}"
+        );
+        let query = query_of(&target);
+        assert_eq!(
+            query.get("error").map(String::as_str),
+            Some(expected),
+            "{what}"
+        );
+        assert_eq!(
+            query.get("state").map(String::as_str),
+            Some("st ate&=?"),
+            "{what} carries the state back verbatim"
+        );
+        assert_eq!(
+            query.get("iss").map(String::as_str),
+            Some(ctx.origin().as_str()),
+            "{what} says which server answered"
+        );
+        assert!(!query.contains_key("code"), "{what} grants nothing");
+    }
+
+    // A state longer than this server will carry is refused - and the refusal
+    // carries no state, because there is no bounded value to carry. The map it
+    // would have ridden in is one a stranger can add to.
+    let huge = "s".repeat(513);
+    let response = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", &huge),
+        ])
+        .await;
+    assert_eq!(response.status(), 302);
+    let query = query_of(&location(&response));
+    assert_eq!(
+        query.get("error").map(String::as_str),
+        Some("invalid_request")
+    );
+    assert!(
+        !query.contains_key("state"),
+        "an unbounded state is not echoed"
+    );
+
+    // A request with no state gets an answer with no state, rather than an
+    // empty one: a client that sent none has nothing to compare.
+    let response = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", HOSTED_REDIRECT),
+        ])
+        .await;
+    assert_eq!(response.status(), 302);
+    let query = query_of(&location(&response));
+    assert_eq!(
+        query.get("error").map(String::as_str),
+        Some("invalid_request")
+    );
+    assert!(!query.contains_key("state"), "no state in, no state out");
+}
+
+/// **The consent page is a signed-in person's, and the decision on it happens
+/// once.**
+///
+/// The whole point of the page: the account that presses Allow is the account
+/// the client will act as, so there has to be one. An anonymous browser is told
+/// to sign in the way every other account-bearing route tells it, and Fluid
+/// carries it to the login page and back (`return_to`, pinned in `oidc.rs`).
+///
+/// The record is taken by the decision rather than read, so a second press
+/// finds nothing: a person who leaves the tab open and presses Allow again is
+/// not a second grant.
+#[tokio::test]
+async fn consent_needs_a_signed_in_account_and_is_single_use() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Viewer).await;
+    let (client_id, id) = ctx.start_authorization(HOSTED_REDIRECT, Some("st-1")).await;
+
+    let anonymous = ctx.consent(&id, None).await;
+    assert_eq!(anonymous.status(), 401, "there is nobody to grant anything");
+    assert!(
+        ctx.decide(&id, &ctx.sign_in("ada").await, "allow")
+            .await
+            .status()
+            != 401,
+        "and a signed-in browser is not refused for the same reason"
+    );
+
+    // A second request, this time walked all the way.
+    let (_, id) = ctx.start_authorization(HOSTED_REDIRECT, Some("st-2")).await;
+    let ada = ctx.sign_in("ada").await;
+    let view = ctx.consent(&id, Some(&ada)).await;
+    assert_eq!(view.status(), 200);
+    assert_eq!(
+        view.headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "a page naming an account and a client is not stored anywhere"
+    );
+    let body: Value = view.json().await.unwrap();
+    assert_eq!(body["client_name"], "a hosted client");
+    assert_eq!(body["redirect_host"], "claude.ai");
+    assert_eq!(body["loopback"], false);
+    assert_eq!(body["account"], "ada");
+    let left = body["expires_in"].as_u64().unwrap();
+    assert!(
+        left > 0 && left <= 600,
+        "ten minutes at the outside: {left}"
+    );
+    let rendered = body.to_string();
+    for secret in [CHALLENGE, "st-2"] {
+        assert!(
+            !rendered.contains(secret),
+            "the consent view shows what to decide about, never the protocol: {rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains(&client_id),
+        "nor an identifier only the client has any use for: {rendered}"
+    );
+
+    assert_eq!(
+        ctx.consent("not-a-request-anybody-made", Some(&ada))
+            .await
+            .status(),
+        404,
+        "an id naming no pending request is gone, not refused"
+    );
+
+    // No CSRF token: refused before the record is touched, so the decision is
+    // still there to be made afterwards.
+    let no_token = ctx
+        .client
+        .post(ctx.url(&format!("/oauth/authorizations/{id}")))
+        .header("cookie", ada.cookie_header())
+        .json(&json!({ "decision": "allow" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(no_token.status(), 403, "a decision is an unsafe request");
+
+    let allowed = ctx.decide(&id, &ada, "allow").await;
+    assert_eq!(allowed.status(), 200);
+    assert_eq!(
+        ctx.decide(&id, &ada, "allow").await.status(),
+        404,
+        "the record was taken by the decision, not read"
+    );
+    assert_eq!(
+        ctx.consent(&id, Some(&ada)).await.status(),
+        404,
+        "and the page it was on is gone with it"
+    );
+
+    // A body that is not a decision decides nothing.
+    let (_, id) = ctx.start_authorization(HOSTED_REDIRECT, None).await;
+    let nonsense = ctx.decide(&id, &ada, "maybe").await;
+    assert_eq!(
+        nonsense.status(),
+        422,
+        "there are two answers and no others - refused by the body extractor,          the way this mount refuses every other unreadable member"
+    );
+    assert_eq!(
+        ctx.consent(&id, Some(&ada)).await.status(),
+        200,
+        "and the request survives an unreadable answer to it"
+    );
+}
+
+/// **Allow hands the client a code; Deny hands it `access_denied`.**
+///
+/// Both answers are a location the browser navigates to, because the client is
+/// waiting at its redirect uri either way and a person who says no is owed the
+/// same round trip as one who says yes. `state` comes back verbatim in both -
+/// it is the client's own value and the thing it matches its pending request
+/// on - and `iss` says which server answered.
+#[tokio::test]
+async fn allow_returns_a_code_and_deny_returns_access_denied() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Viewer).await;
+    ctx.create_user("bob", Role::Editor).await;
+    let ada = ctx.sign_in("ada").await;
+    let bob = ctx.sign_in("bob").await;
+    let state = "a state&with=punctuation";
+
+    let (_, id) = ctx.start_authorization(HOSTED_REDIRECT, Some(state)).await;
+    let allowed = ctx.decide(&id, &ada, "allow").await;
+    assert_eq!(allowed.status(), 200);
+    assert_eq!(
+        allowed
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok()),
+        Some("no-store"),
+        "an answer carrying an authorization code is never cached"
+    );
+    let body: Value = allowed.json().await.unwrap();
+    let target = body["location"].as_str().unwrap().to_string();
+    assert!(
+        target.starts_with(&format!("{HOSTED_REDIRECT}?")),
+        "{target}"
+    );
+    let query = query_of(&target);
+    let code = query.get("code").expect("allow issues a code");
+    assert!(
+        code.len() == 64 && code.chars().all(|c| c.is_ascii_hexdigit()),
+        "a code is 32 random bytes: {code}"
+    );
+    assert_eq!(query.get("state").map(String::as_str), Some(state));
+    assert_eq!(
+        query.get("iss").map(String::as_str),
+        Some(ctx.origin().as_str())
+    );
+    assert!(
+        !query.contains_key("error"),
+        "an allowed request is not an error"
+    );
+
+    // Deny: the same round trip, and nothing granted.
+    let (_, id) = ctx.start_authorization(HOSTED_REDIRECT, Some(state)).await;
+    let denied = ctx.decide(&id, &bob, "deny").await;
+    assert_eq!(denied.status(), 200);
+    let body: Value = denied.json().await.unwrap();
+    let query = query_of(body["location"].as_str().unwrap());
+    assert_eq!(
+        query.get("error").map(String::as_str),
+        Some("access_denied")
+    );
+    assert_eq!(query.get("state").map(String::as_str), Some(state));
+    assert_eq!(
+        query.get("iss").map(String::as_str),
+        Some(ctx.origin().as_str())
+    );
+    assert!(!query.contains_key("code"), "a refusal grants nothing");
+
+    // The decision is any signed-in account's, and the code binds to whoever
+    // made it: there is no account at the moment a client starts a request, so
+    // there is nothing for a request to belong to before somebody decides.
+    let (_, id) = ctx.start_authorization(HOSTED_REDIRECT, None).await;
+    let view: Value = ctx.consent(&id, Some(&bob)).await.json().await.unwrap();
+    assert_eq!(
+        view["account"], "bob",
+        "the page names who is about to grant"
+    );
+    assert_eq!(ctx.decide(&id, &bob, "allow").await.status(), 200);
+
+    // A redirect uri that already carries a query keeps it, and the answer is
+    // appended rather than substituted for it.
+    let with_query = "https://claude.ai/api/mcp/auth_callback?tenant=eu";
+    let (_, id) = ctx.start_authorization(with_query, Some("st")).await;
+    let allowed: Value = ctx.decide(&id, &ada, "allow").await.json().await.unwrap();
+    let target = allowed["location"].as_str().unwrap().to_string();
+    assert!(target.starts_with(&format!("{with_query}&")), "{target}");
+    let query = query_of(&target);
+    assert_eq!(query.get("tenant").map(String::as_str), Some("eu"));
+    assert!(query.contains_key("code"));
+}
+
+/// **With `auth.oauth` off there is no front door either.**
+///
+/// The same `404` the two well-known documents and the registration endpoint
+/// answer, so a client probing an instance that serves no OAuth gets one
+/// consistent answer wherever it knocks.
+#[tokio::test]
+async fn authorizing_is_gone_while_oauth_is_off() {
+    let ctx = OauthCtx::start_with(false).await;
+    ctx.create_user("ada", Role::Viewer).await;
+    let ada = ctx.sign_in("ada").await;
+
+    let response = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", "coc_0000000000000000000000000000dead"),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+        ])
+        .await;
+    assert_eq!(response.status(), 404);
+    assert_eq!(
+        response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json"),
+    );
+    let body: Value = response.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("auth.oauth"),
+        "the operator reading it is the one who can change the answer: {body}"
+    );
+
+    assert_eq!(ctx.consent("whatever", Some(&ada)).await.status(), 404);
+    assert_eq!(ctx.decide("whatever", &ada, "allow").await.status(), 404);
 }

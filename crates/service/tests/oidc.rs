@@ -2313,3 +2313,89 @@ async fn a_configured_redirect_uri_is_repeated_at_the_token_exchange() {
         "and the sign-in completed into a session"
     );
 }
+
+/// **A provider sign-in lands back on the page it was started from.**
+///
+/// The OAuth consent page is the case this exists for: an MCP client sends a
+/// browser to `/authorize?request=<id>`, Fluid finds nobody signed in and sends
+/// the person to the login page, and single sign-on has to bring them back to
+/// that exact request rather than to the application root - the pending
+/// authorization is only reachable by its id, so a landing anywhere else loses
+/// it and the client has to start again.
+///
+/// What may be returned to is a path on this instance and nothing else. A
+/// `return_to` is a value a stranger puts in a link, so the refused spellings
+/// here are the ones that turn a trusted login link into somebody else's page:
+/// a scheme-relative `//host` (a url, not a path), a backslash (which several
+/// browsers read as a slash), an absolute url, and anything absurdly long.
+/// Every refusal lands on `/` rather than failing the sign-in: the person did
+/// sign in, and only the destination was unusable.
+#[tokio::test]
+async fn a_provider_sign_in_returns_to_the_consent_page_it_started_from() {
+    let idp = FakeIdp::start().await;
+    let ctx = RestCtx::with_oidc(&idp.issuer()).await;
+
+    let honoured = "/authorize?request=9f2c1d7e4b6a80351c8e0d2f4a6b8c1e";
+    let landed = sign_in_returning_to(&ctx, Some(honoured)).await;
+    assert_eq!(
+        landed, honoured,
+        "the browser goes back to the consent page"
+    );
+
+    let refused = [
+        "//evil.test/steal",
+        "/\\evil.test",
+        "\\/evil.test",
+        "https://evil.test/steal",
+        "authorize?request=1",
+        "/authorize\u{0d}\u{0a}Set-Cookie: a=b",
+        "/authorize?request=\u{e9}",
+    ];
+    for value in refused {
+        assert_eq!(
+            sign_in_returning_to(&ctx, Some(value)).await,
+            "/",
+            "'{value}' is not a path on this instance"
+        );
+    }
+    let too_long = format!("/{}", "a".repeat(600));
+    assert_eq!(
+        sign_in_returning_to(&ctx, Some(&too_long)).await,
+        "/",
+        "a return path is at most 512 characters"
+    );
+
+    // And a sign-in that asked for nothing still lands where it always did.
+    assert_eq!(sign_in_returning_to(&ctx, None).await, "/");
+}
+
+/// One whole sign-in with `return_to` on the login request, answered with where
+/// the callback finally sent the browser.
+async fn sign_in_returning_to(ctx: &RestCtx, return_to: Option<&str>) -> String {
+    let url = match return_to {
+        Some(value) => format!(
+            "{}?return_to={}",
+            ctx.url("/auth/oidc/login"),
+            path_segment(value)
+        ),
+        None => ctx.url("/auth/oidc/login"),
+    };
+    let start = ctx.get(&url, &[]).await;
+    assert_eq!(
+        start.status(),
+        302,
+        "the sign-in starts whatever it asked for"
+    );
+    let cookies = cookies_from(&start);
+    let bounced = ctx.client.get(location(&start)).send().await.unwrap();
+    assert_eq!(bounced.status(), 302);
+    let done = ctx.get(&location(&bounced), &cookies).await;
+    assert_eq!(done.status(), 302, "the sign-in completes");
+    assert!(
+        cookies_from(&done)
+            .iter()
+            .any(|(name, _)| name == "fluid_session"),
+        "and it completed into a session"
+    );
+    location(&done)
+}

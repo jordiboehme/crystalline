@@ -500,6 +500,16 @@ struct Pending {
     /// belongs to the request that started the flow, not to the one that
     /// finishes it.
     link_for: Option<String>,
+    /// Where to send the browser once this sign-in completes, when the page
+    /// that started it asked for somewhere in particular. `None` is the
+    /// application root.
+    ///
+    /// Held here rather than in a cookie or in the url for the same reason
+    /// everything else in this record is: a value the browser carries is a
+    /// value the browser can be talked into replacing, and this one decides
+    /// where a freshly signed-in person is sent. It has already been through
+    /// [`safe_return_path`] before it gets here.
+    return_to: Option<String>,
     /// When the record was made, for the TTL and for the eviction order.
     started: Instant,
 }
@@ -1157,6 +1167,59 @@ pub struct LoginQuery {
     /// be a GET.
     #[serde(default)]
     pub link: bool,
+    /// Where to send the browser once the sign-in completes: a path on this
+    /// instance, which the callback 302s to instead of `/`.
+    ///
+    /// The OAuth consent page is what this exists for. A client sends a
+    /// browser to `/authorize?request=<id>`, Fluid finds nobody signed in and
+    /// carries the intended location to the login page, and a provider sign-in
+    /// has to come back to that exact request: the pending authorization is
+    /// only reachable by its id, so landing anywhere else loses it.
+    ///
+    /// Anything [`safe_return_path`] does not accept is dropped rather than
+    /// refused, and the sign-in lands on `/`: the person did sign in, and only
+    /// the destination was unusable.
+    pub return_to: Option<String>,
+}
+
+/// How long a `return_to` may be. Generous for a path with a query on it, and
+/// far short of what would make the pending record a place to store somebody
+/// else's data.
+const MAX_RETURN_PATH: usize = 512;
+
+/// `path` if it names somewhere on this instance, `None` if it names anything
+/// else.
+///
+/// A `return_to` is a value a stranger puts in a link and sends to somebody, so
+/// the only question worth asking is whether it can leave this origin. It
+/// cannot if it is a path - and the rules are what stop a url from looking like
+/// one:
+///
+/// - **Starts with `/`, and not with `//`.** `//evil.test/steal` is a
+///   scheme-relative url, not a path: a browser sent there leaves this
+///   instance entirely, which is the whole attack.
+/// - **No backslash anywhere.** Several browsers read `\` as `/` in a url, so
+///   `/\evil.test` reaches the same place `//evil.test` does while passing a
+///   naive "starts with one slash" check.
+/// - **Printable ASCII, no whitespace or control characters.** The value goes
+///   into a `Location` header, so it has to be a valid header value; a CR or LF
+///   in one is a response-splitting attempt, and this is the check that ends
+///   it. Same rule, and the same reason, as [`super::oauth::redirect_uri_problem`].
+/// - **At most [`MAX_RETURN_PATH`] characters.**
+pub(crate) fn safe_return_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') || path.starts_with("//") {
+        return None;
+    }
+    if path.len() > MAX_RETURN_PATH {
+        return None;
+    }
+    if path.contains('\\') {
+        return None;
+    }
+    if !path.is_ascii() || path.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// What `POST /auth/oidc/login` answers with: where to send the browser.
@@ -1188,6 +1251,10 @@ struct StartedSignOn {
 /// Answers 302 to the provider's authorization endpoint with PKCE (S256), a
 /// server-generated state and a server-generated nonce, and sets the
 /// short-lived state cookie that binds the sign-in to this browser.
+///
+/// `return_to` says where the callback should land the browser afterwards. It
+/// is checked by [`safe_return_path`] here, before the record exists, and
+/// dropped rather than refused when it names anywhere but this instance.
 #[utoipa::path(
     get,
     path = "/api/v1/auth/oidc/login",
@@ -1203,7 +1270,13 @@ struct StartedSignOn {
                    session yet. Linking a provider identity to an existing \
                    account is the POST on this same path, not a flag here: a \
                    GET carrying `link=true` is refused with a 400 that says \
-                   so, because a GET could be sent by another origin.",
+                   so, because a GET could be sent by another origin. \
+                   `return_to` names where the callback should land the \
+                   browser once the sign-in completes - the OAuth consent \
+                   page is what it exists for. It must be a path on this \
+                   instance (starts with `/`, not `//`, no backslash, at most \
+                   512 printable ASCII characters); anything else is dropped \
+                   and the sign-in lands on `/`.",
     responses(
         (
             status = 302,
@@ -1261,7 +1334,8 @@ pub async fn login(
              token - this GET starts an ordinary sign-in and will not link anything",
         ));
     }
-    let started = start_sign_on(&state, &headers, None).await?;
+    let return_to = query.return_to.as_deref().and_then(safe_return_path);
+    let started = start_sign_on(&state, &headers, None, return_to).await?;
     Ok((
         jar.add(started.cookie),
         super::auth::no_store(),
@@ -1380,7 +1454,10 @@ pub async fn start_link(
     // An instance with no provider is the 404 `start_sign_on` answers on its
     // own first line; the account check above it is what keeps that answer
     // from telling an unauthenticated caller anything.
-    let started = start_sign_on(&state, &headers, Some(account.name)).await?;
+    // No `return_to`: a link is started by a script that is already on the
+    // page it wants to stay on, and answers a location in a body rather than
+    // a redirect. The one caller that needs the landing carried is the GET.
+    let started = start_sign_on(&state, &headers, Some(account.name), None).await?;
     Ok((
         jar.add(started.cookie),
         super::auth::no_store(),
@@ -1398,10 +1475,13 @@ pub async fn start_link(
 /// `link_for` is the only difference between an ordinary sign-in and a link,
 /// and it is carried in the pending record rather than in the url, so nothing
 /// a browser or a provider can rewrite decides which of the two this is.
+/// `return_to` rides there for the same reason, and has already been through
+/// [`safe_return_path`].
 async fn start_sign_on(
     state: &RestState,
     headers: &HeaderMap,
     link_for: Option<String>,
+    return_to: Option<String>,
 ) -> Result<StartedSignOn, ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
     let redirect_uri = client.settings.redirect_uri(headers)?;
@@ -1427,6 +1507,7 @@ async fn start_sign_on(
             verifier,
             redirect_uri,
             link_for,
+            return_to,
             started: Instant::now(),
         },
     );
@@ -1569,8 +1650,8 @@ pub async fn callback(
     // presented twice.
     let jar = jar.remove(Cookie::build(STATE_COOKIE).path("/").build());
     let outcome = finish(&state, bound, query).await;
-    let claims = match outcome {
-        Ok(claims) => claims,
+    let (claims, return_to) = match outcome {
+        Ok(finished) => finished,
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
     let user = resolve_oidc_identity(&state, claims, &identity).await;
@@ -1579,20 +1660,26 @@ pub async fn callback(
         Err(err) => return Ok((jar, super::auth::no_store(), err).into_response()),
     };
     let jar = super::auth::issue_session(&state, jar, &headers, &user).await?;
-    Ok((jar, super::auth::no_store(), found("/")).into_response())
+    // Where the page that started this asked to land, or the application root.
+    // The value came out of the pending record rather than off this request,
+    // so nothing the provider or the browser sent decides it.
+    let landing = return_to.as_deref().unwrap_or("/");
+    Ok((jar, super::auth::no_store(), found(landing)).into_response())
 }
 
 /// The protocol half of [`callback`]: everything from the query the provider
-/// sent to a set of validated claims.
+/// sent to a set of validated claims, plus where the page that started this
+/// asked to land.
 ///
 /// Split out so the mechanism can be exercised without an identity resolver
 /// behind it, and so the seam below is one call rather than a tail of one long
-/// handler.
+/// handler. The landing rides out of here rather than being read off the
+/// request because the record is the only place it was ever trusted.
 async fn finish(
     state: &RestState,
     bound: Option<String>,
     query: CallbackQuery,
-) -> Result<OidcClaims, ApiError> {
+) -> Result<(OidcClaims, Option<String>), ApiError> {
     let client = state.oidc.as_ref().ok_or_else(sso_is_off)?;
     let issuer = &client.settings.issuer;
     if let Some(error) = query.error.as_deref() {
@@ -1657,6 +1744,7 @@ async fn finish(
             &pending.nonce,
         )
         .await?;
+    let return_to = pending.return_to;
     let mut claims = OidcClaims::from_id_token(&verified, pending.link_for);
     if claims.lacks_presentation_claims() {
         client
@@ -1673,7 +1761,7 @@ async fn finish(
         claims.subject,
         claims.issuer
     );
-    Ok(claims)
+    Ok((claims, return_to))
 }
 
 /// A 302 to `location`.
@@ -2343,6 +2431,67 @@ mod tests {
         );
     }
 
+    /// A `return_to` is somewhere on this instance or it is nothing.
+    ///
+    /// The value arrives in a link, so the question is only ever whether a
+    /// browser sent there leaves this origin. Each refused spelling below is a
+    /// different way of writing a url that a "starts with a slash" check on
+    /// its own would wave through.
+    #[test]
+    fn a_return_path_is_same_origin_or_nothing() {
+        for accepted in [
+            "/",
+            "/authorize?request=9f2c1d7e4b6a80351c8e0d2f4a6b8c1e",
+            "/domains/eng/engrams/alpha",
+            "/search?q=a%20b&tag=x",
+            "/a#section",
+        ] {
+            assert_eq!(
+                safe_return_path(accepted).as_deref(),
+                Some(accepted),
+                "'{accepted}' is a path on this instance"
+            );
+        }
+
+        for refused in [
+            // Not a path at all.
+            "",
+            "authorize",
+            "https://evil.test/steal",
+            "http://evil.test",
+            "javascript:alert(1)",
+            // A url wearing a path's clothes: scheme-relative, and the
+            // backslash spellings browsers read as slashes.
+            "//evil.test/steal",
+            "//evil.test",
+            "/\\evil.test",
+            "\\\\evil.test",
+            "/authorize\\..\\..",
+            // Not a header value: a newline here is response splitting, and a
+            // non-ASCII byte is not one either.
+            "/authorize\r\nSet-Cookie: a=b",
+            "/authorize\nx",
+            "/authorize\tx",
+            "/authorize with a space",
+            "/caf\u{e9}",
+            "/\u{0}",
+        ] {
+            assert_eq!(
+                safe_return_path(refused),
+                None,
+                "'{refused}' must not be returned to"
+            );
+        }
+
+        // The length bound, on both sides of it.
+        let longest = format!("/{}", "a".repeat(MAX_RETURN_PATH - 1));
+        assert_eq!(
+            safe_return_path(&longest).as_deref(),
+            Some(longest.as_str())
+        );
+        assert_eq!(safe_return_path(&format!("{longest}a")), None);
+    }
+
     /// The secret is a field of the settings struct, so the struct's own
     /// `Debug` is one of the ways it could escape into a log line.
     #[test]
@@ -2512,6 +2661,7 @@ mod tests {
             verifier: PkceCodeVerifier::new("v".repeat(43)),
             redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
             link_for: None,
+            return_to: None,
             started: Instant::now() - age,
         };
         // Single use.
@@ -2609,6 +2759,7 @@ mod tests {
             verifier: PkceCodeVerifier::new("v".repeat(43)),
             redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
             link_for: None,
+            return_to: None,
             started: Instant::now(),
         };
         for i in 0..(MAX_PENDING * 2) {

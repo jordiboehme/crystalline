@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register`, `/oauth/authorize` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -420,7 +420,7 @@
           "auth"
         ],
         "summary": "Start a single sign-on against the configured provider.",
-        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin.",
+        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance (starts with `/`, not `//`, no backslash, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on `/`.",
         "operationId": "oidc_login",
         "parameters": [
           {
@@ -430,6 +430,15 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "name": "return_to",
+            "in": "query",
+            "description": "Where to send the browser once the sign-in completes: a path on this\ninstance, which the callback 302s to instead of `/`.\n\nThe OAuth consent page is what this exists for. A client sends a\nbrowser to `/authorize?request=<id>`, Fluid finds nobody signed in and\ncarries the intended location to the login page, and a provider sign-in\nhas to come back to that exact request: the pending authorization is\nonly reachable by its id, so landing anywhere else loses it.\n\nAnything [`safe_return_path`] does not accept is dropped rather than\nrefused, and the sign-in lands on `/`: the person did sign in, and only\nthe destination was unusable.",
+            "required": false,
+            "schema": {
+              "type": "string"
             }
           }
         ],
@@ -5517,6 +5526,273 @@
         }
       }
     },
+    "/api/v1/oauth/authorizations/{id}": {
+      "get": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "What an MCP client is asking this account to grant.",
+        "description": "The consent screen's own read: the client's name and home page, the host the answer will be sent to and whether it is this machine, the account that would be granted, and how long is left. Never the authorization code, the PKCE challenge or the client's `state` - none of them is anything a person decides with. Needs a signed-in account, any role.",
+        "operationId": "oauth_authorization",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The pending authorization, from the consent screen's `request` parameter.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request, as the consent screen shows it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No signed-in account: there is nobody to grant anything.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such pending request: it expired, it was already decided, or this instance serves no OAuth.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Allow or deny what an MCP client is asking for.",
+        "description": "Takes the pending request - once, so a second answer finds nothing - and answers where to send the browser. On `allow` that is the client's redirect uri carrying a single-use authorization code, the client's `state` and `iss`; the code is bound to this account, this client, this redirect uri, the PKCE challenge and this resource, and lives sixty seconds. On `deny` it is the same uri carrying `error=access_denied`. A grant is the whole account's rights until it is revoked from the profile page. Needs a signed-in account, any role, and the session's CSRF token; served on a read-only instance, like the personal token surface.",
+        "operationId": "oauth_decide",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The pending authorization being decided.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Navigate the whole page to `location`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No signed-in account: there is nobody to grant anything.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The session's CSRF token was missing or wrong.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such pending request: it expired, it was already decided, or this instance serves no OAuth.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is not `{\"decision\": \"allow\"}` or `{\"decision\": \"deny\"}`. The request is left undecided, because the body is read before it is taken.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/authorize": {
+      "get": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Start an authorization for an MCP client.",
+        "description": "The authorization endpoint the metadata advertises. `response_type=code` and PKCE `S256` are required - this server registers public clients only, so the challenge is what makes an intercepted code worthless. A good request answers 302 to the consent screen `/authorize?request=<id>`, where a signed-in person allows or denies it. An unknown `client_id`, or a `redirect_uri` the registration did not name, is answered here as a problem detail and is never redirected anywhere; every other refusal goes back to the client's redirect uri with `error`, `state` and `iss`.",
+        "operationId": "oauth_authorize",
+        "parameters": [
+          {
+            "name": "response_type",
+            "in": "query",
+            "description": "Always `code`: this server answers no other response type.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "query",
+            "description": "The registration this request is made under.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "description": "Where to send the browser with the answer. Must be one the\nregistration named, port-agnostically for a loopback client.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code_challenge",
+            "in": "query",
+            "description": "The PKCE challenge: 43 to 128 unreserved characters.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code_challenge_method",
+            "in": "query",
+            "description": "Always `S256`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The client's own value, carried back on the answer.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "Accepted and ignored. See the struct's documentation.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resource",
+            "in": "query",
+            "description": "Which resource a token is being asked for: absent, or this instance's\nown identifier (a trailing slash is tolerated).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Follow `location`: the consent screen for a good request, or the client's redirect uri carrying `error`, `state` and `iss`.",
+            "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`."
+              },
+              "location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The consent screen, or the client's redirect uri."
+              }
+            }
+          },
+          "400": {
+            "description": "No usable `client_id` or `redirect_uri`, so there is nowhere this server is willing to send an error.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/oauth/register": {
       "post": {
         "tags": [
@@ -6927,6 +7203,53 @@
           }
         }
       },
+      "AuthorizationView": {
+        "type": "object",
+        "description": "What the consent page shows: who is asking, where the answer goes, and who\nis about to grant it.\n\nDeliberately not the protocol: no code, no challenge, no state, no client\nid. A person deciding whether to trust something is helped by the client's\nname and the address the answer will be sent to, and by nothing else on\nthis list. `Debug` is derived because there is nothing here to redact,\nwhich is the property rather than an accident.",
+        "required": [
+          "client_name",
+          "redirect_host",
+          "loopback",
+          "account",
+          "expires_in"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "The account that will be granted. A client acts as the person who\nconsented, so this is what is actually being handed over.",
+            "example": "ada"
+          },
+          "client_name": {
+            "type": "string",
+            "description": "The client's name as it registered it, at most 100 characters of\nprintable text.",
+            "example": "Claude"
+          },
+          "client_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's home page, when it registered one.",
+            "example": "https://claude.ai"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds until the request expires and has to be started again from the\nclient.",
+            "example": 587,
+            "minimum": 0
+          },
+          "loopback": {
+            "type": "boolean",
+            "description": "Whether that address is this machine, so the page can say that the\nclient is a program on this computer rather than a service elsewhere."
+          },
+          "redirect_host": {
+            "type": "string",
+            "description": "The host (and port, when it names one) the browser will be sent to.\nThe one fact that says where an authorization actually goes.",
+            "example": "claude.ai"
+          }
+        }
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -7105,6 +7428,41 @@
             ],
             "description": "The engram `type`. Defaults to `engram`. Free form; recommended values\nare guidance.",
             "example": "decision"
+          }
+        }
+      },
+      "Decision": {
+        "type": "string",
+        "description": "Allow or deny, and there is nothing else to choose: a grant here is the\nwhole account's rights until it is revoked.",
+        "enum": [
+          "allow",
+          "deny"
+        ]
+      },
+      "DecisionBody": {
+        "type": "object",
+        "description": "What `POST /oauth/authorizations/{id}` takes.",
+        "required": [
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/Decision",
+            "description": "`allow` or `deny`. Anything else is not a decision and is refused\nbefore the pending request is touched, so an unreadable answer leaves\nit there to be answered again."
+          }
+        }
+      },
+      "DecisionResponse": {
+        "type": "object",
+        "description": "Where to send the browser once the decision is made.\n\nA body rather than a redirect, for the reason `POST /auth/oidc/login`\nanswers one: only a script can send the session's CSRF token, and a script\ncannot read where a redirect went, so a 302 here would hand the browser\nsomewhere the page could not learn. Fluid navigates the whole page to it.\n\n`Debug` is written rather than derived: on an allow this location carries\nthe authorization code.",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "The client's redirect uri with the answer on it: `code`, `state` and\n`iss` on an allow, `error=access_denied`, `state` and `iss` on a deny.",
+            "example": "https://claude.ai/api/mcp/auth_callback?code=...&state=...&iss=https://kb.example"
           }
         }
       },

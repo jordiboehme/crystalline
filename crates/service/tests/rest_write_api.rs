@@ -2181,6 +2181,25 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Viewer,
             read_only_exempt: true,
         },
+        // Deciding what an MCP client may do: every signed-in account may
+        // answer a consent request of its own, because a client acts as the
+        // person who consented and there is no account at the moment the
+        // client starts one. Read-only exempt on the settlement the two
+        // surfaces below share - a grant is account state in the accounts
+        // database rather than knowledge, and a read-only team server with
+        // `auth.oauth` on is exactly where a client cannot connect without
+        // one. The id names no pending request (the fixture instance serves
+        // no OAuth at all), so every allowed leg answers 404 - past
+        // authorization, which is what this matrix asserts - and `deny`
+        // rather than `allow` so that a leg could grant nothing even if it
+        // did name one.
+        WriteOp {
+            method: Method::POST,
+            path: "/api/v1/oauth/authorizations/9",
+            body: Some(serde_json::json!({"decision": "deny"})),
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
         // The self-service identity-link surface, on the same settlement as
         // the tokens above: every account may give up its own link, and an
         // identity link is account state rather than knowledge, so a
@@ -2391,6 +2410,12 @@ fn canonicalize(path: &str) -> String {
             None => String::new(),
         };
         return format!("/api/v1/me/mcp-tokens/{{id}}{tail}");
+    }
+    // The consent route's id is 32 random bytes of hex, which the per-segment
+    // pass below could not name either: spelled out here for the same reason
+    // the token ids above are.
+    if path.starts_with("/api/v1/oauth/authorizations/") {
+        return "/api/v1/oauth/authorizations/{id}".to_string();
     }
     // The identity-link route takes an issuer url percent-encoded into one
     // segment, which no per-segment name could match: it is spelled out here

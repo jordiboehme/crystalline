@@ -61,6 +61,35 @@
 //! is the rule that decides what may be stored and [`redirect_matches`] the
 //! rule that decides what may be presented against it; they are two halves of
 //! one decision and live side by side for that reason.
+//!
+//! # The authorization leg, and where the person comes in
+//!
+//! [`authorize`] is the front door: a client sends a browser to it, and it
+//! checks everything a server can check without a person - a known
+//! registration, a redirect uri that registration named, PKCE with `S256`, and
+//! a `resource` naming this instance. Nothing is granted there. What it
+//! produces is a [`PendingAuthorization`] under an unguessable id and a `302`
+//! to the Fluid consent screen, and only a signed-in account pressing a button
+//! turns that into an authorization code.
+//!
+//! Two rules carry the weight, and they are the two the checks are ordered
+//! around:
+//!
+//! 1. **An error is only ever redirected to a registered redirect uri.** A bad
+//!    `client_id` or a `redirect_uri` no registration named is answered here,
+//!    to the person, as a problem detail. Redirecting it would make this
+//!    endpoint an open redirect with an OAuth error stapled to it.
+//! 2. **Everything a client can be told, it is told.** Once the redirect uri is
+//!    trusted, RFC 6749 section 4.1.2.1 sends the refusal to the client with
+//!    `state` and `iss`, because a browser stuck on an error page is a flow
+//!    nobody can recover.
+//!
+//! Both stores here are in memory ([`AuthorizationStore`], [`CodeStore`]) and
+//! that is the specification's own trade: a restart between the client's
+//! redirect and the person's decision, or between the decision and the
+//! exchange, costs a retry, where keeping either in the database would cost a
+//! row per abandoned tab. The tokens a code turns into are in the database and
+//! survive both.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -75,9 +104,9 @@ use crystalline_core::config::GlobalConfig;
 use openidconnect::url::{Host, Url};
 use serde_json::{Value, json};
 
-use super::auth::{NoStore, no_store, request_origin};
+use super::auth::{Identity, NoStore, no_store, request_origin};
 use super::auth_store::normalize_resource;
-use super::{ApiError, ApiJson, AuthStore, ProblemDetail, RestState};
+use super::{ApiError, ApiJson, ApiPath, ApiQuery, AuthStore, ProblemDetail, RestState};
 
 /// RFC 9728 protected resource metadata, at the origin root. A client reads it
 /// from the `resource_metadata` parameter of the gate's `401`, and falls back
@@ -89,8 +118,22 @@ pub const PROTECTED_RESOURCE_PATH: &str = "/.well-known/oauth-protected-resource
 /// does not.
 pub const AUTHORIZATION_SERVER_PATH: &str = "/.well-known/oauth-authorization-server";
 
-/// Where a browser is sent to consent, relative to the API mount.
+/// Where a client sends a browser to start an authorization, relative to the
+/// API mount. NOT the page a person sees: this route answers a redirect to
+/// [`CONSENT_PAGE`], which is the Fluid screen. The two are deliberately
+/// spelled apart.
 pub const AUTHORIZE_PATH: &str = "/oauth/authorize";
+
+/// The consent pair, relative to the API mount: `GET` reads what is being
+/// asked for and `POST` answers it. Guarded like every other account-bearing
+/// route - the whole point is that a person decides - so it is not in
+/// [`super::auth::PUBLIC_PATHS`] the way [`AUTHORIZE_PATH`] is.
+pub const AUTHORIZATIONS_PATH: &str = "/oauth/authorizations/{id}";
+
+/// The Fluid screen a person consents on, at the application root rather than
+/// under the API mount: a browser is navigated here, and what it loads is the
+/// single-page app. `?request=<id>` names the pending authorization.
+pub const CONSENT_PAGE: &str = "/authorize";
 
 /// Where a code or a refresh token is exchanged, relative to the API mount.
 pub const TOKEN_PATH: &str = "/oauth/token";
@@ -164,6 +207,46 @@ const AUTH_METHOD_NONE: &str = "none";
 /// room to spare for anything legitimate and a thousandth of what an anonymous
 /// caller could otherwise make this process parse.
 pub const MAX_REGISTER_BYTES: usize = 64 * 1024;
+
+/// How long a started authorization waits for a person to decide.
+///
+/// The same ten minutes a single sign-on gets, and for the same reason: long
+/// enough to read a consent screen, sign in at a provider and type a second
+/// factor, short enough that an abandoned tab is forgotten while it is still
+/// open.
+const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How many authorizations may be waiting for a decision at once.
+///
+/// [`authorize`] is public, so this map is something a stranger can add to.
+/// Smaller than the sign-in map's ten thousand because a pending authorization
+/// costs a client registration first, which is itself bounded three ways.
+const MAX_PENDING_AUTHORIZATIONS: usize = 1000;
+
+/// How old a pending authorization must be before a full map may drop it to
+/// make room. See [`AuthorizationStore::insert`]; the rule and the number are
+/// the single sign-on store's.
+const MIN_EVICT_AGE: Duration = Duration::from_secs(30);
+
+/// How long an authorization code may be exchanged for.
+///
+/// One minute: the code goes from this server to the client's redirect uri and
+/// straight back to the token endpoint, which is two hops of a program rather
+/// than anything a person waits through. OAuth 2.1 recommends a maximum of ten
+/// minutes and every second past the exchange is a second an intercepted code
+/// is worth something.
+const CODE_TTL: Duration = Duration::from_secs(60);
+
+/// The shortest and longest a PKCE `code_challenge` may be, from RFC 7636
+/// section 4.2. An S256 challenge is always exactly 43 characters; the range
+/// is the specification's and is checked rather than the exact width, so a
+/// client padding within the rule is not refused for it.
+const CHALLENGE_LEN: std::ops::RangeInclusive<usize> = 43..=128;
+
+/// How long a `state` this server will carry back. Not in the specification:
+/// `state` is opaque to this server and rides in a bounded map that a stranger
+/// can add to, so it is bounded for the reason every other length here is.
+const MAX_STATE_LEN: usize = 512;
 
 /// How this instance names itself, per request.
 ///
@@ -269,6 +352,12 @@ pub struct OauthServer {
     /// What bounds the one unauthenticated write here. See
     /// [`RegistrationLimiter`].
     pub limiter: RegistrationLimiter,
+    /// The authorizations waiting for somebody to decide them. See
+    /// [`AuthorizationStore`].
+    authorizations: Mutex<AuthorizationStore>,
+    /// The codes a decision has issued and the token endpoint has not spent
+    /// yet. See [`CodeStore`].
+    codes: Mutex<CodeStore>,
 }
 
 impl OauthServer {
@@ -278,6 +367,8 @@ impl OauthServer {
             Arc::new(OauthServer {
                 origin: OriginRule::from_config(config),
                 limiter: RegistrationLimiter::default(),
+                authorizations: Mutex::new(AuthorizationStore::default()),
+                codes: Mutex::new(CodeStore::default()),
             })
         })
     }
@@ -1156,11 +1247,1217 @@ pub(super) fn prune_at_start(auth: Arc<AuthStore>) {
     handle.spawn(async move { prune_registrations(&auth).await });
 }
 
+// --- authorization, consent and codes ---------------------------------------
+
+/// 32 bytes from the OS CSPRNG as lowercase hex: the shape of every
+/// unguessable value this half of the surface mints - a pending
+/// authorization's id and an authorization code.
+///
+/// Spelled here rather than reached for in [`super::auth_store`] because that
+/// module's generator is private to it and the two have no reason to be one:
+/// what it mints is written to a database, and what this mints never leaves
+/// memory.
+fn random_hex_32() -> String {
+    use argon2::password_hash::rand_core::{OsRng, RngCore};
+    let mut bytes = [0u8; 32];
+    OsRng.fill_bytes(&mut bytes);
+    crystalline_index::hex_lower(&bytes)
+}
+
+/// The sha256 of `value`, lowercase hex. What the code store keys on, so a
+/// process dump of a running daemon yields nothing that can be exchanged.
+fn sha256_hex(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    crystalline_index::hex_lower(&hasher.finalize())
+}
+
+/// An authorization request that passed every check a server can make on its
+/// own, waiting for a person to allow or deny it.
+///
+/// It holds what the consent page shows and what the code will be bound to.
+/// Nothing here is taken from the deciding request later: a person's browser
+/// arrives at the consent page with an id and nothing else, so what is decided
+/// about is what the client asked for, not what the browser says it asked for.
+///
+/// `Debug` is written rather than derived: the challenge and the state are the
+/// client's protocol values and have no business in a log line.
+struct PendingAuthorization {
+    /// The registration this was started by.
+    client_id: String,
+    /// What to call that client on the consent page, as it was registered.
+    client_name: String,
+    /// The client's home page, when the registration named one. Copied here
+    /// rather than looked up at consent time so that a re-registration between
+    /// the two cannot change what the person is shown.
+    client_uri: Option<String>,
+    /// Where the browser goes with the answer: the uri the client PRESENTED,
+    /// which for a loopback client is not the one it registered (RFC 8252
+    /// section 7.3 forgives the port). The code binds to this one, because it
+    /// is the one the token request will name.
+    redirect_uri: String,
+    /// The PKCE challenge the token endpoint will check a verifier against.
+    code_challenge: String,
+    /// The resource a token from this will be minted for: this instance's own
+    /// identifier, normalized, never the spelling the client asked in.
+    resource: String,
+    /// The client's own value, carried back untouched, or `None` when it sent
+    /// none.
+    state: Option<String>,
+    /// When the request arrived, for the TTL and the eviction order.
+    started: Instant,
+}
+
+impl std::fmt::Debug for PendingAuthorization {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PendingAuthorization")
+            .field("client_id", &self.client_id)
+            .field("client_name", &self.client_name)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("code_challenge", &"[redacted]")
+            .field("resource", &self.resource)
+            .field("state", &self.state.as_ref().map(|_| "[redacted]"))
+            .finish()
+    }
+}
+
+/// The authorizations waiting for a decision, keyed by their unguessable id.
+///
+/// In memory and nowhere else, which is the trade the specification names: a
+/// daemon restarted between the client's redirect and the person's decision
+/// loses the request and the client starts over, and a second replica behind a
+/// proxy does not see the first one's. Both cost a retry; putting a
+/// short-lived consent record in the accounts database would cost a row per
+/// abandoned tab forever.
+#[derive(Default)]
+struct AuthorizationStore {
+    records: std::collections::HashMap<String, PendingAuthorization>,
+    /// Every id inserted, oldest first. Records only ever go in with a fresh
+    /// `started`, so this is chronological and both expiry and eviction walk
+    /// it from the front. An entry whose record was taken is skipped when it
+    /// is reached.
+    order: VecDeque<(Instant, String)>,
+}
+
+/// The map is full of authorizations too young to evict. See
+/// [`AuthorizationStore::insert`].
+#[derive(Debug)]
+struct AuthorizationsFull;
+
+impl AuthorizationStore {
+    /// How many authorizations are waiting.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    /// Remember `record` under `id`, forgetting what has expired and, if the
+    /// map is still full, the oldest records past [`MIN_EVICT_AGE`].
+    ///
+    /// The floor is the single sign-on store's and is the whole reason this is
+    /// not a plain oldest-first eviction: without it, filling the map is a way
+    /// to evict every real consent mid decision - the cap would be reached and
+    /// the oldest record, somebody who pressed a button in their client a few
+    /// seconds ago, would go. With it a full map of young records refuses the
+    /// newcomer, which costs a flood its own next request and costs the person
+    /// deciding nothing.
+    fn insert(
+        &mut self,
+        id: String,
+        record: PendingAuthorization,
+    ) -> Result<(), AuthorizationsFull> {
+        let now = Instant::now();
+        self.purge_expired(now);
+        while self.records.len() >= MAX_PENDING_AUTHORIZATIONS {
+            let Some((started, key)) = self.order.front() else {
+                break;
+            };
+            let already_taken = !self.records.contains_key(key);
+            if !already_taken && now.duration_since(*started) < MIN_EVICT_AGE {
+                return Err(AuthorizationsFull);
+            }
+            let (_, key) = self.order.pop_front().expect("checked just above");
+            self.records.remove(&key);
+        }
+        self.order.push_back((record.started, id.clone()));
+        self.records.insert(id, record);
+        Ok(())
+    }
+
+    /// Read the record for `id` without spending it: the consent page is a
+    /// page, and a person may open it twice before deciding once.
+    fn get(&mut self, id: &str) -> Option<&PendingAuthorization> {
+        self.purge_expired(Instant::now());
+        self.records.get(id)
+    }
+
+    /// Take the record for `id`, if it exists and has not expired.
+    ///
+    /// Taking rather than reading is what makes a decision happen once: the
+    /// record is gone before a code is minted, so a second press of Allow - or
+    /// a page left open and pressed again tomorrow - finds nothing to decide.
+    fn take(&mut self, id: &str) -> Option<PendingAuthorization> {
+        let now = Instant::now();
+        let taken = self.records.remove(id);
+        self.purge_expired(now);
+        taken.filter(|record| now.duration_since(record.started) < PENDING_TTL)
+    }
+
+    /// Forget every record older than [`PENDING_TTL`], from the front of the
+    /// chronological order until the first one still live, dropping the spent
+    /// entries met on the way. See the single sign-on store, whose reasoning
+    /// this is.
+    fn purge_expired(&mut self, now: Instant) {
+        while let Some((started, key)) = self.order.front() {
+            let spent = !self.records.contains_key(key);
+            if !spent && now.duration_since(*started) < PENDING_TTL {
+                break;
+            }
+            let (_, key) = self.order.pop_front().expect("checked just above");
+            self.records.remove(&key);
+        }
+    }
+}
+
+/// What an authorization code stands for, kept under the code's own sha256.
+///
+/// Every field is a condition the token endpoint checks: the client that
+/// presents the code must be the one it was issued to, at the redirect uri it
+/// was issued for, holding the verifier behind the challenge, asking for the
+/// same resource - and the grant that comes out is for the account named here,
+/// which is the account that pressed Allow and no other.
+///
+/// `Debug` is written rather than derived, for [`PendingAuthorization`]'s
+/// reason.
+// Read by the token endpoint, which is the next task's: this half of the code
+// store mints and the other half spends, and they land in two commits.
+#[allow(dead_code)]
+struct IssuedCode {
+    client_id: String,
+    redirect_uri: String,
+    code_challenge: String,
+    resource: String,
+    user: String,
+    issued: Instant,
+}
+
+impl std::fmt::Debug for IssuedCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedCode")
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field("code_challenge", &"[redacted]")
+            .field("resource", &self.resource)
+            .field("user", &self.user)
+            .finish()
+    }
+}
+
+/// The codes a decision has issued and the token endpoint has not spent yet,
+/// keyed by sha256 of the code.
+///
+/// Hashed for the reason every credential here is hashed: what is held is not
+/// what can be presented. In memory for [`AuthorizationStore`]'s reason, and
+/// with a much shorter life - the code travels from this server to the
+/// client's redirect uri and straight back to the token endpoint, which is two
+/// hops of a program.
+///
+/// No eviction rule and no cap, deliberately. Every entry costs a signed-in
+/// person pressing Allow and lives sixty seconds, and both halves purge what
+/// has expired, so what bounds this is the rate a human can consent at.
+#[derive(Default)]
+struct CodeStore {
+    codes: std::collections::HashMap<String, IssuedCode>,
+}
+
+impl CodeStore {
+    /// Remember `code` under the hash of the code it was minted as.
+    fn issue(&mut self, hash: String, code: IssuedCode) {
+        self.purge_expired(Instant::now());
+        self.codes.insert(hash, code);
+    }
+
+    /// Take the code named by `hash`, if it exists and is still live.
+    ///
+    /// Removed before the expiry is looked at, so a code past its window is
+    /// spent by the attempt that presented it rather than left to be presented
+    /// again.
+    // The token endpoint is this method's only caller and lands with the next
+    // task. See `IssuedCode`.
+    #[allow(dead_code)]
+    fn take(&mut self, hash: &str) -> Option<IssuedCode> {
+        let now = Instant::now();
+        let taken = self.codes.remove(hash);
+        self.purge_expired(now);
+        taken.filter(|code| now.duration_since(code.issued) < CODE_TTL)
+    }
+
+    /// Forget every code past [`CODE_TTL`]. A full scan, which is what a map
+    /// holding a minute of one person's consents can afford.
+    fn purge_expired(&mut self, now: Instant) {
+        self.codes
+            .retain(|_, code| now.duration_since(code.issued) < CODE_TTL);
+    }
+}
+
+/// What a decision binds a code to, given the request it decides and the
+/// account that decided it.
+///
+/// One function so the binding is one place: the client, the redirect uri, the
+/// challenge and the resource all come from the record the client itself
+/// started, and the account comes from the session that pressed the button.
+/// Nothing about a code is ever taken from the request that mints it.
+fn code_for(record: &PendingAuthorization, user: &str) -> IssuedCode {
+    IssuedCode {
+        client_id: record.client_id.clone(),
+        redirect_uri: record.redirect_uri.clone(),
+        code_challenge: record.code_challenge.clone(),
+        resource: record.resource.clone(),
+        user: user.to_string(),
+        issued: Instant::now(),
+    }
+}
+
+/// `uri` with `params` appended to whatever query it already has.
+///
+/// String work rather than a parse and a re-serialization, because the
+/// registered uri has to reach the browser as the bytes it was registered as:
+/// a url library normalizes on the way out (`https://knowledge.example`
+/// becomes `https://knowledge.example/`), and a client comparing the redirect
+/// it receives against the one it registered would see a different address.
+/// What makes that safe is that a stored redirect uri is printable ASCII with
+/// no whitespace and no fragment - see [`redirect_uri_problem`] - so appending
+/// to it cannot produce anything but a valid header value.
+///
+/// Values are percent-encoded down to the unreserved set, which over-encodes a
+/// little and is decoded transparently by every client.
+fn redirect_with(uri: &str, params: &[(&str, &str)]) -> String {
+    const UNRESERVED: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
+    let mut out = String::from(uri);
+    let mut separator = if uri.contains('?') { '&' } else { '?' };
+    for (name, value) in params {
+        out.push(separator);
+        out.push_str(name);
+        out.push('=');
+        out.extend(percent_encoding::utf8_percent_encode(value, UNRESERVED));
+        separator = '&';
+    }
+    out
+}
+
+/// The query of `GET /oauth/authorize`.
+///
+/// Every member is optional at the type level so that a missing one is
+/// answered by the rule that wanted it - which decides whether the answer is
+/// rendered here or redirected to the client - rather than by a
+/// deserialization failure that could only ever be rendered. `scope` is
+/// accepted and ignored: a grant here is the whole account's rights until it
+/// is revoked, so there is nothing to narrow.
+///
+/// `Debug` is written rather than derived: this struct is the request's
+/// challenge and state.
+#[derive(Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct AuthorizeQuery {
+    /// Always `code`: this server answers no other response type.
+    pub response_type: Option<String>,
+    /// The registration this request is made under.
+    pub client_id: Option<String>,
+    /// Where to send the browser with the answer. Must be one the
+    /// registration named, port-agnostically for a loopback client.
+    pub redirect_uri: Option<String>,
+    /// The PKCE challenge: 43 to 128 unreserved characters.
+    pub code_challenge: Option<String>,
+    /// Always `S256`.
+    pub code_challenge_method: Option<String>,
+    /// The client's own value, carried back on the answer.
+    pub state: Option<String>,
+    /// Accepted and ignored. See the struct's documentation.
+    pub scope: Option<String>,
+    /// Which resource a token is being asked for: absent, or this instance's
+    /// own identifier (a trailing slash is tolerated).
+    pub resource: Option<String>,
+}
+
+impl std::fmt::Debug for AuthorizeQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AuthorizeQuery")
+            .field("response_type", &self.response_type)
+            .field("client_id", &self.client_id)
+            .field("redirect_uri", &self.redirect_uri)
+            .field(
+                "code_challenge",
+                &self.code_challenge.as_ref().map(|_| "[redacted]"),
+            )
+            .field("code_challenge_method", &self.code_challenge_method)
+            .field("state", &self.state.as_ref().map(|_| "[redacted]"))
+            .field("scope", &self.scope)
+            .field("resource", &self.resource)
+            .finish()
+    }
+}
+
+/// What the consent page shows: who is asking, where the answer goes, and who
+/// is about to grant it.
+///
+/// Deliberately not the protocol: no code, no challenge, no state, no client
+/// id. A person deciding whether to trust something is helped by the client's
+/// name and the address the answer will be sent to, and by nothing else on
+/// this list. `Debug` is derived because there is nothing here to redact,
+/// which is the property rather than an accident.
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct AuthorizationView {
+    /// The client's name as it registered it, at most 100 characters of
+    /// printable text.
+    #[schema(example = "Claude")]
+    pub client_name: String,
+    /// The client's home page, when it registered one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = "https://claude.ai")]
+    pub client_uri: Option<String>,
+    /// The host (and port, when it names one) the browser will be sent to.
+    /// The one fact that says where an authorization actually goes.
+    #[schema(example = "claude.ai")]
+    pub redirect_host: String,
+    /// Whether that address is this machine, so the page can say that the
+    /// client is a program on this computer rather than a service elsewhere.
+    pub loopback: bool,
+    /// The account that will be granted. A client acts as the person who
+    /// consented, so this is what is actually being handed over.
+    #[schema(example = "ada")]
+    pub account: String,
+    /// Seconds until the request expires and has to be started again from the
+    /// client.
+    #[schema(example = 587)]
+    pub expires_in: u64,
+}
+
+/// Allow or deny, and there is nothing else to choose: a grant here is the
+/// whole account's rights until it is revoked.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Decision {
+    /// Issue a code for this account.
+    Allow,
+    /// Send the client away with `access_denied`.
+    Deny,
+}
+
+/// What `POST /oauth/authorizations/{id}` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+pub struct DecisionBody {
+    /// `allow` or `deny`. Anything else is not a decision and is refused
+    /// before the pending request is touched, so an unreadable answer leaves
+    /// it there to be answered again.
+    pub decision: Decision,
+}
+
+/// Where to send the browser once the decision is made.
+///
+/// A body rather than a redirect, for the reason `POST /auth/oidc/login`
+/// answers one: only a script can send the session's CSRF token, and a script
+/// cannot read where a redirect went, so a 302 here would hand the browser
+/// somewhere the page could not learn. Fluid navigates the whole page to it.
+///
+/// `Debug` is written rather than derived: on an allow this location carries
+/// the authorization code.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct DecisionResponse {
+    /// The client's redirect uri with the answer on it: `code`, `state` and
+    /// `iss` on an allow, `error=access_denied`, `state` and `iss` on a deny.
+    #[schema(
+        example = "https://claude.ai/api/mcp/auth_callback?code=...&state=...&iss=https://kb.example"
+    )]
+    pub location: String,
+}
+
+impl std::fmt::Debug for DecisionResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DecisionResponse")
+            .field("location", &"[redacted]")
+            .finish()
+    }
+}
+
+/// A `302` to `location`, never stored.
+///
+/// `302` rather than axum's `303`, for the reason `oidc::found` gives: it is
+/// what the OAuth authorization request is specified and universally
+/// implemented as.
+fn found(location: String) -> Response {
+    (
+        StatusCode::FOUND,
+        no_store(),
+        [(header::LOCATION, location)],
+    )
+        .into_response()
+}
+
+/// An authorization refusal that goes back to the client, because the redirect
+/// uri it named is one its registration named too.
+///
+/// RFC 6749 section 4.1.2.1: once the redirect uri is trusted, the error
+/// belongs to the client rather than to the person, and a browser sitting on
+/// an error page is a flow nothing can recover. `iss` (RFC 9207) says which
+/// server answered, which is how a client talking to two authorization servers
+/// detects a mix-up; `state` goes back exactly as it came, when it came at all.
+fn redirect_error(
+    redirect_uri: &str,
+    error: &'static str,
+    state: Option<&str>,
+    origin: &str,
+    client_id: &str,
+) -> Response {
+    // Never the state, the challenge or the redirect uri: the category and the
+    // client are what an operator reading a log needs, and everything else on
+    // this request is the caller's own text.
+    tracing::warn!(
+        reason = error,
+        client_id = %client_id,
+        "an authorization request was refused"
+    );
+    let mut params: Vec<(&str, &str)> = vec![("error", error)];
+    if let Some(state) = state {
+        params.push(("state", state));
+    }
+    params.push(("iss", origin));
+    found(redirect_with(redirect_uri, &params))
+}
+
+/// A refusal the person at the browser reads, because there is no redirect uri
+/// this server is willing to send anything to.
+///
+/// The one rule of this endpoint that cannot bend: an unknown client or a
+/// redirect uri no registration named means an error sent there would be an
+/// open redirect with an OAuth error attached to it. So it is rendered here,
+/// in the mount's own problem-detail shape, and the browser stays.
+fn rendered_refusal(reason: &str, detail: &str) -> ApiError {
+    tracing::warn!(
+        reason,
+        "an authorization request was refused before any redirect"
+    );
+    ApiError::bad_request(detail)
+}
+
+/// `GET /oauth/authorize` - start an authorization the person will decide.
+///
+/// Public by path, like the registration endpoint and for the same reason: the
+/// browser arriving here is following a link from a client and may well have no
+/// session yet. Nothing is granted by this route - it checks what a server can
+/// check without a person, remembers the request under an unguessable id and
+/// hands the browser to the consent page, which is where an account appears.
+///
+/// The order of the checks is the security property. Everything that decides
+/// **whether there is a redirect uri worth trusting** happens first and is
+/// answered here; everything after it is the client's problem and is sent to
+/// the client.
+#[utoipa::path(
+    get,
+    path = "/api/v1/oauth/authorize",
+    tag = "oauth",
+    operation_id = "oauth_authorize",
+    params(AuthorizeQuery),
+    summary = "Start an authorization for an MCP client.",
+    description = "The authorization endpoint the metadata advertises. \
+                   `response_type=code` and PKCE `S256` are required - this \
+                   server registers public clients only, so the challenge is \
+                   what makes an intercepted code worthless. A good request \
+                   answers 302 to the consent screen `/authorize?request=<id>`, \
+                   where a signed-in person allows or denies it. An unknown \
+                   `client_id`, or a `redirect_uri` the registration did not \
+                   name, is answered here as a problem detail and is never \
+                   redirected anywhere; every other refusal goes back to the \
+                   client's redirect uri with `error`, `state` and `iss`.",
+    responses(
+        (
+            status = 302,
+            description = "Follow `location`: the consent screen for a good \
+                           request, or the client's redirect uri carrying \
+                           `error`, `state` and `iss`.",
+            headers(
+                ("location" = String, description = "The consent screen, or the client's redirect uri."),
+                ("cache-control" = String, description = "`no-store`."),
+            ),
+        ),
+        (
+            status = 400,
+            description = "No usable `client_id` or `redirect_uri`, so there \
+                           is nowhere this server is willing to send an error.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "This instance does not serve OAuth: `auth.oauth` \
+                           is off.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The accounts database could not be reached.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn authorize(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+    ApiQuery(query): ApiQuery<AuthorizeQuery>,
+) -> Result<Response, ApiError> {
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found(NO_OAUTH_HERE))?;
+    // This instance's own identifier, normalized once, here: it is what the
+    // `resource` is checked against, what the code is bound to and what `iss`
+    // says, and deriving it three times is how those three come to disagree.
+    let origin = oauth.origin.origin(&headers)?;
+
+    // --- what decides whether there is anywhere to redirect to --------------
+    let Some(client_id) = query
+        .client_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(rendered_refusal(
+            "no client id",
+            "this authorization request names no client_id, so there is no registration to \
+             check its redirect uri against - the client registers first, at \
+             POST /api/v1/oauth/register",
+        ));
+    };
+    let client = state
+        .auth
+        .oauth_client(client_id)
+        .await
+        .map_err(|error| {
+            tracing::error!("the accounts database failed while reading a registration: {error:#}");
+            ApiError::internal("this server could not reach its accounts database")
+        })?
+        .ok_or_else(|| {
+            rendered_refusal(
+                "unknown client",
+                "no client is registered here under that client_id - it may have been collected \
+                 after thirty days without use, in which case the client registers again",
+            )
+        })?;
+    let Some(redirect_uri) = query
+        .redirect_uri
+        .as_deref()
+        .filter(|presented| {
+            client
+                .redirect_uris
+                .iter()
+                .any(|registered| redirect_matches(registered, presented))
+        })
+        .map(str::to_string)
+    else {
+        return Err(rendered_refusal(
+            "redirect uri not registered",
+            "this authorization request names no redirect_uri, or one this client did not \
+             register - an authorization is only ever sent to an address the registration \
+             named, so nothing can be sent anywhere from here",
+        ));
+    };
+
+    // --- everything the client can be told ---------------------------------
+    // The state is bounded before it is echoed: it rides in a map a stranger
+    // can add to, and one that is too long is a request this server will not
+    // carry rather than a value to truncate.
+    let state_value = match query.state.as_deref() {
+        Some(state) if state.len() > MAX_STATE_LEN => {
+            return Ok(redirect_error(
+                &redirect_uri,
+                "invalid_request",
+                None,
+                &origin,
+                client_id,
+            ));
+        }
+        other => other,
+    };
+    let refuse = |error: &'static str| {
+        Ok(redirect_error(
+            &redirect_uri,
+            error,
+            state_value,
+            &origin,
+            client_id,
+        ))
+    };
+
+    if query.response_type.as_deref() != Some("code") {
+        return refuse("unsupported_response_type");
+    }
+    // PKCE, and S256 only. `plain` would make the challenge worth exactly what
+    // the code it protects is worth, and no challenge at all would make an
+    // intercepted code enough on its own - which for a public client is the
+    // whole credential.
+    if query.code_challenge_method.as_deref() != Some("S256") {
+        return refuse("invalid_request");
+    }
+    let Some(code_challenge) = query.code_challenge.as_deref().filter(|challenge| {
+        CHALLENGE_LEN.contains(&challenge.len())
+            && challenge
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+    }) else {
+        return refuse("invalid_request");
+    };
+    // RFC 8707: a token is minted for a named resource, and this server mints
+    // for itself alone. A client asking for another server's is asking the
+    // wrong server.
+    if let Some(asked) = query.resource.as_deref()
+        && !OriginRule::same_resource(asked, &origin)
+    {
+        return refuse("invalid_target");
+    }
+
+    let record = PendingAuthorization {
+        client_id: client.client_id.clone(),
+        client_name: client.client_name.clone(),
+        client_uri: client.client_uri.clone(),
+        redirect_uri: redirect_uri.clone(),
+        code_challenge: code_challenge.to_string(),
+        // The instance's own spelling, never the one the client asked in: the
+        // audience the gate checks comes out of `normalize_resource`, and a
+        // trailing slash stored here would mint a token nothing accepts.
+        resource: origin.clone(),
+        state: state_value.map(str::to_string),
+        started: Instant::now(),
+    };
+    let id = random_hex_32();
+    let remembered = oauth
+        .authorizations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id.clone(), record);
+    if remembered.is_err() {
+        return refuse("temporarily_unavailable");
+    }
+
+    // Only now, and deliberately: the thirty-day prune clock is "when did a
+    // client last get an authorization under way", so a caller that never got
+    // past PKCE must not be able to keep a registration alive with rubbish.
+    if let Err(error) = state.auth.touch_oauth_client(client_id).await {
+        // Not worth failing a good request for: the stamp decides when an
+        // unused registration is collected, and one collected a little early
+        // is a client that registers again.
+        tracing::warn!("a registration's last use could not be stamped: {error:#}");
+    }
+    tracing::info!(
+        client_id = %client_id,
+        "an mcp client started an authorization"
+    );
+    Ok(found(format!("{CONSENT_PAGE}?request={id}")))
+}
+
+/// `GET /oauth/authorizations/{id}` - what is being asked for.
+///
+/// Any signed-in account, and that is the design rather than a gap: there is no
+/// account at the moment a client starts a request, so there is nothing for the
+/// request to belong to. What protects it is the id, which is 32 random bytes
+/// and is only ever known by the browser the client sent here; the account that
+/// reads it is the person at that browser, and the code binds to whoever
+/// actually decides.
+///
+/// Served on a read-only instance, for the reason the personal token surface
+/// is: a grant is account state in the accounts database rather than knowledge,
+/// and a read-only team server with `auth.oauth` on is exactly where a client
+/// cannot connect at all without one.
+#[utoipa::path(
+    get,
+    path = "/api/v1/oauth/authorizations/{id}",
+    tag = "oauth",
+    operation_id = "oauth_authorization",
+    params(("id" = String, Path, description = "The pending authorization, from the consent screen's `request` parameter.")),
+    summary = "What an MCP client is asking this account to grant.",
+    description = "The consent screen's own read: the client's name and home \
+                   page, the host the answer will be sent to and whether it is \
+                   this machine, the account that would be granted, and how \
+                   long is left. Never the authorization code, the PKCE \
+                   challenge or the client's `state` - none of them is \
+                   anything a person decides with. Needs a signed-in account, \
+                   any role.",
+    responses(
+        (status = 200, description = "The request, as the consent screen shows it.", body = AuthorizationView),
+        (
+            status = 401,
+            description = "No signed-in account: there is nobody to grant anything.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such pending request: it expired, it was already \
+                           decided, or this instance serves no OAuth.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn authorization(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(id): ApiPath<String>,
+) -> Result<(NoStore, Json<AuthorizationView>), ApiError> {
+    let account = identity.require_account().map_err(|_| {
+        ApiError::unauthorized(
+            "deciding what an MCP client may do needs a signed-in account - sign in, and the \
+             consent screen will be here",
+        )
+    })?;
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found(NO_OAUTH_HERE))?;
+    let mut authorizations = oauth
+        .authorizations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let record = authorizations.get(&id).ok_or_else(gone_authorization)?;
+    let view = view_of(record, &account.name);
+    Ok((no_store(), Json(view)))
+}
+
+/// The consent screen's view of a pending request, for `account`.
+fn view_of(record: &PendingAuthorization, account: &str) -> AuthorizationView {
+    AuthorizationView {
+        client_name: record.client_name.clone(),
+        client_uri: record.client_uri.clone(),
+        redirect_host: super::auth_store::redirect_host(&record.redirect_uri),
+        loopback: Url::parse(&record.redirect_uri).is_ok_and(|url| is_loopback_host(&url)),
+        account: account.to_string(),
+        expires_in: PENDING_TTL
+            .saturating_sub(record.started.elapsed())
+            .as_secs(),
+    }
+}
+
+/// One answer for a request that is not there, whichever way it went: expired,
+/// already decided, or an id nobody ever issued.
+///
+/// Deliberately one answer. Telling them apart would tell a caller holding a
+/// guessed id whether it ever named anything, and the person at the browser
+/// does the same thing in every case - start again from the client.
+fn gone_authorization() -> ApiError {
+    ApiError::not_found(
+        "there is no authorization request waiting under that id - it may have been decided \
+         already, or waited more than ten minutes; start again from the client",
+    )
+}
+
+/// `POST /oauth/authorizations/{id}` - allow or deny.
+///
+/// The record is TAKEN rather than read, before anything is minted, so a
+/// decision happens once: a second press of Allow finds nothing, and so does a
+/// tab left open overnight.
+///
+/// The answer is a location for the browser to navigate to, in both directions.
+/// A person who says no is owed the same round trip as one who says yes - the
+/// client is waiting at its redirect uri either way, and `access_denied` is
+/// what tells it to stop waiting rather than time out.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/authorizations/{id}",
+    tag = "oauth",
+    operation_id = "oauth_decide",
+    params(("id" = String, Path, description = "The pending authorization being decided.")),
+    summary = "Allow or deny what an MCP client is asking for.",
+    description = "Takes the pending request - once, so a second answer finds \
+                   nothing - and answers where to send the browser. On `allow` \
+                   that is the client's redirect uri carrying a single-use \
+                   authorization code, the client's `state` and `iss`; the \
+                   code is bound to this account, this client, this redirect \
+                   uri, the PKCE challenge and this resource, and lives sixty \
+                   seconds. On `deny` it is the same uri carrying \
+                   `error=access_denied`. A grant is the whole account's \
+                   rights until it is revoked from the profile page. Needs a \
+                   signed-in account, any role, and the session's CSRF token; \
+                   served on a read-only instance, like the personal token \
+                   surface.",
+    request_body = DecisionBody,
+    responses(
+        (status = 200, description = "Navigate the whole page to `location`.", body = DecisionResponse),
+        (
+            status = 422,
+            description = "The body is not `{\"decision\": \"allow\"}` or \
+                           `{\"decision\": \"deny\"}`. The request is left \
+                           undecided, because the body is read before it is \
+                           taken.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 401,
+            description = "No signed-in account: there is nobody to grant anything.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The session's CSRF token was missing or wrong.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such pending request: it expired, it was already \
+                           decided, or this instance serves no OAuth.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn decide(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<DecisionBody>,
+) -> Result<(NoStore, Json<DecisionResponse>), ApiError> {
+    let account = identity.require_account().map_err(|_| {
+        ApiError::unauthorized(
+            "deciding what an MCP client may do needs a signed-in account - sign in, and the \
+             consent screen will be here",
+        )
+    })?;
+    let oauth = state
+        .oauth
+        .as_ref()
+        .ok_or_else(|| ApiError::not_found(NO_OAUTH_HERE))?;
+    let record = oauth
+        .authorizations
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(&id)
+        .ok_or_else(gone_authorization)?;
+
+    // `iss` and the code's resource are the record's, not this request's: the
+    // consent page may well have been reached over a different `Host` than the
+    // client's redirect was, and what a token is minted for was settled when
+    // the client asked.
+    let mut params: Vec<(&str, &str)> = Vec::new();
+    let code = match body.decision {
+        Decision::Allow => {
+            let code = random_hex_32();
+            oauth
+                .codes
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .issue(sha256_hex(&code), code_for(&record, &account.name));
+            tracing::info!(
+                account = %account.name,
+                client_id = %record.client_id,
+                client_name = %record.client_name,
+                "an account granted an mcp client access"
+            );
+            Some(code)
+        }
+        Decision::Deny => {
+            tracing::info!(
+                account = %account.name,
+                client_id = %record.client_id,
+                "an account refused an mcp client"
+            );
+            None
+        }
+    };
+    match &code {
+        Some(code) => params.push(("code", code)),
+        None => params.push(("error", "access_denied")),
+    }
+    if let Some(state) = record.state.as_deref() {
+        params.push(("state", state));
+    }
+    params.push(("iss", &record.resource));
+    Ok((
+        no_store(),
+        Json(DecisionResponse {
+            location: redirect_with(&record.redirect_uri, &params),
+        }),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use axum::http::header;
     use crystalline_core::config::{AuthConfig, OidcConfig};
+
+    /// A pending authorization that started `age` ago.
+    fn pending(age: Duration) -> PendingAuthorization {
+        PendingAuthorization {
+            client_id: "coc_1".to_string(),
+            client_name: "Claude".to_string(),
+            client_uri: Some("https://claude.ai".to_string()),
+            redirect_uri: "https://claude.ai/api/mcp/auth_callback".to_string(),
+            code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM".to_string(),
+            resource: "https://kb.example".to_string(),
+            state: Some("st-1".to_string()),
+            started: Instant::now() - age,
+        }
+    }
+
+    /// A pending authorization is forgotten when it expires, and a full map
+    /// makes room from the oldest end - but never at the expense of somebody
+    /// who is deciding right now.
+    ///
+    /// The floor is what separates this from a plain oldest-first eviction and
+    /// is the single sign-on store's rule: without it, filling the map is a way
+    /// to push every real consent out from under the person reading it, because
+    /// the oldest record in a busy map is somebody who pressed a button in
+    /// their client a few seconds ago.
+    #[test]
+    fn a_pending_authorization_expires_and_the_cap_evicts_the_oldest_first() {
+        // Expiry, from both halves: an insert purges, and so does a take, so an
+        // idle instance does not hold spent requests until the next client
+        // happens to arrive.
+        let mut store = AuthorizationStore::default();
+        store
+            .insert(
+                "old".to_string(),
+                pending(PENDING_TTL + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(
+            store.take("old").is_none(),
+            "a request nobody decided within ten minutes is gone"
+        );
+        store
+            .insert(
+                "old".to_string(),
+                pending(PENDING_TTL + Duration::from_secs(1)),
+            )
+            .unwrap();
+        assert!(store.get("old").is_none(), "and reading it finds nothing");
+        assert_eq!(store.len(), 0, "the read purged it rather than leaving it");
+
+        // Oldest first, once there is something old enough to take.
+        let mut store = AuthorizationStore::default();
+        store
+            .insert(
+                "stale".to_string(),
+                pending(MIN_EVICT_AGE + Duration::from_secs(1)),
+            )
+            .unwrap();
+        for i in 0..MAX_PENDING_AUTHORIZATIONS {
+            store
+                .insert(format!("fill-{i}"), pending(Duration::ZERO))
+                .unwrap_or_else(|_| panic!("insert {i} should have evicted the stale record"));
+        }
+        assert!(store.take("stale").is_none(), "the oldest one made room");
+        assert!(
+            store.take("fill-0").is_some(),
+            "and nothing younger was touched"
+        );
+
+        // A map full of records younger than the floor refuses the newcomer.
+        let mut store = AuthorizationStore::default();
+        store
+            .insert("deciding".to_string(), pending(Duration::from_secs(5)))
+            .unwrap();
+        let mut refused = 0;
+        for i in 0..(MAX_PENDING_AUTHORIZATIONS * 2) {
+            if store
+                .insert(format!("flood-{i}"), pending(Duration::ZERO))
+                .is_err()
+            {
+                refused += 1;
+            }
+        }
+        assert!(refused > 0, "past the cap a flood is refused, not served");
+        assert!(store.len() <= MAX_PENDING_AUTHORIZATIONS);
+        assert!(
+            store.take("deciding").is_some(),
+            "the person who pressed a button five seconds ago survived the flood"
+        );
+    }
+
+    /// A code is spent by the first attempt that presents it, and only while it
+    /// is fresh.
+    ///
+    /// Both halves matter to the token endpoint: single use is what stops an
+    /// intercepted code being exchanged behind the client's back, and the
+    /// sixty-second window is what makes an interception have to be immediate.
+    /// An expired code is removed by the attempt that presented it rather than
+    /// left to be presented again.
+    #[test]
+    fn a_code_is_taken_once_and_only_while_it_is_fresh() {
+        let mut store = CodeStore::default();
+        let issue = |store: &mut CodeStore, name: &str, age: Duration| {
+            let mut code = code_for(&pending(Duration::ZERO), "ada");
+            code.issued = Instant::now() - age;
+            store.issue(sha256_hex(name), code);
+        };
+
+        issue(&mut store, "live", Duration::ZERO);
+        assert!(store.take(&sha256_hex("live")).is_some(), "the first use");
+        assert!(
+            store.take(&sha256_hex("live")).is_none(),
+            "and there is no second one"
+        );
+
+        issue(&mut store, "stale", CODE_TTL + Duration::from_secs(1));
+        assert!(
+            store.take(&sha256_hex("stale")).is_none(),
+            "past its minute"
+        );
+        assert!(
+            store.codes.is_empty(),
+            "and taken out of the map by the try"
+        );
+
+        // A code nobody ever presents is collected by the next issue, so an
+        // instance that consents and never exchanges does not grow a map.
+        issue(&mut store, "abandoned", CODE_TTL + Duration::from_secs(1));
+        issue(&mut store, "next", Duration::ZERO);
+        assert_eq!(store.codes.len(), 1, "the abandoned one was swept");
+
+        // The code itself is never a key: what is held is the digest, so a
+        // dump of a running process yields nothing exchangeable.
+        assert!(
+            !store.codes.keys().any(|key| key == "next"),
+            "a code is stored hashed"
+        );
+    }
+
+    /// A code is bound to the request the client started and to the account
+    /// that answered it, and to nothing the answering request said.
+    ///
+    /// This is the whole authorization decision in one function: the client,
+    /// the redirect uri, the PKCE challenge and the resource all come out of
+    /// the record - which was written when the client asked - and only the
+    /// account comes from the session that pressed the button.
+    #[test]
+    fn a_decision_binds_a_code_to_the_request_and_the_account_that_answered_it() {
+        let record = pending(Duration::ZERO);
+        let code = code_for(&record, "ada");
+        assert_eq!(code.client_id, record.client_id);
+        assert_eq!(code.redirect_uri, record.redirect_uri);
+        assert_eq!(code.code_challenge, record.code_challenge);
+        assert_eq!(code.resource, record.resource);
+        assert_eq!(code.user, "ada", "the account that decided, and no other");
+
+        // Nothing that carries a code, a challenge or a state prints one.
+        let rendered = format!(
+            "{record:?} {code:?} {:?}",
+            DecisionResponse {
+                location: "https://claude.ai/cb?code=deadbeef".to_string(),
+            }
+        );
+        for secret in [record.code_challenge.as_str(), "st-1", "deadbeef"] {
+            assert!(
+                !rendered.contains(secret),
+                "{secret} leaked into {rendered}"
+            );
+        }
+        let query = AuthorizeQuery {
+            code_challenge: Some(record.code_challenge.clone()),
+            state: Some("st-1".to_string()),
+            ..AuthorizeQuery::default()
+        };
+        let rendered = format!("{query:?}");
+        assert!(!rendered.contains("st-1"), "{rendered}");
+        assert!(
+            !rendered.contains(record.code_challenge.as_str()),
+            "{rendered}"
+        );
+    }
+
+    /// The answer is appended to whatever query the registered uri already
+    /// carries, rather than replacing it or being parsed and rebuilt.
+    ///
+    /// A url library normalizes on the way out - `https://kb.example` comes
+    /// back as `https://kb.example/` - and a client comparing the redirect it
+    /// receives against the one it registered would see a different address.
+    #[test]
+    fn a_redirect_appends_to_whatever_query_it_already_has() {
+        assert_eq!(
+            redirect_with(
+                "https://claude.ai/cb",
+                &[("code", "abc"), ("iss", "https://kb.example")]
+            ),
+            "https://claude.ai/cb?code=abc&iss=https%3A%2F%2Fkb.example"
+        );
+        assert_eq!(
+            redirect_with("https://claude.ai/cb?tenant=eu", &[("code", "abc")]),
+            "https://claude.ai/cb?tenant=eu&code=abc"
+        );
+        // A path-less uri keeps its shape, which is the reason this is string
+        // work and not a parse.
+        assert_eq!(
+            redirect_with("https://kb.example", &[("error", "access_denied")]),
+            "https://kb.example?error=access_denied"
+        );
+        // A state is the client's own text and is encoded, never interpreted.
+        assert_eq!(
+            redirect_with("https://claude.ai/cb", &[("state", "a b&c=d#e")]),
+            "https://claude.ai/cb?state=a%20b%26c%3Dd%23e"
+        );
+        assert_eq!(
+            redirect_with("https://claude.ai/cb", &[]),
+            "https://claude.ai/cb"
+        );
+    }
+
+    /// The consent screen is shown what a person decides with, and none of the
+    /// protocol.
+    ///
+    /// The loopback marker is the one thing on it that is not simply repeated
+    /// from the registration: a client at `127.0.0.1` is a program on this
+    /// computer, and one at `claude.ai` is a service somewhere else, and the
+    /// person deciding is entitled to be told which.
+    #[test]
+    fn the_consent_view_shows_what_to_decide_with_and_no_protocol() {
+        let view = view_of(&pending(Duration::from_secs(13)), "ada");
+        assert_eq!(view.client_name, "Claude");
+        assert_eq!(view.client_uri.as_deref(), Some("https://claude.ai"));
+        assert_eq!(view.redirect_host, "claude.ai");
+        assert!(!view.loopback);
+        assert_eq!(view.account, "ada");
+        // Truncating seconds, so thirteen seconds in leaves either 586 or 587
+        // depending on where the sub-second remainder fell.
+        let left = PENDING_TTL.as_secs() - 13;
+        assert!(
+            view.expires_in == left || view.expires_in == left - 1,
+            "thirteen seconds of ten minutes have gone: {}",
+            view.expires_in
+        );
+
+        let rendered = serde_json::to_string(&view).unwrap();
+        for absent in ["code_challenge", "state", "coc_1", "E9Melhoa"] {
+            assert!(
+                !rendered.contains(absent),
+                "{absent} is not a person's business: {rendered}"
+            );
+        }
+
+        // The three loopback spellings, and a port that is part of the host a
+        // person reads.
+        for (uri, host) in [
+            ("http://127.0.0.1:51902/callback", "127.0.0.1:51902"),
+            ("http://localhost:8765/cb", "localhost:8765"),
+            ("http://[::1]:9000/cb", "[::1]:9000"),
+        ] {
+            let mut record = pending(Duration::ZERO);
+            record.redirect_uri = uri.to_string();
+            let view = view_of(&record, "ada");
+            assert!(view.loopback, "{uri} is this machine");
+            assert_eq!(view.redirect_host, host);
+        }
+
+        // An expired record would report no time left rather than underflow.
+        let view = view_of(&pending(PENDING_TTL + Duration::from_secs(30)), "ada");
+        assert_eq!(view.expires_in, 0);
+    }
 
     /// A config carrying `auth.oauth` on and whatever `redirect_uri` says.
     fn config_with(redirect_uri: Option<&str>) -> GlobalConfig {
