@@ -457,7 +457,7 @@ pub enum DatabaseBackend {
 
 /// The `database` block: which backend backs the derived index and, for
 /// PostgreSQL, its connection URL.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     /// The storage backend. Absent means Turso.
     #[serde(default)]
@@ -467,6 +467,25 @@ pub struct DatabaseConfig {
     /// and the default `index.db` path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// Hand-written for the reason [`OidcConfig`]'s is: a Postgres URL carries the
+/// database password in it, in cleartext, and a derived `Debug` would put it
+/// in whatever log line or panic message printed the config. Nothing prints
+/// one today - the settings registry already masks `database.url` - and a
+/// `{:?}` away is exactly the distance this mask exists to close.
+///
+/// The backend renders as-is, so what a reader wants from a debug print (which
+/// store is behind this instance) survives; whether a URL is configured
+/// survives too, since a file path override reads as `(set)` and an absent one
+/// as `None`.
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("backend", &self.backend)
+            .field("url", &self.url.as_ref().map(|_| SECRET_DISPLAY))
+            .finish()
+    }
 }
 
 impl DatabaseConfig {
@@ -1280,6 +1299,27 @@ mod tests {
 
         let unset = format!("{:?}", OidcConfig::default());
         assert!(unset.contains("client_secret: None"), "{unset}");
+    }
+
+    /// The other credential a config carries in a field that is not called
+    /// one: a Postgres URL holds the database password inside it.
+    #[test]
+    fn the_database_debug_render_masks_the_url_and_keeps_the_backend() {
+        let cfg = GlobalConfig {
+            database: Some(DatabaseConfig {
+                backend: DatabaseBackend::Postgres,
+                url: Some("postgres://crystalline:hunter2@db.example.test/crystalline".into()),
+            }),
+            ..GlobalConfig::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("db.example.test"), "{rendered}");
+        assert!(rendered.contains(SECRET_DISPLAY), "{rendered}");
+        assert!(rendered.contains("Postgres"), "{rendered}");
+
+        let unset = format!("{:?}", DatabaseConfig::default());
+        assert!(unset.contains("url: None"), "{unset}");
     }
 
     #[test]
