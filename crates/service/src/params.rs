@@ -139,6 +139,17 @@ pub struct EditParams {
     /// last-write-wins.
     #[serde(default)]
     pub expected_checksum: Option<String>,
+    /// The pair an `evolve_ack` assignment names, for the one rule that is
+    /// acknowledged per pair rather than per engram.
+    ///
+    /// Never on the wire - `serde(skip)` keeps it out of the deserialized body
+    /// and out of the tool schema alike. An agent setting frontmatter says
+    /// which rule it is ruling intentional and the server works out what that
+    /// rule is firing on; this is how the REST acknowledgment route passes on
+    /// the pair a person's client named, where the row they clicked is the one
+    /// they meant and nothing else can tell the server which of two it was.
+    #[serde(skip)]
+    pub ack_scope: Option<String>,
 }
 
 /// Parameters for `save_engram`, the full-document save behind the HTTP PUT.

@@ -198,6 +198,77 @@ function includingSuppressedPayload() {
   });
 }
 
+/**
+ * One engram raising two semantic-twin findings, which is the only shape where
+ * the engram and the rule do not name the finding: each row carries the pair it
+ * fired on, and that pair is what an acknowledgment has to be given for.
+ */
+function twinPayload() {
+  const base = evolvePayload();
+  return evolvePayload({
+    total: 5,
+    count: 5,
+    families: [
+      { family: "temporal", findings: 1 },
+      { family: "structure", findings: 1 },
+      { family: "redundancy", findings: 3 },
+    ],
+    queue: [
+      ...base.queue,
+      {
+        n: 4,
+        priority: 75,
+        rule: "V301",
+        class: "judgment",
+        domain: "eng",
+        permalink: "hub",
+        title: "Hub",
+        line: null,
+        finding: "semantic twin of eng/first",
+        evidence: "lead-vector cosine 0.94 at or above 0.88; twin: eng/first",
+        fix: "read both then merge and supersede or link and acknowledge",
+        scope: "eng/first, eng/hub",
+      },
+      {
+        n: 5,
+        priority: 75,
+        rule: "V301",
+        class: "judgment",
+        domain: "eng",
+        permalink: "hub",
+        title: "Hub",
+        line: null,
+        finding: "semantic twin of eng/second",
+        evidence: "lead-vector cosine 0.91 at or above 0.88; twin: eng/second",
+        fix: "read both then merge and supersede or link and acknowledge",
+        scope: "eng/hub, eng/second",
+      },
+    ],
+    actions: [
+      ...base.actions,
+      { rule: "V301", instruction: "Read both, then merge or link them." },
+    ],
+  });
+}
+
+/** The same hub with one of its two pairs already silenced. */
+function acknowledgedTwinPayload() {
+  const twins = twinPayload();
+  return evolvePayload({
+    ...twins,
+    queue: twins.queue.map((finding) =>
+      finding.rule === "V301" && finding.n === 4
+        ? {
+            ...finding,
+            acknowledged: true,
+            ack_note: "distinct, linked",
+            ack_scope: "eng/first, eng/hub",
+          }
+        : finding,
+    ),
+  });
+}
+
 /** A sweep whose acknowledgment was given for evidence that has since moved. */
 function stalePayload() {
   const base = evolvePayload();
@@ -1035,6 +1106,75 @@ describe("acknowledging a finding", () => {
     expect(sentBody(acks[0])).toEqual({
       permalink: "notes/old-way",
       rule: "V005",
+    });
+  });
+
+  it("gives the acknowledgment for the pair the clicked row fired on", async () => {
+    const acks: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": twinPayload,
+      "/domains/eng/evolve/ack": (_path, init) => {
+        acks.push(init);
+        return undefined;
+      },
+    });
+    // The second of the hub's two twin rows. Naming the rule alone would leave
+    // the server to pick, and it picks the first - so the pair a reader read
+    // and the pair their note lands on would be different ones.
+    const row = defined(
+      rows(await section(/^Redundancy/))[2],
+      "the second twin",
+    );
+    expect(row).toHaveTextContent("twin: eng/second");
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+    await userEvent.type(
+      within(row).getByLabelText(/why is this intentional/i),
+      "distinct, linked",
+    );
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Acknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(acks).toHaveLength(1);
+    });
+    expect(sentBody(acks[0])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+      note: "distinct, linked",
+      scope: "eng/hub, eng/second",
+    });
+  });
+
+  it("takes back the one pair, not every pair the rule holds", async () => {
+    const removals: (RequestInit | undefined)[] = [];
+    await open({
+      "/evolve": acknowledgedTwinPayload,
+      "/domains/eng/evolve/ack": (_path, init) => {
+        removals.push(init);
+        return undefined;
+      },
+    });
+    const row = defined(
+      rows(await section(/^Redundancy/))[1],
+      "the silenced twin",
+    );
+
+    await userEvent.click(
+      within(row).getByRole("button", { name: "Unacknowledge" }),
+    );
+
+    await waitFor(() => {
+      expect(removals).toHaveLength(1);
+    });
+    expect(removals[0]?.method).toBe("DELETE");
+    expect(sentBody(removals[0])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+      scope: "eng/first, eng/hub",
     });
   });
 

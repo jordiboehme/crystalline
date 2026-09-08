@@ -200,6 +200,10 @@ describe("the evolve payload", () => {
       acknowledged: false,
       ackStale: false,
       ackNote: null,
+      // Both scopes are the twin rule's: a row that fires once per engram is
+      // named by its engram and its rule, and sends neither.
+      scope: null,
+      ackScope: null,
     });
     expect(defined(queue.queue[1], "the second finding").line).toBe(12);
     expect(queue.actions).toContainEqual({
@@ -466,12 +470,16 @@ describe("the family of a rule", () => {
     expect(evolveFamily("V006")).toBe("temporal");
     expect(evolveFamily("V105")).toBe("structure");
     expect(evolveFamily("V203")).toBe("redundancy");
+    // The meaning series shares the redundancy heading, as the catalog does:
+    // a twin found by embedding is the same kind of work as a duplicate found
+    // by wording, and a section of its own would say otherwise.
+    expect(evolveFamily("V301")).toBe("redundancy");
   });
 
   it("puts a rule from a newer catalog under no section at all", () => {
     // Never guessed into a section: a finding filed under the wrong heading
     // reads as a claim about what kind of work it is.
-    expect(evolveFamily("V301")).toBeNull();
+    expect(evolveFamily("V401")).toBeNull();
     expect(evolveFamily("")).toBeNull();
     expect(evolveFamily("nonsense")).toBeNull();
   });
@@ -603,6 +611,41 @@ describe("acknowledging a finding", () => {
     });
   });
 
+  it("names the pair when the row carries one, and never a blank one", async () => {
+    const spy = stubFetch(
+      new Response(null, { status: 204 }),
+      new Response(null, { status: 204 }),
+      new Response(null, { status: 204 }),
+    );
+
+    await acknowledgeFinding(
+      "eng",
+      "hub",
+      "V301",
+      "distinct, linked",
+      "eng/hub, eng/second",
+    );
+    await acknowledgeFinding("eng", "hub", "V301", undefined, "   ");
+    await acknowledgeFinding("eng", "hub", "V301", undefined, null);
+
+    expect(sentBody(spy.mock.calls[0]?.[1])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+      note: "distinct, linked",
+      scope: "eng/hub, eng/second",
+    });
+    // A blank scope is not a pair, and sending one would have the server
+    // check evidence nobody named.
+    expect(sentBody(spy.mock.calls[1]?.[1])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+    });
+    expect(sentBody(spy.mock.calls[2]?.[1])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+    });
+  });
+
   it("encodes a domain name that is not URL safe", async () => {
     const spy = stubFetch(new Response(null, { status: 204 }));
 
@@ -627,5 +670,19 @@ describe("acknowledging a finding", () => {
     );
     // No note: a removal names the entry, and the endpoint ignores one anyway.
     expect(sentBody(init)).toEqual({ permalink: "notes/beta", rule: "V101" });
+  });
+
+  it("takes one twin pair back by naming the entry the engram holds", async () => {
+    const spy = stubFetch(new Response(null, { status: 204 }));
+
+    await unacknowledgeFinding("eng", "hub", "V301", "eng/first, eng/hub");
+
+    // Without the pair the withdrawal would take every entry the rule has,
+    // which un-silences twins nobody asked about.
+    expect(sentBody(spy.mock.calls[0]?.[1])).toEqual({
+      permalink: "hub",
+      rule: "V301",
+      scope: "eng/first, eng/hub",
+    });
   });
 });

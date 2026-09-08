@@ -101,6 +101,12 @@ pub struct EvolveQuery {
 /// `include_acknowledged` to see the suppressed rows themselves, each marked
 /// `acknowledged` and carrying the same two fields.
 ///
+/// A `V301` row carries one column the others do not: its own `scope`, the
+/// twin pair it fired on. It is the one rule that fires more than once on an
+/// engram, so naming the engram and the rule does not name the finding - send
+/// this value back on the acknowledgment route to silence the pair that was
+/// read rather than whichever one the server would have picked.
+///
 /// `today` is not exposed. The temporal rules are evaluated as of now, which is
 /// the only question a page asks; the tool takes a pinned date for a run that
 /// has to be reproducible.
@@ -300,10 +306,12 @@ async fn sweepable_domains(
 /// after a wildcard would be eaten by the wildcard.
 #[derive(Debug, Deserialize, utoipa::ToSchema)]
 #[schema(description = "Acknowledge one finding on one engram: the engram by \
-                        permalink, the rule id that fired and an optional note \
-                        saying why it is intentional. The scope an \
-                        acknowledgment holds for is never sent - the server \
-                        computes it by running detection.")]
+                        permalink, the rule id that fired, an optional note \
+                        saying why it is intentional and, for a rule that \
+                        fires more than once on an engram, the row's own \
+                        `scope`. Omit the scope and the server picks the \
+                        finding by running detection, which is the right \
+                        answer for every rule that fires once.")]
 pub struct AckBody {
     /// The engram the finding fired on.
     #[schema(example = "notes/beta")]
@@ -315,16 +323,34 @@ pub struct AckBody {
     #[serde(default)]
     #[schema(example = "lineage citation, keep")]
     note: Option<String>,
+    /// The evidence this acknowledgment is for, copied from the queue row's
+    /// own `scope`.
+    ///
+    /// Only `V301` sends one: it is the one rule that fires more than once on
+    /// an engram (an engram can be the semantic twin of several others), so it
+    /// is the one where naming the rule does not name the finding. On `POST`
+    /// the server checks the scope is really firing and refuses with a 422 if
+    /// it is not, which is what a queue read too long ago looks like; on
+    /// `DELETE` it takes back that pair's entry and leaves the engram's other
+    /// pairs silenced. Every other rule ignores it, and omitting it on `V301`
+    /// means the whole rule: the server's own pick on `POST`, every pair at
+    /// once on `DELETE`.
+    #[serde(default)]
+    #[schema(example = "notes/backoff-lesson, notes/retry-queue-gotcha")]
+    scope: Option<String>,
 }
 
 /// `POST /domains/{domain}/evolve/ack` - rule a finding intentional so future
 /// sweeps count it instead of raising it.
 ///
-/// The evidence the acknowledgment is given for is the server's to determine:
-/// it runs detection over the engram's domain, takes the firing finding's scope
-/// and stores it with the entry. That is what makes an acknowledgment hold
-/// while its evidence holds and come back marked stale when the evidence
-/// changes, without a human or an agent ever handling a fingerprint.
+/// The evidence the acknowledgment is given for is the server's to settle: it
+/// runs detection over the engram's domain and stores the firing finding's
+/// scope with the entry. That is what makes an acknowledgment hold while its
+/// evidence holds and come back marked stale when the evidence changes,
+/// without a human ever composing a fingerprint. A body may name which finding
+/// it means with the row's own `scope` - the one rule that fires twice on an
+/// engram needs to - and detection then checks that scope rather than choosing
+/// one, so the pair a person clicked is the pair that gets silenced.
 ///
 /// The entry lands in the engram's own frontmatter through the same edit path
 /// the MCP `set_frontmatter` verb uses, so it travels with team sharing,
@@ -336,10 +362,14 @@ pub struct AckBody {
     operation_id = "acknowledge_finding",
     summary = "Acknowledge one evolve finding on one engram.",
     description = "Records `evolve_ack` on the engram: the rule, the evidence \
-                   the server computed it fired on, the note, the acknowledging \
-                   user and the instant. A matching acknowledgment keeps the \
-                   finding out of the queue and counted in `acknowledged`; when \
-                   the evidence changes the finding returns marked `ack_stale`.",
+                   it fired on, the note, the acknowledging user and the \
+                   instant. A matching acknowledgment keeps the finding out of \
+                   the queue and counted in `acknowledged`; when the evidence \
+                   changes the finding returns marked `ack_stale`. The \
+                   evidence is the server's, either picked by running \
+                   detection or - when the body names the row's `scope`, which \
+                   is how a caller says which of an engram's two `V301` \
+                   findings it read - checked against it.",
     params(("domain" = String, Path, description = "The engram's domain.")),
     request_body = AckBody,
     responses(
@@ -384,7 +414,9 @@ pub struct AckBody {
         ),
         (
             status = 422,
-            description = "The rule id is not one the sweep catalog holds.",
+            description = "The rule id is not one the sweep catalog holds, or \
+                           the `scope` names evidence the rule is not firing \
+                           on here.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -405,6 +437,7 @@ pub async fn acknowledge(
             &body.permalink,
             &body.rule,
             body.note.as_deref(),
+            body.scope.as_deref(),
             Some(&format!("human:{}", caller.name())),
         )
         .await?;
@@ -425,9 +458,10 @@ pub async fn acknowledge(
     summary = "Withdraw an acknowledgment.",
     description = "Removes the engram's `evolve_ack` entries for that rule, \
                    leaving the other rules' alone. A rule has one entry, except \
-                   `V301`, which has one per twin pair and loses all of them \
-                   here: there is no way to name a single pair on this route. \
-                   404 when the engram carries none for the rule, rather than \
+                   `V301`, which has one per twin pair: name the row's `scope` \
+                   to take one pair back and leave the engram's other pairs \
+                   silenced, or send none to take every pair at once. 404 when \
+                   the engram carries no entry the body names, rather than \
                    reporting a removal that did not happen.",
     params(("domain" = String, Path, description = "The engram's domain.")),
     request_body = AckBody,
@@ -448,8 +482,8 @@ pub async fn acknowledge(
         ),
         (
             status = 404,
-            description = "No such domain or engram, or no acknowledgment for \
-                           that rule on it.",
+            description = "No such domain or engram, or no acknowledgment the \
+                           body names on it.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -481,6 +515,7 @@ pub async fn unacknowledge(
             &domain,
             &body.permalink,
             &body.rule,
+            body.scope.as_deref(),
             Some(&format!("human:{}", caller.name())),
         )
         .await?;

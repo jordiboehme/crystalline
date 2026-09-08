@@ -200,6 +200,7 @@ fn ack(permalink: &str) -> EditParams {
         expected_checksum: None,
         expected_replacements: None,
         include_subsections: false,
+        ack_scope: None,
     }
 }
 
@@ -332,4 +333,144 @@ async fn two_pairs_on_one_hub_are_acknowledged_side_by_side() {
         "a pair nobody acknowledged is not stale: {}",
         rows[0]
     );
+}
+
+/// Every `V301` row on `permalink`, as `(scope, evidence)` in queue order. The
+/// scope is what names the pair on the wire: the row a person clicks and the
+/// acknowledgment they ask for have to be the same pair, and this is the only
+/// field that says which.
+fn pairs_on(value: &Value, permalink: &str) -> Vec<(String, String)> {
+    value["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "V301" && f["permalink"] == permalink)
+        .map(|f| {
+            (
+                f["scope"]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("a twin row carries its pair: {f}"))
+                    .to_string(),
+                f["evidence"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+/// The engram that leads two twin findings.
+fn hub_of(value: &Value) -> String {
+    value["queue"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["rule"] == "V301")
+        .map(|f| f["permalink"].as_str().unwrap().to_string())
+        .fold(std::collections::HashMap::new(), |mut counts, p| {
+            *counts.entry(p).or_insert(0usize) += 1;
+            counts
+        })
+        .into_iter()
+        .find(|(_, n)| *n == 2)
+        .map(|(p, _)| p)
+        .expect("one engram leads two twin findings")
+}
+
+/// The pair a person clicked is the pair that gets acknowledged, not whichever
+/// one the server would have picked. A hub leads two twin findings; naming the
+/// **second** row's pair silences that row and leaves the first standing.
+#[tokio::test]
+async fn an_acknowledgment_is_given_for_the_pair_the_caller_names() {
+    let (_tmp, engine) = engine(true).await;
+    three_twins(&engine).await;
+    let before = sweep(&engine).await;
+    let hub = hub_of(&before);
+    let rows = pairs_on(&before, &hub);
+    assert_eq!(rows.len(), 2, "{before}");
+    let (second_pair, second_evidence) = rows[1].clone();
+
+    let entry = engine
+        .acknowledge_finding_as(
+            "notes",
+            &hub,
+            "V301",
+            Some("distinct, linked"),
+            Some(&second_pair),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        entry["scope"], second_pair,
+        "the entry names the pair the caller did: {entry}"
+    );
+
+    engine.embed_pending().await.unwrap();
+    let after = sweep(&engine).await;
+    let standing = pairs_on(&after, &hub);
+    assert_eq!(standing.len(), 1, "one of the hub's pairs is silenced");
+    assert_ne!(
+        standing[0].1, second_evidence,
+        "the row that stands is the one nobody named"
+    );
+    assert_eq!(standing[0].0, rows[0].0, "and it is the first pair");
+}
+
+/// A pair that is not firing cannot be acknowledged: the caller is naming
+/// evidence the sweep does not see, which is a queue they read too long ago.
+#[tokio::test]
+async fn a_pair_the_sweep_does_not_see_is_refused() {
+    let (_tmp, engine) = engine(true).await;
+    three_twins(&engine).await;
+    let before = sweep(&engine).await;
+    let hub = hub_of(&before);
+
+    let refused = engine
+        .acknowledge_finding_as(
+            "notes",
+            &hub,
+            "V301",
+            None,
+            Some("crystalline://notes/nobody, crystalline://notes/nothing"),
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        refused.to_string().contains("V301"),
+        "the refusal names the rule: {refused}"
+    );
+}
+
+/// A withdrawal names a pair too, so taking one acknowledgment back leaves the
+/// hub's other pair silenced.
+#[tokio::test]
+async fn withdrawing_one_pair_leaves_the_other_acknowledged() {
+    let (_tmp, engine) = engine(true).await;
+    three_twins(&engine).await;
+    let before = sweep(&engine).await;
+    let hub = hub_of(&before);
+    let rows = pairs_on(&before, &hub);
+    for (pair, _) in &rows {
+        engine
+            .acknowledge_finding_as("notes", &hub, "V301", Some("linked"), Some(pair), None)
+            .await
+            .unwrap();
+        engine.embed_pending().await.unwrap();
+    }
+
+    let removed = engine
+        .unacknowledge_finding_as("notes", &hub, "V301", Some(&rows[0].0), None)
+        .await
+        .unwrap();
+    assert!(removed);
+    engine.embed_pending().await.unwrap();
+
+    let after = sweep(&engine).await;
+    let standing = pairs_on(&after, &hub);
+    assert_eq!(
+        standing.len(),
+        1,
+        "the withdrawn pair is back and the other stays silenced: {after}"
+    );
+    assert_eq!(standing[0].0, rows[0].0);
 }

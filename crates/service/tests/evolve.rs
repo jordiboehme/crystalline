@@ -1331,7 +1331,7 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
     assert_eq!(v["acknowledged"]["total"], 1);
 
     let removed = engine
-        .unacknowledge_finding_as("eng", "live-doc", "v101", Some("human:jordi"))
+        .unacknowledge_finding_as("eng", "live-doc", "v101", None, Some("human:jordi"))
         .await
         .unwrap();
     assert!(removed);
@@ -1355,7 +1355,7 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
     // rewrite that changed nothing.
     assert!(
         !engine
-            .unacknowledge_finding_as("eng", "live-doc", "V101", None)
+            .unacknowledge_finding_as("eng", "live-doc", "V101", None, None)
             .await
             .unwrap()
     );
@@ -1558,7 +1558,7 @@ async fn a_lowercase_hand_written_rule_id_can_still_be_withdrawn() {
 
     assert!(
         engine
-            .unacknowledge_finding_as("eng", "live-doc", "V101", Some("human:jordi"))
+            .unacknowledge_finding_as("eng", "live-doc", "V101", None, Some("human:jordi"))
             .await
             .unwrap()
     );

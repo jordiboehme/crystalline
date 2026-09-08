@@ -969,8 +969,15 @@ pub struct Finding {
     /// rule in [`RuleInfo::instruction`] rather than being repeated here.
     pub fix: String,
     /// The evidence discriminator an acknowledgment is matched against, per
-    /// [`scope_for`]. Internal: it exists so an acknowledgment can hold while
-    /// the evidence holds, and no surface renders it as a column.
+    /// [`scope_for`]. It exists so an acknowledgment can hold while the
+    /// evidence holds.
+    ///
+    /// Skipped by the derived serialization, and rendered as a column by one
+    /// surface only: the queue row of a [pair-scoped](is_pair_scoped) rule,
+    /// where it is what tells two findings on one engram apart and so what a
+    /// caller sends back to acknowledge the one it read. Every other rule
+    /// answers for its engram alone, so its scope stays the internal
+    /// discriminator it always was.
     #[serde(skip)]
     pub scope: String,
     /// An acknowledgment matched and this finding is only here because the

@@ -599,7 +599,7 @@ function FindingRow({
   // deleted and what gets shown are read from different fields on purpose, so
   // a future prettier title cannot aim the delete somewhere else.
   const attachmentPath = finding.attachmentPath;
-  // Re-acknowledging is the same write: the server recomputes the scope, so
+  // Re-acknowledging is the same write, given for what the row fires on now:
   // the entry it replaces is the one that stopped matching.
   const ackLabel = finding.ackStale ? "Re-acknowledge" : "Acknowledge";
 
@@ -734,6 +734,10 @@ function FindingRow({
                   finding.domain,
                   finding.permalink,
                   finding.rule,
+                  // The entry this row was silenced by, so a twin pair is
+                  // taken back on its own and the engram's other pairs stay
+                  // acknowledged.
+                  finding.ackScope,
                 ),
               );
             }}
@@ -808,6 +812,10 @@ function FindingRow({
                   finding.permalink,
                   finding.rule,
                   note,
+                  // The evidence this row fires on, so an engram raising two
+                  // twin findings silences the one that was read rather than
+                  // whichever the server would have picked.
+                  finding.scope,
                 ),
               );
             }}

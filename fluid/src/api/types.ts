@@ -438,12 +438,12 @@ export interface paths {
         put?: never;
         /**
          * Acknowledge one evolve finding on one engram.
-         * @description Records `evolve_ack` on the engram: the rule, the evidence the server computed it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`.
+         * @description Records `evolve_ack` on the engram: the rule, the evidence it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`. The evidence is the server's, either picked by running detection or - when the body names the row's `scope`, which is how a caller says which of an engram's two `V301` findings it read - checked against it.
          */
         post: operations["acknowledge_finding"];
         /**
          * Withdraw an acknowledgment.
-         * @description Removes the engram's `evolve_ack` entries for that rule, leaving the other rules' alone. A rule has one entry, except `V301`, which has one per twin pair and loses all of them here: there is no way to name a single pair on this route. 404 when the engram carries none for the rule, rather than reporting a removal that did not happen.
+         * @description Removes the engram's `evolve_ack` entries for that rule, leaving the other rules' alone. A rule has one entry, except `V301`, which has one per twin pair: name the row's `scope` to take one pair back and leave the engram's other pairs silenced, or send none to take every pair at once. 404 when the engram carries no entry the body names, rather than reporting a removal that did not happen.
          */
         delete: operations["unacknowledge_finding"];
         options?: never;
@@ -862,6 +862,12 @@ export interface paths {
          *     `ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass
          *     `include_acknowledged` to see the suppressed rows themselves, each marked
          *     `acknowledged` and carrying the same two fields.
+         *
+         *     A `V301` row carries one column the others do not: its own `scope`, the
+         *     twin pair it fired on. It is the one rule that fires more than once on an
+         *     engram, so naming the engram and the rule does not name the finding - send
+         *     this value back on the acknowledgment route to silence the pair that was
+         *     read rather than whichever one the server would have picked.
          *
          *     `today` is not exposed. The temporal rules are evaluated as of now, which is
          *     the only question a page asks; the tool takes a pinned date for a run that
@@ -1484,7 +1490,7 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired and an optional note saying why it is intentional. The scope an acknowledgment holds for is never sent - the server computes it by running detection. */
+        /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once. */
         AckBody: {
             /**
              * @description Why the finding is intentional. Ignored on `DELETE`.
@@ -1501,6 +1507,22 @@ export interface components {
              * @example V101
              */
             rule: string;
+            /**
+             * @description The evidence this acknowledgment is for, copied from the queue row's
+             *     own `scope`.
+             *
+             *     Only `V301` sends one: it is the one rule that fires more than once on
+             *     an engram (an engram can be the semantic twin of several others), so it
+             *     is the one where naming the rule does not name the finding. On `POST`
+             *     the server checks the scope is really firing and refuses with a 422 if
+             *     it is not, which is what a queue read too long ago looks like; on
+             *     `DELETE` it takes back that pair's entry and leaves the engram's other
+             *     pairs silenced. Every other rule ignores it, and omitting it on `V301`
+             *     means the whole rule: the server's own pick on `POST`, every pair at
+             *     once on `DELETE`.
+             * @example notes/backoff-lesson, notes/retry-queue-gotcha
+             */
+            scope?: string | null;
         };
         /** @description One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`. */
         ArchiveEntryReport: {
@@ -4573,7 +4595,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The rule id is not one the sweep catalog holds. */
+            /** @description The rule id is not one the sweep catalog holds, or the `scope` names evidence the rule is not firing on here. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4625,7 +4647,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description No such domain or engram, or no acknowledgment for that rule on it. */
+            /** @description No such domain or engram, or no acknowledgment the body names on it. */
             404: {
                 headers: {
                     [name: string]: unknown;

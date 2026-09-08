@@ -641,6 +641,89 @@ async fn acknowledging_removes_a_finding_and_withdrawing_brings_it_back() {
     assert_eq!(resp.status(), 404);
 }
 
+/// A body may name the evidence it is acknowledging, which is how a caller
+/// says which of an engram's two twin findings it read. Both halves of the
+/// rule hold here, on the wire: a scope the sweep is not raising is refused,
+/// and a scope on a rule that fires once per engram is ignored, because there
+/// is nothing to choose between and the caller has nothing to get wrong.
+///
+/// The twin rule needs embeddings, which this fixture has none of - which is
+/// exactly what makes it the refusal case: no `V301` finding is firing here,
+/// so no scope can name one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_named_scope_is_checked_for_the_rule_that_needs_one_and_ignored_otherwise() {
+    let fixture = serve(Options::default()).await;
+    fixture
+        .auth
+        .add_user("ada", "Ada", None, Role::Editor, "s3cret")
+        .await
+        .unwrap();
+    let session = login_session(fixture.addr, "ada", "s3cret").await;
+
+    // A pair nothing is firing on: the caller is naming evidence that is not
+    // there, which is a queue read too long ago rather than a bad request
+    // shape.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V301",
+            "scope": "eng/human-capture, eng/live-doc"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 422);
+    assert_eq!(resp.headers()["content-type"], "application/problem+json");
+    let problem: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        problem["detail"].as_str().unwrap().contains("V301"),
+        "the refusal names the rule the scope belongs to: {problem}"
+    );
+
+    // The same field on a rule that answers for its engram: ignored, so the
+    // acknowledgment lands with the scope the server itself computed.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::POST,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "scope": "eng/nothing-like-this"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    let status = resp.status();
+    let entry: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(status, 200, "{entry}");
+    assert_ne!(
+        entry["scope"], "eng/nothing-like-this",
+        "a scope-less rule never wears a caller's scope: {entry}"
+    );
+
+    // And ignored on the way back out, so the withdrawal still finds it.
+    let resp = ack_request(
+        fixture.addr,
+        reqwest::Method::DELETE,
+        &session,
+        serde_json::json!({
+            "permalink": "human-capture",
+            "rule": "V006",
+            "scope": "eng/nothing-like-this"
+        }),
+    )
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(resp.status(), 204);
+}
+
 /// The write matrix the endpoint is held to: identity, role, CSRF, and the two
 /// ways a body can be wrong.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

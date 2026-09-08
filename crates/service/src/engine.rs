@@ -4592,15 +4592,18 @@ impl Engine {
                     AckDraft::Record(entry) => entry,
                     // A removal reads the entries the file holds right now,
                     // under the lock, so a concurrent acknowledgment is either
-                    // fully there or not there at all when it filters.
+                    // fully there or not there at all when it filters. It
+                    // names a rule and never a pair: `remove <rule-id>` is the
+                    // whole of the value form an agent writes here, so every
+                    // entry the rule has goes.
                     AckDraft::Remove(rule) => {
-                        if !has_ack(source, rule) {
+                        if !has_ack(source, rule, None) {
                             return Err(EngineError::Invalid(format!(
                                 "no acknowledgment for {rule} on '{permalink}'; nothing to remove"
                             )));
                         }
                         return guarded_ack_write(
-                            without_ack(source, rule),
+                            without_ack(source, rule, None),
                             "removal",
                             &p.identifier,
                         );
@@ -7126,6 +7129,17 @@ impl Engine {
                     "evidence": f.evidence,
                     "fix": f.fix,
                 });
+                // The pair a twin row is about, which is the value an
+                // acknowledgment for it is given for and the value the ack
+                // route takes back. Only a pair-scoped rule carries it: it is
+                // the one rule that fires more than once on an engram, so it
+                // is the one whose rows a caller has to be able to tell apart.
+                // Every other rule's acknowledgment is named by the engram and
+                // the rule alone, and a column repeating what those two fields
+                // already say would cost every queue tokens for nothing.
+                if crystalline_index::is_pair_scoped(f.rule) && !f.scope.is_empty() {
+                    row["scope"] = Value::String(f.scope.clone());
+                }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
                 // renderer already knows.
@@ -7139,8 +7153,10 @@ impl Engine {
                 // stale row is deliberately not what the finding fires on now:
                 // the row's own evidence and fix columns say that, and the pair
                 // is what shows a reader why the acknowledgment stopped
-                // matching. Named beside `ack_note` rather than plain `scope`,
-                // which at the top level already names the swept domains.
+                // matching. Named beside `ack_note` rather than sharing the
+                // `scope` above it, because the two disagree on exactly the
+                // rows that matter - and it is this one a withdrawal names,
+                // since it is the entry the file holds.
                 if let Some(scope) = f.ack_scope.as_deref().filter(|s| !s.is_empty()) {
                     row["ack_scope"] = Value::String(scope.to_string());
                 }
@@ -7256,6 +7272,14 @@ impl Engine {
     /// which matches whatever it finds later. That is the honest reading of
     /// "acknowledge this before it appears".
     ///
+    /// **A caller that names the pair gets that pair**, which is what
+    /// [`EditParams::ack_scope`] carries. It is honoured for a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule and ignored for
+    /// every other, whose acknowledgment answers for the engram and so has
+    /// nothing to choose between; and it is checked rather than trusted, by
+    /// [`Engine::named_scope`]. So detection still runs on this path - it just
+    /// validates a request instead of resolving one.
+    ///
     /// A removal needs none of that: it names an entry that is already on the
     /// engram, so it travels to the text edit as the rule id alone and the
     /// filtering happens there, under the lock, against what the file holds.
@@ -7268,16 +7292,62 @@ impl Engine {
         Ok(match Self::ack_intent(p)? {
             None => None,
             Some(AckIntent::Remove { rule }) => Some(AckDraft::Remove(rule)),
-            Some(AckIntent::Record { rule, note }) => Some(AckDraft::Record(EvolveAck {
-                scope: self
-                    .firing_scope(&desc.domain, &desc.permalink, &rule)
-                    .await?,
-                rule,
-                note,
-                by: actor.to_string(),
-                at: Some(now_offset()),
-            })),
+            Some(AckIntent::Record { rule, note }) => {
+                let named = p
+                    .ack_scope
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
+                let scope = match named {
+                    Some(named) => Some(
+                        self.named_scope(&desc.domain, &desc.permalink, &rule, named)
+                            .await?,
+                    ),
+                    None => {
+                        self.firing_scope(&desc.domain, &desc.permalink, &rule)
+                            .await?
+                    }
+                };
+                Some(AckDraft::Record(EvolveAck {
+                    scope,
+                    rule,
+                    note,
+                    by: actor.to_string(),
+                    at: Some(now_offset()),
+                }))
+            }
         })
+    }
+
+    /// `named` back, once detection confirms `rule` is really firing on
+    /// `permalink` for it. The refusal is the point: an acknowledgment is a
+    /// record that somebody read a finding and ruled it intentional, so one
+    /// given for evidence no sweep can see is a claim about nothing.
+    ///
+    /// What it protects against is a queue read too long ago. Two twin
+    /// findings on one engram differ only by their pair, so a page still
+    /// showing yesterday's rows would otherwise silence a pair its reader
+    /// never saw, with their note on it - the exact confusion the pair is
+    /// carried to prevent.
+    ///
+    /// Compared as the whole string, because a scope **is** one value: the
+    /// sweep sorts and joins its parts before it renders one, so two callers
+    /// naming the same pair send the same bytes, and a pair that gained a
+    /// member is a different scope rather than a near miss.
+    async fn named_scope(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+        named: &str,
+    ) -> Result<String> {
+        let firing = self.firing_findings(domain, permalink, rule).await?;
+        if firing.iter().any(|f| f.scope == named) {
+            return Ok(named.to_string());
+        }
+        Err(EngineError::Invalid(format!(
+            "no {rule} finding on '{permalink}' for '{named}'; re-read the queue and acknowledge a row it still shows"
+        )))
     }
 
     /// What `rule` is currently firing on `permalink` for, as the scope an
@@ -7304,6 +7374,27 @@ impl Engine {
         permalink: &str,
         rule: &str,
     ) -> Result<Option<String>> {
+        let firing = self.firing_findings(domain, permalink, rule).await?;
+        Ok(firing
+            .iter()
+            .find(|f| !f.acknowledged)
+            .or(firing.first())
+            .map(|f| f.scope.clone())
+            .filter(|scope| !scope.is_empty()))
+    }
+
+    /// Every finding `rule` is raising on `permalink` right now, in queue
+    /// order and with the suppressed ones included, which is what both readers
+    /// need: [`Engine::firing_scope`] to resolve a scope and
+    /// [`Engine::named_scope`] to check one. A domain that sweeps to nothing
+    /// answers with no findings rather than an error - there is no evidence
+    /// there to name.
+    async fn firing_findings(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+    ) -> Result<Vec<Finding>> {
         let mut known_domains = self.known_domain_names();
         known_domains.sort();
         known_domains.dedup();
@@ -7312,20 +7403,14 @@ impl Engine {
             .sweep_domain(domain, today, &known_domains, true)
             .await?
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
-        let firing: Vec<Finding> = swept
+        Ok(swept
             .report
             .findings
             .into_iter()
             .filter(|f| f.rule == rule && f.permalink == permalink)
-            .collect();
-        Ok(firing
-            .iter()
-            .find(|f| !f.acknowledged)
-            .or(firing.first())
-            .map(|f| f.scope.clone())
-            .filter(|scope| !scope.is_empty()))
+            .collect())
     }
 
     /// Acknowledge a finding: record on the engram that this rule's finding was
@@ -7347,12 +7432,19 @@ impl Engine {
     /// without another lookup - the catalog is right there in the message - and
     /// an acknowledgment of a rule nobody has could not be recorded even on an
     /// engram that does exist.
+    ///
+    /// `scope` names the pair the acknowledgment is for, which only a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule has more than one
+    /// of; it is ignored for every other rule and checked rather than trusted
+    /// for that one (see [`Engine::named_scope`]). `None` leaves the choice to
+    /// the server, which is what an agent's `set_frontmatter` does.
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
         identifier: &str,
         rule: &str,
         note: Option<&str>,
+        scope: Option<&str>,
         client: Option<&str>,
     ) -> Result<Value> {
         let screened = rule.trim().to_ascii_uppercase();
@@ -7369,6 +7461,7 @@ impl Engine {
             operation: "set_frontmatter".to_string(),
             key: Some(EVOLVE_ACK_KEY.to_string()),
             value: Some(value),
+            ack_scope: scope.map(str::to_string),
             ..EditParams::default()
         };
         let result = self.edit_engram_as(&params, client).await?;
@@ -7376,17 +7469,26 @@ impl Engine {
     }
 
     /// Withdraw an acknowledgment, leaving the engram's other entries alone.
-    /// `false` when the engram carries none for that rule, which the surface
+    /// `false` when the engram carries none this names, which the surface
     /// answers as a 404 rather than pretending a removal happened.
     ///
+    /// `scope` narrows the withdrawal to the one entry given for that pair,
+    /// and like the recording half it speaks only for a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule: every other rule
+    /// keeps one entry, so there is nothing to narrow. `None` takes every
+    /// entry the rule has, which is the whole of it for the ten and all pairs
+    /// at once for the one.
+    ///
     /// Fluid's half of the take-back an agent asks for with the `remove
-    /// <rule-id>` value form; both filter through [`without_ack`], and they
-    /// differ only in how an entry that is not there is reported.
+    /// <rule-id>` value form; both filter through [`without_ack`]. They differ
+    /// in how an entry that is not there is reported, and in that the agent's
+    /// form names a rule and never a pair.
     pub async fn unacknowledge_finding_as(
         &self,
         domain: &str,
         identifier: &str,
         rule: &str,
+        scope: Option<&str>,
         client: Option<&str>,
     ) -> Result<bool> {
         if self.read_only {
@@ -7397,16 +7499,19 @@ impl Engine {
             return Err(EngineError::Invalid(unknown_rule_message(&rule)));
         }
         let actor = self.actor(client);
+        let scope = scope
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
         let (desc, source) = self.resolve_in(identifier, domain).await?;
         // Checked before the write so an engram carrying no such entry answers
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block.
         let current = self.load_source(&source, &desc).await?;
-        if !has_ack(&current, &rule) {
+        if !has_ack(&current, &rule, scope) {
             return Ok(false);
         }
         self.apply_source_edit(&desc, &source, None, &actor, |current| {
-            Ok(without_ack(current, &rule))
+            Ok(without_ack(current, &rule, scope))
         })
         .await?;
         Ok(true)
@@ -14043,30 +14148,50 @@ fn acks_of(source: &str) -> Vec<EvolveAck> {
         .unwrap_or_default()
 }
 
-/// Whether the engram acknowledges `rule` at all.
+/// Whether the engram acknowledges `rule` at all, or - when `scope` names a
+/// pair - acknowledges that pair.
 ///
-/// Case-folded, like every other rule comparison on this path: a hand-written
-/// `- { rule: v101 }` suppresses findings, so it has to be findable - and
-/// withdrawable - too.
-fn has_ack(source: &str, rule: &str) -> bool {
-    acks_of(source)
-        .iter()
-        .any(|a| a.rule.eq_ignore_ascii_case(rule))
+/// Case-folded on the rule, like every other rule comparison on this path: a
+/// hand-written `- { rule: v101 }` suppresses findings, so it has to be
+/// findable - and withdrawable - too. The scope is compared exactly, being one
+/// value the sweep renders rather than something anybody types.
+fn has_ack(source: &str, rule: &str, scope: Option<&str>) -> bool {
+    acks_of(source).iter().any(|a| ack_names(a, rule, scope))
 }
 
-/// The engram's markdown with `rule`'s acknowledgment dropped and every other
-/// entry left exactly as it was. Removing the last one removes the key rather
-/// than leaving an empty one ([`set_evolve_ack`] on an empty slice).
+/// Whether one entry is what `rule` and an optional `scope` name. The scope
+/// half is what makes a withdrawal able to take one twin pair back and leave
+/// the engram's other pair silenced; without one, every entry for the rule is
+/// named.
+///
+/// An entry that carries no scope of its own - a hand-written line, or an
+/// acknowledgment given before its rule fired - is never what a named pair
+/// means: it was given for nothing in particular, so a request naming a pair
+/// leaves it alone rather than removing an answer it did not ask about.
+fn ack_names(entry: &EvolveAck, rule: &str, scope: Option<&str>) -> bool {
+    entry.rule.eq_ignore_ascii_case(rule)
+        && match scope {
+            Some(scope) => entry.scope.as_deref() == Some(scope),
+            None => true,
+        }
+}
+
+/// The engram's markdown with the acknowledgment `rule` and an optional
+/// `scope` name dropped, and every other entry left exactly as it was.
+/// Removing the last one removes the key rather than leaving an empty one
+/// ([`set_evolve_ack`] on an empty slice).
 ///
 /// The one removal both surfaces run: Fluid's withdraw
 /// ([`Engine::unacknowledge_finding_as`]) and an agent's `remove <rule-id>`
-/// value. They differ only in how they report an entry that is not there - a
+/// value. They differ in how they report an entry that is not there - a
 /// `false` the REST layer answers as a 404, an error the agent reads - which is
-/// why the presence test is [`has_ack`] beside this rather than folded into it.
-fn without_ack(source: &str, rule: &str) -> String {
+/// why the presence test is [`has_ack`] beside this rather than folded into it,
+/// and in that only the first can name a pair: the agent's value form carries a
+/// rule id and nothing else, so it takes every entry the rule has.
+fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
     let kept: Vec<EvolveAck> = acks_of(source)
         .into_iter()
-        .filter(|a| !a.rule.eq_ignore_ascii_case(rule))
+        .filter(|a| !ack_names(a, rule, scope))
         .collect();
     set_evolve_ack(source, &kept)
 }

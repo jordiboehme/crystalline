@@ -164,6 +164,7 @@ async fn an_edit_that_changes_the_title_updates_the_listing() {
             expected_replacements: None,
             include_subsections: false,
             expected_checksum: None,
+            ack_scope: None,
         })
         .await
         .unwrap();
