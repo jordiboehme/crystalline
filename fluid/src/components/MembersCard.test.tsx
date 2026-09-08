@@ -9,7 +9,7 @@
  * "what may I do here" field the route does not carry.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -741,10 +741,28 @@ describe("the members card", () => {
       expect(control).not.toBeDisabled();
       expect(control).toHaveAttribute("aria-disabled", "true");
       expect(control).toHaveAccessibleDescription(reason);
-      // Still reachable: the whole point of `aria-disabled` over `disabled`.
+      // Still IN the tab order, which is the whole point of `aria-disabled`
+      // over `disabled`: focusing a node by script proves only that it can
+      // hold focus, so what is asserted is that nothing took it out of the
+      // sequential order - a native button or select without `tabindex="-1"`
+      // is in it by definition.
+      expect(control).not.toHaveAttribute("tabindex", "-1");
       control.focus();
       expect(control).toHaveFocus();
     }
+    // And reached by the keyboard for real, on the one that ends the form: a
+    // Tab from the level picker lands on Invite rather than skipping past it.
+    within(card).getByRole("combobox", { name: "Level" }).focus();
+    await userEvent.tab();
+    expect(invite).toHaveFocus();
+
+    // The submit's guard needs something to submit, or a refusal to call the
+    // API says only that the form was empty. `readonly` refuses a person's
+    // typing and not a programmatic change, which is exactly what is wanted
+    // here: a filled field on a read-only instance.
+    const account = within(card).getByLabelText("Account");
+    fireEvent.change(account, { target: { value: "newbie" } });
+    expect(account).toHaveValue("newbie");
 
     const before = apiMock.mock.calls.length;
     await userEvent.click(visibility);
@@ -801,10 +819,15 @@ describe("the members card", () => {
     expect(level).toHaveAttribute("aria-disabled", "true");
     expect(level).toHaveAccessibleDescription(reason);
 
-    account.focus();
-    expect(account).toHaveFocus();
-    level.focus();
-    expect(level).toHaveFocus();
+    // In the tab order rather than merely focusable, for the reason the
+    // five-control test above spells out.
+    for (const control of [account, level]) {
+      expect(control).not.toHaveAttribute("tabindex", "-1");
+      control.focus();
+      expect(control).toHaveFocus();
+    }
+    await userEvent.tab();
+    expect(within(card).getByRole("button", { name: "Invite" })).toHaveFocus();
 
     await userEvent.type(account, "x");
     expect(account).toHaveValue("");

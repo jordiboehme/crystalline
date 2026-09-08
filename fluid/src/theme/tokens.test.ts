@@ -16,6 +16,8 @@ import { describe, expect, it, test } from "vitest";
 
 const CSS_PATH = join(__dirname, "..", "index.css");
 const css = readFileSync(CSS_PATH, "utf8");
+const EDITOR_SETUP_PATH = join(__dirname, "..", "editor", "setup.ts");
+const editorSetup = readFileSync(EDITOR_SETUP_PATH, "utf8");
 
 describe("design tokens", () => {
   test("the five-step scale exists and floors at 12px", () => {
@@ -235,6 +237,16 @@ describe("the editor's code-string color, per scheme", () => {
     const dark = cssVar(themeBlock("dark"), "--color-code-string");
     expect(dark).toBe(colorAfter('[data-theme="dark"] .hljs-string,'));
     expect(contrastRatio(dark, SLATE_950)).toBeGreaterThanOrEqual(4.5);
+  });
+
+  // Both tests above pin a property nothing here reads. What makes them worth
+  // anything is that the editor still asks for it: a `tags.string` rule
+  // rewritten back to a literal color would leave two green tests and a
+  // regression, since the per-scheme values would simply stop being consulted.
+  it("is what the editor's string rule actually reads", () => {
+    expect(editorSetup).toMatch(
+      /tag:\s*tags\.string\s*,\s*color:\s*"var\(--color-code-string\)"/,
+    );
   });
 });
 
