@@ -602,6 +602,23 @@ fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str)
             entries[first]["command"] = Value::String(command.to_string());
             changed = true;
         }
+        // A dropped entry may be the only one carrying a timeout, and the
+        // shape this really happens in is the one above: a Copilot file
+        // holding the plain routing entry first and the `--format copilot`
+        // one second, where the second is the entry with `timeoutSec` on it.
+        // The survivor is about to run that entry's command, so it inherits
+        // that entry's timeout rather than falling back to Copilot's own
+        // default. A timeout already on the survivor is somebody's own answer
+        // and is left exactly as it is, and a set of dropped entries that
+        // carried none loses nothing and gains nothing.
+        if entries[first].get("timeoutSec").is_none()
+            && let Some(inherited) = ours[1..]
+                .iter()
+                .find_map(|&i| entries[i].get("timeoutSec").cloned())
+        {
+            entries[first]["timeoutSec"] = inherited;
+            changed = true;
+        }
         // Reverse order, so each removal leaves the indexes below it valid.
         for &i in ours[1..].iter().rev() {
             entries.remove(i);
@@ -3207,6 +3224,56 @@ mod tests {
             !add_owned_hooks(&mut root, HarnessKind::Copilot),
             "the healed file is stable"
         );
+    }
+
+    /// The surviving entry keeps the dropped one's timeout.
+    ///
+    /// The survivor is chosen by position and takes over the dropped entry's
+    /// command, so without this the real shape - a plain routing entry written
+    /// first and the `--format copilot` one, with the timeout on it, written
+    /// second - would leave a managed hook running on Copilot's default rather
+    /// than ours, with nothing that ever puts it back.
+    #[test]
+    fn the_surviving_entry_inherits_the_dropped_ones_timeout() {
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": SESSION_START_COMMAND },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 7 }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["timeoutSec"], 7,
+            "the timeout came from the entry that was dropped, not from its position"
+        );
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "and the healed file is stable"
+        );
+    }
+
+    /// A timeout the survivor already carries is its own, never overwritten by
+    /// one from a dropped entry.
+    #[test]
+    fn a_timeout_on_the_survivor_is_left_alone() {
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": SESSION_START_COMMAND, "timeoutSec": 3 },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 7 }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["timeoutSec"], 3);
     }
 
     /// Dropping the duplicate is a change even when the entry that survives
