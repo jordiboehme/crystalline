@@ -1283,6 +1283,14 @@ fn http_base(
     // off there is nowhere for them to live, so the refusal happens here
     // rather than waiting for `RestState::new` below, which never runs when
     // `api` is false.
+    //
+    // Both guards below only ever fire on an explicit `true`: an unset
+    // `auth.oauth` follows `auth.mcp` where the UI is served
+    // (`GlobalConfig::auth_oauth`), so a derived value is `true` only where
+    // `ui_enabled()` already holds, and `ui_enabled()` implies `api_enabled()`
+    // - a config nobody set `auth.oauth` on can never trip either bail, which
+    // is what lets an upgrade turn OAuth on for a shared instance without
+    // also risking its daemon start.
     let oauth = config.auth_oauth();
     if oauth && !api {
         anyhow::bail!("auth.oauth needs service.api: its endpoints live under /api/v1");

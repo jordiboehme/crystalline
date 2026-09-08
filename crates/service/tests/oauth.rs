@@ -100,7 +100,9 @@ impl OauthCtx {
         });
         cfg.auth = Some(AuthConfig {
             mcp: Some(true),
-            oauth: oauth.then_some(true),
+            // Explicit either way: `auth.mcp` is already on here, so an unset
+            // `auth.oauth` would derive back on rather than stay off.
+            oauth: Some(oauth),
             ..AuthConfig::default()
         });
         let config_path = root.join("config.yaml");

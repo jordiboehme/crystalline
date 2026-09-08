@@ -3723,11 +3723,14 @@ mod tests {
     }
 
     /// With the setting off there is no rule to answer with, and the refusal
-    /// names the two keys that change that.
+    /// names the two keys that change that. Explicit `false` here, not an
+    /// unset key: `config_with(None)` already has `auth.mcp` on, and since
+    /// `auth.oauth` unset follows `auth.mcp` where the UI is served, leaving
+    /// it unset in this config would derive it back on.
     #[test]
     fn without_the_setting_there_is_no_server_and_the_documents_are_gone() {
         let mut config = config_with(None);
-        config.auth.as_mut().unwrap().oauth = None;
+        config.auth.as_mut().unwrap().oauth = Some(false);
         assert!(OauthServer::new(&config).is_none());
         assert!(OauthServer::new(&config_with(None)).is_some());
 

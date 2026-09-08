@@ -75,7 +75,10 @@ async fn build_engine_with(
     cfg.auth = Some(AuthConfig {
         mcp: Some(mcp_auth),
         proxy_headers: proxy_headers.then_some(true),
-        oauth: oauth.then_some(true),
+        // Explicit either way: with `mcp_auth` true an unset `auth.oauth`
+        // would derive back on, which every caller passing `oauth: false`
+        // here means as an actual off.
+        oauth: Some(oauth),
         oidc: redirect_uri.map(|uri| crystalline_core::config::OidcConfig {
             redirect_uri: Some(uri.to_string()),
             ..crystalline_core::config::OidcConfig::default()

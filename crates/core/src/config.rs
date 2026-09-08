@@ -302,9 +302,16 @@ impl GlobalConfig {
     }
 
     /// Whether OAuth is served for MCP clients, from `auth.oauth`. Absent
-    /// config or an absent key means off (false).
+    /// config or an absent key follows `auth.mcp` where the UI is served: a
+    /// shared instance with agents authenticating and a consent page to show
+    /// them gets OAuth for free. An explicit `false` turns it off; an
+    /// explicit `true` insists and the two startup guards refuse to serve
+    /// where it cannot be met.
     pub fn auth_oauth(&self) -> bool {
-        self.auth.as_ref().and_then(|a| a.oauth).unwrap_or(false)
+        self.auth
+            .as_ref()
+            .and_then(|a| a.oauth)
+            .unwrap_or_else(|| self.auth_mcp() && self.ui_enabled())
     }
 
     /// `auth.max_users`. Absent config or an absent key means the default cap.

@@ -30,8 +30,14 @@ struct AuthOptions {
     /// `auth.max_users`: how many accounts trusted-header provisioning may
     /// mint in total. `None` leaves the default cap (100) in place.
     max_users: Option<u32>,
-    /// `auth.oauth`: serve OAuth for MCP clients. Off by default.
-    oauth: bool,
+    /// `auth.mcp`: require every MCP connection over HTTP to authenticate.
+    /// `None` leaves the key unset (off, the legacy open tier), which is also
+    /// what lets an unset `oauth` below follow it.
+    mcp: Option<bool>,
+    /// `auth.oauth`: serve OAuth for MCP clients. `None` leaves the key
+    /// unset, so it follows `auth.mcp` and `service.ui` the way the config
+    /// layer derives it; `Some` sets it explicitly either way.
+    oauth: Option<bool>,
     /// `service.api`: serve the JSON API under `/api/v1`. `None` leaves the
     /// default of on in place.
     api: Option<bool>,
@@ -62,8 +68,8 @@ async fn build_engine_with(
             trusted_header: opts.trusted_header.map(str::to_string),
             proxy_headers: opts.proxy_headers.then_some(true),
             anonymous: Some(opts.anonymous),
-            mcp: None,
-            oauth: Some(opts.oauth),
+            mcp: opts.mcp,
+            oauth: opts.oauth,
             max_users: opts.max_users,
             oidc: None,
         }),
@@ -1451,7 +1457,7 @@ async fn both_header_modes_together_refuse_to_serve() {
 async fn oauth_without_mcp_refuses_the_http_endpoint() {
     let (tmp, engine) = build_engine_with(
         AuthOptions {
-            oauth: true,
+            oauth: Some(true),
             ..AuthOptions::default()
         },
         &[],
@@ -1476,7 +1482,7 @@ async fn oauth_without_mcp_refuses_the_http_endpoint() {
 async fn oauth_without_api_refuses_the_http_endpoint() {
     let (tmp, engine) = build_engine_with(
         AuthOptions {
-            oauth: true,
+            oauth: Some(true),
             api: Some(false),
             ..AuthOptions::default()
         },
@@ -1502,7 +1508,7 @@ async fn oauth_without_api_refuses_the_http_endpoint() {
 async fn oauth_without_ui_refuses_the_http_endpoint() {
     let (tmp, engine) = build_engine_with(
         AuthOptions {
-            oauth: true,
+            oauth: Some(true),
             ui: Some(false),
             ..AuthOptions::default()
         },
@@ -1518,6 +1524,33 @@ async fn oauth_without_ui_refuses_the_http_endpoint() {
         .expect_err("a router must not be built with auth.oauth on and service.ui off");
     let text = format!("{err:#}");
     assert!(text.contains("service.ui"), "{text}");
+}
+
+/// **An upgrade must never fail an existing daemon's start.** `auth.oauth`
+/// unset follows `auth.mcp` where the UI is served, and it is load-bearing
+/// that the two guards above never trip on a value the config layer derived
+/// itself: a shared instance that only ever set `auth.mcp` true - the whole
+/// point of the derivation - has to keep starting on this build exactly as
+/// it did before `auth.oauth` existed. `service.ui` here is left at its
+/// default (on) on purpose, the other half of the condition the derivation
+/// checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_derived_oauth_value_never_trips_the_daemon_guards() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            mcp: Some(true),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let _ = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect("auth.mcp on with auth.oauth unset must derive rather than refuse to start");
 }
 
 /// Logout is a mutating request, so it carries the CSRF token the session was
