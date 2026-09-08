@@ -8391,3 +8391,69 @@ async fn a_preview_plans_the_selection_rather_than_the_whole_delta() {
         nothing.action
     );
 }
+
+// A directory whose case was tidied up locally, with an edit inside it. The
+// base snapshot still holds the old spelling, so the change is reported at
+// that spelling - a path this working tree does not contain. On a
+// case-sensitive filesystem the share has to read the file that IS there, or
+// it dies with a bare "No such file or directory" naming a path the user
+// cannot see; on a case-insensitive one the reported path happens to open the
+// file, which is why this needs a case-sensitive volume (or a Linux CI leg) to
+// mean anything. Either way the proposal must carry the spelling the
+// repository already knows, never a rename no teammate's checkout can hold.
+#[tokio::test]
+async fn a_case_only_directory_rename_shares_at_the_recorded_spelling() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            (
+                "Platform.Components.Common/CustomHeaderModule.md",
+                b"header module\n",
+            ),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    std::fs::remove_dir_all(sub.domain_root.join("Platform.Components.Common")).unwrap();
+    write(
+        &sub.domain_root
+            .join("platform.components.common/CustomHeaderModule.md"),
+        b"header module, revised\n",
+    );
+
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .expect("a case-only rename must not break the read behind the share");
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    assert_eq!(
+        report.updated,
+        vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()]
+    );
+    assert!(report.added.is_empty(), "{:?}", report.added);
+    assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+
+    let record = load_state(&sub.state_dir)
+        .proposals
+        .into_iter()
+        .find(|p| p.number == report.number)
+        .expect("the proposal is recorded");
+    let paths: Vec<String> = record.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()],
+        "the edited bytes travel upstream under the name the repository knows"
+    );
+}

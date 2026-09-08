@@ -1582,6 +1582,7 @@ mod tests {
                     },
                 ],
                 skipped_large: vec![],
+                ..Default::default()
             },
             effective_title: "Share updates from brand".to_string(),
         };
@@ -1643,6 +1644,7 @@ mod tests {
                     },
                 ],
                 skipped_large: vec![],
+                ..Default::default()
             },
             effective_title: "Share".to_string(),
         };

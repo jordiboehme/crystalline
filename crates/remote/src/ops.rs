@@ -1060,13 +1060,22 @@ fn select_share_files(
     let Some(files) = files else {
         return Ok(local);
     };
-    let detected: BTreeSet<&str> = local.changes.iter().map(|c| c.path()).collect();
+    // A change whose spelling on disk differs only in case is reported at the
+    // base's spelling, so `ls` and the preview can disagree about one path's
+    // case. Both spellings select it, and both resolve to the reported one.
+    let mut detected: BTreeMap<&str, &str> =
+        local.changes.iter().map(|c| (c.path(), c.path())).collect();
+    for (reported, on_disk) in &local.disk_paths {
+        if detected.contains_key(reported.as_str()) {
+            detected.insert(on_disk.as_str(), reported.as_str());
+        }
+    }
     let mut chosen: BTreeSet<String> = BTreeSet::new();
     let mut unknown: Vec<String> = Vec::new();
     for raw in files {
         let path = normalize_selected_path(raw);
-        if detected.contains(path.as_str()) {
-            chosen.insert(path);
+        if let Some(reported) = detected.get(path.as_str()) {
+            chosen.insert((*reported).to_string());
         } else if !unknown.contains(&path) {
             unknown.push(path);
         }
@@ -1094,6 +1103,7 @@ fn select_share_files(
     Ok(crate::changes::LocalChanges {
         changes,
         skipped_large: local.skipped_large,
+        disk_paths: local.disk_paths,
     })
 }
 
@@ -2186,7 +2196,7 @@ async fn collect_changes(
     for change in &local.changes {
         match change {
             LocalChange::Added { path, sha256 } => {
-                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
                 let bytes = std::fs::read(&wt_path)?;
                 let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
@@ -2205,7 +2215,7 @@ async fn collect_changes(
                 });
             }
             LocalChange::Modified { path, sha256 } => {
-                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
                 let bytes = std::fs::read(&wt_path)?;
                 let size = bytes.len() as u64;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
@@ -3038,7 +3048,8 @@ async fn collect_amend_changes(
                 // nothing to check a re-read against.
                 return Err(unreplayable_layer(layer.number));
             };
-            let wt_path = checked_working_path(state_dir, domain_root, &kept.path)?;
+            let wt_path =
+                checked_working_path(state_dir, domain_root, fresh.disk_path(&kept.path))?;
             let Some(bytes) = read_optional_file(&wt_path)? else {
                 return Err(unreplayable_layer(layer.number));
             };
@@ -3073,7 +3084,7 @@ async fn collect_amend_changes(
                     merged.remove(path);
                     continue;
                 }
-                let wt_path = checked_working_path(state_dir, domain_root, path)?;
+                let wt_path = checked_working_path(state_dir, domain_root, fresh.disk_path(path))?;
                 let bytes = std::fs::read(&wt_path)?;
                 let blob_sha = provider.create_blob(spec, &bytes).await?;
                 merged.insert(

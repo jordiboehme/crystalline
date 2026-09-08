@@ -84,6 +84,23 @@ pub struct LocalChanges {
     /// Files skipped for exceeding [`MAX_SHARED_FILE_BYTES`], with their
     /// sizes in bytes.
     pub skipped_large: Vec<(String, u64)>,
+    /// For every base-snapshot path the walk found on disk under a spelling
+    /// that differs only in case, that spelling on disk. Keyed by the base's
+    /// spelling, which is the one every change, every proposal and every
+    /// snapshot record uses. Read it through [`LocalChanges::disk_path`].
+    ///
+    /// This map is the difference between a path a share can name and a path a
+    /// share can open. A case-only difference is reported at the base spelling
+    /// so what travels upstream is the name the repository already knows, and
+    /// on a case-insensitive filesystem that name happens to open the file too.
+    /// On a case-sensitive one it does not, and without this map every read
+    /// behind such a change would fail with a bare `No such file or directory`
+    /// naming a path the user cannot see.
+    ///
+    /// Every adoption is recorded, including the ones that produced no change
+    /// at all, so a later replay of a recorded layer can resolve a path it was
+    /// handed as well.
+    pub disk_paths: BTreeMap<String, String>,
 }
 
 impl LocalChanges {
@@ -110,6 +127,20 @@ impl LocalChanges {
             .filter(|c| c.is_generated_index())
             .count()
     }
+
+    /// Where to actually open `reported` on this machine.
+    ///
+    /// Every caller that reads a file behind a change must go through this
+    /// rather than joining the reported path onto the domain root: a change
+    /// whose spelling on disk differs only in case is reported at the base's
+    /// spelling, and on a case-sensitive filesystem that spelling opens
+    /// nothing. Identity for every other path, which is nearly all of them.
+    pub fn disk_path<'a>(&'a self, reported: &'a str) -> &'a str {
+        self.disk_paths
+            .get(reported)
+            .map(String::as_str)
+            .unwrap_or(reported)
+    }
 }
 
 /// Detects local changes in `domain_root` relative to `base`, the base
@@ -131,7 +162,11 @@ impl LocalChanges {
 ///   size and digest; content that still matches (a file touched or rewritten
 ///   with identical bytes, whatever its new mtime) is not a change at all,
 ///   and anything else is [`LocalChange::Modified`].
-/// - a base entry with no file on disk is [`LocalChange::Deleted`].
+/// - a base entry with no file on disk is [`LocalChange::Deleted`], unless
+///   another base entry differing from it only in case IS on disk, in which
+///   case nothing is reported: the two cannot be told apart on a
+///   case-insensitive filesystem, and offering to delete one of them is
+///   offering to delete the file the user can see.
 /// - a file whose path differs from exactly one base entry by case alone is
 ///   that entry, not an addition plus a deletion. The case-folding pass in the
 ///   body states the exact conditions, and why a case-sensitive filesystem is
@@ -235,10 +270,14 @@ pub fn detect_local_changes(
     // Case-sensitive filesystems: this deliberately does NOT probe the
     // filesystem, and relies on the guard above alone. Four reasons.
     //
-    //   - The guard already covers the case that matters. Two files differing
-    //     only in case can coexist on ext4 or a case-sensitive APFS volume,
-    //     and when both are there both match their base entries exactly, so
-    //     neither ever reaches this pass. Condition 2 is what makes that hold.
+    //   - The guard already covers the case that matters: two files differing
+    //     only in case coexisting on ext4 or a case-sensitive APFS volume.
+    //     That is two situations, and each is safe for its own reason. If the
+    //     base records both spellings, both files match byte-exactly, neither
+    //     is unmatched and this pass is never reached at all. If the base
+    //     records only one, the other file is unmatched and does reach the
+    //     pass - and condition 2 rejects it, because the base key it would
+    //     fold onto is sitting in `seen`, matched by the file beside it.
     //   - A probe would answer the wrong question. The base snapshot may have
     //     been written on another machine and another filesystem than the one
     //     walking now - pulled by Linux CI, `status` run on a mac - so the
@@ -276,6 +315,7 @@ pub fn detect_local_changes(
     }
 
     let mut adopted: BTreeSet<&str> = BTreeSet::new();
+    let mut disk_paths: BTreeMap<String, String> = BTreeMap::new();
     for (rel, size, sha256) in &unmatched {
         let folded = fold_case(rel);
         let claim = folded_base
@@ -285,14 +325,23 @@ pub fn detect_local_changes(
             .map(|keys| keys[0])
             .filter(|key| !seen.contains(key.as_str()));
 
+        if let Some(key) = claim {
+            adopted.insert(key.as_str());
+            disk_paths.insert(key.clone(), rel.clone());
+        }
+
         match (claim, sha256) {
             (Some(key), Some(sha256)) => {
-                adopted.insert(key.as_str());
-                // The base's spelling, not the disk's: sharing must never
-                // propose a rename no teammate's filesystem can carry out.
-                // Downstream re-reads the file at this path when it collects
-                // a share, which resolves on the case-insensitive filesystems
-                // this case arises on.
+                // The base's spelling, not the disk's: what travels upstream
+                // has to be the name the repository already knows. That name
+                // is, by construction, one the walk never saw - adoption
+                // requires it not be in `seen` - so on a case-sensitive
+                // filesystem it opens nothing, and this branch is reachable
+                // there: a Linux user who re-cases a directory and then edits
+                // a file inside it lands exactly here. `disk_paths` carries
+                // the spelling that does open, so the share reads the file
+                // that exists while the proposal writes the name the
+                // repository knows.
                 let stamp = &base[key];
                 if stamp.size != *size || stamp.sha256 != *sha256 {
                     changes.push(LocalChange::Modified {
@@ -302,10 +351,9 @@ pub fn detect_local_changes(
                 }
             }
             // Too large to hash or share, so no change either way; claiming
-            // the base entry is the whole point, so it is not reported gone.
-            (Some(key), None) => {
-                adopted.insert(key.as_str());
-            }
+            // the base entry above is the whole point, so it is not reported
+            // gone.
+            (Some(_), None) => {}
             (None, Some(sha256)) => changes.push(LocalChange::Added {
                 path: rel.clone(),
                 sha256: sha256.clone(),
@@ -314,8 +362,36 @@ pub fn detect_local_changes(
         }
     }
 
+    // A base entry with no file on disk is a deletion - unless another base
+    // entry that differs from it only in case IS on disk.
+    //
+    // That is the ambiguity the fold above declines to resolve, seen from the
+    // other side. The base holds `Common/X.md` and `common/X.md`; a macOS or
+    // Windows checkout can hold only one of them, so one matches byte-exactly
+    // and the other looks gone. It is not gone, it was never checked out, and
+    // on that machine there is no evidence at all that would tell those two
+    // apart - `E009` reports the pair, but only where the pair can exist, so
+    // never on the platform that suffers from it, and a verify finding does
+    // not gate a share in any case.
+    //
+    // So the same asymmetry that governs the fold governs this: reporting the
+    // deletion offers to remove a file the user can see, one click from
+    // proposing that a teammate's work be deleted, while suppressing it on a
+    // case-sensitive filesystem loses a real deletion, which costs one later
+    // sync once the pair is renamed apart. This does not touch the fold and
+    // guesses at nothing: it declines to claim a file is gone when a file that
+    // is indistinguishable from it on this machine is right there.
+    let removed_but_for_case: BTreeSet<&str> = folded_base
+        .values()
+        .filter(|keys| keys.len() > 1 && keys.iter().any(|k| seen.contains(k.as_str())))
+        .flat_map(|keys| keys.iter().map(|k| k.as_str()))
+        .collect();
+
     for rel in base.keys() {
-        if !seen.contains(rel) && !adopted.contains(rel.as_str()) {
+        if !seen.contains(rel)
+            && !adopted.contains(rel.as_str())
+            && !removed_but_for_case.contains(rel.as_str())
+        {
             changes.push(LocalChange::Deleted { path: rel.clone() });
         }
     }
@@ -325,6 +401,7 @@ pub fn detect_local_changes(
     Ok(LocalChanges {
         changes,
         skipped_large,
+        disk_paths,
     })
 }
 
@@ -449,6 +526,12 @@ fn is_excluded_name(name: &str) -> bool {
 /// collapse: folding two paths together that a filesystem would keep apart
 /// trips the ambiguity guard in [`detect_local_changes`], which then changes
 /// nothing at all.
+///
+/// Verify rule `E009` (`crystalline_core::verify`, `format::check_domain`)
+/// answers the same question about one domain's files and must fold the same
+/// way, or the rule and this function disagree about which paths collide. It
+/// cannot share this helper - `core` may not depend on this crate - so the two
+/// are kept in step by hand, and each says so.
 fn fold_case(path: &str) -> String {
     path.to_lowercase()
 }
@@ -822,6 +905,77 @@ mod tests {
             }],
             "expected one Modified carrying the base spelling"
         );
+        // The reported path is one the walk never saw, so on a case-sensitive
+        // filesystem it opens nothing. Every reader has to go through
+        // `disk_path`, and it has to lead to the file that is really there.
+        assert_eq!(result.disk_path(BASE_SPELLING), DISK_SPELLING);
+        assert!(
+            dir.path().join(result.disk_path(BASE_SPELLING)).is_file(),
+            "the path a share reads through must exist on this filesystem"
+        );
+        assert_eq!(result.disk_path("notes/untouched.md"), "notes/untouched.md");
+    }
+
+    #[test]
+    fn an_adoption_that_reports_no_change_still_records_where_the_file_is() {
+        // A replayed layer can hand a recorded path back long after the share
+        // that made it, and that path is the base spelling. The map has to
+        // cover adoptions that produced nothing, or that replay reads a path
+        // that does not exist.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), DISK_SPELLING, b"header module");
+        let mut base = BTreeMap::new();
+        base.insert(BASE_SPELLING.to_string(), stamp_for(b"header module"));
+
+        let result = detect_local_changes(dir.path(), &base).unwrap();
+        assert!(result.changes.is_empty(), "{:?}", result.changes);
+        assert_eq!(result.disk_path(BASE_SPELLING), DISK_SPELLING);
+    }
+
+    #[test]
+    fn a_base_spelling_left_behind_by_a_checkout_is_not_offered_for_deletion() {
+        // The colleague's repository as it stood BEFORE the pull request
+        // collapsed the pair: the base carries both spellings, and a macOS
+        // checkout could only ever hold one of them. The one it holds matches
+        // byte-exactly; the other is not gone, it was never written. Offering
+        // to delete it is offering to delete the file on screen.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), DISK_SPELLING, b"header module");
+        let mut base = BTreeMap::new();
+        base.insert(DISK_SPELLING.to_string(), stamp_for(b"header module"));
+        base.insert(BASE_SPELLING.to_string(), stamp_for(b"header module"));
+
+        let result = detect_local_changes(dir.path(), &base).unwrap();
+        assert!(
+            result.changes.is_empty(),
+            "no deletion may be proposed for a spelling this checkout could not hold: {:?}",
+            result.changes
+        );
+    }
+
+    #[test]
+    fn a_deletion_is_still_reported_when_no_spelling_of_it_is_on_disk() {
+        // The suppression above must not swallow a real deletion: with neither
+        // spelling on disk there is no file the pair could be standing for.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "classes/kept.md", b"kept");
+        let mut base = BTreeMap::new();
+        base.insert("classes/kept.md".to_string(), stamp_for(b"kept"));
+        base.insert(DISK_SPELLING.to_string(), stamp_for(b"header module"));
+        base.insert(BASE_SPELLING.to_string(), stamp_for(b"header module"));
+
+        let result = detect_local_changes(dir.path(), &base).unwrap();
+        let mut paths: Vec<&str> = result.changes.iter().map(|c| c.path()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec![BASE_SPELLING, DISK_SPELLING]);
+        assert!(
+            result
+                .changes
+                .iter()
+                .all(|c| matches!(c, LocalChange::Deleted { .. })),
+            "{:?}",
+            result.changes
+        );
     }
 
     #[test]
@@ -921,9 +1075,13 @@ mod tests {
             std::fs::read(dir.path().join("notes/Alpha.md")).unwrap() == b"alpha"
         };
         if !sensitive {
-            // A case-insensitive filesystem just overwrote `notes/Alpha.md`;
-            // put it back and leave the rest to the Linux legs of CI.
-            write(dir.path(), "notes/Alpha.md", b"alpha");
+            // A case-insensitive filesystem just overwrote `notes/Alpha.md`
+            // rather than making a second file, so there is no pair here to
+            // test with. Say so: a test that returns in silence reads exactly
+            // like a test that checked something.
+            eprintln!(
+                "skipped: this filesystem is case-insensitive, so the two spellings cannot coexist"
+            );
             return;
         }
 
