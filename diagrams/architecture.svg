@@ -1,0 +1,92 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 440" width="720" height="440" role="img" aria-labelledby="arch-title arch-desc">
+  <title id="arch-title">What Crystalline provides</title>
+  <desc id="arch-desc">One binary, one daemon, drawn as a large rounded panel containing the MCP server, the CLI, Fluid and, below them, the search index, derived and disposable. The panel stands on a base labelled plain markdown files, the source of truth. Agents enter from the left through the MCP server; people enter from the right through Fluid.</desc>
+
+  <defs>
+    <marker id="crys-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c5eb5"/>
+    </marker>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="0.5" y="0.5" width="719" height="439" rx="12" ry="12"
+        fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+
+  <g font-family="Avenir Next, Segoe UI, system-ui, sans-serif"
+     stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- The binary: one process holding every surface -->
+    <g>
+      <rect x="150" y="40" width="420" height="292" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="360" y="70" text-anchor="middle" font-size="16" font-weight="600" fill="#352879">CRYSTALLINE</text>
+      <text x="360" y="90" text-anchor="middle" font-size="14" fill="#57606a">one binary, one daemon</text>
+    </g>
+
+    <!-- Surfaces inside the binary -->
+    <g>
+      <rect x="172" y="118" width="116" height="60" rx="8" ry="8"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <text x="230" y="144" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">MCP server</text>
+      <text x="230" y="163" text-anchor="middle" font-size="12" fill="#57606a">tools for agents</text>
+
+      <rect x="302" y="118" width="116" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="360" y="144" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">CLI</text>
+      <text x="360" y="163" text-anchor="middle" font-size="12" fill="#57606a">for the terminal</text>
+
+      <rect x="432" y="118" width="116" height="60" rx="8" ry="8"
+            fill="#70a4b2" fill-opacity="0.12" stroke="#70a4b2" stroke-width="1.5"/>
+      <text x="490" y="144" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">Fluid</text>
+      <text x="490" y="163" text-anchor="middle" font-size="12" fill="#57606a">for the browser</text>
+    </g>
+
+    <!-- The index, shared by all three surfaces -->
+    <g>
+      <rect x="172" y="218" width="376" height="60" rx="8" ry="8"
+            fill="#ffffff" stroke="#57606a" stroke-width="1.5"/>
+      <text x="360" y="244" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">search index</text>
+      <text x="360" y="263" text-anchor="middle" font-size="12" fill="#57606a">derived, disposable, rebuilt from the files at any time</text>
+    </g>
+
+    <!-- Surfaces to index -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 230 178 L 230 218"/>
+      <path d="M 360 178 L 360 218"/>
+      <path d="M 490 178 L 490 218"/>
+    </g>
+
+    <!-- Index and files: derived both ways, the index rebuilt from the files, the files watched by the index -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-start="url(#crys-arrow)" marker-end="url(#crys-arrow)">
+      <path d="M 360 279 L 360 345"/>
+    </g>
+    <text x="378" y="316" font-size="12" fill="#57606a">watches, reads, writes</text>
+
+    <!-- Base: the source of truth -->
+    <g>
+      <rect x="150" y="346" width="420" height="60" rx="10" ry="10"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="360" y="372" text-anchor="middle" font-size="14" font-weight="600" fill="#352879">plain markdown files - the source of truth</text>
+      <text x="360" y="391" text-anchor="middle" font-size="12" fill="#57606a">engrams in domains, each with a MANIFEST</text>
+    </g>
+
+    <!-- Who comes in through which door -->
+    <g>
+      <rect x="24" y="118" width="96" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="72" y="144" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">agents</text>
+      <text x="72" y="163" text-anchor="middle" font-size="12" fill="#57606a">over MCP</text>
+
+      <rect x="600" y="118" width="96" height="60" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="648" y="144" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">people</text>
+      <text x="648" y="163" text-anchor="middle" font-size="12" fill="#57606a">in a browser</text>
+    </g>
+
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 120 148 L 172 148"/>
+      <path d="M 600 148 L 548 148"/>
+    </g>
+  </g>
+</svg>

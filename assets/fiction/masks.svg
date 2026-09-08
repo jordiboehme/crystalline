@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- The theatre masks beside the colophon's fiction disclaimer, drawn in the
+     idiom of the Creative Commons marks beside it: a thick black ring on
+     white, a solid black glyph inside with the features cut out in white.
+     The sad mask sits behind at top left, the smiling one in front at
+     bottom right, with a thin white keyline separating the two. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <circle cx="32" cy="32" r="28.5" fill="#fff" stroke="#000" stroke-width="5.5"/>
+  <g transform="translate(32 32) scale(1.08) translate(-32 -32)">
+    <!-- back mask, tragedy -->
+    <path d="M14 17h21v14.5a10.5 10.5 0 0 1 -21 0z" fill="#000"/>
+    <circle cx="20.5" cy="24" r="2.3" fill="#fff"/><circle cx="28.5" cy="24" r="2.3" fill="#fff"/>
+    <path d="M19.5 33c1.8-2.6 8.2-2.6 10 0" fill="none" stroke="#fff" stroke-width="2.6"/>
+    <!-- front mask, comedy -->
+    <path d="M28.5 27h21v14.5a10.5 10.5 0 0 1 -21 0z" fill="#000" stroke="#fff" stroke-width="1.5" stroke-linejoin="miter"/>
+    <circle cx="35" cy="34" r="2.3" fill="#fff"/><circle cx="43" cy="34" r="2.3" fill="#fff"/>
+    <path d="M33.5 40.5c1.8 2.6 9.2 2.6 11 0" fill="none" stroke="#fff" stroke-width="2.6"/>
+  </g>
+</svg>

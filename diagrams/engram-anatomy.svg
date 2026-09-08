@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 720 460" width="720" height="460" role="img" aria-labelledby="anatomy-title anatomy-desc">
+  <title id="anatomy-title">The anatomy of an engram</title>
+  <desc id="anatomy-desc">A stylized markdown file on the left: a frontmatter block with type, title, permalink, tags, status, recorded_at and generated; three lines of prose; an observation bullet; and a relation bullet. Callout labels on the right point at each part: frontmatter, identity and state; prose, the explanation a colleague would give; observation, the atomic unit; relation, a typed edge to another engram.</desc>
+
+  <defs>
+    <marker id="crys-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#6c5eb5"/>
+    </marker>
+  </defs>
+
+  <!-- Panel -->
+  <rect x="0.5" y="0.5" width="719" height="459" rx="12" ry="12"
+        fill="#ffffff" stroke="#d0d7de" stroke-width="1"/>
+
+  <g font-family="Avenir Next, Segoe UI, system-ui, sans-serif"
+     stroke-linejoin="round" stroke-linecap="round">
+
+    <!-- The file -->
+    <rect x="40" y="32" width="384" height="396" rx="10" ry="10"
+          fill="#ffffff" stroke="#352879" stroke-width="1.5"/>
+    <text x="232" y="56" text-anchor="middle" font-size="12" fill="#57606a">engineering/retry-queue-gotcha.md</text>
+
+    <!-- Frontmatter band -->
+    <rect x="52" y="66" width="360" height="170" rx="8" ry="8"
+          fill="#352879" fill-opacity="0.12" stroke="none"/>
+    <g font-size="13" fill="#1f2328">
+      <text x="64" y="84">---</text>
+      <text x="64" y="102">type: engram</text>
+      <text x="64" y="120">title: Retry queue gotcha</text>
+      <text x="64" y="138">permalink: retry-queue-gotcha</text>
+      <text x="64" y="156">tags: [gotcha, payments]</text>
+      <text x="64" y="174">status: stable</text>
+      <text x="64" y="192">recorded_at: 2026-03-09</text>
+      <text x="64" y="210">generated: { by: claude-code, at: ... }</text>
+      <text x="64" y="228">---</text>
+    </g>
+
+    <!-- Prose -->
+    <g font-size="13" fill="#1f2328">
+      <text x="64" y="262">The retry queue drops any job older than</text>
+      <text x="64" y="280">twenty-four hours. The cutoff mirrors the</text>
+      <text x="64" y="298">chargeback window at Encom, the bank.</text>
+    </g>
+
+    <!-- Observation band -->
+    <rect x="52" y="322" width="360" height="30" rx="8" ry="8"
+          fill="#6c5eb5" fill-opacity="0.12" stroke="none"/>
+    <text x="64" y="342" font-size="13" fill="#1f2328">- [gotcha] Drops jobs older than 24h #payments</text>
+
+    <!-- Relation band -->
+    <rect x="52" y="362" width="360" height="30" rx="8" ry="8"
+          fill="#70a4b2" fill-opacity="0.12" stroke="none"/>
+    <text x="64" y="382" font-size="13" fill="#1f2328">- depends_on [[Encom chargeback window]]</text>
+
+    <!-- Callouts -->
+    <g>
+      <rect x="472" y="112" width="224" height="76" rx="8" ry="8"
+            fill="#352879" fill-opacity="0.12" stroke="#352879" stroke-width="1.5"/>
+      <text x="584" y="136" text-anchor="middle" font-size="14" font-weight="600" fill="#352879">FRONTMATTER</text>
+      <text x="584" y="156" text-anchor="middle" font-size="12" fill="#1f2328">type, status, tags, provenance,</text>
+      <text x="584" y="174" text-anchor="middle" font-size="12" fill="#1f2328">validity dates when bounded</text>
+    </g>
+
+    <g>
+      <rect x="472" y="246" width="224" height="58" rx="8" ry="8"
+            fill="#57606a" fill-opacity="0.12" stroke="#57606a" stroke-width="1.5"/>
+      <text x="584" y="270" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">PROSE</text>
+      <text x="584" y="290" text-anchor="middle" font-size="12" fill="#1f2328">what a colleague would explain</text>
+    </g>
+
+    <g>
+      <rect x="472" y="318" width="224" height="40" rx="8" ry="8"
+            fill="#6c5eb5" fill-opacity="0.12" stroke="#6c5eb5" stroke-width="1.5"/>
+      <text x="584" y="335" text-anchor="middle" font-size="14" font-weight="600" fill="#6c5eb5">OBSERVATION</text>
+      <text x="584" y="351" text-anchor="middle" font-size="12" fill="#1f2328">[category] text #tag, the atomic unit</text>
+    </g>
+
+    <g>
+      <rect x="472" y="370" width="224" height="40" rx="8" ry="8"
+            fill="#70a4b2" fill-opacity="0.12" stroke="#70a4b2" stroke-width="1.5"/>
+      <text x="584" y="387" text-anchor="middle" font-size="14" font-weight="600" fill="#1f2328">RELATION</text>
+      <text x="584" y="403" text-anchor="middle" font-size="12" fill="#1f2328">rel_type [[Target]], a typed edge</text>
+    </g>
+
+    <!-- Leaders from callouts to the file -->
+    <g fill="none" stroke="#6c5eb5" stroke-width="1.5" marker-end="url(#crys-arrow)">
+      <path d="M 472 150 L 412 150"/>
+      <path d="M 472 275 L 412 275"/>
+      <path d="M 472 338 L 412 338"/>
+      <path d="M 472 390 L 412 378"/>
+    </g>
+  </g>
+</svg>
