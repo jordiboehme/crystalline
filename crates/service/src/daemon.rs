@@ -71,7 +71,7 @@ const BANNER: &str = r"
 /// environment rather than retyped, matching `crates/cli/src/main.rs`'s
 /// `VERSION_BLOCK`.
 const COPYRIGHT_LINE: &str = concat!(
-    "Copyright (C) 2026 Jordi Boehme - ",
+    "Copyright (C) 2026 Jordi Böhme - ",
     env!("CARGO_PKG_LICENSE"),
     " - ",
     env!("CARGO_PKG_REPOSITORY"),
@@ -2626,7 +2626,7 @@ mod tests {
         assert_eq!(
             COPYRIGHT_LINE,
             format!(
-                "Copyright (C) 2026 Jordi Boehme - {} - {}",
+                "Copyright (C) 2026 Jordi Böhme - {} - {}",
                 env!("CARGO_PKG_LICENSE"),
                 env!("CARGO_PKG_REPOSITORY")
             )

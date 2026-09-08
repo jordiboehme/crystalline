@@ -1171,7 +1171,7 @@ fn a_missing_harness_cli_prints_a_manual_command_and_still_succeeds() {
 fn write_version_shim(bin_dir: &Path, version: &str) {
     std::fs::create_dir_all(bin_dir).unwrap();
     let script = format!(
-        "#!/bin/sh\necho 'crystalline {version}'\necho 'Copyright (C) 2026 Jordi Boehme - {}'\necho '{}'\nexit 0\n",
+        "#!/bin/sh\necho 'crystalline {version}'\necho 'Copyright (C) 2026 Jordi Böhme - {}'\necho '{}'\nexit 0\n",
         env!("CARGO_PKG_LICENSE"),
         env!("CARGO_PKG_REPOSITORY"),
     );

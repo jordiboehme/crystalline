@@ -41,7 +41,7 @@ mod users;
 /// itself, so spelling it here too would print it twice.
 const VERSION_BLOCK: &str = concat!(
     env!("CARGO_PKG_VERSION"),
-    "\nCopyright (C) 2026 Jordi Boehme - ",
+    "\nCopyright (C) 2026 Jordi Böhme - ",
     env!("CARGO_PKG_LICENSE"),
     "\n",
     env!("CARGO_PKG_REPOSITORY"),

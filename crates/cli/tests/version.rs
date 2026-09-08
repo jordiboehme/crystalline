@@ -37,7 +37,7 @@ fn version_output_names_the_copyright_the_license_and_the_source() {
         format!("crystalline {}", env!("CARGO_PKG_VERSION"))
     );
     assert!(
-        lines[1].contains("Copyright (C) 2026 Jordi Boehme"),
+        lines[1].contains("Copyright (C) 2026 Jordi Böhme"),
         "second line names the copyright holder: {}",
         lines[1]
     );
