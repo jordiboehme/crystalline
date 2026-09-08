@@ -36,7 +36,8 @@ use tokio::sync::Mutex;
 
 /// A real temp-directory domain synced into an in-memory store, with
 /// `auth.mcp` set to `mcp_auth`, `auth.proxy_headers` to `proxy_headers`,
-/// `auth.oauth` to `oauth` and `auth.oidc.redirect_uri` to `redirect_uri`.
+/// `auth.oauth` to `oauth` - `None` included, which is the derived case - and
+/// `auth.oidc.redirect_uri` to `redirect_uri`.
 /// Modelled on the other service integration suites' engine builders; the
 /// response format is pinned to plain JSON so no assertion here has to account
 /// for TOON framing.
@@ -53,7 +54,7 @@ use tokio::sync::Mutex;
 async fn build_engine_with(
     mcp_auth: bool,
     proxy_headers: bool,
-    oauth: bool,
+    oauth: Option<bool>,
     redirect_uri: Option<&str>,
 ) -> (tempfile::TempDir, Arc<Engine>) {
     let tmp = tempfile::tempdir().unwrap();
@@ -75,10 +76,11 @@ async fn build_engine_with(
     cfg.auth = Some(AuthConfig {
         mcp: Some(mcp_auth),
         proxy_headers: proxy_headers.then_some(true),
-        // Explicit either way: with `mcp_auth` true an unset `auth.oauth`
-        // would derive back on, which every caller passing `oauth: false`
-        // here means as an actual off.
-        oauth: Some(oauth),
+        // Passed through as it arrives, tri-state and all: `Some(false)` is
+        // the explicit off every caller that is not about OAuth wants, since
+        // with `mcp_auth` true an unset value derives back on, and `None` is
+        // how the one test about that derivation asks for it.
+        oauth,
         oidc: redirect_uri.map(|uri| crystalline_core::config::OidcConfig {
             redirect_uri: Some(uri.to_string()),
             ..crystalline_core::config::OidcConfig::default()
@@ -105,14 +107,21 @@ async fn build_engine_with(
 async fn serve_with_mcp_auth(
     mcp_auth: bool,
 ) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
-    serve_with_mcp_auth_and(mcp_auth, false, false).await
+    serve_with_mcp_auth_and(mcp_auth, false, Some(false)).await
 }
 
 /// [`serve_with_mcp_auth`] with `auth.oauth` on beside the gate, which is the
 /// only combination the setting allows: the tokens OAuth issues are checked at
 /// that gate, so `auth.oauth` without `auth.mcp` refuses to start.
 async fn serve_with_oauth() -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
-    serve_with_mcp_auth_and(true, false, true).await
+    serve_with_mcp_auth_and(true, false, Some(true)).await
+}
+
+/// The instance an operator gets by turning `auth.mcp` on and nothing else:
+/// `auth.oauth` unset, so it follows `auth.mcp` where the UI is served, which
+/// is the shape `docs/deployment.md` recommends for a shared instance.
+async fn serve_with_derived_oauth() -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
+    serve_with_mcp_auth_and(true, false, None).await
 }
 
 /// [`serve_with_mcp_auth`] on an instance that also trusts the forward-auth
@@ -120,7 +129,7 @@ async fn serve_with_oauth() -> (std::net::SocketAddr, tempfile::TempDir, Arc<Aut
 async fn serve_with_mcp_auth_and(
     mcp_auth: bool,
     proxy_headers: bool,
-    oauth: bool,
+    oauth: Option<bool>,
 ) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
     serve_with(mcp_auth, proxy_headers, oauth, None).await
 }
@@ -130,7 +139,7 @@ async fn serve_with_mcp_auth_and(
 async fn serve_with(
     mcp_auth: bool,
     proxy_headers: bool,
-    oauth: bool,
+    oauth: Option<bool>,
     redirect_uri: Option<&str>,
 ) -> (std::net::SocketAddr, tempfile::TempDir, Arc<AuthStore>) {
     let (tmp, engine) = build_engine_with(mcp_auth, proxy_headers, oauth, redirect_uri).await;
@@ -2456,7 +2465,7 @@ async fn the_aggregate_origin_verbs_hide_a_private_team_domain_from_the_open_tie
 /// quartet is refused in the identical words a bare one is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proxy_headers_are_no_way_past_the_mcp_gate() {
-    let (addr, _tmp, _store) = serve_with_mcp_auth_and(true, true, false).await;
+    let (addr, _tmp, _store) = serve_with_mcp_auth_and(true, true, Some(false)).await;
     let refused = reqwest::Client::new()
         .post(format!("http://{addr}/"))
         .header("content-type", "application/json")
@@ -3181,6 +3190,33 @@ async fn with_oauth_on_the_refusal_points_at_the_resource_metadata() {
     );
 }
 
+/// **A followed `auth.oauth` answers the same challenge an explicit one does.**
+///
+/// The configuration `docs/deployment.md` recommends for a shared instance is
+/// `auth.mcp` on and nothing else, which leaves `auth.oauth` unset and derives
+/// it on. So the challenge that instance sends is the OAuth one, not the bare
+/// `Bearer` the token tier answers with, and the docs say so on the `auth.mcp`
+/// row as well as in the OAuth section.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_derived_oauth_value_answers_the_oauth_challenge() {
+    let (addr, _guard, _store) = serve_with_derived_oauth().await;
+    let refused = post_initialize(&addr, None).await;
+    assert_eq!(refused.status(), 401);
+    assert_eq!(
+        refused.headers()["www-authenticate"].to_str().unwrap(),
+        format!("Bearer resource_metadata=\"http://{addr}/.well-known/oauth-protected-resource\""),
+        "a derived value arms the same challenge an explicit true does"
+    );
+    drop(refused);
+
+    // And the document that challenge names is served, so the derivation
+    // reaches the well-known routes and the gate alike rather than one of
+    // them: a client told to read metadata that answers 404 is worse off than
+    // one that was never told about it.
+    let resource = get_with_accept(&addr, "/.well-known/oauth-protected-resource", None).await;
+    assert_eq!(resource.status(), 200);
+}
+
 /// **An OAuth access token is refused while `auth.oauth` is off**, and the
 /// personal token beside it still works.
 ///
@@ -3286,7 +3322,7 @@ async fn the_configured_public_address_is_the_resource_a_token_is_minted_for() {
     let (addr, _guard, store) = serve_with(
         true,
         false,
-        true,
+        Some(true),
         Some("https://knowledge.example/api/v1/auth/oidc/callback"),
     )
     .await;
