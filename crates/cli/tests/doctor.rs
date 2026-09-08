@@ -1569,3 +1569,65 @@ fn provisioning_section_honors_the_domain_filter() {
 
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// The other half of the colleague's report: running `sync` by hand on a
+/// domain holding an unparseable file used to print a normal-looking summary
+/// plus one `failed:` line and still exit 0, so nothing in an automated
+/// pipeline ever saw the partial failure. `doctor` already exits 1 on a
+/// problem and `verify` exits 2; a `sync` that silently succeeded was the
+/// outlier.
+#[test]
+fn sync_fails_the_process_when_a_file_could_not_be_indexed() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(
+        &domain_dir,
+        "bad.md",
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    );
+
+    let out = bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("added"),
+        "the summary line still prints before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("failed: "),
+        "the per-file failure line still prints: {stdout}"
+    );
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(
+        stderr.contains('1') && stderr.to_lowercase().contains("fail"),
+        "the process failure names the count: {stderr}"
+    );
+}
+
+/// A clean domain (nothing failed) still exits 0, so the new failure path
+/// only fires on an actual `failed` entry, never on an ordinary sync.
+#[test]
+fn sync_still_succeeds_when_nothing_failed() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(&domain_dir, "good.md", &engram("Good", "good"));
+
+    bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+}

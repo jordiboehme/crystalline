@@ -996,6 +996,26 @@ pub async fn sync(
         let store = store.lock().await;
         store.checkpoint_wal().await?;
     }
+
+    // A file that failed to read, parse or upsert is a real failure, not a
+    // shrug: `doctor` exits 1 on a problem and `verify` exits 2, so a sync
+    // that printed a `failed:` line and still exited 0 was the outlier, and a
+    // CI step piping through it could not see the partial failure at all.
+    // The full report (JSON included) has already printed above, so a
+    // `--json` consumer still gets the complete document before this fails
+    // the process.
+    let failed_count: usize = reports.iter().map(|r| r.failed.len()).sum();
+    if failed_count > 0 {
+        let domains: Vec<&str> = reports
+            .iter()
+            .filter(|r| !r.failed.is_empty())
+            .map(|r| r.domain.as_str())
+            .collect();
+        return Err(anyhow!(
+            "{failed_count} file(s) failed to sync in domain(s): {}",
+            domains.join(", ")
+        ));
+    }
     Ok(())
 }
 
