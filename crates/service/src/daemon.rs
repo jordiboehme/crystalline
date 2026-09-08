@@ -1287,6 +1287,19 @@ fn http_base(
     if oauth && !api {
         anyhow::bail!("auth.oauth needs service.api: its endpoints live under /api/v1");
     }
+    // `authorize` answers a redirect to `/authorize`, a Fluid route; with the
+    // embedded UI off, that address falls to the MCP transport instead
+    // (`ui_serving`'s own rule for every UI path once `service.ui` is off),
+    // and no consent can ever be given. Checked after the `service.api` guard
+    // above rather than folded into it: `ui_enabled()` is already false
+    // whenever `api` is, so that case is already caught there with the more
+    // specific word; this one is what catches `service.ui` turned off on its
+    // own, with the API still serving.
+    if oauth && !config.ui_enabled() {
+        anyhow::bail!(
+            "auth.oauth needs service.ui: authorize redirects to /authorize, and with the UI off that address falls to the MCP transport, where no consent can ever happen"
+        );
+    }
     // What this instance calls itself, resolved once with the other startup
     // settings: the audience the gate checks an OAuth access token against and
     // the origin the two well-known documents publish, which have to be one

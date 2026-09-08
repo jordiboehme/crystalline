@@ -35,6 +35,9 @@ struct AuthOptions {
     /// `service.api`: serve the JSON API under `/api/v1`. `None` leaves the
     /// default of on in place.
     api: Option<bool>,
+    /// `service.ui`: serve the embedded web UI. `None` leaves the default of
+    /// on in place.
+    ui: Option<bool>,
 }
 
 /// Build the same kind of engine the other service integration tests use: a
@@ -106,6 +109,7 @@ async fn build_engine_with(
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
         api: opts.api,
+        ui: opts.ui,
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -1484,6 +1488,32 @@ async fn oauth_without_api_refuses_the_http_endpoint() {
         .expect_err("a router must not be built with auth.oauth on and service.api off");
     let text = format!("{err:#}");
     assert!(text.contains("service.api"), "{text}");
+}
+
+/// `authorize` answers a redirect to the Fluid consent page at `/authorize`;
+/// with the embedded UI off, that address falls to the MCP transport instead
+/// and no consent can ever be given. Refused at startup, distinctly from the
+/// `service.api` case above: here the API is still on, only the UI is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_without_ui_refuses_the_http_endpoint() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            oauth: true,
+            ui: Some(false),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built with auth.oauth on and service.ui off");
+    let text = format!("{err:#}");
+    assert!(text.contains("service.ui"), "{text}");
 }
 
 /// Logout is a mutating request, so it carries the CSRF token the session was

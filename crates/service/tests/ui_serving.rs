@@ -115,6 +115,13 @@ async fn the_index_is_served_and_never_stored() {
          revalidate against it today: it is what nginx sends here too, and a \
          later decision to allow revalidation finds it already in place"
     );
+    assert_eq!(
+        header_of(&response, header::CONTENT_SECURITY_POLICY),
+        "frame-ancestors 'none'",
+        "the shell answers the OAuth consent screen too, and nothing may \
+         frame that page"
+    );
+    assert_eq!(header_of(&response, header::X_FRAME_OPTIONS), "DENY");
     assert!(
         body_of(response).await.contains("fixture-index-marker"),
         "the body is the embedded document, not a placeholder"
@@ -718,6 +725,33 @@ async fn the_root_serves_the_app_shell() {
     );
 }
 
+/// The one page in this product where a single click hands a client
+/// everything an account can do - the OAuth consent screen at `/authorize` -
+/// is this same shell, so a policy that unframes the shell has to reach it
+/// too, and this is what pins that it does rather than trusting the shared
+/// code path.
+#[tokio::test]
+async fn the_app_shell_refuses_to_be_framed() {
+    let server = serve_fixture().await;
+
+    for path in ["/", "/authorize"] {
+        let response = get_accepting(server.addr, path, BROWSER_ACCEPT).await;
+        assert_eq!(response.status(), 200, "{path}");
+        assert_eq!(
+            head(&response, header::CONTENT_SECURITY_POLICY),
+            "frame-ancestors 'none'",
+            "{path}: no origin, including this instance's own consent page \
+             reached another way, may frame the shell"
+        );
+        assert_eq!(
+            head(&response, header::X_FRAME_OPTIONS),
+            "DENY",
+            "{path}: the same rule for the browser that does not read the CSP \
+             directive"
+        );
+    }
+}
+
 #[tokio::test]
 async fn a_hashed_asset_is_immutable_and_revalidates() {
     let server = serve_fixture().await;
@@ -803,6 +837,7 @@ async fn every_browser_navigation_gets_the_app_shell() {
         "/nonsense",
         "/settings/github",
         "/graph",
+        "/authorize",
     ] {
         let response = get_accepting(server.addr, path, BROWSER_ACCEPT).await;
         assert_eq!(
