@@ -40,9 +40,10 @@ pub use error::{
 };
 pub use oauth::{
     AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
-    MAX_OAUTH_CLIENTS, OauthError, OauthServer, OriginRule, PROTECTED_RESOURCE_PATH, REGISTER_PATH,
-    REGISTRATION_BURST, REGISTRATION_WINDOW, RegistrationLimiter, TOKEN_PATH, redirect_matches,
-    redirect_uri_problem, resource_metadata_url, well_known_routes,
+    MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, OauthError, OauthServer, OriginRule,
+    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
+    RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
+    well_known_routes,
 };
 pub use oidc::{OidcClaims, OidcClient, OidcSettings};
 

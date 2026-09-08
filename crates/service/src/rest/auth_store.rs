@@ -838,20 +838,20 @@ pub const OAUTH_ACCESS_TTL_SECS: i64 = 3600;
 /// for a month has to ask its person again.
 pub const OAUTH_REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 
-/// How long a registration that HAS asked for an authorization is kept once it
-/// stops being used, in seconds. Thirty days from the last authorization
-/// request, so somebody's client between connections keeps its identity while
+/// How long a registration that HAS been authorized is kept once it stops
+/// being used, in seconds. Thirty days from the last authorization a person
+/// allowed, so somebody's client between connections keeps its identity while
 /// one nobody has used in a month is swept by
 /// [`AuthStore::prune_oauth_clients`]. A registration that holds a grant is
 /// never pruned, however old it is.
 pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
 
-/// How long a registration that never asked for an authorization is kept, in
-/// seconds. One hour, and the short clock is the point.
+/// How long a registration nobody has authorized is kept, in seconds. One
+/// hour, and the short clock is the point.
 ///
-/// The two ages measure different things. A row that never reached the
-/// authorize endpoint is the residue of a client that registered and walked
-/// away - or of an anonymous caller filling the table, which is the only way
+/// The two ages measure different things. A row nobody has authorized is the
+/// residue of a client that registered and walked away - or of an anonymous
+/// caller filling the table, which is the only way
 /// [`crate::rest::MAX_OAUTH_CLIENTS`] is ever reached, since registration is
 /// the one write nobody has to authenticate for. Keeping such a row for thirty
 /// days is exactly what would make that filling stick: the table would stay
@@ -859,6 +859,13 @@ pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
 /// hour is far longer than any client needs between registering and sending
 /// its person to consent, and short enough that a filled table drains by
 /// itself.
+///
+/// **"Authorized" means a person allowed it, not that a request arrived.** The
+/// authorize leg carries no identity and passes by construction for whoever
+/// owns the registration, so a clock that started on a request rather than on
+/// a decision would cost an attacker one extra call per row and buy back the
+/// whole thirty days. [`AuthStore::touch_oauth_client`] is where that line is
+/// drawn.
 pub const OAUTH_CLIENT_UNAUTHORIZED_SECS: i64 = 3600;
 
 /// What [`AuthStore::list_oauth_grants`] shows where a client name should be,
@@ -2570,10 +2577,22 @@ impl AuthStore {
         }))
     }
 
-    /// Stamp a registration as used, which every authorization request does.
-    /// That stamp is the whole input to [`AuthStore::prune_oauth_clients`]:
-    /// a client still asking for authorizations is a client in use, whether or
-    /// not anybody consented.
+    /// Record that a person AUTHORIZED this registration, which is the only
+    /// thing `last_used` means and the whole input to the long clock in
+    /// [`AuthStore::prune_oauth_clients`].
+    ///
+    /// **Call this when consent is allowed, and when a grant is issued or
+    /// refreshed for the client. Never on an authorization request.** The
+    /// authorize leg runs before anybody has signed in, and a caller that
+    /// registered a client is authorizing against its own row, so every check
+    /// there passes by construction: stamping on that request would let one
+    /// extra unauthenticated call per row move it onto the thirty-day branch,
+    /// which is exactly the fill-and-hold the one-hour clock exists to prevent
+    /// (see [`OAUTH_CLIENT_UNAUTHORIZED_SECS`]). Reading a registration is not
+    /// using it. The call sites are the consent endpoint's allow decision and
+    /// the token endpoint; nothing else in this file writes the column, and
+    /// `only_an_allowed_authorization_stamps_a_registration_as_used` is that
+    /// contract in executable form.
     ///
     /// A `client_id` that names no registration is a no-op rather than an
     /// error: the caller has already refused the request it was stamping for,
@@ -2632,14 +2651,17 @@ impl AuthStore {
     /// connected through is kept however old it is, because deleting it would
     /// leave live grants pointing at nothing.
     ///
-    /// **Two ages, decided by whether the client ever authorized.** A row that
-    /// has never been touched (`last_used IS NULL`, so it never reached the
-    /// authorize endpoint) is collected [`OAUTH_CLIENT_UNAUTHORIZED_SECS`]
-    /// after it was made; one that has authorized at least once is collected
-    /// [`OAUTH_CLIENT_UNUSED_SECS`] after its last authorization. See the two
-    /// constants for why they differ by that much: the short clock is what
+    /// **Two ages, decided by whether a person ever authorized the client.** A
+    /// row with `last_used IS NULL` - nobody has allowed it anything, whatever
+    /// requests it has made - is collected [`OAUTH_CLIENT_UNAUTHORIZED_SECS`]
+    /// after it was made; one that has been authorized at least once is
+    /// collected [`OAUTH_CLIENT_UNUSED_SECS`] after that last authorization.
+    /// See the two constants for why they differ by that much, and
+    /// [`AuthStore::touch_oauth_client`] for why the stamp follows a person's
+    /// decision rather than the arrival of a request: the short clock is what
     /// keeps a table filled by an anonymous caller from staying full for a
-    /// month.
+    /// month, and a clock keyed on requests would hand that month back for one
+    /// extra call per row.
     ///
     /// Every date compared here is RFC 3339 UTC written by this file, so byte
     /// order is time order - the same property
@@ -7591,7 +7613,7 @@ mod tests {
             .unwrap();
         assert!(
             touched.last_used.is_some(),
-            "an authorization request stamps the registration"
+            "an authorization a person allowed stamps the registration"
         );
         store
             .touch_oauth_client("coc_nobody")
@@ -7616,7 +7638,7 @@ mod tests {
     /// Registrations arrive one per fresh connection and nobody deletes them,
     /// so the store prunes the ones that never became a connection. A
     /// registration somebody is still connected through is never pruned, and
-    /// an authorization request buys another thirty days.
+    /// an authorization a person allowed buys another thirty days.
     #[tokio::test]
     async fn an_unused_registration_is_pruned_after_thirty_days() {
         let (_dir, store) = store().await;
@@ -7689,8 +7711,10 @@ mod tests {
             "the prune left the live connection alone"
         );
 
-        // An authorization request stamps `last_used`, and that is what keeps
-        // an old registration alive for another thirty days.
+        // An authorization somebody allowed stamps `last_used`, and that is
+        // what keeps an old registration alive for another thirty days. Nothing
+        // an unauthenticated request does reaches this column: see
+        // `only_an_allowed_authorization_stamps_a_registration_as_used`.
         store
             .conn
             .execute(
@@ -7707,8 +7731,98 @@ mod tests {
         assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
     }
 
-    /// **A registration that never asked for an authorization expires within
-    /// the hour**, and only one that did gets the thirty days.
+    /// **Reading a registration is not using it**: only an authorization that
+    /// a person actually allowed moves a row off the one-hour clock.
+    ///
+    /// The distinction is the whole of why the short clock works. Everything an
+    /// authorization *request* does to a registration is read it - look it up
+    /// by the id the caller named, compare the redirect uri it presented - and
+    /// that request carries no identity: the person has not signed in yet, and
+    /// a caller that registered the client is authorizing against its own row,
+    /// so every check on that leg passes by construction. If reading stamped
+    /// `last_used`, one extra unauthenticated request per row would move it to
+    /// the thirty-day branch, and the fill-and-hold the short clock exists to
+    /// prevent would be back at the cost of one GET.
+    ///
+    /// So [`AuthStore::touch_oauth_client`] is called when consent is ALLOWED
+    /// and when a grant is issued or refreshed, never on the authorize request,
+    /// and nothing else in this file writes that column. This test is the
+    /// contract in executable form for the two tasks that hold those call
+    /// sites.
+    #[tokio::test]
+    async fn only_an_allowed_authorization_stamps_a_registration_as_used() {
+        let (_dir, store) = store().await;
+        let client = store
+            .register_oauth_client("Asker", None, &["https://asker.example/cb".to_string()])
+            .await
+            .unwrap();
+        assert!(client.last_used.is_none());
+
+        // Everything the authorize leg does to the row before a person has
+        // decided anything, twice over.
+        for _ in 0..2 {
+            let read = store
+                .oauth_client(&client.client_id)
+                .await
+                .unwrap()
+                .expect("the registration reads back");
+            assert!(
+                read.last_used.is_none(),
+                "reading a registration never stamps it"
+            );
+        }
+
+        // Two hours later that row is still on the short clock, because
+        // nothing it has been through counts as an authorization.
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(client.client_id.clone()),
+                    Value::Text(two_hours_ago.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "an hour of being asked about is not an hour of being used"
+        );
+
+        // The same row, with the one thing that does count: a person allowed
+        // it, which is what the consent endpoint stamps.
+        let allowed = store
+            .register_oauth_client("Allowed", None, &["https://allowed.example/cb".to_string()])
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(allowed.client_id.clone()),
+                    Value::Text(two_hours_ago),
+                ],
+            )
+            .await
+            .unwrap();
+        store.touch_oauth_client(&allowed.client_id).await.unwrap();
+        assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
+        assert!(
+            store
+                .oauth_client(&allowed.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "an allowed authorization buys the thirty days"
+        );
+    }
+
+    /// **A registration nobody ever authorized expires within the hour**, and
+    /// only one somebody did gets the thirty days.
     ///
     /// The two clocks exist because the two rows mean different things. A row
     /// that never reached the authorize endpoint is the residue of a client
@@ -7779,7 +7893,7 @@ mod tests {
         assert_eq!(
             store.prune_oauth_clients().await.unwrap(),
             1,
-            "only the registration that never authorized and holds nothing goes"
+            "only the registration nobody authorized, holding nothing, goes"
         );
         assert!(
             store
@@ -7794,7 +7908,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_some(),
-            "a registration that asked for an authorization gets the thirty days"
+            "a registration somebody authorized gets the thirty days"
         );
         assert!(
             store

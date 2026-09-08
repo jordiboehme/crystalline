@@ -204,7 +204,7 @@ const AUTH_METHOD_NONE: &str = "none";
 /// time [`RegistrationLimiter::admit`] runs the body has been buffered and put
 /// through serde already. The largest registration the rules here allow is ten
 /// [`MAX_URI_LEN`] uris beside a [`MAX_CLIENT_NAME_CHARS`] name, so this is
-/// room to spare for anything legitimate and a thousandth of what an anonymous
+/// room to spare for anything legitimate and a 160th of what an anonymous
 /// caller could otherwise make this process parse.
 pub const MAX_REGISTER_BYTES: usize = 64 * 1024;
 

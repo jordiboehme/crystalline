@@ -131,8 +131,8 @@ const PUBLIC_PATHS: [&str; 9] = [
     super::oidc::PROVIDERS_PATH,
     // A client registers itself before anybody has signed in anywhere, so
     // there is no identity it could carry here. What bounds it instead is a
-    // burst limit, a ceiling and a prune, none of which need a caller to be
-    // anybody. See `super::oauth::register`.
+    // body limit of its own, a burst limit, a ceiling and a prune, none of
+    // which need a caller to be anybody. See `super::oauth::register`.
     super::oauth::REGISTER_PATH,
     // And a client sends a browser here before that browser has signed in
     // anywhere either - the consent screen it redirects to is what needs an

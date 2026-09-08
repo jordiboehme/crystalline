@@ -1952,7 +1952,11 @@ impl OidcClaims {
 /// stored. A provider is trusted to assert who somebody is, not to write
 /// direction changes into an admin's table. Every other character the provider
 /// sends survives, including every script: this removes control and formatting
-/// codepoints, never letters.
+/// codepoints, never letters. The set is every Cc, the bidi marks and
+/// overrides (U+061C with U+200E and U+200F, U+202A..U+202E, U+2066..U+2069),
+/// the invisible joiners and spaces (U+00AD, U+200B..U+200D, U+2060..U+206F,
+/// U+FEFF) and the two separators that are line breaks without being Cc
+/// (U+2028, U+2029).
 ///
 /// `pub(super)` because the OAuth registration endpoint holds text of exactly
 /// the same kind: a client's own name, chosen by whoever registered it and
@@ -1962,12 +1966,15 @@ pub(super) fn presentation_text(value: &str) -> Option<String> {
     let cleaned: String = value
         .chars()
         .filter(|ch| {
-            // Cc, plus the Cf ranges that reorder or hide what follows them.
+            // Cc, plus the Cf ranges that reorder or hide what follows them,
+            // plus the two separators that are line breaks without being Cc.
             !ch.is_control()
                 && !matches!(
                     ch,
                     '\u{00ad}'
+                        | '\u{061c}'
                         | '\u{200b}'..='\u{200f}'
+                        | '\u{2028}'..='\u{2029}'
                         | '\u{202a}'..='\u{202e}'
                         | '\u{2060}'..='\u{206f}'
                         | '\u{feff}'
@@ -2947,6 +2954,16 @@ mod tests {
             "a claim of nothing but formatting is a claim of nothing"
         );
         assert_eq!(presentation_text("   ").as_deref(), None);
+        assert_eq!(
+            presentation_text("Ada\u{61c}Lovelace").as_deref(),
+            Some("AdaLovelace"),
+            "the arabic letter mark bends direction like the marks beside it"
+        );
+        assert_eq!(
+            presentation_text("Ada\u{2028}Lovelace\u{2029}").as_deref(),
+            Some("AdaLovelace"),
+            "a line or paragraph separator is a line break that Cc does not catch"
+        );
         for kept in ["Ada Lovelace", "Ада Лавлейс", "愛達", "josé", "\u{3a9}"] {
             assert_eq!(
                 presentation_text(kept).as_deref(),

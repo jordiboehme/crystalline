@@ -25,7 +25,9 @@ use crystalline_core::config::{
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
-use crystalline_service::rest::{AuthStore, REGISTRATION_BURST, Role, redirect_matches};
+use crystalline_service::rest::{
+    AuthStore, MAX_REGISTER_BYTES, REGISTRATION_BURST, Role, redirect_matches,
+};
 use serde_json::{Value, json};
 
 /// The password every account in this suite is created with. Long enough for
@@ -732,8 +734,11 @@ async fn registrations_are_rate_limited_per_window() {
         "the refused registration stored nothing"
     );
 
-    // A request the limiter turned away costs the caller nothing else: the
-    // body is not even read, so a malformed one gets the same answer.
+    // A request the limiter turned away is not looked at any further: the
+    // metadata is never checked and the store is never touched, so a malformed
+    // body gets the same answer a well formed one does. (The body itself has
+    // been read by then - axum resolves extractors before the handler runs -
+    // which is what the route's own body limit is for.)
     let refused = ctx
         .register(json!({ "redirect_uris": ["http://evil.test/cb"] }))
         .await;
@@ -888,6 +893,30 @@ async fn a_body_that_is_not_the_client_metadata_is_an_invalid_request() {
         .await
         .unwrap();
     assert_oauth_error(malformed, 400, "invalid_request").await;
+
+    // Oversize is the same failure, and asserting it is what pins two things
+    // that are otherwise only true by a chain of defaults: that this route's
+    // limit is its own 64 KiB rather than the mount's ten megabytes, and that
+    // exceeding it reaches the client as RFC 7591 JSON rather than as the
+    // plain-text 413 a body-limit layer would answer on its own.
+    let oversize = ctx
+        .client
+        .post(ctx.url("/oauth/register"))
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body("x".repeat(MAX_REGISTER_BYTES + 1))
+        .send()
+        .await
+        .unwrap();
+    assert_oauth_error(oversize, 400, "invalid_request").await;
+    // And a body under the route's limit but over what a registration may
+    // hold is refused by the rules rather than by the limit.
+    let large = ctx
+        .register(json!({
+            "redirect_uris": [HOSTED_REDIRECT],
+            "client_name": "x".repeat(MAX_REGISTER_BYTES / 2),
+        }))
+        .await;
+    assert_oauth_error(large, 400, "invalid_client_metadata").await;
 
     // A member of the right name and the wrong type is the same failure: it
     // never reaches the metadata checks, so it cannot be told apart from a
