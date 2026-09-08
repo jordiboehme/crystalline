@@ -198,6 +198,10 @@ async fn serve_personal_share_with_mcp_auth()
         }),
         auth: Some(AuthConfig {
             mcp: Some(true),
+            // Explicit off: with `auth.mcp` on and the UI at its default an
+            // unset `auth.oauth` derives back on, and this fixture is about
+            // the personal-token tier alone.
+            oauth: Some(false),
             ..AuthConfig::default()
         }),
         ..GlobalConfig::default()
@@ -1303,6 +1307,10 @@ async fn mcp_ctx_with(mcp_auth: bool, fault: bool, team: bool) -> VisibilityCtx 
     });
     cfg.auth = Some(AuthConfig {
         mcp: Some(mcp_auth),
+        // Explicit off, for [`serve_personal_share_with_mcp_auth`]'s reason:
+        // every test on this fixture is about which domains a token tier
+        // sees, and none of them wants an OAuth surface mounted beside it.
+        oauth: Some(false),
         ..AuthConfig::default()
     });
     let config_path = root.join("config.yaml");
