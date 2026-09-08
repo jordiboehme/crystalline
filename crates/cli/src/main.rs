@@ -1267,6 +1267,10 @@ enum OriginCommand {
         /// Report only this domain instead of every team domain.
         #[arg(long)]
         domain: Option<String>,
+        /// Name the unshared files under each domain, grouped as added,
+        /// modified and deleted, instead of only counting them.
+        #[arg(long)]
+        files: bool,
         /// Load the global config from this file instead of the default path.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -2033,15 +2037,23 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
             print_origin_update(&data, json);
             Ok(())
         }
-        OriginCommand::Status { domain, config } => {
+        OriginCommand::Status {
+            domain,
+            files,
+            config,
+        } => {
+            // Detail is asked for whatever `--files` says, because the always
+            // printed ahead line names the change kinds: "2 local change(s)"
+            // reads as two things you added, and both can be deletions. The
+            // flag decides whether the paths themselves are listed under it.
             let data = crystalline_service::origin_status(
                 domain.as_deref(),
-                false,
+                true,
                 db.as_deref(),
                 config.as_deref(),
             )
             .await?;
-            print_origin_status(&data, json);
+            print_origin_status(&data, files, json);
             Ok(())
         }
         OriginCommand::Share {
@@ -2200,13 +2212,86 @@ fn shared_by(proposal: &serde_json::Value) -> String {
 /// chain's own standing (see below), unresolved conflicts and when it was
 /// last checked, then one line per domain that genuinely failed to report.
 ///
+/// The ahead line names the kinds of change it counts (see [`ahead_line`]),
+/// and `files` adds the paths themselves under it (see
+/// [`unshared_file_lines`]).
+///
 /// Open proposals arrive in chain order, bottom layer first, and are labelled
 /// `layer k:` only while more than one is open: a lone proposal stands in no
 /// chain, so it renders exactly as it always did. The three chain lines below
 /// them each name something a caller can act on - a declined layer still
 /// carrying open work above it, a link the forge never got, a repair the next
 /// share or withdraw finishes - and stay silent otherwise.
-fn print_origin_status(data: &serde_json::Value, json: bool) {
+/// The always-printed ahead line for one domain entry, indented as it prints:
+/// how much unshared work the domain holds and, unless it is all additions,
+/// what kind of work it is.
+///
+/// A bare "ahead: 2 local change(s)" reads as two things you wrote, and both
+/// can be deletions - somebody can share believing they publish two notes
+/// while proposing to remove two files from the team's repository. So the
+/// kinds are named whenever the set is not purely additions, whether or not
+/// `--files` was asked for. A set that is only additions keeps the short form,
+/// because there the plain reading is the true one.
+///
+/// The breakdown comes from the entry's `detail` block, which the CLI always
+/// asks for. Without it (a daemon from before detail existed, or a working
+/// tree that could not be walked) the line degrades to the bare count rather
+/// than guessing at kinds.
+fn ahead_line(d: &serde_json::Value) -> String {
+    let total = d["local_changes"].as_u64().unwrap_or(0);
+    let kinds: Vec<String> = ["added", "modified", "deleted"]
+        .iter()
+        .filter_map(|kind| {
+            let count = d["detail"][*kind].as_array()?.len();
+            (count > 0).then(|| format!("{count} {kind}"))
+        })
+        .collect();
+    let only_additions = kinds.len() == 1 && kinds[0].ends_with(" added");
+    if total == 0 || kinds.is_empty() || only_additions {
+        return format!("  ahead: {total} local change(s)");
+    }
+    format!("  ahead: {total} local change(s) ({})", kinds.join(", "))
+}
+
+/// The `--files` block under one domain: the unshared paths grouped by what
+/// happened to each, then the folder listings that ride along as one quiet
+/// line, because a refreshed listing is derived from the files beside it and
+/// says nothing on its own.
+///
+/// Empty when the domain owes its origin nothing, listings included: a
+/// refreshed listing rides along with a share, so with nothing to share there
+/// is nothing for it to ride along with and the block says nothing at all. A
+/// domain whose working tree could not be walked says so instead of printing
+/// an empty group, which would read as "nothing to share".
+fn unshared_file_lines(d: &serde_json::Value) -> Vec<String> {
+    let Some(detail) = d.get("detail").filter(|v| v.is_object()) else {
+        return vec!["  unshared files: unknown (the working tree could not be read)".to_string()];
+    };
+    let mut lines = Vec::new();
+    for kind in ["added", "modified", "deleted"] {
+        let paths = detail[kind].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if paths.is_empty() {
+            continue;
+        }
+        lines.push(format!("    {kind}:"));
+        for path in paths {
+            lines.push(format!("      {}", path.as_str().unwrap_or("")));
+        }
+    }
+    if lines.is_empty() {
+        return lines;
+    }
+    let indexes = detail["generated_indexes"].as_u64().unwrap_or(0);
+    if indexes > 0 {
+        lines.push(format!(
+            "    plus {indexes} generated folder listing(s) riding along"
+        ));
+    }
+    lines.insert(0, "  unshared files:".to_string());
+    lines
+}
+
+fn print_origin_status(data: &serde_json::Value, files: bool, json: bool) {
     if json {
         print_value(data, true);
         return;
@@ -2254,10 +2339,12 @@ fn print_origin_status(data: &serde_json::Value, json: bool) {
         let repo = d["repo"].as_str().unwrap_or("");
         let branch = d["branch"].as_str().unwrap_or("");
         println!("{name}: {repo}@{branch}");
-        println!(
-            "  ahead: {} local change(s)",
-            d["local_changes"].as_u64().unwrap_or(0)
-        );
+        println!("{}", ahead_line(d));
+        if files {
+            for line in unshared_file_lines(d) {
+                println!("{line}");
+            }
+        }
         println!(
             "  behind: {}",
             match d["behind"].as_bool() {
@@ -3530,5 +3617,118 @@ fn to_core_format(f: OutputFormat) -> verify::Format {
         OutputFormat::Human => verify::Format::Human,
         OutputFormat::Json => verify::Format::Json,
         OutputFormat::Github => verify::Format::Github,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    /// One domain entry as `origin status` receives it, carrying the detail
+    /// block the CLI always asks for.
+    fn entry(added: &[&str], modified: &[&str], deleted: &[&str], indexes: u64) -> Value {
+        json!({
+            "domain": "advisor",
+            "local_changes": added.len() + modified.len() + deleted.len(),
+            "detail": {
+                "added": added,
+                "modified": modified,
+                "deleted": deleted,
+                "generated_indexes": indexes,
+            },
+        })
+    }
+
+    /// The line that misled a reader: two deletions counted as "2 local
+    /// change(s)" read as two notes somebody wrote, when sharing them would
+    /// propose removing two files from the team's repository.
+    #[test]
+    fn the_ahead_line_says_when_the_changes_are_deletions() {
+        let all_deleted = entry(
+            &[],
+            &[],
+            &["CustomHeaderModule.md", "Sysimage Store (AS-2465).md"],
+            12,
+        );
+        assert_eq!(
+            ahead_line(&all_deleted),
+            "  ahead: 2 local change(s) (2 deleted)"
+        );
+    }
+
+    /// A mixed set names every kind in it, in the order a share reports them.
+    #[test]
+    fn the_ahead_line_breaks_a_mixed_set_down_by_kind() {
+        let mixed = entry(&["notes/new.md"], &["notes/edit.md"], &["notes/gone.md"], 3);
+        assert_eq!(
+            ahead_line(&mixed),
+            "  ahead: 3 local change(s) (1 added, 1 modified, 1 deleted)"
+        );
+    }
+
+    /// Nothing unshared, and a set that really is only additions: both keep
+    /// the short form, because there the plain reading is the true one.
+    #[test]
+    fn the_ahead_line_stays_short_for_an_empty_set_and_for_additions() {
+        assert_eq!(
+            ahead_line(&entry(&[], &[], &[], 0)),
+            "  ahead: 0 local change(s)"
+        );
+        assert_eq!(
+            ahead_line(&entry(&["a.md", "b.md"], &[], &[], 4)),
+            "  ahead: 2 local change(s)"
+        );
+    }
+
+    /// A payload with no detail block - a daemon from before it existed, or a
+    /// working tree that could not be walked - degrades to the bare count
+    /// rather than inventing kinds for it.
+    #[test]
+    fn the_ahead_line_degrades_to_the_bare_count_without_detail() {
+        assert_eq!(
+            ahead_line(&json!({ "domain": "advisor", "local_changes": 2 })),
+            "  ahead: 2 local change(s)"
+        );
+    }
+
+    /// `--files` names each path under its own kind and draws the folder
+    /// listings as one line, never among the engrams.
+    #[test]
+    fn the_files_block_groups_the_paths_and_keeps_the_listings_apart() {
+        let mixed = entry(
+            &["notes/new.md"],
+            &[],
+            &["CustomHeaderModule.md", "Sysimage Store (AS-2465).md"],
+            12,
+        );
+        assert_eq!(
+            unshared_file_lines(&mixed),
+            vec![
+                "  unshared files:",
+                "    added:",
+                "      notes/new.md",
+                "    deleted:",
+                "      CustomHeaderModule.md",
+                "      Sysimage Store (AS-2465).md",
+                "    plus 12 generated folder listing(s) riding along",
+            ]
+        );
+    }
+
+    /// A domain that owes its origin nothing prints nothing; one whose tree
+    /// could not be read says so, because an empty block would read as
+    /// "nothing to share".
+    #[test]
+    fn the_files_block_tells_nothing_unshared_from_nothing_known() {
+        assert!(unshared_file_lines(&entry(&[], &[], &[], 0)).is_empty());
+        assert!(
+            unshared_file_lines(&entry(&[], &[], &[], 12)).is_empty(),
+            "listings ride along with a share, so with nothing to share they are not a block"
+        );
+        assert_eq!(
+            unshared_file_lines(&json!({ "domain": "advisor", "local_changes": 2 })),
+            vec!["  unshared files: unknown (the working tree could not be read)"]
+        );
     }
 }

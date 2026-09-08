@@ -389,7 +389,7 @@ crystalline domain add design --origin acme/design-knowledge --branch main
 
 From there, `crystalline origin` covers the team domain lifecycle:
 
-- **`origin status [--domain <name>]`** - where a team domain stands: ahead, behind, open and declined proposals, unresolved conflicts, and which GitHub identity this machine reads and shares as.
+- **`origin status [--domain <name>] [--files]`** - where a team domain stands: ahead (by change kind, so deletions never read as new notes), behind, open and declined proposals, unresolved conflicts, and which GitHub identity this machine reads and shares as. `--files` names the unshared paths under each domain instead of only counting them.
 - **`origin update [--domain <name>]`** - bring a team domain (or every one) up to date with what the team has merged.
 - **`origin share <name> [--title <t>] [--message <m>] [--proposal <n>] [--file <path>]`** - share local changes as a proposal the team reviews on GitHub; refuses while a conflict is unresolved so the team always reviews a clean proposal. Sharing again while a proposal is open stacks a new proposal on top of it, `--proposal <n>` amends that layer instead, and `--file` (repeatable) shares only the paths you name.
 - **`origin resolve <name> <path> --keep mine|theirs`** (or `--content-file <f>` for a hand-merged result) - settle a flagged conflict.
