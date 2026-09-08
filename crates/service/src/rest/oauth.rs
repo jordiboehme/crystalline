@@ -347,21 +347,27 @@ pub fn well_known_routes(oauth: Option<OriginRule>) -> Router {
 }
 
 /// `GET /.well-known/oauth-protected-resource`.
+///
+/// Never stored, like every other auth-shaped answer here: what these documents
+/// say depends on the request's own `Host` unless an origin is configured, so a
+/// cache in front of this instance holding one answer would hand a client the
+/// wrong instance's endpoints and the wrong audience to ask a token for.
 async fn protected_resource(
     State(oauth): State<Option<OriginRule>>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(NoStore, Json<Value>), ApiError> {
     let origin = enabled(&oauth)?.origin(&headers)?;
-    Ok(Json(protected_resource_document(&origin)))
+    Ok((no_store(), Json(protected_resource_document(&origin))))
 }
 
-/// `GET /.well-known/oauth-authorization-server`.
+/// `GET /.well-known/oauth-authorization-server`. Never stored, for
+/// [`protected_resource`]'s reason.
 async fn authorization_server(
     State(oauth): State<Option<OriginRule>>,
     headers: HeaderMap,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<(NoStore, Json<Value>), ApiError> {
     let origin = enabled(&oauth)?.origin(&headers)?;
-    Ok(Json(authorization_server_document(&origin)))
+    Ok((no_store(), Json(authorization_server_document(&origin))))
 }
 
 /// The rule, or the refusal for an instance that serves no OAuth.
@@ -1611,6 +1617,35 @@ mod tests {
             "application/problem+json",
             "an instance that serves no OAuth is not answering an OAuth failure"
         );
+    }
+
+    /// **Neither document is ever cached.**
+    ///
+    /// Both are a function of the request's own `Host` unless an origin is
+    /// configured, so one stored answer in front of an instance reached by two
+    /// names would hand a client the other name's endpoints - and the resource
+    /// identifier a token is minted for with them, which is the audience the
+    /// gate then refuses.
+    #[tokio::test]
+    async fn neither_well_known_document_is_ever_stored() {
+        let rule = Some(OriginRule::from_config(&config_with(None)));
+        let headers = headers_with("127.0.0.1:7411", None);
+        for answer in [
+            protected_resource(State(rule.clone()), headers.clone())
+                .await
+                .unwrap()
+                .into_response(),
+            authorization_server(State(rule), headers)
+                .await
+                .unwrap()
+                .into_response(),
+        ] {
+            assert_eq!(
+                answer.headers().get(header::CACHE_CONTROL).unwrap(),
+                "no-store",
+                "a discovery document follows the request it answered"
+            );
+        }
     }
 
     /// With the setting off there is no rule to answer with, and the refusal
