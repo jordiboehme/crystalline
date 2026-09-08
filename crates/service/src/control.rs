@@ -3,7 +3,7 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, tool, configure, origin_add, origin_update, origin_status,
+//! file_stamps, sessions, tool, configure, origin_add, origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
 //! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -115,6 +115,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     maybe_embed(shared, embed, &mut data).await;
                     (envelope_ok(data), false)
                 }
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // The recorded file stamps of one named domain, or of every registered
+        // file domain when none is named. Served from this daemon's own open
+        // store, so a caller that needs to read the index while the daemon
+        // holds the file never has to open it a second time: that is the
+        // collision `crystalline doctor` used to die on.
+        "file_stamps" => {
+            let domain = req.get("domain").and_then(Value::as_str);
+            match shared.engine.domain_file_stamps(domain).await {
+                Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }

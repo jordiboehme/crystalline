@@ -1942,16 +1942,7 @@ impl Engine {
     /// starts watching its root without a restart. A virtual domain has no root,
     /// so it is cached but never watched.
     fn refresh_domain(&self, name: &str) -> Option<DomainEntry> {
-        // Re-read the same file this engine persists to (its `--config`
-        // override, else the default global path) and layer the overlay back
-        // on, so a post-startup re-read sees the same effective config a fresh
-        // load would, environment overrides included.
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => crystalline_core::config::global_config_path().ok()?,
-        };
-        let file = overlay::load_file(&path).ok()?;
-        let fresh = self.overlay.apply(&file);
+        let fresh = self.reread_config()?;
         let entry = fresh.domains.get(name)?.clone();
         self.discovered_domains
             .write()
@@ -1964,6 +1955,65 @@ impl Engine {
             let _ = tx.send(WatchEvent::Add(name.to_string(), root));
         }
         Some(entry)
+    }
+
+    /// The effective config as the file has it right now: the same file this
+    /// engine persists to (its `--config` override, else the default global
+    /// path) with the environment overlay layered back on, so a post-startup
+    /// re-read sees what a fresh load would, environment overrides included.
+    /// `None` when the path cannot be resolved or the file cannot be read.
+    ///
+    /// Shared by [`Engine::refresh_domain`], which caches what it finds and
+    /// arms a watch for it, and [`Engine::diagnostic_file_domains`], which
+    /// deliberately does neither. Keep the two together: they read the same
+    /// file the same way and only differ in what they do with the answer.
+    fn reread_config(&self) -> Option<GlobalConfig> {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => crystalline_core::config::global_config_path().ok()?,
+        };
+        let file = overlay::load_file(&path).ok()?;
+        Some(self.overlay.apply(&file))
+    }
+
+    /// The file domains a diagnostic read covers, as `(name, root)` pairs:
+    /// everything [`Engine::sync_targets`] would sync, plus every file domain
+    /// the config file names right now, so a domain registered after this
+    /// daemon started is diagnosed rather than reported as entirely
+    /// unindexed. `only` narrows the set to one domain; naming a virtual
+    /// domain is an empty answer (a virtual domain has no files to stamp),
+    /// and naming a domain nobody registered is an error.
+    ///
+    /// Deliberately not routed through [`Engine::domain_entry`]: that path
+    /// ends in [`Engine::refresh_domain`], which caches the hit and arms a
+    /// watch, so merely diagnosing a domain would start indexing it and the
+    /// "not indexed yet" a report just printed would quietly fix itself
+    /// behind the reader's back. A diagnosis only reads.
+    fn diagnostic_file_domains(&self, only: Option<&str>) -> Result<Vec<(String, PathBuf)>> {
+        let mut targets = self.sync_targets(None)?;
+        let fresh = self.reread_config();
+        if let Some(fresh) = &fresh {
+            for (name, entry) in &fresh.domains {
+                if targets.iter().any(|(n, _)| n == name) {
+                    continue;
+                }
+                if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
+                    targets.push((name.clone(), root));
+                }
+            }
+        }
+        if let Some(name) = only {
+            let registered = self.known_domain_names().iter().any(|n| n == name)
+                || fresh.is_some_and(|c| c.domains.contains_key(name));
+            if !registered {
+                return Err(EngineError::UnknownDomain {
+                    domain: name.to_string(),
+                    registered: self.known_domain_names(),
+                });
+            }
+            targets.retain(|(n, _)| n == name);
+        }
+        Ok(targets)
     }
 
     /// Every domain name this engine currently knows about: the startup
@@ -8708,6 +8758,41 @@ impl Engine {
                 Ok(targets)
             }
         }
+    }
+
+    /// The recorded file stamps of one or every registered file domain, keyed
+    /// by domain name and then by domain-relative path: what a caller
+    /// compares the files on disk against to tell an indexed file from one
+    /// the index has never seen. `crystalline doctor`'s orphan and unindexed
+    /// checks read it over ctl, since this daemon holds the index file itself
+    /// and a second opener would only collide with it.
+    ///
+    /// A store read, not a pure one: it upserts each domain row exactly as
+    /// [`Engine::sync_take_over`] does, because stamps are keyed by domain id
+    /// and a domain nobody has synced yet has no row to read. Nothing about
+    /// what this daemon watches, syncs or caches changes here (see
+    /// [`Engine::diagnostic_file_domains`]).
+    ///
+    /// Each entry carries the engram's mtime, size and checksum, more than a
+    /// presence check needs, because a stamp is what the index records: a
+    /// caller comparing content rather than presence should not need a second
+    /// verb for it.
+    pub async fn domain_file_stamps(&self, only: Option<&str>) -> Result<Value> {
+        let targets = self.diagnostic_file_domains(only)?;
+        let mut domains = serde_json::Map::new();
+        let store = self.store.lock().await;
+        for (name, root) in &targets {
+            let domain = store
+                .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                .await?;
+            let stamps = store.file_stamps(domain).await?;
+            domains.insert(
+                name.clone(),
+                serde_json::to_value(&stamps).unwrap_or(Value::Null),
+            );
+        }
+        drop(store);
+        Ok(json!({ "domains": Value::Object(domains) }))
     }
 
     /// Diagnostics for ctl `status`: per-domain stats, embedding coverage and the

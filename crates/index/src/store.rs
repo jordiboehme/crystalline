@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 pub use crystalline_core::config::DomainKind;
 use crystalline_core::{Engram, slugify};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::sweep::UnresolvedRef;
@@ -35,7 +35,11 @@ pub struct EngramId(pub i64);
 
 /// The recorded file identity used by the sync prefilter: modification time and
 /// size are the cheap comparison, the SHA-256 is the authoritative one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because the daemon serves a domain's stamps over the ctl
+/// `file_stamps` command, which is how `crystalline doctor` reads the index
+/// while the daemon holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStamp {
     /// Modification time in whole seconds since the Unix epoch.
     pub mtime: i64,
