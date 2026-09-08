@@ -697,6 +697,64 @@ fn sync_over_a_running_daemon_fails_when_a_file_could_not_be_indexed() {
     let _ = env.run(&["ctl", "shutdown"]);
 }
 
+/// The other failure class the daemon path used to ignore entirely: not one
+/// file with broken frontmatter, but a whole domain `Engine::sync_take_over`
+/// could not scan at all - it logs a warning, records `{"domain", "error"}`
+/// in the response's top-level `failed` array and moves on to the next
+/// domain, rather than aborting the sweep. That per-domain record rode in
+/// the ctl envelope exactly like a per-file one, so a daemon-routed sync
+/// with one unscannable domain among several still exited 0. A missing
+/// directory is the easy way to trigger it: `scan_domain` errors loudly the
+/// moment its walk root itself cannot be read (see its own comment), and a
+/// removed directory hits that same branch as a permission error would.
+#[test]
+fn sync_over_a_running_daemon_fails_when_a_domain_could_not_be_scanned() {
+    let env = Env::new("scanfail");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // Registered while the daemon is up, exactly like the sibling
+    // `domain_add_while_daemon_running_...` test, so this domain is fully
+    // synced and known-good before its directory disappears out from under
+    // it.
+    env.setup_domain("broken");
+    std::fs::remove_dir_all(env.dir.join("kb-broken")).unwrap();
+
+    // No `--domain` filter: `Engine::sync_take_over` only soft-skips a
+    // domain whose scan failed when sweeping everything (`only.is_none()`);
+    // naming one domain that fails would abort with a plain error instead,
+    // which is not the shape this bug needs (multiple domains, one bad).
+    let (ok, stdout, stderr) = env.run_full(&["sync"]);
+    assert!(
+        !ok,
+        "a domain that could not be scanned at all must fail the process, not exit 0: stdout={stdout} stderr={stderr}"
+    );
+    // The full report still prints before the failure, "eng" included, so a
+    // healthy domain's result is never hidden by a sibling's failure.
+    assert!(
+        stdout.contains("\"eng\""),
+        "eng's own report still prints: {stdout}"
+    );
+    assert!(
+        stdout.contains("broken"),
+        "the daemon's failed-domains array still names it: {stdout}"
+    );
+    assert!(
+        stderr.contains("could not be scanned") && stderr.contains("broken"),
+        "the failure names the domain and says it could not be scanned, not that a file failed to parse: {stderr}"
+    );
+    assert!(
+        !stderr.contains("file(s) failed to sync"),
+        "the wrong failure class must not be claimed - no file parse failure happened here: {stderr}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
 /// The domain names in a `list_domains` result value.
 fn domain_names(value: &Value) -> Vec<String> {
     value["domains"]

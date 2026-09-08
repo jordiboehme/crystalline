@@ -1003,34 +1003,59 @@ pub async fn sync(
     // CI step piping through it could not see the partial failure at all.
     // The full report (JSON included) has already printed above, so a
     // `--json` consumer still gets the complete document before this fails
-    // the process.
-    if let Some(err) = sync_failure(&reports) {
+    // the process. The direct path has no equivalent of a whole domain
+    // skipped by a scan error: `scan_domain` above is called with `?`, so
+    // that class already aborts the whole command immediately rather than
+    // being collected here - `scan_failed` is always empty on this path, and
+    // only the daemon-routed path in `sync_dispatch` (`main.rs`) passes one.
+    if let Some(err) = sync_failure(&reports, &[]) {
         return Err(err);
     }
     Ok(())
 }
 
-/// The error `sync` fails with when any report in `reports` carries a
-/// per-file failure, or `None` when every report is clean. Shared by both
-/// ways a sync can run - directly, above, and daemon-routed through
-/// `sync_dispatch` in `main.rs`, which deserialises the daemon's JSON back
-/// into `SyncReport`s and calls this too - so the wording and the trigger
-/// condition can never drift apart between the two paths, and a user cannot
-/// tell which one handled their command from the failure alone.
-pub(crate) fn sync_failure(reports: &[crystalline_index::SyncReport]) -> Option<anyhow::Error> {
+/// The error `sync` fails with when either failure class is present, or
+/// `None` when both are empty. Shared by both ways a sync can run - directly,
+/// above, and daemon-routed through `sync_dispatch` in `main.rs`, which reads
+/// both classes back out of the daemon's own JSON and calls this too - so the
+/// wording and the trigger condition can never drift apart between the two
+/// paths, and a user cannot tell which one handled their command from the
+/// failure alone.
+///
+/// The two classes mean different things to a person, so a combined failure
+/// names both rather than merging them into one count: a file in `reports[].failed`
+/// is theirs to edit (bad frontmatter, most often), while a domain in
+/// `scan_failed` could not be scanned at all, which is usually a path or
+/// permission problem - not something a file edit fixes.
+pub(crate) fn sync_failure(
+    reports: &[crystalline_index::SyncReport],
+    scan_failed: &[(String, String)],
+) -> Option<anyhow::Error> {
     let failed_count: usize = reports.iter().map(|r| r.failed.len()).sum();
-    if failed_count == 0 {
+    if failed_count == 0 && scan_failed.is_empty() {
         return None;
     }
-    let domains: Vec<&str> = reports
-        .iter()
-        .filter(|r| !r.failed.is_empty())
-        .map(|r| r.domain.as_str())
-        .collect();
-    Some(anyhow!(
-        "{failed_count} file(s) failed to sync in domain(s): {}",
-        domains.join(", ")
-    ))
+    let mut parts = Vec::new();
+    if failed_count > 0 {
+        let domains: Vec<&str> = reports
+            .iter()
+            .filter(|r| !r.failed.is_empty())
+            .map(|r| r.domain.as_str())
+            .collect();
+        parts.push(format!(
+            "{failed_count} file(s) failed to sync in domain(s): {}",
+            domains.join(", ")
+        ));
+    }
+    if !scan_failed.is_empty() {
+        let domains: Vec<&str> = scan_failed.iter().map(|(name, _)| name.as_str()).collect();
+        parts.push(format!(
+            "{} domain(s) could not be scanned at all, usually a path or permission problem: {}",
+            scan_failed.len(),
+            domains.join(", ")
+        ));
+    }
+    Some(anyhow!(parts.join("; ")))
 }
 
 // --- reindex -----------------------------------------------------------------
