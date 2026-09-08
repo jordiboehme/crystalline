@@ -42,7 +42,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo nextest run
-        run: cargo nextest run --workspace
+        # The `ci` profile is the default one plus a single retry, so an
+        # environmental failure on a hosted runner reports FLAKY instead of
+        # turning a green change red. A test that fails twice still fails.
+        run: cargo nextest run --workspace --profile ci
 
       - name: cargo test --doc
         run: cargo test --workspace --doc

@@ -48,6 +48,23 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 filter = 'package(crystalline) & binary(service) | package(crystalline-index) & test(embed::remote)'
 slow-timeout = { period = "120s", terminate-after = 10 }
 
+# The CI profile: the default one, plus one retry.
+#
+# Windows runners have twice in four days failed a test on the environment
+# rather than on the code - `tempfile::tempdir()` inside a migration answering
+# "permission denied" on the hosted runner's temp directory, in two unrelated
+# suites - and each time the whole run went red on a machine, not on a change.
+# One retry is enough to tell the two apart: an environmental failure passes on
+# the second attempt and is reported FLAKY, while a test that is actually broken
+# fails twice and the run is red exactly as before. Retries are never a fix -
+# a suite that reports FLAKY is a bug report about the test or the runner, and
+# the flake report is where it is read.
+#
+# `--profile ci` on the CI workflow's test step only; every local gate and the
+# battery keep the default profile, where a flake is a failure.
+[profile.ci]
+retries = 1
+
 # The iteration profile: `cargo nextest run --profile quick -p <crate>`
 # skips the tests that dominate wall time in the index suite - the
 # real-embedding and remote-embed families - so a task's inner loop stays
