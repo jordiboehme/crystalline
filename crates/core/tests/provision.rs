@@ -393,3 +393,65 @@ fn missing_manifest_resolves_to_nothing() {
     let entry = DomainEntry::file(dir.path());
     assert!(resolve_source_roots("harbor", &entry).is_empty());
 }
+
+/// **Every name a provisioning notice interpolates is rendered in backticks.**
+///
+/// The MCP `provision` surface filters notices that name a domain the caller
+/// may not see, and it recognizes the name by its backticks: a notice reading
+/// "the `lab` domain is virtual" is matched on "`lab`" rather than on the bare
+/// word, so an unrelated notice that happens to contain the word is not
+/// swallowed and a notice naming the domain in prose is not missed. That filter
+/// is a promise about how these strings are written, made in another crate, and
+/// nothing here was keeping it true.
+///
+/// So it is checked where the strings are: any `{name}` or `{domain}` that
+/// reaches a message is wrapped. The exceptions are the lines that build a path
+/// or a JSON body out of the same variables, which are not prose and are never
+/// read by the filter.
+#[test]
+fn every_name_a_notice_interpolates_is_backticked() {
+    const SOURCES: [(&str, &str); 4] = [
+        ("provision/mod.rs", include_str!("../src/provision/mod.rs")),
+        (
+            "provision/model.rs",
+            include_str!("../src/provision/model.rs"),
+        ),
+        (
+            "provision/reconcile.rs",
+            include_str!("../src/provision/reconcile.rs"),
+        ),
+        (
+            "provision/translate.rs",
+            include_str!("../src/provision/translate.rs"),
+        ),
+    ];
+    // Not prose: a path segment, a struct field holding one, a JSON body, and
+    // the recorded calls of the test doubles at the bottom of these files.
+    let structural = |line: &str| {
+        line.contains("out.insert(")
+            || line.contains("rel: format!")
+            || line.contains("PathBuf::from")
+            || line.contains("server_json")
+            || line.contains("self.calls.push(")
+    };
+    for (file, source) in SOURCES {
+        // Everything below the test module is fixtures rather than notices.
+        let source = source.split("\n#[cfg(test)]\n").next().unwrap_or(source);
+        for (n, line) in source.lines().enumerate() {
+            if structural(line) {
+                continue;
+            }
+            for placeholder in ["{name}", "{domain}"] {
+                if !line.contains(placeholder) {
+                    continue;
+                }
+                assert!(
+                    line.contains(&format!("`{placeholder}`")),
+                    "{file}:{} interpolates {placeholder} without backticks, so the \
+                     MCP notice filter cannot recognize the name it carries:\n{line}",
+                    n + 1
+                );
+            }
+        }
+    }
+}

@@ -1578,6 +1578,55 @@ async fn move_same_domain_and_cross_domain_link_rewrite() {
     assert!(h.root.join("ops/target.md").exists());
 }
 
+/// **The write gate reads the destination domain exactly as the verb does.**
+///
+/// The gate used to trim `destination_domain` before checking it while the
+/// engine read the field as sent. Trimming could only make the gate check a
+/// name at least as restrictive as the one written to, so it was not a hole -
+/// but the argument that says so has to be re-derived by whoever reads the two
+/// lines next, and the day both sides trim, a padded destination silently moves
+/// an engram into the trimmed domain. So the property is pinned instead: a
+/// padded name is not a registered domain, the move is refused, and nothing
+/// lands anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_padded_destination_domain_names_no_domain_at_all() {
+    let h = Harness::new(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target" }),
+    )
+    .await
+    .unwrap();
+
+    let refused = call(
+        peer,
+        "move_engram",
+        json!({
+            "identifier": "target",
+            "domain": "eng",
+            "destination": "target.md",
+            "destination_domain": " ops",
+        }),
+    )
+    .await
+    .expect_err("' ops' is not a registered domain");
+    assert!(
+        format!("{refused}").contains("' ops' not registered"),
+        "and the refusal names the string as sent: {refused}"
+    );
+    assert!(
+        h.root.join("eng/target.md").exists(),
+        "the engram stayed where it was"
+    );
+    assert!(
+        !h.root.join("ops/target.md").exists(),
+        "and nothing was written into the domain the padded name resembles"
+    );
+}
+
 /// **A cross-domain move rewrites bare links and nothing else.**
 ///
 /// A reference written with a prefix in its brackets - `[[open:Thing]]`, or a
