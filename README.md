@@ -471,6 +471,7 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals |
 | [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
+| [MCP clients over OAuth](docs/deployment.md#mcp-clients-over-oauth) | A hosted client such as Claude.ai signs the person in and consents once; no token is pasted |
 | [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in |
 | [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet |
 

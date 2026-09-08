@@ -7,7 +7,7 @@ description: Use when working in a domain that has a team origin on GitHub - che
 
 A team domain is an ordinary domain that also tracks a GitHub repository: the files on disk stay the source of truth on this machine, and an origin records which repository, subfolder and branch it follows. Call `origin_status` with no arguments to see which registered domains have a team origin and where each one stands; it lists only origin-connected domains, so an empty result means none of the current domains are shared this way.
 
-On an instance that requires agent authentication, connect with the MCP token your user issued in Fluid (profile > Agent access); you then act as that person - their visibility, their share identity. A domain you cannot see may simply be private; ask the domain owner for membership rather than treating absence as deletion.
+On an instance that requires agent authentication, connect with the MCP token your user issued in Fluid (profile > Agent access); you then act as that person - their visibility, their share identity. An instance may instead let the harness sign in through OAuth, in which case the agent still acts as the person who consented. A domain you cannot see may simply be private; ask the domain owner for membership rather than treating absence as deletion.
 
 ## Session start in a shared domain
 

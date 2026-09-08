@@ -788,7 +788,10 @@ mod tests {
     }
 
     /// The teaching text is what an agent has to act on unaided, so it names
-    /// the header, both ways to get a token, and where the header goes.
+    /// the header, both ways to get a token, and where the header goes. The
+    /// OAuth variant carries the same remedy plus the extra door, so it is
+    /// checked against the identical fragments rather than trusted to inherit
+    /// them from the macro.
     #[test]
     fn the_refusal_teaches_the_whole_remedy() {
         for fragment in [
@@ -800,6 +803,10 @@ mod tests {
             assert!(
                 MCP_AUTH_REQUIRED.contains(fragment),
                 "the refusal must name '{fragment}': {MCP_AUTH_REQUIRED}"
+            );
+            assert!(
+                MCP_AUTH_REQUIRED_OAUTH.contains(fragment),
+                "the OAuth refusal must name '{fragment}' too: {MCP_AUTH_REQUIRED_OAUTH}"
             );
         }
         assert!(
