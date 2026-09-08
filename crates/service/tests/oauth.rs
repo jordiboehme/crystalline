@@ -1286,6 +1286,21 @@ async fn a_missing_pkce_or_foreign_resource_redirects_with_an_error_and_iss() {
             },
             "unsupported_response_type",
         ),
+        (
+            // RFC 6749 section 4.1.2.1 keeps the two apart: a parameter that
+            // is missing is a malformed request, and `unsupported_response_type`
+            // is reserved for a value that is there and not answered here.
+            "no response type at all",
+            {
+                let mut params = base(&[
+                    ("code_challenge", CHALLENGE),
+                    ("code_challenge_method", "S256"),
+                ]);
+                params.remove(0);
+                params
+            },
+            "invalid_request",
+        ),
     ];
 
     for (what, params, expected) in cases {
@@ -1319,10 +1334,32 @@ async fn a_missing_pkce_or_foreign_resource_redirects_with_an_error_and_iss() {
         assert!(!query.contains_key("code"), "{what} grants nothing");
     }
 
-    // A state longer than this server will carry is refused - and the refusal
-    // carries no state, because there is no bounded value to carry. The map it
-    // would have ridden in is one a stranger can add to.
-    let huge = "s".repeat(513);
+    // A state at the bound is carried whole. Two kilobytes is what a hosted
+    // client's own signed state runs to, and this is the one leg of the flow
+    // nobody can debug from the client when it trips - the refusal below
+    // carries no state to correlate on.
+    let longest = "s".repeat(2048);
+    let response = ctx
+        .authorize(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_challenge", CHALLENGE),
+            ("code_challenge_method", "S256"),
+            ("state", &longest),
+        ])
+        .await;
+    assert_eq!(response.status(), 302, "a state at the bound is carried");
+    assert_eq!(
+        request_id(&location(&response)).len(),
+        64,
+        "and the request lands on the consent page like any other"
+    );
+
+    // One byte over, and it is refused - and the refusal carries no state,
+    // because there is no bounded value to carry. The map it would have ridden
+    // in is one a stranger can add to.
+    let huge = "s".repeat(2049);
     let response = ctx
         .authorize(&[
             ("response_type", "code"),

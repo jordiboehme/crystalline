@@ -246,7 +246,15 @@ const CHALLENGE_LEN: std::ops::RangeInclusive<usize> = 43..=128;
 /// How long a `state` this server will carry back. Not in the specification:
 /// `state` is opaque to this server and rides in a bounded map that a stranger
 /// can add to, so it is bounded for the reason every other length here is.
-const MAX_STATE_LEN: usize = 512;
+///
+/// [`MAX_URI_LEN`]'s number rather than a smaller one, deliberately. A hosted
+/// client's `state` is often its own signed value and runs to a kilobyte or
+/// two, and this is the one leg of the flow that cannot be exercised against
+/// the real client before release: a refusal here carries no `state` back, so
+/// it is also the hardest thing for that client to correlate from its own
+/// side. A thousand records at this bound is about two megabytes of the
+/// process, against a flow nobody could debug if the number were wrong.
+const MAX_STATE_LEN: usize = MAX_URI_LEN;
 
 /// How this instance names itself, per request.
 ///
@@ -1352,6 +1360,12 @@ impl AuthorizationStore {
         self.records.len()
     }
 
+    /// How many entries the chronological order holds, live or spent.
+    #[cfg(test)]
+    fn order_len(&self) -> usize {
+        self.order.len()
+    }
+
     /// Remember `record` under `id`, forgetting what has expired and, if the
     /// map is still full, the oldest records past [`MIN_EVICT_AGE`].
     ///
@@ -1706,8 +1720,16 @@ fn found(location: String) -> Response {
 /// an error page is a flow nothing can recover. `iss` (RFC 9207) says which
 /// server answered, which is how a client talking to two authorization servers
 /// detects a mix-up; `state` goes back exactly as it came, when it came at all.
+///
+/// `reason` is the operator's word for what happened and `error` is the
+/// client's, and they are two parameters because they are not the same thing:
+/// four of the six refusals below are `invalid_request` on the wire, and a log
+/// that only carried the wire code could not tell an over-long `state` from a
+/// missing PKCE method from a malformed challenge. The shape is
+/// [`rendered_refusal`]'s, two functions down.
 fn redirect_error(
     redirect_uri: &str,
+    reason: &'static str,
     error: &'static str,
     state: Option<&str>,
     origin: &str,
@@ -1717,7 +1739,8 @@ fn redirect_error(
     // client are what an operator reading a log needs, and everything else on
     // this request is the caller's own text.
     tracing::warn!(
-        reason = error,
+        reason,
+        error,
         client_id = %client_id,
         "an authorization request was refused"
     );
@@ -1885,6 +1908,7 @@ pub async fn authorize(
         Some(state) if state.len() > MAX_STATE_LEN => {
             return Ok(redirect_error(
                 &redirect_uri,
+                "state too long",
                 "invalid_request",
                 None,
                 &origin,
@@ -1893,9 +1917,10 @@ pub async fn authorize(
         }
         other => other,
     };
-    let refuse = |error: &'static str| {
+    let refuse = |reason: &'static str, error: &'static str| {
         Ok(redirect_error(
             &redirect_uri,
+            reason,
             error,
             state_value,
             &origin,
@@ -1903,15 +1928,21 @@ pub async fn authorize(
         ))
     };
 
-    if query.response_type.as_deref() != Some("code") {
-        return refuse("unsupported_response_type");
+    // RFC 6749 section 4.1.2.1 keeps the two apart, and so does this: a
+    // parameter that is missing makes the request malformed, and
+    // `unsupported_response_type` is for a value that is there and is not one
+    // this server answers.
+    match query.response_type.as_deref() {
+        Some("code") => {}
+        None => return refuse("no response type", "invalid_request"),
+        Some(_) => return refuse("unknown response type", "unsupported_response_type"),
     }
     // PKCE, and S256 only. `plain` would make the challenge worth exactly what
     // the code it protects is worth, and no challenge at all would make an
     // intercepted code enough on its own - which for a public client is the
     // whole credential.
     if query.code_challenge_method.as_deref() != Some("S256") {
-        return refuse("invalid_request");
+        return refuse("no s256 pkce method", "invalid_request");
     }
     let Some(code_challenge) = query.code_challenge.as_deref().filter(|challenge| {
         CHALLENGE_LEN.contains(&challenge.len())
@@ -1919,7 +1950,7 @@ pub async fn authorize(
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
     }) else {
-        return refuse("invalid_request");
+        return refuse("challenge malformed", "invalid_request");
     };
     // RFC 8707: a token is minted for a named resource, and this server mints
     // for itself alone. A client asking for another server's is asking the
@@ -1927,7 +1958,7 @@ pub async fn authorize(
     if let Some(asked) = query.resource.as_deref()
         && !OriginRule::same_resource(asked, &origin)
     {
-        return refuse("invalid_target");
+        return refuse("foreign resource", "invalid_target");
     }
 
     let record = PendingAuthorization {
@@ -1950,7 +1981,7 @@ pub async fn authorize(
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), record);
     if remembered.is_err() {
-        return refuse("temporarily_unavailable");
+        return refuse("pending store full", "temporarily_unavailable");
     }
 
     // The registration's `last_used` is deliberately NOT stamped here. This
@@ -2296,6 +2327,29 @@ mod tests {
         assert!(
             store.take("deciding").is_some(),
             "the person who pressed a button five seconds ago survived the flood"
+        );
+    }
+
+    /// A decision that spends its record does not grow the order past the cap.
+    ///
+    /// The order carries an entry per insert and the front walk drops the spent
+    /// ones it meets, so a request started and decided at once - which is the
+    /// ordinary shape of the whole flow - must not leave its entry sitting
+    /// there for the full ten minutes. `oidc.rs` pins the same rule on the
+    /// store this one was copied from, and the copy arrived without it.
+    #[test]
+    fn deciding_authorizations_does_not_grow_the_order_past_the_cap() {
+        let mut store = AuthorizationStore::default();
+        for i in 0..(MAX_PENDING_AUTHORIZATIONS * 2) {
+            let id = format!("cycle-{i}");
+            store.insert(id.clone(), pending(Duration::ZERO)).unwrap();
+            assert!(store.take(&id).is_some());
+        }
+        assert_eq!(store.len(), 0);
+        assert!(
+            store.order_len() <= MAX_PENDING_AUTHORIZATIONS,
+            "spent entries piled up in the order: {}",
+            store.order_len()
         );
     }
 
