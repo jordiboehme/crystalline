@@ -336,6 +336,18 @@ pub(crate) fn hook_present(root: &Map<String, Value>, event: &str, command: &str
 /// entirely untouched (foreign data is never coerced), reported as no change,
 /// and a command that is not one of ours is refused outright rather than
 /// matching every foreign hook in the file.
+///
+/// Only the first hook of ours in the event is rewritten, which is the same
+/// rule [`ensure_owned_entry`] follows: rewriting every one of them can bring
+/// a second spelling up to a command that then runs beside the first. Where
+/// the two sides part company is the cleanup. The owned file drops the
+/// duplicate, because there the second entry was a spelling of ours that
+/// produced nothing until the rewrite made it live. Here it does not: two
+/// managed hooks of the same kind in one event can only be hand-written (an
+/// install appends at most one, and only when the event runs none), and both
+/// of them already ran before this rule existed. Deleting one would be new
+/// data loss rather than a fix, so a later hook of ours is left exactly as
+/// its author wrote it.
 fn ensure_group(
     root: &mut Map<String, Value>,
     event: &str,
@@ -359,6 +371,7 @@ fn ensure_group(
     };
     let mut present = false;
     let mut changed = false;
+    let mut ours_seen = false;
     for group_value in groups.iter_mut() {
         let Some(hooklist) = group_value.get_mut("hooks").and_then(Value::as_array_mut) else {
             continue;
@@ -371,10 +384,14 @@ fn ensure_group(
                 continue;
             }
             present = true;
+            if ours_seen || !is_own_spelling(stored) {
+                continue;
+            }
+            ours_seen = true;
             // Compared before it is assigned, so a file already carrying the
             // current spelling reports no change and a second install stays a
             // byte-identical no-op.
-            if stored != command && is_own_spelling(stored) {
+            if stored != command {
                 hook["command"] = Value::String(command.to_string());
                 changed = true;
             }
@@ -521,6 +538,18 @@ pub(crate) fn owned_hook_present(root: &Map<String, Value>, event: &str, command
 /// type is left entirely untouched, reported as no change. Both sides go
 /// through the same rule so the owned file and the merged file can never
 /// disagree about what is already installed.
+///
+/// Exactly one entry of ours survives per event. A file carrying two
+/// spellings we wrote for the same event - reachable by hand, and reachable
+/// for real in a Copilot file holding both the plain routing entry and the
+/// `--format copilot` one - keeps the first and drops the rest. Rewriting
+/// every one of them instead would leave two entries running the same
+/// command, and Copilot would inject the routing block twice per session:
+/// the plain entry used to produce output Copilot dropped on the floor, so
+/// bringing it up to the current spelling is what would make the second copy
+/// live. Only spellings we wrote are dropped, never a hand-written variant
+/// carrying somebody's own flags, which is counted present and left exactly
+/// as it is.
 fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str) -> bool {
     let Some(kind) = managed_command_kind(command) else {
         return false;
@@ -537,9 +566,12 @@ fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str)
     let Some(entries) = event_entry.as_array_mut() else {
         return false;
     };
+    // Presence stays a question about the kind, never about the spelling, so
+    // an event carrying only a hand-written variant of ours is present and
+    // gets nothing appended beside it.
     let mut present = false;
-    let mut changed = false;
-    for entry in entries.iter_mut() {
+    let mut ours: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
         let Some(stored) = entry.get("command").and_then(Value::as_str) else {
             continue;
         };
@@ -547,8 +579,22 @@ fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str)
             continue;
         }
         present = true;
-        if stored != command && is_own_spelling(stored) {
-            entry["command"] = Value::String(command.to_string());
+        if is_own_spelling(stored) {
+            ours.push(i);
+        }
+    }
+    let mut changed = false;
+    if let Some(&first) = ours.first() {
+        // Compared before it is assigned, so a file already carrying the
+        // current spelling reports no change and a second install stays a
+        // byte-identical no-op.
+        if entries[first].get("command").and_then(Value::as_str) != Some(command) {
+            entries[first]["command"] = Value::String(command.to_string());
+            changed = true;
+        }
+        // Reverse order, so each removal leaves the indexes below it valid.
+        for &i in ours[1..].iter().rev() {
+            entries.remove(i);
             changed = true;
         }
     }
@@ -3124,6 +3170,141 @@ mod tests {
             "SessionStart",
             SESSION_START_COMMAND_COPILOT
         ));
+    }
+
+    /// A Copilot file holding both spellings of ours ends with one entry, not
+    /// two identical ones. The plain entry produced text Copilot drops, so
+    /// only the `--format copilot` entry was ever live; bringing both up to
+    /// the current command would make the second one live too and inject the
+    /// routing block twice per session.
+    #[test]
+    fn two_entries_of_ours_in_one_event_are_reduced_to_one() {
+        let [copilot_start, _] = managed_hook_commands(HarnessKind::Copilot);
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": SESSION_START_COMMAND },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 10 }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the duplicate is dropped, not rewritten");
+        assert_eq!(entries[0]["command"], copilot_start.as_str());
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "the healed file is stable"
+        );
+    }
+
+    /// Dropping the duplicate is a change even when the entry that survives
+    /// needed no rewriting, and the file is a byte-identical no-op once it
+    /// holds exactly one current entry.
+    #[test]
+    fn dropping_a_duplicate_entry_counts_as_a_change() {
+        let [copilot_start, copilot_stop] = managed_hook_commands(HarnessKind::Copilot);
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": copilot_start },
+                    { "type": "command", "command": copilot_start }
+                ],
+                "Stop": [ { "type": "command", "command": copilot_stop } ]
+            }
+        }));
+        assert!(
+            add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "a dropped duplicate is a change even with nothing to rewrite"
+        );
+        assert_eq!(root["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "and the reduced file is then a no-op"
+        );
+    }
+
+    /// The reduction only ever drops a spelling we wrote. A hand-written
+    /// variant beside one of ours keeps every character its author typed, and
+    /// an event carrying only such a variant still gets nothing appended
+    /// beside it.
+    #[test]
+    fn a_hand_written_owned_entry_is_never_dropped_as_a_duplicate() {
+        let [copilot_start, _] = managed_hook_commands(HarnessKind::Copilot);
+        let hand_written = "crystalline prompt system --workspace /repo";
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": hand_written },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "the hand-written entry is not a duplicate"
+        );
+        assert_eq!(entries[0]["command"], hand_written);
+        assert_eq!(entries[1]["command"], copilot_start.as_str());
+    }
+
+    /// An owned file carrying only hand-written variants of ours is counted
+    /// present on both events: nothing is appended beside them and not a
+    /// character of them is rewritten.
+    #[test]
+    fn an_owned_file_of_hand_written_variants_alone_is_left_untouched() {
+        let hand_written = "crystalline prompt system --workspace /repo";
+        let hand_written_stop = "crystalline hook stop --quiet";
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [ { "type": "command", "command": hand_written } ],
+                "Stop": [ { "type": "command", "command": hand_written_stop } ]
+            }
+        }));
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "counted present, so nothing is appended and nothing is rewritten"
+        );
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], hand_written);
+        assert_eq!(root["hooks"]["Stop"][0]["command"], hand_written_stop);
+    }
+
+    /// The merged path holds the same rewrite rule and deliberately not the
+    /// same cleanup: two hand-written hooks of ours in one event both ran
+    /// before this rule existed, so neither is deleted, and only the first is
+    /// brought up to the current spelling.
+    #[test]
+    fn a_second_managed_hook_in_one_event_is_left_as_its_author_wrote_it() {
+        let [start, _] = cc();
+        let mut root = root(json!({
+            "hooks": {
+                "SessionStart": [
+                    { "matcher": "startup", "hooks": [ { "type": "command", "command": SESSION_START_COMMAND } ] },
+                    { "matcher": "resume", "hooks": [ { "type": "command", "command": SESSION_START_COMMAND } ] }
+                ]
+            }
+        }));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+        let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 2, "no group is deleted");
+        assert_eq!(session_start[0]["hooks"][0]["command"], start.as_str());
+        assert_eq!(
+            session_start[1]["hooks"][0]["command"], SESSION_START_COMMAND,
+            "the second is left exactly as it was found"
+        );
+        assert!(
+            !add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
+            "and it is not rewritten on the next run either"
+        );
     }
 
     // --- skill reconcile ------------------------------------------------
