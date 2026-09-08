@@ -62,7 +62,7 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 
-use crystalline_core::config;
+use crystalline_core::{HarnessKind, config};
 use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState};
 
 /// The reminder printed on the one Stop call per session that earns it. Exact
@@ -471,7 +471,14 @@ fn nudge_reason(evolve: Option<&[String]>, share: Option<&str>) -> String {
 /// input and never returns an error - every failure mode this function can
 /// reach degrades to silence, per the module's binding contract, so the
 /// caller in `main.rs` always exits 0.
-pub fn run_stop() {
+///
+/// `harness` is the id `crystalline install` wrote into the settings file
+/// beside this command. An id this binary does not know resolves to `None`
+/// and is treated exactly as an absent flag is: a hook wired by a newer
+/// binary and run by an older one must still answer, in the shape every
+/// harness has always accepted.
+pub fn run_stop(harness: Option<&str>) {
+    let _harness = harness.and_then(HarnessKind::from_id);
     let mut raw = String::new();
     // A defensive cap: a Stop payload is a few hundred bytes, so a megabyte
     // is generous. A misbehaving harness feeding an endless stream gets cut

@@ -660,7 +660,21 @@ enum HookEvent {
     /// payload, a hook-caused continuation, an unconfigured or read-only
     /// install, a session already nudged or a session too short to be worth
     /// interrupting - is silent.
-    Stop,
+    Stop {
+        /// Which harness this hook is answering, as `crystalline install`
+        /// wrote it into the harness's settings file (claude-code, codex,
+        /// copilot). Harnesses honour different Stop response shapes, so this
+        /// is what lets each one be answered in its own.
+        ///
+        /// A plain string rather than a value enum, for the reason the `mcp`
+        /// command's flag is one: a hook wired by a newer binary and run by an
+        /// older one names a harness this binary may not know, and a
+        /// lifecycle hook that refuses to start is worse than one that
+        /// answers in the shape every harness has always accepted. Omitted or
+        /// unrecognized is exactly today's behaviour.
+        #[arg(long)]
+        harness: Option<String>,
+    },
 }
 
 /// The kind of prompt to generate: `system` renders the live routing block for
@@ -689,6 +703,14 @@ enum PromptKind {
         /// Output format: text, json or copilot.
         #[arg(long, value_enum)]
         format: Option<PromptFormat>,
+        /// Which harness this routing prompt is being generated for, as
+        /// `crystalline install` wrote it into the harness's settings file
+        /// (claude-code, codex, copilot). Accepted so both managed hook
+        /// commands carry their harness in the same spelling; the routing
+        /// block itself does not vary by harness today. Omitted or
+        /// unrecognized is exactly today's behaviour.
+        #[arg(long)]
+        harness: Option<String>,
     },
     /// Print the standing onboarding snippet for a remote MCP client: paste it
     /// into the client's custom instructions and the agent onboards itself
@@ -1442,7 +1464,10 @@ fn main() -> anyhow::Result<()> {
                 read_only,
                 config,
                 format,
-            } => run_prompt(workspace, read_only, config, cli.db, cli.json, format),
+                harness,
+            } => run_prompt(
+                workspace, read_only, config, cli.db, cli.json, format, harness,
+            ),
             PromptKind::Connector => run_prompt_connector(cli.json),
         },
         Some(Command::Domain { command }) => run_domain(command, cli.db, cli.json),
@@ -1583,8 +1608,8 @@ fn main() -> anyhow::Result<()> {
             on_runtime(move || delete_dispatch(identifier, domain, force, config, cli.db, cli.json))
         }
         Some(Command::Hook { event }) => match event {
-            HookEvent::Stop => {
-                hook::run_stop();
+            HookEvent::Stop { harness } => {
+                hook::run_stop(harness.as_deref());
                 Ok(())
             }
         },
@@ -3315,6 +3340,7 @@ fn run_prompt_connector(json: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_prompt(
     workspace: Option<PathBuf>,
     read_only_flag: bool,
@@ -3322,7 +3348,15 @@ fn run_prompt(
     db: Option<PathBuf>,
     json_flag: bool,
     format: Option<PromptFormat>,
+    harness: Option<String>,
 ) -> anyhow::Result<()> {
+    // Resolved and then deliberately unused: the routing block does not vary
+    // by harness today. The flag is on the command so both managed hook
+    // commands are spelled the same way, and resolving it here is what makes
+    // an id this binary does not know inert - an older binary running a hook a
+    // newer one wrote must behave exactly as it always did, never fail.
+    let _harness = harness.as_deref().and_then(HarnessKind::from_id);
+
     // An explicit --format wins; the global --json keeps selecting the JSON
     // shape it always has; the default is plain text.
     let format = match format {

@@ -375,12 +375,12 @@ fn install_into_an_empty_home_writes_the_exact_managed_shape() {
             "SessionStart": [
                 {
                     "matcher": "startup|clear|compact",
-                    "hooks": [ { "type": "command", "command": "crystalline prompt system", "timeout": 10 } ]
+                    "hooks": [ { "type": "command", "command": "crystalline prompt system --harness claude-code", "timeout": 10 } ]
                 }
             ],
             "Stop": [
                 {
-                    "hooks": [ { "type": "command", "command": "crystalline hook stop", "timeout": 10 } ]
+                    "hooks": [ { "type": "command", "command": "crystalline hook stop --harness claude-code", "timeout": 10 } ]
                 }
             ]
         }
@@ -481,11 +481,11 @@ fn foreign_hooks_survive_install_and_uninstall() {
     // Ours added.
     assert_eq!(
         after_install["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        "crystalline prompt system"
+        "crystalline prompt system --harness claude-code"
     );
     assert_eq!(
         after_install["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "crystalline hook stop"
+        "crystalline hook stop --harness claude-code"
     );
 
     install_cmd(&home, &bin_dir)
@@ -646,11 +646,11 @@ fn codex_writes_hooks_json_and_agents_skills_with_a_trust_notice() {
     let settings = read_json(&hooks_json);
     assert_eq!(
         settings["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-        "crystalline prompt system"
+        "crystalline prompt system --harness codex"
     );
     assert_eq!(
         settings["hooks"]["Stop"][0]["hooks"][0]["command"],
-        "crystalline hook stop"
+        "crystalline hook stop --harness codex"
     );
 
     // Skills land under ~/.agents/skills.
@@ -693,10 +693,10 @@ fn copilot_managed_hooks() -> Value {
         "version": 1,
         "hooks": {
             "SessionStart": [
-                { "type": "command", "command": "crystalline prompt system --format copilot", "timeoutSec": 10 }
+                { "type": "command", "command": "crystalline prompt system --format copilot --harness copilot", "timeoutSec": 10 }
             ],
             "Stop": [
-                { "type": "command", "command": "crystalline hook stop", "timeoutSec": 10 }
+                { "type": "command", "command": "crystalline hook stop --harness copilot", "timeoutSec": 10 }
             ]
         }
     })
@@ -1601,6 +1601,139 @@ fn prompt_system_reconciles_an_install_from_another_version() {
     assert!(
         !stdout.contains("[crystalline]"),
         "a matching version reconciles nothing: {stdout}"
+    );
+}
+
+/// The settings file exactly as a release before the harness flag wrote it:
+/// both commands bare, under the matcher and timeout that release used.
+fn bare_claude_hooks() -> Value {
+    json!({
+        "hooks": {
+            "SessionStart": [
+                {
+                    "matcher": "startup|clear|compact",
+                    "hooks": [ { "type": "command", "command": "crystalline prompt system", "timeout": 10 } ]
+                }
+            ],
+            "Stop": [
+                {
+                    "hooks": [ { "type": "command", "command": "crystalline hook stop", "timeout": 10 } ]
+                }
+            ]
+        }
+    })
+}
+
+/// The whole point of the parametrized command: an install written before the
+/// hook commands named their harness heals itself on the first run of the new
+/// version. The session-start auto-reconcile replays the hooks part, and the
+/// bare commands it finds are rewritten in place - one SessionStart hook and
+/// one Stop hook, both carrying the harness, with the receipt stamped current.
+/// The failure this pins against is a second hook appended beside the first,
+/// which would nudge twice and leave an orphan behind on uninstall.
+#[test]
+fn prompt_system_rewrites_the_bare_hook_commands_of_an_older_release() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    install_cmd(&home, &bin_dir)
+        .args(["install", "claude-code"])
+        .assert()
+        .success();
+
+    // Roll the settings file back to what an older release left behind, and
+    // the receipt to the version that wrote it.
+    std::fs::write(
+        claude_settings(&home),
+        serde_json::to_string_pretty(&bare_claude_hooks()).unwrap(),
+    )
+    .unwrap();
+    tamper_receipt(&home, |receipt| {
+        receipt["installs"][0]["version"] = json!("0.0.1");
+    });
+
+    install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .assert()
+        .success();
+
+    let settings = read_json(&claude_settings(&home));
+    let session_start = settings["hooks"]["SessionStart"].as_array().unwrap();
+    assert_eq!(session_start.len(), 1, "exactly one SessionStart group");
+    let session_start_hooks = session_start[0]["hooks"].as_array().unwrap();
+    assert_eq!(
+        session_start_hooks.len(),
+        1,
+        "exactly one SessionStart hook"
+    );
+    assert_eq!(
+        session_start_hooks[0]["command"],
+        "crystalline prompt system --harness claude-code"
+    );
+    assert_eq!(
+        session_start[0]["matcher"], "startup|clear|compact",
+        "the group is repaired in place, matcher and all"
+    );
+    let stop = settings["hooks"]["Stop"].as_array().unwrap();
+    assert_eq!(stop.len(), 1, "exactly one Stop group, never a second");
+    let stop_hooks = stop[0]["hooks"].as_array().unwrap();
+    assert_eq!(stop_hooks.len(), 1, "exactly one Stop hook");
+    assert_eq!(
+        stop_hooks[0]["command"],
+        "crystalline hook stop --harness claude-code"
+    );
+
+    let receipt = read_json(&receipt_file(&home));
+    assert_eq!(receipt["installs"][0]["version"], env!("CARGO_PKG_VERSION"));
+
+    // A second session finds nothing left to do.
+    let out = install_cmd(&home, &bin_dir)
+        .args(["prompt", "system"])
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        !stdout.contains("[crystalline]"),
+        "the healed install reconciles nothing on the next session: {stdout}"
+    );
+}
+
+/// The other half of ownership: a settings file still carrying the bare
+/// commands is recognized as ours by `uninstall`, which would otherwise walk
+/// away leaving a hook behind that nothing reconciles any more.
+#[test]
+fn uninstall_removes_the_bare_commands_of_an_older_release() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let bin_dir = work.path().join("bin");
+    let log = work.path().join("claude.log");
+    write_shim(&bin_dir, "claude", &log);
+
+    let settings_path = claude_settings(&home);
+    std::fs::create_dir_all(settings_path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&bare_claude_hooks()).unwrap(),
+    )
+    .unwrap();
+
+    let out = install_cmd(&home, &bin_dir)
+        .args(["uninstall", "claude-code"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.contains("removed"),
+        "the bare hooks are reported as removed, not as absent: {stdout}"
+    );
+    let settings = read_json(&settings_path);
+    assert!(
+        settings.get("hooks").is_none(),
+        "no orphan is left behind: {settings}"
     );
 }
 
