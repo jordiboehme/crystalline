@@ -1287,6 +1287,42 @@ fn v301_acknowledgment_is_scoped_to_the_pair() {
         .expect("hub still leads its other pair");
     assert_eq!(on_hub.scope, "engineering/hub, engineering/twin-two");
     assert!(!on_hub.acknowledged);
+    // And it is a plain finding, not a stale one: the entry on the hub was
+    // given for the other pair, so its note says nothing about this one.
+    assert!(!on_hub.ack_stale);
+    assert_eq!(on_hub.ack_note, None);
+    assert_eq!(on_hub.ack_scope, None);
+
+    // A second acknowledgment, for this pair, stands beside the first and
+    // silences it alone.
+    let mut hub = fact(1, "hub");
+    hub.lead_vector = Some(unit(&[1.0, 0.0]));
+    hub.salience = Some(9.0);
+    hub.acks.push(AckEntry {
+        rule: "V301".to_string(),
+        scope: Some("engineering/hub, engineering/twin-one".to_string()),
+        note: Some("distinct, linked".to_string()),
+    });
+    hub.acks.push(AckEntry {
+        rule: "V301".to_string(),
+        scope: Some("engineering/hub, engineering/twin-two".to_string()),
+        note: Some("also distinct".to_string()),
+    });
+    let mut one = fact(2, "twin-one");
+    one.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut two = fact(3, "twin-two");
+    two.lead_vector = Some(unit(&[1.0, 0.0]));
+
+    let report = detect(&input(vec![hub, one, two]));
+    assert_eq!(report.acknowledged.redundancy, 2);
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(twins.len(), 1, "{:?}", fired(&report));
+    assert_eq!(twins[0].permalink, "twin-one");
+    assert!(!twins[0].ack_stale);
 }
 
 #[test]

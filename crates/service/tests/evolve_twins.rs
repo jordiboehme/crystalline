@@ -261,6 +261,18 @@ async fn acknowledging_one_pair_leaves_the_other_standing() {
         rules_of(&after).iter().filter(|(r, _)| r == "V301").count(),
         twins_before - 1
     );
+    // The acknowledged engram leads a second pair, and that row is a plain
+    // finding: staleness is judged per pair, so an entry given for one pair
+    // never lends its note to another.
+    assert!(
+        after["queue"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["rule"] == "V301")
+            .all(|f| f.get("ack_stale").is_none() && f.get("ack_note").is_none()),
+        "{after}"
+    );
 }
 
 /// An engram that twins two others carries two `V301` findings, and an

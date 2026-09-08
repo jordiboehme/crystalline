@@ -1160,10 +1160,16 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 ///
 /// - the entry's scope is absent, or equals the finding's scope: **suppressed**,
 ///   counted, and returned only when the caller asked for the suppressed ones;
-/// - the entry's scope differs: **returned**, flagged [`Finding::ack_stale`]
-///   and carrying the old note, because "somebody ruled this intentional and
-///   the evidence has since changed" is a different thing to read than a fresh
-///   finding;
+/// - the rule fires once here, on one entry, and the two scopes differ:
+///   **returned**, flagged [`Finding::ack_stale`] and carrying the old note,
+///   because "somebody ruled this intentional and the evidence has since
+///   changed" is a different thing to read than a fresh finding;
+/// - the rule fires more than once here, or the engram carries more than one
+///   entry for it, and none of them matches: **returned plain**. Staleness is
+///   judged per scope, and a set-scoped rule firing twice on one engram - two
+///   twin pairs under `V301`, two half-finished supersedes under `V103` -
+///   carries one entry per pair, so an entry given for another pair has nothing
+///   to say about this finding and must not lend it a note;
 /// - no entry for the rule: untouched.
 ///
 /// A finding with no anchor engram - `V203`'s vocabulary, `V108`'s attachment -
@@ -1179,39 +1185,56 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
         return;
     }
 
+    // How often each rule fires on each acknowledging engram, so a finding that
+    // matches no entry can tell drift from a second pair. Keyed on an owned
+    // permalink because this borrow has to end before the findings are walked
+    // mutably below.
+    let mut fires: HashMap<(String, &'static str), usize> = HashMap::new();
+    for f in &report.findings {
+        if acks.contains_key(f.permalink.as_str()) {
+            *fires.entry((f.permalink.clone(), f.rule)).or_default() += 1;
+        }
+    }
+
     let mut counts = AckCounts::default();
     let include = input.include_acknowledged;
     report.findings.retain_mut(|finding| {
         let Some(entries) = acks.get(finding.permalink.as_str()) else {
             return true;
         };
+        // The generous match wins over a stale one: an engram carrying both a
+        // scope-less entry and an outdated scoped one is acknowledged.
+        let matching = entries
+            .iter()
+            .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule))
+            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
+        if let Some(ack) = matching {
+            counts.add(finding.family);
+            finding.acknowledged = true;
+            finding.ack_note = ack.note.clone();
+            finding.ack_scope = ack.scope.clone();
+            return include;
+        }
+        // Nothing matches, so the question is whether this finding is the
+        // drifted self of an acknowledgment or a pair nobody has answered yet.
+        // Only one entry against one finding can be the first: a set-scoped
+        // rule firing twice on this engram (two twin pairs under `V301`, two
+        // half-finished supersedes under `V103`) keeps one entry per pair, and
+        // lending this row another pair's note would tell a reader they have
+        // seen evidence they have not.
+        let alone = fires.get(&(finding.permalink.clone(), finding.rule)) == Some(&1);
         let mut for_rule = entries
             .iter()
             .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule));
-        // The generous match wins over a stale one: an engram carrying both a
-        // scope-less entry and an outdated scoped one is acknowledged.
-        let matching = for_rule
-            .clone()
-            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
-        match matching.or_else(|| for_rule.next()) {
-            Some(ack) if matching.is_some() => {
-                counts.add(finding.family);
-                finding.acknowledged = true;
-                finding.ack_note = ack.note.clone();
-                finding.ack_scope = ack.scope.clone();
-                include
-            }
-            Some(stale) => {
-                finding.ack_stale = true;
-                finding.ack_note = stale.note.clone();
-                // The entry's own scope, not the finding's: a stale row exists
-                // precisely because those two have drifted apart, and the row
-                // is where a reader compares them.
-                finding.ack_scope = stale.scope.clone();
-                true
-            }
-            None => true,
+        if let (true, Some(stale), None) = (alone, for_rule.next(), for_rule.next()) {
+            finding.ack_stale = true;
+            finding.ack_note = stale.note.clone();
+            // The entry's own scope, not the finding's: a stale row exists
+            // precisely because those two have drifted apart, and the row is
+            // where a reader compares them.
+            finding.ack_scope = stale.scope.clone();
         }
+        true
     });
     report.acknowledged = counts;
 }
