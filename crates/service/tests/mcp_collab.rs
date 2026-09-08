@@ -1222,6 +1222,56 @@ async fn a_restart_abandons_the_pending_flow_and_issues_a_fresh_code() {
     assert!(landed["github"]["pending_connect"].is_null());
 }
 
+/// A `restart` against a sign-in that has already LANDED reports the outcome
+/// rather than throwing it away.
+///
+/// The restart arm used to be matched first, so `restart: true` on a flow that
+/// had finished dropped its one-shot report and answered with a fresh code
+/// beside `connected: true` - a code for a sign-in nobody needed any more. The
+/// landed outcome is drained and reported first now, and the slot is clear
+/// afterwards, so a caller who really does want a new sign-in asks again.
+#[tokio::test]
+async fn a_restart_after_the_flow_landed_reports_it_instead_of_starting_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
+        device_code: "devcode-two".to_string(),
+        user_code: "WXYZ-9876".to_string(),
+        verification_url: "https://github.com/login/device".to_string(),
+        interval_secs: 0,
+        expires_in_secs: 900,
+    }));
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    // The outcome has landed in the slot but nobody has read it yet: that is
+    // the state this test is about.
+    wait_until(|| async { auth.run_was_entered().then_some(()) }).await;
+    let landed = wait_until(|| async {
+        let snap = eng.start_device_connect(None, true).await.unwrap();
+        (snap["github"]["connected"] == json!(true)).then_some(snap)
+    })
+    .await;
+    assert_eq!(
+        landed["github"]["user"],
+        json!("octocat"),
+        "the restart reports the sign-in that landed"
+    );
+    assert!(
+        landed["github"]["pending_connect"].is_null(),
+        "and issues no code for a sign-in that is already done: {landed}"
+    );
+    assert_ne!(
+        landed["github"]["pending_connect"]["user_code"],
+        json!("WXYZ-9876")
+    );
+}
+
 /// A sign-in that lands narrates itself: one line per step, so the next
 /// "it looks stuck" report is answered from one daemon log rather than five
 /// rounds of trace gathering. And nothing secret is in any of them - the

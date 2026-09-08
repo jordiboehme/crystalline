@@ -11719,15 +11719,7 @@ impl Engine {
             .unwrap()
             .as_ref()
             .filter(|p| p.identity == *identity)
-            .map(|p| {
-                json!({
-                    "pending": true,
-                    "user_code": p.user_code,
-                    "verification_url": p.verification_url,
-                    "expires_in_secs": p.remaining_secs(),
-                    "next_steps": p.next_steps,
-                })
-            })
+            .map(PendingConnect::view)
     }
 
     /// Takes the pending INSTANCE flow's outcome if it has landed, clearing
@@ -12149,7 +12141,20 @@ impl Engine {
         {
             let mut guard = self.pending_connect.lock().unwrap();
             match guard.as_ref() {
-                Some(p) if p.identity == *identity && restart => {
+                // A landed outcome is not a flow to abandon, so the
+                // restart arm asks for one that is still running. Without
+                // that, `restart: true` against a sign-in that already
+                // finished threw away its one-shot report and answered with a
+                // fresh code beside `connected: true`. Falling through to the
+                // arm below instead answers `None`, which is what makes the
+                // caller's status read drain the outcome and say what
+                // happened; the slot is clear afterwards, so a second restart
+                // starts fresh.
+                Some(p)
+                    if p.identity == *identity
+                        && restart
+                        && p.outcome.lock().unwrap().is_none() =>
+                {
                     // Abort first, then drop: the task stops at its next poll
                     // and the record it would have written into is gone
                     // either way, since the fresh flow below builds its own
@@ -12174,6 +12179,13 @@ impl Engine {
         let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
         let client_id = self.oauth_client_id();
         let label = identity_label(identity);
+        // Where this identity's token will be saved, resolved BEFORE anything
+        // is started. It is fallible, and it used to run after the pending
+        // record was already in the slot, which left a failure holding a slot
+        // with no task in it. Resolved here, a failure costs nothing at all:
+        // no code has been asked for and no record exists.
+        let token_host = origin::token_host(api_url.as_deref());
+        let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
         let start = match self
             .connect_auth
             .start_device_flow(&auth_base, &client_id)
@@ -12200,22 +12212,15 @@ impl Engine {
         let next_steps = crystalline_remote::github::auth::confirmation_guidance(&auth_base);
         let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
             Arc::new(std::sync::Mutex::new(None));
-        let pending = PendingConnect {
-            identity: identity.clone(),
-            user_code: start.user_code.clone(),
-            verification_url: start.verification_url.clone(),
-            expires_in_secs: start.expires_in_secs,
-            started_at: tokio::time::Instant::now(),
-            next_steps: next_steps.clone(),
-            outcome: outcome_slot.clone(),
-            abort: None,
-        };
-        *self.pending_connect.lock().unwrap() = Some(pending);
 
         let auth = self.connect_auth.clone();
-        let token_host = origin::token_host(api_url.as_deref());
-        let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
         let task_label = label.clone();
+        // Cloned for the record below, which is now built after the spawn: the
+        // task owns the poll's copy of the start and the outcome slot.
+        let user_code = start.user_code.clone();
+        let verification_url = start.verification_url.clone();
+        let expires_in_secs = start.expires_in_secs;
+        let record_slot = outcome_slot.clone();
         let task = tokio::spawn(async move {
             let result: std::result::Result<String, (&'static str, RemoteError)> = async {
                 let access_token = auth
@@ -12267,19 +12272,30 @@ impl Engine {
             *outcome_slot.lock().unwrap() = Some(result);
         });
 
-        // The handle only exists once the task is spawned, so the record is
-        // completed here rather than built with it. Nothing can have replaced
-        // the record in between: there is no await point between the insert
-        // above and this line, and the guard is re-checked by identity anyway.
-        {
-            let mut guard = self.pending_connect.lock().unwrap();
-            if let Some(p) = guard.as_mut()
-                && p.identity == *identity
-            {
-                p.abort = Some(task.abort_handle());
-            }
-        }
-        Ok(self.pending_view_for(identity))
+        // The record is built and inserted AFTER the task, complete, under one
+        // lock. It used to be inserted first and have its abort handle written
+        // back under a second acquisition, which left a window: two concurrent
+        // restarts of the same identity could store the first task's handle on
+        // the second record, and a later restart would then abort a task that
+        // was already dead while a live one kept polling GitHub. One
+        // acquisition, one whole record, no window.
+        let pending = PendingConnect {
+            identity: identity.clone(),
+            user_code,
+            verification_url,
+            expires_in_secs,
+            started_at: tokio::time::Instant::now(),
+            next_steps: next_steps.clone(),
+            outcome: record_slot,
+            abort: Some(task.abort_handle()),
+        };
+        // The view comes from the record in hand rather than from a read-back
+        // of the slot. A `clear_pending_for` landing in that window - a pasted
+        // token, a disconnect - made the read-back answer `None`, and a flow
+        // that HAD started was then reported as no flow at all.
+        let view = pending.view();
+        *self.pending_connect.lock().unwrap() = Some(pending);
+        Ok(Some(view))
     }
 
     // --- one account's own GitHub identity ----------------------------------
@@ -12693,6 +12709,23 @@ impl PendingConnect {
     fn remaining_secs(&self) -> u64 {
         self.expires_in_secs
             .saturating_sub(self.started_at.elapsed().as_secs())
+    }
+
+    /// What a caller is shown about this flow: the code, where to type it, how
+    /// long it lives and what to do next.
+    ///
+    /// A method on the record rather than on the engine, so the answer can be
+    /// built from a record in hand as well as from one read back out of the
+    /// slot - which is what keeps a flow that HAS started from being reported
+    /// as no flow when something clears the slot in between.
+    fn view(&self) -> Value {
+        json!({
+            "pending": true,
+            "user_code": self.user_code,
+            "verification_url": self.verification_url,
+            "expires_in_secs": self.remaining_secs(),
+            "next_steps": self.next_steps,
+        })
     }
 }
 
