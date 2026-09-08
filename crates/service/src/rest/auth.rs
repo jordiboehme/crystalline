@@ -121,6 +121,14 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// unprotected for it - it authenticates on a single-use state this process
 /// generated, matched against a cookie only the browser that started the
 /// sign-in holds. See [`super::oidc`].
+///
+/// One of the three is public by PATH and not by method: `oidc::LOGIN_PATH`
+/// serves the `GET` that starts a sign-in with no session, and also the `POST`
+/// that starts LINKING an identity to the account already signed in, which
+/// calls `require_account` inside the handler and is under the CSRF check like
+/// every other `POST`. This list is a path list, so it exempts both; the guard
+/// that matters for the second one lives in the handler rather than here, and
+/// that is the first thing to check when reading this exemption.
 const PUBLIC_PATHS: [&str; 9] = [
     LOGIN_PATH,
     "/auth/logout",
@@ -174,9 +182,11 @@ pub struct AuthCfg {
     /// Whether OAuth is served for MCP clients, from `auth.oauth`. Requires
     /// `mcp`, since the tokens it issues are checked at that gate.
     pub oauth: bool,
-    /// How many accounts trusted-header provisioning may mint in total, from
-    /// `auth.max_users`. Only minting a *new* account is capped; an existing
-    /// one always resolves, and the `crystalline users` CLI is never capped.
+    /// How many accounts external provisioning may mint in total, from
+    /// `auth.max_users`: the trusted header, the forward-auth headers and
+    /// single sign-on all count against the one cap. Only minting a *new*
+    /// account is capped; an existing one always resolves, and the
+    /// `crystalline users` CLI is never capped.
     pub max_users: usize,
 }
 

@@ -143,10 +143,6 @@ pub struct EnvOverlay {
     config_path: Option<PathBuf>,
 }
 
-/// Redacts `github_token`: an `EnvOverlay` is long-lived on `Engine` and far
-/// more likely to reach a log line or a test failure message via `Debug` than
-/// via any deliberate print, so the secret is masked unconditionally rather
-/// than trusting every future caller to remember not to print it.
 /// The settings pairs with every credential value replaced, for `Debug`. An
 /// overlay reaches a log line or a panic message as a whole struct, and a
 /// secret must not ride along when it does. Which keys are credentials is
@@ -166,6 +162,11 @@ fn redacted_settings(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
         .collect()
 }
 
+/// Redacts `github_token` and every secret setting: an `EnvOverlay` is
+/// long-lived on `Engine` and far more likely to reach a log line or a test
+/// failure message through `Debug` than through any deliberate print, so the
+/// secrets are masked unconditionally rather than trusting every future caller
+/// to remember not to print them.
 impl std::fmt::Debug for EnvOverlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnvOverlay")
@@ -383,10 +384,15 @@ impl EnvOverlay {
     /// Every active override as `(variable, key, display value)`, for surfacing
     /// in `doctor` and the like: first the setting overrides, then the
     /// env-defined domains (keyed `domain.<name>`, their path as the display
-    /// value), then the GitHub token, if set (keyed `github.token`). The
-    /// `database.url` value and the GitHub token are both rendered as `(set)`
-    /// rather than shown, since either may be a credential; a domain path
-    /// carries no secret and is shown as-is.
+    /// value), then the GitHub token, if set (keyed `github.token`).
+    ///
+    /// Every credential is rendered as `(set)` rather than shown: which keys
+    /// those are is the registry's call ([`settings::is_secret_key`], the same
+    /// answer `config show` masks by), so this list never drifts from it -
+    /// `database.url` and the OIDC client secret are two of them today, and a
+    /// key added to the registry as a secret is masked here without this
+    /// sentence being touched. A domain path carries no secret and is shown
+    /// as-is.
     pub fn active_overrides(&self) -> Vec<(String, String, String)> {
         let mut out: Vec<(String, String, String)> = self
             .settings

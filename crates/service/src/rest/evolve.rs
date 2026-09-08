@@ -234,11 +234,17 @@ pub async fn queue(
 /// naming a domain nobody registered, through the same engine check every
 /// other domain-addressed route opens with.
 ///
-/// **Temporary.** `evolve_detect` is gaining a [`crate::scope::Scope`]
-/// parameter of its own, and when it lands this whole function collapses into
-/// passing `identity.scope()` beside the caller's own filter - the engine
-/// already holds the machinery for it (`ScopedDomains`), including the empty
-/// case this one has to refuse rather than answer.
+/// **Not temporary, and not redundant with the engine's own scope.**
+/// `evolve_detect` takes a [`crate::scope::Scope`] now and filters what it
+/// sweeps, so most of what this function does is done twice. One thing is not:
+/// an empty filter means "every registered domain" to the sweep verb, so a
+/// caller who may see NO domain at all would be handed the whole instance's
+/// queue by an empty list that the engine's filter then narrows to nothing
+/// silently. This function turns that into the same 404 every other
+/// domain-addressed route answers, which is why deleting it fails
+/// `a_sweep_with_nothing_visible_refuses_rather_than_widening`. It is belt and
+/// braces on purpose: the belt is what refuses, the braces are what the engine
+/// would filter anyway.
 async fn sweepable_domains(
     state: &RestState,
     identity: &Identity,

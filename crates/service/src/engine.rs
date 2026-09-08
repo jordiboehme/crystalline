@@ -848,14 +848,6 @@ pub enum ShareActor {
     HttpAgent,
 }
 
-/// Which credential a SHARE PREVIEW may compute on when the acting identity has
-/// no personal one of its own. A preview writes nothing to the forge - it pulls,
-/// detects local changes and names the layer a share would target - so the two
-/// answers differ only in what a caller wants a missing connection to mean.
-///
-/// This is a preview-only choice. The share itself always resolves the acting
-/// identity's own credential and refuses without it, in every mode and on every
-/// surface, which is what makes serving the plan a read rather than a loophole.
 /// What a removal knows about how much knowledge is at stake.
 ///
 /// The two absent cases are not the same fact, and keeping them apart is the
@@ -892,6 +884,14 @@ impl RemovalCount {
     }
 }
 
+/// Which credential a SHARE PREVIEW may compute on when the acting identity has
+/// no personal one of its own. A preview writes nothing to the forge - it pulls,
+/// detects local changes and names the layer a share would target - so the two
+/// answers differ only in what a caller wants a missing connection to mean.
+///
+/// This is a preview-only choice. The share itself always resolves the acting
+/// identity's own credential and refuses without it, in every mode and on every
+/// surface, which is what makes serving the plan a read rather than a loophole.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PreviewCredential {
     /// The share's own, or the share's own refusal. A caller about to ASK
@@ -3346,8 +3346,8 @@ impl Engine {
     /// through [`Engine::resolve_in`], which is what actually holds the
     /// successor to this domain: the absolute `crystalline://` form overrides
     /// a domain hint wherever it is accepted, so "the same domain" is a rule
-    /// enforced there rather than a property of passing the name in. The target is then written first, and
-    /// only then the successor's reciprocal `- supersedes [[..]]` line
+    /// enforced there rather than a property of passing the name in. The
+    /// target is then written first, and only then the successor's reciprocal `- supersedes [[..]]` line
     /// (appended only when not already present, so a repeat call is
     /// idempotent). A failure on the successor write leaves the target
     /// retired with a one-sided pair; nothing here rolls that back, since the
@@ -9445,9 +9445,14 @@ impl Engine {
         match (counted, purge) {
             (RemovalCount::Unreadable, false) => return Err(Engine::purge_refusal(name, None)),
             (RemovalCount::Unreadable, true) => {
-                // Already confirmed: the removal proceeds and the receipt is
-                // one number poorer. Logged rather than swallowed silently,
-                // because an index that cannot be swept is worth knowing about.
+                // Already confirmed: the removal proceeds. Nothing is lost
+                // from the removal's own receipt, which never carried a count -
+                // the number belongs to the PREVIEW, and a preview that could
+                // not read it says so with `engrams_unknown`. What is lost is
+                // the chance to have shown the figure before the decision, and
+                // that decision was already taken. Logged rather than swallowed
+                // silently, because an index that cannot be swept is worth
+                // knowing about.
                 tracing::warn!(
                     domain = name,
                     error = stats

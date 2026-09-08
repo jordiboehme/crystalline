@@ -2152,8 +2152,11 @@ fn write_ops() -> Vec<WriteOp> {
         // on this API, because an agent acts as the account that issued its
         // token, so a viewer's agent is read-only by construction. Every
         // other leg of the matrix applies unchanged - the anonymous viewer
-        // never writes, a cookie session echoes its CSRF token, and a
-        // read-only instance refuses.
+        // never writes and a cookie session echoes its CSRF token - except the
+        // read-only one, which is what `read_only_exempt` on these rows says:
+        // a read-only instance with `auth.mcp` on is exactly where an agent
+        // cannot connect at all until somebody issues it a token, and a token
+        // is account state in the accounts database rather than knowledge.
         WriteOp {
             method: Method::POST,
             path: "/api/v1/me/mcp-tokens",

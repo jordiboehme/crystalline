@@ -170,11 +170,15 @@ function GithubIdentityCard() {
  * holds a link from a provider an operator has since turned off keeps the card,
  * so the link is visible and can be given up.
  *
- * Linking is a link, not a button: it navigates the whole page to the sign-on,
- * which redirects to the provider and back. A fetch would follow that hop in
- * the background and land nowhere anybody can type a password into. What comes
- * back lands on the home screen rather than here, because the callback is the
- * ordinary sign-in path and mints a session the same way.
+ * Linking starts with a POST and ends with a navigation, which is why it is a
+ * button rather than a plain link: the POST is what records, server side, that
+ * this journey is linking an identity to THIS account rather than signing
+ * somebody in, and it is under the CSRF check like every other POST. Only what
+ * comes back from it is navigated to, with the whole page: a fetch would follow
+ * the redirect to the provider in the background and land nowhere anybody can
+ * type a password into. The journey ends on the home screen rather than here,
+ * because the callback is the ordinary sign-in path and mints a session the
+ * same way.
  */
 function SsoIdentityCard({ user }: { user: User }) {
   const queryClient = useQueryClient();

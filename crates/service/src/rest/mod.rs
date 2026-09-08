@@ -887,13 +887,18 @@ pub(super) async fn require_domain_read(
 /// instance role's own (the policy in `crate::scope`), so a caller past step 2
 /// holds `Write` or better by construction.
 ///
-/// Three routes carry no domain gate of any kind, deliberately: unregistering
-/// a domain, saving its MANIFEST and the origin pull. All three are
-/// `require_admin`, and an instance admin resolves to [`DomainRight::Own`] on
-/// every domain, private ones included, so a gate there is a store round trip
-/// that cannot refuse. If that early return is ever narrowed, those three are
-/// what has to be revisited - which is why this sentence sits here rather than
-/// nowhere. The share surfaces beside them are NOT in that set: their gate
+/// Two routes carry no domain gate of any kind, deliberately: saving a domain's
+/// MANIFEST and the origin pull. Both are `require_admin`, and an instance
+/// admin resolves to [`DomainRight::Own`] on every domain, private ones
+/// included, so a gate there is a store round trip that cannot refuse. If that
+/// early return is ever narrowed, those two are what has to be revisited -
+/// which is why this sentence sits here rather than nowhere.
+///
+/// `DELETE /domains/{domain}` used to be the third. It is not admin-only any
+/// more: it runs `Identity::require_account` and hands the decision to
+/// `Engine::unregister_domain`, whose `require_domain_owner` is owner-or-admin
+/// and is the same rule the MCP verb and the CLI remove through. So its gate is
+/// the engine's rather than absent. The share surfaces beside them are NOT in that set: their gate
 /// moves with `github.share_identity`, so an instance editor reaches them in
 /// personal mode, and they carry a domain gate of their own.
 pub(super) async fn require_domain_write(
