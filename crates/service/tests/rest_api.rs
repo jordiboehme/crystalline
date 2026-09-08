@@ -506,7 +506,7 @@ async fn me_reports_capabilities_without_an_identity() {
     assert!(body["read_only"].is_boolean());
     assert_eq!(
         body["oauth"], false,
-        "auth.oauth is off by default, and this fixture never turns it on: {body}"
+        "this fixture leaves auth.mcp unset, so the followed auth.oauth is off: {body}"
     );
 }
 

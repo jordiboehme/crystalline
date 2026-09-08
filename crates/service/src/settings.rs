@@ -388,7 +388,7 @@ pub fn registry() -> &'static [SettingSpec] {
         },
         SettingSpec {
             key: "auth.mcp",
-            doc: "Require every MCP connection over HTTP to authenticate with a personal MCP token (issue one in Fluid under profile > Agent access); off means the legacy open HTTP tier (applies at the next daemon start)",
+            doc: "Require every MCP connection over HTTP to authenticate with a personal MCP token (issue one in Fluid under profile > Agent access); off means the legacy open HTTP tier. Turning this on also serves OAuth for MCP clients wherever the UI is served, unless auth.oauth says otherwise (applies at the next daemon start)",
             kind: SettingKind::Bool,
             startup_effective: true,
             secret: false,

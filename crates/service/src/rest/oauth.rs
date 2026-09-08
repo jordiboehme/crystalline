@@ -411,8 +411,10 @@ impl OriginRule {
     /// loopback http) url ending at the callback path, so the only way another
     /// value arrives here is through the environment overlay, and refusing to
     /// serve at all would take the instance down over a key that has a
-    /// perfectly good default behaviour. The warning is logged once, at
-    /// startup, where an operator is still watching.
+    /// perfectly good default behaviour. The warning is logged at startup,
+    /// where an operator is still watching - twice on an instance that serves
+    /// OAuth, since the rule is built once for the gate and the two well-known
+    /// documents and once more inside [`OauthServer`].
     ///
     /// **The scheme is what decides, not the presence of a host.**
     /// `Url::origin` answers a tuple origin for a short list of schemes
@@ -2723,7 +2725,10 @@ fn granted(grant: super::IssuedOauthGrant) -> (NoStore, Json<TokenResponse>) {
                    `redirect_uri` it was issued for, the PKCE `code_verifier` \
                    and the `client_id`; `grant_type=refresh_token` takes a \
                    `refresh_token` and the `client_id`. Both may name a \
-                   `resource`, which must be this instance. The answer is an \
+                   `resource`: on an exchange it must be this instance, and on \
+                   a refresh it must be the audience the grant already holds, \
+                   which on a deployment reached under two names is not the \
+                   same sentence. The answer is an \
                    access token good for an hour and a refresh token good for \
                    thirty days; every refresh rotates both, and presenting a \
                    refresh token that was already rotated away revokes the \

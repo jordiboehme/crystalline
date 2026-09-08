@@ -417,11 +417,11 @@ flowchart LR
     C[Client] -->|1. connect, no token| G{MCP gate}
     G -->|2. 401 + resource_metadata| C
     C -->|3. GET well-known documents| M[Metadata]
-    C -->|4. POST /oauth/register| M
+    C -->|4. POST /oauth/register| S[OAuth endpoints]
     C -->|5. GET /oauth/authorize| F[Fluid: sign in, then consent]
     F -->|6. code| C
-    C -->|7. POST /oauth/token| M
-    M -->|8. coa_... access token| C
+    C -->|7. POST /oauth/token| S
+    S -->|8. coa_... access token| C
     C -->|9. Authorization: Bearer coa_...| G
 ```
 

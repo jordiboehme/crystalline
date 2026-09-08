@@ -2441,14 +2441,19 @@ async fn a_refresh_resource_is_judged_against_the_grant_and_never_before_a_repla
     assert!(mcp_opens(&ctx.addr, &access_two).await);
 
     // A resource the grant does not hold, on a live token: refused, and the
-    // grant is left exactly as it was.
+    // grant is left exactly as it was. Sent at the other name on purpose: the
+    // request then names exactly the origin it arrived at, so a comparison
+    // against the request rather than against the grant would have served it.
     assert_oauth_error(
-        ctx.token(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_two.as_str()),
-            ("client_id", client_id.as_str()),
-            ("resource", "https://knowledge.example"),
-        ])
+        ctx.token_at_host(
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_two.as_str()),
+                ("client_id", client_id.as_str()),
+                ("resource", "https://knowledge.example"),
+            ],
+            "knowledge.example",
+        )
         .await,
         400,
         "invalid_target",

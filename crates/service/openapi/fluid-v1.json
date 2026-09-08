@@ -5993,7 +5993,7 @@
           "oauth"
         ],
         "summary": "Exchange an authorization code, or rotate a refresh token.",
-        "description": "The token endpoint the metadata advertises, form-encoded in and JSON out. `grant_type=authorization_code` takes the single-use `code` the consent screen issued, the `redirect_uri` it was issued for, the PKCE `code_verifier` and the `client_id`; `grant_type=refresh_token` takes a `refresh_token` and the `client_id`. Both may name a `resource`, which must be this instance. The answer is an access token good for an hour and a refresh token good for thirty days; every refresh rotates both, and presenting a refresh token that was already rotated away revokes the whole grant. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`.",
+        "description": "The token endpoint the metadata advertises, form-encoded in and JSON out. `grant_type=authorization_code` takes the single-use `code` the consent screen issued, the `redirect_uri` it was issued for, the PKCE `code_verifier` and the `client_id`; `grant_type=refresh_token` takes a `refresh_token` and the `client_id`. Both may name a `resource`: on an exchange it must be this instance, and on a refresh it must be the audience the grant already holds, which on a deployment reached under two names is not the same sentence. The answer is an access token good for an hour and a refresh token good for thirty days; every refresh rotates both, and presenting a refresh token that was already rotated away revokes the whole grant. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`.",
         "operationId": "oauth_token",
         "requestBody": {
           "description": "The token request.",

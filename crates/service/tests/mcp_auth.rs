@@ -2959,7 +2959,7 @@ async fn expire_access_token(path: &std::path::Path, grant: i64) {
         Err(err)
             if err
                 .to_string()
-                .contains("multiprocess WAL is not supported") =>
+                .contains("experimental multiprocess WAL is not supported") =>
         {
             turso::Builder::new_local(&name).build().await.unwrap()
         }

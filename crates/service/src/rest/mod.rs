@@ -760,7 +760,7 @@ pub fn router(state: RestState) -> Router {
         .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
         .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
         // The caller's own OAuth grants - the clients connected through
-        // `/oauth/authorize` - on the exact settlement the two routes above
+        // `/oauth/authorize` - on the exact settlement the token routes above
         // carry: self-service, every account included, served on a
         // read-only instance because a grant is account state rather than
         // knowledge. Revoking deletes the row outright, so both of its

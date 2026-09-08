@@ -1204,7 +1204,7 @@ function RevealDialog({
  * connected, since when, when it last used the connection, when its refresh
  * token expires, and a way to revoke it.
  *
- * Absent entirely on an instance that has never turned `auth.oauth` on -
+ * Absent entirely on an instance where `auth.oauth` resolves off -
  * `capabilities.oauth`, the probe's own rendering signal, the same role
  * `canShare` plays for the share surfaces - the same call `SsoIdentityCard`
  * makes for a feature this instance does not have: a card offering to manage

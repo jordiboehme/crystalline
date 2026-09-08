@@ -2708,7 +2708,7 @@ impl AuthStore {
         let removed = self
             .conn
             .execute(
-                "DELETE FROM oauth_grants WHERE refresh_expires_at < ?1",
+                "DELETE FROM oauth_grants WHERE refresh_expires_at <= ?1",
                 vec![Value::Integer(now)],
             )
             .await
@@ -2770,16 +2770,18 @@ impl AuthStore {
     /// endpoint enforces and for the settings surface that reports it.
     pub async fn count_oauth_clients(&self) -> Result<usize> {
         let _guard = self.guard.lock().await;
-        Ok(
-            match self
-                .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
-                .await?
-                .map(|row| row.get_value(0))
-            {
-                Some(Ok(Value::Integer(n))) => n as usize,
-                _ => 0,
-            },
-        )
+        // A count this method cannot read fails the call rather than reading
+        // as an empty table: the one caller is the ceiling on registration,
+        // the only unauthenticated write here, and a zero there would admit
+        // the very row the ceiling exists to refuse.
+        match self
+            .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
+            .await?
+            .map(|row| row.get_value(0))
+        {
+            Some(Ok(Value::Integer(n))) => Ok(n as usize),
+            _ => bail!("the oauth client registrations could not be counted"),
+        }
     }
 
     /// Issue a grant: one row carrying an access token good for an hour and a
@@ -3041,9 +3043,11 @@ impl AuthStore {
     /// be replayed here, and no branch in Rust can forget to check.
     ///
     /// Stamps `last_used` on a hit, and prunes any grant whose account is gone
-    /// on every call - the same defense in depth `mcp_token_user` applies to
-    /// tokens, for a row reached by some path the issuing transaction does not
-    /// cover.
+    /// on every call that reaches the statement - the same defense in depth
+    /// `mcp_token_user` applies to tokens, for a row reached by some path the
+    /// issuing transaction does not cover. A call naming an empty resource
+    /// returns before it, since such a call could never have matched a grant
+    /// anyway.
     pub async fn oauth_access_user(&self, token: &str, resource: &str) -> Result<Option<User>> {
         let hash = token_hash(token);
         let resource = normalize_resource(resource);

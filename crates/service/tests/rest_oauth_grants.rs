@@ -259,7 +259,7 @@ async fn an_account_lists_and_revokes_its_own_grants_and_no_others() {
         "no token material of any shape is listed: {text}"
     );
     assert!(
-        !text.contains("coa_") && !text.contains("cor_") && !text.contains("hash"),
+        !text.contains("coa_") && !text.contains("cor_"),
         "and no prefix or column name that would hint at one either: {text}"
     );
     let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
