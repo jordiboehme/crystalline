@@ -2839,6 +2839,7 @@ mod tests {
             verifier: PkceCodeVerifier::new("v".repeat(43)),
             redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
             link_for: None,
+            return_to: None,
             started: Instant::now(),
         };
         // The tab somebody opened and walked away from, at the front and live.
