@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register`, `/oauth/authorize` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register`, `/oauth/authorize`, `/oauth/token` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -5977,6 +5977,89 @@
         }
       }
     },
+    "/api/v1/oauth/token": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Exchange an authorization code, or rotate a refresh token.",
+        "description": "The token endpoint the metadata advertises, form-encoded in and JSON out. `grant_type=authorization_code` takes the single-use `code` the consent screen issued, the `redirect_uri` it was issued for, the PKCE `code_verifier` and the `client_id`; `grant_type=refresh_token` takes a `refresh_token` and the `client_id`. Both may name a `resource`, which must be this instance. The answer is an access token good for an hour and a refresh token good for thirty days; every refresh rotates both, and presenting a refresh token that was already rotated away revokes the whole grant. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`.",
+        "operationId": "oauth_token",
+        "requestBody": {
+          "description": "The token request.",
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The grant: an access token, its lifetime and the refresh token that mints the next pair.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not a form or a parameter is missing (`invalid_request`), the code or refresh token cannot be exchanged (`invalid_grant`), the `grant_type` is not served here (`unsupported_grant_type`), or the `resource` names another server (`invalid_target`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The `client_id` names no registration here (`invalid_client`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/openapi.json": {
       "get": {
         "tags": [
@@ -8575,6 +8658,98 @@
             "description": "A GitHub personal access token. Write-only: no response ever echoes it.",
             "example": "ghp_xxxxxxxxxxxxxxxxxxxx",
             "writeOnly": true
+          }
+        }
+      },
+      "TokenForm": {
+        "type": "object",
+        "description": "A token request, sent as `application/x-www-form-urlencoded`. Which members are required depends on `grant_type`: `authorization_code` takes `code`, `redirect_uri`, `code_verifier` and `client_id`, `refresh_token` takes `refresh_token` and `client_id`. `resource` is optional on both.",
+        "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The registration this request is made under. Required by both grant\ntypes.",
+            "example": "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The single-use code the consent screen issued, for\n`grant_type=authorization_code`."
+          },
+          "code_verifier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PKCE verifier: 43 to 128 unreserved characters whose `S256` is the\nchallenge the authorization was started with."
+          },
+          "grant_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`authorization_code` or `refresh_token`. Anything else is\n`unsupported_grant_type`.",
+            "example": "authorization_code"
+          },
+          "redirect_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The redirect uri the code was issued for, compared exactly. For a\nnative client that is the address it PRESENTED at the authorize leg -\nthe port it managed to bind - and not necessarily the one it\nregistered."
+          },
+          "refresh_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The refresh token to rotate, for `grant_type=refresh_token`."
+          },
+          "resource": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which resource the token is for (RFC 8707): absent, or this instance's\nown identifier, a trailing slash tolerated.",
+            "example": "https://kb.example"
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "description": "What a successful token request answers: RFC 6749 section 5.1, with the two\nmembers this server always sends and none of the ones it has no use for.\n\nNo `scope`, because a grant here is the whole account's rights until it is\nrevoked and there was never anything to narrow; no `id_token`, because this\nis not OpenID Connect and the account a token acts for is a fact of this\ninstance rather than a claim about a person.\n\n`Debug` is written rather than derived: both tokens are live credentials the\nmoment this struct exists, and a derived one is a single `tracing` call away\nfrom putting them in a file.",
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in",
+          "refresh_token"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "The bearer token an MCP request presents. `coa_` plus 64 hex, and the\nonly copy: the server keeps its sha256.",
+            "example": "coa_..."
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds the access token lives, which is an hour.",
+            "example": 3600,
+            "minimum": 0
+          },
+          "refresh_token": {
+            "type": "string",
+            "description": "The token that mints the next pair. `cor_` plus 64 hex, good for thirty\ndays, and rotated by every use: the one presented is dead the moment\nthis one exists, and presenting it again revokes the whole grant.",
+            "example": "cor_..."
+          },
+          "token_type": {
+            "type": "string",
+            "description": "Always `Bearer`.",
+            "example": "Bearer"
           }
         }
       },

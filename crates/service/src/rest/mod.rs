@@ -41,7 +41,7 @@ pub use error::{
 };
 pub use oauth::{
     AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
-    MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, OauthError, OauthServer, OriginRule,
+    MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,
     PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
     RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
     well_known_routes,
@@ -73,7 +73,8 @@ use crate::scope::{DomainAccess, DomainRight};
                        being replaced, and account management needs an \
                        admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
                        `/auth/me`, `/auth/setup`, `/auth/providers`, \
-                       `/oauth/register`, `/oauth/authorize` and the \
+                       `/oauth/register`, `/oauth/authorize`, \
+                       `/oauth/token` and the \
                        two `/auth/oidc/*` routes is closed by default: a \
                        request that \
                        carries no identity is answered 401 ahead of routing, so \
@@ -176,6 +177,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::decide,
         oauth_grants::list,
         oauth_grants::revoke,
+        oauth::token,
         identity_links::list,
         identity_links::unlink,
     ),
@@ -237,6 +239,8 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::Decision,
         oauth::DecisionResponse,
         OauthGrantInfo,
+        oauth::TokenForm,
+        oauth::TokenResponse,
     )),
 )]
 struct ApiDoc;
@@ -524,6 +528,18 @@ pub fn router(state: RestState) -> Router {
         .route(
             oauth::AUTHORIZATIONS_PATH,
             get(oauth::authorization).post(oauth::decide),
+        )
+        // The token endpoint, public by path for the reason the two routes
+        // above it are: the caller is a program that has never signed in here
+        // and never will - what it takes away from this route is what it
+        // authenticates with afterwards. It is NOT CSRF-exempt either, so a
+        // page on another origin cannot drive an exchange from a signed-in
+        // visitor's browser. Its own body limit, for the reason registration
+        // has one: an anonymous caller decides how much of it arrives, and the
+        // extractor has parsed the body before any rule in the handler runs.
+        .route(
+            oauth::TOKEN_PATH,
+            post(oauth::token).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
         )
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route

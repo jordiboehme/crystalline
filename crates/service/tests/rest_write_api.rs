@@ -2505,7 +2505,8 @@ fn canonicalize(path: &str) -> String {
 ///   read-only carve-out - is pinned by `tests/rest_setup_api.rs` instead,
 ///   which serves a deliberately account-less instance.
 ///
-/// The fourth is `POST /api/v1/oauth/register`, and it is exempt for a
+/// The fourth and fifth are `POST /api/v1/oauth/register` and
+/// `POST /api/v1/oauth/token`, and they are exempt for a
 /// different reason from all three: it is CSRF-protected exactly like every
 /// matrix row (a browser holding a session must echo its token, or the
 /// registration is refused 403), but it has no ROLE dimension for the matrix to
@@ -2516,6 +2517,13 @@ fn canonicalize(path: &str) -> String {
 /// limit, a stored-registration ceiling and a thirty-day prune, and those,
 /// together with its CSRF behaviour and its refusal on an instance with
 /// `auth.oauth` off, are pinned by `tests/oauth.rs`.
+///
+/// The token endpoint is the same case one leg later: it answers a program
+/// holding an authorization code, which every fixture account here would be
+/// answered identically for, because the account a grant is issued to comes off
+/// the code rather than off the caller. What bounds it is the PKCE verifier
+/// behind the challenge the authorization was started with, and that, the RFC
+/// 6749 refusals and the rotation rules are pinned by `tests/oauth.rs`.
 #[test]
 fn write_ops_covers_every_mutating_route_mounted() {
     use std::collections::BTreeSet;
@@ -2525,6 +2533,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/auth/logout",
         "POST /api/v1/auth/setup",
         "POST /api/v1/oauth/register",
+        "POST /api/v1/oauth/token",
     ];
 
     let mutating: BTreeSet<String> = support::MOUNTED_OPERATIONS

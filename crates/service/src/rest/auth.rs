@@ -129,7 +129,7 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// every other `POST`. This list is a path list, so it exempts both; the guard
 /// that matters for the second one lives in the handler rather than here, and
 /// that is the first thing to check when reading this exemption.
-const PUBLIC_PATHS: [&str; 9] = [
+const PUBLIC_PATHS: [&str; 10] = [
     LOGIN_PATH,
     "/auth/logout",
     "/auth/me",
@@ -147,6 +147,12 @@ const PUBLIC_PATHS: [&str; 9] = [
     // account, and it is guarded. Nothing is granted by this route. See
     // `super::oauth::authorize`.
     super::oauth::AUTHORIZE_PATH,
+    // Where the client comes back with the code a person just granted it. It
+    // has no session and never will: what it takes away from this route is the
+    // credential it authenticates with from then on, checked at the MCP gate.
+    // What proves it may have one is the PKCE verifier behind the challenge the
+    // authorization was started with. See `super::oauth::token`.
+    super::oauth::TOKEN_PATH,
 ];
 
 /// The three auth settings, resolved once when the HTTP surface is built.

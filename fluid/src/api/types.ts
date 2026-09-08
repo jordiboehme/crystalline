@@ -1183,6 +1183,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/oauth/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange an authorization code, or rotate a refresh token.
+         * @description The token endpoint the metadata advertises, form-encoded in and JSON out. `grant_type=authorization_code` takes the single-use `code` the consent screen issued, the `redirect_uri` it was issued for, the PKCE `code_verifier` and the `client_id`; `grant_type=refresh_token` takes a `refresh_token` and the `client_id`. Both may name a `resource`, which must be this instance. The answer is an access token good for an hour and a refresh token good for thirty days; every refresh rotates both, and presenting a refresh token that was already rotated away revokes the whole grant. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`.
+         */
+        post: operations["oauth_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/openapi.json": {
         parameters: {
             query?: never;
@@ -2501,6 +2521,85 @@ export interface components {
              * @example ghp_xxxxxxxxxxxxxxxxxxxx
              */
             token: string;
+        };
+        /** @description A token request, sent as `application/x-www-form-urlencoded`. Which members are required depends on `grant_type`: `authorization_code` takes `code`, `redirect_uri`, `code_verifier` and `client_id`, `refresh_token` takes `refresh_token` and `client_id`. `resource` is optional on both. */
+        TokenForm: {
+            /**
+             * @description The registration this request is made under. Required by both grant
+             *     types.
+             * @example coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0
+             */
+            client_id?: string | null;
+            /**
+             * @description The single-use code the consent screen issued, for
+             *     `grant_type=authorization_code`.
+             */
+            code?: string | null;
+            /**
+             * @description The PKCE verifier: 43 to 128 unreserved characters whose `S256` is the
+             *     challenge the authorization was started with.
+             */
+            code_verifier?: string | null;
+            /**
+             * @description `authorization_code` or `refresh_token`. Anything else is
+             *     `unsupported_grant_type`.
+             * @example authorization_code
+             */
+            grant_type?: string | null;
+            /**
+             * @description The redirect uri the code was issued for, compared exactly. For a
+             *     native client that is the address it PRESENTED at the authorize leg -
+             *     the port it managed to bind - and not necessarily the one it
+             *     registered.
+             */
+            redirect_uri?: string | null;
+            /** @description The refresh token to rotate, for `grant_type=refresh_token`. */
+            refresh_token?: string | null;
+            /**
+             * @description Which resource the token is for (RFC 8707): absent, or this instance's
+             *     own identifier, a trailing slash tolerated.
+             * @example https://kb.example
+             */
+            resource?: string | null;
+        };
+        /**
+         * @description What a successful token request answers: RFC 6749 section 5.1, with the two
+         *     members this server always sends and none of the ones it has no use for.
+         *
+         *     No `scope`, because a grant here is the whole account's rights until it is
+         *     revoked and there was never anything to narrow; no `id_token`, because this
+         *     is not OpenID Connect and the account a token acts for is a fact of this
+         *     instance rather than a claim about a person.
+         *
+         *     `Debug` is written rather than derived: both tokens are live credentials the
+         *     moment this struct exists, and a derived one is a single `tracing` call away
+         *     from putting them in a file.
+         */
+        TokenResponse: {
+            /**
+             * @description The bearer token an MCP request presents. `coa_` plus 64 hex, and the
+             *     only copy: the server keeps its sha256.
+             * @example coa_...
+             */
+            access_token: string;
+            /**
+             * Format: int64
+             * @description Seconds the access token lives, which is an hour.
+             * @example 3600
+             */
+            expires_in: number;
+            /**
+             * @description The token that mints the next pair. `cor_` plus 64 hex, good for thirty
+             *     days, and rotated by every use: the one presented is dead the moment
+             *     this one exists, and presenting it again revokes the whole grant.
+             * @example cor_...
+             */
+            refresh_token: string;
+            /**
+             * @description Always `Bearer`.
+             * @example Bearer
+             */
+            token_type: string;
         };
         /** @description The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry. */
         UploadedAttachment: {
@@ -7401,6 +7500,76 @@ export interface operations {
             };
             /** @description This instance is holding as many registrations as it will, and none are old enough to collect. */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+        };
+    };
+    oauth_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The token request. */
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": components["schemas"]["TokenForm"];
+            };
+        };
+        responses: {
+            /** @description The grant: an access token, its lifetime and the refresh token that mints the next pair. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description The body is not a form or a parameter is missing (`invalid_request`), the code or refresh token cannot be exchanged (`invalid_grant`), the `grant_type` is not served here (`unsupported_grant_type`), or the `resource` names another server (`invalid_target`). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description The `client_id` names no registration here (`invalid_client`). */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance does not serve OAuth: `auth.oauth` is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The accounts database could not be reached. */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

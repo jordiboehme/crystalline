@@ -44,9 +44,18 @@ const HOSTED_REDIRECT: &str = "https://claude.ai/api/mcp/auth_callback";
 const LOOPBACK_REDIRECT: &str = "http://127.0.0.1:33418/callback";
 
 /// RFC 7636's own example challenge: 43 characters of base64url, which is what
-/// the S256 of any verifier is. The verifier behind it belongs to the token
-/// endpoint; nothing here ever needs it, which is the point of PKCE.
+/// the S256 of any verifier is. Only the token endpoint ever needs the verifier
+/// behind it, which is the point of PKCE.
 const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+
+/// The verifier [`CHALLENGE`] is the S256 of, from the same appendix. What the
+/// client keeps to itself between the authorize leg and the exchange, and the
+/// whole of what it proves possession with.
+const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+/// A second, unrelated verifier of the right shape: what a client that lost its
+/// own would send, and what an interceptor holding only the code has.
+const OTHER_VERIFIER: &str = "sJ3nQ2hVv7Lm4Xp9Rt6Yb1Kd8Wc0Nz5Ae2Gf7Hj3Qs4";
 
 /// A running instance and everything a test needs to talk to it.
 struct OauthCtx {
@@ -310,6 +319,130 @@ impl OauthCtx {
             .await
             .unwrap()
     }
+
+    /// `POST /oauth/token` with `form` as an ordinary form body, which is the
+    /// one shape the endpoint takes. No cookies and no CSRF token: the caller
+    /// here is a program that has never seen this instance's UI.
+    ///
+    /// Encoded by hand rather than through `reqwest`'s own form helper, which
+    /// this workspace's feature set does not build, and by the same encoder the
+    /// authorize leg's query uses.
+    async fn token(&self, form: &[(&str, &str)]) -> reqwest::Response {
+        let body = form
+            .iter()
+            .map(|(name, value)| format!("{}={}", encoded(name), encoded(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.token_body("application/x-www-form-urlencoded", &body)
+            .await
+    }
+
+    /// The same request from a browser that holds a session, with or without
+    /// the CSRF token that session's unsafe requests owe.
+    async fn token_as(
+        &self,
+        form: &[(&str, &str)],
+        session: &Session,
+        csrf: bool,
+    ) -> reqwest::Response {
+        let body = form
+            .iter()
+            .map(|(name, value)| format!("{}={}", encoded(name), encoded(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let mut request = self
+            .client
+            .post(self.url("/oauth/token"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(reqwest::header::COOKIE, session.cookie_header())
+            .body(body);
+        if csrf {
+            request = request.header("x-csrf-token", session.csrf.clone());
+        }
+        request.send().await.unwrap()
+    }
+
+    /// The same endpoint reached with a body of the test's own choosing, for
+    /// the shapes a form encoder cannot produce.
+    async fn token_body(&self, content_type: &str, body: &str) -> reqwest::Response {
+        self.client
+            .post(self.url("/oauth/token"))
+            .header("content-type", content_type)
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// A registration, an authorization, a sign-in and an allow: everything up
+    /// to the moment a client holds an authorization code. Answers the client
+    /// id and the code.
+    async fn code_for(&self, account: &str, redirect_uri: &str) -> (String, String) {
+        self.code_presenting(account, redirect_uri, redirect_uri)
+            .await
+    }
+
+    /// The same, with the uri the client PRESENTS spelled apart from the one it
+    /// registered - which for a native client is the port it actually managed
+    /// to bind (RFC 8252 section 7.3).
+    async fn code_presenting(
+        &self,
+        account: &str,
+        registered: &str,
+        presented: &str,
+    ) -> (String, String) {
+        let client_id = self.register_ok(registered).await["client_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let started = self
+            .authorize(&[
+                ("response_type", "code"),
+                ("client_id", client_id.as_str()),
+                ("redirect_uri", presented),
+                ("code_challenge", CHALLENGE),
+                ("code_challenge_method", "S256"),
+            ])
+            .await;
+        assert_eq!(
+            started.status(),
+            302,
+            "a good authorization request lands on the consent page"
+        );
+        let request = request_id(&location(&started));
+        let session = self.sign_in(account).await;
+        let decided = self.decide(&request, &session, "allow").await;
+        assert_eq!(
+            decided.status(),
+            200,
+            "an allowed consent answers a location"
+        );
+        let body: Value = decided.json().await.unwrap();
+        (client_id, code_of(body["location"].as_str().unwrap()))
+    }
+
+    /// The parameters of an honest exchange of `code`, so the tests below
+    /// change one of them at a time rather than repeating six.
+    fn exchange_form<'a>(
+        &'a self,
+        client_id: &'a str,
+        code: &'a str,
+        redirect_uri: &'a str,
+    ) -> Vec<(&'a str, &'a str)> {
+        vec![
+            ("grant_type", "authorization_code"),
+            ("code", code),
+            ("redirect_uri", redirect_uri),
+            ("code_verifier", VERIFIER),
+            ("client_id", client_id),
+        ]
+    }
+
+    /// The domain this instance serves, on disk, for the one test that reads
+    /// back what an agent wrote through it.
+    fn domain_dir(&self) -> std::path::PathBuf {
+        self._tmp.path().join("eng")
+    }
 }
 
 /// A signed-in browser: the cookies it holds and the token its unsafe requests
@@ -414,6 +547,179 @@ async fn assert_oauth_error(response: reqwest::Response, status: u16, error: &st
         "a refusal says what is wrong: {body}"
     );
     body
+}
+
+/// The authorization code out of a consent answer's location, asserted to be
+/// the 32 random bytes it is specified as.
+fn code_of(location: &str) -> String {
+    let code = query_of(location)
+        .remove("code")
+        .unwrap_or_else(|| panic!("an allowed consent carries a code: {location}"));
+    assert!(
+        code.len() == 64 && code.chars().all(|c| c.is_ascii_hexdigit()),
+        "an authorization code is 32 random bytes: {code}"
+    );
+    code
+}
+
+/// The MCP handshake, from a client naming itself the way `mcp_auth.rs`'s does.
+fn initialize_body() -> String {
+    json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": { "name": "oauth-test", "version": "0.0.0" },
+        },
+    })
+    .to_string()
+}
+
+/// One raw HTTP/1.1 POST at the MCP endpoint root, presenting `token`.
+///
+/// Raw rather than through `reqwest` for the reason `mcp_auth.rs` gives: the
+/// transport answers a `text/event-stream` that stays open, so a client reading
+/// to EOF waits forever, and what a test wants is whatever arrived within a
+/// bounded window.
+///
+/// **The `Host` carries the port.** An OAuth access token is minted for the
+/// resource identifier this instance answers at, and that identifier is derived
+/// from the request's own `Host`; a header naming `127.0.0.1` alone would be a
+/// different resource, and a perfectly good token would be refused for it.
+async fn mcp_post(
+    addr: &SocketAddr,
+    body: &str,
+    headers: &[(&str, &str)],
+    token: Option<&str>,
+) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut request = format!(
+        "POST / HTTP/1.1\r\n\
+         Host: {addr}\r\n\
+         Content-Type: application/json\r\n\
+         Accept: application/json, text/event-stream\r\n\
+         Connection: close\r\n"
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    if let Some(token) = token {
+        request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+    }
+    request.push_str(&format!("Content-Length: {}\r\n\r\n{body}", body.len()));
+    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.flush().await;
+
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(2500);
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match tokio::time::timeout(remaining, stream.read(&mut chunk)).await {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+            Ok(Err(_)) => break,
+            Err(_) => break,
+        }
+    }
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Whether the MCP gate served a handshake presenting `token`, which is the
+/// whole question an access token answers.
+async fn mcp_opens(addr: &SocketAddr, token: &str) -> bool {
+    let answer = mcp_post(addr, &initialize_body(), &[], Some(token)).await;
+    if answer.starts_with("HTTP/1.1 200 ") {
+        return true;
+    }
+    assert!(
+        answer.starts_with("HTTP/1.1 401 "),
+        "a token either opens a session or is refused at the gate:\n{answer}"
+    );
+    false
+}
+
+/// An MCP session opened with an OAuth access token, and the tool calls made on
+/// it.
+struct McpSession {
+    addr: SocketAddr,
+    session: String,
+    token: String,
+}
+
+impl McpSession {
+    /// Handshake presenting `token`, then send the `notifications/initialized`
+    /// a client owes the session before its first call.
+    async fn open(addr: &SocketAddr, token: &str) -> McpSession {
+        let handshake = mcp_post(addr, &initialize_body(), &[], Some(token)).await;
+        assert!(
+            handshake.starts_with("HTTP/1.1 200 "),
+            "an access token from the flow opens a session:\n{handshake}"
+        );
+        let session = header_of(&handshake, "mcp-session-id");
+        let ready = mcp_post(
+            addr,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            &[("Mcp-Session-Id", session.as_str())],
+            Some(token),
+        )
+        .await;
+        assert!(
+            ready.starts_with("HTTP/1.1 2"),
+            "the initialized notification must be accepted:\n{ready}"
+        );
+        McpSession {
+            addr: *addr,
+            session,
+            token: token.to_string(),
+        }
+    }
+
+    /// Call `tool` on this session, handing back the raw response bytes.
+    async fn call_tool(&self, tool: &str, arguments: Value) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        })
+        .to_string();
+        mcp_post(
+            &self.addr,
+            &body,
+            &[("Mcp-Session-Id", self.session.as_str())],
+            Some(&self.token),
+        )
+        .await
+    }
+}
+
+/// One header out of a raw response head, case-insensitively.
+fn header_of(raw: &str, name: &str) -> String {
+    for line in raw.split("\r\n") {
+        if let Some((header, value)) = line.split_once(':')
+            && header.trim().eq_ignore_ascii_case(name)
+        {
+            return value.trim().to_string();
+        }
+    }
+    panic!("no {name} header in response:\n{raw}");
+}
+
+/// The `Cache-Control` a response carries, which for everything this endpoint
+/// answers has to be `no-store`.
+fn cache_control(response: &reqwest::Response) -> Option<&str> {
+    response
+        .headers()
+        .get(reqwest::header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
 }
 
 /// **A client registers as a public client and is handed no secret.**
@@ -1650,4 +1956,669 @@ async fn authorizing_is_gone_while_oauth_is_off() {
 
     assert_eq!(ctx.consent("whatever", Some(&ada)).await.status(), 404);
     assert_eq!(ctx.decide("whatever", &ada, "allow").await.status(), 404);
+
+    // The token endpoint too, and in the mount's shape rather than an OAuth
+    // error: no registered code means "no such endpoint", and the reader of
+    // this one is the operator who can turn the key on.
+    let refused = ctx
+        .token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "cor_whatever"),
+            ("client_id", "coc_0000000000000000000000000000dead"),
+        ])
+        .await;
+    assert_eq!(refused.status(), 404);
+    assert_eq!(
+        refused
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok()),
+        Some("application/problem+json"),
+    );
+    let body: Value = refused.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("auth.oauth"),
+        "{body}"
+    );
+}
+
+/// **The whole flow, from a client nobody had heard of to an MCP session that
+/// writes as the person who consented.**
+///
+/// Every leg in one test on purpose: registration, an authorization, a person
+/// signing in and pressing Allow, an exchange with the PKCE verifier, and then
+/// the thing all of it exists for - an agent calling a tool over MCP and the
+/// engram it writes naming the account that granted it. Six endpoints hold that
+/// chain, and a test per endpoint would let any pair of them agree on the wrong
+/// thing while each passed its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_full_flow_ends_in_an_mcp_session_as_the_consenting_account() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+
+    // Wound back to 2020 between the two stamps, so that what the exchange
+    // does to `last_used` is visible: the allow above already stamped it, and
+    // an assertion that it is merely `Some` would pass with the exchange's own
+    // stamp deleted. Nothing prunes in between - `prune_registrations` runs at
+    // a registration and at startup, and there is no registration below here.
+    ctx.age_client(&client_id).await;
+
+    let exchanged = ctx
+        .token(&[
+            ("grant_type", "authorization_code"),
+            ("code", code.as_str()),
+            ("redirect_uri", HOSTED_REDIRECT),
+            ("code_verifier", VERIFIER),
+            ("client_id", client_id.as_str()),
+            // RFC 8707: the client names what it wants a token for, and this
+            // instance mints for itself alone.
+            ("resource", ctx.origin().as_str()),
+        ])
+        .await;
+    assert_eq!(exchanged.status(), 200, "the exchange is served");
+    assert_eq!(
+        cache_control(&exchanged),
+        Some("no-store"),
+        "a token answer is never cached anywhere"
+    );
+    let body: Value = exchanged.json().await.unwrap();
+    let access = body["access_token"].as_str().unwrap().to_string();
+    let refresh = body["refresh_token"].as_str().unwrap().to_string();
+    assert!(
+        access.starts_with("coa_")
+            && access.len() == 4 + 64
+            && access[4..].chars().all(|c| c.is_ascii_hexdigit()),
+        "an access token is the crystalline oauth access prefix plus 32 random bytes: {access}"
+    );
+    assert!(
+        refresh.starts_with("cor_")
+            && refresh.len() == 4 + 64
+            && refresh[4..].chars().all(|c| c.is_ascii_hexdigit()),
+        "and a refresh token its own prefix: {refresh}"
+    );
+    assert_eq!(body["token_type"], "Bearer");
+    assert_eq!(
+        body["expires_in"], 3600,
+        "one hour, as the metadata promises"
+    );
+    assert!(
+        body.get("scope").is_none() && body.get("id_token").is_none(),
+        "there is nothing to narrow and no identity token here: {body}"
+    );
+
+    // The grant is ada's, at this registration, and there is exactly one of it.
+    let grants = ctx.auth.list_oauth_grants("ada").await.unwrap();
+    assert_eq!(grants.len(), 1, "one consent is one grant");
+    assert_eq!(grants[0].client_id, client_id);
+
+    // The registration was used, so it is on the thirty-day clock rather than
+    // the one-hour one - and it was used by THIS exchange, not only by the
+    // consent that preceded it.
+    let registration = ctx.auth.oauth_client(&client_id).await.unwrap().unwrap();
+    let last_used = registration.last_used.unwrap();
+    assert!(
+        !last_used.starts_with("2020"),
+        "issuing a grant is a registration being used: {last_used}"
+    );
+
+    // And now the thing the whole flow is for.
+    let session = McpSession::open(&ctx.addr, &access).await;
+    let answer = session
+        .call_tool(
+            "write_engram",
+            json!({
+                "domain": "eng",
+                "title": "Oauth Trace",
+                "content": "- [fact] traced",
+            }),
+        )
+        .await;
+    assert!(
+        answer.contains("\"result\""),
+        "the write must be served, not refused:\n{answer}"
+    );
+    let written = std::fs::read_to_string(ctx.domain_dir().join("oauth-trace.md")).unwrap();
+    assert!(
+        written.contains("for-ada"),
+        "the provenance names the account that consented: {written}"
+    );
+    assert!(
+        written.contains("oauth-test"),
+        "and still names the client that asked: {written}"
+    );
+}
+
+/// **A wrong verifier, a code presented twice, a foreign redirect uri and
+/// another client's code are one answer: `invalid_grant`.**
+///
+/// The four ways an authorization code can be presented by something that
+/// should not have it, and they are deliberately indistinguishable. A caller
+/// holding an intercepted code learns nothing about why it did not work, and
+/// every one of them spends the code, so a second guess is a second flow.
+#[tokio::test]
+async fn a_wrong_verifier_a_reused_code_and_a_foreign_redirect_are_invalid_grant() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+
+    // A code intercepted without its verifier is worth nothing, which is the
+    // whole of what PKCE buys a public client.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let mut form = ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT);
+    form[3] = ("code_verifier", OTHER_VERIFIER);
+    let wrong_verifier = assert_oauth_error(ctx.token(&form).await, 400, "invalid_grant").await;
+    // And the attempt spent the code: the take happens before anything is
+    // checked, so one guess is all a wrong verifier gets.
+    let after_guess = assert_oauth_error(
+        ctx.token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+            .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    assert_eq!(
+        wrong_verifier, after_guess,
+        "and the two refusals read alike, so a guess cannot be told from a spent code"
+    );
+
+    // A code is single use. The honest exchange works once and never again.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let first = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await;
+    assert_eq!(first.status(), 200, "the first exchange is served");
+    let reused = assert_oauth_error(
+        ctx.token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+            .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    // A code nobody ever issued reads exactly the same.
+    let never_issued = assert_oauth_error(
+        ctx.token(&ctx.exchange_form(&client_id, &"a".repeat(64), HOSTED_REDIRECT))
+            .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    assert_eq!(
+        reused, never_issued,
+        "spent, expired and never-issued are one answer: telling them apart is a hint"
+    );
+
+    // The port is forgiven ONCE, at the authorize leg. A native client that
+    // bound :51902 and authorized on it cannot then collect the token by naming
+    // the port it happened to register.
+    let (client_id, code) = ctx
+        .code_presenting("ada", LOOPBACK_REDIRECT, "http://127.0.0.1:51902/callback")
+        .await;
+    assert_oauth_error(
+        ctx.token(&ctx.exchange_form(&client_id, &code, LOOPBACK_REDIRECT))
+            .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+
+    // Another registration's redirect uri, presented against this code.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    assert_oauth_error(
+        ctx.token(&ctx.exchange_form(
+            &client_id,
+            &code,
+            "https://claude.com/api/mcp/auth_callback",
+        ))
+        .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+
+    // A registration this server does hold, presenting a code issued to
+    // another one. Registered, so not `invalid_client`: it is a perfectly good
+    // client with a grant that is none of its business.
+    let (own_client, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let other_client = ctx
+        .register_ok("https://claude.com/api/mcp/auth_callback")
+        .await["client_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ne!(own_client, other_client);
+    assert_oauth_error(
+        ctx.token(&ctx.exchange_form(&other_client, &code, HOSTED_REDIRECT))
+            .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+
+    // Nothing above granted anything.
+    assert_eq!(
+        ctx.auth.list_oauth_grants("ada").await.unwrap().len(),
+        1,
+        "only the one honest exchange above left a grant"
+    );
+}
+
+/// **A refresh rotates both tokens, and the predecessor coming back revokes the
+/// whole grant.**
+///
+/// Rotation is what makes a thirty-day refresh token survivable: the one a
+/// client holds is only ever the newest, and a copy of the previous one turning
+/// up is proof that a copy exists. The answer to that is not to refuse the
+/// request - it is to stop the grant, because the legitimate client and the
+/// thief are now indistinguishable and only one of them can be locked out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refresh_rotates_and_the_old_token_replays_into_a_revoked_grant() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let first: Value = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let access_one = first["access_token"].as_str().unwrap().to_string();
+    let refresh_one = first["refresh_token"].as_str().unwrap().to_string();
+    assert!(mcp_opens(&ctx.addr, &access_one).await);
+
+    // Wound back, so the rotation's own stamp is what the assertion below
+    // reads rather than the exchange's. See the full-flow test.
+    ctx.age_client(&client_id).await;
+
+    let rotated = ctx
+        .token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_one.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .await;
+    assert_eq!(rotated.status(), 200);
+    assert_eq!(cache_control(&rotated), Some("no-store"));
+    let second: Value = rotated.json().await.unwrap();
+    let access_two = second["access_token"].as_str().unwrap().to_string();
+    let refresh_two = second["refresh_token"].as_str().unwrap().to_string();
+    assert_ne!(access_one, access_two, "a rotation moves both credentials");
+    assert_ne!(refresh_one, refresh_two);
+    assert_eq!(second["expires_in"], 3600, "and the hour starts again");
+    assert_eq!(
+        ctx.auth.list_oauth_grants("ada").await.unwrap().len(),
+        1,
+        "a refresh moves one grant along rather than forking it"
+    );
+    let last_used = ctx
+        .auth
+        .oauth_client(&client_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .last_used
+        .unwrap();
+    assert!(
+        !last_used.starts_with("2020"),
+        "a rotation is a registration being used, and buys it another thirty days: {last_used}"
+    );
+
+    // The predecessor's access token stops at the rotation, and the successor's
+    // works.
+    assert!(!mcp_opens(&ctx.addr, &access_one).await);
+    assert!(mcp_opens(&ctx.addr, &access_two).await);
+
+    // Now the leak: the token that was rotated away comes back.
+    let replayed = assert_oauth_error(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_one.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    assert!(
+        ctx.auth.list_oauth_grants("ada").await.unwrap().is_empty(),
+        "a replayed refresh token revokes the grant it belonged to"
+    );
+    assert!(
+        !mcp_opens(&ctx.addr, &access_two).await,
+        "which stops the live access token too, in the same instant"
+    );
+
+    // And the client that was doing everything right is now refused in exactly
+    // the same words as the thief. There is no way to tell them apart, so
+    // there is no way to answer them differently.
+    let after = assert_oauth_error(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_two.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    assert_eq!(replayed, after, "a replay never announces itself");
+
+    // A refresh token nobody ever issued reads the same again.
+    let invented = assert_oauth_error(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            (
+                "refresh_token",
+                "cor_0000000000000000000000000000000000000000000000000000000000000000",
+            ),
+            ("client_id", client_id.as_str()),
+        ])
+        .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    assert_eq!(replayed, invented);
+}
+
+/// **A token asked for another server is `invalid_target`, and a client this
+/// server never registered is `invalid_client`.**
+///
+/// Plus the shape rules of the endpoint itself, which are the same three
+/// refusals RFC 6749 section 5.2 names: a body that is not a form, a grant type
+/// this server does not serve, and a request missing a parameter its grant
+/// type needs.
+#[tokio::test]
+async fn a_foreign_resource_at_exchange_is_invalid_target_and_an_unknown_client_is_invalid_client()
+{
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+
+    // An unknown client id is refused BEFORE the code is looked up, so a caller
+    // guessing client ids cannot burn somebody else's code mid-flow. The proof
+    // is that the honest exchange still works afterwards.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let mut stranger = ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT);
+    stranger[4] = ("client_id", "coc_0000000000000000000000000000dead");
+    assert_oauth_error(ctx.token(&stranger).await, 401, "invalid_client").await;
+    let survived = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await;
+    assert_eq!(
+        survived.status(),
+        200,
+        "the code was never taken, so the client it belongs to can still spend it"
+    );
+
+    // RFC 8707: this server mints for itself and nothing else.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let mut foreign = ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT);
+    foreign.push(("resource", "https://knowledge.example"));
+    assert_oauth_error(ctx.token(&foreign).await, 400, "invalid_target").await;
+
+    // A trailing slash is the one spelling difference tolerated, because a
+    // person typing an address into a client adds or omits one without meaning
+    // anything by it.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let mut slashed = ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT);
+    let with_slash = format!("{}/", ctx.origin());
+    slashed.push(("resource", with_slash.as_str()));
+    assert_eq!(ctx.token(&slashed).await.status(), 200);
+
+    // A refresh asking for another server's resource is refused the same way.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let issued: Value = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let refresh = issued["refresh_token"].as_str().unwrap().to_string();
+    assert_oauth_error(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.as_str()),
+            ("client_id", client_id.as_str()),
+            ("resource", "https://knowledge.example"),
+        ])
+        .await,
+        400,
+        "invalid_target",
+    )
+    .await;
+    // Refused rather than rotated: the grant is untouched and the token still
+    // works.
+    assert_eq!(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh.as_str()),
+            ("client_id", client_id.as_str()),
+        ])
+        .await
+        .status(),
+        200,
+    );
+
+    // A body that is not a form at all. Both of these reach axum as a rejection
+    // rather than the handler, and both come back as the one error an OAuth
+    // client can read.
+    for (content_type, body) in [
+        ("text/plain", "grant_type=refresh_token"),
+        ("application/json", r#"{"grant_type":"refresh_token"}"#),
+        (
+            "application/x-www-form-urlencoded",
+            "grant_type=refresh_token&grant_type",
+        ),
+    ] {
+        assert_oauth_error(
+            ctx.token_body(content_type, body).await,
+            400,
+            "invalid_request",
+        )
+        .await;
+    }
+
+    // A grant type this server does not serve, and none at all.
+    assert_oauth_error(
+        ctx.token(&[("grant_type", "client_credentials"), ("client_id", "coc_x")])
+            .await,
+        400,
+        "unsupported_grant_type",
+    )
+    .await;
+    assert_oauth_error(
+        ctx.token(&[("client_id", "coc_x")]).await,
+        400,
+        "invalid_request",
+    )
+    .await;
+
+    // Every parameter a grant type needs, left out one at a time.
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    for missing in ["code", "redirect_uri", "code_verifier", "client_id"] {
+        let form: Vec<(&str, &str)> = ctx
+            .exchange_form(&client_id, &code, HOSTED_REDIRECT)
+            .into_iter()
+            .filter(|(name, _)| *name != missing)
+            .collect();
+        assert_oauth_error(ctx.token(&form).await, 400, "invalid_request").await;
+    }
+    for missing in ["refresh_token", "client_id"] {
+        let form: Vec<(&str, &str)> = vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", "cor_whatever"),
+            ("client_id", client_id.as_str()),
+        ]
+        .into_iter()
+        .filter(|(name, _)| *name != missing)
+        .collect();
+        assert_oauth_error(ctx.token(&form).await, 400, "invalid_request").await;
+    }
+    // None of which spent the code, because none of them was a request this
+    // server could act on.
+    assert_eq!(
+        ctx.token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+            .await
+            .status(),
+        200,
+    );
+}
+
+/// **Nothing the token endpoint answers may be stored, and nothing it is
+/// handed may be logged.**
+///
+/// Two properties with one cause: every value on this endpoint is a credential.
+/// A cached token answer is a credential in a proxy, and a code, a verifier or
+/// a token in a log line is a credential in a file somebody ships to a support
+/// address. What an operator actually needs is the category of the refusal and
+/// which client caused it, and that is exactly what is there.
+#[tokio::test]
+async fn token_answers_are_uncacheable_and_carry_no_secret_in_a_log() {
+    let (logs, _guard) = support::capture_logs();
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+
+    let granted = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await;
+    assert_eq!(cache_control(&granted), Some("no-store"));
+    let body: Value = granted.json().await.unwrap();
+    let access = body["access_token"].as_str().unwrap().to_string();
+    let refresh = body["refresh_token"].as_str().unwrap().to_string();
+
+    // One refusal of each shape this endpoint answers, and every one of them
+    // uncacheable too: a refusal carries the code that was presented in the
+    // request it answers, and a shared cache keying on that would be a way to
+    // read one.
+    let mut refusals = vec![
+        // spent code
+        ctx.token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+            .await,
+        // no grant type
+        ctx.token(&[("client_id", client_id.as_str())]).await,
+        // a grant type this server does not serve
+        ctx.token(&[
+            ("grant_type", "password"),
+            ("client_id", client_id.as_str()),
+        ])
+        .await,
+    ];
+    let (other_client, other_code) = ctx
+        .code_for("ada", "https://claude.com/api/mcp/auth_callback")
+        .await;
+    let mut unknown = ctx.exchange_form(
+        &other_client,
+        &other_code,
+        "https://claude.com/api/mcp/auth_callback",
+    );
+    unknown[4] = ("client_id", "coc_0000000000000000000000000000dead");
+    refusals.push(ctx.token(&unknown).await);
+    let mut foreign = ctx.exchange_form(
+        &other_client,
+        &other_code,
+        "https://claude.com/api/mcp/auth_callback",
+    );
+    foreign.push(("resource", "https://knowledge.example"));
+    refusals.push(ctx.token(&foreign).await);
+    for refused in &refusals {
+        assert!(refused.status().is_client_error(), "{:?}", refused.status());
+        assert_eq!(
+            cache_control(refused),
+            Some("no-store"),
+            "a refusal is no more cacheable than a grant"
+        );
+    }
+
+    // Nothing secret reached a log line - not the code, not the verifier, not
+    // either token, and not the challenge they were bound to.
+    let lines = logs.lines().join("\n");
+    for secret in [
+        code.as_str(),
+        other_code.as_str(),
+        access.as_str(),
+        refresh.as_str(),
+        VERIFIER,
+        CHALLENGE,
+    ] {
+        assert!(
+            !lines.contains(secret),
+            "a secret reached the log: {secret}\n{lines}"
+        );
+    }
+    // And what an operator does need is there: the category and the client.
+    assert!(
+        logs.any_contains("a token request was refused"),
+        "every refusal is logged once, in one place:\n{lines}"
+    );
+    assert!(
+        logs.any_contains("invalid_grant") && logs.any_contains("unsupported_grant_type"),
+        "naming the category rather than the request:\n{lines}"
+    );
+    assert!(
+        logs.any_contains(&client_id),
+        "and the registration to look at:\n{lines}"
+    );
+}
+
+/// **The token endpoint is reachable with no session and refuses to be ridden
+/// from another origin's browser.**
+///
+/// The same pair of properties registration has, one leg later and for the same
+/// reason. It is pre-session by necessity - the caller is a program holding a
+/// code, and what it takes away is the credential it authenticates with
+/// afterwards - so it is public by path. What it is not is CSRF-exempt: a
+/// browser that happens to hold a session still echoes its token, so a page on
+/// another origin cannot drive an exchange from a signed-in visitor's browser
+/// and read the tokens out of the answer.
+///
+/// Driven on a refresh token rather than a code, because a code is spent by the
+/// first attempt and the three legs have to be the same request three times.
+#[tokio::test]
+async fn the_token_endpoint_needs_no_session_and_is_not_csrf_exempt() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let issued: Value = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let mut refresh = issued["refresh_token"].as_str().unwrap().to_string();
+    let session = ctx.sign_in("ada").await;
+
+    fn rotate<'a>(refresh: &'a str, client_id: &'a str) -> Vec<(&'a str, &'a str)> {
+        vec![
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh),
+            ("client_id", client_id),
+        ]
+    }
+
+    let ridden = ctx
+        .token_as(&rotate(&refresh, &client_id), &session, false)
+        .await;
+    assert_eq!(
+        ridden.status(),
+        403,
+        "a browser's token request carries the session's CSRF token or nothing is issued"
+    );
+
+    let with_token = ctx
+        .token_as(&rotate(&refresh, &client_id), &session, true)
+        .await;
+    assert_eq!(with_token.status(), 200);
+    let rotated: Value = with_token.json().await.unwrap();
+    refresh = rotated["refresh_token"].as_str().unwrap().to_string();
+
+    // And the ordinary case: no cookie, no token, no account anywhere. This is
+    // what every real client is.
+    let anonymous = ctx.token(&rotate(&refresh, &client_id)).await;
+    assert_eq!(anonymous.status(), 200);
+
+    // The refused leg rotated nothing, so ada still has exactly the one grant
+    // the two served ones moved along.
+    assert_eq!(ctx.auth.list_oauth_grants("ada").await.unwrap().len(), 1);
 }

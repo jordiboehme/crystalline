@@ -96,10 +96,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
+use axum::extract::rejection::FormRejection;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use axum::{Json, Router};
+use axum::{Form, Json, Router};
 use crystalline_core::config::GlobalConfig;
 use openidconnect::url::{Host, Url};
 use serde_json::{Value, json};
@@ -207,6 +208,40 @@ const AUTH_METHOD_NONE: &str = "none";
 /// room to spare for anything legitimate and a 160th of what an anonymous
 /// caller could otherwise make this process parse.
 pub const MAX_REGISTER_BYTES: usize = 64 * 1024;
+
+/// How large a token request body may be, in bytes.
+///
+/// Its own limit for [`MAX_REGISTER_BYTES`]'s reason, and a smaller one because
+/// the largest legal token request is a 2048-character redirect uri beside a
+/// 128-character verifier, a client id, a code and a resource: under three
+/// kilobytes with everything at its maximum. Eight is room to spare and a
+/// twelve-hundredth of the mount's ceiling, which matters because this route,
+/// like registration, is reachable by anyone who can reach the port.
+pub const MAX_TOKEN_BYTES: usize = 8 * 1024;
+
+/// The one token type this server issues. An opaque bearer token: the whole of
+/// what a client does with it is put it in an `Authorization` header.
+const BEARER: &str = "Bearer";
+
+/// What every refusal on the authorization-code path says.
+///
+/// One constant rather than a sentence per case, so an unknown code, a spent
+/// one, an expired one, one bound to another client or another redirect uri and
+/// one presented without its verifier are byte-identical answers. See
+/// [`OauthError::invalid_grant`].
+const BAD_CODE: &str = "this authorization code cannot be exchanged: it is unknown, already spent, \
+                        past its minute, bound to a different client or redirect uri, or was \
+                        presented without the code_verifier behind its challenge - start the \
+                        authorization again";
+
+/// The same, for the refresh grant. A replayed token and an unknown one read
+/// alike on purpose: the client that presents a rotated token has already lost
+/// the grant by the time it reads this, and saying so would tell whoever stole
+/// it that the theft was noticed.
+const BAD_REFRESH: &str = "this refresh token cannot be exchanged: it is unknown, past its thirty \
+                           days, presented under a different client, or was rotated away already, \
+                           in which case the grant it belonged to has been revoked - authorize \
+                           again";
 
 /// How long a started authorization waits for a person to decide.
 ///
@@ -618,6 +653,43 @@ impl OauthError {
             "invalid_client_metadata",
             description,
         )
+    }
+
+    /// The code or refresh token presented is not one this server will act on:
+    /// unknown, spent, expired, replayed, bound to another client or another
+    /// redirect uri, or presented without the secret behind its challenge.
+    ///
+    /// **One error for all of them, and the description is a constant rather
+    /// than a sentence per case.** Telling a caller which of those it was is
+    /// telling it whether the value it holds ever meant anything, which is the
+    /// one thing somebody guessing wants to know.
+    pub fn invalid_grant(description: impl Into<String>) -> OauthError {
+        OauthError::new(StatusCode::BAD_REQUEST, "invalid_grant", description)
+    }
+
+    /// A `grant_type` this server does not serve. It serves two.
+    pub fn unsupported_grant_type(description: impl Into<String>) -> OauthError {
+        OauthError::new(
+            StatusCode::BAD_REQUEST,
+            "unsupported_grant_type",
+            description,
+        )
+    }
+
+    /// RFC 8707: a token was asked for a resource that is not this one.
+    pub fn invalid_target(description: impl Into<String>) -> OauthError {
+        OauthError::new(StatusCode::BAD_REQUEST, "invalid_target", description)
+    }
+
+    /// The `client_id` names no registration here.
+    ///
+    /// `401` per RFC 6749 section 5.2, and with no `WWW-Authenticate` beside
+    /// it: every client on this surface is a public one registered with
+    /// `token_endpoint_auth_method: "none"`, so there is no scheme to
+    /// challenge with and a header naming one would send a client looking for
+    /// a secret it was never issued.
+    pub fn invalid_client(description: impl Into<String>) -> OauthError {
+        OauthError::new(StatusCode::UNAUTHORIZED, "invalid_client", description)
     }
 
     /// The burst is spent; come back in `seconds`.
@@ -1281,6 +1353,43 @@ fn sha256_hex(value: &str) -> String {
     crystalline_index::hex_lower(&hasher.finalize())
 }
 
+/// Whether `verifier` is the secret behind `challenge`: RFC 7636's `S256`,
+/// which is `base64url(sha256(verifier))` with no padding.
+///
+/// This is the entire proof a public client gives at the token endpoint. It
+/// holds no secret - it runs on somebody else's machine - so what makes an
+/// intercepted authorization code worthless is that the code alone does not
+/// carry the verifier, and only the program that started the flow has it.
+///
+/// Three properties, and each is a way this has been got wrong elsewhere:
+///
+/// 1. **The alphabet is base64URL and the encoding carries no padding.** The
+///    standard alphabet or a trailing `=` produces a string that matches
+///    nothing, so a client is refused rather than let through.
+/// 2. **The verifier's own shape is checked before it is hashed**: 43 to 128
+///    unreserved characters, RFC 7636 section 4.1. Nothing outside that is a
+///    verifier, and refusing it here costs a hash rather than a comparison.
+/// 3. **The comparison does not exit early** ([`super::auth::constant_time_eq`]),
+///    so the time an attempt takes says nothing about how much of the challenge
+///    a caller has guessed. Lengths leak, which is what that function
+///    documents, and both sides here are fixed-width base64.
+fn pkce_matches(verifier: &str, challenge: &str) -> bool {
+    use base64::Engine as _;
+    use sha2::{Digest, Sha256};
+
+    if !CHALLENGE_LEN.contains(&verifier.len())
+        || !verifier
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
+    {
+        return false;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(verifier.as_bytes());
+    let computed = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hasher.finalize());
+    super::auth::constant_time_eq(computed.as_bytes(), challenge.as_bytes())
+}
+
 /// An authorization request that passed every check a server can make on its
 /// own, waiting for a person to allow or deny it.
 ///
@@ -1444,9 +1553,6 @@ impl AuthorizationStore {
 ///
 /// `Debug` is written rather than derived, for [`PendingAuthorization`]'s
 /// reason.
-// Read by the token endpoint, which is the next task's: this half of the code
-// store mints and the other half spends, and they land in two commits.
-#[allow(dead_code)]
 struct IssuedCode {
     client_id: String,
     redirect_uri: String,
@@ -1496,10 +1602,8 @@ impl CodeStore {
     ///
     /// Removed before the expiry is looked at, so a code past its window is
     /// spent by the attempt that presented it rather than left to be presented
-    /// again.
-    // The token endpoint is this method's only caller and lands with the next
-    // task. See `IssuedCode`.
-    #[allow(dead_code)]
+    /// again. [`exchange_code`] is the only caller, and this one call is the
+    /// whole of the single-use rule: unknown, spent and expired are one `None`.
     fn take(&mut self, hash: &str) -> Option<IssuedCode> {
         let now = Instant::now();
         let taken = self.codes.remove(hash);
@@ -2196,12 +2300,9 @@ pub async fn decide(
             // authorize leg instead would let an unauthenticated GET per row
             // keep the whole table alive; a denied or abandoned request leaves
             // it exactly as it was.
-            if let Err(error) = state.auth.touch_oauth_client(&record.client_id).await {
-                // Not worth failing a granted consent for. The stamp decides
-                // when an unused registration is collected, and one collected
-                // a little early is a client that registers again.
-                tracing::warn!("a registration's last use could not be stamped: {error:#}");
-            }
+            // Not worth failing a granted consent for, which is why
+            // [`stamp_client`] swallows what it cannot do.
+            stamp_client(&state, &record.client_id).await;
             tracing::info!(
                 account = %account.name,
                 client_id = %record.client_id,
@@ -2233,6 +2334,495 @@ pub async fn decide(
             location: redirect_with(&record.redirect_uri, &params),
         }),
     ))
+}
+
+// --- the token endpoint -----------------------------------------------------
+
+/// What `POST /oauth/token` takes: RFC 6749's form body, in both the shapes
+/// this server serves.
+///
+/// Every member is optional at the type level, `grant_type` included, for the
+/// reason [`AuthorizeQuery`] and [`RegisterBody`] are: which parameters a
+/// request needs depends on the grant type it names, so a missing one is
+/// answered by the rule that wanted it rather than by a deserialization
+/// failure that could only ever be one undifferentiated `invalid_request`.
+///
+/// `Debug` is written rather than derived: three of these fields are
+/// credentials.
+#[derive(Default, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "A token request, sent as \
+                        `application/x-www-form-urlencoded`. Which members are \
+                        required depends on `grant_type`: \
+                        `authorization_code` takes `code`, `redirect_uri`, \
+                        `code_verifier` and `client_id`, `refresh_token` takes \
+                        `refresh_token` and `client_id`. `resource` is \
+                        optional on both.")]
+pub struct TokenForm {
+    /// `authorization_code` or `refresh_token`. Anything else is
+    /// `unsupported_grant_type`.
+    #[schema(example = "authorization_code")]
+    pub grant_type: Option<String>,
+    /// The single-use code the consent screen issued, for
+    /// `grant_type=authorization_code`.
+    pub code: Option<String>,
+    /// The redirect uri the code was issued for, compared exactly. For a
+    /// native client that is the address it PRESENTED at the authorize leg -
+    /// the port it managed to bind - and not necessarily the one it
+    /// registered.
+    pub redirect_uri: Option<String>,
+    /// The PKCE verifier: 43 to 128 unreserved characters whose `S256` is the
+    /// challenge the authorization was started with.
+    pub code_verifier: Option<String>,
+    /// The refresh token to rotate, for `grant_type=refresh_token`.
+    pub refresh_token: Option<String>,
+    /// The registration this request is made under. Required by both grant
+    /// types.
+    #[schema(example = "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0")]
+    pub client_id: Option<String>,
+    /// Which resource the token is for (RFC 8707): absent, or this instance's
+    /// own identifier, a trailing slash tolerated.
+    #[schema(example = "https://kb.example")]
+    pub resource: Option<String>,
+}
+
+impl std::fmt::Debug for TokenForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenForm")
+            .field("grant_type", &self.grant_type)
+            .field("code", &self.code.as_ref().map(|_| "[redacted]"))
+            .field("redirect_uri", &self.redirect_uri)
+            .field(
+                "code_verifier",
+                &self.code_verifier.as_ref().map(|_| "[redacted]"),
+            )
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[redacted]"),
+            )
+            .field("client_id", &self.client_id)
+            .field("resource", &self.resource)
+            .finish()
+    }
+}
+
+/// What a successful token request answers: RFC 6749 section 5.1, with the two
+/// members this server always sends and none of the ones it has no use for.
+///
+/// No `scope`, because a grant here is the whole account's rights until it is
+/// revoked and there was never anything to narrow; no `id_token`, because this
+/// is not OpenID Connect and the account a token acts for is a fact of this
+/// instance rather than a claim about a person.
+///
+/// `Debug` is written rather than derived: both tokens are live credentials the
+/// moment this struct exists, and a derived one is a single `tracing` call away
+/// from putting them in a file.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub struct TokenResponse {
+    /// The bearer token an MCP request presents. `coa_` plus 64 hex, and the
+    /// only copy: the server keeps its sha256.
+    #[schema(example = "coa_...")]
+    pub access_token: String,
+    /// Always `Bearer`.
+    #[schema(example = "Bearer")]
+    pub token_type: &'static str,
+    /// Seconds the access token lives, which is an hour.
+    #[schema(example = 3600)]
+    pub expires_in: u64,
+    /// The token that mints the next pair. `cor_` plus 64 hex, good for thirty
+    /// days, and rotated by every use: the one presented is dead the moment
+    /// this one exists, and presenting it again revokes the whole grant.
+    #[schema(example = "cor_...")]
+    pub refresh_token: String,
+}
+
+impl std::fmt::Debug for TokenResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TokenResponse")
+            .field("access_token", &"coa_[redacted]")
+            .field("token_type", &self.token_type)
+            .field("expires_in", &self.expires_in)
+            .field("refresh_token", &"cor_[redacted]")
+            .finish()
+    }
+}
+
+impl From<super::IssuedOauthGrant> for TokenResponse {
+    fn from(grant: super::IssuedOauthGrant) -> TokenResponse {
+        TokenResponse {
+            access_token: grant.access_token,
+            token_type: BEARER,
+            expires_in: grant.expires_in,
+            refresh_token: grant.refresh_token,
+        }
+    }
+}
+
+/// A parameter the grant type needs, or the refusal that names it.
+///
+/// The name is this server's own vocabulary rather than anything the caller
+/// sent, so no attacker-chosen text reaches the description.
+fn required<'a>(value: Option<&'a str>, name: &str) -> Result<&'a str, OauthError> {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            OauthError::invalid_request(format!("a token request of this grant_type names {name}"))
+        })
+}
+
+/// A client id as a log line may carry it.
+///
+/// The value is caller-chosen text on a public endpoint, and the refusal that
+/// names it is often the one where no registration was found - so it is
+/// printed only when it has the shape of an identifier this server could have
+/// issued, and reads as `unreadable` otherwise. An operator debugging a real
+/// client sees the real id; a caller trying to write a log line sees nothing
+/// of their own back.
+fn logged_client_id(value: Option<&str>) -> &str {
+    match value {
+        None => "none",
+        Some(value)
+            if !value.is_empty()
+                && value.len() <= 64
+                && value
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) =>
+        {
+            value
+        }
+        Some(_) => "unreadable",
+    }
+}
+
+/// Stamp a registration as used, and carry on if it could not be.
+///
+/// Called from the two places a registration is of actual use to somebody - a
+/// person allowing a consent, and a grant issued or refreshed here - which is
+/// the whole of what `last_used` means and therefore what buys a registration
+/// its thirty days. A failure is warned and swallowed: the stamp decides when
+/// an unused registration is collected, and one collected a little early is a
+/// client that registers again.
+async fn stamp_client(state: &RestState, client_id: &str) {
+    if let Err(error) = state.auth.touch_oauth_client(client_id).await {
+        tracing::warn!("a registration's last use could not be stamped: {error:#}");
+    }
+}
+
+/// A grant, as the answer a client reads.
+fn granted(grant: super::IssuedOauthGrant) -> (NoStore, Json<TokenResponse>) {
+    (no_store(), Json(TokenResponse::from(grant)))
+}
+
+/// `POST /oauth/token` - turn a code into a grant, or rotate one.
+///
+/// The one endpoint on this surface that hands out credentials, and the only
+/// proof it asks for is what the client can prove without holding a secret:
+/// possession of the verifier behind the challenge the authorization was
+/// started with, or possession of the newest refresh token of a live grant.
+///
+/// Public by path, like registration and the authorize leg, because the client
+/// asking has no session and never will - it is a program, and what it takes
+/// away from here is what it authenticates with afterwards. It is NOT
+/// CSRF-exempt: a browser that happens to hold a session still echoes its
+/// token, so a page on another origin cannot drive an exchange from a
+/// signed-in visitor's browser.
+///
+/// Every answer, granted or refused, carries `Cache-Control: no-store`: a token
+/// answer in a shared cache is a credential handed to whoever asks next, and a
+/// refusal is keyed on a request body carrying a code.
+#[utoipa::path(
+    post,
+    path = "/api/v1/oauth/token",
+    tag = "oauth",
+    operation_id = "oauth_token",
+    summary = "Exchange an authorization code, or rotate a refresh token.",
+    description = "The token endpoint the metadata advertises, form-encoded in \
+                   and JSON out. `grant_type=authorization_code` takes the \
+                   single-use `code` the consent screen issued, the \
+                   `redirect_uri` it was issued for, the PKCE `code_verifier` \
+                   and the `client_id`; `grant_type=refresh_token` takes a \
+                   `refresh_token` and the `client_id`. Both may name a \
+                   `resource`, which must be this instance. The answer is an \
+                   access token good for an hour and a refresh token good for \
+                   thirty days; every refresh rotates both, and presenting a \
+                   refresh token that was already rotated away revokes the \
+                   whole grant. Errors are OAuth JSON rather than problem \
+                   details - see `OauthErrorBody`.",
+    request_body(
+        content = TokenForm,
+        content_type = "application/x-www-form-urlencoded",
+        description = "The token request.",
+    ),
+    responses(
+        (
+            status = 200,
+            description = "The grant: an access token, its lifetime and the \
+                           refresh token that mints the next pair.",
+            body = TokenResponse,
+        ),
+        (
+            status = 400,
+            description = "The body is not a form or a parameter is missing \
+                           (`invalid_request`), the code or refresh token \
+                           cannot be exchanged (`invalid_grant`), the \
+                           `grant_type` is not served here \
+                           (`unsupported_grant_type`), or the `resource` names \
+                           another server (`invalid_target`).",
+            body = OauthErrorBody,
+        ),
+        (
+            status = 401,
+            description = "The `client_id` names no registration here \
+                           (`invalid_client`).",
+            body = OauthErrorBody,
+        ),
+        (
+            status = 403,
+            description = "A cookie session did not echo its CSRF token.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "This instance does not serve OAuth: `auth.oauth` \
+                           is off.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 500,
+            description = "The accounts database could not be reached.",
+            body = OauthErrorBody,
+        ),
+    ),
+)]
+pub async fn token(
+    State(state): State<RestState>,
+    headers: HeaderMap,
+    form: Result<Form<TokenForm>, FormRejection>,
+) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
+    // Read before the body is consumed, so the one log line below can name the
+    // client whichever way the request went.
+    let client_id = form.as_ref().ok().and_then(|form| form.0.client_id.clone());
+    let outcome = tokened(&state, &headers, form).await;
+    // One WARN per refused token request, naming the category and the client
+    // and nothing else - never the code, the verifier or either token. The
+    // `404` is not a refused request, it is an instance that serves no OAuth,
+    // so it is not logged as one.
+    if let Err(error) = &outcome
+        && !error.problem
+    {
+        tracing::warn!(
+            reason = error.error,
+            status = error.status.as_u16(),
+            client_id = logged_client_id(client_id.as_deref()),
+            "a token request was refused"
+        );
+    }
+    outcome
+}
+
+/// [`token`]'s body, so the refusal is logged in exactly one place.
+async fn tokened(
+    state: &RestState,
+    headers: &HeaderMap,
+    form: Result<Form<TokenForm>, FormRejection>,
+) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
+    let oauth = state.oauth.as_ref().ok_or_else(OauthError::no_oauth_here)?;
+    // A body that is not a form never reaches this handler - axum resolves
+    // extractors first - so the rejection is caught rather than left to render
+    // as this mount's problem detail, which the client reading it cannot
+    // branch on. The same reason registration catches its own.
+    let Form(form) = form.map_err(|_| {
+        OauthError::invalid_request(
+            "a token request is a form body sent as application/x-www-form-urlencoded",
+        )
+    })?;
+    match form.grant_type.as_deref().map(str::trim) {
+        Some("authorization_code") => exchange_code(state, oauth, &form).await,
+        Some("refresh_token") => rotate_refresh(state, oauth, headers, &form).await,
+        Some(named) if !named.is_empty() => Err(OauthError::unsupported_grant_type(
+            "this server serves grant_type=authorization_code and \
+             grant_type=refresh_token, which is what its authorization server metadata says",
+        )),
+        _ => Err(OauthError::invalid_request(
+            "a token request names a grant_type: authorization_code or refresh_token",
+        )),
+    }
+}
+
+/// `grant_type=authorization_code`: the code becomes a grant for the account
+/// that consented.
+///
+/// The order of the checks is the security property, and two of the lines carry
+/// it:
+///
+/// 1. **The registration is checked BEFORE the code is taken.** Taking is
+///    spending, so looking the code up first would let anybody who can guess a
+///    client id burn somebody else's code mid-flow.
+/// 2. **Everything after the take is `invalid_grant` in the same words.** A
+///    code issued to another client, presented at another redirect uri or
+///    without its verifier is a bad grant rather than a bad client, and the
+///    caller learns which only by already knowing.
+///
+/// Nothing here is taken from the request except the four parameters that have
+/// to match: the account, the client, the resource and the redirect uri all
+/// come off the code, which was bound when a person pressed Allow.
+async fn exchange_code(
+    state: &RestState,
+    oauth: &OauthServer,
+    form: &TokenForm,
+) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
+    let client_id = required(form.client_id.as_deref(), "client_id")?;
+    let code = required(form.code.as_deref(), "code")?;
+    let redirect_uri = required(form.redirect_uri.as_deref(), "redirect_uri")?;
+    let verifier = required(form.code_verifier.as_deref(), "code_verifier")?;
+
+    if state
+        .auth
+        .oauth_client(client_id)
+        .await
+        .map_err(|error| store_unavailable("reading a registration", &error))?
+        .is_none()
+    {
+        return Err(OauthError::invalid_client(
+            "no client is registered here under that client_id - it may have been collected, in \
+             which case the client registers again and starts a fresh authorization",
+        ));
+    }
+
+    // Single use and the sixty-second window in one call: `take` removes before
+    // it looks at the age, so a code past its minute, one already spent and one
+    // nobody ever issued are one `None` and one answer.
+    let Some(issued) = oauth
+        .codes
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take(&sha256_hex(code))
+    else {
+        return Err(OauthError::invalid_grant(BAD_CODE));
+    };
+    if issued.client_id != client_id {
+        return Err(OauthError::invalid_grant(BAD_CODE));
+    }
+    // Exactly, never through `redirect_matches`. The port-agnostic match
+    // happened once, at the authorize leg, and the code holds the value the
+    // client presented there; forgiving the port a second time would let a
+    // different local port collect the token.
+    if issued.redirect_uri != redirect_uri {
+        return Err(OauthError::invalid_grant(BAD_CODE));
+    }
+    if let Some(asked) = form
+        .resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        && !OriginRule::same_resource(asked, &issued.resource)
+    {
+        return Err(OauthError::invalid_target(
+            "this server mints tokens for itself alone, and the resource asked for is not it - \
+             the protected resource metadata names the one it answers to",
+        ));
+    }
+    if !pkce_matches(verifier, &issued.code_challenge) {
+        return Err(OauthError::invalid_grant(BAD_CODE));
+    }
+
+    // The account is checked here rather than left to the store's own error,
+    // because a person disabled in the sixty seconds since they consented is a
+    // grant that cannot be issued rather than a database that cannot be
+    // reached, and the two must not answer alike. See the store's
+    // `issue_oauth_grant`, which refuses both as one `Err`.
+    let live = state
+        .auth
+        .user(&issued.user)
+        .await
+        .map_err(|error| store_unavailable("reading the account that consented", &error))?
+        .is_some_and(|user| !user.disabled);
+    if !live {
+        return Err(OauthError::invalid_grant(BAD_CODE));
+    }
+
+    let grant = state
+        .auth
+        .issue_oauth_grant(&issued.user, &issued.client_id, &issued.resource)
+        .await
+        .map_err(|error| store_unavailable("issuing an oauth grant", &error))?;
+    stamp_client(state, &issued.client_id).await;
+    tracing::info!(
+        account = %issued.user,
+        client_id = %issued.client_id,
+        grant = grant.id,
+        "an mcp client exchanged an authorization code for a grant"
+    );
+    Ok(granted(grant))
+}
+
+/// `grant_type=refresh_token`: the grant moves along, and both credentials
+/// move with it.
+///
+/// **There is deliberately no registration check before the store is asked.**
+/// The replay lookup is keyed on the token alone, with no client condition, so
+/// that a rotated token presented under the wrong client id still revokes the
+/// grant it belonged to. Refusing an unknown client id here would be a way to
+/// present a stolen refresh token without the theft ever being noticed.
+///
+/// [`super::RefreshOutcome::Replayed`] has already revoked the grant and logged
+/// it by the time it arrives here, so this only has to answer - and it answers
+/// what an unknown token gets, in the same words.
+async fn rotate_refresh(
+    state: &RestState,
+    oauth: &OauthServer,
+    headers: &HeaderMap,
+    form: &TokenForm,
+) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
+    let client_id = required(form.client_id.as_deref(), "client_id")?;
+    let refresh_token = required(form.refresh_token.as_deref(), "refresh_token")?;
+
+    // A refresh has no code to read the resource off, so the comparison is
+    // against what this instance calls itself. That is the right answer rather
+    // than an approximation: every grant here is minted for this instance and
+    // for nothing else, so a request naming another resource is asking a
+    // question this server has no true answer to.
+    if let Some(asked) = form
+        .resource
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let origin = oauth.origin.origin(headers).map_err(|_| {
+            OauthError::invalid_request(
+                "this server could not tell from the request what address it was reached at, so \
+                 it cannot say whether the resource asked for is its own",
+            )
+        })?;
+        if !OriginRule::same_resource(asked, &origin) {
+            return Err(OauthError::invalid_target(
+                "this server mints tokens for itself alone, and the resource asked for is not \
+                 it - the protected resource metadata names the one it answers to",
+            ));
+        }
+    }
+
+    match state
+        .auth
+        .refresh_oauth_grant(refresh_token, client_id)
+        .await
+        .map_err(|error| store_unavailable("rotating an oauth grant", &error))?
+    {
+        super::RefreshOutcome::Rotated(grant) => {
+            stamp_client(state, client_id).await;
+            tracing::info!(
+                client_id = %client_id,
+                grant = grant.id,
+                "an mcp client rotated its oauth grant"
+            );
+            Ok(granted(grant))
+        }
+        super::RefreshOutcome::Unknown | super::RefreshOutcome::Replayed { .. } => {
+            Err(OauthError::invalid_grant(BAD_REFRESH))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -3133,5 +3723,127 @@ mod tests {
         assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);
         assert!(error.detail.contains("auth.oauth"), "{}", error.detail);
         assert!(error.detail.contains("auth.mcp"), "{}", error.detail);
+    }
+
+    /// **The PKCE check is RFC 7636's own worked example.**
+    ///
+    /// The one piece of arithmetic on this surface that has a published answer,
+    /// so it is checked against that answer rather than against another copy of
+    /// this code: appendix B of the RFC fixes a verifier and the challenge it
+    /// hashes to, and a base64 alphabet or a padding rule that drifted would
+    /// show up here as a mismatch rather than as a client that cannot connect.
+    #[test]
+    fn pkce_s256_verifies_the_rfc_7636_example() {
+        use base64::Engine as _;
+
+        // RFC 7636 appendix B, verbatim.
+        const VERIFIER: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+        const CHALLENGE: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+        assert!(pkce_matches(VERIFIER, CHALLENGE));
+
+        // The alphabet is base64URL and the encoding carries no padding: a
+        // challenge spelled in the standard alphabet, or padded, is a different
+        // string and matches nothing.
+        assert!(!pkce_matches(VERIFIER, &CHALLENGE.replace('-', "+")));
+        assert!(!pkce_matches(VERIFIER, &format!("{CHALLENGE}=")));
+        // One character of the verifier is one different challenge.
+        assert!(!pkce_matches(&VERIFIER.replace('d', "D"), CHALLENGE));
+        assert!(!pkce_matches("", CHALLENGE));
+        assert!(!pkce_matches(VERIFIER, ""));
+
+        // A verifier outside the RFC's own shape is refused before it is
+        // hashed: 43 to 128 unreserved characters, and nothing else.
+        assert!(!pkce_matches(&"a".repeat(42), CHALLENGE));
+        assert!(!pkce_matches(&"a".repeat(129), CHALLENGE));
+        assert!(
+            !pkce_matches(&format!("{VERIFIER}\u{0}"), CHALLENGE),
+            "a control character is not an unreserved character"
+        );
+        // And the boundaries themselves are inside the rule: each of these
+        // hashes to its own challenge, which is what verifying it means.
+        for verifier in [&"a".repeat(43), &"a".repeat(128)] {
+            let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .encode(<sha2::Sha256 as sha2::Digest>::digest(verifier.as_bytes()));
+            assert!(pkce_matches(verifier, &challenge), "{verifier}");
+        }
+    }
+
+    /// **An unknown code, a spent one and an expired one are one answer.**
+    ///
+    /// The token endpoint asks [`CodeStore::take`] exactly once and branches on
+    /// `Some` or `None`, so what an exchange can learn about a code it does not
+    /// hold is nothing at all. Pinned here rather than over HTTP because the
+    /// third case needs a code older than a minute, and a test that sleeps for
+    /// one is a test nobody runs; the route-level half - that a spent code and
+    /// a never-issued one come back as byte-identical `invalid_grant` answers -
+    /// is `a_wrong_verifier_a_reused_code_and_a_foreign_redirect_are_invalid_grant`
+    /// in `tests/oauth.rs`.
+    #[test]
+    fn an_unknown_a_spent_and_an_expired_code_are_one_answer() {
+        let mut codes = CodeStore::default();
+        let fresh = code_for(&pending(Duration::ZERO), "ada");
+        codes.issue(sha256_hex("fresh"), fresh);
+        let mut expired = code_for(&pending(Duration::ZERO), "ada");
+        expired.issued = Instant::now() - CODE_TTL - Duration::from_secs(1);
+        codes.issue(sha256_hex("expired"), expired);
+
+        assert!(
+            codes.take(&sha256_hex("never issued")).is_none(),
+            "a code nobody minted"
+        );
+        assert!(
+            codes.take(&sha256_hex("expired")).is_none(),
+            "and one past its minute, which the attempt that presented it spends"
+        );
+        assert!(codes.take(&sha256_hex("fresh")).is_some());
+        assert!(
+            codes.take(&sha256_hex("fresh")).is_none(),
+            "and one already spent"
+        );
+    }
+
+    /// **A token answer never prints what it carries.**
+    ///
+    /// Both types on this endpoint hold credentials in every field that
+    /// matters: the answer holds two tokens, and the request holds a code, a
+    /// verifier and a refresh token. So both write their own `Debug`, because a
+    /// derived one on either is a `tracing` call away from putting a live
+    /// credential in a log.
+    #[test]
+    fn a_token_answer_never_prints_its_tokens() {
+        let answer = TokenResponse {
+            access_token: "coa_secretaccess".to_string(),
+            token_type: BEARER,
+            expires_in: 3600,
+            refresh_token: "cor_secretrefresh".to_string(),
+        };
+        let printed = format!("{answer:?}");
+        assert!(!printed.contains("secretaccess"), "{printed}");
+        assert!(!printed.contains("secretrefresh"), "{printed}");
+        assert!(printed.contains("[redacted]"), "{printed}");
+        assert!(
+            printed.contains("3600") && printed.contains("Bearer"),
+            "what is not a secret is still printed: {printed}"
+        );
+
+        let asked = TokenForm {
+            grant_type: Some("authorization_code".to_string()),
+            code: Some("thecode".to_string()),
+            redirect_uri: Some("https://claude.ai/api/mcp/auth_callback".to_string()),
+            code_verifier: Some("theverifier".to_string()),
+            refresh_token: Some("therefresh".to_string()),
+            client_id: Some("coc_1".to_string()),
+            resource: Some("https://kb.example".to_string()),
+        };
+        let printed = format!("{asked:?}");
+        for secret in ["thecode", "theverifier", "therefresh"] {
+            assert!(!printed.contains(secret), "{printed}");
+        }
+        assert!(
+            printed.contains("coc_1")
+                && printed.contains("authorization_code")
+                && printed.contains("https://kb.example"),
+            "the client, the grant type and the resource are what a log line is for: {printed}"
+        );
     }
 }
