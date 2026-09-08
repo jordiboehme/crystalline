@@ -93,9 +93,9 @@ use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, folder_slash, page_window, reference_match,
+    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
+    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -2029,6 +2029,44 @@ impl Store for PostgresStore {
         let cov = self.compute_coverage().await?;
         *self.coverage_cache.lock().unwrap() = Some(cov.clone());
         Ok(cov)
+    }
+
+    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
+        let mut conn = self.acquire().await?;
+        let rows = query_all(
+            conn.as_mut(),
+            "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+             JOIN engram e ON e.id=c.engram_id \
+             WHERE e.domain_id=$1 AND c.seq=0 AND c.model=$2 AND c.embedding IS NOT NULL \
+             ORDER BY c.engram_id ASC",
+            vec![Param::Int(domain.0), Param::Text(model.to_string())],
+        )
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let (Some(id), Some(dims)) = (cell_i64(r, 0), cell_i64(r, 1)) else {
+                continue;
+            };
+            let Some(vector) = r.try_get::<Option<pgvector::Vector>, _>(2).ok().flatten() else {
+                continue;
+            };
+            let vector = vector.to_vec();
+            if vector.len() != dims as usize {
+                tracing::warn!(
+                    engram_id = id,
+                    dims,
+                    stored = vector.len(),
+                    "skipping a lead vector whose stored width disagrees with its dims column"
+                );
+                continue;
+            }
+            out.push(LeadVector {
+                engram_id: EngramId(id),
+                dims: dims as usize,
+                vector,
+            });
+        }
+        Ok(out)
     }
 
     async fn wipe(&self) -> Result<()> {

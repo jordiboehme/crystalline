@@ -974,6 +974,19 @@ pub struct EmbeddingRow {
     pub dims: usize,
 }
 
+/// One engram's lead vector: the embedding of its first chunk (`seq = 0`)
+/// for one model, as [`Store::lead_vectors`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeadVector {
+    /// The engram the lead chunk belongs to.
+    pub engram_id: EngramId,
+    /// The vector dimensionality, as the chunk row declares it. Carried so a
+    /// caller can skip a pair of mismatched widths rather than compare them.
+    pub dims: usize,
+    /// The lead chunk's embedding, exactly as the backend stored it.
+    pub vector: Vec<f32>,
+}
+
 /// A freshly computed chunk to store against an engram. Produced by the chunker
 /// and handed to [`Store::replace_chunks`], which reconciles it against the
 /// engram's existing chunk rows and carries over any matching embedding.
@@ -1624,6 +1637,15 @@ pub trait Store: Send + Sync {
     /// per-model breakdown. Drives `status` reporting and the interactive
     /// default search mode.
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage>;
+
+    /// Every engram in `domain` whose first chunk carries an embedding by
+    /// `model`, with that vector, ordered by engram id. The maintenance
+    /// sweep's `V301` compares these pairwise, so the projection is exactly
+    /// the lead chunk - title, description and opening body - and nothing
+    /// wider: one row per engram, never one per chunk. A row whose stored
+    /// width disagrees with its `dims` column is skipped rather than
+    /// returned mis-sized.
+    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery and
     /// full-reindex path.

@@ -34,9 +34,9 @@ use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, folder_slash, page_window, reference_match,
+    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
+    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -431,6 +431,24 @@ fn cell_real(row: &Row, idx: usize) -> Option<f64> {
         Ok(Value::Integer(i)) => Some(i as f64),
         _ => None,
     }
+}
+
+fn cell_blob(row: &Row, idx: usize) -> Option<Vec<u8>> {
+    match row.get_value(idx) {
+        Ok(Value::Blob(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// The inverse of the little-endian f32 packing `store_embeddings` writes (and
+/// of `search::pack_vector`, which packs a query the same way). Turso scores
+/// vectors in SQL through `vector_distance_cos`, so this is the only place a
+/// stored embedding is read back into Rust. A trailing partial float cannot be
+/// produced by that packing and is dropped rather than guessed at; the caller
+/// then sees a width that disagrees with the `dims` column and skips the row.
+fn unpack_vector(bytes: &[u8]) -> Vec<f32> {
+    let (quads, _partial) = bytes.as_chunks::<4>();
+    quads.iter().copied().map(f32::from_le_bytes).collect()
 }
 
 fn opt_text(o: &Option<String>) -> Value {
@@ -1741,6 +1759,42 @@ impl Store for TursoStore {
         let cov = self.compute_coverage().await?;
         *self.coverage_cache.lock().unwrap() = Some(cov.clone());
         Ok(cov)
+    }
+
+    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+             JOIN engram e ON e.id=c.engram_id \
+             WHERE e.domain_id=?1 AND c.seq=0 AND c.model=?2 AND c.embedding IS NOT NULL \
+             ORDER BY c.engram_id ASC",
+            vec![Value::Integer(domain.0), Value::Text(model.to_string())],
+        )
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let (Some(id), Some(dims), Some(blob)) =
+                (cell_i64(r, 0), cell_i64(r, 1), cell_blob(r, 2))
+            else {
+                continue;
+            };
+            let vector = unpack_vector(&blob);
+            if vector.len() != dims as usize {
+                tracing::warn!(
+                    engram_id = id,
+                    dims,
+                    stored = vector.len(),
+                    "skipping a lead vector whose stored width disagrees with its dims column"
+                );
+                continue;
+            }
+            out.push(LeadVector {
+                engram_id: EngramId(id),
+                dims: dims as usize,
+                vector,
+            });
+        }
+        Ok(out)
     }
 
     async fn wipe(&self) -> Result<()> {
