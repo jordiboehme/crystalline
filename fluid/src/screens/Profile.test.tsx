@@ -801,28 +801,32 @@ describe("the agent access card", () => {
 
 describe("the connected clients card", () => {
   it("lists grants with their client and last use", async () => {
-    serveAs("editor", {
-      "/me/oauth-grants": () => [
-        {
-          id: 1,
-          client_id: "coc_1a2b3c",
-          client_name: "Claude",
-          redirect_host: "claude.ai",
-          created_at: "2026-08-29T09:12:44Z",
-          last_used: "2026-09-01T10:00:00Z",
-          refresh_expires_at: "2026-10-08T04:00:00Z",
-        },
-        {
-          id: 2,
-          client_id: "coc_4d5e6f",
-          client_name: "a local agent",
-          redirect_host: "127.0.0.1:51902",
-          created_at: "2026-08-20T00:00:00Z",
-          last_used: null,
-          refresh_expires_at: "2026-10-20T00:00:00Z",
-        },
-      ],
-    });
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => [
+          {
+            id: 1,
+            client_id: "coc_1a2b3c",
+            client_name: "Claude",
+            redirect_host: "claude.ai",
+            created_at: "2026-08-29T09:12:44Z",
+            last_used: "2026-09-01T10:00:00Z",
+            refresh_expires_at: "2026-10-08T04:00:00Z",
+          },
+          {
+            id: 2,
+            client_id: "coc_4d5e6f",
+            client_name: "a local agent",
+            redirect_host: "127.0.0.1:51902",
+            created_at: "2026-08-20T00:00:00Z",
+            last_used: null,
+            refresh_expires_at: "2026-10-20T00:00:00Z",
+          },
+        ],
+      },
+      { oauth: true },
+    );
     renderApp("/profile");
 
     expect(
@@ -838,11 +842,56 @@ describe("the connected clients card", () => {
   });
 
   it("says so when no client is connected yet", async () => {
-    serveAs("viewer");
+    serveAs("viewer", {}, { oauth: true });
     renderApp("/profile");
 
     expect(
       await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("is absent on an instance that never turned OAuth on", async () => {
+    serveAs(
+      "editor",
+      {
+        // If the card ignored the gate and fetched anyway, this would be
+        // the listing it drew from - present so a leak reads as a real
+        // failure rather than an accidental empty-state pass.
+        "/me/oauth-grants": () => [
+          {
+            id: 1,
+            client_id: "coc_1a2b3c",
+            client_name: "Claude",
+            redirect_host: "claude.ai",
+            created_at: "2026-08-29T09:12:44Z",
+            last_used: null,
+            refresh_expires_at: "2026-10-08T04:00:00Z",
+          },
+        ],
+      },
+      { oauth: false },
+    );
+    renderApp("/profile");
+
+    // Agent access is the marker that the screen finished rendering, so the
+    // absence below is an absence rather than a race with the initial load.
+    await screen.findByRole("heading", { name: "Agent access" });
+    expect(
+      screen.queryByRole("heading", { name: "Connected clients" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Claude")).not.toBeInTheDocument();
+    // And the gate is on the fetch too, not only the render.
+    expect(
+      apiMock.mock.calls.some(([path]) => path === "/me/oauth-grants"),
+    ).toBe(false);
+  });
+
+  it("is present on an instance that serves OAuth", async () => {
+    serveAs("editor", { "/me/oauth-grants": () => [] }, { oauth: true });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Connected clients" }),
     ).toBeInTheDocument();
   });
 
@@ -859,49 +908,107 @@ describe("the connected clients card", () => {
       },
     ];
     let refuse = true;
-    serveAs("editor", {
-      "/me/oauth-grants": () => listing,
-      "/me/oauth-grants/9": (_path, init) => {
-        if (init?.method === "DELETE") {
-          if (refuse) {
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => listing,
+        "/me/oauth-grants/9": (_path, init) => {
+          if (init?.method === "DELETE") {
+            if (refuse) {
+              throw new ApiProblem(
+                404,
+                "not found",
+                "no such connected client: it may already have been revoked",
+              );
+            }
+            listing = [];
+          }
+          return undefined;
+        },
+      },
+      { oauth: true },
+    );
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke Claude (#9)" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude (#9)" }),
+    );
+
+    // The server's own refusal, word for word.
+    expect(
+      await screen.findByText(/no such connected client/i),
+    ).toBeInTheDocument();
+
+    refuse = false;
+    await userEvent.click(
+      screen.getByRole("button", { name: "Revoke Claude (#9)" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude (#9)" }),
+    );
+
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("treats a 404 on revoke as already gone, not a red error left on screen", async () => {
+    let listing = [
+      {
+        id: 11,
+        client_id: "coc_1a2b3c",
+        client_name: "Claude",
+        redirect_host: "claude.ai",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+        refresh_expires_at: "2026-10-08T04:00:00Z",
+      },
+    ];
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => listing,
+        "/me/oauth-grants/11": (_path, init) => {
+          if (init?.method === "DELETE") {
+            // Already gone - revoked from another tab, say, or simply
+            // expired - so the store no longer holds it even though this
+            // is the first time THIS button asked. The server answers 404,
+            // and the button's job (make sure it is disconnected) is done
+            // either way.
+            listing = [];
             throw new ApiProblem(
               404,
               "not found",
               "no such connected client: it may already have been revoked",
             );
           }
-          listing = [];
-        }
-        return undefined;
+          return undefined;
+        },
       },
-    });
+      { oauth: true },
+    );
     renderApp("/profile");
 
     await userEvent.click(
-      await screen.findByRole("button", { name: "Revoke Claude" }),
+      await screen.findByRole("button", { name: "Revoke Claude (#11)" }),
     );
     await userEvent.click(
-      screen.getByRole("button", { name: "Confirm revoke Claude" }),
+      screen.getByRole("button", { name: "Confirm revoke Claude (#11)" }),
     );
 
-    // The server's own refusal, word for word - and the row nothing
-    // happened to is still there.
-    expect(
-      await screen.findByText(/no such connected client/i),
-    ).toBeInTheDocument();
-    expect(screen.getByText("Claude")).toBeInTheDocument();
-
-    refuse = false;
-    await userEvent.click(
-      screen.getByRole("button", { name: "Revoke Claude" }),
-    );
-    await userEvent.click(
-      screen.getByRole("button", { name: "Confirm revoke Claude" }),
-    );
-
+    // The server's exact sentence, but as a neutral notice - never
+    // `role="alert"` - because a grant that is already gone is not a
+    // failure of this press.
+    const notice = await screen.findByText(/no such connected client/i);
+    expect(notice).toHaveAttribute("role", "status");
+    // And the list is refreshed rather than the stale row left behind.
     expect(
       await screen.findByText(/no client connected yet/i),
     ).toBeInTheDocument();
+    expect(screen.queryByText("Claude")).not.toBeInTheDocument();
   });
 });
 

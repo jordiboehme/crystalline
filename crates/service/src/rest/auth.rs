@@ -1015,6 +1015,17 @@ pub struct MeResponse {
     /// is allowed to ask: an editor on an instance-mode install draws no share
     /// card and issues no request behind it.
     can_share: bool,
+    /// Whether this instance serves OAuth for MCP clients, from the effective
+    /// `auth.oauth` setting.
+    ///
+    /// A rendering signal for the profile's connected-clients card, the same
+    /// role `can_share` plays for the share surfaces above: an instance that
+    /// never turned OAuth on draws no card asking somebody to manage clients
+    /// that can never exist. It is not a gate - `/me/oauth-grants` and
+    /// `/oauth/*` refuse on their own, off `auth.oauth` itself, regardless of
+    /// what this probe says - so a stale or forged `true` costs a 404 rather
+    /// than access.
+    oauth: bool,
     /// The server version, so a mismatched UI can say so.
     #[schema(example = "0.12.0")]
     version: &'static str,
@@ -1763,6 +1774,12 @@ pub async fn me(
             // one rule decides what they serve and what a client draws.
             // Resolved off `identity` before it is moved into `user` above.
             can_share,
+            // Whether the OAuth surface actually came up at startup, read off
+            // the same `Option` the routes themselves are gated on rather than
+            // re-reading `auth.oauth` from live config: this is the setting as
+            // it stood when this daemon started, not what a config file says
+            // right now, which is what "serves OAuth" has to mean here.
+            oauth: state.oauth.is_some(),
             version: crystalline_core::VERSION,
         }),
     ))

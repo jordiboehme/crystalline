@@ -54,6 +54,11 @@ export function meResponse(overrides: Partial<MeResponse> = {}): MeResponse {
     // An instance that has been set up already, which is what every screen
     // under test assumes; the first-run flow overrides it where it matters.
     needs_setup: false,
+    // Off by default, the same as every other feature-gate field here: a
+    // test that wants the connected-clients card visible says so with an
+    // explicit override, the same way a personal-mode test passes
+    // `can_share` itself below.
+    oauth: false,
     csrf: null,
     version: import.meta.env.VITE_APP_VERSION,
     ...overrides,

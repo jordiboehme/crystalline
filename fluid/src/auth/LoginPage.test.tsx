@@ -158,6 +158,30 @@ describe("the login screen", () => {
     expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
   });
 
+  it("carries no return_to when the interrupted journey was already the home screen", async () => {
+    serve({
+      // Anonymous stays false: an identity-less request to `/` is exactly
+      // what `RequireAuth` intercepts and sends here with `from` set, so
+      // this is the "root, but via an interrupted journey" case - distinct
+      // from the direct-visit case above, where `from` is unset entirely.
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp("/");
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    // The destination is `/`, the server's own default, so there is nothing
+    // for `return_to` to add - this is the bare href the e2e smoke test
+    // pins for a plain sign-in.
+    expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+  });
+
   it("shows the server's own words when the credentials are refused", async () => {
     serve({
       "/auth/me": () => meResponse(),

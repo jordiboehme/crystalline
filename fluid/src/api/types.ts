@@ -2095,6 +2095,19 @@ export interface components {
              *     the state itself is what makes `POST /auth/setup` answer at all.
              */
             needs_setup: boolean;
+            /**
+             * @description Whether this instance serves OAuth for MCP clients, from the effective
+             *     `auth.oauth` setting.
+             *
+             *     A rendering signal for the profile's connected-clients card, the same
+             *     role `can_share` plays for the share surfaces above: an instance that
+             *     never turned OAuth on draws no card asking somebody to manage clients
+             *     that can never exist. It is not a gate - `/me/oauth-grants` and
+             *     `/oauth/*` refuse on their own, off `auth.oauth` itself, regardless of
+             *     what this probe says - so a stale or forged `true` costs a 404 rather
+             *     than access.
+             */
+            oauth: boolean;
             /** @description Whether this instance refuses content mutations. */
             read_only: boolean;
             user?: null | components["schemas"]["User"];

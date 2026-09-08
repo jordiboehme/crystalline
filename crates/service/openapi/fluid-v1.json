@@ -8009,6 +8009,7 @@
           "read_only",
           "needs_setup",
           "can_share",
+          "oauth",
           "version"
         ],
         "properties": {
@@ -8031,6 +8032,10 @@
           "needs_setup": {
             "type": "boolean",
             "description": "Whether no account exists yet, so the first-run setup path is open.\n\nRead fresh on every probe rather than cached: it is one indexed count\nover a table with a handful of rows, and a stale `true` would draw a\nwizard whose POST then answers 410 - correct, but baffling. That it\ntells an unauthenticated caller \"this instance has no accounts yet\" is\ndeliberate: the login page needs to know before any identity exists, and\nthe state itself is what makes `POST /auth/setup` answer at all."
+          },
+          "oauth": {
+            "type": "boolean",
+            "description": "Whether this instance serves OAuth for MCP clients, from the effective\n`auth.oauth` setting.\n\nA rendering signal for the profile's connected-clients card, the same\nrole `can_share` plays for the share surfaces above: an instance that\nnever turned OAuth on draws no card asking somebody to manage clients\nthat can never exist. It is not a gate - `/me/oauth-grants` and\n`/oauth/*` refuse on their own, off `auth.oauth` itself, regardless of\nwhat this probe says - so a stale or forged `true` costs a 404 rather\nthan access."
           },
           "read_only": {
             "type": "boolean",

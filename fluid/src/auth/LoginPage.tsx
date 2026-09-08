@@ -29,10 +29,13 @@
  * button is a plain link, not a fetch - what follows is a redirect to the
  * provider's own domain and a redirect back, and a background fetch would
  * follow that hop invisibly and land nowhere anybody can type a password into.
- * When `RequireAuth` sent somebody here with a destination in mind - the OAuth
- * consent screen, most of all - the button carries it as `return_to`, so the
- * callback lands back where the sign-in started rather than on the home
- * screen.
+ * When `RequireAuth` sent somebody here with a destination other than the
+ * home screen in mind - the OAuth consent screen, most of all - the button
+ * carries it as `return_to`, so the callback lands back where the sign-in
+ * started. A destination of `/` carries nothing: that is already where the
+ * server's own default lands a plain sign-in, so a direct visit to this
+ * screen (no interrupted journey at all, `from` unset) and one interrupted
+ * right at the home screen produce the identical bare link.
  *
  * The one rule worth stating: when the server refuses, its own `detail` is
  * what is shown, word for word. That text is product copy written where the
@@ -300,7 +303,7 @@ export default function LoginPage() {
               <span className="h-px flex-1 bg-slate-200 dark:bg-slate-800" />
             </div>
             <a
-              href={ssoSignInUrl(from ? destination : undefined)}
+              href={ssoSignInUrl(destination === "/" ? undefined : destination)}
               className={`py-2 text-center ${BUTTON.secondary}`}
             >
               Sign in with {sso.name}

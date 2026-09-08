@@ -53,7 +53,7 @@ import {
   startMyGithubIdentityDevice,
 } from "../api/admin";
 import type { GithubIdentity, GithubPending } from "../api/admin";
-import { problemDetail } from "../api/client";
+import { ApiProblem, problemDetail } from "../api/client";
 import {
   MCP_TOKENS_KEY,
   fetchMcpTokens,
@@ -1204,6 +1204,15 @@ function RevealDialog({
  * connected, since when, when it last used the connection, when its refresh
  * token expires, and a way to revoke it.
  *
+ * Absent entirely on an instance that has never turned `auth.oauth` on -
+ * `capabilities.oauth`, the probe's own rendering signal, the same role
+ * `canShare` plays for the share surfaces - the same call `SsoIdentityCard`
+ * makes for a feature this instance does not have: a card offering to manage
+ * clients that can never exist is noise on the one screen that is about this
+ * account. The query itself is gated the same way (`enabled:
+ * capabilities.oauth`), so an instance that never serves OAuth pays no round
+ * trip for a card it will never draw.
+ *
  * Shown to every signed-in account, viewers included, and offered on a
  * read-only instance too - a grant is account state in the accounts database,
  * the same reason {@link AgentAccessCard} is and for the same server-side
@@ -1216,16 +1225,25 @@ function RevealDialog({
  * authorization code flow at `/authorize`, which is a client's journey, not
  * an action on this screen - this card only ever lists what already happened
  * there and lets it be taken back.
+ *
+ * A 404 on revoke is not shown as a failure: the server's non-idempotent
+ * `DELETE` answers 404 for a grant that is already gone, whichever tab or
+ * reason took it, and the button's job is done either way - the list is
+ * refreshed and the server's own sentence is shown as a neutral notice, the
+ * same `kind: "done"` path a genuine revoke takes, never `role="alert"` red
+ * text over a row that no longer means anything.
  */
-// Exported for the same reason `AgentAccessCard` is: so a test can mount it
-// on its own, with no router or auth context required.
+// Exported the same way `AgentAccessCard` is: so a test can mount it on its
+// own. Unlike that card, this one needs the auth context for its gate.
 export function OauthGrantsCard() {
+  const { capabilities } = useAuth();
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<Notice | null>(null);
 
   const grants = useQuery({
     queryKey: OAUTH_GRANTS_KEY,
     queryFn: fetchOauthGrants,
+    enabled: capabilities.oauth,
   });
 
   const invalidate = () =>
@@ -1238,9 +1256,23 @@ export function OauthGrantsCard() {
       void invalidate();
     },
     onError: (error: Error) => {
+      // A grant that is already gone - revoked from another tab, expired,
+      // whatever - is not a failure of this press: the button's job (making
+      // sure this client is disconnected) is done either way. Refresh and
+      // say so in the neutral notice, the same as a genuine revoke, rather
+      // than leaving a red error over a row that no longer means anything.
+      if (error instanceof ApiProblem && error.status === 404) {
+        setNotice({ kind: "done", text: problemDetail(error) });
+        void invalidate();
+        return;
+      }
       setNotice({ kind: "problem", text: problemDetail(error) });
     },
   });
+
+  if (!capabilities.oauth) {
+    return null;
+  }
 
   const rows = grants.data ?? [];
 
@@ -1412,7 +1444,7 @@ function GrantRow({
           <button
             ref={trigger}
             type="button"
-            aria-label={`Revoke ${grant.client_name}`}
+            aria-label={`Revoke ${grant.client_name} (#${grant.id})`}
             aria-expanded={confirming}
             aria-disabled={revoking}
             onClick={() => {
@@ -1430,7 +1462,7 @@ function GrantRow({
               <button
                 type="button"
                 autoFocus
-                aria-label={`Confirm revoke ${grant.client_name}`}
+                aria-label={`Confirm revoke ${grant.client_name} (#${grant.id})`}
                 aria-disabled={revoking}
                 onClick={() => {
                   if (revoking) {

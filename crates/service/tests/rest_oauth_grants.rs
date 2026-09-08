@@ -457,3 +457,24 @@ async fn a_revoked_grant_is_refused_at_the_mcp_gate_at_once() {
         "revoked at once, on the next request"
     );
 }
+
+/// `GET /auth/me`'s `oauth` field is the signal Fluid's connected-clients
+/// card gates its whole render on (`Profile.tsx`'s `OauthGrantsCard`), so it
+/// has to follow the setting this daemon actually came up with. The off side
+/// of that (a default instance never turning it on) is pinned in
+/// `rest_api.rs`'s `me_reports_capabilities_without_an_identity`; this is the
+/// on side, over the one fixture in this file where `auth.oauth` is really
+/// serving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_probes_oauth_flag_follows_the_setting() {
+    let (addr, _guard, _auth) = serve_with_mcp_oauth().await;
+    let body: serde_json::Value = reqwest::Client::new()
+        .get(format!("http://{addr}/api/v1/auth/me"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["oauth"], true, "{body}");
+}
