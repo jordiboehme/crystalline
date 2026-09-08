@@ -270,6 +270,87 @@ fn detects_unindexed_files_without_fixing_them() {
     );
 }
 
+/// Reproduces a colleague's real-world report: a file whose frontmatter
+/// repeats a key never becomes indexed no matter how many times `sync` runs,
+/// so `doctor` must tell it apart from a file that is merely unsynced.
+/// Covers a nested path, since `verify` reports an absolute path and the
+/// unindexed set holds forward-slashed paths relative to the domain root -
+/// the two must be normalised to the same shape before they can be compared.
+#[test]
+fn tells_an_unsyncable_file_from_an_unsynced_one() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+
+    // A well-formed file that simply has not been synced yet.
+    write(&domain_dir, "good.md", &engram("Good", "good"));
+
+    // A nested file whose frontmatter repeats the `tags` key: `verify` calls
+    // this E001, and no amount of syncing will ever index it.
+    write(
+        &domain_dir,
+        "a/b/bad.md",
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["domains"][0]["unindexed"],
+        serde_json::json!(["good.md"]),
+        "the duplicate-key file must not show up as merely unindexed: {report}"
+    );
+    let unsyncable = &report["domains"][0]["unsyncable"];
+    assert_eq!(unsyncable[0]["path"], serde_json::json!("a/b/bad.md"));
+    assert!(
+        unsyncable[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("duplicate entry with key"),
+        "unsyncable message should explain why: {unsyncable}"
+    );
+
+    // The human report renders a runnable sync command with no path or colon
+    // glued onto it, and a separate block for the unsyncable file.
+    let mut human_cmd = bin();
+    let _home = shield_ambient_home(&mut human_cmd);
+    let human_out = human_cmd
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let stdout = String::from_utf8(human_out).unwrap();
+    assert!(
+        stdout.contains("run: crystalline sync --domain eng\n"),
+        "the suggested command must be pasteable, with nothing glued after the domain name: {stdout}"
+    );
+    assert!(
+        stdout.contains("cannot be indexed until the frontmatter is fixed (verify rule E001)"),
+        "unsyncable files get their own explanation: {stdout}"
+    );
+    assert!(
+        stdout.contains("a/b/bad.md: ") && stdout.contains("duplicate entry with key"),
+        "the unsyncable line names the file and the reason: {stdout}"
+    );
+}
+
 #[test]
 fn detects_a_registered_domain_whose_path_vanished() {
     let work = tempfile::tempdir().unwrap();

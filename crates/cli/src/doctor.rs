@@ -77,8 +77,14 @@ pub struct DomainDoctor {
     pub orphans: Vec<String>,
     /// How many of `orphans` were removed by `--fix`.
     pub orphans_removed: usize,
-    /// On-disk `.md` files not yet present in the index.
+    /// On-disk `.md` files not yet present in the index. Holds only files that
+    /// parse; a file whose frontmatter fails to parse is never merely
+    /// unsynced, so it is reported under `unsyncable` instead.
     pub unindexed: Vec<String>,
+    /// On-disk `.md` files that cannot be indexed at all, because their
+    /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
+    /// again never resolves these; the frontmatter itself needs a fix.
+    pub unsyncable: Vec<UnsyncableFile>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
     /// The instance currently hosting this file domain in a shared database, or
@@ -99,6 +105,16 @@ pub struct EncodingIssue {
     /// The source line, when known.
     pub line: Option<usize>,
     /// The human message from `verify`.
+    pub message: String,
+}
+
+/// One `E001` finding: a file whose frontmatter does not parse at all, so no
+/// `sync` will ever index it until the frontmatter itself is fixed.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsyncableFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The human message from `verify`'s `E001` rule.
     pub message: String,
 }
 
@@ -417,6 +433,7 @@ impl DoctorReport {
             }
             n += d.orphans.len().saturating_sub(d.orphans_removed);
             n += d.unindexed.len();
+            n += d.unsyncable.len();
             n += d.encoding_issues.len();
         }
         if self.service.lock_stale && !self.service.lock_removed {
@@ -626,19 +643,31 @@ async fn check_domain(
         return Ok(d);
     }
 
-    // (c) Encoding problems: delegate to verify's E006 rather than
-    // re-implementing BOM/null-byte detection.
+    // (c) Encoding problems and (b') unsyncable files: one verify_paths call
+    // sources both. Encoding delegates to E006 rather than re-implementing
+    // BOM/null-byte detection; E001 (frontmatter that fails to parse at all)
+    // is kept keyed by its root-relative, forward-slashed path so it can be
+    // matched against the unindexed set below - `verify` reports an absolute
+    // path, the unindexed set does not, so they are normalised to the same
+    // shape before comparing.
+    let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
-        d.encoding_issues = report
-            .issues
-            .into_iter()
-            .filter(|i| i.rule == "E006")
-            .map(|i| EncodingIssue {
-                path: i.path.display().to_string(),
-                line: i.line,
-                message: i.message,
-            })
-            .collect();
+        for issue in report.issues {
+            match issue.rule {
+                "E006" => {
+                    d.encoding_issues.push(EncodingIssue {
+                        path: issue.path.display().to_string(),
+                        line: issue.line,
+                        message: issue.message,
+                    });
+                }
+                "E001" => {
+                    unsyncable_by_path
+                        .insert(relative_slash_path(&path, &issue.path), issue.message);
+                }
+                _ => {}
+            }
+        }
     }
 
     // (a) + (b): DB orphans and unindexed files.
@@ -670,6 +699,21 @@ async fn check_domain(
             .filter(|p| !db_set.contains(p.as_str()))
             .collect();
         unindexed.sort();
+
+        // A path with an E001 finding is not merely unsynced, it cannot be
+        // indexed at all until its frontmatter is fixed - split it out.
+        let mut unsyncable: Vec<UnsyncableFile> = Vec::new();
+        unindexed.retain(|p| match unsyncable_by_path.remove(p) {
+            Some(message) => {
+                unsyncable.push(UnsyncableFile {
+                    path: p.clone(),
+                    message,
+                });
+                false
+            }
+            None => true,
+        });
+        d.unsyncable = unsyncable;
 
         if fix {
             for p in &orphans {
@@ -714,17 +758,23 @@ fn markdown_rel_paths(root: &Path) -> Vec<String> {
         {
             continue;
         }
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or(entry.path())
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        out.push(rel);
+        out.push(relative_slash_path(root, entry.path()));
     }
     out
+}
+
+/// `p`, relative to `root` and forward-slashed, matching the shape the sync
+/// engine's own walk produces (and, in turn, what the unindexed and orphan
+/// sets are keyed by). `verify::Issue::path` is constructed from the same
+/// root but stays a platform `PathBuf`, so any comparison against those sets
+/// goes through this first.
+fn relative_slash_path(root: &Path, p: &Path) -> String {
+    p.strip_prefix(root)
+        .unwrap_or(p)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -1270,6 +1320,16 @@ pub fn render_human(report: &DoctorReport) -> String {
                 let _ = writeln!(out, "    {p}");
             }
         }
+        if !d.unsyncable.is_empty() {
+            let _ = writeln!(
+                out,
+                "  [problem] {} file(s) cannot be indexed until the frontmatter is fixed (verify rule E001):",
+                d.unsyncable.len()
+            );
+            for f in &d.unsyncable {
+                let _ = writeln!(out, "    {}: {}", f.path, f.message);
+            }
+        }
         if !d.encoding_issues.is_empty() {
             let _ = writeln!(
                 out,
@@ -1283,6 +1343,7 @@ pub fn render_human(report: &DoctorReport) -> String {
         if d.manifest_present
             && d.orphans.is_empty()
             && d.unindexed.is_empty()
+            && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
         {
             let _ = writeln!(out, "  ok");
