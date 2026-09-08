@@ -539,9 +539,18 @@ enum KeyringRead {
 /// commands, the engine's sync credential resolver) as well as from inside
 /// the daemon's runtime, and a sync function cannot await a
 /// `tokio::time::timeout`. One shape that behaves the same in and out of a
-/// runtime beats two, one of which would never be exercised. The daemon's own
-/// async connect paths additionally move the whole save off the runtime with
-/// `spawn_blocking`, so the bound here is the floor and not the only defence.
+/// runtime beats two, one of which would never be exercised.
+///
+/// **The bound is the whole of the defence on a read.** The daemon's async
+/// connect paths move the whole SAVE off the runtime with `spawn_blocking`, so
+/// a wedged keychain write costs a blocking-pool thread and nothing else. A
+/// read is called synchronously from inside the runtime (the sync credential
+/// resolver every share and pull goes through), so a wedged keychain read
+/// occupies a runtime worker for up to [`KEYRING_TIMEOUT`] before this bound
+/// frees it. That is the reason the bound exists and the reason it is measured
+/// in seconds rather than minutes; moving the reads behind `spawn_blocking`
+/// means making the resolver async, which is a bigger change than the fault it
+/// would soften.
 ///
 /// A call that outruns the deadline leaves its thread behind, still parked in
 /// the platform keychain. That is deliberate: the point of the bound is that
@@ -557,13 +566,32 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
+    keyring_call_bounded(timeout, operation, f)
+        .map_err(|reason| credential_error(operation, reason))
+}
+
+/// [`keyring_call_with_timeout`] with the reason left bare, for the one caller
+/// that frames it itself.
+///
+/// [`keyring_read`] carries its failures inside [`KeyringRead::Failed`], which
+/// its own callers then turn into an error naming what THEY were doing
+/// ("could not load the GitHub token: ..."). Handing it an already-framed
+/// sentence produced "could not load the GitHub token: could not read the
+/// GitHub token: the OS keychain did not answer within 15s" - one fault
+/// described twice. So the framing happens once, at whichever layer is
+/// speaking.
+fn keyring_call_bounded<T, F>(timeout: Duration, operation: &str, f: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::Builder::new()
         .name("crystalline-keyring".to_string())
         .spawn(move || {
             let _ = tx.send(f());
         })
-        .map_err(|e| credential_error(operation, e))?;
+        .map_err(|e| e.to_string())?;
     match rx.recv_timeout(timeout) {
         Ok(value) => Ok(value),
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -572,18 +600,14 @@ where
                 timeout_secs = timeout.as_secs_f64(),
                 "the OS keychain did not answer in time; treating the backend as unusable"
             );
-            Err(credential_error(
-                operation,
-                format!(
-                    "the OS keychain did not answer within {:.0}s",
-                    timeout.as_secs_f64()
-                ),
+            Err(format!(
+                "the OS keychain did not answer within {:.0}s",
+                timeout.as_secs_f64()
             ))
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(credential_error(
-            operation,
-            "the OS keychain call ended without an answer",
-        )),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err("the OS keychain call ended without an answer".to_string())
+        }
     }
 }
 
@@ -594,7 +618,7 @@ where
 /// the file fallback takes over on both.
 fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
     let owned = account.to_string();
-    let read = keyring_call_with_timeout(timeout, "read", move || {
+    let read = keyring_call_bounded(timeout, "read", move || {
         match keyring::Entry::new(KEYRING_SERVICE, &owned) {
             Ok(entry) => match entry.get_password() {
                 Ok(json) => KeyringRead::Found(json),
@@ -604,7 +628,9 @@ fn keyring_read(account: &str, timeout: Duration) -> KeyringRead {
             Err(e) => KeyringRead::Failed(e.to_string()),
         }
     });
-    read.unwrap_or_else(|e| KeyringRead::Failed(e.to_string()))
+    // Bare, because whoever asked for the read is the one who says so: see
+    // [`keyring_call_bounded`].
+    read.unwrap_or_else(KeyringRead::Failed)
 }
 
 /// One bounded keychain write for `account`, the shape both
@@ -760,6 +786,39 @@ mod tests {
         assert!(
             err.to_string().contains("did not answer within"),
             "the failure names the timeout: {err}"
+        );
+    }
+
+    /// The reason a wedged READ reports is framed once, by whoever asked for
+    /// it. It used to be framed twice - "could not load the GitHub token:
+    /// could not read the GitHub token: ..." - because the bounded call framed
+    /// it for the read and `TokenStore::load` framed it again for the load.
+    #[test]
+    fn a_wedged_read_is_reported_once_and_not_twice() {
+        let read = keyring_call_bounded(Duration::from_millis(50), "read", || {
+            std::thread::sleep(Duration::from_secs(30));
+        })
+        .map(|()| KeyringRead::Empty)
+        .unwrap_or_else(KeyringRead::Failed);
+        let KeyringRead::Failed(reason) = read else {
+            panic!("a call past the bound is a failure");
+        };
+        assert!(
+            reason.contains("did not answer within"),
+            "the reason names the timeout: {reason}"
+        );
+        assert!(
+            !reason.contains("could not"),
+            "and is bare, so the layer that speaks frames it once: {reason}"
+        );
+        let framed = credential_error("load", reason).to_string();
+        assert!(
+            framed.contains("could not load the GitHub token"),
+            "the load says what IT was doing: {framed}"
+        );
+        assert!(
+            !framed.contains("could not read the GitHub token"),
+            "and does not carry the read's framing as well: {framed}"
         );
     }
 
