@@ -2781,15 +2781,31 @@ async fn expire_access_token(path: &std::path::Path, grant: i64) {
         .await
     {
         Ok(db) => db,
-        Err(_) => turso::Builder::new_local(&name).build().await.unwrap(),
+        // Narrowed to the one error the store itself falls back on: any other
+        // failure - a lock held by the daemon's own connection above all - must
+        // surface here rather than be retried in a mode that cannot see the
+        // daemon's writes.
+        Err(err)
+            if err
+                .to_string()
+                .contains("multiprocess WAL is not supported") =>
+        {
+            turso::Builder::new_local(&name).build().await.unwrap()
+        }
+        Err(err) => panic!("cannot open the accounts database to age a grant: {err}"),
     };
     let conn = db.connect().unwrap();
-    conn.execute(
-        "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
-        vec![turso::Value::Integer(grant)],
-    )
-    .await
-    .unwrap();
+    let touched = conn
+        .execute(
+            "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+            vec![turso::Value::Integer(grant)],
+        )
+        .await
+        .unwrap();
+    // A write that reached no row would leave a live token where the caller
+    // expects an expired one, and the refusal it then asserts would be proving
+    // nothing.
+    assert_eq!(touched, 1, "the grant to age must be there to age");
 }
 
 /// GET a path on the endpoint with `accept`, which is the whole of what
@@ -2861,23 +2877,43 @@ async fn an_oauth_access_token_opens_a_session_as_its_account() {
 async fn an_expired_revoked_or_foreign_audience_oauth_token_gets_the_identical_refusal() {
     let (addr, guard, store) = serve_with_oauth().await;
     let origin = origin_of(&addr);
-    store
-        .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
-        .await
-        .unwrap();
+    for (name, display) in [("ada", "Ada"), ("bob", "Bob")] {
+        store
+            .add_user(name, display, None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+    }
 
-    // Minted for another deployment: everything about it is live except the
-    // audience.
+    // Every case below is refused by its OWN property, one at a time, on a live
+    // account: ada stays enabled throughout, and the disabled case is bob's, so
+    // nothing here can be refused by a second reason it happens to also carry.
+    // The audience check in particular is the one new rule in this task, and a
+    // disabled account would refuse its token whatever the audience said.
+    //
+    // Minted for another deployment: live, unexpired, unrevoked, ada's own.
     let foreign = oauth_grant_for(&store, "ada", "https://knowledge.example").await;
     // Revoked after the fact, the way a person revokes a connected client.
     let revoked = oauth_grant_for(&store, "ada", &origin).await;
     assert!(store.revoke_oauth_grant("ada", revoked.id).await.unwrap());
-    // Past its hour.
+    // Past its hour, and nothing else.
     let expired = oauth_grant_for(&store, "ada", &origin).await;
     expire_access_token(&guard.path().join("web-auth.db"), expired.id).await;
-    // A live grant whose account is then disabled.
-    let disabled = oauth_grant_for(&store, "ada", &origin).await;
-    store.set_disabled("ada", true).await.unwrap();
+    // A live grant of a live account, for this very origin, whose account is
+    // then disabled: the only thing wrong with it.
+    let disabled = oauth_grant_for(&store, "bob", &origin).await;
+    store.set_disabled("bob", true).await.unwrap();
+
+    // A token with nothing wrong with it at all, proving the instance is
+    // serving and that every refusal below is the presentation rather than the
+    // state of the server.
+    let live = oauth_grant_for(&store, "ada", &origin).await;
+    let ok = post_initialize_with_token(&addr, Some(&live.access_token)).await;
+    assert_eq!(
+        ok.status(),
+        200,
+        "ada is live and this origin is the audience"
+    );
+    drop(ok);
 
     let baseline = post_initialize(&addr, None).await;
     assert_eq!(baseline.status(), 401);
@@ -2930,11 +2966,17 @@ async fn an_expired_revoked_or_foreign_audience_oauth_token_gets_the_identical_r
         );
     }
 
-    // And re-enabling hands the connection back, so none of the above was the
-    // grant being quietly destroyed.
-    store.set_disabled("ada", false).await.unwrap();
-    let ok = post_initialize_with_token(&addr, Some(&disabled.access_token)).await;
-    assert_eq!(ok.status(), 200);
+    // Ada's own token is still good after all of that, so no refusal above was
+    // the instance having stopped serving anybody.
+    let still = post_initialize_with_token(&addr, Some(&live.access_token)).await;
+    assert_eq!(still.status(), 200);
+    drop(still);
+
+    // And re-enabling hands bob's connection back, so the disabled refusal was
+    // not the grant being quietly destroyed.
+    store.set_disabled("bob", false).await.unwrap();
+    let back = post_initialize_with_token(&addr, Some(&disabled.access_token)).await;
+    assert_eq!(back.status(), 200);
 }
 
 /// **With `auth.oauth` on the refusal points at the protected-resource

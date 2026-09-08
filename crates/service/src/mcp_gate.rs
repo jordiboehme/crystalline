@@ -45,6 +45,19 @@
 //! than a branch a future edit could forget. A token for another deployment is
 //! a live credential of a real account, and it opens nothing here.
 //!
+//! What that delivers is exactly what RFC 8707 asks of a resource server, and
+//! it is worth saying which half it is. The guarantee holds against a client
+//! presenting a token at the wrong server: a token naming another resource is
+//! refused rather than accepted on the strength of being valid somewhere. It is
+//! not a guarantee against the presenter, because with no override configured
+//! the identifier is the `Host` that presenter sent, so whoever holds a token
+//! can satisfy the check by naming the audience the token already carries.
+//! (This instance answers to more than one identifier for that reason:
+//! `http://127.0.0.1` and `http://127.0.0.1:7411` are different resources.)
+//! `auth.oidc.redirect_uri` is what pins the identifier to one address
+//! independent of the header, and a public deployment behind a proxy wants it
+//! set.
+//!
 //! # Why a session is bound to the identity that opened it
 //!
 //! A transport session is a bag of protocol state keyed by an `Mcp-Session-Id`

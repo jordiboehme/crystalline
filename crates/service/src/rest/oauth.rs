@@ -108,35 +108,44 @@ impl OriginRule {
     /// key is still the operator's answer to "what is this instance called"
     /// whether or not single sign-on is switched on beside it.
     ///
-    /// A value that cannot be parsed leaves the rule deriving from the request.
-    /// It is a fail-safe rather than tolerance: the settings layer already
-    /// refuses anything but an absolute https (or loopback http) url ending at
-    /// the callback path, so the only way an unparseable value arrives here is
-    /// through the environment overlay, and refusing to serve at all would take
-    /// the instance down over a key that has a perfectly good default
-    /// behaviour. The warning is logged once, at startup, where an operator is
-    /// still watching.
+    /// A value that is not an absolute `http` or `https` url leaves the rule
+    /// deriving from the request. It is a fail-safe rather than tolerance: the
+    /// settings layer already refuses anything but an absolute https (or
+    /// loopback http) url ending at the callback path, so the only way another
+    /// value arrives here is through the environment overlay, and refusing to
+    /// serve at all would take the instance down over a key that has a
+    /// perfectly good default behaviour. The warning is logged once, at
+    /// startup, where an operator is still watching.
+    ///
+    /// **The scheme is what decides, not the presence of a host.**
+    /// `Url::origin` answers a tuple origin for a short list of schemes
+    /// (`http`, `https`, `ws`, `wss`, `ftp`, `blob`) and an opaque origin for
+    /// every other one, and an opaque origin serializes to the literal
+    /// `"null"`. A scheme that carries an authority (`foo://kb.example/...`,
+    /// `ftp://kb.example/...`) therefore has a host and would still publish
+    /// `"null"` as this instance's `resource` and `issuer`, in both documents
+    /// and in the gate's challenge. Only the two schemes this surface is ever
+    /// served over are accepted, so nothing an operator can mistype reaches a
+    /// document.
     pub fn from_config(config: &GlobalConfig) -> OriginRule {
         let configured = config
             .auth_oidc()
             .and_then(|oidc| oidc.redirect_uri.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty());
-        let override_origin = configured.and_then(|value| {
-            match openidconnect::url::Url::parse(value) {
-                Ok(url) if url.host().is_some() => Some(url.origin().ascii_serialization()),
-                // `Url::origin` answers an opaque origin for a scheme with no
-                // host (`mailto:`, `data:`), which serializes to the literal
-                // "null" - never an address to publish.
+        let override_origin =
+            configured.and_then(|value| match openidconnect::url::Url::parse(value) {
+                Ok(url) if matches!(url.scheme(), "http" | "https") && url.host().is_some() => {
+                    Some(url.origin().ascii_serialization())
+                }
                 _ => {
                     tracing::warn!(
-                        "auth.oidc.redirect_uri is not an absolute url, so the OAuth resource \
-                         identifier is derived from each request's Host instead"
+                        "auth.oidc.redirect_uri is not an absolute http or https url, so the \
+                         OAuth resource identifier is derived from each request's Host instead"
                     );
                     None
                 }
-            }
-        });
+            });
         OriginRule { override_origin }
     }
 
@@ -389,6 +398,49 @@ mod tests {
                 .origin(&headers_with("127.0.0.1:7411", None))
                 .unwrap(),
             "http://127.0.0.1:7411"
+        );
+    }
+
+    /// **Only an http or https url names an origin here**, and every other
+    /// scheme falls back to deriving from the request.
+    ///
+    /// The scheme is what decides, not the presence of a host. `Url::origin`
+    /// answers a *tuple* origin for a handful of schemes and an opaque origin
+    /// for everything else, and an opaque origin serializes to the literal
+    /// "null" - which, published, would make `resource`, `issuer`, all three
+    /// endpoint urls and the gate's challenge nonsense a client cannot use. A
+    /// scheme with an authority (`foo://kb.example/...`, `ftp://`, `ws://`)
+    /// gets past a host check and would produce exactly that, so the allowlist
+    /// is the guard rather than the host.
+    #[test]
+    fn only_an_http_or_https_address_names_the_origin() {
+        for unusable in [
+            "foo://knowledge.example/api/v1/auth/oidc/callback",
+            "ftp://knowledge.example/api/v1/auth/oidc/callback",
+            "ws://knowledge.example/api/v1/auth/oidc/callback",
+            "mailto:admin@knowledge.example",
+            "data:text/plain,callback",
+            "knowledge.example/api/v1/auth/oidc/callback",
+        ] {
+            let rule = OriginRule::from_config(&config_with(Some(unusable)));
+            let origin = rule.origin(&headers_with("127.0.0.1:7411", None)).unwrap();
+            assert_eq!(
+                origin, "http://127.0.0.1:7411",
+                "{unusable} must leave the rule deriving from the request"
+            );
+            assert!(
+                !origin.contains("null"),
+                "and an opaque origin must never be published: {unusable} gave {origin}"
+            );
+        }
+        // The loopback development server the settings layer does allow.
+        assert_eq!(
+            OriginRule::from_config(&config_with(Some(
+                "http://localhost:7411/api/v1/auth/oidc/callback"
+            )))
+            .origin(&HeaderMap::new())
+            .unwrap(),
+            "http://localhost:7411"
         );
     }
 
