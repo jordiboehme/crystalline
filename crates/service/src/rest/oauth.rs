@@ -263,6 +263,52 @@ const MAX_PENDING_AUTHORIZATIONS: usize = 1000;
 /// the single sign-on store's.
 const MIN_EVICT_AGE: Duration = Duration::from_secs(30);
 
+/// How many authorizations one registration may have waiting at once.
+///
+/// This is what makes a flood refuse itself rather than refuse the next person
+/// to arrive. [`authorize`] is anonymous, but it is not sourceless: every
+/// request carries a `client_id` that was minted by a registration, and
+/// registration is the bounded surface. So the cap that matters is per
+/// registration, and the global one behind it becomes a backstop rather than
+/// the thing a stranger races a real person for.
+///
+/// Four is generous for the real shape - a client sends one person to consent
+/// at a time, and a second or third pending request means a retry or a
+/// reopened tab - and it is small enough that the two bounds compose. A caller
+/// with no consent behind it cannot hold registrations indefinitely: the
+/// [`RegistrationLimiter`] admits [`REGISTRATION_BURST`] per
+/// [`REGISTRATION_WINDOW`], and a registration nobody consented to is
+/// collected after [`OAUTH_CLIENT_UNAUTHORIZED_SECS`], so the most unstamped
+/// registrations that can be alive at once is [`UNSTAMPED_CLIENT_CEILING`] -
+/// and that many buckets of four still leaves most of
+/// [`MAX_PENDING_AUTHORIZATIONS`] free, which the assert below pins.
+///
+/// **What this does not bound, said out loud so it is not a fresh unargued
+/// half.** A registration that reaches a real consent gets `last_used` stamped
+/// and then lives thirty days, so somebody who can actually sign in here and
+/// press Allow can accumulate registrations toward [`MAX_OAUTH_CLIENTS`] and
+/// past the arithmetic below. That is an account holder on the instance rather
+/// than the stranger at the port this cap exists for, and an account holder
+/// has cheaper ways to be a nuisance.
+const MAX_PENDING_PER_CLIENT: usize = 4;
+
+/// The most registrations that can be alive at once without a single consent
+/// behind them: the burst rate carried across the unauthorized lifetime.
+const UNSTAMPED_CLIENT_CEILING: usize = REGISTRATION_BURST
+    * (crate::rest::auth_store::OAUTH_CLIENT_UNAUTHORIZED_SECS as usize
+        / REGISTRATION_WINDOW.as_secs() as usize);
+
+// The two bounds compose or the per-client cap buys nothing: an unauthenticated
+// flood must not be able to fill the map even with every registration it can
+// hold. If a later change to any of these four numbers breaks this, the
+// per-client rule has stopped protecting the global one and the comment above
+// has stopped being true.
+const _: () = assert!(
+    UNSTAMPED_CLIENT_CEILING * MAX_PENDING_PER_CLIENT < MAX_PENDING_AUTHORIZATIONS,
+    "an unstamped flood could fill the pending map: raise MAX_PENDING_AUTHORIZATIONS or lower \
+     MAX_PENDING_PER_CLIENT"
+);
+
 /// How long an authorization code may be exchanged for.
 ///
 /// One minute: the code goes from this server to the client's redirect uri and
@@ -1630,8 +1676,9 @@ struct AuthorizationStore {
     order: VecDeque<(Instant, String)>,
 }
 
-/// The map is full of authorizations too young to evict. See
-/// [`AuthorizationStore::insert`].
+/// There is no slot for a new authorization: either this client's own
+/// [`MAX_PENDING_PER_CLIENT`] are all too young to evict, or the whole map is.
+/// See [`AuthorizationStore::insert`].
 #[derive(Debug)]
 struct AuthorizationsFull;
 
@@ -1648,16 +1695,51 @@ impl AuthorizationStore {
         self.order.len()
     }
 
-    /// Remember `record` under `id`, forgetting what has expired and, if the
-    /// map is still full, the oldest records past [`MIN_EVICT_AGE`].
+    /// Remember `record` under `id`, forgetting what has expired and then, in
+    /// turn, this client's own oldest and the map's oldest - each only once it
+    /// is past [`MIN_EVICT_AGE`], and refusing rather than taking a record
+    /// younger than that.
     ///
-    /// The floor is the single sign-on store's and is the whole reason this is
-    /// not a plain oldest-first eviction: without it, filling the map is a way
-    /// to evict every real consent mid decision - the cap would be reached and
-    /// the oldest record, somebody who pressed a button in their client a few
-    /// seconds ago, would go. With it a full map of young records refuses the
-    /// newcomer, which costs a flood its own next request and costs the person
-    /// deciding nothing.
+    /// **The floor.** It is the single sign-on store's and is the whole reason
+    /// this is not a plain oldest-first eviction: without it, filling the map
+    /// is a way to evict every real consent mid decision - the cap would be
+    /// reached and the oldest record, somebody who pressed a button in their
+    /// client a few seconds ago, would go.
+    ///
+    /// **Who the refusal lands on, which is the half the floor alone got
+    /// wrong.** With only a global cap behind the floor, filling the map stops
+    /// being a way to evict every real consent and becomes a way to *refuse*
+    /// every real consent: [`authorize`] is a public GET with no limiter of
+    /// its own, so roughly thirty-four requests a second keep a thousand
+    /// records under thirty seconds old, and from then on every person
+    /// pressing connect is sent back to their client with
+    /// `temporarily_unavailable`. Nothing is granted and the map drains itself
+    /// within half a minute of the flood stopping, but a stranger at the port
+    /// should not be able to take the consent flow away from everyone, and
+    /// that trade was never argued anywhere - it was simply the other side of
+    /// the floor.
+    ///
+    /// So the cap the flood meets first is per registration
+    /// ([`MAX_PENDING_PER_CLIENT`]), and it is reached by the client that
+    /// filled it. A flood refuses itself after four requests in flight; a
+    /// person whose client has one pending request is not competing with it at
+    /// all. The global cap stays as the memory bound behind that, and by the
+    /// arithmetic at [`UNSTAMPED_CLIENT_CEILING`] an unauthenticated caller
+    /// cannot reach it.
+    ///
+    /// **Why the floor is kept inside the bucket too.** A `client_id` names a
+    /// registration, not a person: one registration handed to a small team
+    /// puts several people's decisions in one bucket. Evicting a bucket's
+    /// oldest with no age check would therefore be a way to take a colleague's
+    /// pending consent out from under them, which is the hazard the floor
+    /// exists to prevent, moved rather than removed. Inside the bucket the
+    /// floor costs nothing real: four tabs opened within thirty seconds from
+    /// one registration is a retry loop, and the fifth waits half a minute.
+    ///
+    /// Nothing here lets a caller evict a record it does not already share a
+    /// registration with, and a `client_id` is thirty-two random bytes handed
+    /// only to the client that registered, so a bucket is not a thing a
+    /// stranger can aim at.
     fn insert(
         &mut self,
         id: String,
@@ -1665,6 +1747,11 @@ impl AuthorizationStore {
     ) -> Result<(), AuthorizationsFull> {
         let now = Instant::now();
         self.purge_expired(now);
+        while self.pending_for_client(&record.client_id) >= MAX_PENDING_PER_CLIENT {
+            if !self.drop_oldest_for_client(&record.client_id, now) {
+                return Err(AuthorizationsFull);
+            }
+        }
         while self.records.len() >= MAX_PENDING_AUTHORIZATIONS {
             let Some((started, key)) = self.order.front() else {
                 break;
@@ -1679,6 +1766,41 @@ impl AuthorizationStore {
         self.order.push_back((record.started, id.clone()));
         self.records.insert(id, record);
         Ok(())
+    }
+
+    /// How many live records this registration holds.
+    fn pending_for_client(&self, client_id: &str) -> usize {
+        self.records
+            .values()
+            .filter(|record| record.client_id == client_id)
+            .count()
+    }
+
+    /// Drop this registration's oldest live record, if it is past
+    /// [`MIN_EVICT_AGE`]; `false` when there is none or it is too young.
+    ///
+    /// The chronological entry goes with it rather than being left to be
+    /// skipped later. A record taken by a decision may leave its entry behind
+    /// because the front walk collects those, but this path can fire on every
+    /// insert from a busy client without the map ever reaching its global cap,
+    /// so an entry left here would never be walked past and `order` would grow
+    /// without bound.
+    fn drop_oldest_for_client(&mut self, client_id: &str, now: Instant) -> bool {
+        let Some(index) = self.order.iter().position(|(_, key)| {
+            self.records
+                .get(key)
+                .is_some_and(|record| record.client_id == client_id)
+        }) else {
+            return false;
+        };
+        let (started, key) = &self.order[index];
+        if now.duration_since(*started) < MIN_EVICT_AGE {
+            return false;
+        }
+        let key = key.clone();
+        self.order.remove(index);
+        self.records.remove(&key);
+        true
     }
 
     /// Read the record for `id` without spending it: the consent page is a
@@ -2268,7 +2390,7 @@ pub async fn authorize(
         .unwrap_or_else(|e| e.into_inner())
         .insert(id.clone(), record);
     if remembered.is_err() {
-        return refuse("pending store full", "temporarily_unavailable");
+        return refuse("no pending slot", "temporarily_unavailable");
     }
 
     // The registration's `last_used` is deliberately NOT stamped here. This
@@ -3014,8 +3136,15 @@ mod tests {
 
     /// A pending authorization that started `age` ago.
     fn pending(age: Duration) -> PendingAuthorization {
+        pending_for("coc_1", age)
+    }
+
+    /// The same, for a named registration. The `client_id` is what the
+    /// per-registration cap buckets on, so a test about the global cap has to
+    /// spend a registration per record the way a real flood would.
+    fn pending_for(client_id: &str, age: Duration) -> PendingAuthorization {
         PendingAuthorization {
-            client_id: "coc_1".to_string(),
+            client_id: client_id.to_string(),
             client_name: "Claude".to_string(),
             client_uri: Some("https://claude.ai".to_string()),
             redirect_uri: "https://claude.ai/api/mcp/auth_callback".to_string(),
@@ -3070,7 +3199,10 @@ mod tests {
             .unwrap();
         for i in 0..MAX_PENDING_AUTHORIZATIONS {
             store
-                .insert(format!("fill-{i}"), pending(Duration::ZERO))
+                .insert(
+                    format!("fill-{i}"),
+                    pending_for(&format!("coc_fill_{i}"), Duration::ZERO),
+                )
                 .unwrap_or_else(|_| panic!("insert {i} should have evicted the stale record"));
         }
         assert!(store.take("stale").is_none(), "the oldest one made room");
@@ -3087,7 +3219,10 @@ mod tests {
         let mut refused = 0;
         for i in 0..(MAX_PENDING_AUTHORIZATIONS * 2) {
             if store
-                .insert(format!("flood-{i}"), pending(Duration::ZERO))
+                .insert(
+                    format!("flood-{i}"),
+                    pending_for(&format!("coc_flood_{i}"), Duration::ZERO),
+                )
                 .is_err()
             {
                 refused += 1;
@@ -3098,6 +3233,114 @@ mod tests {
         assert!(
             store.take("deciding").is_some(),
             "the person who pressed a button five seconds ago survived the flood"
+        );
+    }
+
+    /// A flood spends its own registration's four slots and then refuses
+    /// itself, leaving every other client's pending consent alone.
+    ///
+    /// This is the property the per-registration cap exists for. Without it
+    /// the same flood fills the global map with records younger than the
+    /// eviction floor, and from that point every real consent is answered
+    /// `temporarily_unavailable` - nothing granted and nothing leaked, but the
+    /// consent flow taken away from everybody by a stranger who needs one
+    /// registration and no account.
+    #[test]
+    fn a_flood_from_one_registration_refuses_itself_and_spares_the_others() {
+        let mut store = AuthorizationStore::default();
+        store
+            .insert(
+                "deciding".to_string(),
+                pending_for("coc_person", Duration::from_secs(5)),
+            )
+            .unwrap();
+        let mut refused = 0;
+        for i in 0..(MAX_PENDING_AUTHORIZATIONS * 4) {
+            if store
+                .insert(
+                    format!("flood-{i}"),
+                    pending_for("coc_flood", Duration::ZERO),
+                )
+                .is_err()
+            {
+                refused += 1;
+            }
+        }
+        assert!(refused > 0, "the flood is refused rather than served");
+        assert_eq!(
+            store.pending_for_client("coc_flood"),
+            MAX_PENDING_PER_CLIENT,
+            "one registration never holds more than its own four"
+        );
+        assert!(
+            store.len() <= MAX_PENDING_PER_CLIENT + 1,
+            "and the map never fills, so nothing else is competing for it"
+        );
+        assert!(
+            store
+                .insert(
+                    "newcomer".to_string(),
+                    pending_for("coc_other", Duration::ZERO)
+                )
+                .is_ok(),
+            "a person pressing connect during the flood is still admitted"
+        );
+        assert!(
+            store.take("deciding").is_some(),
+            "and the one already deciding was never touched"
+        );
+    }
+
+    /// The eviction floor holds inside a bucket as well as across the map.
+    ///
+    /// A `client_id` names a registration rather than a person, so one
+    /// registration shared by a few people puts their decisions in one bucket.
+    /// Dropping a bucket's oldest with no age check would move the hazard the
+    /// floor exists for rather than removing it.
+    #[test]
+    fn a_registrations_own_slots_are_not_taken_from_somebody_mid_decision() {
+        let mut store = AuthorizationStore::default();
+        for i in 0..MAX_PENDING_PER_CLIENT {
+            store
+                .insert(
+                    format!("young-{i}"),
+                    pending_for("coc_team", Duration::ZERO),
+                )
+                .unwrap();
+        }
+        assert!(
+            store
+                .insert("next".to_string(), pending_for("coc_team", Duration::ZERO))
+                .is_err(),
+            "a fifth request waits rather than taking a colleague's decision"
+        );
+        assert!(
+            store.take("young-0").is_some(),
+            "the person who pressed a button a moment ago still has a record"
+        );
+
+        // Once one of them is past the floor it is the one that goes.
+        let mut store = AuthorizationStore::default();
+        store
+            .insert(
+                "abandoned".to_string(),
+                pending_for("coc_team", MIN_EVICT_AGE + Duration::from_secs(1)),
+            )
+            .unwrap();
+        for i in 1..MAX_PENDING_PER_CLIENT {
+            store
+                .insert(
+                    format!("young-{i}"),
+                    pending_for("coc_team", Duration::ZERO),
+                )
+                .unwrap();
+        }
+        store
+            .insert("next".to_string(), pending_for("coc_team", Duration::ZERO))
+            .expect("the abandoned one is past the floor and makes room");
+        assert!(
+            store.take("abandoned").is_none(),
+            "and it is the one dropped"
         );
     }
 
