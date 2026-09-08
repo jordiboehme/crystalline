@@ -303,6 +303,9 @@ pub async fn run_serve(
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
             eprintln!("{}", ui_startup_line(&loaded.effective, addr));
+            if let Some(line) = oauth_without_a_consent_page(&loaded.effective) {
+                eprintln!("crystalline warning: {line}");
+            }
             if let Some(token) = &setup_token {
                 for line in setup_token_lines(addr, token) {
                     eprintln!("{line}");
@@ -1322,6 +1325,21 @@ fn http_base(
     // whenever `api` is, so that case is already caught there with the more
     // specific word; this one is what catches `service.ui` turned off on its
     // own, with the API still serving.
+    //
+    // **This guard reads the setting, not whether a bundle exists, and that is
+    // deliberate.** A binary built without `fluid-ui` (or over an empty
+    // `fluid/dist`) still has `ui_enabled()` true, so a derived `auth.oauth`
+    // comes up on with nowhere to consent. Detecting the bundle here would
+    // have to change what OAuth *is* on that build, and `auth.oauth()` is read
+    // independently by four places - the gate's `with_oauth`,
+    // `well_known_routes`, `OauthServer::new` and `AuthCfg::resolve` - whose
+    // agreement is the property that makes "is OAuth served" one answer. A
+    // fifth answer, disagreeing with the config for a build no release
+    // produces, would cost more than the case is worth. So the combination is
+    // named at startup instead (`oauth_without_a_consent_page`) and documented
+    // as unsupported in `docs/deployment.md`; an explicit `auth.oauth: false`
+    // is the fix, and nothing is granted meanwhile - the flow simply cannot
+    // complete.
     if oauth && !config.ui_enabled() {
         anyhow::bail!(
             "auth.oauth needs service.ui: authorize redirects to /authorize, and with the UI off that address falls to the MCP transport, where no consent can ever happen"
@@ -1490,22 +1508,56 @@ fn ui_startup_line(config: &GlobalConfig, addr: &str) -> String {
     if !config.ui_enabled() {
         return "web UI off (service.ui=false)".to_string();
     }
+    if ui_bundled() {
+        return format!("crystalline web UI at http://{addr}");
+    }
+    // Either built without the `fluid-ui` feature, so there is no bundle at
+    // all, or a dev build whose `fluid/dist` was never built (or was built
+    // after the last compile of this crate: see the note in `build.rs`).
+    "web UI not built into this binary".to_string()
+}
+
+/// Whether this binary actually carries a Fluid bundle, which is a different
+/// question from whether `service.ui` is on.
+///
+/// Both absences look the same from here and neither is a setting: the
+/// `fluid-ui` feature can be off, or it can be on over an empty embed because
+/// `fluid/dist` was never built. Every release binary and the container image
+/// carry the bundle, so this is false only in a hand-rolled build.
+fn ui_bundled() -> bool {
     #[cfg(feature = "fluid-ui")]
     {
-        if crate::ui::ui_available::<crate::ui::FluidAssets>() {
-            return format!("crystalline web UI at http://{addr}");
-        }
-        // A dev build whose `fluid/dist` was never built, or was built after
-        // the last compile of this crate: see the note in `build.rs`.
-        "web UI not built into this binary".to_string()
+        crate::ui::ui_available::<crate::ui::FluidAssets>()
     }
     #[cfg(not(feature = "fluid-ui"))]
     {
-        // Built without the `fluid-ui` feature, so there is no bundle at all
-        // and nothing to point an address at.
-        let _ = addr;
-        "web UI not built into this binary".to_string()
+        false
     }
+}
+
+/// The line a start prints when OAuth is served by a binary that carries no
+/// consent page, which is a combination nothing releases and nobody can use.
+///
+/// `None` for every ordinary start. The second startup guard in [`http_base`]
+/// carries the reasoning for why this is a line rather than a refusal.
+fn oauth_without_a_consent_page(config: &GlobalConfig) -> Option<&'static str> {
+    consent_page_warning(config, ui_bundled())
+}
+
+/// [`oauth_without_a_consent_page`] with the bundle answered rather than
+/// detected.
+///
+/// Split out so both arms are testable on any build. Asking `ui_bundled()`
+/// inside the decision would leave the warning branch unreachable from a test
+/// on every machine that has a bundle, which is every machine this is
+/// developed and released on - and this line is the only signal a build
+/// without one gets.
+fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static str> {
+    (config.auth_oauth() && config.api_enabled() && config.ui_enabled() && !bundled).then_some(
+        "auth.oauth is on but this binary carries no web UI: /oauth/authorize redirects to \
+         the consent page and there is none, so no client can finish connecting - rebuild \
+         with the bundle or set auth.oauth: false",
+    )
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload
@@ -2166,6 +2218,47 @@ mod tests {
             line, "web UI not built into this binary",
             "a binary built without the feature carries no bundle at all"
         );
+    }
+
+    /// A binary with no consent page in it says so when OAuth is on, rather
+    /// than serving a flow that cannot complete in silence.
+    ///
+    /// The combination is unsupported rather than guarded against: see the
+    /// second startup guard in `http_base` for why detecting the bundle there
+    /// would cost more than this case is worth.
+    #[test]
+    fn a_start_with_oauth_on_and_no_bundle_says_so() {
+        let mut config = config_with_ui(None, None);
+        config.auth = Some(crystalline_core::config::AuthConfig {
+            mcp: Some(true),
+            ..Default::default()
+        });
+        assert!(config.auth_oauth(), "derived on where the UI is served");
+        // Both arms, decided rather than detected, so neither depends on
+        // whether the machine running this test happens to hold a bundle.
+        let warned = consent_page_warning(&config, false).expect("no bundle, so a warning");
+        assert!(
+            warned.contains("auth.oauth"),
+            "the warning names the key to change: {warned}"
+        );
+        assert!(
+            !warned.contains("  "),
+            "a wrapped literal that lost its continuations reads with gaps in it: {warned}"
+        );
+        assert!(
+            consent_page_warning(&config, true).is_none(),
+            "and an ordinary build says nothing"
+        );
+        assert_eq!(
+            oauth_without_a_consent_page(&config).is_some(),
+            !ui_bundled(),
+            "the production predicate answers for this binary's own bundle"
+        );
+
+        // Never for an instance that is not serving OAuth at all.
+        let off = config_with_ui(None, None);
+        assert!(!off.auth_oauth());
+        assert!(consent_page_warning(&off, false).is_none());
     }
 
     fn config_with_allowed_hosts(hosts: Vec<String>) -> GlobalConfig {
