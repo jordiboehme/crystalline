@@ -22,6 +22,7 @@ mod mock;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crystalline_remote::merge::ConflictKind;
 use crystalline_remote::ops::{
     OriginStatusReport, PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions,
     SubscribeReport, propose, propose_preview, pull, resolve, status, subscribe, withdraw,
@@ -2143,6 +2144,148 @@ async fn scenario_22_resolve_merged_writes_the_supplied_content() {
     .unwrap();
     assert_eq!(report.remaining, 0);
     assert_eq!(read(&sub.domain_root.join("notes/a.md")), merged);
+}
+
+/// Seeds a re-cased engram that upstream also edited, so the conflict is
+/// recorded at a spelling nothing on disk answers to.
+///
+/// The engram is re-cased locally and edited under its new spelling, so at the
+/// recorded spelling the working tree has nothing: the merge sees a base, no
+/// local and an upstream edit, which is the one conflict shape reachable with
+/// the local file absent. The base snapshot is what still maps `notes/a.md` to
+/// the `notes/A.md` the person can see.
+async fn seeded_recased_delete_edit_conflict(mock: &MockProvider, spec: &OriginSpec) -> Subscribed {
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(mock, spec, &c1, "brand").await;
+    std::fs::remove_file(sub.domain_root.join("notes/a.md")).unwrap();
+    write(&sub.domain_root.join("notes/A.md"), b"line one LOCAL\n");
+    // The whole point of the scenario only exists where the two spellings are
+    // two files; on a case-insensitive filesystem this asserts the same
+    // outcome over one file, which is why it passes there either way.
+    let case_sensitive = !sub.domain_root.join("notes/a.md").exists();
+
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one UPSTREAM\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(mock, spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.conflicts.len(), 1);
+    assert_eq!(st.conflicts[0].path, "notes/a.md");
+    // Both filesystems reach a conflict here, by different routes, and the
+    // kind says which machine this is running on. Where the two spellings are
+    // one file the merge sees a local edit and calls it `EditEdit`; where they
+    // are two the recorded spelling opens nothing, which is the one conflict
+    // shape reachable with the local file absent.
+    assert_eq!(
+        st.conflicts[0].kind,
+        if case_sensitive {
+            ConflictKind::DeleteEdit
+        } else {
+            ConflictKind::EditEdit
+        }
+    );
+    sub
+}
+
+/// The names under `notes/` that differ from `a.md` by case alone.
+fn a_md_spellings(domain_root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("a.md"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A hand-merged body lands on the file the domain actually holds, not at the
+/// spelling the conflict was recorded under.
+///
+/// This is the worst member of the recorded-spelling family: written at the
+/// recorded spelling the merge goes to a path nothing reads, the live file
+/// keeps its pre-merge content and the conflict is cleared anyway, so somebody
+/// is told their resolution worked while it silently is not there.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; demonstrated on a case-sensitive APFS image.
+#[tokio::test]
+async fn a_resolved_merge_lands_on_the_recased_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_recased_delete_edit_conflict(&mock, &spec).await;
+
+    let merged: &[u8] = b"merged by hand\n";
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Merged(merged),
+    )
+    .unwrap();
+    assert_eq!(
+        report.resolved, "notes/a.md",
+        "the reported channel stays at the recorded spelling"
+    );
+    assert_eq!(report.remaining, 0);
+
+    assert_eq!(
+        read(&sub.domain_root.join("notes/A.md")),
+        merged,
+        "the merge has to be in the file the person can open"
+    );
+    assert_eq!(
+        a_md_spellings(&sub.domain_root),
+        vec!["A.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+}
+
+/// Taking the origin's copy of a re-cased file replaces it rather than landing
+/// a second copy beside it. The same line as the merge above, the milder
+/// outcome.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; demonstrated on a case-sensitive APFS image.
+#[tokio::test]
+async fn a_resolved_theirs_replaces_the_recased_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_recased_delete_edit_conflict(&mock, &spec).await;
+
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Theirs,
+    )
+    .unwrap();
+    assert_eq!(report.remaining, 0);
+
+    assert_eq!(
+        a_md_spellings(&sub.domain_root),
+        vec!["A.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/A.md")),
+        b"line one UPSTREAM\n"
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
 }
 
 #[tokio::test]

@@ -4100,6 +4100,27 @@ async fn layer_below_content(
 /// Errors with [`RemoteError::ConflictNotFound`], naming `path` and listing
 /// every currently open conflict path, when there is no open conflict there.
 /// Offline: this never talks to a provider.
+///
+/// **The two writing arms open the file at its spelling on disk, never at the
+/// recorded one.** A conflict is recorded at the base snapshot's spelling, and
+/// on a case-sensitive filesystem that spelling opens nothing once the file
+/// has been re-cased - which is itself how the conflict came to be recorded:
+/// with nothing at the recorded spelling the merge sees a deleted local file
+/// and an upstream edit, and asks. Writing the answer there would put the
+/// person's own hand-merged body at a path nothing reads, leave the file they
+/// can see at its pre-merge content and then clear the conflict, so a
+/// resolution that reports success would silently not be there.
+/// [`Resolution::Theirs`] lands the milder shape of the same mistake, a second
+/// copy of the engram beside the real one. `path` and
+/// [`ResolveReport::resolved`] keep naming the recorded spelling, which is the
+/// one the conflict, the forge and every other surface know.
+///
+/// The map is [`detect_local_changes`] over the base snapshot, which the pull
+/// that recorded the conflict advanced past it, so the recorded spelling is
+/// still a base entry there and the fold adopts whatever the disk spells it.
+/// That detection walks and hashes the domain, so it is paid only by the arms
+/// that write: [`Resolution::Mine`] keeps the local file untouched and needs
+/// neither the path nor the walk's failure mode.
 pub fn resolve(
     domain_root: &Path,
     state_dir: &Path,
@@ -4122,17 +4143,22 @@ pub fn resolve(
             open: state.conflicts.iter().map(|c| c.path.clone()).collect(),
         })?;
 
-    let wt_path = checked_working_path(state_dir, domain_root, path)?;
     match resolution {
         Resolution::Mine => {}
         Resolution::Theirs => {
             let (_, upstream) = state::read_conflict_files(state_dir, &conflict.id)?;
+            let local = detect_local_changes(domain_root, &state.files)?;
+            let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
             match upstream {
                 Some(bytes) => write_working_file(&wt_path, &bytes)?,
                 None => remove_working_file(&wt_path)?,
             }
         }
-        Resolution::Merged(content) => write_working_file(&wt_path, content)?,
+        Resolution::Merged(content) => {
+            let local = detect_local_changes(domain_root, &state.files)?;
+            let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(path))?;
+            write_working_file(&wt_path, content)?;
+        }
     }
 
     state::clear_conflict(state_dir, &conflict.id)?;
