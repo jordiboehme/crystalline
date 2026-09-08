@@ -351,6 +351,148 @@ fn tells_an_unsyncable_file_from_an_unsynced_one() {
     );
 }
 
+/// The plain invocation on a machine with no daemon: nothing to ask, so the
+/// index is opened here and every index-backed check runs exactly as it
+/// always did. The daemon route must not change what a person sees when there
+/// is no daemon, so this pins the direct branch by name.
+#[test]
+#[cfg(unix)]
+fn without_a_daemon_the_index_is_read_directly() {
+    let home = tempfile::tempdir().unwrap();
+    let domain_dir = home.path().join("kb-eng");
+    let mut init = bin();
+    common::isolate(&mut init, home.path());
+    init.args(["domain", "init"])
+        .arg(&domain_dir)
+        .args(["--name", "eng"])
+        .assert()
+        .success();
+
+    // No --config and no --db: the default paths inside the isolated home,
+    // which is what makes this the socket-first branch with no socket to find.
+    let mut add = bin();
+    common::isolate(&mut add, home.path());
+    add.args(["domain", "add", "eng"])
+        .arg(&domain_dir)
+        .assert()
+        .success();
+
+    let mut cmd = bin();
+    common::isolate(&mut cmd, home.path());
+    let out = cmd
+        .args(["--json", "doctor"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["index"]["source"],
+        serde_json::json!("direct"),
+        "with no daemon the index is opened here: {report}"
+    );
+    assert_eq!(
+        report["domains"][0]["index_checked"],
+        serde_json::json!(true),
+        "and the index-backed checks ran: {report}"
+    );
+    assert!(
+        report["embeddings"].is_object(),
+        "including the embedding summary, which needs the open store: {report}"
+    );
+}
+
+/// A diagnostic tool that dies when one of its sources is unavailable is no
+/// diagnostic tool. With an index nobody can open, every check that does not
+/// need it still runs, the report says what stopped the ones that do and what
+/// to do about it, and the exit code still reports a problem.
+#[test]
+fn an_unreadable_index_still_produces_a_report() {
+    let work = tempfile::tempdir().unwrap();
+    let config = work.path().join("config.yaml");
+    let db = work.path().join("index.db");
+    let domain_dir = setup_domain(work.path(), "eng", &config);
+    write(&domain_dir, "a.md", &engram("A", "a"));
+
+    // Not a database at all. The route does not matter to the report: an
+    // unopenable file, a file another process holds and a file this user
+    // cannot read all land in the same branch.
+    std::fs::write(&db, b"this is not a database\n").unwrap();
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .code(1)
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(
+        report["index"]["source"],
+        serde_json::json!("unavailable"),
+        "{report}"
+    );
+    let reason = report["index"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("did not run") && reason.contains("Check that the file is readable"),
+        "the reason reads as guidance, not as a bare error: {reason}"
+    );
+    assert_eq!(
+        report["domains"][0]["index_checked"],
+        serde_json::json!(false),
+        "the index-backed checks are marked as not run: {report}"
+    );
+    assert_eq!(
+        report["domains"][0]["path_exists"],
+        serde_json::json!(true),
+        "while the checks that need no index still ran: {report}"
+    );
+    assert!(
+        report["service"].is_object(),
+        "the service section is one of them: {report}"
+    );
+
+    // The human report says the same thing, and never claims the domain is ok.
+    let mut human = bin();
+    let _home = shield_ambient_home(&mut human);
+    let stdout = String::from_utf8(
+        human
+            .args(["doctor", "--config"])
+            .arg(&config)
+            .args(["--db"])
+            .arg(&db)
+            .assert()
+            .code(1)
+            .get_output()
+            .stdout
+            .clone(),
+    )
+    .unwrap();
+    assert!(
+        stdout.contains("index:\n  [problem] the index at "),
+        "the index section carries the problem: {stdout}"
+    );
+    assert!(
+        stdout.contains("index checks skipped (orphan rows, unindexed files)"),
+        "and each domain says which of its checks did not run: {stdout}"
+    );
+    let domains_block = stdout.split("service:").next().unwrap_or_default();
+    assert!(
+        !domains_block.contains("\n  ok\n"),
+        "a domain whose index checks never ran is never reported as ok: {stdout}"
+    );
+    assert!(
+        stdout.contains("embeddings: not read, the index checks did not run"),
+        "the embedding line says why it is empty rather than 'no index yet': {stdout}"
+    );
+}
+
 #[test]
 fn detects_a_registered_domain_whose_path_vanished() {
     let work = tempfile::tempdir().unwrap();

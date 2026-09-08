@@ -32,8 +32,17 @@
 //! service artifacts; the rest, including the whole GitHub, environment,
 //! harnesses and provisioning sections, are report-only, and every finding
 //! that has a fix points at the right next command.
+//!
+//! The index reads are socket-first, the same shape `sync_dispatch` uses: a
+//! running daemon holds the index file, so its stamps are asked for over ctl
+//! and only a machine with no daemon (or an invocation an explicit
+//! `--db`/`--config` sends down the direct path) opens the file here. When
+//! neither route can read it, doctor does not abort: every check that does
+//! not need the index still runs, [`DoctorReport::index`] names what stopped
+//! the ones that do and what to do about it, and that counts as one
+//! unresolved problem so the exit code still says something is wrong.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -41,7 +50,9 @@ use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
-use crystalline_index::{Store, TagCluster, configured_model_id, tag_clusters_with_aliases};
+use crystalline_index::{
+    FileStamp, Store, TagCluster, configured_model_id, tag_clusters_with_aliases,
+};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
@@ -52,6 +63,40 @@ use serde::Serialize;
 use crate::cmd;
 use crate::install;
 use crate::receipt;
+
+/// How `doctor` read the index this run.
+///
+/// Every index-backed check - orphan rows, unindexed files, a virtual
+/// domain's engram count, the embedding summary, tag hygiene - needs one of
+/// these routes to be open, and a diagnostic tool must not abort because
+/// none of them was. The report therefore says which route it took, and the
+/// human render reads the same field rather than guessing why a section is
+/// thin.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum IndexAccess {
+    /// No index file exists yet: a fresh install that has never synced.
+    /// Neither an error nor a problem.
+    #[default]
+    Absent,
+    /// Opened here, in this process. The route a machine with no running
+    /// daemon takes, and the one an explicit `--db` or `--config` always
+    /// takes (see [`crystalline_service::use_daemon`]).
+    Direct,
+    /// Served by the running daemon over its control socket, because that
+    /// daemon holds the index file. Orphan rows and unindexed files come
+    /// from its stamps and read exactly as they do on the direct path; the
+    /// checks that need the open store itself (embedding coverage, tag
+    /// hygiene, a virtual domain's engram count) sit this run out.
+    Daemon,
+    /// Neither route could read the index. Every check that does not need it
+    /// still ran.
+    Unavailable {
+        /// What stopped the index-backed checks and what to do about it, as
+        /// guidance a person can act on rather than a bare locking error.
+        reason: String,
+    },
+}
 
 /// One domain's diagnostics.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -69,6 +114,12 @@ pub struct DomainDoctor {
     /// on-disk orphan and unindexed checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engrams: Option<i64>,
+    /// Whether this domain's index-backed checks ran at all: the orphan and
+    /// unindexed sets below, and a virtual domain's engram count. False when
+    /// no route to the index was open, in which case `orphans` and
+    /// `unindexed` are empty because nothing was read, not because nothing
+    /// was found - [`DoctorReport::index`] says why.
+    pub index_checked: bool,
     /// Whether the path exists on disk.
     pub path_exists: bool,
     /// Whether `MANIFEST.md` is present at the root.
@@ -395,6 +446,8 @@ pub struct TagsDoctor {
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
+    /// How the index was read this run, and, when it could not be, why.
+    pub index: IndexAccess,
     /// Per-domain diagnostics.
     pub domains: Vec<DomainDoctor>,
     /// Service lock and socket diagnostics.
@@ -427,6 +480,14 @@ impl DoctorReport {
     /// when this is nonzero, 0 otherwise.
     pub fn remaining_problems(&self) -> usize {
         let mut n = 0;
+        // An index nobody could read is one problem, counted once for the
+        // machine rather than once per domain: the cause is shared, and the
+        // per-domain `index_checked` flags only record which checks it took
+        // down with it. Counting it at all is what keeps the exit code
+        // honest, since a partial report otherwise looks like a clean one.
+        if matches!(self.index, IndexAccess::Unavailable { .. }) {
+            n += 1;
+        }
         for d in &self.domains {
             if !d.path_exists || !d.manifest_present {
                 n += 1;
@@ -507,31 +568,38 @@ pub async fn run(
     // the process causing it - the one state where doctor matters most.
     let service = check_service(fix).await?;
 
-    let store = if db.is_file() {
-        Some(
-            crystalline_index::open_store(&cfg.database(), Some(&db), false)
-                .await
-                .map_err(|e| {
-                    let hint = if service.daemon_unresponsive && !service.daemon_dislodged {
-                        let pid = service
-                            .lock_pid
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        format!(
-                            ". An unresponsive daemon (pid {pid}) holds the index and answers nothing; rerun with --fix to replace it"
-                        )
-                    } else {
-                        String::new()
-                    };
-                    anyhow!(
-                        "could not open the index at {}: {e}{hint}",
-                        db.display()
-                    )
-                })?,
-        )
-    } else {
+    // The index read, socket-first, in the same shape `sync_dispatch` uses. A
+    // healthy daemon holds the index file, so asking it for the stamps is the
+    // only way the ordinary case (a diagnosis run while the service is up)
+    // gets a report at all. Probed after `check_service` and never before it:
+    // a `--fix` that just dislodged a wedged holder has already run, so this
+    // answer is the current one and the ordering above is preserved.
+    let bypassed = !crystalline_service::use_daemon(db_override, config_override);
+    let mut daemon_stamps = if bypassed {
         None
+    } else {
+        daemon_file_stamps(domain_filter).await
     };
+
+    let mut index = IndexAccess::Absent;
+    let mut store = None;
+    if daemon_stamps.is_some() {
+        index = IndexAccess::Daemon;
+    } else if db.is_file() {
+        match crystalline_index::open_store(&cfg.database(), Some(&db), false).await {
+            Ok(opened) => {
+                index = IndexAccess::Direct;
+                store = Some(opened);
+            }
+            // Not an abort. Every check that does not need the index still
+            // runs below, and the reason travels in the report as guidance.
+            Err(e) => {
+                index = IndexAccess::Unavailable {
+                    reason: index_unavailable_reason(&db, &e.to_string(), &service, bypassed),
+                };
+            }
+        }
+    }
     // Lock once for the whole diagnostic pass: a one-shot CLI command has no
     // concurrent store users, and the helpers take a plain `&dyn Store`.
     let guard = match &store {
@@ -542,7 +610,14 @@ pub async fn run(
 
     let mut domains = Vec::with_capacity(targets.len());
     for (name, entry) in &targets {
-        domains.push(check_domain(name, entry, store_ref, fix).await?);
+        // Taken out of the daemon's answer rather than borrowed, so each
+        // domain's stamps are consumed once. A file domain the daemon
+        // answered for but has no rows for reads as an empty set, which is
+        // exactly what the direct path produces for an unsynced domain.
+        let stamps = daemon_stamps
+            .as_mut()
+            .map(|by_domain| by_domain.remove(name).unwrap_or_default());
+        domains.push(check_domain(name, entry, store_ref, stamps, fix).await?);
     }
 
     let environment = check_environment(&loaded.overlay);
@@ -565,6 +640,7 @@ pub async fn run(
     let tags = check_tags(store_ref).await?;
 
     Ok(DoctorReport {
+        index,
         domains,
         service,
         environment,
@@ -575,6 +651,62 @@ pub async fn run(
         tags,
         fix,
     })
+}
+
+/// The per-domain file stamps a running daemon serves over its ctl socket,
+/// keyed by domain name and then by domain-relative path, or `None` when no
+/// daemon answered.
+///
+/// Never an error: a daemon that is not running, one that refuses the request
+/// and one whose answer does not parse all mean the same thing to the caller,
+/// which is that the direct open is the route to try next.
+async fn daemon_file_stamps(
+    domain: Option<&str>,
+) -> Option<HashMap<String, HashMap<String, FileStamp>>> {
+    let data = crystalline_service::ctl_if_running(
+        serde_json::json!({ "v": 1, "cmd": "file_stamps", "domain": domain }),
+    )
+    .await
+    .ok()??;
+    serde_json::from_value(data.get("domains")?.clone()).ok()
+}
+
+/// Why the index-backed checks did not run, written as guidance: what holds
+/// the index, and the command that gets a full report. A person who runs
+/// `doctor` while a daemon is up used to see nothing but the raw locking
+/// error, which named neither.
+fn index_unavailable_reason(
+    db: &Path,
+    error: &str,
+    service: &ServiceDoctor,
+    bypassed: bool,
+) -> String {
+    let db = db.display();
+    let pid = service
+        .lock_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let skipped = "so the orphan, unindexed, embedding and tag checks did not run";
+    // The wedge first: it is the one holder `--fix` can do something about.
+    if service.daemon_unresponsive && !service.daemon_dislodged {
+        return format!(
+            "an unresponsive daemon (pid {pid}) holds the index at {db} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
+        );
+    }
+    let live_daemon = instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
+    if live_daemon && bypassed {
+        return format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {db}, and --db or --config told doctor to read that file directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}"
+        );
+    }
+    if live_daemon {
+        return format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {db} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
+        );
+    }
+    format!(
+        "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+    )
 }
 
 fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
@@ -594,10 +726,18 @@ fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String,
     }
 }
 
+/// One domain's diagnostics. `daemon_stamps` carries the file stamps a
+/// running daemon served for this domain, which is the index read whenever
+/// the daemon holds the index file; `store` is the direct open, used when
+/// there is no daemon to ask. At most one of the two is ever `Some`, and both
+/// produce the identical orphan, unindexed and unsyncable sets - the split
+/// between "not indexed yet" and "cannot be indexed until the frontmatter is
+/// fixed" is computed here, off the stamps, whichever route delivered them.
 async fn check_domain(
     name: &str,
     entry: &DomainEntry,
     store: Option<&dyn Store>,
+    daemon_stamps: Option<HashMap<String, FileStamp>>,
     fix: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
@@ -613,6 +753,8 @@ async fn check_domain(
             manifest_present: true,
             ..Default::default()
         };
+        // The count needs the store itself, so a run served by the daemon
+        // leaves it absent rather than reporting a fabricated zero.
         if let Some(store) = store {
             let count = store
                 .list_engrams(name, None, None)
@@ -620,6 +762,7 @@ async fn check_domain(
                 .map(|e| e.len() as i64)
                 .unwrap_or(0);
             d.engrams = Some(count);
+            d.index_checked = true;
         }
         return Ok(d);
     }
@@ -670,20 +813,35 @@ async fn check_domain(
         }
     }
 
-    // (a) + (b): DB orphans and unindexed files.
-    if let Some(store) = store {
-        let domain_id = store
-            .upsert_domain(
-                name,
-                Some(&path.to_string_lossy()),
-                crystalline_index::DomainKind::File,
-            )
-            .await
-            .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
-        let stamps = store
-            .file_stamps(domain_id)
-            .await
-            .map_err(|e| anyhow!("could not read file stamps for '{name}': {e}"))?;
+    // (a) + (b): DB orphans and unindexed files, from whichever route reached
+    // the index. `domain_id` stays `None` on the daemon-served route, which is
+    // what keeps `--fix` from pretending it can delete rows through it.
+    let mut domain_id = None;
+    let stamps = match daemon_stamps {
+        Some(stamps) => Some(stamps),
+        None => match store {
+            Some(store) => {
+                let id = store
+                    .upsert_domain(
+                        name,
+                        Some(&path.to_string_lossy()),
+                        crystalline_index::DomainKind::File,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
+                domain_id = Some(id);
+                Some(
+                    store
+                        .file_stamps(id)
+                        .await
+                        .map_err(|e| anyhow!("could not read file stamps for '{name}': {e}"))?,
+                )
+            }
+            None => None,
+        },
+    };
+    if let Some(stamps) = stamps {
+        d.index_checked = true;
         let on_disk = markdown_rel_paths(&path);
         let disk_set: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
         let db_set: HashSet<&str> = stamps.keys().map(String::as_str).collect();
@@ -715,7 +873,10 @@ async fn check_domain(
         });
         d.unsyncable = unsyncable;
 
-        if fix {
+        // Only the direct route can delete. Over a daemon the orphans are
+        // still reported, with the render saying plainly what removing them
+        // takes, rather than being silently left in place.
+        if let (true, Some(store), Some(domain_id)) = (fix, store, domain_id) {
             for p in &orphans {
                 store.delete_engram(domain_id, p).await?;
                 d.orphans_removed += 1;
@@ -726,7 +887,9 @@ async fn check_domain(
 
         // Ownership: who hosts this file domain in a shared database. Unhosted
         // (single-instance) domains leave this `None`.
-        if let Ok(Some(host)) = store.domain_host(domain_id).await {
+        if let (Some(store), Some(domain_id)) = (store, domain_id)
+            && let Ok(Some(host)) = store.domain_host(domain_id).await
+        {
             d.host_instance_id = Some(host.instance_id);
             d.host_heartbeat_at = Some(host.heartbeat_at);
         }
@@ -1302,6 +1465,23 @@ pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
+    // The index route first, so a reader meets the reason before the thin
+    // domain sections it explains. A plain direct open, and a machine with no
+    // index yet, say nothing here: only a route worth knowing about does.
+    match &report.index {
+        IndexAccess::Daemon => {
+            let _ = writeln!(
+                out,
+                "index: read through the running daemon, which owns the index file"
+            );
+        }
+        IndexAccess::Unavailable { reason } => {
+            let _ = writeln!(out, "index:");
+            let _ = writeln!(out, "  [problem] {reason}");
+        }
+        IndexAccess::Absent | IndexAccess::Direct => {}
+    }
+
     for d in &report.domains {
         let _ = writeln!(out, "{} ({})", d.name, d.path);
         // Ownership in a shared database: who hosts this file domain. Unhosted
@@ -1315,11 +1495,17 @@ pub fn render_human(report: &DoctorReport) -> String {
             let _ = writeln!(out, "  hosted by instance {host}{hb}");
         }
         if d.is_virtual {
-            let _ = writeln!(
-                out,
-                "  ok (virtual, {} engram(s) in the database)",
-                d.engrams.unwrap_or(0)
-            );
+            match d.engrams {
+                Some(n) => {
+                    let _ = writeln!(out, "  ok (virtual, {n} engram(s) in the database)");
+                }
+                // A virtual domain lives entirely in the index, so with no
+                // route to it there is nothing to count and nothing to
+                // claim.
+                None => {
+                    let _ = writeln!(out, "  ok (virtual, engram count not read)");
+                }
+            }
             continue;
         }
         if !d.path_exists {
@@ -1329,12 +1515,32 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.manifest_present {
             let _ = writeln!(out, "  [problem] no MANIFEST.md at the domain root");
         }
+        // Said once per domain so an empty orphan and unindexed list is never
+        // mistaken for a clean bill of health. The cause, and its remedy, are
+        // in the index section above.
+        if !d.index_checked && matches!(report.index, IndexAccess::Unavailable { .. }) {
+            let _ = writeln!(
+                out,
+                "  index checks skipped (orphan rows, unindexed files); see the index section above"
+            );
+        }
         if !d.orphans.is_empty() {
             if d.orphans_removed > 0 {
                 let _ = writeln!(
                     out,
                     "  removed {} orphan row(s): {}",
                     d.orphans_removed,
+                    d.orphans.join(", ")
+                );
+            } else if report.index == IndexAccess::Daemon {
+                // Removing a row is a write, and this run reached the index
+                // through a read verb on the daemon that holds it. Say what
+                // that takes instead of pointing at a --fix that would do
+                // nothing.
+                let _ = writeln!(
+                    out,
+                    "  [problem] {} orphan row(s) (file missing on disk): {}. The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
+                    d.orphans.len(),
                     d.orphans.join(", ")
                 );
             } else {
@@ -1377,11 +1583,14 @@ pub fn render_human(report: &DoctorReport) -> String {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
             }
         }
+        // "ok" is a claim about everything, so a domain whose index checks
+        // never ran does not get to make it.
         if d.manifest_present
             && d.orphans.is_empty()
             && d.unindexed.is_empty()
             && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
+            && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
             let _ = writeln!(out, "  ok");
         }
@@ -1529,7 +1738,25 @@ pub fn render_human(report: &DoctorReport) -> String {
             e["stale_chunks"]
         );
     } else {
-        let _ = writeln!(out, "embeddings: no index yet");
+        // Absent for three different reasons, and a person acts on each of
+        // them differently, so none of them may print as "no index yet".
+        match &report.index {
+            IndexAccess::Daemon => {
+                let _ = writeln!(
+                    out,
+                    "embeddings: not read here, the running daemon owns the index; run: crystalline status"
+                );
+            }
+            IndexAccess::Unavailable { .. } => {
+                let _ = writeln!(
+                    out,
+                    "embeddings: not read, the index checks did not run (see the index section above)"
+                );
+            }
+            IndexAccess::Absent | IndexAccess::Direct => {
+                let _ = writeln!(out, "embeddings: no index yet");
+            }
+        }
     }
 
     if let Some(harnesses) = &report.harnesses {
@@ -1723,6 +1950,89 @@ mod tests {
             }),
             "colours and colour cluster when no alias explains them: {:?}",
             doctor.clusters
+        );
+    }
+
+    /// One file domain with `orphans` recorded and nothing else wrong, read
+    /// through `index`.
+    fn report_with_orphans(index: IndexAccess, orphans: &[&str]) -> DoctorReport {
+        DoctorReport {
+            index,
+            domains: vec![DomainDoctor {
+                name: "eng".to_string(),
+                kind: "file".to_string(),
+                path: "/kb/eng".to_string(),
+                index_checked: true,
+                path_exists: true,
+                manifest_present: true,
+                orphans: orphans.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Over a daemon the doctor reads the index through a read verb, so
+    /// `--fix` cannot delete an orphan row however it is spelled. The finding
+    /// is still reported, with what removing it actually takes, rather than
+    /// pointing at a flag that would silently do nothing.
+    #[test]
+    fn an_orphan_found_over_a_daemon_says_what_removing_it_takes() {
+        let daemon = render_human(&report_with_orphans(IndexAccess::Daemon, &["gone.md"]));
+        assert!(
+            daemon.contains("[problem] 1 orphan row(s) (file missing on disk): gone.md."),
+            "{daemon}"
+        );
+        assert!(
+            daemon.contains(
+                "The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
+            ),
+            "{daemon}"
+        );
+        assert!(
+            !daemon.contains("rerun with --fix to remove"),
+            "the direct path's advice would be false here: {daemon}"
+        );
+
+        let direct = render_human(&report_with_orphans(IndexAccess::Direct, &["gone.md"]));
+        assert!(
+            direct.contains("rerun with --fix to remove: gone.md"),
+            "the direct path keeps the advice that works there: {direct}"
+        );
+    }
+
+    /// An index nobody could read counts once for the machine, so the exit
+    /// code says something is wrong without inflating the count by one per
+    /// domain.
+    #[test]
+    fn an_unreadable_index_counts_as_exactly_one_problem() {
+        let mut report = DoctorReport {
+            index: IndexAccess::Unavailable {
+                reason: "the index at /kb/index.db could not be opened".to_string(),
+            },
+            domains: vec![
+                DomainDoctor {
+                    name: "eng".to_string(),
+                    path_exists: true,
+                    manifest_present: true,
+                    ..Default::default()
+                },
+                DomainDoctor {
+                    name: "docs".to_string(),
+                    path_exists: true,
+                    manifest_present: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+
+        report.index = IndexAccess::Daemon;
+        assert_eq!(
+            report.remaining_problems(),
+            0,
+            "a run served by the daemon read the index, so there is nothing to report"
         );
     }
 
