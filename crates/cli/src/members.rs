@@ -121,7 +121,7 @@ pub async fn close_new_domain(
 ) -> Result<()> {
     let domain = &require_registered(domain, config)?;
     let store = store().await?;
-    store
+    let written = store
         .set_domain_visibility(domain, true, owner)
         .await
         .with_context(|| {
@@ -132,6 +132,25 @@ pub async fn close_new_domain(
                 owner.trim().to_lowercase()
             )
         })?;
+    // The name can already carry a visibility record: a domain that was private
+    // under an earlier registration whose records outlived it, or one closed
+    // against a name nobody had registered yet. Owned by the account just named
+    // it is what was asked for. Owned by anybody else it is not, and this write
+    // no longer takes it over, so saying "private, owned by <you>" would be a
+    // lie about who can see the domain that was just created.
+    if let VisibilityWrite::AlreadyPrivate { owner: held } = written
+        && held != owner.trim().to_lowercase()
+    {
+        bail!(
+            "domain '{domain}' is registered, and the name already carried a \
+             private-domain record owned by '{held}' - so it is PRIVATE TO \
+             '{held}' rather than to '{}'. Hand it over with `crystalline domain \
+             transfer {domain} {}`, or drop it with `crystalline domain remove \
+             {domain}`",
+            owner.trim().to_lowercase(),
+            owner.trim().to_lowercase()
+        );
+    }
     let line = format!(
         "Domain '{domain}' is private, owned by '{}'. Only its owner, the \
          accounts invited into it and instance admins see it.",

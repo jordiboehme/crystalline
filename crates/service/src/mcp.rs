@@ -2481,6 +2481,15 @@ impl McpServer {
                 ));
             }
         };
+        // Read-only first, matching `configure`, `add_domain` and
+        // `remove_domain`: on an instance where nothing may be provisioned at
+        // all, "this instance is read-only" is the more useful of the two true
+        // answers, and it is the one that does not depend on who is asking.
+        // The engine refuses these three arms for the same reason; asking here
+        // is what keeps the ORDER the same as the sibling verbs'.
+        if !matches!(action, ProvisionAction::Status) && self.engine.read_only() {
+            return Err(to_error(EngineError::ReadOnly));
+        }
         // Then the role, because allow, deny and apply change what this
         // instance IS: each writes a provisioning decision into the same
         // `config.yaml` that `configure set` edits, and `apply` reconciles

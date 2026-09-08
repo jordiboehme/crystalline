@@ -4881,6 +4881,15 @@ impl Engine {
             }
             // A linking engram in a domain this caller may not see is left
             // exactly as it was: see the scope note on this function.
+            //
+            // Defensive since the guard above landed, and kept for that
+            // reason. A reference reaching this point is bare, and a bare
+            // reference resolves in its own domain, so an inbound bare
+            // reference to the moved engram is in the domain the engram is
+            // LEAVING - which the mover had to be able to see in order to move
+            // out of it. There is no input today that reaches this `continue`;
+            // it is what keeps the rule true if the query above ever widens
+            // again.
             if hidden.contains(&r.src_domain) {
                 continue;
             }

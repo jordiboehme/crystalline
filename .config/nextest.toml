@@ -62,6 +62,13 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 #
 # `--profile ci` on the CI workflow's test step only; every local gate and the
 # battery keep the default profile, where a flake is a failure.
+#
+# Everything above still applies under it: a custom profile inherits the default
+# profile's settings AND its `[[profile.default.overrides]]` blocks, so the
+# forge-wire group cap and the two extended slow-timeouts are in force here too.
+# Verified rather than assumed (2026-09-08): with the default period cut to 2s
+# and terminate-after 1, a test carrying the long override ran 39s under
+# `--profile ci` without being killed.
 [profile.ci]
 retries = 1
 

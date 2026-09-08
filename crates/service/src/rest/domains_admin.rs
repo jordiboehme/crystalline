@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
 use super::auth::Identity;
+use super::auth_store::VisibilityWrite;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
     require_domain_read, require_domain_write,
@@ -408,8 +409,22 @@ async fn close_new_domain(state: &RestState, report: &Value, owner: &str) -> Res
             )
         })?
         .to_string();
-    let Err(e) = state.auth.set_domain_visibility(&name, true, owner).await else {
-        return Ok(());
+    let e = match state.auth.set_domain_visibility(&name, true, owner).await {
+        Ok(VisibilityWrite::Written) => return Ok(()),
+        // The name already carried a visibility record: a domain that was
+        // private under an earlier registration whose records outlived it, or
+        // one closed against a name nobody had registered yet. Owned by the
+        // caller it is exactly what was asked for. Owned by somebody else it is
+        // NOT - the domain would be private to a stranger, invisible to the
+        // person who just created it - and this write no longer takes it over,
+        // so the registration is rolled back like any other failure here.
+        Ok(VisibilityWrite::AlreadyPrivate { owner: held }) if held == owner => return Ok(()),
+        Ok(VisibilityWrite::AlreadyPrivate { owner: held }) => anyhow::anyhow!(
+            "the name already carries a private-domain record owned by another \
+             account, so it was not made yours"
+        )
+        .context(format!("owner on file: '{held}'")),
+        Err(e) => e,
     };
     let rolled_back = state.engine.domain_remove(&name).await.is_ok();
     Err(ApiError::internal(format!(

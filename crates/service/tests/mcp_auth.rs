@@ -1675,7 +1675,17 @@ async fn an_instance_viewers_agent_is_refused_and_an_admins_is_not() {
     assert!(ctx.path("lab", "admin-note.md").exists());
 }
 
-/// **A cross-domain move rewrites links only where the mover can see.**
+/// **A cross-domain move rewrites links only where the mover can see, and only
+/// the links it is for.**
+///
+/// Two rules hold this test up now and it is worth saying which does the work:
+/// `lab`'s references to the moved engram are a prefixed `[[open:Open Note]]`
+/// and a bare `[[Open Note]]` that resolves inside `lab` and never pointed
+/// here, so NEITHER is a link this rewrite repairs, whoever asks. The scope
+/// skip is a second line of defence behind that (see the note at the skip in
+/// `Engine::move_engram`), and its converse is pinned by
+/// `an_admins_move_rewrites_the_bare_link_in_the_domain_left_behind`, where an
+/// admin's move does repair the link that actually dangles.
 ///
 /// Moving an engram between domains rewrites every bare `[[target]]` that
 /// pointed at it into the prefixed form, and those linking engrams were not

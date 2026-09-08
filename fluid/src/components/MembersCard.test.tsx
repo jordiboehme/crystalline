@@ -759,7 +759,10 @@ describe("the members card", () => {
     // The submit's guard needs something to submit, or a refusal to call the
     // API says only that the form was empty. `readonly` refuses a person's
     // typing and not a programmatic change, which is exactly what is wanted
-    // here: a filled field on a read-only instance.
+    // here: a filled field on a read-only instance. The same field and the same
+    // press DO reach the API on a writable one - "invites an account at the
+    // level chosen in the form" above - so what is asserted below is the guard
+    // and not an empty form.
     const account = within(card).getByLabelText("Account");
     fireEvent.change(account, { target: { value: "newbie" } });
     expect(account).toHaveValue("newbie");

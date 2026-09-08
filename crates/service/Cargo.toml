@@ -110,7 +110,13 @@ windows-sys = { workspace = true }
 # This package, with its test seam on: an integration test is its own crate, so
 # `cfg(test)` inside the library does not cover it. Cargo unifies the feature
 # for the test build only - `cargo build --release` of the CLI never sees it.
-crystalline-service = { path = ".", features = ["testing"] }
+# `default-features = false` because this edge must add exactly one feature and
+# nothing else: with the defaults implied, a `--no-default-features` build that
+# carries tests would union `local-embeddings`, `postgres` and `fluid-ui` back
+# in through this line and the lean-build check would be checking nothing.
+crystalline-service = { path = ".", default-features = false, features = [
+    "testing",
+] }
 tempfile = { workspace = true }
 # `test-util` adds the paused clock the device flow's countdown test runs on,
 # and `tracing-subscriber` the capture layer one test asserts the sign-in's
