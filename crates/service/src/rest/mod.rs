@@ -39,8 +39,10 @@ pub use error::{
     if_none_match_matches, precondition_failed,
 };
 pub use oauth::{
-    AUTHORIZATION_SERVER_PATH, AUTHORIZE_PATH, OauthServer, OriginRule, PROTECTED_RESOURCE_PATH,
-    REGISTER_PATH, TOKEN_PATH, resource_metadata_url, well_known_routes,
+    AUTHORIZATION_SERVER_PATH, AUTHORIZE_PATH, MAX_OAUTH_CLIENTS, OauthError, OauthServer,
+    OriginRule, PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
+    RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
+    well_known_routes,
 };
 pub use oidc::{OidcClaims, OidcClient, OidcSettings};
 
@@ -68,7 +70,8 @@ use crate::scope::{DomainAccess, DomainRight};
                        editor account and the `If-Match` token of the version \
                        being replaced, and account management needs an \
                        admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
-                       `/auth/me`, `/auth/setup`, `/auth/providers` and the \
+                       `/auth/me`, `/auth/setup`, `/auth/providers`, \
+                       `/oauth/register` and the \
                        two `/auth/oidc/*` routes is closed by default: a \
                        request that \
                        carries no identity is answered 401 ahead of routing, so \
@@ -92,6 +95,7 @@ use crate::scope::{DomainAccess, DomainRight};
         (name = "maintenance", description = "The consolidation queue: what the knowledge needs next. Read-only."),
         (name = "users", description = "Account management. Admin only."),
         (name = "settings", description = "Instance settings. Admin only."),
+        (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
     ),
     paths(
         openapi_json,
@@ -164,6 +168,7 @@ use crate::scope::{DomainAccess, DomainRight};
         mcp_tokens::rotate,
         mcp_tokens::revoke,
         oidc::start_link,
+        oauth::register,
         identity_links::list,
         identity_links::unlink,
     ),
@@ -217,6 +222,9 @@ use crate::scope::{DomainAccess, DomainRight};
         McpTokenInfo,
         mcp_tokens::IssueBody,
         mcp_tokens::IssuedTokenResponse,
+        oauth::RegisterBody,
+        oauth::RegisteredClient,
+        oauth::OauthErrorBody,
     )),
 )]
 struct ApiDoc;
@@ -290,6 +298,13 @@ impl RestState {
         let auth_cfg = AuthCfg::resolve(&config)?;
         let oidc = OidcClient::new(&config)?;
         let oauth = OauthServer::new(&config);
+        if oauth.is_some() {
+            // The registrations nobody used, collected once at startup as well
+            // as at every registration: an instance nobody connects to again
+            // would otherwise keep its abandoned rows forever. Detached; see
+            // [`oauth::prune_at_start`].
+            oauth::prune_at_start(auth.clone());
+        }
         let collab = crate::collab::session::CollabSessions::new(engine.clone());
         // The engine closes co-editing rooms itself when it unregisters a
         // domain, whichever surface asked for the removal, so it needs the
@@ -466,6 +481,13 @@ pub fn router(state: RestState) -> Router {
         .route(oidc::LOGIN_PATH, get(oidc::login).post(oidc::start_link))
         .route(oidc::CALLBACK_PATH, get(oidc::callback))
         .route(oidc::PROVIDERS_PATH, get(oidc::providers))
+        // Dynamic client registration, public by path for the reason the four
+        // routes above are public: a client registers before anybody has
+        // signed in anywhere, so there is no session it could carry. It is
+        // NOT CSRF-exempt - a browser that happens to hold one still echoes
+        // its token - and it is bounded three ways rather than by an identity
+        // it cannot have. See [`oauth::register`].
+        .route(oauth::REGISTER_PATH, post(oauth::register))
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route
         // here. Registered before the domain sub-paths for readability only;

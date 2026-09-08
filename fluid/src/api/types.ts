@@ -1077,6 +1077,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/oauth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register an MCP client as a public OAuth client.
+         * @description RFC 7591 dynamic client registration, the endpoint the authorization server metadata advertises. Open to any caller, because a client registers before it can authenticate as anything. The answer carries a `client_id` and no secret: every client here is a public client, so `token_endpoint_auth_method` is always `none` and the proof of possession at the token endpoint is PKCE. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`. Bounded three ways: 30 registrations per 10 minutes per process, 1000 stored registrations, and a prune of every registration that has gone 30 days without an authorization.
+         */
+        post: operations["register_oauth_client"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/openapi.json": {
         parameters: {
             query?: never;
@@ -1950,6 +1970,19 @@ export interface components {
              */
             permalink: string;
         };
+        /** @description An OAuth error, sent as `application/json`. The only failures on this surface that are not RFC 9457 problem details: the client reading them speaks OAuth and branches on `error`. */
+        OauthErrorBody: {
+            /**
+             * @description The registered error code.
+             * @example invalid_redirect_uri
+             */
+            error: string;
+            /**
+             * @description What is wrong, in words.
+             * @example a redirect uri must be an https url, or an http url on a loopback address
+             */
+            error_description: string;
+        };
         /** @description The configured single sign-on provider as the sign-in screen needs it: whether to draw the button and what to write on it. Never the issuer, the client id or the secret. */
         OidcProviderView: {
             /**
@@ -2043,6 +2076,87 @@ export interface components {
             local: boolean;
             /** @description The single sign-on provider, if one is configured. */
             oidc: components["schemas"]["OidcProviderView"];
+        };
+        /** @description RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored. */
+        RegisterBody: {
+            /**
+             * @description What to call this client on the consent screen. Trimmed, at most 100
+             *     characters, and defaulted when it is absent or blank.
+             * @example Claude
+             */
+            client_name?: string | null;
+            /**
+             * @description The client's own home page, shown beside the name. Absolute https.
+             * @example https://claude.ai
+             */
+            client_uri?: string | null;
+            /**
+             * @description The grants this client will use, within `authorization_code` and
+             *     `refresh_token`.
+             */
+            grant_types?: string[] | null;
+            /**
+             * @description Where this client may be redirected back to. At least one, at most ten,
+             *     each an https url or an http url on a loopback address.
+             * @example [
+             *       "https://claude.ai/api/mcp/auth_callback"
+             *     ]
+             */
+            redirect_uris?: string[];
+            /** @description The response types this client will ask for, within `code`. */
+            response_types?: string[] | null;
+            /**
+             * @description How the client authenticates at the token endpoint. Absent or `none`:
+             *     this server registers public clients only.
+             * @example none
+             */
+            token_endpoint_auth_method?: string | null;
+        };
+        /**
+         * @description What a registration answers with: the identifier, and the metadata as
+         *     stored.
+         *
+         *     No `client_secret` and no `registration_access_token`. Both would be
+         *     credentials handed to a caller that proved nothing, and this server has no
+         *     use for either: every client is public, and a registration is managed by
+         *     being left to expire rather than by a management API. `Debug` is derived
+         *     because there is nothing here to redact - a client id authorizes nothing on
+         *     its own.
+         */
+        RegisteredClient: {
+            /**
+             * @description The identifier this client names itself with from now on: `coc_` plus
+             *     32 hex characters.
+             * @example coc_9f2c1d7e4b6a80351c8e0d2f4a6b8c1e
+             */
+            client_id: string;
+            /**
+             * Format: int64
+             * @description When the registration was made, in seconds since the epoch.
+             * @example 1767225600
+             */
+            client_id_issued_at: number;
+            /**
+             * @description The name as stored, which is what a consent screen shows.
+             * @example Claude
+             */
+            client_name: string;
+            /**
+             * @description The home page as stored, absent when the registration named none.
+             * @example https://claude.ai
+             */
+            client_uri?: string | null;
+            /** @description Always `authorization_code` and `refresh_token`. */
+            grant_types: string[];
+            /** @description The redirect uris as stored, in the order they were sent. */
+            redirect_uris: string[];
+            /** @description Always `code`. */
+            response_types: string[];
+            /**
+             * @description Always `none`: a public client presents no secret.
+             * @example none
+             */
+            token_endpoint_auth_method: string;
         };
         /** @description How to settle the conflict: keep `mine`, take `theirs`, or write `merged` content of your own. `content` belongs to `merged` and to nothing else. */
         ResolveBody: {
@@ -6742,6 +6856,75 @@ export interface operations {
                 };
                 content: {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    register_oauth_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterBody"];
+            };
+        };
+        responses: {
+            /** @description The registration, as stored. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegisteredClient"];
+                };
+            };
+            /** @description The body is not the JSON client metadata (`invalid_request`), a redirect uri may not be stored (`invalid_redirect_uri`), or the metadata describes a client this server does not register (`invalid_client_metadata`). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance does not serve OAuth: `auth.oauth` is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The burst is spent. `Retry-After` says when to come back. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description This instance is holding as many registrations as it will, and none are old enough to collect. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
                 };
             };
         };

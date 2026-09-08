@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -5517,6 +5517,88 @@
         }
       }
     },
+    "/api/v1/oauth/register": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Register an MCP client as a public OAuth client.",
+        "description": "RFC 7591 dynamic client registration, the endpoint the authorization server metadata advertises. Open to any caller, because a client registers before it can authenticate as anything. The answer carries a `client_id` and no secret: every client here is a public client, so `token_endpoint_auth_method` is always `none` and the proof of possession at the token endpoint is PKCE. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`. Bounded three ways: 30 registrations per 10 minutes per process, 1000 stored registrations, and a prune of every registration that has gone 30 days without an authorization.",
+        "operationId": "register_oauth_client",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The registration, as stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisteredClient"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not the JSON client metadata (`invalid_request`), a redirect uri may not be stored (`invalid_redirect_uri`), or the metadata describes a client this server does not register (`invalid_client_metadata`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The burst is spent. `Retry-After` says when to come back.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "This instance is holding as many registrations as it will, and none are old enough to collect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/openapi.json": {
       "get": {
         "tags": [
@@ -7508,6 +7590,26 @@
           }
         }
       },
+      "OauthErrorBody": {
+        "type": "object",
+        "description": "An OAuth error, sent as `application/json`. The only failures on this surface that are not RFC 9457 problem details: the client reading them speaks OAuth and branches on `error`.",
+        "required": [
+          "error",
+          "error_description"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "The registered error code.",
+            "example": "invalid_redirect_uri"
+          },
+          "error_description": {
+            "type": "string",
+            "description": "What is wrong, in words.",
+            "example": "a redirect uri must be an https url, or an http url on a loopback address"
+          }
+        }
+      },
       "OidcProviderView": {
         "type": "object",
         "description": "The configured single sign-on provider as the sign-in screen needs it: whether to draw the button and what to write on it. Never the issuer, the client id or the secret.",
@@ -7647,6 +7749,131 @@
           "oidc": {
             "$ref": "#/components/schemas/OidcProviderView",
             "description": "The single sign-on provider, if one is configured."
+          }
+        }
+      },
+      "RegisterBody": {
+        "type": "object",
+        "description": "RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored.",
+        "properties": {
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to call this client on the consent screen. Trimmed, at most 100\ncharacters, and defaulted when it is absent or blank.",
+            "example": "Claude"
+          },
+          "client_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's own home page, shown beside the name. Absolute https.",
+            "example": "https://claude.ai"
+          },
+          "grant_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The grants this client will use, within `authorization_code` and\n`refresh_token`."
+          },
+          "redirect_uris": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Where this client may be redirected back to. At least one, at most ten,\neach an https url or an http url on a loopback address.",
+            "example": [
+              "https://claude.ai/api/mcp/auth_callback"
+            ]
+          },
+          "response_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The response types this client will ask for, within `code`."
+          },
+          "token_endpoint_auth_method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the client authenticates at the token endpoint. Absent or `none`:\nthis server registers public clients only.",
+            "example": "none"
+          }
+        }
+      },
+      "RegisteredClient": {
+        "type": "object",
+        "description": "What a registration answers with: the identifier, and the metadata as\nstored.\n\nNo `client_secret` and no `registration_access_token`. Both would be\ncredentials handed to a caller that proved nothing, and this server has no\nuse for either: every client is public, and a registration is managed by\nbeing left to expire rather than by a management API. `Debug` is derived\nbecause there is nothing here to redact - a client id authorizes nothing on\nits own.",
+        "required": [
+          "client_id",
+          "client_id_issued_at",
+          "client_name",
+          "redirect_uris",
+          "token_endpoint_auth_method",
+          "grant_types",
+          "response_types"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The identifier this client names itself with from now on: `coc_` plus\n32 hex characters.",
+            "example": "coc_9f2c1d7e4b6a80351c8e0d2f4a6b8c1e"
+          },
+          "client_id_issued_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the registration was made, in seconds since the epoch.",
+            "example": 1767225600
+          },
+          "client_name": {
+            "type": "string",
+            "description": "The name as stored, which is what a consent screen shows.",
+            "example": "Claude"
+          },
+          "client_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The home page as stored, absent when the registration named none.",
+            "example": "https://claude.ai"
+          },
+          "grant_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Always `authorization_code` and `refresh_token`."
+          },
+          "redirect_uris": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The redirect uris as stored, in the order they were sent."
+          },
+          "response_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Always `code`."
+          },
+          "token_endpoint_auth_method": {
+            "type": "string",
+            "description": "Always `none`: a public client presents no secret.",
+            "example": "none"
           }
         }
       },
@@ -8116,6 +8343,10 @@
     {
       "name": "settings",
       "description": "Instance settings. Admin only."
+    },
+    {
+      "name": "oauth",
+      "description": "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."
     }
   ]
 }

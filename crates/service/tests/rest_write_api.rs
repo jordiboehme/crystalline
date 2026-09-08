@@ -2416,8 +2416,9 @@ fn canonicalize(path: &str) -> String {
 /// instead of relying on a reviewer noticing a pointer comment (this is
 /// exactly how Task 13 shipped three routes uncovered by the matrix).
 ///
-/// Three mounted mutating routes are named exemptions rather than matrix rows,
-/// all three resting on `check_csrf` in `rest/auth.rs`:
+/// Four mounted mutating routes are named exemptions rather than matrix rows.
+/// Three of them rest on `check_csrf` in `rest/auth.rs`; the fourth rests on
+/// something else entirely and is described after them:
 /// - `POST /auth/login` is CSRF-exempt by design: `check_csrf` waves through
 ///   any request whose path is `LOGIN_PATH` unconditionally, because login is
 ///   what mints the token a later request would echo - there is no session
@@ -2439,6 +2440,18 @@ fn canonicalize(path: &str) -> String {
 ///   account exists, the loopback-or-token gate, the CSRF exemption and the
 ///   read-only carve-out - is pinned by `tests/rest_setup_api.rs` instead,
 ///   which serves a deliberately account-less instance.
+///
+/// The fourth is `POST /api/v1/oauth/register`, and it is exempt for a
+/// different reason from all three: it is CSRF-protected exactly like every
+/// matrix row (a browser holding a session must echo its token, or the
+/// registration is refused 403), but it has no ROLE dimension for the matrix to
+/// drive. Every leg here signs in as one of six accounts, and this route
+/// answers 201 to all six and to the anonymous caller alike - a client
+/// registers before anybody has signed in anywhere, which is what being in
+/// `PUBLIC_PATHS` means. What actually bounds it is not an identity but a burst
+/// limit, a stored-registration ceiling and a thirty-day prune, and those,
+/// together with its CSRF behaviour and its refusal on an instance with
+/// `auth.oauth` off, are pinned by `tests/oauth.rs`.
 #[test]
 fn write_ops_covers_every_mutating_route_mounted() {
     use std::collections::BTreeSet;
@@ -2447,6 +2460,7 @@ fn write_ops_covers_every_mutating_route_mounted() {
         "POST /api/v1/auth/login",
         "POST /api/v1/auth/logout",
         "POST /api/v1/auth/setup",
+        "POST /api/v1/oauth/register",
     ];
 
     let mutating: BTreeSet<String> = support::MOUNTED_OPERATIONS
