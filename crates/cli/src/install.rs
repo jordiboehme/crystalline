@@ -556,8 +556,19 @@ fn path_binary_notice() -> Option<String> {
                 .to_string(),
         ),
         Ok(out) => {
-            let version = String::from_utf8_lossy(&out.stdout);
-            let version = version.trim().strip_prefix("crystalline ").unwrap_or("");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // `--version` now answers three lines (copyright, license,
+            // source); only the first one carries the version to compare, so
+            // take that line before stripping the `crystalline ` prefix -
+            // trimming the whole string first would fold all three lines
+            // into one and this could never match.
+            let version = stdout
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .strip_prefix("crystalline ")
+                .unwrap_or("");
             if !out.status.success() || version.is_empty() {
                 Some(
                     "The hooks run `crystalline` from your PATH, but it did not answer --version. Check which binary the PATH resolves."

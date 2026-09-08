@@ -59,6 +59,19 @@ const BANNER: &str = r"
  ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
 ";
 
+/// The copyright line the foreground banner and the daemon log both print,
+/// right after the `crystalline {version} serving on ...` line. AGPL section
+/// 13 is why it names the source: a network-served copy has to offer its
+/// users the source, so the link belongs where a user of a running instance
+/// can see it. Read from the environment rather than retyped, matching
+/// `crates/cli/src/main.rs`'s `VERSION_BLOCK`.
+const COPYRIGHT_LINE: &str = concat!(
+    "Copyright (C) 2026 Jordi Boehme - ",
+    env!("CARGO_PKG_LICENSE"),
+    " - ",
+    env!("CARGO_PKG_REPOSITORY"),
+);
+
 /// A tracked live session.
 #[derive(Clone, serde::Serialize)]
 struct SessionInfo {
@@ -281,6 +294,7 @@ pub async fn run_serve(
             ownership.socket_display(),
             shared.pid
         );
+        eprintln!("{COPYRIGHT_LINE}");
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
             eprintln!("{}", ui_startup_line(&loaded.effective, addr));
@@ -2592,6 +2606,23 @@ mod tests {
         assert!(
             !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
             "the caveat line carries no secret of its own"
+        );
+    }
+
+    /// The banner's copyright line, printed right after
+    /// `crystalline {version} serving on ...` outside the `is_terminal`
+    /// guard so a captured log carries it too. Names the same copyright
+    /// holder, license and source `crates/cli/src/main.rs`'s `VERSION_BLOCK`
+    /// does, both read from the environment so a Cargo.toml change carries.
+    #[test]
+    fn the_banner_copyright_line_names_the_license_and_the_source() {
+        assert_eq!(
+            COPYRIGHT_LINE,
+            format!(
+                "Copyright (C) 2026 Jordi Boehme - {} - {}",
+                env!("CARGO_PKG_LICENSE"),
+                env!("CARGO_PKG_REPOSITORY")
+            )
         );
     }
 

@@ -1163,10 +1163,18 @@ fn a_missing_harness_cli_prints_a_manual_command_and_still_succeeds() {
 }
 
 /// A `crystalline` shim answering `--version` with the given version string,
-/// for the PATH version-skew notice.
+/// for the PATH version-skew notice. Answers all three lines the real binary
+/// does (version, copyright/license, source) so the test exercises the
+/// first-line rule `path_binary_notice` applies, not a single-line stand-in
+/// that would pass even if that rule regressed to comparing the whole
+/// answer.
 fn write_version_shim(bin_dir: &Path, version: &str) {
     std::fs::create_dir_all(bin_dir).unwrap();
-    let script = format!("#!/bin/sh\necho 'crystalline {version}'\nexit 0\n");
+    let script = format!(
+        "#!/bin/sh\necho 'crystalline {version}'\necho 'Copyright (C) 2026 Jordi Boehme - {}'\necho '{}'\nexit 0\n",
+        env!("CARGO_PKG_LICENSE"),
+        env!("CARGO_PKG_REPOSITORY"),
+    );
     let path = bin_dir.join("crystalline");
     std::fs::write(&path, script).unwrap();
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();

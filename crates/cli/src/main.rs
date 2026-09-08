@@ -23,11 +23,35 @@ mod receipt;
 mod render;
 mod users;
 
+/// What `-V` and `--version` print. clap's `version` attribute feeds both as
+/// long as `long_version` stays unset - which is what keeps them
+/// byte-identical - so this is the only text either flag prints.
+///
+/// Three lines, no blank line: this is Jordi's own compact form (decided
+/// 2026-09-08), not the fuller GNU disclaimer block - no warranty
+/// paragraph, no "this is free software" line. AGPL section 13 is why the
+/// source link is here at all: a network-served copy has to offer its users
+/// the source.
+///
+/// Read from the environment rather than retyped, so a change to
+/// Cargo.toml's `version`, `license` or `repository` carries here too.
+///
+/// Starts with the bare version number, not `crystalline 0.18.0`: clap
+/// renders `--version`/`-V` as `{bin name} {version}`, prepending the name
+/// itself, so spelling it here too would print it twice.
+const VERSION_BLOCK: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\nCopyright (C) 2026 Jordi Boehme - ",
+    env!("CARGO_PKG_LICENSE"),
+    "\n",
+    env!("CARGO_PKG_REPOSITORY"),
+);
+
 /// Local-first knowledge management for humans and AI agents.
 #[derive(Parser, Debug)]
 #[command(
     name = "crystalline",
-    version,
+    version = VERSION_BLOCK,
     about,
     long_about = None,
     after_help = "Quickstart:
