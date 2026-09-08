@@ -82,6 +82,19 @@ impl OauthCtx {
     /// The same instance with `auth.oauth` set to `oauth`, for the one test
     /// that asks what a client finds when the surface is switched off.
     async fn start_with(oauth: bool) -> OauthCtx {
+        OauthCtx::start_full(oauth, &[]).await
+    }
+
+    /// An instance that answers only for the hosts in `allowed_hosts` (plus
+    /// loopback, which the transport always serves and the harness itself
+    /// reaches this instance by), for the tests about what a derived origin is
+    /// willing to name.
+    async fn start_with_allowed_hosts(allowed_hosts: &[&str]) -> OauthCtx {
+        OauthCtx::start_full(true, allowed_hosts).await
+    }
+
+    /// The whole of what this harness can configure.
+    async fn start_full(oauth: bool, allowed_hosts: &[&str]) -> OauthCtx {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let dir = root.join("eng");
@@ -117,10 +130,14 @@ impl OauthCtx {
         engine.sync(None).await.unwrap();
         let db = root.join("web-auth.db");
         let auth = Arc::new(AuthStore::open(&db).await.unwrap());
+        let allowed_hosts = allowed_hosts
+            .iter()
+            .map(|host| host.to_string())
+            .collect::<Vec<_>>();
         let router = http_router(
             engine,
             Arc::new(AtomicUsize::new(0)),
-            &[],
+            &allowed_hosts,
             auth.clone(),
             None,
         )
@@ -264,6 +281,32 @@ impl OauthCtx {
             .join("&");
         self.client
             .get(format!("{}?{query}", self.url("/oauth/authorize")))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// `GET` one of the two root documents, arrived at as `host` says.
+    async fn well_known_at_host(&self, path: &str, host: &str) -> reqwest::Response {
+        self.client
+            .get(format!("http://{}{path}", self.addr))
+            .header(reqwest::header::HOST, host)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// [`OauthCtx::authorize`] arrived at as `host` says, which is the leg
+    /// that decides the audience a grant is recorded for.
+    async fn authorize_at_host(&self, params: &[(&str, &str)], host: &str) -> reqwest::Response {
+        let query = params
+            .iter()
+            .map(|(name, value)| format!("{name}={}", encoded(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.client
+            .get(format!("{}?{query}", self.url("/oauth/authorize")))
+            .header(reqwest::header::HOST, host)
             .send()
             .await
             .unwrap()
@@ -2754,4 +2797,106 @@ async fn the_token_endpoint_needs_no_session_and_is_not_csrf_exempt() {
     // The refused leg rotated nothing, so ada still has exactly the one grant
     // the two served ones moved along.
     assert_eq!(ctx.auth.list_oauth_grants("ada").await.unwrap().len(), 1);
+}
+
+/// **A `Host` this instance was not told to answer to names no origin**, so
+/// neither well-known document publishes it and no authorization starts under
+/// it.
+///
+/// The two documents are root documents by specification, mounted beside
+/// `/health` rather than behind the MCP transport, so the transport's own
+/// DNS-rebinding guard never sees a request for them: whatever `Host` arrives
+/// used to be echoed back as this instance's `resource` and `issuer`. A
+/// forged one is not a minted token - the audience condition means such a
+/// token only works when the same forged `Host` is presented again, and the
+/// transport refuses it there - but it is a document sending a client at an
+/// address this instance does not serve, and an authorization completed under
+/// it would record a grant for that address. With `service.allowed_hosts`
+/// configured, the documents and the authorize leg now hold to the same list
+/// the transport does.
+#[tokio::test]
+async fn an_unlisted_host_names_no_origin_and_starts_no_authorization() {
+    let ctx = OauthCtx::start_with_allowed_hosts(&["knowledge.example"]).await;
+
+    // The host the operator listed: published, and as the address a client
+    // would actually reach it at.
+    let served = ctx
+        .well_known_at_host("/.well-known/oauth-protected-resource", "knowledge.example")
+        .await;
+    assert_eq!(served.status(), 200);
+    let document: Value = served.json().await.unwrap();
+    assert_eq!(document["resource"], "https://knowledge.example");
+
+    // A host nobody listed: refused rather than echoed, in the surface's own
+    // problem shape, and the refusal does not read the list back.
+    for path in [
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-authorization-server",
+    ] {
+        let refused = ctx.well_known_at_host(path, "evil.example").await;
+        assert_eq!(refused.status(), 403, "{path} must not name a forged Host");
+        assert_eq!(
+            refused
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json"),
+        );
+        let body: Value = refused.json().await.unwrap();
+        let detail = body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("service.allowed_hosts"),
+            "the operator reading it is the one who can change the answer: {detail}"
+        );
+        assert!(
+            !detail.contains("knowledge.example"),
+            "and whoever forged the Host is not handed the list: {detail}"
+        );
+    }
+
+    // The authorize leg is where the audience of a grant is decided, so it
+    // refuses the same way - before it has looked at the client at all, which
+    // is why an unregistered id still answers 403 rather than the 400 an
+    // unknown client gets.
+    let params = [
+        ("response_type", "code"),
+        ("client_id", "coc_0000000000000000000000000000dead"),
+        ("redirect_uri", HOSTED_REDIRECT),
+        ("code_challenge", CHALLENGE),
+        ("code_challenge_method", "S256"),
+    ];
+    let refused = ctx.authorize_at_host(&params, "evil.example").await;
+    assert_eq!(refused.status(), 403);
+    let refused = ctx.authorize_at_host(&params, "knowledge.example").await;
+    assert_eq!(
+        refused.status(),
+        400,
+        "and at a listed host the request is judged on its own merits again"
+    );
+
+    // Loopback is what the harness itself arrives as, and the transport serves
+    // it whatever the list says, so the documents keep naming it too.
+    let local = ctx
+        .well_known_at_host(
+            "/.well-known/oauth-protected-resource",
+            &ctx.addr.to_string(),
+        )
+        .await;
+    assert_eq!(local.status(), 200);
+    let document: Value = local.json().await.unwrap();
+    assert_eq!(document["resource"], ctx.origin());
+}
+
+/// **With no `service.allowed_hosts` configured, a derived origin is whatever
+/// the request says**, which is what a default install has always done and
+/// what the transport's own guard does with an empty list.
+#[tokio::test]
+async fn an_unconfigured_allow_list_narrows_nothing() {
+    let ctx = OauthCtx::start().await;
+    let served = ctx
+        .well_known_at_host("/.well-known/oauth-protected-resource", "anything.example")
+        .await;
+    assert_eq!(served.status(), 200);
+    let document: Value = served.json().await.unwrap();
+    assert_eq!(document["resource"], "https://anything.example");
 }

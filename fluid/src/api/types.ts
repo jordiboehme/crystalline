@@ -7455,6 +7455,15 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
+            /** @description The request's `Host` is not one this instance answers to, so it names no resource to authorize for: `service.allowed_hosts` decides, and an unlisted `Host` is refused before the request is looked at. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
             /** @description This instance does not serve OAuth: `auth.oauth` is off. */
             404: {
                 headers: {

@@ -312,6 +312,88 @@ pub struct OriginRule {
     /// The configured public origin, already parsed down to scheme, host and
     /// port. `None` means derive it from each request.
     override_origin: Option<String>,
+    /// The `Host` values a *derived* origin may name, normalized the way the
+    /// transport normalizes one. Empty means every one of them, which is both
+    /// an unconfigured `service.allowed_hosts` and a single `*` in it - the
+    /// two cases where the transport's own guard is off. See
+    /// [`OriginRule::from_config`].
+    allowed_hosts: Vec<AllowedHost>,
+}
+
+/// The three `Host` values this instance always answers to, whatever
+/// `service.allowed_hosts` says.
+///
+/// `daemon::http_config` merges the same three into the list it hands the
+/// transport, and reads them from here so the two lists cannot come apart: a
+/// `Host` the transport serves must be one the documents are willing to
+/// publish, or a client would read a resource identifier off an address that
+/// then refuses it.
+pub(crate) const ALWAYS_ALLOWED_HOSTS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
+
+/// A host name in the one spelling both sides are compared in: lowercased,
+/// with any IPv6 brackets off, so `[::1]` from a request and `::1` from the
+/// configuration are the same address.
+fn normalize_host(host: &str) -> String {
+    host.trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
+}
+
+/// One entry of an allow-list, or one request's `Host`, in the spelling both
+/// are compared in.
+///
+/// Mirrors rmcp's own `normalize_authority` and `host_is_allowed`
+/// (`streamable_http_server::tower`, private there): the host lowercased with
+/// any IPv6 brackets off, and a port that matches everything when the entry
+/// names none. Written out here rather than borrowed because it is private
+/// upstream; if an rmcp bump changes it, this is the code to diff against.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AllowedHost {
+    host: String,
+    port: Option<u16>,
+}
+
+impl AllowedHost {
+    /// The `Host` a request arrived at. `None` is a value that is not an
+    /// authority at all, which matches no entry and is therefore refused - the
+    /// same direction [`request_origin`]'s own parse takes, and the same one
+    /// the transport takes.
+    fn arriving(value: &str) -> Option<AllowedHost> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        let authority = axum::http::uri::Authority::try_from(value).ok()?;
+        Some(AllowedHost {
+            host: normalize_host(authority.host()),
+            port: authority.port_u16(),
+        })
+    }
+
+    /// One entry of `service.allowed_hosts`.
+    ///
+    /// A value that is not an authority is kept as a bare host name rather
+    /// than dropped, which is what an unbracketed IPv6 literal is: `::1` - the
+    /// spelling `ALWAYS_ALLOWED_HOSTS` and rmcp's own default both use - does
+    /// not parse as one, while the `[::1]:7411` a client sends does. rmcp
+    /// falls back the same way, so the two lists accept the same entries.
+    fn entry(value: &str) -> Option<AllowedHost> {
+        let value = value.trim();
+        if value.is_empty() {
+            return None;
+        }
+        Some(AllowedHost::arriving(value).unwrap_or_else(|| AllowedHost {
+            host: normalize_host(value),
+            port: None,
+        }))
+    }
+
+    /// Whether `self`, an allow-list entry, covers the `Host` of a request.
+    /// An entry naming no port covers every port on that host, which is the
+    /// transport's rule and the one an operator listing a hostname expects.
+    fn covers(&self, request: &AllowedHost) -> bool {
+        self.host == request.host && (self.port.is_none() || self.port == request.port)
+    }
 }
 
 impl OriginRule {
@@ -342,7 +424,7 @@ impl OriginRule {
     /// and in the gate's challenge. Only the two schemes this surface is ever
     /// served over are accepted, so nothing an operator can mistype reaches a
     /// document.
-    pub fn from_config(config: &GlobalConfig) -> OriginRule {
+    pub fn from_config(config: &GlobalConfig, allowed_hosts: &[String]) -> OriginRule {
         let configured = config
             .auth_oidc()
             .and_then(|oidc| oidc.redirect_uri.as_deref())
@@ -361,7 +443,26 @@ impl OriginRule {
                     None
                 }
             });
-        OriginRule { override_origin }
+        // The same two escapes the transport's guard has, and nothing else:
+        // an unconfigured list and a single `*` both mean every `Host` is
+        // answered, so a derived origin echoes whatever arrives, which is what
+        // a default install has always done. Anything else is the operator's
+        // list plus the loopback names the transport adds to it.
+        let allowed_hosts =
+            if allowed_hosts.is_empty() || allowed_hosts.iter().any(|host| host.trim() == "*") {
+                Vec::new()
+            } else {
+                ALWAYS_ALLOWED_HOSTS
+                    .iter()
+                    .copied()
+                    .chain(allowed_hosts.iter().map(String::as_str))
+                    .filter_map(AllowedHost::entry)
+                    .collect()
+            };
+        OriginRule {
+            override_origin,
+            allowed_hosts,
+        }
     }
 
     /// The origin a request arrived at, in the spelling everything else
@@ -371,12 +472,65 @@ impl OriginRule {
     /// derived one never carries a trailing slash by construction, so the call
     /// is a no-op there, and one exit means the two branches cannot come to
     /// disagree about the spelling a token's audience is stored in.
+    ///
+    /// **A derived origin is refused for a `Host` this instance does not
+    /// answer to.** The two well-known documents are root documents by
+    /// specification and are therefore mounted outside the transport's own
+    /// DNS-rebinding guard, so without this a forged `Host` would be published
+    /// as this instance's `resource` and `issuer`, and an authorization
+    /// completed under it would record a grant whose audience is an address
+    /// the operator never named. Nothing is minted by that - the audience
+    /// condition means such a token only ever works when the same forged
+    /// `Host` is presented again, and the transport refuses it there - but a
+    /// document naming an address this instance does not serve is a document
+    /// no client should have been handed. The override skips the check: it is
+    /// the operator's own answer to what this instance is called, and a
+    /// deployment behind a `Host`-rewriting proxy sets it precisely because
+    /// the arriving `Host` is not the public one.
     pub fn origin(&self, headers: &HeaderMap) -> Result<String, ApiError> {
         let raw = match &self.override_origin {
             Some(configured) => configured.clone(),
-            None => request_origin(headers)?,
+            None => {
+                let derived = request_origin(headers)?;
+                self.host_is_answered(headers)?;
+                derived
+            }
         };
         Ok(normalize_resource(&raw))
+    }
+
+    /// Whether the `Host` of this request is one a derived origin may name.
+    ///
+    /// Reads the header [`request_origin`] has already accepted, so a missing
+    /// or malformed one is refused there, with the more specific word, before
+    /// this runs. An empty [`OriginRule::allowed_hosts`] is every host; a
+    /// value that is not an authority at all cannot match an entry and is
+    /// refused, which is the same direction the parse failure above takes.
+    fn host_is_answered(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        if self.allowed_hosts.is_empty() {
+            return Ok(());
+        }
+        let arrived = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .and_then(AllowedHost::arriving);
+        let listed = arrived.is_some_and(|arrived| {
+            self.allowed_hosts
+                .iter()
+                .any(|entry| entry.covers(&arrived))
+        });
+        if listed {
+            return Ok(());
+        }
+        // The refusal names the setting and never the entries in it: whoever
+        // sent this Host is not owed the list of the ones that would have
+        // worked, and the operator who can act on it is reading a log line or
+        // their own request, where the setting is the whole answer.
+        Err(ApiError::forbidden(
+            "this request's Host is not one this instance answers to, so it names no OAuth \
+             resource here - an administrator adds the public host to service.allowed_hosts, \
+             which the MCP transport checks the same request against",
+        ))
     }
 
     /// Whether two resource identifiers name the same resource: equal once at
@@ -413,10 +567,10 @@ pub struct OauthServer {
 
 impl OauthServer {
     /// The server, or `None` while `auth.oauth` is off.
-    pub fn new(config: &GlobalConfig) -> Option<Arc<OauthServer>> {
+    pub fn new(config: &GlobalConfig, allowed_hosts: &[String]) -> Option<Arc<OauthServer>> {
         config.auth_oauth().then(|| {
             Arc::new(OauthServer {
-                origin: OriginRule::from_config(config),
+                origin: OriginRule::from_config(config, allowed_hosts),
                 limiter: RegistrationLimiter::default(),
                 authorizations: Mutex::new(AuthorizationStore::default()),
                 codes: Mutex::new(CodeStore::default()),
@@ -1942,6 +2096,16 @@ fn rendered_refusal(reason: &str, client_id: Option<&str>, detail: &str) -> ApiE
             content_type = "application/problem+json",
         ),
         (
+            status = 403,
+            description = "The request's `Host` is not one this instance \
+                           answers to, so it names no resource to authorize \
+                           for: `service.allowed_hosts` decides, and an \
+                           unlisted `Host` is refused before the request is \
+                           looked at.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
             status = 404,
             description = "This instance does not serve OAuth: `auth.oauth` \
                            is off.",
@@ -3164,7 +3328,7 @@ mod tests {
     /// sign-in and another for tokens.
     #[test]
     fn an_origin_is_derived_like_the_callback_address() {
-        let rule = OriginRule::from_config(&config_with(None));
+        let rule = OriginRule::from_config(&config_with(None), &[]);
         assert_eq!(
             rule.origin(&headers_with("127.0.0.1:7411", None)).unwrap(),
             "http://127.0.0.1:7411",
@@ -3195,9 +3359,10 @@ mod tests {
     /// and it wins over whatever the request says.
     #[test]
     fn a_configured_callback_address_names_the_origin() {
-        let rule = OriginRule::from_config(&config_with(Some(
-            "https://knowledge.example/api/v1/auth/oidc/callback",
-        )));
+        let rule = OriginRule::from_config(
+            &config_with(Some("https://knowledge.example/api/v1/auth/oidc/callback")),
+            &[],
+        );
         assert_eq!(
             rule.origin(&headers_with("127.0.0.1:7411", None)).unwrap(),
             "https://knowledge.example",
@@ -3210,9 +3375,12 @@ mod tests {
         );
         // A port is part of an origin; a default port is not spelled.
         assert_eq!(
-            OriginRule::from_config(&config_with(Some(
-                "https://knowledge.example:8443/api/v1/auth/oidc/callback"
-            )))
+            OriginRule::from_config(
+                &config_with(Some(
+                    "https://knowledge.example:8443/api/v1/auth/oidc/callback"
+                )),
+                &[],
+            )
             .origin(&HeaderMap::new())
             .unwrap(),
             "https://knowledge.example:8443"
@@ -3220,7 +3388,8 @@ mod tests {
         // A value the settings layer would have refused, arriving through the
         // environment overlay: the rule falls back to deriving rather than
         // publishing something nobody can reach.
-        let unusable = OriginRule::from_config(&config_with(Some("/api/v1/auth/oidc/callback")));
+        let unusable =
+            OriginRule::from_config(&config_with(Some("/api/v1/auth/oidc/callback")), &[]);
         assert_eq!(
             unusable
                 .origin(&headers_with("127.0.0.1:7411", None))
@@ -3250,7 +3419,7 @@ mod tests {
             "data:text/plain,callback",
             "knowledge.example/api/v1/auth/oidc/callback",
         ] {
-            let rule = OriginRule::from_config(&config_with(Some(unusable)));
+            let rule = OriginRule::from_config(&config_with(Some(unusable)), &[]);
             let origin = rule.origin(&headers_with("127.0.0.1:7411", None)).unwrap();
             assert_eq!(
                 origin, "http://127.0.0.1:7411",
@@ -3263,12 +3432,113 @@ mod tests {
         }
         // The loopback development server the settings layer does allow.
         assert_eq!(
-            OriginRule::from_config(&config_with(Some(
-                "http://localhost:7411/api/v1/auth/oidc/callback"
-            )))
+            OriginRule::from_config(
+                &config_with(Some("http://localhost:7411/api/v1/auth/oidc/callback")),
+                &[],
+            )
             .origin(&HeaderMap::new())
             .unwrap(),
             "http://localhost:7411"
+        );
+    }
+
+    /// **A derived origin answers only for a `Host` this instance was told to
+    /// answer to**, and an override is never checked against that list.
+    ///
+    /// The two well-known documents are root documents by specification, so
+    /// they sit outside the transport's own `Host` guard: without this check a
+    /// forged `Host` would be published as this instance's `resource` and
+    /// `issuer`, and an authorization completed under it would record a grant
+    /// whose audience is an address the operator never named. A configured
+    /// override is the operator's own answer to what this instance is called,
+    /// so it wins whatever the request says.
+    #[test]
+    fn a_derived_origin_answers_only_for_a_listed_host() {
+        let listed = ["knowledge.example".to_string()];
+        let rule = OriginRule::from_config(&config_with(None), &listed);
+        assert_eq!(
+            rule.origin(&headers_with("knowledge.example", None))
+                .unwrap(),
+            "https://knowledge.example",
+            "the host the operator listed is the one this instance names itself"
+        );
+        assert_eq!(
+            rule.origin(&headers_with("knowledge.example:8443", None))
+                .unwrap(),
+            "https://knowledge.example:8443",
+            "an entry naming no port answers on every port, as the transport's does"
+        );
+        assert_eq!(
+            rule.origin(&headers_with("KNOWLEDGE.example", None))
+                .unwrap(),
+            "https://KNOWLEDGE.example",
+            "the match is case insensitive, whatever spelling arrives"
+        );
+        for local in ["127.0.0.1:7411", "localhost:7411", "[::1]:7411"] {
+            assert!(
+                rule.origin(&headers_with(local, None)).is_ok(),
+                "{local} is served by the transport whatever the list says, so it is named here too"
+            );
+        }
+
+        let refused = rule
+            .origin(&headers_with("evil.example", None))
+            .expect_err("a Host nobody listed names no origin");
+        assert_eq!(refused.status, StatusCode::FORBIDDEN);
+        assert!(
+            refused.detail.contains("service.allowed_hosts"),
+            "the operator reading it is the one who can change the answer: {}",
+            refused.detail
+        );
+        assert!(
+            !refused.detail.contains("knowledge.example"),
+            "and the refusal does not read the list back to whoever forged the Host: {}",
+            refused.detail
+        );
+        assert!(
+            rule.origin(&headers_with("knowledge.example.evil", None))
+                .is_err(),
+            "a longer name that merely starts with a listed one is another host"
+        );
+
+        // An entry that names a port is that port only, which is the
+        // transport's rule as well.
+        let ported = ["knowledge.example:8443".to_string()];
+        let rule = OriginRule::from_config(&config_with(None), &ported);
+        assert!(
+            rule.origin(&headers_with("knowledge.example:8443", None))
+                .is_ok()
+        );
+        assert!(
+            rule.origin(&headers_with("knowledge.example", None))
+                .is_err(),
+            "the same name on another port is not the address that was listed"
+        );
+
+        // The two ways the guard is off: nothing configured, and a single
+        // `*`. Both are what the transport itself does, and the first is what
+        // every install has done until one is configured.
+        for open in [Vec::new(), vec!["*".to_string()]] {
+            let rule = OriginRule::from_config(&config_with(None), &open);
+            assert_eq!(
+                rule.origin(&headers_with("anything.example", None))
+                    .unwrap(),
+                "https://anything.example",
+                "with the transport's guard off nothing here narrows it either"
+            );
+        }
+
+        // The override is the operator's own answer, so it is published for a
+        // request whose Host nobody listed rather than checked against a list
+        // it was never on.
+        let rule = OriginRule::from_config(
+            &config_with(Some("https://public.example/api/v1/auth/oidc/callback")),
+            &listed,
+        );
+        assert_eq!(
+            rule.origin(&headers_with("evil.example", None)).unwrap(),
+            "https://public.example",
+            "a configured origin does not depend on the Host at all"
         );
     }
 
@@ -3702,7 +3972,7 @@ mod tests {
     /// gate then refuses.
     #[tokio::test]
     async fn neither_well_known_document_is_ever_stored() {
-        let rule = Some(OriginRule::from_config(&config_with(None)));
+        let rule = Some(OriginRule::from_config(&config_with(None), &[]));
         let headers = headers_with("127.0.0.1:7411", None);
         for answer in [
             protected_resource(State(rule.clone()), headers.clone())
@@ -3731,8 +4001,8 @@ mod tests {
     fn without_the_setting_there_is_no_server_and_the_documents_are_gone() {
         let mut config = config_with(None);
         config.auth.as_mut().unwrap().oauth = Some(false);
-        assert!(OauthServer::new(&config).is_none());
-        assert!(OauthServer::new(&config_with(None)).is_some());
+        assert!(OauthServer::new(&config, &[]).is_none());
+        assert!(OauthServer::new(&config_with(None), &[]).is_some());
 
         let error = enabled(&None).unwrap_err();
         assert_eq!(error.status, axum::http::StatusCode::NOT_FOUND);

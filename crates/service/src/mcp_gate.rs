@@ -418,8 +418,12 @@ where
             // The origin this request arrived at, derived once and used twice:
             // as the audience an OAuth token must have been minted for, and as
             // the address the refusal's metadata pointer is built on. Nothing
-            // to derive with OAuth off, and a malformed `Host` leaves it
-            // `None`, which refuses every OAuth token and drops the pointer.
+            // to derive with OAuth off, and a `Host` the rule will not name -
+            // a malformed one, or one `service.allowed_hosts` does not cover -
+            // leaves it `None`, which refuses every OAuth token and drops the
+            // pointer, leaving the bare `Bearer` challenge. That is the right
+            // way round: a request the transport itself would answer `403` is
+            // not one to hand an address to authorize against.
             let origin = oauth
                 .as_ref()
                 .and_then(|rule| rule.origin(request.headers()).ok());
@@ -783,6 +787,7 @@ mod tests {
         )
         .with_oauth(OriginRule::from_config(
             &crystalline_core::config::GlobalConfig::default(),
+            &[],
         ));
         assert!(gate.oauth.is_none());
     }

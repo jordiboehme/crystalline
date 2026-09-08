@@ -1331,7 +1331,7 @@ fn http_base(
     // settings: the audience the gate checks an OAuth access token against and
     // the origin the two well-known documents publish, which have to be one
     // answer or a client is sent somewhere its token does not work.
-    let origin_rule = crate::rest::OriginRule::from_config(&config);
+    let origin_rule = crate::rest::OriginRule::from_config(&config, allowed_hosts);
 
     // Every HTTP caller is answered through a resolved scope, so the engine
     // gets the resolver the moment the store behind it exists. Installed here,
@@ -1366,7 +1366,8 @@ fn http_base(
     // that daemon is deliberately not offering.
     let rest = if api {
         Some(crate::rest::router(
-            crate::rest::RestState::new(engine.clone(), auth)?.with_setup_token(setup_token),
+            crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
+                .with_setup_token(setup_token),
         ))
     } else {
         None
@@ -1941,11 +1942,10 @@ fn http_config(
     if allowed_hosts.is_empty() {
         return base;
     }
-    let mut hosts = vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-    ];
+    let mut hosts = crate::rest::ALWAYS_ALLOWED_HOSTS
+        .iter()
+        .map(|host| host.to_string())
+        .collect::<Vec<_>>();
     hosts.extend(allowed_hosts.iter().cloned());
     base.with_allowed_hosts(hosts)
 }

@@ -39,6 +39,9 @@ pub use error::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
     if_none_match_matches, precondition_failed,
 };
+/// The loopback names every tier answers to, shared with `daemon::http_config`
+/// so the transport's allow-list and the origin rule's cannot come apart.
+pub(crate) use oauth::ALWAYS_ALLOWED_HOSTS;
 pub use oauth::{
     AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
     MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,
@@ -309,11 +312,15 @@ impl RestState {
     /// than serving with a header that silently never matches or with two
     /// answers to one question. The daemon itself keeps running and keeps
     /// serving MCP over its socket; see `daemon::run`.
-    pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>) -> anyhow::Result<RestState> {
+    pub fn new(
+        engine: Arc<Engine>,
+        auth: Arc<AuthStore>,
+        allowed_hosts: &[String],
+    ) -> anyhow::Result<RestState> {
         let config = engine.config();
         let auth_cfg = AuthCfg::resolve(&config)?;
         let oidc = OidcClient::new(&config)?;
-        let oauth = OauthServer::new(&config);
+        let oauth = OauthServer::new(&config, allowed_hosts);
         if oauth.is_some() {
             // The registrations nobody used, collected once at startup as well
             // as at every registration: an instance nobody connects to again
@@ -1036,7 +1043,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        (dir, RestState::new(engine, auth).unwrap())
+        (dir, RestState::new(engine, auth, &[]).unwrap())
     }
 
     /// The cap the admin routes borrow: whatever calls

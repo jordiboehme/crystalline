@@ -5872,6 +5872,16 @@
               }
             }
           },
+          "403": {
+            "description": "The request's `Host` is not one this instance answers to, so it names no resource to authorize for: `service.allowed_hosts` decides, and an unlisted `Host` is refused before the request is looked at.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
           "404": {
             "description": "This instance does not serve OAuth: `auth.oauth` is off.",
             "content": {
