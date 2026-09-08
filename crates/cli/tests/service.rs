@@ -153,6 +153,19 @@ impl Env {
         )
     }
 
+    /// Like [`Self::run`], but also returns stderr - needed to see a command's
+    /// failure message, which never lands on stdout.
+    fn run_full(&self, args: &[&str]) -> (bool, String, String) {
+        let mut cmd = Command::new(bin());
+        self.apply(&mut cmd);
+        let out = cmd.args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
     /// Poll ctl status until the daemon answers, or panic after ~8s.
     fn wait_ready(&self) {
         let start = Instant::now();
@@ -614,6 +627,71 @@ fn domain_add_while_daemon_running_syncs_and_watches_the_new_domain() {
         found,
         "the watcher picked up an external write in a domain added after daemon start"
     );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The reported bug's exact shape: a bare `crystalline sync --domain <name>`
+/// with a daemon running. `sync_dispatch` (`main.rs`) routes this over the
+/// daemon's ctl socket instead of the direct path in `cmd.rs`, and a
+/// per-file failure used to ride inside the daemon's own `data.reports[].failed`
+/// as an ordinary field, so the ctl envelope around it stayed "ok" and the
+/// process exited 0 regardless. The daemon path now runs the identical
+/// failure check `cmd::sync` runs on the direct path, so a user cannot tell
+/// which one handled their command from the exit code or the message.
+#[test]
+fn sync_over_a_running_daemon_fails_when_a_file_could_not_be_indexed() {
+    let env = Env::new("syncfail");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // A file whose frontmatter repeats a key lands after the daemon started,
+    // so this sync is the first thing to see it - the same duplicate-`tags`
+    // shape the original report hit.
+    std::fs::write(
+        env.dir.join("kb-eng/bad.md"),
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["sync", "--domain", "eng"]);
+    assert!(
+        !ok,
+        "a partial failure over the daemon must fail the process, not exit 0: stdout={stdout} stderr={stderr}"
+    );
+    // The daemon path prints the full report before failing, same as the
+    // direct path - `sync_dispatch` always renders the daemon's JSON answer
+    // through `print_value`, so the shape differs from the direct path's
+    // plain-text summary line, but the evidence is the same either way: the
+    // report, the failing file's path and the reason are all still on
+    // stdout, printed before the process fails.
+    assert!(
+        stdout.contains("\"failed\""),
+        "the report still prints in full before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("bad.md"),
+        "the failing file is named: {stdout}"
+    );
+    assert!(
+        stdout.contains("duplicate entry with key"),
+        "the reason travels with it: {stdout}"
+    );
+    assert!(
+        stderr.contains("failed to sync") && stderr.contains("eng"),
+        "the failure names the count and the domain on stderr: {stderr}"
+    );
+
+    // A clean sync over the same still-running daemon succeeds: the check
+    // only fires on an actual failure, so the two paths cannot drift apart
+    // on the happy path either.
+    std::fs::remove_file(env.dir.join("kb-eng/bad.md")).unwrap();
+    let (ok, out) = env.run(&["sync", "--domain", "eng"]);
+    assert!(ok, "a clean sync over the daemon still succeeds: {out}");
 
     drop(c1);
     let _ = env.run(&["ctl", "shutdown"]);

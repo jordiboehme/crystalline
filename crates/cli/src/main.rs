@@ -1793,6 +1793,23 @@ async fn sync_dispatch(
         .await?
     {
         print_value(&data, json);
+        // A per-file failure rides inside `data.reports[].failed` as an
+        // ordinary field, so the ctl envelope around it is still `ok`: the
+        // daemon path needs its own check, the same one `cmd::sync` runs on
+        // the direct path, or a user going through a running daemon (the
+        // common case) would see the exact silently-successful sync this
+        // whole fix exists to end. Read the reports back out of the daemon's
+        // own JSON rather than assuming its shape, so the two paths cannot
+        // drift out of sync with each other.
+        let reports: Vec<crystalline_index::SyncReport> = data
+            .get("reports")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()?
+            .unwrap_or_default();
+        if let Some(err) = cmd::sync_failure(&reports) {
+            return Err(err);
+        }
         return Ok(());
     }
     cmd::sync(

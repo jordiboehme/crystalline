@@ -1004,19 +1004,33 @@ pub async fn sync(
     // The full report (JSON included) has already printed above, so a
     // `--json` consumer still gets the complete document before this fails
     // the process.
-    let failed_count: usize = reports.iter().map(|r| r.failed.len()).sum();
-    if failed_count > 0 {
-        let domains: Vec<&str> = reports
-            .iter()
-            .filter(|r| !r.failed.is_empty())
-            .map(|r| r.domain.as_str())
-            .collect();
-        return Err(anyhow!(
-            "{failed_count} file(s) failed to sync in domain(s): {}",
-            domains.join(", ")
-        ));
+    if let Some(err) = sync_failure(&reports) {
+        return Err(err);
     }
     Ok(())
+}
+
+/// The error `sync` fails with when any report in `reports` carries a
+/// per-file failure, or `None` when every report is clean. Shared by both
+/// ways a sync can run - directly, above, and daemon-routed through
+/// `sync_dispatch` in `main.rs`, which deserialises the daemon's JSON back
+/// into `SyncReport`s and calls this too - so the wording and the trigger
+/// condition can never drift apart between the two paths, and a user cannot
+/// tell which one handled their command from the failure alone.
+pub(crate) fn sync_failure(reports: &[crystalline_index::SyncReport]) -> Option<anyhow::Error> {
+    let failed_count: usize = reports.iter().map(|r| r.failed.len()).sum();
+    if failed_count == 0 {
+        return None;
+    }
+    let domains: Vec<&str> = reports
+        .iter()
+        .filter(|r| !r.failed.is_empty())
+        .map(|r| r.domain.as_str())
+        .collect();
+    Some(anyhow!(
+        "{failed_count} file(s) failed to sync in domain(s): {}",
+        domains.join(", ")
+    ))
 }
 
 // --- reindex -----------------------------------------------------------------
