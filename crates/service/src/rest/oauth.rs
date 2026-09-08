@@ -278,6 +278,14 @@ const CODE_TTL: Duration = Duration::from_secs(60);
 /// client padding within the rule is not refused for it.
 const CHALLENGE_LEN: std::ops::RangeInclusive<usize> = 43..=128;
 
+/// The shortest and longest a PKCE `code_verifier` may be, RFC 7636 section
+/// 4.1. The same numbers as [`CHALLENGE_LEN`] and a separate constant on
+/// purpose: they coincide by arithmetic accident - an S256 challenge is always
+/// exactly 43 characters while a verifier is anything from 43 to 128 - and one
+/// name for both would quietly narrow the verifier rule the day the challenge
+/// rule is tightened.
+const VERIFIER_LEN: std::ops::RangeInclusive<usize> = 43..=128;
+
 /// How long a `state` this server will carry back. Not in the specification:
 /// `state` is opaque to this server and rides in a bounded map that a stranger
 /// can add to, so it is bounded for the reason every other length here is.
@@ -1281,6 +1289,15 @@ async fn registered(
 
 /// Log a storage failure for the operator and answer the caller with nothing
 /// but the fact of it.
+///
+/// The store's own error text is printed here, which makes it the one line on
+/// this surface that a token-endpoint log-hygiene test cannot reach: no test
+/// can provoke a database fault. So the requirement is on the store rather
+/// than on this function - every context string it attaches names what it was
+/// doing ("rotating an oauth grant", "reading a registration") and never a
+/// value it was doing it with, and every value reaches a statement as a bound
+/// parameter. A context that interpolated a code, a token or a verifier would
+/// put it in an operator's log file from here.
 fn store_unavailable(doing: &str, error: &anyhow::Error) -> OauthError {
     tracing::error!("the accounts database failed while {doing}: {error:#}");
     OauthError::store_unavailable()
@@ -1377,7 +1394,7 @@ fn pkce_matches(verifier: &str, challenge: &str) -> bool {
     use base64::Engine as _;
     use sha2::{Digest, Sha256};
 
-    if !CHALLENGE_LEN.contains(&verifier.len())
+    if !VERIFIER_LEN.contains(&verifier.len())
         || !verifier
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~'))
@@ -2598,13 +2615,12 @@ fn granted(grant: super::IssuedOauthGrant) -> (NoStore, Json<TokenResponse>) {
 )]
 pub async fn token(
     State(state): State<RestState>,
-    headers: HeaderMap,
     form: Result<Form<TokenForm>, FormRejection>,
 ) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
     // Read before the body is consumed, so the one log line below can name the
     // client whichever way the request went.
     let client_id = form.as_ref().ok().and_then(|form| form.0.client_id.clone());
-    let outcome = tokened(&state, &headers, form).await;
+    let outcome = tokened(&state, form).await;
     // One WARN per refused token request, naming the category and the client
     // and nothing else - never the code, the verifier or either token. The
     // `404` is not a refused request, it is an instance that serves no OAuth,
@@ -2625,7 +2641,6 @@ pub async fn token(
 /// [`token`]'s body, so the refusal is logged in exactly one place.
 async fn tokened(
     state: &RestState,
-    headers: &HeaderMap,
     form: Result<Form<TokenForm>, FormRejection>,
 ) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
     let oauth = state.oauth.as_ref().ok_or_else(OauthError::no_oauth_here)?;
@@ -2640,7 +2655,7 @@ async fn tokened(
     })?;
     match form.grant_type.as_deref().map(str::trim) {
         Some("authorization_code") => exchange_code(state, oauth, &form).await,
-        Some("refresh_token") => rotate_refresh(state, oauth, headers, &form).await,
+        Some("refresh_token") => rotate_refresh(state, &form).await,
         Some(named) if !named.is_empty() => Err(OauthError::unsupported_grant_type(
             "this server serves grant_type=authorization_code and \
              grant_type=refresh_token, which is what its authorization server metadata says",
@@ -2767,46 +2782,38 @@ async fn exchange_code(
 /// grant it belonged to. Refusing an unknown client id here would be a way to
 /// present a stolen refresh token without the theft ever being noticed.
 ///
+/// **For the same reason a `resource` is not checked here either.** A refresh
+/// has no code to read an audience off, and the honest comparand is the one
+/// the grant already holds rather than the address this request happened to
+/// arrive at: an instance reached under two names would otherwise refuse a
+/// client asking for exactly what its token is good for, and accept one asking
+/// for something else. That comparison needs the row, and reading the row here
+/// first would put a refusal ahead of the replay lookup, which is how one
+/// extra form field turns the replay tripwire off. So the asked resource is
+/// handed to [`super::AuthStore::refresh_oauth_grant`] and compared inside the
+/// transaction that rotates, and a replay is detected whatever it names.
+///
 /// [`super::RefreshOutcome::Replayed`] has already revoked the grant and logged
 /// it by the time it arrives here, so this only has to answer - and it answers
 /// what an unknown token gets, in the same words.
 async fn rotate_refresh(
     state: &RestState,
-    oauth: &OauthServer,
-    headers: &HeaderMap,
     form: &TokenForm,
 ) -> Result<(NoStore, Json<TokenResponse>), OauthError> {
     let client_id = required(form.client_id.as_deref(), "client_id")?;
     let refresh_token = required(form.refresh_token.as_deref(), "refresh_token")?;
-
-    // A refresh has no code to read the resource off, so the comparison is
-    // against what this instance calls itself. That is the right answer rather
-    // than an approximation: every grant here is minted for this instance and
-    // for nothing else, so a request naming another resource is asking a
-    // question this server has no true answer to.
-    if let Some(asked) = form
+    // An empty `resource=` is a field the client left blank rather than an
+    // audience it asked for, and it is dropped here so the store is never
+    // asked to compare a grant against nothing.
+    let asked = form
         .resource
         .as_deref()
         .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        let origin = oauth.origin.origin(headers).map_err(|_| {
-            OauthError::invalid_request(
-                "this server could not tell from the request what address it was reached at, so \
-                 it cannot say whether the resource asked for is its own",
-            )
-        })?;
-        if !OriginRule::same_resource(asked, &origin) {
-            return Err(OauthError::invalid_target(
-                "this server mints tokens for itself alone, and the resource asked for is not \
-                 it - the protected resource metadata names the one it answers to",
-            ));
-        }
-    }
+        .filter(|value| !value.is_empty());
 
     match state
         .auth
-        .refresh_oauth_grant(refresh_token, client_id)
+        .refresh_oauth_grant(refresh_token, client_id, asked)
         .await
         .map_err(|error| store_unavailable("rotating an oauth grant", &error))?
     {
@@ -2819,6 +2826,11 @@ async fn rotate_refresh(
             );
             Ok(granted(grant))
         }
+        super::RefreshOutcome::WrongTarget => Err(OauthError::invalid_target(
+            "this grant was issued for another resource than the one asked for, and a refresh \
+             cannot change what a token is good for - the protected resource metadata names the \
+             resource this server answers to",
+        )),
         super::RefreshOutcome::Unknown | super::RefreshOutcome::Replayed { .. } => {
             Err(OauthError::invalid_grant(BAD_REFRESH))
         }

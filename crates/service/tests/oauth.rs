@@ -362,6 +362,28 @@ impl OauthCtx {
         request.send().await.unwrap()
     }
 
+    /// The same request as [`OauthCtx::token`], sent with a `Host` of the
+    /// test's choosing, for the deployment that is reached under two names.
+    ///
+    /// What it buys is a request whose origin is provably not the one the
+    /// grant was minted for, which is the only way to tell a comparison
+    /// against the grant apart from a comparison against the request.
+    async fn token_at_host(&self, form: &[(&str, &str)], host: &str) -> reqwest::Response {
+        let body = form
+            .iter()
+            .map(|(name, value)| format!("{}={}", encoded(name), encoded(value)))
+            .collect::<Vec<_>>()
+            .join("&");
+        self.client
+            .post(self.url("/oauth/token"))
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(reqwest::header::HOST, host)
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap()
+    }
+
     /// The same endpoint reached with a body of the test's own choosing, for
     /// the shapes a form encoder cannot produce.
     async fn token_body(&self, content_type: &str, body: &str) -> reqwest::Response {
@@ -2322,6 +2344,106 @@ async fn a_refresh_rotates_and_the_old_token_replays_into_a_revoked_grant() {
     assert_eq!(replayed, invented);
 }
 
+/// **A `resource` on a refresh is judged against the grant's own audience,
+/// never against the address the refresh arrived at, and never before the
+/// replay lookup has had its say.**
+///
+/// Three properties with one cause. An instance reached under two names mints
+/// a grant for the name the client authorized at, so an honest refresh asking
+/// for exactly the audience its token holds is served whichever of the names
+/// it arrives over. A refresh asking for an audience the grant does not hold
+/// is `invalid_target`, because rotating it would hand the client a token for
+/// a resource it did not ask for and the gate would then refuse it. And
+/// neither answer may be given before the store has looked for a replay: the
+/// check lives inside the same transaction as the rotation, so a stale token
+/// carrying a foreign `resource` revokes its grant exactly as a bare one does.
+#[tokio::test]
+async fn a_refresh_resource_is_judged_against_the_grant_and_never_before_a_replay() {
+    let ctx = OauthCtx::start().await;
+    ctx.create_user("ada", Role::Editor).await;
+    let (client_id, code) = ctx.code_for("ada", HOSTED_REDIRECT).await;
+    let issued: Value = ctx
+        .token(&ctx.exchange_form(&client_id, &code, HOSTED_REDIRECT))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let refresh_one = issued["refresh_token"].as_str().unwrap().to_string();
+    let origin = ctx.origin();
+
+    // The honest refresh of a two-named deployment: it arrives at the other
+    // name and asks for the one its grant was minted for. The grant's audience
+    // is what the request is measured against, so it is served.
+    let served = ctx
+        .token_at_host(
+            &[
+                ("grant_type", "refresh_token"),
+                ("refresh_token", refresh_one.as_str()),
+                ("client_id", client_id.as_str()),
+                ("resource", origin.as_str()),
+            ],
+            "knowledge.example",
+        )
+        .await;
+    assert_eq!(
+        served.status(),
+        200,
+        "a refresh naming the audience its own token holds is not a refusal"
+    );
+    let second: Value = served.json().await.unwrap();
+    let access_two = second["access_token"].as_str().unwrap().to_string();
+    let refresh_two = second["refresh_token"].as_str().unwrap().to_string();
+    assert!(mcp_opens(&ctx.addr, &access_two).await);
+
+    // A resource the grant does not hold, on a live token: refused, and the
+    // grant is left exactly as it was.
+    assert_oauth_error(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_two.as_str()),
+            ("client_id", client_id.as_str()),
+            ("resource", "https://knowledge.example"),
+        ])
+        .await,
+        400,
+        "invalid_target",
+    )
+    .await;
+    assert_eq!(
+        ctx.auth.list_oauth_grants("ada").await.unwrap().len(),
+        1,
+        "a refusal on the resource rotates nothing"
+    );
+    assert!(
+        mcp_opens(&ctx.addr, &access_two).await,
+        "and leaves the credentials the client already holds alive"
+    );
+
+    // The predecessor comes back with a foreign resource attached. One extra
+    // form field must not be a way to probe a stolen token without the theft
+    // being noticed.
+    assert_oauth_error(
+        ctx.token(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_one.as_str()),
+            ("client_id", client_id.as_str()),
+            ("resource", "https://knowledge.example"),
+        ])
+        .await,
+        400,
+        "invalid_grant",
+    )
+    .await;
+    assert!(
+        ctx.auth.list_oauth_grants("ada").await.unwrap().is_empty(),
+        "a replay revokes the grant whatever resource it names"
+    );
+    assert!(
+        !mcp_opens(&ctx.addr, &access_two).await,
+        "and the live access token dies with it"
+    );
+}
+
 /// **A token asked for another server is `invalid_target`, and a client this
 /// server never registered is `invalid_client`.**
 ///
@@ -2610,6 +2732,15 @@ async fn the_token_endpoint_needs_no_session_and_is_not_csrf_exempt() {
         .token_as(&rotate(&refresh, &client_id), &session, true)
         .await;
     assert_eq!(with_token.status(), 200);
+    assert!(
+        with_token
+            .headers()
+            .get(reqwest::header::SET_COOKIE)
+            .is_none(),
+        "and a token answer sets no cookie, even for the one caller that has a session: what \
+         this endpoint hands out is a bearer credential, and a middleware that refreshed a \
+         session here would put it in a browser's cookie jar"
+    );
     let rotated: Value = with_token.json().await.unwrap();
     refresh = rotated["refresh_token"].as_str().unwrap().to_string();
 

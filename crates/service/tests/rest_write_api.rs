@@ -2507,11 +2507,11 @@ fn canonicalize(path: &str) -> String {
 ///
 /// The fourth and fifth are `POST /api/v1/oauth/register` and
 /// `POST /api/v1/oauth/token`, and they are exempt for a
-/// different reason from all three: it is CSRF-protected exactly like every
+/// different reason from all three: both are CSRF-protected exactly like every
 /// matrix row (a browser holding a session must echo its token, or the
-/// registration is refused 403), but it has no ROLE dimension for the matrix to
-/// drive. Every leg here signs in as one of six accounts, and this route
-/// answers 201 to all six and to the anonymous caller alike - a client
+/// registration is refused 403), but neither has a ROLE dimension for the
+/// matrix to drive. Every leg here signs in as one of six accounts, and
+/// registration answers 201 to all six and to the anonymous caller alike - a client
 /// registers before anybody has signed in anywhere, which is what being in
 /// `PUBLIC_PATHS` means. What actually bounds it is not an identity but a burst
 /// limit, a stored-registration ceiling and a thirty-day prune, and those,

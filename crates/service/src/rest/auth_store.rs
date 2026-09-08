@@ -384,9 +384,10 @@ impl std::fmt::Debug for IssuedOauthGrant {
 
 /// What presenting a refresh token did.
 ///
-/// Three outcomes rather than a `Result<Option<_>>`, because the third one is
-/// not a failure to find anything: it is a fact about the grant that the
-/// caller has to act on.
+/// Four outcomes rather than a `Result<Option<_>>`, because two of them are
+/// not a failure to find anything: a replay is a fact about the grant that the
+/// caller has to act on, and a wrong audience is a live grant that was
+/// deliberately left where it was.
 pub enum RefreshOutcome {
     /// The grant moved along: both tokens are new, the predecessors are dead.
     Rotated(IssuedOauthGrant),
@@ -402,6 +403,25 @@ pub enum RefreshOutcome {
         /// The id of the grant this replay revoked.
         grant: i64,
     },
+    /// The token is live and the grant is this client's, but the request asked
+    /// for a resource the grant does not hold. Nothing was rotated: handing
+    /// back a token whose audience is not the one asked for would tell the
+    /// client something untrue about the credential it is holding, and RFC 8707
+    /// section 2.2 has an error for exactly this.
+    ///
+    /// **This is the one outcome here that is not indistinguishable from a
+    /// miss, and deliberately so.** It is reachable only from inside the live
+    /// lookup, so a caller who gets it has learned that the token it presented
+    /// is a live one for that client - and it learned it without rotating
+    /// anything, so it can ask again. That is accepted rather than overlooked:
+    /// a refresh token is 32 random bytes, so this tells nothing to anybody who
+    /// does not already hold one, and the alternative is to answer a client
+    /// that made a protocol mistake with a refusal that sends it back through
+    /// the whole authorization flow it did not need to repeat. Every other
+    /// miss - invented, expired, wrong client, disabled account - stays one
+    /// [`RefreshOutcome::Unknown`], and a replay stays indistinguishable from
+    /// all of them at the route.
+    WrongTarget,
 }
 
 /// Hand-written rather than derived, so the rule that no type carrying a token
@@ -412,6 +432,7 @@ impl std::fmt::Debug for RefreshOutcome {
         match self {
             RefreshOutcome::Rotated(grant) => f.debug_tuple("Rotated").field(grant).finish(),
             RefreshOutcome::Unknown => f.write_str("Unknown"),
+            RefreshOutcome::WrongTarget => f.write_str("WrongTarget"),
             RefreshOutcome::Replayed { grant } => {
                 f.debug_struct("Replayed").field("grant", grant).finish()
             }
@@ -2866,10 +2887,27 @@ impl AuthStore {
     /// predecessor is detectable - a second rotation overwrites
     /// `previous_refresh_hash` - which is enough, because a client that keeps
     /// rotating is the one that holds the live token.
+    ///
+    /// `resource` is what the client asked its next token to be minted for
+    /// (RFC 8707 section 2.2), or `None` when it asked for nothing. It is
+    /// compared against the audience the grant actually holds - never against
+    /// the address this request arrived at, which says nothing about what the
+    /// token in the caller's hand is good for - and a mismatch is
+    /// [`RefreshOutcome::WrongTarget`] with the row untouched.
+    ///
+    /// **The comparison is here rather than in the caller, and inside this
+    /// transaction, because ordering is a security property.** A replayed
+    /// token has no row under `refresh_hash` at all, so a caller that read the
+    /// grant first and refused on `resource` would refuse before the replay
+    /// was ever looked for, and one extra form field would turn the tripwire
+    /// off. The replay branch below therefore runs whatever resource was
+    /// named, and only a token that matched a live row can be refused for its
+    /// audience.
     pub async fn refresh_oauth_grant(
         &self,
         refresh_token: &str,
         client_id: &str,
+        resource: Option<&str>,
     ) -> Result<RefreshOutcome> {
         let presented = token_hash(refresh_token);
         let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
@@ -2886,7 +2924,7 @@ impl AuthStore {
         let result = async {
             let live = self
                 .query_first(
-                    "SELECT g.id FROM oauth_grants g JOIN users u ON u.name = g.user
+                    "SELECT g.id, g.resource FROM oauth_grants g JOIN users u ON u.name = g.user
                      WHERE g.refresh_hash = ?1 AND g.client_id = ?2
                        AND g.refresh_expires_at > ?3 AND u.disabled = 0",
                     vec![
@@ -2900,6 +2938,20 @@ impl AuthStore {
                 let Ok(Value::Integer(id)) = row.get_value(0) else {
                     return Ok(());
                 };
+                // Only read when there is something to compare it to, and then
+                // fail closed the way the replay branch does: a grant whose
+                // audience cannot be read is one whose audience cannot be
+                // checked, and rotating it would answer a question this store
+                // does not know the answer to.
+                if let Some(asked) = resource {
+                    let Ok(Value::Text(held)) = row.get_value(1) else {
+                        bail!("an oauth grant row has an unreadable resource");
+                    };
+                    if normalize_resource(asked) != normalize_resource(&held) {
+                        outcome = RefreshOutcome::WrongTarget;
+                        return Ok(());
+                    }
+                }
                 self.conn
                     .execute(
                         "UPDATE oauth_grants
@@ -2968,7 +3020,10 @@ impl AuthStore {
                 client = %client_id,
                 "a replayed refresh token revoked an oauth grant"
             ),
-            RefreshOutcome::Unknown => {}
+            // Neither is worth an audit line: a miss is a miss, and a wrong
+            // audience is a protocol mistake the route already logs one WARN
+            // for, with the client id beside it.
+            RefreshOutcome::Unknown | RefreshOutcome::WrongTarget => {}
         }
         Ok(outcome)
     }
@@ -7316,7 +7371,7 @@ mod tests {
             .unwrap();
 
         let outcome = store
-            .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
             .await
             .unwrap();
         let RefreshOutcome::Rotated(second) = outcome else {
@@ -7378,7 +7433,7 @@ mod tests {
             .await
             .unwrap();
         let outcome = store
-            .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
             .await
             .unwrap();
         let RefreshOutcome::Rotated(second) = outcome else {
@@ -7386,7 +7441,7 @@ mod tests {
         };
 
         let replay = store
-            .refresh_oauth_grant(&first.refresh_token, &stranger.client_id)
+            .refresh_oauth_grant(&first.refresh_token, &stranger.client_id, None)
             .await
             .unwrap();
         match replay {
@@ -7404,7 +7459,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_oauth_grant(&second.refresh_token, &client.client_id)
+                    .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
                     .await
                     .unwrap(),
                 RefreshOutcome::Unknown
@@ -7429,14 +7484,14 @@ mod tests {
             .await
             .unwrap();
         let outcome = store
-            .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
             .await
             .unwrap();
         let RefreshOutcome::Rotated(second) = outcome else {
             panic!("a live refresh token rotates, got {outcome:?}");
         };
         let outcome = store
-            .refresh_oauth_grant(&second.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
             .await
             .unwrap();
         let RefreshOutcome::Rotated(third) = outcome else {
@@ -7446,7 +7501,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_oauth_grant(&first.refresh_token, &client.client_id)
+                    .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
                     .await
                     .unwrap(),
                 RefreshOutcome::Unknown
@@ -7462,7 +7517,7 @@ mod tests {
             "so the grant is still live"
         );
         match store
-            .refresh_oauth_grant(&second.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
             .await
             .unwrap()
         {
@@ -7507,7 +7562,10 @@ mod tests {
         ] {
             assert!(
                 matches!(
-                    store.refresh_oauth_grant(&token, &client_id).await.unwrap(),
+                    store
+                        .refresh_oauth_grant(&token, &client_id, None)
+                        .await
+                        .unwrap(),
                     RefreshOutcome::Unknown
                 ),
                 "{why} rotates nothing"
@@ -7518,7 +7576,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
                     .await
                     .unwrap(),
                 RefreshOutcome::Unknown
@@ -7538,7 +7596,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
                     .await
                     .unwrap(),
                 RefreshOutcome::Unknown
@@ -7604,7 +7662,7 @@ mod tests {
         assert!(
             matches!(
                 store
-                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
                     .await
                     .unwrap(),
                 RefreshOutcome::Unknown
@@ -8061,7 +8119,7 @@ mod tests {
         );
 
         let rotated = store
-            .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
             .await
             .unwrap();
         let printed = format!("{rotated:?}");
@@ -8190,7 +8248,7 @@ mod tests {
             .await
             .unwrap();
         let first = store
-            .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
             .await
             .unwrap();
         assert!(
@@ -8198,7 +8256,7 @@ mod tests {
             "the first presentation rotates, got {first:?}"
         );
         match store
-            .refresh_oauth_grant(&issued.refresh_token, &client.client_id)
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
             .await
             .unwrap()
         {
