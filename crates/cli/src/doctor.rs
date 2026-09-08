@@ -1262,11 +1262,13 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unindexed.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}: {}",
+                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}",
                 d.unindexed.len(),
-                d.name,
-                d.unindexed.join(", ")
+                d.name
             );
+            for p in &d.unindexed {
+                let _ = writeln!(out, "    {p}");
+            }
         }
         if !d.encoding_issues.is_empty() {
             let _ = writeln!(
