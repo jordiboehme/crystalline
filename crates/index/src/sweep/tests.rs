@@ -1135,6 +1135,14 @@ fn v301_stays_quiet_below_the_threshold_without_vectors_and_across_widths() {
     d.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
     let report = detect(&input(vec![a, b, c, d]));
     assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+    assert!(report.truncations.is_empty(), "{:?}", report.truncations);
+
+    // No provider installed at all: every lead vector absent. The rule is
+    // silent, which means no finding AND no truncation line - a skip would
+    // tell a reader something was cut when nothing was ever there.
+    let quiet = detect(&input(vec![fact(5, "five"), fact(6, "six")]));
+    assert!(!fired(&quiet).contains(&"V301"), "{:?}", fired(&quiet));
+    assert!(quiet.truncations.is_empty(), "{:?}", quiet.truncations);
 }
 
 #[test]
@@ -1288,6 +1296,69 @@ fn twins_cosine_is_symmetric_and_refuses_mismatched_widths() {
     assert!((cosine(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-9);
     assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
     assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    // A NaN component poisons the quotient, and NaN fails every threshold
+    // comparison, so the pair is dropped rather than ranked.
+    assert!(cosine(&[f32::NAN, 0.0], &[1.0, 0.0]).is_nan());
+}
+
+#[test]
+fn twins_never_retain_more_pairs_than_the_pair_cap() {
+    use crate::sweep::twins::find_twins;
+
+    // A dense scope: twelve vectors fanned across a narrow arc, so all 66
+    // pairs clear the threshold and the retention guard has real work to do.
+    let vectors: Vec<Vec<f32>> = (0..12).map(|i| unit(&[1.0, 0.01 * i as f32])).collect();
+    let refs: Vec<Option<&[f32]>> = vectors.iter().map(|v| Some(v.as_slice())).collect();
+
+    let unbounded = SweepOptions {
+        max_twin_pairs: 1000,
+        ..SweepOptions::default()
+    };
+    let all = find_twins(&refs, &unbounded);
+    assert_eq!(
+        all.pairs.len(),
+        66,
+        "the fixture has to be dense to test this"
+    );
+    assert_eq!(all.compared, 12);
+
+    // The guard discards from the bottom, so a bounded run is the prefix of
+    // the unbounded one: the same findings in the same order, never a
+    // different set.
+    // Zero included: the guard must not panic on an empty heap's peek.
+    for cap in [0usize, 1, 5, 12, 65] {
+        let options = SweepOptions {
+            max_twin_pairs: cap,
+            ..SweepOptions::default()
+        };
+        let bounded = find_twins(&refs, &options);
+        assert_eq!(bounded.pairs.len(), cap, "cap {cap}");
+        assert_eq!(bounded.pairs, all.pairs[..cap], "cap {cap}");
+        assert_eq!(bounded.compared, 12, "cap {cap}");
+        assert!(
+            !bounded.capped,
+            "cap {cap}: the pair guard is not the vector cap"
+        );
+    }
+}
+
+#[test]
+fn v301_keeps_its_findings_when_the_pair_guard_bites() {
+    // The default guard leaves room far above the finding cap, so a domain
+    // dense enough to trip it still fills the queue.
+    let mut facts = Vec::new();
+    for i in 0..12 {
+        let mut f = fact(i as i64 + 1, &format!("twin-{i:02}"));
+        f.lead_vector = Some(unit(&[1.0, 0.002 * i as f32]));
+        facts.push(f);
+    }
+    let mut sweep = input(facts);
+    sweep.options.max_twin_pairs = 12;
+    let report = detect(&sweep);
+    assert_eq!(
+        report.findings.iter().filter(|f| f.rule == "V301").count(),
+        10
+    );
 }
 
 // ---------------------------------------------------------------------------

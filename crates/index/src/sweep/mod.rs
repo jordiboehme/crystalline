@@ -13,8 +13,7 @@
 //! - `V1xx` **structural integrity** - unresolved references, one-sided
 //!   reciprocal relations, orphans, stubs, oversized engrams;
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
-//!   tag spellings that drifted apart.
-//!
+//!   tag spellings that drifted apart;
 //! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
 //!   sit at or above the twin threshold: knowledge that says the same thing
 //!   twice in different words. Filed under the redundancy family, because
@@ -92,6 +91,18 @@ pub const TWIN_THRESHOLD: f64 = 0.88;
 /// The most lead vectors `V301` will compare in one domain. All pairs is
 /// quadratic; above this the rule reports a truncation and skips.
 pub const MAX_TWIN_VECTORS: usize = 5000;
+
+/// The most pairs `V301`'s twin pass keeps while it scans, closest first. The
+/// vector cap bounds the comparisons; this bounds what they produce, because a
+/// scope dense enough that most pairs clear the threshold would otherwise
+/// materialize millions of them to hand back ten.
+///
+/// Far above [`MAX_TWIN_FINDINGS`] on purpose. The `V201` suppression runs
+/// after the pass returns, so the retained list has to carry enough clustered
+/// pairs for ten unclustered ones to survive; a cluster of `k` members
+/// contributes only `k * (k - 1) / 2` of them, so this slack covers any
+/// plausible one and still costs about 24 KB.
+pub const MAX_TWIN_PAIRS: usize = 1000;
 
 /// The most `V301` findings one domain sweep emits, closest pairs first.
 pub const MAX_TWIN_FINDINGS: usize = 10;
@@ -786,6 +797,10 @@ pub struct SweepOptions {
     pub twin_threshold: f64,
     /// See [`MAX_TWIN_VECTORS`].
     pub max_twin_vectors: usize,
+    /// See [`MAX_TWIN_PAIRS`]. Keep it above `max_twin_findings`: it bounds
+    /// what the pass retains, and the `V201` suppression eats into that
+    /// afterwards.
+    pub max_twin_pairs: usize,
     /// See [`MAX_TWIN_FINDINGS`].
     pub max_twin_findings: usize,
 }
@@ -807,6 +822,7 @@ impl Default for SweepOptions {
             share_stale_days: SHARE_STALE_DAYS,
             twin_threshold: TWIN_THRESHOLD,
             max_twin_vectors: MAX_TWIN_VECTORS,
+            max_twin_pairs: MAX_TWIN_PAIRS,
             max_twin_findings: MAX_TWIN_FINDINGS,
         }
     }
