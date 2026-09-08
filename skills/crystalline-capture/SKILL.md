@@ -31,6 +31,8 @@ Before creating anything, search for it - the same `search_engrams` call `crysta
 
 Treat this as a hard gate: a `search_engrams` call comes before the first `write_engram` or `edit_engram` on a topic, no exceptions, and loading a tool schema does not count as searching. When a hit looks like the owner, `read_engram` it before editing - a snippet is not enough to judge fit or write a correct edit - and pass the returned checksum as `expected_checksum` on the edit so a concurrent change is rejected instead of overwritten. Both tools take the permalink as `identifier`; keep it bare - an identifier without the `crystalline://` scheme is always domain-relative, so a domain-prefixed identifier never resolves.
 
+The write is also a search. Every `write_engram` and every content `edit_engram` receipt may carry a `similar` list - up to three existing engrams closest in meaning to what you just wrote, with a `guidance` line - and it is a search you did not have to run, scoped to what you may see. Act on it or say why not, never ignore it silently: read the one that fits, then merge into it and retire or delete yours if it owns the topic, supersede it if yours makes it false, add a relation if they are related but distinct, and say "unrelated" when they are. A receipt without the list means nothing was near.
+
 ## Edit over create
 
 Prefer refining an existing engram over starting a new one for the same topic, as long as the new knowledge shares the same validity state as what is already there:
@@ -160,7 +162,7 @@ Not every retirement has a replacement. When nothing takes the old fact's place 
 
 ## Working a maintenance queue
 
-When the user asks what the archive itself needs - what has gone stale, what is half-finished, what looks duplicated - `evolve_engrams` sweeps a domain or every domain read-only and returns a ranked queue where each finding carries its evidence and its next action: work the items marked `mechanical` directly and summarize once, propose each `judgment` item and wait for a yes one at a time, and never read a finding as proof that two engrams disagree, since the sweep detects by dates, links and graph shape rather than by meaning. A tag drift finding is the one fix you never apply yourself: hand the user the `crystalline tags merge` command it names and let them run it.
+When the user asks what the archive itself needs - what has gone stale, what is half-finished, what looks duplicated - `evolve_engrams` sweeps a domain or every domain read-only and returns a ranked queue where each finding carries its evidence and its next action: work the items marked `mechanical` directly and summarize once, propose each `judgment` item and wait for a yes one at a time, and never read a finding as proof that two engrams disagree - the sweep detects by dates, links, graph shape and embedding similarity, and a `V301` semantic twin means two current engrams say the same thing in different words, not that one of them is wrong; read both, merge and supersede or link and acknowledge the pair with `evolve_ack`. A tag drift finding is the one fix you never apply yourself: hand the user the `crystalline tags merge` command it names and let them run it.
 
 ## Confirm before destroying
 

@@ -169,7 +169,7 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Items marked mechanical complete intent the archive already records - fix those directly and summarize once. \
      Items marked judgment change what the archive claims - read the engram, propose and wait for a yes, one at a time. \
      A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
-     Act only on the evidence stated: this sweep detects by dates, links and graph shape, never by meaning, so it cannot confirm a contradiction. \
+     Act only on the evidence stated: this sweep detects by dates, links, graph shape and embedding similarity, and similarity is not a contradiction - it cannot confirm that two engrams disagree. \
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:

@@ -568,7 +568,8 @@ enum Command {
     /// Sweep for the maintenance the knowledge needs and print a ranked queue.
     ///
     /// Read-only: it detects temporal and lifecycle debt, structural gaps and
-    /// redundancy by dates, links and graph shape, never by meaning, and
+    /// redundancy by dates, links, graph shape and embedding similarity
+    /// (semantic twins), never confirming a contradiction, and
     /// changes nothing itself. Work the queue with the write verbs and re-run
     /// the same scope to confirm it shrank.
     Evolve {

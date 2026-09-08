@@ -430,6 +430,13 @@ sharper measurement of the same behavior does not, so it is a correction edited 
 place. A value that genuinely changed in the world does, and that is a
 supersession - the next chapter.
 
+The agent does not rely on remembering to search. Every capture and every content
+edit comes back with the three engrams closest in meaning to what just landed - a
+second search it did not have to run - and a fixed line on what to do: merge into
+the one that owns the topic, supersede the one the new fact makes false, link the
+one that is related but distinct, or say unrelated. A quiet receipt means nothing
+was near. Fluid shows the same list after a save.
+
 Vocabulary drifts the same way. Two engrams now touch the hyperdrive - the recall
 notice tagged `hyperdrive` and the install guide tagged `hyper-drive` - the same
 topic split under two spellings. The agent surveys the vocabulary and surfaces the
@@ -712,13 +719,15 @@ shift ends between step two and step three.
 
 Which is the honest limit of the whole thing. The sweep reads dates, links and
 graph shape: a status, a validity window, an edge that resolves or does not, a
-tag spelled two ways. It never reads for meaning. It found item 1 because a
+tag spelled two ways. It never forms a view about what an engram says. It found item 1 because a
 `supersedes` edge points at an engram still marked stable, not because it
 compared the recall with the swap and formed a view about which one is right. It
 will hand you a half-finished retirement every time and it will never tell you
-that two engrams contradict each other - even the duplicate detection is
-lexical, so two engrams saying the same thing in different words stay invisible
-to it. It finds the work; you still decide it.
+that two engrams contradict each other. It does see meaning in one narrow way: a
+`V301` semantic twin is two current engrams whose lead embeddings sit close
+together, the same thing said twice in different words. That is agreement about
+a topic, not a verdict on a fact - read both and decide. It finds the work; you
+still decide it.
 
 When the queue is worked, ask again:
 
