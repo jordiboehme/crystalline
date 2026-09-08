@@ -410,8 +410,11 @@ function ackBody(permalink: string, rule: string, note?: string): AckBody {
  *
  * The scope it holds for is never sent: the server runs detection for the
  * engram and takes the firing finding's own evidence, so neither a person nor
- * an agent ever handles a fingerprint. Acknowledging the same rule again
- * replaces the entry, which is what makes this the re-acknowledge call too.
+ * an agent ever handles a fingerprint. The server takes the finding still
+ * standing, so calling this again on an engram whose rule fires twice - two
+ * twin pairs, say - acknowledges the other pair rather than overwriting the
+ * first. With every one of them acknowledged the call updates the first
+ * entry's note in place, which is what makes this the re-acknowledge call too.
  */
 export async function acknowledgeFinding(
   domain: string,

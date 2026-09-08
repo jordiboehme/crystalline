@@ -6960,7 +6960,7 @@ impl Engine {
     /// shapes the merged result. Nothing is written and nothing is remembered,
     /// so "what is left" is re-derived by calling again with the same scope.
     ///
-    /// Six details of the assembly are load-bearing, each guarding a class of
+    /// Seven details of the assembly are load-bearing, each guarding a class of
     /// silently wrong finding:
     ///
     /// - the resolved degrees are counted over the **merged** graph slices, so
@@ -6989,7 +6989,12 @@ impl Engine {
     ///   and would report claimed attachments as orphans. This is the same
     ///   split [`Engine::peer_engram_text`] makes for the move's referent
     ///   count, and the two agree on what a reference is: an `assets/` link in
-    ///   the body or the `analyzes` key, compared as exact paths.
+    ///   the body or the `analyzes` key, compared as exact paths;
+    /// - the lead vectors reach `V301` only when a provider is installed, so
+    ///   meaning is compared on exactly the machines that compute it. A machine
+    ///   with an index full of embeddings and no provider says nothing about
+    ///   meaning rather than scoring against whatever an older model left
+    ///   behind.
     pub async fn evolve_detect(
         &self,
         p: &EvolveParams,
@@ -7284,6 +7289,14 @@ impl Engine {
     /// re-acknowledging a finding an older entry already silences still sees
     /// the evidence it fires on and records the current scope rather than
     /// dropping to a scope-less entry.
+    ///
+    /// **The unacknowledged finding wins when the rule fires more than once
+    /// here**, which a set-scoped rule does: an engram that twins two others
+    /// carries two `V301` findings and neither one is "the" finding. Taking
+    /// the first row every time made the second acknowledgment re-record the
+    /// pair the first already covered, so the other pair could never be
+    /// acknowledged at all. With every pair acknowledged the first row wins
+    /// again, which is what makes a re-acknowledgment update a note in place.
     async fn firing_scope(
         &self,
         domain: &str,
@@ -7300,12 +7313,17 @@ impl Engine {
         else {
             return Ok(None);
         };
-        Ok(swept
+        let firing: Vec<Finding> = swept
             .report
             .findings
             .into_iter()
-            .find(|f| f.rule == rule && f.permalink == permalink)
-            .map(|f| f.scope)
+            .filter(|f| f.rule == rule && f.permalink == permalink)
+            .collect();
+        Ok(firing
+            .iter()
+            .find(|f| !f.acknowledged)
+            .or(firing.first())
+            .map(|f| f.scope.clone())
             .filter(|scope| !scope.is_empty()))
     }
 
@@ -7451,12 +7469,29 @@ impl Engine {
             *inbound.entry(edge.to.0).or_default() += 1;
         }
 
+        // Read before the store lock is taken: the provider lives behind its
+        // own guard and the sweep has no reason to hold both.
+        let embedded = self.provider().is_some();
+
         let store = self.store.lock().await;
         let unresolved = store.unresolved_refs(domain_id).await?;
         let vocab = store.vocabulary(Some(name)).await?;
         // Metadata only, one query: the attachment rules compare paths,
         // sizes and hashes and never read a byte of any file.
         let attachments = store.list_attachments(domain_id).await?;
+        // Lead vectors for V301, only with a provider installed: without one
+        // the rule stays silent whatever a previous run left embedded, so a
+        // sweep on a machine that never embeds never speaks about meaning.
+        let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
+            store
+                .lead_vectors(domain_id, &self.model_id)
+                .await?
+                .into_iter()
+                .map(|lv| (lv.engram_id.0, lv.vector))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         drop(store);
 
         let verify_config = domain_verify_config(&source);
@@ -7518,8 +7553,9 @@ impl Engine {
                 acks: ack_entries(fm),
                 // Filled in by the caller that has the store: the sweep is
                 // pure, so the lead embeddings are handed to it, never fetched
-                // from inside it.
-                lead_vector: None,
+                // from inside it. Removed rather than cloned - one engram is
+                // assembled once, and the vector is the largest field here.
+                lead_vector: lead_vectors.remove(&d.id.0),
                 // The parser's own bullets, so `V010` compares what an
                 // observation asserts rather than re-deriving it from the body.
                 observations: engram
@@ -7546,6 +7582,12 @@ impl Engine {
             attachments,
             share: self.share_facts(name).await,
             include_acknowledged,
+            // The sweep module's own constants, never literals repeated here:
+            // the thresholds and the twin caps are one place, and nothing
+            // configures them yet. The twin caps hold an invariant the defaults
+            // satisfy and a future settings surface has to keep - the pairs
+            // retained bound the findings emitted, so `max_twin_pairs` stays
+            // above `max_twin_findings` or the cap on findings is unreachable.
             options: SweepOptions::default(),
         };
         let report = detect(&input);
@@ -14028,19 +14070,31 @@ fn without_ack(source: &str, rule: &str) -> String {
     set_evolve_ack(source, &kept)
 }
 
-/// The engram's acknowledgments with `entry` folded in: one entry per rule, so
-/// re-acknowledging a finding replaces what it said rather than stacking a
-/// second line nobody reads. The replacement keeps the original position, which
-/// keeps a hand-ordered list hand-ordered.
+/// The engram's acknowledgments with `entry` folded in: one entry per rule
+/// **and scope**, so re-acknowledging the same finding replaces what it said
+/// rather than stacking a second line nobody reads, while a second finding of
+/// the same rule given for different evidence is recorded beside the first. The
+/// replacement keeps the original position, which keeps a hand-ordered list
+/// hand-ordered.
+///
+/// Keyed by the pair rather than by the rule because a set-scoped rule fires
+/// more than once on one engram: an engram that twins two others carries two
+/// `V301` findings, and `V103` two half-finished pairs. Keying by rule alone
+/// made the second acknowledgment overwrite the first, which silenced one pair
+/// and left the other standing with somebody else's note on it. A scope-less
+/// entry - what a hand-written line or an acknowledgment given before the rule
+/// fires carries - is its own key too, and keeps matching whatever the rule
+/// finds.
 fn merged_acks(source: &str, entry: EvolveAck) -> Vec<EvolveAck> {
     let mut entries = acks_of(source);
     let mut replaced = false;
     entries.retain_mut(|existing| {
-        if !existing.rule.eq_ignore_ascii_case(&entry.rule) {
+        if !existing.rule.eq_ignore_ascii_case(&entry.rule) || existing.scope != entry.scope {
             return true;
         }
-        // A hand-edited file may name one rule twice; the entry just written is
-        // the survivor and the rest go, so the list stays one entry per rule.
+        // A hand-edited file may name one rule and scope twice; the entry just
+        // written is the survivor and the rest go, so the list stays one entry
+        // per rule and scope.
         if replaced {
             return false;
         }
