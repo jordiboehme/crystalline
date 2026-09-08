@@ -63,9 +63,18 @@ export async function unlinkIdentity(issuer: string): Promise<void> {
  * Where to send the browser to sign in with the provider. A plain address, for
  * a plain link: this is the public way in, and it signs in whoever the
  * provider turns out to say it is.
+ *
+ * `returnTo`, when given, rides along as `return_to`: a path on this
+ * instance for the callback to land the browser on once the sign-in
+ * completes, instead of the home screen. The OAuth consent page is what this
+ * exists for - `RequireAuth` carries the address it interrupted to the login
+ * screen, and a provider sign-in started from there has to come back to that
+ * exact address, because the pending authorization it names is only
+ * reachable by its id.
  */
-export function ssoSignInUrl(): string {
-  return `${API_BASE}/auth/oidc/login`;
+export function ssoSignInUrl(returnTo?: string): string {
+  const url = `${API_BASE}/auth/oidc/login`;
+  return returnTo ? `${url}?return_to=${encodeURIComponent(returnTo)}` : url;
 }
 
 /**

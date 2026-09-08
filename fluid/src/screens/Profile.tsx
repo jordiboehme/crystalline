@@ -30,6 +30,14 @@
  * since that would leave an account nobody can sign in to. The server owns
  * that rule and says so in its own words, which name the command that gives
  * the account a password first.
+ *
+ * A fourth card, {@link OauthGrantsCard}, sits directly under the agent
+ * access one: the clients this account connected through OAuth rather than
+ * through a pasted token - a hosted client like Claude, or a local agent that
+ * ran the loopback flow. It is the opposite direction of both cards above it,
+ * connection-wise: nothing here is issued or pasted, only listed and revoked,
+ * because a grant is minted by the authorization code flow at `/authorize`,
+ * never by this screen.
  */
 
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
@@ -57,8 +65,14 @@ import type {
   IdentityLink,
   IssuedMcpToken,
   McpTokenInfo,
+  OauthGrantInfo,
   User,
 } from "../api/model";
+import {
+  OAUTH_GRANTS_KEY,
+  fetchOauthGrants,
+  revokeOauthGrant,
+} from "../api/oauth";
 import {
   IDENTITY_LINKS_KEY,
   PROVIDERS_KEY,
@@ -115,6 +129,7 @@ export default function Profile() {
       <GithubIdentityCard />
       <SsoIdentityCard user={user} />
       <AgentAccessCard />
+      <OauthGrantsCard />
     </div>
   );
 }
@@ -1181,5 +1196,264 @@ function RevealDialog({
         </Dialog.Content>
       </Dialog.Portal>
     </Dialog.Root>
+  );
+}
+
+/**
+ * The card an account's connected OAuth clients live behind: which client
+ * connected, since when, when it last used the connection, when its refresh
+ * token expires, and a way to revoke it.
+ *
+ * Shown to every signed-in account, viewers included, and offered on a
+ * read-only instance too - a grant is account state in the accounts database,
+ * the same reason {@link AgentAccessCard} is and for the same server-side
+ * rule (`revoke_my_oauth_grant` is `read_only_exempt`). Never a token: only
+ * hashes are stored server side, so this listing carries `client_name`,
+ * `redirect_host`, `created_at`, `last_used` and `refresh_expires_at`, and
+ * nothing more, ever.
+ *
+ * Nothing here mints a grant. The only way one comes to exist is the
+ * authorization code flow at `/authorize`, which is a client's journey, not
+ * an action on this screen - this card only ever lists what already happened
+ * there and lets it be taken back.
+ */
+// Exported for the same reason `AgentAccessCard` is: so a test can mount it
+// on its own, with no router or auth context required.
+export function OauthGrantsCard() {
+  const queryClient = useQueryClient();
+  const [notice, setNotice] = useState<Notice | null>(null);
+
+  const grants = useQuery({
+    queryKey: OAUTH_GRANTS_KEY,
+    queryFn: fetchOauthGrants,
+  });
+
+  const invalidate = () =>
+    queryClient.invalidateQueries({ queryKey: OAUTH_GRANTS_KEY });
+
+  const revoke = useMutation({
+    mutationFn: (id: number) => revokeOauthGrant(id),
+    onSuccess: () => {
+      setNotice({ kind: "done", text: "The client is disconnected." });
+      void invalidate();
+    },
+    onError: (error: Error) => {
+      setNotice({ kind: "problem", text: problemDetail(error) });
+    },
+  });
+
+  const rows = grants.data ?? [];
+
+  return (
+    <section
+      aria-labelledby="oauth-grants"
+      className="flex flex-col gap-4 rounded border border-slate-200 p-4 dark:border-slate-800"
+    >
+      <div>
+        <h2 id="oauth-grants" className="text-section">
+          Connected clients
+        </h2>
+        <p className={`mt-1 ${MUTED}`}>
+          The clients you connected through OAuth. Each one can do whatever your
+          own account can, until you revoke it here.
+        </p>
+      </div>
+
+      {notice && (
+        <p
+          role={notice.kind === "problem" ? "alert" : "status"}
+          className={
+            notice.kind === "problem"
+              ? "rounded border border-red-300 bg-red-50 px-3 py-2 text-sm text-red-800 dark:border-red-900 dark:bg-red-950 dark:text-red-200"
+              : "rounded border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-700 dark:border-slate-800 dark:bg-slate-900 dark:text-slate-300"
+          }
+        >
+          {notice.text}
+        </p>
+      )}
+
+      {grants.error && (
+        <p
+          role="alert"
+          className="rounded bg-red-50 px-3 py-2 text-sm text-red-800 dark:bg-red-950 dark:text-red-200"
+        >
+          {problemDetail(grants.error)}
+        </p>
+      )}
+
+      {grants.isPending ? (
+        <p className={MUTED}>Reading your connected clients</p>
+      ) : rows.length === 0 ? (
+        <p className={MUTED}>No client connected yet.</p>
+      ) : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-sm">
+            <caption className="sr-only">Your connected OAuth clients</caption>
+            <thead className="text-caption font-semibold text-slate-500 dark:text-slate-400">
+              <tr>
+                <th scope="col" className="px-2 py-2">
+                  Client
+                </th>
+                <th scope="col" className="px-2 py-2">
+                  Redirects to
+                </th>
+                <th scope="col" className="px-2 py-2">
+                  Granted
+                </th>
+                <th scope="col" className="px-2 py-2">
+                  Last use
+                </th>
+                <th scope="col" className="px-2 py-2">
+                  Refresh expires
+                </th>
+                <th scope="col" className="px-2 py-2">
+                  Actions
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-200 dark:divide-slate-800">
+              {rows.map((grant) => (
+                <GrantRow
+                  key={grant.id}
+                  grant={grant}
+                  revoking={revoke.isPending && revoke.variables === grant.id}
+                  onRevoke={() => {
+                    revoke.mutate(grant.id);
+                  }}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </section>
+  );
+}
+
+/** One connected client: what it is called, where it goes, and when it was last used. */
+function GrantRow({
+  grant,
+  revoking,
+  onRevoke,
+}: {
+  grant: OauthGrantInfo;
+  revoking: boolean;
+  onRevoke: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+
+  /** Give up on the pending revoke, and hand the focus back to what asked. */
+  function abandon() {
+    setConfirming(false);
+    trigger.current?.focus();
+  }
+
+  return (
+    <tr className="align-top">
+      <th scope="row" className="px-2 py-2 font-normal">
+        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
+          {grant.client_name}
+        </span>
+      </th>
+      <td className="px-2 py-2">
+        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
+          {grant.redirect_host}
+        </span>
+      </td>
+      <td className="px-2 py-2 tabular-nums">
+        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
+          {formatDay(grant.created_at)}
+        </span>
+      </td>
+      <td className="px-2 py-2 tabular-nums">
+        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
+          {grant.last_used == null ? (
+            <span className="text-slate-500 dark:text-slate-400">Never</span>
+          ) : (
+            formatDay(grant.last_used)
+          )}
+        </span>
+      </td>
+      <td className="px-2 py-2 tabular-nums">
+        <span className={`flex ${CONTROL_HEIGHT} items-center`}>
+          {formatDay(grant.refresh_expires_at)}
+        </span>
+      </td>
+      <td className="px-2 py-2">
+        {/*
+          Two steps rather than a browser confirm, the reason every other
+          destructive control on this screen gives; `aria-disabled` rather
+          than `disabled` on both presses below, the newer of this app's two
+          idioms for that (`MembersCard.tsx`'s own `DestructiveAction`) - a
+          mutation in flight is a passing state rather than a certainty this
+          side already holds, but keeping the trigger reachable and its state
+          announced costs nothing while it lasts.
+        */}
+        <div
+          className="flex flex-wrap items-center gap-2"
+          onKeyDown={(event) => {
+            if (event.key === "Escape" && confirming) {
+              event.stopPropagation();
+              abandon();
+            }
+          }}
+          onBlur={(event) => {
+            const next = event.relatedTarget;
+            if (
+              confirming &&
+              next instanceof Node &&
+              !event.currentTarget.contains(next)
+            ) {
+              setConfirming(false);
+            }
+          }}
+        >
+          <button
+            ref={trigger}
+            type="button"
+            aria-label={`Revoke ${grant.client_name}`}
+            aria-expanded={confirming}
+            aria-disabled={revoking}
+            onClick={() => {
+              if (revoking) {
+                return;
+              }
+              setConfirming(true);
+            }}
+            className={`${DANGER_BUTTON} aria-disabled:cursor-default aria-disabled:opacity-50`}
+          >
+            Revoke
+          </button>
+          {confirming && (
+            <>
+              <button
+                type="button"
+                autoFocus
+                aria-label={`Confirm revoke ${grant.client_name}`}
+                aria-disabled={revoking}
+                onClick={() => {
+                  if (revoking) {
+                    return;
+                  }
+                  setConfirming(false);
+                  onRevoke();
+                }}
+                className={`${DANGER_BUTTON} aria-disabled:cursor-default aria-disabled:opacity-50`}
+              >
+                Confirm revoke
+              </button>
+              <button
+                type="button"
+                onClick={abandon}
+                className={SECONDARY_BUTTON}
+              >
+                Keep
+              </button>
+            </>
+          )}
+        </div>
+      </td>
+    </tr>
   );
 }

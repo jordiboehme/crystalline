@@ -116,6 +116,48 @@ describe("the login screen", () => {
     expect(screen.queryByRole("link", { name: /sign in with/i })).toBeNull();
   });
 
+  it("the provider link carries the intended destination as return_to", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    // Not `/login` directly: this is the OAuth consent screen `RequireAuth`
+    // intercepted, and the destination it carries along is what the button
+    // has to echo as `return_to`, so a provider sign-in started from here
+    // comes back to the exact pending authorization rather than the home
+    // screen.
+    renderApp("/authorize?request=req-1");
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute(
+      "href",
+      "/api/v1/auth/oidc/login?return_to=%2Fauthorize%3Frequest%3Dreq-1",
+    );
+  });
+
+  it("carries no return_to when nothing redirected here", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp("/login");
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+  });
+
   it("shows the server's own words when the credentials are refused", async () => {
     serve({
       "/auth/me": () => meResponse(),

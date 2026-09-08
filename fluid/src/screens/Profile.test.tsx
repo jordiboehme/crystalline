@@ -86,6 +86,7 @@ function serveAs(
       "/domains": domainsResponse,
       "/me/github-identity": () => identityPayload(),
       "/me/mcp-tokens": () => [],
+      "/me/oauth-grants": () => [],
       // The default is an instance with no provider and an account with no
       // link, which is the shape in which the SSO card is not there at all.
       "/auth/providers": () => ({ local: true, oidc: { enabled: false } }),
@@ -795,6 +796,112 @@ describe("the agent access card", () => {
     expect(JSON.stringify(client.getMutationCache().getAll())).not.toContain(
       "cmt_deadbeef",
     );
+  });
+});
+
+describe("the connected clients card", () => {
+  it("lists grants with their client and last use", async () => {
+    serveAs("editor", {
+      "/me/oauth-grants": () => [
+        {
+          id: 1,
+          client_id: "coc_1a2b3c",
+          client_name: "Claude",
+          redirect_host: "claude.ai",
+          created_at: "2026-08-29T09:12:44Z",
+          last_used: "2026-09-01T10:00:00Z",
+          refresh_expires_at: "2026-10-08T04:00:00Z",
+        },
+        {
+          id: 2,
+          client_id: "coc_4d5e6f",
+          client_name: "a local agent",
+          redirect_host: "127.0.0.1:51902",
+          created_at: "2026-08-20T00:00:00Z",
+          last_used: null,
+          refresh_expires_at: "2026-10-20T00:00:00Z",
+        },
+      ],
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Connected clients" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Claude")).toBeInTheDocument();
+    expect(screen.getByText("claude.ai")).toBeInTheDocument();
+    expect(screen.getByText("2026-08-29")).toBeInTheDocument();
+    expect(screen.getByText("2026-09-01")).toBeInTheDocument();
+    expect(screen.getByText("a local agent")).toBeInTheDocument();
+    expect(screen.getByText("127.0.0.1:51902")).toBeInTheDocument();
+    expect(screen.getByText("Never")).toBeInTheDocument();
+  });
+
+  it("says so when no client is connected yet", async () => {
+    serveAs("viewer");
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("revokes a grant and shows the server's refusal word for word", async () => {
+    let listing = [
+      {
+        id: 9,
+        client_id: "coc_1a2b3c",
+        client_name: "Claude",
+        redirect_host: "claude.ai",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+        refresh_expires_at: "2026-10-08T04:00:00Z",
+      },
+    ];
+    let refuse = true;
+    serveAs("editor", {
+      "/me/oauth-grants": () => listing,
+      "/me/oauth-grants/9": (_path, init) => {
+        if (init?.method === "DELETE") {
+          if (refuse) {
+            throw new ApiProblem(
+              404,
+              "not found",
+              "no such connected client: it may already have been revoked",
+            );
+          }
+          listing = [];
+        }
+        return undefined;
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke Claude" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude" }),
+    );
+
+    // The server's own refusal, word for word - and the row nothing
+    // happened to is still there.
+    expect(
+      await screen.findByText(/no such connected client/i),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Claude")).toBeInTheDocument();
+
+    refuse = false;
+    await userEvent.click(
+      screen.getByRole("button", { name: "Revoke Claude" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude" }),
+    );
+
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
   });
 });
 

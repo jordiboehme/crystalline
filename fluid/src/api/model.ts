@@ -147,3 +147,21 @@ export type OwnerBody = components["schemas"]["OwnerBody"];
 
 /** What `PUT /domains/{domain}/visibility` takes. */
 export type VisibilityBody = components["schemas"]["VisibilityBody"];
+
+/**
+ * What the consent screen shows: the client name, the redirect host (with
+ * the loopback marker), and the account that is about to grant it. Never the
+ * protocol - no code, no challenge, no state, no client id.
+ */
+export type AuthorizationView = components["schemas"]["AuthorizationView"];
+
+/** What deciding a pending authorization answers with: where to navigate next. */
+export type DecisionResponse = components["schemas"]["DecisionResponse"];
+
+/**
+ * One row of an account's connected OAuth clients: which client, since when,
+ * when it was last used, and until when its refresh token may keep rotating.
+ * Never a token - only hashes are stored on the server, so there is nothing
+ * to show back.
+ */
+export type OauthGrantInfo = components["schemas"]["OauthGrantInfo"];
