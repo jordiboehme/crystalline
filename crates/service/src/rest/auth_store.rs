@@ -3187,15 +3187,15 @@ impl AuthStore {
 
     /// Make `domain` private, owned by `owner`, or make it shared again.
     ///
-    /// `private = true` writes (or replaces) the acl row and leaves the
-    /// existing membership alone, so changing the owner of an already-private
-    /// domain does not empty it. The one row it does drop is the incoming
-    /// owner's own membership, if it had one: an owner holds every level, so
-    /// the row could now only say less than the truth, and it would come back
-    /// to life the moment the domain is handed on again. This is the same step
-    /// [`AuthStore::transfer_domain`] takes, for the same reason - the two
-    /// paths that change an owner must agree. `private = false` deletes the acl
-    /// row *and*
+    /// `private = true` on a SHARED domain writes the acl row naming `owner`
+    /// and leaves the (nonexistent) membership alone. The one row it drops is
+    /// the new owner's own membership, if some earlier private spell left one:
+    /// an owner holds every level, so the row could only say less than the
+    /// truth, and it would come back to life the moment the domain is handed
+    /// on again. This is the same step [`AuthStore::transfer_domain`] takes,
+    /// for the same reason - the two paths that change an owner must agree.
+    /// On a domain that is already private this writes nothing at all; see the
+    /// paragraph below. `private = false` deletes the acl row *and*
     /// every membership row for the domain: membership only means anything
     /// while a domain is private, and leaving the rows behind would silently
     /// restore them if the domain were ever made private again by somebody
@@ -6013,8 +6013,13 @@ mod tests {
             .unwrap();
     }
 
+    /// Privatizing a domain that is already private writes nothing: not the
+    /// owner, not the membership rows. It used to hand the domain to whoever
+    /// asked last, which made a retried request an ownership transfer nobody
+    /// asked for and dropped the previous owner - who holds no membership row
+    /// by construction - to no access at all.
     #[tokio::test]
-    async fn changing_the_owner_of_a_private_domain_keeps_its_members() {
+    async fn privatizing_an_already_private_domain_writes_nothing() {
         let (_dir, store) = store().await;
         members_cast(&store).await;
         store
@@ -6025,10 +6030,33 @@ mod tests {
             .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
             .await
             .unwrap();
-        store
+
+        let again = store
             .set_domain_visibility("lab", true, "out")
             .await
             .unwrap();
+        assert_eq!(
+            again,
+            VisibilityWrite::AlreadyPrivate {
+                owner: "owner".to_string()
+            },
+            "the answer says it was already private, and names the owner it kept"
+        );
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "owner",
+            "a visibility statement is not an ownership transfer"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "and nobody was evicted"
+        );
+
+        // The verb that DOES change an owner still does, and still keeps the
+        // members: the two paths that change an owner must agree, and one of
+        // them is no longer this one.
+        store.transfer_domain("lab", "out").await.unwrap();
         assert_eq!(
             store.domain_visibility("lab").await.unwrap().unwrap().owner,
             "out"
@@ -6040,40 +6068,12 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn promoting_a_member_to_owner_drops_the_row_that_now_says_less() {
-        let (_dir, store) = store().await;
-        members_cast(&store).await;
-        store
-            .set_domain_visibility("lab", true, "owner")
-            .await
-            .unwrap();
-        for name in ["mem", "out"] {
-            store
-                .upsert_domain_member("lab", name, MemberLevel::Viewer, "owner")
-                .await
-                .unwrap();
-        }
-        // The same step `transfer_domain` takes, on the other path that changes
-        // an owner: the two must agree, or a demotion would resurrect a level
-        // the domain has since outgrown.
-        store
-            .set_domain_visibility("lab", true, "mem")
-            .await
-            .unwrap();
-        assert_eq!(
-            store
-                .domain_members("lab")
-                .await
-                .unwrap()
-                .iter()
-                .map(|m| m.principal.as_str())
-                .collect::<Vec<_>>(),
-            vec!["out"],
-            "the incoming owner's viewer row is gone, everyone else stays"
-        );
-        assert!(store.memberships_of("mem").await.unwrap().is_empty());
-    }
+    // `promoting_a_member_to_owner_drops_the_row_that_now_says_less` used to sit
+    // here, promoting a member by privatizing an already-private domain with a
+    // new owner. That is not a thing this method does any more - privatizing
+    // one that is already private writes nothing at all - and the step it was
+    // really about is `transfer_domain`'s, which the test below pins on the one
+    // path that still takes it.
 
     #[tokio::test]
     async fn transfer_domain_swaps_the_owner_and_drops_its_member_row() {
@@ -6394,13 +6394,29 @@ mod tests {
             "{disabled:#}"
         );
 
-        // And a failure that is not one of the three carries no kind at all,
-        // so the surfaces keep answering 500 for what is genuinely theirs.
+        // A principal that cannot be a login name at all carries its own kind,
+        // which is what lets the one route taking a principal in the BODY
+        // answer the 422 its documentation promises rather than a 500.
         let malformed = store
             .upsert_domain_member("lab", "  ", MemberLevel::Editor, "owner")
             .await
             .unwrap_err();
-        assert_eq!(StoreRefusal::kind_of(&malformed), None);
+        assert_eq!(
+            StoreRefusal::kind_of(&malformed),
+            Some(RefusalKind::InvalidName)
+        );
+
+        // And a failure that is nobody's doing carries no kind at all, so the
+        // surfaces keep answering 500 for what is genuinely theirs.
+        let unregistered = store
+            .upsert_domain_member("nosuchdomain", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&unregistered),
+            Some(RefusalKind::NotPrivate),
+            "a domain with no acl row is shared as far as this table knows"
+        );
     }
 
     #[tokio::test]

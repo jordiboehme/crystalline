@@ -1722,13 +1722,30 @@ async fn a_strangers_move_leaves_a_hidden_domains_link_alone() {
 }
 
 /// The converse, so the skip above is the scope rather than a broken rewrite:
-/// an admin sees every domain, so the same move rewrites the same link.
+/// an admin sees every domain, and the same move repairs what it should.
+///
+/// What it should repair is a BARE link in the domain the engram is LEAVING:
+/// that link resolved at home and now points at nothing, which is the dangle
+/// this rewrite exists for. `lab`'s two references are deliberately not that -
+/// `[[open:Open Note]]` named its domain, and the bare `[[Open Note]]` beside
+/// it never pointed here at all, since a bare link resolves in its own domain -
+/// so neither is touched even by a caller who sees everything. Rewriting the
+/// second used to be counted as a success, because the needle built from the
+/// prefixed reference's target text found the bare one sitting in the same
+/// file; this pair now pins the absence of that.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_admins_move_rewrites_the_private_domains_link() {
+async fn an_admins_move_rewrites_the_bare_link_in_the_domain_left_behind() {
     let ctx = mcp_ctx(true).await;
+    std::fs::write(
+        ctx.path("open", "linker.md"),
+        "---\ntype: engram\ntitle: Linker\npermalink: linker\ntags:\n  - shared\nstatus: stable\nrecorded_at: 2026-01-04\n---\n\n# Linker\n\nSee [[Open Note]] for the shared half.\n",
+    )
+    .unwrap();
+    ctx.engine.sync(None).await.unwrap();
+    let before = std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap();
+
     let token = ctx.token_for("boss").await;
     let session = McpTestSession::open(&ctx.addr, Some(&token)).await;
-
     let moved = session
         .call_tool(
             "move_engram",
@@ -1742,13 +1759,19 @@ async fn an_admins_move_rewrites_the_private_domains_link() {
         .await;
     assert!(
         moved.contains("links_rewritten\\\":1"),
-        "an admin's move rewrites it:\n{moved}"
+        "an admin's move repairs the link that now dangles:\n{moved}"
     );
     assert!(
-        std::fs::read_to_string(ctx.path("lab", "lab-note.md"))
+        std::fs::read_to_string(ctx.path("open", "linker.md"))
             .unwrap()
             .contains("[[second:Open Note]]"),
         "and the link is prefixed"
+    );
+    assert_eq!(
+        std::fs::read_to_string(ctx.path("lab", "lab-note.md")).unwrap(),
+        before,
+        "while the references that were never bare links to this engram are \
+         byte-for-byte what they were"
     );
 }
 
