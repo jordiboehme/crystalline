@@ -5606,6 +5606,17 @@ impl Engine {
     /// just written, matched on domain and permalink; the retirement set is
     /// dropped after the page comes back, which is why the page is one wider
     /// than the list. Ranking only: no score leaves this function.
+    ///
+    /// The scoping reconciliation, the mode decision and the phasing that never
+    /// holds the store lock across the embed call are all
+    /// [`Engine::search_engrams_under`]'s, repeated here rather than shared: the
+    /// two bodies differ enough (no text, vector only, no envelope, typed rows,
+    /// two post-filters) that a common helper would cost more than it saves, so
+    /// a change to either belongs in both. One thing differs on purpose. That
+    /// function settles the mode before it applies the scoping, so its envelope
+    /// reports a truthful mode even to a caller who may see nothing; this one
+    /// scopes first, because it has no envelope to be truthful in and would
+    /// rather skip the coverage read for a caller with nothing to search.
     pub async fn similar_engrams(
         &self,
         probe_text: &str,

@@ -15,14 +15,18 @@ use serde_json::{Value, json};
 
 use crate::params::{EditParams, WriteParams};
 
-/// The probe is capped to mirror the leading indexed chunk, so what the
-/// receipt compares is what search would have compared.
+/// The probe is capped to mirror the leading indexed chunk, so the receipt
+/// compares close to what search compared. Close, not identical:
+/// `build_header` joins title and description with a blank line where this
+/// joins every part with one newline, a difference no embedder makes anything
+/// of.
 pub const SIMILAR_PROBE_MAX_CHARS: usize = 900;
 /// Below this a probe is a title and a fragment, and the neighbours it finds
 /// are noise; the write is left quiet instead.
 pub const SIMILAR_PROBE_MIN_CHARS: usize = 80;
-/// One more than the receipt carries, so dropping the engram itself still
-/// leaves a full list.
+/// One more than the receipt carries, so excluding the engram itself still
+/// leaves a full list. Two predicates filter the page though, not one: a
+/// retired hit inside it costs a slot, and no deeper hit refills that slot.
 pub const SIMILAR_PAGE: usize = 4;
 /// How many neighbours a receipt names.
 pub const SIMILAR_LIMIT: usize = 3;
@@ -257,45 +261,39 @@ mod tests {
         assert_eq!(receipt["guidance"], SIMILAR_GUIDANCE);
     }
 
-    /// The advisory rows are flat scalar maps with one key set, which is what
-    /// `ok_list` needs to render them as a TOON table. Receipts go through
-    /// `ok` today, so this pins that a later move to `ok_list` costs nothing.
+    /// The advisory renders as a TOON table, which is the property spec 3.4
+    /// asks a unit test to pin: receipts go through `ok` today, so a later move
+    /// to `ok_list` costs nothing. Asserted through `toon::render`, the crate's
+    /// own encoder, rather than by re-deriving its tabular criteria here - a
+    /// hand-rolled copy would not notice `is_tabular` tightening.
     #[test]
-    fn similar_rows_are_tabular_eligible() {
-        let rows = json!([
-            SimilarEngram {
-                domain: "d".into(),
-                permalink: "q".into(),
-                title: "Q".into(),
-                status: "stable".into(),
-                engram_type: "engram".into(),
-            },
-            SimilarEngram {
-                domain: "d".into(),
-                permalink: "r".into(),
-                title: "R".into(),
-                status: "draft".into(),
-                engram_type: "guide".into(),
-            },
-        ]);
-        let rows = rows.as_array().unwrap();
-        let keys: Vec<Vec<&String>> = rows
-            .iter()
-            .map(|r| r.as_object().unwrap().keys().collect())
-            .collect();
-        assert_eq!(keys[0], keys[1], "every row carries the same keys");
-        // `preserve_order` is off in this workspace, so the map orders its keys
-        // itself; the set is the contract, not the order.
-        let mut names: Vec<&str> = keys[0].iter().map(|k| k.as_str()).collect();
-        names.sort_unstable();
-        assert_eq!(
-            names,
-            vec!["domain", "permalink", "status", "title", "type"]
+    fn similar_rows_render_as_a_toon_table() {
+        let mut receipt = json!({ "domain": "d", "permalink": "p" });
+        attach(
+            &mut receipt,
+            &[
+                SimilarEngram {
+                    domain: "d".into(),
+                    permalink: "q".into(),
+                    title: "Q".into(),
+                    status: "stable".into(),
+                    engram_type: "engram".into(),
+                },
+                SimilarEngram {
+                    domain: "d".into(),
+                    permalink: "r".into(),
+                    title: "R".into(),
+                    status: "draft".into(),
+                    engram_type: "guide".into(),
+                },
+            ],
         );
-        for row in rows {
-            for value in row.as_object().unwrap().values() {
-                assert!(value.is_string(), "every cell is a scalar: {value}");
-            }
-        }
+        let rendered = crate::toon::render(&receipt);
+        assert!(
+            rendered.contains("similar[2]{domain,permalink,status,title,type}:"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("d,q,stable,Q,engram"), "{rendered}");
+        assert!(rendered.contains("d,r,draft,R,guide"), "{rendered}");
     }
 }
