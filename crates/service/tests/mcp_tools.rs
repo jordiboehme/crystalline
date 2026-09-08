@@ -1614,7 +1614,7 @@ async fn a_padded_destination_domain_names_no_domain_at_all() {
     .await
     .expect_err("' ops' is not a registered domain");
     assert!(
-        format!("{refused}").contains("' ops' not registered"),
+        refused.to_string().contains("' ops' not registered"),
         "and the refusal names the string as sent: {refused}"
     );
     assert!(
