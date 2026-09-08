@@ -5,8 +5,11 @@
 //! harness (Claude Code, Codex) wires this to its Stop lifecycle event,
 //! feeding it a small JSON payload over stdin; on the one call per session
 //! that matters, a single line of JSON goes to stdout asking the agent to
-//! review the conversation for durable learnings before it finishes. Every
-//! other call is silent: exit 0, empty stdout. This is not a style
+//! review the conversation for durable learnings before it finishes. Which
+//! fields that line carries depends on the harness, which the command names
+//! itself through `--harness`: the harnesses honour different response
+//! shapes, and only one of them has been measured (see [`stop_payload`]).
+//! Every other call is silent: exit 0, empty stdout. This is not a style
 //! preference, it is a correctness requirement - a harness that sees any
 //! other output on a lifecycle hook's stdout can misinterpret it (Codex
 //! rejects a plain-text Stop response outright), so a bail path never
@@ -76,6 +79,23 @@ use crystalline_service::maintenance::{self, MAINTENANCE_FILE, MaintenanceState}
 /// already captured engram wrong is an edit or a supersession, not a second
 /// engram written beside the first.
 pub const NUDGE_REASON: &str = "Review this conversation for durable learnings before finishing: new facts, decisions, patterns and antipatterns, gotchas, corrections from the user or researched answers worth keeping. Corrections include ones that make an existing engram wrong - for those propose the reconciling edit or supersession, not a new capture beside the old. If any are not yet captured, propose capturing each one as an engram into the fitting crystalline domain: name the insight, the domain and the folder when one fits and wait for a yes. If a recalled engram proved to be the key to the task, raise its salience. If nothing qualifies or everything is already captured, finish normally without mentioning this check.";
+
+/// The one plain sentence a person sees when the nudge fires under Claude
+/// Code, which renders it as `Stop says: <text>` on its own notice line.
+///
+/// It earns its place because a blocked stop also prints an unconditional
+/// `Stop hook error occurred`, which is not ours to remove and reads like a
+/// fault. A calm sentence beside it is the whole difference between a user
+/// who thinks something broke and one who can see their agent looking over
+/// the session before it finishes.
+///
+/// One sentence, and a claim that is true on every session it appears on:
+/// nothing is known about what this session holds at the moment this line is
+/// printed, so it promises a check and never a capture. Most sessions end
+/// with the agent finding nothing to keep and finishing quietly, and this
+/// line has to read correctly on those too.
+pub const STOP_SYSTEM_MESSAGE: &str =
+    "Crystalline is checking this session for anything worth keeping.";
 
 /// The ride-along maintenance ask, appended to [`NUDGE_REASON`] on the
 /// sessions where the throttle says evolve is due. Wording is load-bearing:
@@ -478,7 +498,7 @@ fn nudge_reason(evolve: Option<&[String]>, share: Option<&str>) -> String {
 /// binary and run by an older one must still answer, in the shape every
 /// harness has always accepted.
 pub fn run_stop(harness: Option<&str>) {
-    let _harness = harness.and_then(HarnessKind::from_id);
+    let harness = harness.and_then(HarnessKind::from_id);
     let mut raw = String::new();
     // A defensive cap: a Stop payload is a few hundred bytes, so a megabyte
     // is generous. A misbehaving harness feeding an endless stream gets cut
@@ -601,14 +621,55 @@ pub fn run_stop(harness: Option<&str>) {
     sweep_stale_state();
 
     if decision == StopDecision::Nudge {
-        let payload = serde_json::json!({
-            "decision": "block",
-            "reason": nudge_reason(evolve.as_deref(), share.as_deref()),
-        });
+        let payload = stop_payload(harness, &nudge_reason(evolve.as_deref(), share.as_deref()));
         if let Ok(line) = serde_json::to_string(&payload) {
             println!("{line}");
         }
     }
+}
+
+/// The Stop response, in the shape the harness that asked for it honours.
+///
+/// Every harness gets the top-level `decision`/`reason` pair, which is what
+/// actually carries the nudge. Claude Code additionally gets a
+/// `systemMessage` and the `hookSpecificOutput` block its own documentation
+/// describes. Measured against Claude Code 2.1.263 on 2026-09-08, with a
+/// scratch project and `claude -p --output-format stream-json`:
+///
+/// | response | nudge delivered | user sees |
+/// | --- | --- | --- |
+/// | top-level `decision`/`reason` | yes | `Stop hook error occurred` |
+/// | `hookSpecificOutput.decision` plus `stopReason` | no, silently dropped | nothing |
+/// | top-level pair plus `systemMessage` | yes | a notice line reading `Stop says: <text>` |
+/// | all three together | yes, exactly once | the notice, plus the same error line |
+///
+/// So the documented shape is not implemented for Stop in that version, and
+/// adopting it on its own would have killed the nudge without a word. All
+/// three go out together instead: the top-level pair is what works today, the
+/// block is forward compatibility for the version that does implement it, and
+/// the two together still deliver exactly one nudge. The error line is
+/// unconditional on a blocked stop and is not ours to remove;
+/// [`STOP_SYSTEM_MESSAGE`] is what puts a plain sentence beside it.
+///
+/// Codex and Copilot get exactly the two fields they have always got, and not
+/// one field more. Codex's Stop parser is stricter and neither harness has
+/// been measured here, so a field they do not already receive is a risk taken
+/// for no measured gain, and this module's binding contract is that a hook
+/// must never be the reason a harness's turn breaks. An unrecognized harness
+/// id and an absent flag land in the same conservative arm, which is also
+/// what an older binary running a newer install's hook gets. Widen this only
+/// for a harness somebody has actually watched answer.
+fn stop_payload(harness: Option<HarnessKind>, reason: &str) -> serde_json::Value {
+    let mut payload = serde_json::json!({ "decision": "block", "reason": reason });
+    if harness == Some(HarnessKind::ClaudeCode) {
+        payload["systemMessage"] = serde_json::json!(STOP_SYSTEM_MESSAGE);
+        payload["hookSpecificOutput"] = serde_json::json!({
+            "hookEventName": "Stop",
+            "decision": "block",
+            "stopReason": reason,
+        });
+    }
+    payload
 }
 
 /// The state file path for a session, `<state_dir>/hooks/<session_id>.json`.
@@ -714,6 +775,37 @@ fn sweep_dir(dir: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- the response shape per harness --------------------------------------
+
+    /// Claude Code gets all three: the top-level pair that actually delivers
+    /// the nudge today, the system message a person reads, and the block its
+    /// documentation describes, carried for the version that implements it.
+    #[test]
+    fn claude_code_gets_the_pair_the_message_and_the_documented_block() {
+        let payload = stop_payload(Some(HarnessKind::ClaudeCode), "the reason");
+        assert_eq!(payload["decision"], "block");
+        assert_eq!(payload["reason"], "the reason");
+        assert_eq!(payload["systemMessage"], STOP_SYSTEM_MESSAGE);
+        assert_eq!(payload["hookSpecificOutput"]["hookEventName"], "Stop");
+        assert_eq!(payload["hookSpecificOutput"]["decision"], "block");
+        assert_eq!(payload["hookSpecificOutput"]["stopReason"], "the reason");
+    }
+
+    /// Every other harness gets byte-for-byte what it has always got. Asserted
+    /// on the serialized line rather than on parsed fields, because a check
+    /// that reads two fields would pass just as happily with a third field
+    /// beside them under a name nobody thought to look for.
+    #[test]
+    fn every_other_harness_gets_exactly_the_two_fields_it_always_got() {
+        for harness in [None, Some(HarnessKind::Codex), Some(HarnessKind::Copilot)] {
+            let line = serde_json::to_string(&stop_payload(harness, "the reason")).unwrap();
+            assert_eq!(
+                line, r#"{"decision":"block","reason":"the reason"}"#,
+                "an unmeasured harness gets no field it did not get before: {harness:?}"
+            );
+        }
+    }
 
     fn input() -> StopInput {
         StopInput {
