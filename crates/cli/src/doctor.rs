@@ -768,13 +768,50 @@ fn markdown_rel_paths(root: &Path) -> Vec<String> {
 /// sets are keyed by). `verify::Issue::path` is constructed from the same
 /// root but stays a platform `PathBuf`, so any comparison against those sets
 /// goes through this first.
+///
+/// The fast path is a literal component-prefix strip: free, and exact for
+/// every caller that built `p` by walking `root` itself (`markdown_rel_paths`
+/// below, always). It can still fail for a path that names the same file but
+/// was produced by a second, independent walk of "the same" root -
+/// `check_domain` passes its own `path` into `verify::verify_paths` by
+/// reference, but a config-round-tripped or Windows-verbatim-prefixed
+/// (`\\?\C:\...`) form can disagree with a plain one even when both resolve
+/// to the identical file (seen on Windows CI: a duplicate-key E001 finding
+/// fell back into `unindexed` instead of `unsyncable`, because keeping the
+/// unstripped absolute path on a failed strip can never equal a relative
+/// entry, so the mismatch produced a wrong bucket with nothing on screen to
+/// say so). Canonicalizing both sides and retrying converges them regardless
+/// of which one carries the mismatched form - `dunce::canonicalize`
+/// specifically, not `std::fs::canonicalize`, because it strips a Windows
+/// verbatim prefix from its result rather than risking adding one, so two
+/// paths naming the same file end up in the same shape either way. If even
+/// that fails (one side no longer exists, a permission error), the file's
+/// own name is returned - still relative, in the shape callers expect,
+/// rather than the absolute string a silent mismatch used to produce.
 fn relative_slash_path(root: &Path, p: &Path) -> String {
-    p.strip_prefix(root)
-        .unwrap_or(p)
-        .components()
-        .map(|c| c.as_os_str().to_string_lossy().into_owned())
-        .collect::<Vec<_>>()
-        .join("/")
+    if let Some(rel) = strip_to_slash(root, p) {
+        return rel;
+    }
+    if let (Ok(canon_root), Ok(canon_p)) = (dunce::canonicalize(root), dunce::canonicalize(p))
+        && let Some(rel) = strip_to_slash(&canon_root, &canon_p)
+    {
+        return rel;
+    }
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The literal, zero-cost half of [`relative_slash_path`]: `Some` only when
+/// `root` is exactly a component prefix of `p`.
+fn strip_to_slash(root: &Path, p: &Path) -> Option<String> {
+    let rel = p.strip_prefix(root).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -1700,5 +1737,82 @@ mod tests {
             "the alias folds colours onto colour, so the cluster is suppressed: {:?}",
             doctor.clusters
         );
+    }
+
+    // `relative_slash_path` - the E001-to-unindexed matching helper. These run
+    // on every platform, including the Windows CI leg the regression showed up
+    // on: a duplicate-key finding was silently falling back into `unindexed`
+    // instead of `unsyncable` because a failed `strip_prefix` used to keep the
+    // absolute path, which can never equal a relative entry.
+
+    #[test]
+    fn relative_slash_path_matches_a_nested_file_under_the_same_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("a").join("b").join("c.md");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "x").unwrap();
+
+        // The fast path: `nested` was built by literally joining `root`, the
+        // shape every real caller (`markdown_rel_paths`'s own walk) produces,
+        // so this must resolve without ever touching the canonicalize fallback.
+        assert_eq!(relative_slash_path(root, &nested), "a/b/c.md");
+    }
+
+    #[test]
+    fn relative_slash_path_falls_back_to_a_file_name_rather_than_an_absolute_path() {
+        // A multi-component absolute path (forward slashes parse as
+        // separators on every platform, Windows included) that shares no
+        // component prefix with `root` and does not exist, so both the fast
+        // path and the canonicalize fallback miss. This is the "verbatim
+        // prefix disagrees with a plain root" failure's general shape - two
+        // absolute paths that cannot be reconciled at all - proving the
+        // degrade-safely half: a total non-match still returns a short,
+        // non-empty, root-relative-looking value (just the file name) rather
+        // than the full absolute string the old code kept on a failed strip,
+        // which could never equal a relative `unindexed` entry and was the
+        // bug. The Windows-specific `\\?\C:\...` prefix parsing itself is not
+        // reproducible on a non-Windows path (backslashes are plain filename
+        // characters there, not separators) - that trigger is only provable
+        // by Windows CI; this test and the next one prove the fallback
+        // mechanism handles a genuine mismatch correctly once one occurs.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unrelated = Path::new("/definitely/not/under/root/a/b/bad.md");
+
+        let result = relative_slash_path(root, unrelated);
+        assert_eq!(
+            result, "bad.md",
+            "falls back to just the file name, never the full absolute path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_slash_path_matches_when_the_root_and_the_path_reach_the_same_file_through_different_forms()
+     {
+        // A symlink stands in for the Windows failure's actual shape: two
+        // absolute paths, both real and both naming the same file, that do
+        // not share a literal component prefix (the verbatim-prefixed root
+        // config canonicalized against a plain re-walk, there; a symlinked
+        // root against its real target, here). `strip_prefix` fails on both
+        // for the same reason - the component sequences genuinely differ -
+        // and `dunce::canonicalize` is what reconciles them in both cases, so
+        // this proves the fallback mechanism the Windows fix relies on
+        // actually works, even though it cannot reproduce the Windows-only
+        // verbatim-prefix trigger itself (Windows CI is the proof for that).
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        std::fs::create_dir_all(real_root.join("a").join("b")).unwrap();
+        std::fs::write(real_root.join("a").join("b").join("c.md"), "x").unwrap();
+
+        let linked_root = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+
+        // `root` is given through the symlink; `p` is the file's canonical,
+        // non-symlinked path - the same mismatch shape a canonicalized config
+        // path and a plain re-walked one would produce.
+        let p = real_root.join("a").join("b").join("c.md");
+        assert_eq!(relative_slash_path(&linked_root, &p), "a/b/c.md");
     }
 }

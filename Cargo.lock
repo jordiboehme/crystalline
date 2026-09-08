@@ -1241,6 +1241,7 @@ dependencies = [
  "crystalline-index",
  "crystalline-remote",
  "crystalline-service",
+ "dunce",
  "fs4 1.1.0",
  "insta",
  "predicates",
