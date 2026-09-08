@@ -41,11 +41,13 @@
 //!   cache of the one connection that ran it (`clear_cached_statements` in
 //!   `ensure_embedding_width`), so any other pooled connection with a stale plan
 //!   still cached raises Postgres's "cached plan must not change result type" on
-//!   its next use. `replace_chunks`' carry SELECT is the only statement in this
-//!   module (or in `search`) that returns that raw column - an expression over
-//!   it (the `<=>` distance operator, which yields `float8`) or a statement that
-//!   only binds a vector parameter is unaffected and stays cached - so it is the
-//!   one exposed to the hazard.
+//!   its next use. Two statements in this module return that raw column and are
+//!   therefore the ones exposed to the hazard: `replace_chunks`' carry SELECT
+//!   and `lead_vectors`' SELECT. Nothing in `search` is - an expression over
+//!   the column (the `<=>` distance operator, which yields `float8`) or a
+//!   statement that only binds a vector parameter is unaffected and stays
+//!   cached. Any statement added later that selects `chunk.embedding` itself
+//!   joins that list and needs the same treatment.
 //!
 //!   Two fixes were tried and rejected before landing on the one below.
 //!   `.persistent(false)` (never cache the statement) looked right but breaks on
@@ -65,13 +67,13 @@
 //!
 //!   The fix instead prevents the stale plan from ever being reused:
 //!   `embedding_generation`, an `AtomicU64` on `PostgresStore`, is bumped every
-//!   time `ensure_embedding_width` actually runs its ALTER. `replace_chunks`
-//!   folds the current generation into its carry SELECT's SQL text as a
-//!   trailing comment, so a width change gives the statement different SQL
-//!   text and therefore a different sqlx cache key; every connection, not just
-//!   the one that ran the DDL, prepares fresh the next time it runs the carry
-//!   SELECT after a resize, and the plan it had cached under the old
-//!   generation's text simply ages out of the LRU unused.
+//!   time `ensure_embedding_width` actually runs its ALTER. Both exposed
+//!   statements fold the current generation into their SQL text as a trailing
+//!   comment, so a width change gives each of them different SQL text and
+//!   therefore a different sqlx cache key; every connection, not just the one
+//!   that ran the DDL, prepares fresh the next time it runs one of them after
+//!   a resize, and the plan it had cached under the old generation's text
+//!   simply ages out of the LRU unused.
 
 mod migrations;
 mod search;
@@ -334,11 +336,12 @@ impl PostgresStore {
     /// not change result type"). The `clear_cached_statements` at the end
     /// sheds `conn`'s own stale plans but cannot reach the pool's other
     /// connections, so on a successful resize this bumps
-    /// `embedding_generation`: `replace_chunks`' carry SELECT folds the new
-    /// value into its SQL text, which changes sqlx's cache key and forces a
+    /// `embedding_generation`: the two statements that return that raw column
+    /// (`replace_chunks`' carry SELECT and `lead_vectors`' SELECT) fold the new
+    /// value into their SQL text, which changes sqlx's cache key and forces a
     /// fresh prepare everywhere, on this connection and every other one,
     /// without needing to reach them. See the module doc for the full hazard
-    /// and why that statement cannot instead retry in place.
+    /// and why those statements cannot instead retry in place.
     async fn ensure_embedding_width(&self, conn: &mut PgConnection, dims: usize) -> Result<()> {
         let dims = dims as i64;
         if *self.embedding_width.lock().unwrap() == Some(dims) {
@@ -382,8 +385,9 @@ impl PostgresStore {
         // column is now stale. `clear_cached_statements` sheds `conn`'s own
         // stale plans directly; it only reaches this one connection, so it is
         // a courtesy for whichever statements this connection still might run
-        // under the old SQL text (there are none, `replace_chunks` is the only
-        // one and it always carries the current generation), not what makes
+        // under the old SQL text (there are none: the two statements returning
+        // that raw column, `replace_chunks`' carry SELECT and `lead_vectors`'
+        // SELECT, both always carry the current generation), not what makes
         // the pool's other connections safe. `embedding_generation` below is
         // what does that, by changing the cache key everywhere at once.
         Connection::clear_cached_statements(&mut *conn)
@@ -2034,12 +2038,25 @@ impl Store for PostgresStore {
 
     async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
         let mut conn = self.acquire().await?;
-        let rows = query_all(
-            conn.as_mut(),
+        // This selects the raw `embedding` column, whose type includes the
+        // column's typmod, so it is the second of the two statements in this
+        // module exposed to `ensure_embedding_width`'s DDL-vs-cached-plan
+        // hazard (see the module doc, and `replace_chunks` for the first). It
+        // carries the same trailing `/* w{generation} */` comment for the same
+        // reason: inert to Postgres, but it changes sqlx's cache key on every
+        // resize, so whichever pooled connection runs this next prepares
+        // against the current column shape instead of raising "cached plan
+        // must not change result type".
+        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let sql = format!(
             "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
              JOIN engram e ON e.id=c.engram_id \
              WHERE e.domain_id=$1 AND c.seq=0 AND c.model=$2 AND c.embedding IS NOT NULL \
-             ORDER BY c.engram_id ASC",
+             ORDER BY c.engram_id ASC /* w{generation} */"
+        );
+        let rows = query_all(
+            conn.as_mut(),
+            &sql,
             vec![Param::Int(domain.0), Param::Text(model.to_string())],
         )
         .await?;

@@ -443,11 +443,20 @@ fn cell_blob(row: &Row, idx: usize) -> Option<Vec<u8>> {
 /// The inverse of the little-endian f32 packing `store_embeddings` writes (and
 /// of `search::pack_vector`, which packs a query the same way). Turso scores
 /// vectors in SQL through `vector_distance_cos`, so this is the only place a
-/// stored embedding is read back into Rust. A trailing partial float cannot be
-/// produced by that packing and is dropped rather than guessed at; the caller
-/// then sees a width that disagrees with the `dims` column and skips the row.
+/// stored embedding is read back into Rust.
+///
+/// A blob whose length is not a whole number of floats cannot come from that
+/// packing, so it is not one of ours and decodes to nothing at all rather than
+/// to its leading whole floats. Dropping just the trailing bytes would not be
+/// safe to hand back: `4 * dims + r` bytes with `0 < r < 4` yields exactly
+/// `dims` floats, which passes the caller's width check and returns a row built
+/// from a blob that is demonstrably not the vector that was written. An empty
+/// vector can never match a positive `dims`, so the caller skips and warns.
 fn unpack_vector(bytes: &[u8]) -> Vec<f32> {
-    let (quads, _partial) = bytes.as_chunks::<4>();
+    let (quads, partial) = bytes.as_chunks::<4>();
+    if !partial.is_empty() {
+        return Vec::new();
+    }
     quads.iter().copied().map(f32::from_le_bytes).collect()
 }
 

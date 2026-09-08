@@ -1657,6 +1657,16 @@ pub trait Store: Send + Sync {
     /// wider: one row per engram, never one per chunk. A row whose stored
     /// width disagrees with its `dims` column is skipped rather than
     /// returned mis-sized.
+    ///
+    /// Unbounded on purpose, and the cost is the caller's to bound: every
+    /// matching engram in the domain comes back, so this materializes
+    /// `dims * 4` bytes of payload per engram plus per-vector heap overhead,
+    /// twice over at the peak (the database rows and the decoded output are
+    /// both live inside the call). At the default model's 384 dims that is
+    /// roughly 1.5 KB an engram, so a hundred thousand of them is hundreds of
+    /// megabytes. A caller with a ceiling - the sweep's `MAX_TWIN_VECTORS`,
+    /// say - must count first and skip, rather than fetch everything and
+    /// discard it above the cap.
     async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery and

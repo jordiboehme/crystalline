@@ -10,8 +10,8 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use crystalline_index::{
-    ChunkParams, DomainId, DomainKind, EmbeddingProvider, Result, Store, TursoStore,
-    run_embedding_pass, sync_domain_with,
+    ChunkParams, DomainId, DomainKind, EMBED_PAGE_SIZE, EmbeddingProvider, EmbeddingRow, Result,
+    Store, TursoStore, run_embedding_pass, sync_domain_with,
 };
 
 // --- fake provider (mirrored from tests/retired.rs) ---------------------------
@@ -91,6 +91,36 @@ async fn sync_and_embed(store: &dyn Store, name: &str, root: &Path, provider: &F
     run_embedding_pass(store, provider, |_, _| {})
         .await
         .unwrap();
+}
+
+/// A unit vector of `dims` pointing along one axis, so a batch written by hand
+/// is distinguishable per chunk without a provider.
+fn axis_vector(axis: usize, dims: usize) -> Vec<f32> {
+    let mut v = vec![0f32; dims];
+    v[axis % dims] = 1.0;
+    v
+}
+
+/// Embed every chunk still pending for `model` at `dims`, bypassing the
+/// provider so a test can choose the width. On Postgres this drives
+/// `ensure_embedding_width` and, when the width actually changes, its
+/// `ALTER TABLE ... TYPE vector(n)`.
+async fn embed_all_by_hand(store: &dyn Store, model: &str, dims: usize) {
+    let jobs = store
+        .chunks_needing_embedding(model, None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    assert!(!jobs.is_empty(), "chunks await embedding for {model}");
+    let rows: Vec<EmbeddingRow> = jobs
+        .iter()
+        .enumerate()
+        .map(|(i, j)| EmbeddingRow {
+            chunk_id: j.chunk_id,
+            embedding: axis_vector(i, dims),
+            dims,
+        })
+        .collect();
+    store.store_embeddings(&rows, model).await.unwrap();
 }
 
 // --- backend runner (mirrored from tests/retired.rs) --------------------------
@@ -294,4 +324,146 @@ async fn lead_vectors_are_one_per_engram_and_skip_the_unembedded(store: &dyn Sto
 parity!(
     lead_vectors_skip_unembedded_parity,
     lead_vectors_are_one_per_engram_and_skip_the_unembedded
+);
+
+/// A width flip and the pooled statement cache. The lead-vector SELECT returns
+/// the raw `chunk.embedding` column, whose type carries the column's typmod, so
+/// on Postgres it sits in exactly the same DDL-vs-cached-plan hazard as
+/// `replace_chunks`' carry SELECT: `ensure_embedding_width`'s
+/// `ALTER TABLE ... TYPE vector(n)` invalidates every cached plan naming that
+/// column, and `clear_cached_statements` reaches only the one connection that
+/// ran the DDL (see the module doc in `postgres/mod.rs`). The two concurrent
+/// calls are what makes this bite: they check out two pooled connections and
+/// leave the statement cached on both, so the ALTER that follows can only clear
+/// one of them and the next call on the other would raise "cached plan must not
+/// change result type". Two flips give it two independent chances. On Turso
+/// this is simply unchanged behavior; the point of the parity run is that
+/// Postgres survives it too.
+async fn lead_vectors_survive_a_width_flip(store: &dyn Store) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "alpha.md",
+        &engram("Alpha", "alpha", "stable", "", "alpha body one"),
+    );
+    write(
+        root,
+        "beta.md",
+        &engram("Beta", "beta", "stable", "", "beta body two"),
+    );
+    sync_domain_with(store, "notes", root, &ChunkParams::for_model("m8"))
+        .await
+        .unwrap();
+    let domain = store
+        .upsert_domain("notes", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    embed_all_by_hand(store, "m8", 8).await;
+
+    // Warm the statement on more than one pooled connection.
+    let (a, b) = tokio::join!(
+        store.lead_vectors(domain, "m8"),
+        store.lead_vectors(domain, "m8")
+    );
+    assert_eq!(a.unwrap().len(), 2, "both engrams at the first width");
+    assert_eq!(b.unwrap().len(), 2);
+
+    // 8 -> 16: the first ALTER.
+    embed_all_by_hand(store, "m16", 16).await;
+    let (c, d) = tokio::join!(
+        store.lead_vectors(domain, "m16"),
+        store.lead_vectors(domain, "m16")
+    );
+    let c = c.expect("the lead-vector statement survives a width flip");
+    let d = d.expect("it survives on every pooled connection, not just the one that resized");
+    assert_eq!(c.len(), 2, "both engrams at the new width");
+    assert_eq!(c, d, "both connections answer identically");
+    for row in &c {
+        assert_eq!(row.dims, 16);
+        assert_eq!(row.vector.len(), 16);
+    }
+
+    // 16 -> 8 again: a second, independent chance for a stale plan to surface.
+    embed_all_by_hand(store, "m8-again", 8).await;
+    let (e, f) = tokio::join!(
+        store.lead_vectors(domain, "m8-again"),
+        store.lead_vectors(domain, "m8-again")
+    );
+    let e = e.expect("the lead-vector statement survives a second width flip");
+    let f = f.expect("on every pooled connection");
+    assert_eq!(e.len(), 2);
+    assert_eq!(e, f);
+    for row in &e {
+        assert_eq!(row.dims, 8);
+        assert_eq!(row.vector.len(), 8);
+    }
+}
+parity!(
+    lead_vectors_survive_a_width_flip_parity,
+    lead_vectors_survive_a_width_flip
+);
+
+/// The model predicate, pinned positively. Two models of the same width embed
+/// different engrams in one domain, so they genuinely coexist (an equal width
+/// means no resize intervenes and neither set is nulled). Asking for one must
+/// return that model's engram alone: a query that dropped `c.model` would
+/// return both here, which asking for a model with no rows at all cannot catch.
+async fn lead_vectors_select_only_the_named_model(store: &dyn Store) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    write(
+        root,
+        "alpha.md",
+        &engram("Alpha", "alpha", "stable", "", "alpha body one"),
+    );
+    write(
+        root,
+        "beta.md",
+        &engram("Beta", "beta", "stable", "", "beta body two"),
+    );
+    sync_domain_with(store, "notes", root, &ChunkParams::for_model("one"))
+        .await
+        .unwrap();
+    let domain = store
+        .upsert_domain("notes", Some(&root.to_string_lossy()), DomainKind::File)
+        .await
+        .unwrap();
+    let alpha = store.find_engram("notes", "alpha").await.unwrap().unwrap();
+    let beta = store.find_engram("notes", "beta").await.unwrap().unwrap();
+
+    // One batch of pending chunks, split by engram and written under two model
+    // names at the same 8 dims.
+    let jobs = store
+        .chunks_needing_embedding("one", None, EMBED_PAGE_SIZE, None)
+        .await
+        .unwrap();
+    let rows = |ids: &[&crystalline_index::ChunkJob]| -> Vec<EmbeddingRow> {
+        ids.iter()
+            .enumerate()
+            .map(|(i, j)| EmbeddingRow {
+                chunk_id: j.chunk_id,
+                embedding: axis_vector(i, 8),
+                dims: 8,
+            })
+            .collect()
+    };
+    let (mine, theirs): (Vec<_>, Vec<_>) = jobs.iter().partition(|j| j.engram_id == alpha.id.0);
+    assert!(
+        !mine.is_empty() && !theirs.is_empty(),
+        "both engrams chunked"
+    );
+    store.store_embeddings(&rows(&mine), "one").await.unwrap();
+    store.store_embeddings(&rows(&theirs), "two").await.unwrap();
+
+    let ones = store.lead_vectors(domain, "one").await.unwrap();
+    assert_eq!(ones.len(), 1, "only the engram embedded by `one`: {ones:?}");
+    assert_eq!(ones[0].engram_id, alpha.id);
+    let twos = store.lead_vectors(domain, "two").await.unwrap();
+    assert_eq!(twos.len(), 1, "only the engram embedded by `two`: {twos:?}");
+    assert_eq!(twos[0].engram_id, beta.id);
+}
+parity!(
+    lead_vectors_select_only_the_named_model_parity,
+    lead_vectors_select_only_the_named_model
 );
