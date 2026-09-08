@@ -505,6 +505,7 @@ pub fn router(state: RestState) -> Router {
         .route(
             oauth::REGISTER_PATH,
             post(oauth::register).route_layer(DefaultBodyLimit::max(oauth::MAX_REGISTER_BYTES)),
+        )
         // The authorization endpoint, public by path for the reason
         // registration is: the browser a client sends here may have no session
         // yet, and Fluid carries it to the login page and back. Nothing is
