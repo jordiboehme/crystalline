@@ -25,6 +25,7 @@
 //! a status for detail rather than a count. None of the three touches the
 //! network.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -464,6 +465,13 @@ pub(crate) fn propose_outcome_json(outcome: &ProposeOutcome) -> Value {
 ///
 /// This is last-writer provenance, never authorship: it says which actor
 /// wrote the revision on disk, not who the knowledge belongs to.
+///
+/// `rel` must be the path as it is spelled on this machine's disk, not the
+/// path the change is reported at. The two differ for a change whose spelling
+/// differs from the base snapshot's only in case, and on a case-sensitive
+/// filesystem the reported spelling opens nothing at all. Callers resolve it
+/// through [`crystalline_remote::changes::LocalChanges::disk_path`] or
+/// [`UnsharedWork::disk_path`] first.
 fn last_author(root: &Path, rel: &str) -> Option<String> {
     let source = std::fs::read_to_string(root.join(rel)).ok()?;
     let engram = crystalline_core::parse_engram(&source).ok()?;
@@ -487,12 +495,29 @@ pub struct UnsharedWork {
     /// path with no file left to stat) or when the tree could not be stat'ed
     /// at all - all three read as "no age to assert".
     pub oldest_change: Option<DateTime<Utc>>,
+    /// Where the paths above actually are on this machine, for the few whose
+    /// spelling on disk differs from the one they are reported at. Carried
+    /// straight from
+    /// [`crystalline_remote::changes::LocalChanges::disk_paths`]; read it
+    /// through [`UnsharedWork::disk_path`] rather than directly.
+    pub disk_paths: BTreeMap<String, String>,
 }
 
 impl UnsharedWork {
     /// How many substantive changes are waiting.
     pub fn count(&self) -> usize {
         self.paths.len()
+    }
+
+    /// Where to actually open `reported` on this machine, the same rule
+    /// [`crystalline_remote::changes::LocalChanges::disk_path`] states:
+    /// identity for nearly every path, and the on-disk spelling for one that
+    /// differs from its base entry only in case.
+    pub fn disk_path<'a>(&'a self, reported: &'a str) -> &'a str {
+        self.disk_paths
+            .get(reported)
+            .map(String::as_str)
+            .unwrap_or(reported)
     }
 
     /// [`UnsharedWork::oldest_change`] as a plain date, which is what the
@@ -511,7 +536,7 @@ impl UnsharedWork {
     pub fn owned_by(&self, root: &Path, actor: &str) -> u64 {
         self.paths
             .iter()
-            .filter(|path| last_author(root, path).as_deref() == Some(actor))
+            .filter(|path| last_author(root, self.disk_path(path)).as_deref() == Some(actor))
             .count() as u64
     }
 }
@@ -531,18 +556,22 @@ impl UnsharedWork {
 /// through an aggregate JSON report that deliberately carries counts.
 pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWork> {
     let state = OriginState::load(state_dir).ok().flatten()?;
-    let detected = crystalline_remote::changes::detect_local_changes(domain_root, &state.files)
-        .ok()?
-        .changes;
+    let detected =
+        crystalline_remote::changes::detect_local_changes(domain_root, &state.files).ok()?;
     let paths: Vec<String> = detected
+        .changes
         .iter()
         .filter(|change| !change.is_generated_index())
         .map(|change| change.path().to_string())
         .collect();
+    // Stat'ed at the spelling on disk, not the one the change is reported at:
+    // the two differ for a case-only rename, and on a case-sensitive
+    // filesystem the reported one stats nothing, which would silently drop
+    // that file's mtime out of the oldest-change answer.
     let oldest_change = paths
         .iter()
         .filter_map(|path| {
-            std::fs::metadata(domain_root.join(path))
+            std::fs::metadata(domain_root.join(detected.disk_path(path)))
                 .ok()?
                 .modified()
                 .ok()
@@ -552,6 +581,7 @@ pub fn unshared_work(domain_root: &Path, state_dir: &Path) -> Option<UnsharedWor
     Some(UnsharedWork {
         paths,
         oldest_change,
+        disk_paths: detected.disk_paths,
     })
 }
 
@@ -582,7 +612,12 @@ pub(crate) fn share_plan_json(plan: &ops::SharePlan, root: &Path) -> Value {
             json!({
                 "path": c.path(),
                 "kind": kind,
-                "last_author": last_author(root, c.path()),
+                // Named at the reported path and read at the one on disk. A
+                // case-only rename is reported at the base snapshot's
+                // spelling, which is the name the repository knows and the
+                // name that travels upstream; on a case-sensitive filesystem
+                // it is not the name that opens the file.
+                "last_author": last_author(root, plan.changes.disk_path(c.path())),
             })
         })
         .collect();
@@ -852,6 +887,92 @@ mod tests {
         assert_eq!(work.paths, vec!["alpha.md".to_string()]);
         assert_eq!(work.count(), 1);
         assert!(work.oldest_change.is_some(), "a written file has an mtime");
+    }
+
+    /// A change whose spelling on disk differs from the base snapshot's only
+    /// in case is still read where the file really is: its provenance is
+    /// named and its mtime counts towards the oldest change.
+    ///
+    /// The reported path is the base snapshot's, because that is the name the
+    /// repository knows and the name that travels upstream. On a
+    /// case-insensitive filesystem it happens to open the file as well, so
+    /// this test cannot fail there; on a case-sensitive one it opens nothing,
+    /// and before the reads were routed through `disk_path` the file came
+    /// back unattributed and un-aged.
+    #[test]
+    fn unshared_work_reads_a_case_folded_change_where_the_file_really_is() {
+        use crystalline_remote::state::BaseStamp;
+        let (_dir, root, state_dir) = tracked_domain();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(
+            root.join("notes/alpha.md"),
+            engram_source("Alpha", Some("human:ada")),
+        )
+        .unwrap();
+        let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+        state.files.insert(
+            "notes/Alpha.md".to_string(),
+            BaseStamp {
+                sha256: "0".repeat(64),
+                size: 1,
+            },
+        );
+        state.save(&state_dir).unwrap();
+
+        let work = unshared_work(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(
+            work.paths,
+            vec!["notes/Alpha.md".to_string()],
+            "reported at the spelling the repository knows"
+        );
+        assert_eq!(
+            work.disk_path("notes/Alpha.md"),
+            "notes/alpha.md",
+            "and resolved to the spelling this machine holds"
+        );
+        assert_eq!(
+            work.owned_by(&root, "human:ada"),
+            1,
+            "the file names its writer and the read reaches it"
+        );
+        assert!(
+            work.oldest_change.is_some(),
+            "a file that is really there has an mtime"
+        );
+    }
+
+    /// The share plan's `last_author` reads the same way: a case-folded
+    /// change is named at the base spelling and read at the one on disk, so
+    /// the browser's preselection offers the person their own work rather
+    /// than leaving exactly that file unticked.
+    #[test]
+    fn a_plan_names_the_actor_of_a_case_folded_change() {
+        use crystalline_remote::changes::{LocalChange, LocalChanges};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(
+            root.join("notes/alpha.md"),
+            engram_source("Alpha", Some("human:ada")),
+        )
+        .unwrap();
+        let plan = ops::SharePlan {
+            action: ops::PlannedAction::Create,
+            changes: LocalChanges {
+                changes: vec![LocalChange::Modified {
+                    path: "notes/Alpha.md".to_string(),
+                    sha256: "aa".to_string(),
+                }],
+                skipped_large: vec![],
+                disk_paths: [("notes/Alpha.md".to_string(), "notes/alpha.md".to_string())]
+                    .into_iter()
+                    .collect(),
+            },
+            effective_title: "Share".to_string(),
+        };
+        let v = share_plan_json(&plan, root);
+        assert_eq!(v["changes"][0]["path"], "notes/Alpha.md");
+        assert_eq!(v["changes"][0]["last_author"], json!("human:ada"));
     }
 
     /// The whole point of the detail block, over the delta that misled a
