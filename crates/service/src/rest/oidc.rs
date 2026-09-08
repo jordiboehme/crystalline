@@ -1865,7 +1865,12 @@ impl OidcClaims {
 /// direction changes into an admin's table. Every other character the provider
 /// sends survives, including every script: this removes control and formatting
 /// codepoints, never letters.
-fn presentation_text(value: &str) -> Option<String> {
+///
+/// `pub(super)` because the OAuth registration endpoint holds text of exactly
+/// the same kind: a client's own name, chosen by whoever registered it and
+/// shown to the person deciding whether to trust it. One rule for both, rather
+/// than two spellings of "what may be shown to a person" that could drift.
+pub(super) fn presentation_text(value: &str) -> Option<String> {
     let cleaned: String = value
         .chars()
         .filter(|ch| {

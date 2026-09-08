@@ -1088,7 +1088,7 @@ export interface paths {
         put?: never;
         /**
          * Register an MCP client as a public OAuth client.
-         * @description RFC 7591 dynamic client registration, the endpoint the authorization server metadata advertises. Open to any caller, because a client registers before it can authenticate as anything. The answer carries a `client_id` and no secret: every client here is a public client, so `token_endpoint_auth_method` is always `none` and the proof of possession at the token endpoint is PKCE. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`. Bounded three ways: 30 registrations per 10 minutes per process, 1000 stored registrations, and a prune of every registration that has gone 30 days without an authorization.
+         * @description RFC 7591 dynamic client registration, the endpoint the authorization server metadata advertises. Open to any caller, because a client registers before it can authenticate as anything. The answer carries a `client_id` and no secret: every client here is a public client, so `token_endpoint_auth_method` is always `none` and the proof of possession at the token endpoint is PKCE. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`. Bounded four ways: a 64 KiB body, 30 registrations per 10 minutes per process, 1000 stored registrations, and a prune that collects a registration which never authorized within the hour and one that has gone 30 days since its last authorization.
          */
         post: operations["register_oauth_client"];
         delete?: never;
@@ -2097,7 +2097,11 @@ export interface components {
             grant_types?: string[] | null;
             /**
              * @description Where this client may be redirected back to. At least one, at most ten,
-             *     each an https url or an http url on a loopback address.
+             *     each an https url or an http url on a loopback address, carrying no
+             *     fragment and no user information, and sent in the form a url parser
+             *     leaves it in (a lowercase scheme and host, no default port, no dot
+             *     segments, and a path of at least `/`), because what is registered is
+             *     matched exactly.
              * @example [
              *       "https://claude.ai/api/mcp/auth_callback"
              *     ]

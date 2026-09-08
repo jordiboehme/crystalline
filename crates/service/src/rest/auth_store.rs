@@ -838,13 +838,28 @@ pub const OAUTH_ACCESS_TTL_SECS: i64 = 3600;
 /// for a month has to ask its person again.
 pub const OAUTH_REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
 
-/// How long a registration that never became a connection is kept, in seconds.
-/// Dynamic registration means one row per fresh client, arriving whether or
-/// not anybody ever consents, and nothing deletes them; thirty days after the
-/// last authorization request (or the registration itself) an unused one is
-/// swept by [`AuthStore::prune_oauth_clients`]. A registration that holds a
-/// grant is never pruned, however old it is.
+/// How long a registration that HAS asked for an authorization is kept once it
+/// stops being used, in seconds. Thirty days from the last authorization
+/// request, so somebody's client between connections keeps its identity while
+/// one nobody has used in a month is swept by
+/// [`AuthStore::prune_oauth_clients`]. A registration that holds a grant is
+/// never pruned, however old it is.
 pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a registration that never asked for an authorization is kept, in
+/// seconds. One hour, and the short clock is the point.
+///
+/// The two ages measure different things. A row that never reached the
+/// authorize endpoint is the residue of a client that registered and walked
+/// away - or of an anonymous caller filling the table, which is the only way
+/// [`crate::rest::MAX_OAUTH_CLIENTS`] is ever reached, since registration is
+/// the one write nobody has to authenticate for. Keeping such a row for thirty
+/// days is exactly what would make that filling stick: the table would stay
+/// full for a month and every real client would be refused for as long. An
+/// hour is far longer than any client needs between registering and sending
+/// its person to consent, and short enough that a filled table drains by
+/// itself.
+pub const OAUTH_CLIENT_UNAUTHORIZED_SECS: i64 = 3600;
 
 /// What [`AuthStore::list_oauth_grants`] shows where a client name should be,
 /// for a grant whose registration is gone. The grant stays listed - and
@@ -2607,36 +2622,47 @@ impl AuthStore {
         Ok(removed as usize)
     }
 
-    /// Delete every registration that has been idle for
-    /// [`OAUTH_CLIENT_UNUSED_SECS`] and holds no grant, and report how many
-    /// went. Runs at every registration and at daemon start, immediately
-    /// **after** [`AuthStore::prune_oauth_grants`] - a registration whose only
-    /// grant is dead is only collectable once that grant is gone, so the two
-    /// prunes in that order collect an abandoned client in one pass.
+    /// Delete every registration that holds no grant and has aged out, and
+    /// report how many went. Runs at every registration and at daemon start,
+    /// immediately **after** [`AuthStore::prune_oauth_grants`] - a registration
+    /// whose only grant is dead is only collectable once that grant is gone, so
+    /// the two prunes in that order collect an abandoned client in one pass.
     ///
     /// The `NOT EXISTS` is the load-bearing half: a registration somebody is
     /// connected through is kept however old it is, because deleting it would
-    /// leave live grants pointing at nothing. Idleness is measured from
-    /// `last_used`, falling back to `created_at` for a registration that never
-    /// asked for an authorization at all.
+    /// leave live grants pointing at nothing.
     ///
-    /// Both sides of that comparison are RFC 3339 UTC written by this file, so
-    /// byte order is time order - the same property
+    /// **Two ages, decided by whether the client ever authorized.** A row that
+    /// has never been touched (`last_used IS NULL`, so it never reached the
+    /// authorize endpoint) is collected [`OAUTH_CLIENT_UNAUTHORIZED_SECS`]
+    /// after it was made; one that has authorized at least once is collected
+    /// [`OAUTH_CLIENT_UNUSED_SECS`] after its last authorization. See the two
+    /// constants for why they differ by that much: the short clock is what
+    /// keeps a table filled by an anonymous caller from staying full for a
+    /// month.
+    ///
+    /// Every date compared here is RFC 3339 UTC written by this file, so byte
+    /// order is time order - the same property
     /// [`AuthStore::list_mcp_tokens`] already orders on.
     pub async fn prune_oauth_clients(&self) -> Result<usize> {
-        let cutoff =
-            (chrono::Utc::now() - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
+        let now = chrono::Utc::now();
+        let idle_cutoff = (now - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
+        let unauthorized_cutoff =
+            (now - chrono::Duration::seconds(OAUTH_CLIENT_UNAUTHORIZED_SECS)).to_rfc3339();
         let _guard = self.guard.lock().await;
         let removed = self
             .conn
             .execute(
                 "DELETE FROM oauth_clients
-                 WHERE COALESCE(last_used, created_at) < ?1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM oauth_grants g
-                       WHERE g.client_id = oauth_clients.client_id
-                   )",
-                vec![Value::Text(cutoff)],
+                 WHERE NOT EXISTS (
+                           SELECT 1 FROM oauth_grants g
+                           WHERE g.client_id = oauth_clients.client_id
+                       )
+                   AND CASE
+                           WHEN last_used IS NULL THEN created_at < ?2
+                           ELSE last_used < ?1
+                       END",
+                vec![Value::Text(idle_cutoff), Value::Text(unauthorized_cutoff)],
             )
             .await
             .context("pruning unused oauth client registrations")?;
@@ -7679,6 +7705,134 @@ mod tests {
         store.touch_oauth_client(&fresh.client_id).await.unwrap();
         assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
         assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
+    }
+
+    /// **A registration that never asked for an authorization expires within
+    /// the hour**, and only one that did gets the thirty days.
+    ///
+    /// The two clocks exist because the two rows mean different things. A row
+    /// that never reached the authorize endpoint is the residue of a client
+    /// that registered and walked away - or of an anonymous caller filling the
+    /// table, which is the only way the cap is ever reached - and keeping it
+    /// for thirty days is what would make that filling stick. A row that HAS
+    /// authorized is somebody's client between connections, and thirty idle
+    /// days is the right patience for it.
+    #[tokio::test]
+    async fn a_registration_that_never_authorized_expires_within_the_hour() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let never = store
+            .register_oauth_client("Never", None, &["https://never.example/cb".to_string()])
+            .await
+            .unwrap();
+        let authorized = store
+            .register_oauth_client("Asked", None, &["https://asked.example/cb".to_string()])
+            .await
+            .unwrap();
+        let connected = store
+            .register_oauth_client("Live", None, &["https://live.example/cb".to_string()])
+            .await
+            .unwrap();
+        store
+            .issue_oauth_grant("ada", &connected.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let just_now = store
+            .register_oauth_client("Fresh", None, &["https://fresh.example/cb".to_string()])
+            .await
+            .unwrap();
+
+        // Two hours ago for all three of the old ones, and the one that
+        // authorized did so half an hour ago: well past the hour, nowhere near
+        // the thirty days.
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let half_hour_ago = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        for id in [
+            &never.client_id,
+            &authorized.client_id,
+            &connected.client_id,
+        ] {
+            store
+                .conn
+                .execute(
+                    "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                    vec![Value::Text(id.clone()), Value::Text(two_hours_ago.clone())],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(authorized.client_id.clone()),
+                    Value::Text(half_hour_ago),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "only the registration that never authorized and holds nothing goes"
+        );
+        assert!(
+            store
+                .oauth_client(&never.client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .oauth_client(&authorized.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a registration that asked for an authorization gets the thirty days"
+        );
+        assert!(
+            store
+                .oauth_client(&connected.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "and one somebody is connected through is never collected at all"
+        );
+        assert!(
+            store
+                .oauth_client(&just_now.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a registration made a moment ago has its hour"
+        );
+
+        // The same row, thirty idle days later.
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(authorized.client_id.clone()),
+                    Value::Text("2020-01-01T00:00:00+00:00".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.prune_oauth_clients().await.unwrap(), 1);
+        assert!(
+            store
+                .oauth_client(&authorized.client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// The two unhashed copies of a live credential must never be one

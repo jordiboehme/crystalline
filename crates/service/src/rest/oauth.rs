@@ -43,12 +43,15 @@
 //! A hosted client has never met this instance and holds no credential, so the
 //! first thing it does is register itself (RFC 7591) and take an identifier
 //! away. That makes `POST /oauth/register` the one unauthenticated write on
-//! this surface: whoever can reach the port can make a row. Three bounds keep
-//! that from being a way to fill somebody's disk - a burst per window
-//! ([`RegistrationLimiter`]), a ceiling on how many registrations are stored
-//! at once ([`MAX_OAUTH_CLIENTS`]), and a prune of every registration that has
-//! sat unused for thirty days, run before each new one is stored so an
-//! instance makes room for itself.
+//! this surface: whoever can reach the port can make a row. Four bounds keep
+//! that from being a way to fill somebody's disk - a body limit on the route
+//! itself, well below the mount's, since an extractor has read the body before
+//! any of the rest of this runs; a burst per window
+//! ([`RegistrationLimiter`]); a ceiling on how many registrations are stored
+//! at once ([`MAX_OAUTH_CLIENTS`]); and a prune, run before each new
+//! registration is stored so an instance makes room for itself, that collects
+//! a registration which never authorized within the hour and one that has gone
+//! unused for thirty days.
 //!
 //! Every client here is a PUBLIC client: it runs on somebody else's machine,
 //! so it can keep no secret, and the registration answer therefore carries
@@ -149,6 +152,18 @@ const MAX_URI_LEN: usize = 2048;
 /// The one authentication method this server registers a client with. Public
 /// clients only: there is no secret to present.
 const AUTH_METHOD_NONE: &str = "none";
+
+/// How large a registration request body may be, in bytes.
+///
+/// Its own limit rather than the mount's ten megabytes, and layered on the
+/// route rather than checked in the handler, because it is the only bound that
+/// can apply before the body is read: axum resolves extractors first, so by the
+/// time [`RegistrationLimiter::admit`] runs the body has been buffered and put
+/// through serde already. The largest registration the rules here allow is ten
+/// [`MAX_URI_LEN`] uris beside a [`MAX_CLIENT_NAME_CHARS`] name, so this is
+/// room to spare for anything legitimate and a thousandth of what an anonymous
+/// caller could otherwise make this process parse.
+pub const MAX_REGISTER_BYTES: usize = 64 * 1024;
 
 /// How this instance names itself, per request.
 ///
@@ -293,11 +308,21 @@ impl RegistrationLimiter {
     /// through a whole window in a test without a test that sleeps for ten
     /// minutes.
     ///
-    /// The slot is taken before the body is read, so an attempt that turns out
-    /// to be malformed still costs a slot: what is being protected is the
-    /// server's willingness to look at unauthenticated requests at all, and a
-    /// limiter a caller could walk past by sending rubbish would protect
-    /// nothing.
+    /// The slot is taken before the body is *validated* and before anything is
+    /// read from or written to the store, so an attempt that turns out to be
+    /// malformed still costs a slot: a limiter a caller could walk past by
+    /// sending rubbish would protect nothing.
+    ///
+    /// Not before the body is *read*, and the distinction is worth keeping
+    /// straight. Axum resolves every extractor before a handler runs, so by
+    /// the time this is called the request body has already been buffered and
+    /// put through serde. What bounds that half is the route's own
+    /// `DefaultBodyLimit` (64 KiB, far below the mount's ten megabytes),
+    /// because it is the only thing that can: a limiter reached after
+    /// extraction cannot decline to have parsed. Moving the count into a layer
+    /// ahead of extraction would buy the stronger property and cost the two
+    /// answers that come first - the `404` for an instance serving no OAuth,
+    /// and any refusal a route-level extractor makes.
     pub fn admit(&self, now: Instant) -> Result<(), u64> {
         let mut window = self.window.lock().unwrap_or_else(|e| e.into_inner());
         while let Some(oldest) = window.front() {
@@ -509,13 +534,21 @@ impl OauthError {
         }
     }
 
-    /// The table is full of registrations that are all in use.
+    /// The table is full of registrations that are none of them collectable
+    /// yet.
+    ///
+    /// The description names what actually frees a slot, which is the
+    /// registrations expiring on their own: there is no delete verb for a
+    /// registration anywhere on this surface, so a line telling an operator to
+    /// revoke something would send them looking for a control that does not
+    /// exist.
     pub fn no_room() -> OauthError {
         OauthError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "temporarily_unavailable",
-            "this server is holding as many client registrations as it will, and none of them \
-             are old enough to collect; an administrator can revoke connections nobody uses",
+            "this server is holding as many client registrations as it will just now; a \
+             registration that never authorized is collected within the hour and an unused one \
+             thirty days after its last use, so a client can register again shortly",
         )
     }
 
@@ -601,7 +634,11 @@ pub struct OauthErrorBody {
 )]
 pub struct RegisterBody {
     /// Where this client may be redirected back to. At least one, at most ten,
-    /// each an https url or an http url on a loopback address.
+    /// each an https url or an http url on a loopback address, carrying no
+    /// fragment and no user information, and sent in the form a url parser
+    /// leaves it in (a lowercase scheme and host, no default port, no dot
+    /// segments, and a path of at least `/`), because what is registered is
+    /// matched exactly.
     #[serde(default)]
     #[schema(example = json!(["https://claude.ai/api/mcp/auth_callback"]))]
     pub redirect_uris: Vec<String>,
@@ -712,6 +749,14 @@ fn issued_at(created_at: &str) -> i64 {
 /// - **No userinfo.** `https://user@knowledge.example/cb` is how a target is
 ///   made to read as one host and resolve as another.
 /// - **At most [`MAX_URI_LEN`] characters.** See the constant.
+/// - **Already normalized.** What is stored is the raw string (the first rule
+///   is why), and [`redirect_matches`] compares it exactly, so a spelling a url
+///   parser would canonicalize - an uppercase scheme or host, a default port, a
+///   dot segment, an absent path - is a registration the client can never use:
+///   it presents the canonical form one leg later and matches nothing. Refusing
+///   it here says so at the moment it can still be fixed, rather than leaving a
+///   "redirect_uri does not match" at the authorize endpoint for something the
+///   client did not think it had changed.
 pub fn redirect_uri_problem(uri: &str) -> Option<&'static str> {
     if uri.is_empty() {
         return Some("a redirect uri must not be empty");
@@ -734,14 +779,25 @@ pub fn redirect_uri_problem(uri: &str) -> Option<&'static str> {
         return Some("a redirect uri must carry no user information before the host");
     }
     match url.scheme() {
-        "https" if url.host().is_some() => None,
-        "https" => Some("a redirect uri must name a host"),
-        "http" if is_loopback_host(&url) => None,
-        _ => Some(
-            "a redirect uri must be an https url, or an http url on a loopback address \
-             (localhost, 127.0.0.1 or [::1])",
-        ),
+        "https" if url.host().is_some() => {}
+        "https" => return Some("a redirect uri must name a host"),
+        "http" if is_loopback_host(&url) => {}
+        _ => {
+            return Some(
+                "a redirect uri must be an https url, or an http url on a loopback address \
+                 (localhost, 127.0.0.1 or [::1])",
+            );
+        }
     }
+    // Last, because it is the only rule about the SPELLING rather than about
+    // the address, and the one a client is most likely to trip on innocently.
+    if url.as_str() != uri {
+        return Some(
+            "a redirect uri must be sent in the form a url parser leaves it in: a lowercase \
+             scheme and host, no default port, no dot segments, and a path of at least '/'",
+        );
+    }
+    None
 }
 
 /// Whether `presented` names the same redirect target as `registered`.
@@ -808,6 +864,10 @@ fn check_metadata(body: RegisterBody) -> Result<CheckedRegistration, OauthError>
             ));
         }
     }
+    // An empty list passes, deliberately: RFC 7591 makes the registration
+    // ANSWER authoritative, so a client that named no grant types is registered
+    // with the two this server runs and told so, which is the same place a
+    // client that named them correctly ends up.
     if body
         .grant_types
         .iter()
@@ -829,23 +889,30 @@ fn check_metadata(body: RegisterBody) -> Result<CheckedRegistration, OauthError>
         ));
     }
 
-    let name = body.client_name.as_deref().unwrap_or_default().trim();
-    if name.chars().count() > MAX_CLIENT_NAME_CHARS {
+    // Trimmed, and stripped of everything that is not text, through the same
+    // rule a single sign-on provider's display name goes through: this name is
+    // shown to the person deciding whether to trust the client, and a
+    // right-to-left override or a zero width character in it renders as a name
+    // that is not the name that was stored. Escaping on the consent page does
+    // not neutralize a direction change; taking it out does. Stripped rather
+    // than refused, because a client with a stray invisible in its name has
+    // done nothing wrong and the refusal would teach it nothing it could act
+    // on - and what is left is the name it actually spells.
+    let name = body
+        .client_name
+        .as_deref()
+        .and_then(super::oidc::presentation_text);
+    // Counted after the stripping, so the bound is on what is shown.
+    if name
+        .as_deref()
+        .is_some_and(|name| name.chars().count() > MAX_CLIENT_NAME_CHARS)
+    {
         return Err(OauthError::invalid_client_metadata(
             "a client name is at most 100 characters: it is shown to the person deciding \
              whether to trust this client",
         ));
     }
-    if name.chars().any(char::is_control) {
-        return Err(OauthError::invalid_client_metadata(
-            "a client name carries no control characters",
-        ));
-    }
-    let name = if name.is_empty() {
-        DEFAULT_CLIENT_NAME.to_string()
-    } else {
-        name.to_string()
-    };
+    let name = name.unwrap_or_else(|| DEFAULT_CLIENT_NAME.to_string());
 
     let client_uri = match body
         .client_uri
@@ -918,10 +985,11 @@ fn check_metadata(body: RegisterBody) -> Result<CheckedRegistration, OauthError>
                    `token_endpoint_auth_method` is always `none` and the \
                    proof of possession at the token endpoint is PKCE. Errors \
                    are OAuth JSON rather than problem details - see \
-                   `OauthErrorBody`. Bounded three ways: 30 registrations per \
-                   10 minutes per process, 1000 stored registrations, and a \
-                   prune of every registration that has gone 30 days without \
-                   an authorization.",
+                   `OauthErrorBody`. Bounded four ways: a 64 KiB body, 30 \
+                   registrations per 10 minutes per process, 1000 stored \
+                   registrations, and a prune that collects a registration \
+                   which never authorized within the hour and one that has \
+                   gone 30 days since its last authorization.",
     request_body = RegisterBody,
     responses(
         (
@@ -991,7 +1059,8 @@ async fn registered(
     body: Result<ApiJson<RegisterBody>, ApiError>,
 ) -> Result<(StatusCode, NoStore, Json<RegisteredClient>), OauthError> {
     let oauth = state.oauth.as_ref().ok_or_else(OauthError::no_oauth_here)?;
-    // Before the body is looked at: see `RegistrationLimiter::admit`.
+    // Before the body is validated and before the store is touched, though
+    // after axum has already read it: see `RegistrationLimiter::admit`.
     oauth
         .limiter
         .admit(Instant::now())
@@ -1314,11 +1383,10 @@ mod tests {
         for uri in [
             "https://claude.ai/api/mcp/auth_callback",
             "https://knowledge.example:8443/cb?next=here",
-            "https://knowledge.example",
+            "https://knowledge.example/",
             "http://127.0.0.1:33418/callback",
             "http://127.0.0.1/callback",
             "http://localhost:8765/cb",
-            "http://LOCALHOST:8765/cb",
             "http://[::1]:9000/cb",
         ] {
             assert_eq!(redirect_uri_problem(uri), None, "{uri} should be storable");
@@ -1351,6 +1419,19 @@ mod tests {
             "https://knowledge.example/cb ",
             // Non-ASCII, which is not a header value.
             "https://knowledge.example/caf\u{e9}",
+            // Spellings a url library would canonicalize between registering
+            // and presenting, which would then match nothing: the scheme, the
+            // host, a default port, a dot segment and an absent path.
+            "HTTPS://claude.ai/api/mcp/auth_callback",
+            "https://Claude.AI/api/mcp/auth_callback",
+            "https://knowledge.example:443/cb",
+            "http://127.0.0.1:80/cb",
+            // Refused by the normalized-form rule rather than by the loopback
+            // one: a url parser lowercases a host, so this registration could
+            // never be presented back in the spelling it was stored in.
+            "http://LOCALHOST:8765/cb",
+            "https://knowledge.example/a/../cb",
+            "https://knowledge.example",
         ] {
             assert!(
                 redirect_uri_problem(uri).is_some(),
@@ -1511,14 +1592,36 @@ mod tests {
             .is_ok(),
             "and the boundary itself is fine"
         );
-        assert_eq!(
-            code_of(RegisterBody {
-                client_name: Some("Claude\u{7}\n".to_string()),
+
+        // A name is shown to the person deciding whether to trust this client,
+        // so what cannot be seen is taken out rather than refused: a client
+        // with a stray zero width character still registers, and a client that
+        // tried to reverse how its name renders registers under the name it
+        // actually spells. Escaping on the consent page does not neutralize a
+        // right-to-left override; removing it does.
+        let name_of = |name: &str| {
+            check_metadata(RegisterBody {
+                client_name: Some(name.to_string()),
                 ..good()
-            }),
-            "invalid_client_metadata",
-            "the name is shown to a person and written to a log"
+            })
+            .unwrap()
+            .name
+        };
+        assert_eq!(name_of("Claude\u{7}\n"), "Claude");
+        assert_eq!(name_of("Ada\u{202e}ecalevoL"), "AdaecalevoL");
+        assert_eq!(name_of("Cla\u{200b}ude"), "Claude");
+        assert_eq!(
+            name_of("\u{200b}\u{feff}\u{00ad}"),
+            "an MCP client",
+            "a name of nothing but invisibles is no name at all"
         );
+        // Every letter survives, in every script: this takes out control and
+        // formatting codepoints, never text.
+        assert_eq!(
+            name_of("\u{30af}\u{30ed}\u{30fc}\u{30c9}"),
+            "\u{30af}\u{30ed}\u{30fc}\u{30c9}"
+        );
+
         assert_eq!(
             code_of(RegisterBody {
                 client_uri: Some("http://claude.ai".to_string()),

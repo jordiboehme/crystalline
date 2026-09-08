@@ -485,9 +485,20 @@ pub fn router(state: RestState) -> Router {
         // routes above are public: a client registers before anybody has
         // signed in anywhere, so there is no session it could carry. It is
         // NOT CSRF-exempt - a browser that happens to hold one still echoes
-        // its token - and it is bounded three ways rather than by an identity
+        // its token - and it is bounded four ways rather than by an identity
         // it cannot have. See [`oauth::register`].
-        .route(oauth::REGISTER_PATH, post(oauth::register))
+        //
+        // The body limit is its own, far below the mount's, and it is the
+        // route's first bound rather than a refinement: axum resolves
+        // extractors before a handler runs, so the burst limiter inside the
+        // handler cannot decline to have buffered and parsed what arrived.
+        // This can. The largest legal registration is ten 2048-character uris
+        // beside a 100-character name, so 64 KiB is room to spare, and this is
+        // the one write on the surface an anonymous caller can make.
+        .route(
+            oauth::REGISTER_PATH,
+            post(oauth::register).route_layer(DefaultBodyLimit::max(oauth::MAX_REGISTER_BYTES)),
+        )
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route
         // here. Registered before the domain sub-paths for readability only;

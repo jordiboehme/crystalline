@@ -25,7 +25,7 @@ use crystalline_core::config::{
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
 use crystalline_service::daemon::http_router;
-use crystalline_service::rest::{AuthStore, Role, redirect_matches};
+use crystalline_service::rest::{AuthStore, REGISTRATION_BURST, Role, redirect_matches};
 use serde_json::{Value, json};
 
 /// The password every account in this suite is created with. Long enough for
@@ -294,7 +294,7 @@ async fn a_client_registers_as_a_public_client_and_gets_no_secret() {
     let ctx = OauthCtx::start().await;
     let response = ctx
         .register(json!({
-            "client_name": "  Claude  ",
+            "client_name": "  Cla\u{202e}ude  ",
             "client_uri": "https://claude.ai",
             "redirect_uris": [HOSTED_REDIRECT, "https://claude.com/api/mcp/auth_callback"],
             "grant_types": ["authorization_code", "refresh_token"],
@@ -327,7 +327,11 @@ async fn a_client_registers_as_a_public_client_and_gets_no_secret() {
         json!([HOSTED_REDIRECT, "https://claude.com/api/mcp/auth_callback"]),
         "the uris come back in the order they were sent"
     );
-    assert_eq!(body["client_name"], "Claude", "trimmed and echoed");
+    assert_eq!(
+        body["client_name"], "Claude",
+        "trimmed, and the direction override taken out: this name is shown to \
+         the person deciding whether to trust the client"
+    );
     assert_eq!(body["client_uri"], "https://claude.ai");
     assert_eq!(body["token_endpoint_auth_method"], "none");
     assert_eq!(
@@ -395,7 +399,7 @@ async fn a_client_registers_as_a_public_client_and_gets_no_secret() {
 #[tokio::test]
 async fn a_registration_naming_a_plain_http_or_fragment_redirect_is_refused() {
     let ctx = OauthCtx::start().await;
-    for uri in [
+    let refused = [
         // Plain http on a host that is not this machine: the code would cross
         // the network in clear.
         "http://knowledge.example/cb",
@@ -421,7 +425,19 @@ async fn a_registration_naming_a_plain_http_or_fragment_redirect_is_refused() {
         " https://knowledge.example/cb",
         "https://knowledge.example/cb ",
         "",
-    ] {
+        // Spellings a url library would canonicalize between registering and
+        // presenting, which would then match nothing.
+        "HTTPS://claude.ai/api/mcp/auth_callback",
+        "https://knowledge.example",
+    ];
+    // Every attempt below costs a slot in the burst, refused or not. If this
+    // table ever grew past the window the tail would answer 429 and this test
+    // would be asserting something else entirely.
+    assert!(
+        refused.len() + 2 <= REGISTRATION_BURST,
+        "the refusal table has grown past the registration burst"
+    );
+    for uri in refused {
         let response = ctx.register(json!({ "redirect_uris": [uri] })).await;
         assert_oauth_error(response, 400, "invalid_redirect_uri").await;
     }
@@ -505,7 +521,7 @@ async fn a_loopback_redirect_matches_with_any_port() {
 #[tokio::test]
 async fn a_confidential_auth_method_is_invalid_client_metadata() {
     let ctx = OauthCtx::start().await;
-    for body in [
+    let refused = [
         json!({ "redirect_uris": [HOSTED_REDIRECT], "token_endpoint_auth_method": "client_secret_basic" }),
         json!({ "redirect_uris": [HOSTED_REDIRECT], "token_endpoint_auth_method": "client_secret_post" }),
         json!({ "redirect_uris": [HOSTED_REDIRECT], "token_endpoint_auth_method": "" }),
@@ -515,7 +531,14 @@ async fn a_confidential_auth_method_is_invalid_client_metadata() {
         json!({ "redirect_uris": [HOSTED_REDIRECT], "client_uri": "http://claude.ai" }),
         json!({ "redirect_uris": [HOSTED_REDIRECT], "client_uri": "not a url" }),
         json!({ "redirect_uris": [HOSTED_REDIRECT], "client_name": "x".repeat(101) }),
-    ] {
+    ];
+    // These attempts plus the accepted one below have to fit inside the burst,
+    // or the tail of this test would be asserting 429s.
+    assert!(
+        refused.len() < REGISTRATION_BURST,
+        "the refusal table has grown past the registration burst"
+    );
+    for body in refused {
         let response = ctx.register(body).await;
         assert_oauth_error(response, 400, "invalid_client_metadata").await;
     }
@@ -618,7 +641,13 @@ async fn the_registration_table_is_capped_rather_than_grown_forever() {
     let refused = ctx
         .register(json!({ "redirect_uris": [HOSTED_REDIRECT] }))
         .await;
-    assert_oauth_error(refused, 503, "temporarily_unavailable").await;
+    let body = assert_oauth_error(refused, 503, "temporarily_unavailable").await;
+    let says = body["error_description"].as_str().unwrap().to_string();
+    assert!(
+        says.contains("collected") && !says.contains("revoke"),
+        "the refusal names what actually frees a slot - the registrations \
+         expiring on their own - rather than a control no operator has: {says}"
+    );
     assert_eq!(ctx.client_count().await, 1000, "and nothing was added");
 }
 
