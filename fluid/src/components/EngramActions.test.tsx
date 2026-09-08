@@ -37,6 +37,8 @@ const ENGRAM = {
   links: [],
   inboundCount: 0,
   inboundRefs: [],
+  similar: [],
+  guidance: null,
 } satisfies EngramDetail;
 
 afterEach(() => {

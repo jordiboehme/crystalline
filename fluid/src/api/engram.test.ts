@@ -38,3 +38,46 @@ describe("the writer a detail payload names", () => {
     ).toBeNull();
   });
 });
+
+describe("the neighbours advisory a write receipt carries", () => {
+  it("reads the neighbours advisory and defaults to none", () => {
+    const withSimilar = readEngramDetail(
+      {
+        domain: "eng",
+        permalink: "retry-backoff-lesson",
+        content: "",
+        similar: [
+          {
+            domain: "eng",
+            permalink: "retry-queue-gotcha",
+            title: "Retry queue gotcha",
+            status: "stable",
+            type: "engram",
+          },
+          { permalink: "missing-domain" },
+        ],
+        guidance: "read the one that fits",
+      },
+      "eng",
+      "retry-backoff-lesson",
+    );
+    expect(withSimilar.similar).toEqual([
+      {
+        domain: "eng",
+        permalink: "retry-queue-gotcha",
+        title: "Retry queue gotcha",
+        status: "stable",
+        type: "engram",
+      },
+    ]);
+    expect(withSimilar.guidance).toBe("read the one that fits");
+
+    const quiet = readEngramDetail(
+      { domain: "eng", permalink: "alpha", content: "" },
+      "eng",
+      "alpha",
+    );
+    expect(quiet.similar).toEqual([]);
+    expect(quiet.guidance).toBeNull();
+  });
+});
