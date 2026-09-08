@@ -5,7 +5,7 @@
 //! it well organized?". This module is that third question, expressed as
 //! detectors over prepared facts.
 //!
-//! Three families, one letter each way:
+//! Three families, four letters:
 //!
 //! - `V0xx` **temporal and lifecycle** - a validity window that closed, a
 //!   staleness date that elapsed, a replacement that landed without the
@@ -15,9 +15,12 @@
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
 //!   tag spellings that drifted apart.
 //!
-//! `V3xx` is reserved for semantic contradiction between engram pairs and is
-//! deliberately not implemented here: this sweep detects by dates, links and
-//! graph shape, never by meaning, so it can never confirm a contradiction.
+//! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
+//!   sit at or above the twin threshold: knowledge that says the same thing
+//!   twice in different words. Filed under the redundancy family, because
+//!   that is what it is. It compares meaning to find twins and still never
+//!   confirms a contradiction, which no rule here can: two texts close in
+//!   embedding space agree about their topic, not about what is true.
 //!
 //! # Detect and guide, never auto-consolidate
 //!
@@ -44,6 +47,7 @@
 //! living in the index crate because its inputs speak the index's vocabulary.
 
 pub mod dedupe;
+pub mod twins;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -77,6 +81,20 @@ pub const ORPHAN_MIN_AGE_DAYS: i64 = 14;
 /// for `V201`. Higher than verify's `Q004` section threshold because a whole
 /// engram has far more room to agree by accident than one section does.
 pub const DUP_THRESHOLD: f64 = 0.80;
+
+/// The lead-vector cosine at or above which `V301` calls two engrams twins.
+/// Above the band where the one published measurement put ordinary related
+/// neighbours (median 0.84, p95 0.90), so a twin is a strong claim; the
+/// finding is judgment class and pair-scoped, so a wrong one costs one
+/// acknowledgment.
+pub const TWIN_THRESHOLD: f64 = 0.88;
+
+/// The most lead vectors `V301` will compare in one domain. All pairs is
+/// quadratic; above this the rule reports a truncation and skips.
+pub const MAX_TWIN_VECTORS: usize = 5000;
+
+/// The most `V301` findings one domain sweep emits, closest pairs first.
+pub const MAX_TWIN_FINDINGS: usize = 10;
 
 /// The shortest normalized body `V201` will score. Below this the Dice
 /// coefficient is dominated by common English bigrams and two unrelated stubs
@@ -198,7 +216,8 @@ pub enum Family {
     Temporal,
     /// `V1xx`: references, reciprocity, orphans, stubs and size.
     Structure,
-    /// `V2xx`: duplicate content, colliding titles and tag drift.
+    /// `V2xx` and `V301`: duplicate content, semantic twins, colliding titles
+    /// and tag drift.
     Redundancy,
 }
 
@@ -276,7 +295,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 21] = [
+pub const RULES: [RuleInfo; 22] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -424,6 +443,13 @@ pub const RULES: [RuleInfo; 21] = [
         summary: "tag drift",
         instruction: "One concept is spelled several ways in the tag vocabulary. Hand the user the exact merge command and let them run it. Never bulk-rewrite tags across engrams.",
     },
+    RuleInfo {
+        id: "V301",
+        family: Family::Redundancy,
+        base: 75,
+        summary: "semantic twins",
+        instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: this sweep still cannot confirm one. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
+    },
 ];
 
 /// The catalog entry for a rule id, or `None` when the id is unknown.
@@ -447,9 +473,10 @@ const SCOPE_SEPARATOR: &str = ", ";
 /// - `V010` (the normalized text of the observations that survive nowhere),
 ///   `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
 ///   counterparts), `V107` (the missing attachment paths), `V201` (the cluster
-///   members) and `V202` (the colliding titles) are **sets**, so the parts are
-///   sorted and deduplicated before joining: reordering the links in a body must
-///   not re-raise an acknowledged finding, while a new member must;
+///   members), `V202` (the colliding titles) and `V301` (the twin pair) are
+///   **sets**, so the parts are sorted and deduplicated before joining:
+///   reordering the links in a body must not re-raise an acknowledged finding,
+///   while a new member must;
 /// - `V007` and `V008` name **one attachment path**, so the first part is the
 ///   whole scope;
 /// - every other rule's identity is just (engram, rule) - the plain temporal
@@ -458,7 +485,7 @@ const SCOPE_SEPARATOR: &str = ", ";
 ///   looks like next time.
 fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
     match rule {
-        "V010" | "V101" | "V102" | "V103" | "V107" | "V201" | "V202" => {
+        "V010" | "V101" | "V102" | "V103" | "V107" | "V201" | "V202" | "V301" => {
             parts.sort();
             parts.dedup();
             parts.join(SCOPE_SEPARATOR)
@@ -500,7 +527,7 @@ pub struct AckCounts {
     pub temporal: usize,
     /// Suppressed `V1xx` findings.
     pub structure: usize,
-    /// Suppressed `V2xx` findings.
+    /// Suppressed redundancy findings: `V2xx` and `V301`.
     pub redundancy: usize,
 }
 
@@ -618,6 +645,10 @@ pub struct EngramFacts {
     /// intentional. Malformed entries never reach here - the engine skips them
     /// rather than failing a sweep over a hand-edited line.
     pub acks: Vec<AckEntry>,
+    /// The embedding of the engram's first chunk for the active model, when
+    /// one is stored. `None` keeps the engram out of `V301` and nothing else;
+    /// the engine leaves it `None` when no provider is installed.
+    pub lead_vector: Option<Vec<f32>>,
 }
 
 impl EngramFacts {
@@ -656,6 +687,7 @@ impl EngramFacts {
             analyzed_hash: None,
             asset_refs: Vec::new(),
             acks: Vec::new(),
+            lead_vector: None,
         }
     }
 
@@ -750,6 +782,12 @@ pub struct SweepOptions {
     pub minhash_rows: usize,
     /// See [`SHARE_STALE_DAYS`].
     pub share_stale_days: i64,
+    /// See [`TWIN_THRESHOLD`].
+    pub twin_threshold: f64,
+    /// See [`MAX_TWIN_VECTORS`].
+    pub max_twin_vectors: usize,
+    /// See [`MAX_TWIN_FINDINGS`].
+    pub max_twin_findings: usize,
 }
 
 impl Default for SweepOptions {
@@ -767,6 +805,9 @@ impl Default for SweepOptions {
             minhash_bands: MINHASH_BANDS,
             minhash_rows: MINHASH_BAND_ROWS,
             share_stale_days: SHARE_STALE_DAYS,
+            twin_threshold: TWIN_THRESHOLD,
+            max_twin_vectors: MAX_TWIN_VECTORS,
+            max_twin_findings: MAX_TWIN_FINDINGS,
         }
     }
 }
@@ -2007,8 +2048,76 @@ fn detect_redundancy(input: &SweepInput, report: &mut SweepReport) {
         );
     }
 
+    detect_twins(&live, &cluster_of, input, report);
     detect_title_collisions(&live, &cluster_of, report);
     detect_tag_drift(input, report);
+}
+
+/// `V301`: pairs of eligible engrams whose lead vectors sit at or above the
+/// twin threshold and that `V201` did not already put in one cluster - a
+/// cluster already prescribes the merge, so a twin finding on top would be two
+/// findings for one fact. Indexed over `live` so the cluster map lines up.
+fn detect_twins(
+    live: &[&EngramFacts],
+    cluster_of: &HashMap<usize, usize>,
+    input: &SweepInput,
+    report: &mut SweepReport,
+) {
+    let vectors: Vec<Option<&[f32]>> = live
+        .iter()
+        .map(|f| {
+            if f.is_speculative() {
+                None
+            } else {
+                f.lead_vector.as_deref()
+            }
+        })
+        .collect();
+    let found = twins::find_twins(&vectors, &input.options);
+    if found.capped {
+        report.truncations.push(format!(
+            "V301 skipped: {} lead vectors over the {} cap",
+            found.compared, input.options.max_twin_vectors
+        ));
+        return;
+    }
+    let mut emitted = 0usize;
+    for pair in &found.pairs {
+        if let (Some(ca), Some(cb)) = (cluster_of.get(&pair.a), cluster_of.get(&pair.b))
+            && ca == cb
+        {
+            continue;
+        }
+        if emitted == input.options.max_twin_findings {
+            report.truncations.push(format!(
+                "V301 findings capped at {}",
+                input.options.max_twin_findings
+            ));
+            break;
+        }
+        let Some(lead) = leader(live, &[pair.a, pair.b]) else {
+            continue;
+        };
+        let other = if lead == pair.a { pair.b } else { pair.a };
+        report.findings.push(
+            Finding::about("V301", live[lead])
+                .with(
+                    Class::Judgment,
+                    format!("semantic twin of {}", live[other].address()),
+                    format!(
+                        "lead-vector cosine {:.2} at or above {:.2}; twin: {}",
+                        pair.cosine,
+                        input.options.twin_threshold,
+                        live[other].address()
+                    ),
+                    "read both then merge and supersede or link and acknowledge".to_string(),
+                )
+                // The pair is the evidence, so acknowledging one twin says
+                // nothing about the next.
+                .scoped(vec![live[pair.a].address(), live[pair.b].address()]),
+        );
+        emitted += 1;
+    }
 }
 
 /// `V202`: same-domain titles that collide after the vocabulary fold.

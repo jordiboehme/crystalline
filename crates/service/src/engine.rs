@@ -7516,6 +7516,10 @@ impl Engine {
                     .map(str::to_string),
                 asset_refs: crystalline_core::find_asset_refs(&engram.body),
                 acks: ack_entries(fm),
+                // Filled in by the caller that has the store: the sweep is
+                // pure, so the lead embeddings are handed to it, never fetched
+                // from inside it.
+                lead_vector: None,
                 // The parser's own bullets, so `V010` compares what an
                 // observation asserts rather than re-deriving it from the body.
                 observations: engram
@@ -13174,8 +13178,8 @@ fn parse_families(requested: &[String]) -> Result<Vec<Family>> {
 }
 
 /// Parse the requested rule ids into their catalog spellings, erroring on an
-/// unknown id with the whole catalog named. The reserved `V3xx` range is not in
-/// the catalog, so asking for it errors here rather than returning silence.
+/// unknown id with the whole catalog named. An id outside the catalog errors
+/// here rather than returning silence.
 fn parse_rules(requested: &[String]) -> Result<Vec<&'static str>> {
     let mut out: Vec<&'static str> = Vec::new();
     for raw in requested {

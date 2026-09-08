@@ -561,8 +561,8 @@ async fn min_priority_drops_the_low_scoring_tail() {
 }
 
 /// An unknown domain, family or rule errors naming the valid set, so a caller
-/// recovers in one step. The reserved `V3xx` range is not in the catalog, so
-/// asking for it errors rather than returning silence.
+/// recovers in one step. An id outside the catalog errors rather than
+/// returning silence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     let (_tmp, engine) = fixture().await;
@@ -600,7 +600,7 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     let e = engine
         .evolve_engrams(
             &EvolveParams {
-                rules: vec!["V301".to_string()],
+                rules: vec!["V999".to_string()],
                 ..EvolveParams::default()
             },
             &Scope::Unrestricted,
@@ -609,10 +609,11 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
         .unwrap_err()
         .to_string();
     assert!(
-        e.starts_with("unknown rule 'V301'; valid rules: V001, V002"),
+        e.starts_with("unknown rule 'V999'; valid rules: V001, V002"),
         "{e}"
     );
-    assert!(e.ends_with("V203"), "{e}");
+    // The catalog's last id, so the error names the whole of it.
+    assert!(e.ends_with("V301"), "{e}");
 
     let e = engine
         .evolve_engrams(

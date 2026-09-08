@@ -1088,6 +1088,209 @@ fn v203_respects_declared_tag_aliases() {
 }
 
 // ---------------------------------------------------------------------------
+// V3xx - meaning
+// ---------------------------------------------------------------------------
+
+/// A unit-length vector, the shape an embedding provider hands back.
+fn unit(v: &[f32]) -> Vec<f32> {
+    let n = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    v.iter().map(|x| x / n).collect()
+}
+
+#[test]
+fn v301_flags_a_twin_pair_on_lead_vectors_and_scopes_the_pair() {
+    let mut a = fact(1, "retry-queue");
+    a.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let mut b = fact(2, "retry-backoff");
+    b.lead_vector = Some(unit(&[0.98, 0.2, 0.0]));
+    let mut c = fact(3, "docking-clamps");
+    c.lead_vector = Some(unit(&[0.0, 1.0, 0.0]));
+
+    let report = detect(&input(vec![a, b, c]));
+    let finding = only(&report, "V301");
+    assert_eq!(finding.family, Family::Redundancy);
+    assert_eq!(finding.class, Class::Judgment);
+    assert_eq!(finding.priority, 75);
+    assert_eq!(
+        finding.permalink, "retry-backoff",
+        "equal salience: the smaller address leads"
+    );
+    assert_eq!(
+        finding.scope,
+        "engineering/retry-backoff, engineering/retry-queue"
+    );
+    assert!(finding.evidence.contains("0.98"), "{}", finding.evidence);
+    assert!(finding.evidence.contains("engineering/retry-queue"));
+    assert!(report.truncations.is_empty());
+}
+
+#[test]
+fn v301_stays_quiet_below_the_threshold_without_vectors_and_across_widths() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[0.8, 0.6]));
+    let c = fact(3, "three");
+    let mut d = fact(4, "four");
+    d.lead_vector = Some(unit(&[1.0, 0.0, 0.0]));
+    let report = detect(&input(vec![a, b, c, d]));
+    assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v301_skips_retired_and_speculative_engrams() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    b.status = "draft".to_string();
+    let mut c = fact(3, "three");
+    c.lead_vector = Some(unit(&[1.0, 0.0]));
+    c.status = "superseded".to_string();
+    let report = detect(&input(vec![a, b, c]));
+    assert!(!fired(&report).contains(&"V301"), "{:?}", fired(&report));
+}
+
+#[test]
+fn v301_counts_implemented_as_current() {
+    let mut a = fact(1, "one");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    a.status = "implemented".to_string();
+    let mut b = fact(2, "two");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    let report = detect(&input(vec![a, b]));
+    only(&report, "V301");
+}
+
+#[test]
+fn v301_is_suppressed_inside_a_v201_cluster() {
+    let mut a = fact(1, "release-process");
+    a.body = long_body("release");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "release-copy");
+    b.body = long_body("release").replace("pages whoever", "wakes whoever");
+    b.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut c = fact(3, "release-paraphrase");
+    c.lead_vector = Some(unit(&[1.0, 0.0]));
+    let report = detect(&input(vec![a, b, c]));
+    assert!(fired(&report).contains(&"V201"));
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(
+        twins.len(),
+        2,
+        "the paraphrase twins each cluster member; the cluster pair itself is V201's: {:?}",
+        fired(&report)
+    );
+    assert!(
+        twins
+            .iter()
+            .all(|f| f.scope.contains("engineering/release-paraphrase"))
+    );
+}
+
+#[test]
+fn v301_caps_findings_at_ten_keeping_the_highest_cosines() {
+    let mut facts = Vec::new();
+    for i in 0..12 {
+        let mut f = fact(i as i64 + 1, &format!("twin-{i:02}"));
+        f.lead_vector = Some(unit(&[1.0, 0.002 * i as f32]));
+        facts.push(f);
+    }
+    let report = detect(&input(facts));
+    assert_eq!(
+        report.findings.iter().filter(|f| f.rule == "V301").count(),
+        10
+    );
+    assert!(
+        report
+            .truncations
+            .iter()
+            .any(|t| t == "V301 findings capped at 10"),
+        "{:?}",
+        report.truncations
+    );
+
+    // Selection is by cosine: with a cap of one, the closest pair wins.
+    let mut a = fact(1, "a");
+    a.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut b = fact(2, "b");
+    b.lead_vector = Some(unit(&[1.0, 0.01]));
+    let mut c = fact(3, "c");
+    c.lead_vector = Some(unit(&[1.0, 0.3]));
+    let mut input = input(vec![a, b, c]);
+    input.options.max_twin_findings = 1;
+    let report = detect(&input);
+    let finding = only(&report, "V301");
+    assert_eq!(finding.scope, "engineering/a, engineering/b");
+}
+
+#[test]
+fn v301_reports_the_vector_cap_and_skips_the_rule() {
+    let mut facts = Vec::new();
+    for i in 0..4 {
+        let mut f = fact(i as i64 + 1, &format!("twin-{i}"));
+        f.lead_vector = Some(unit(&[1.0, 0.0]));
+        facts.push(f);
+    }
+    let mut input = input(facts);
+    input.options.max_twin_vectors = 3;
+    let report = detect(&input);
+    assert!(!fired(&report).contains(&"V301"));
+    assert!(
+        report
+            .truncations
+            .iter()
+            .any(|t| t == "V301 skipped: 4 lead vectors over the 3 cap"),
+        "{:?}",
+        report.truncations
+    );
+}
+
+#[test]
+fn v301_acknowledgment_is_scoped_to_the_pair() {
+    let mut hub = fact(1, "hub");
+    hub.lead_vector = Some(unit(&[1.0, 0.0]));
+    hub.salience = Some(9.0);
+    hub.acks.push(AckEntry {
+        rule: "V301".to_string(),
+        scope: Some("engineering/hub, engineering/twin-one".to_string()),
+        note: Some("distinct, linked".to_string()),
+    });
+    let mut one = fact(2, "twin-one");
+    one.lead_vector = Some(unit(&[1.0, 0.0]));
+    let mut two = fact(3, "twin-two");
+    two.lead_vector = Some(unit(&[1.0, 0.0]));
+
+    let report = detect(&input(vec![hub, one, two]));
+    assert_eq!(report.acknowledged.redundancy, 1);
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(twins.len(), 2, "{:?}", fired(&report));
+    let on_hub = twins
+        .iter()
+        .find(|f| f.permalink == "hub")
+        .expect("hub still leads its other pair");
+    assert_eq!(on_hub.scope, "engineering/hub, engineering/twin-two");
+    assert!(!on_hub.acknowledged);
+}
+
+#[test]
+fn twins_cosine_is_symmetric_and_refuses_mismatched_widths() {
+    use crate::sweep::twins::cosine;
+    assert!((cosine(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-9);
+    assert!((cosine(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-9);
+    assert_eq!(cosine(&[1.0, 0.0], &[1.0, 0.0, 0.0]), 0.0);
+    assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+}
+
+// ---------------------------------------------------------------------------
 // Ranking, catalog and plumbing
 // ---------------------------------------------------------------------------
 
@@ -1447,8 +1650,8 @@ fn human_authored_boost_applies_to_every_rule_not_only_v006() {
 }
 
 #[test]
-fn the_catalog_carries_twenty_one_rules_and_v006_is_temporal() {
-    assert_eq!(RULES.len(), 21);
+fn the_catalog_carries_twenty_two_rules_and_v006_is_temporal() {
+    assert_eq!(RULES.len(), 22);
     let info = rule_info("V006").expect("V006 is in the catalog");
     assert_eq!(info.family, Family::Temporal);
     assert_eq!(info.base, 50);
@@ -1491,7 +1694,7 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         ids,
         vec![
             "V001", "V002", "V003", "V004", "V005", "V006", "V007", "V008", "V009", "V010", "V101",
-            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203",
+            "V102", "V103", "V104", "V105", "V106", "V107", "V108", "V201", "V202", "V203", "V301",
         ]
     );
     for rule in RULES {
@@ -1505,7 +1708,11 @@ fn the_catalog_covers_every_rule_id_exactly_once() {
         };
         assert_eq!(rule.family, expected, "{}", rule.id);
     }
-    assert!(rule_info("V301").is_none(), "V3xx stays reserved");
+    assert_eq!(
+        rule_info("V301").expect("V301 is in the catalog").family,
+        Family::Redundancy,
+        "semantic twins are redundancy, which is what they are"
+    );
 }
 
 #[test]
@@ -1804,7 +2011,7 @@ fn every_rule_in_the_catalog_has_a_decided_scope() {
     // empty-scope arm, which is the safe default, and this pins that the
     // catalog and the scope function are read together.
     let scoped = [
-        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V201", "V202",
+        "V007", "V008", "V010", "V101", "V102", "V103", "V107", "V201", "V202", "V301",
     ];
     for info in RULES {
         let produced = scope_for(info.id, vec!["one".to_string()]);
