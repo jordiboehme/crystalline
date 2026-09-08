@@ -78,8 +78,9 @@ impl LocalChange {
 /// snapshot.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LocalChanges {
-    /// Every detected change, in the order the walk encountered them (added
-    /// and modified files first by walk order, then deletions).
+    /// Every detected change, sorted by path. Walk order differs per
+    /// filesystem and classification does not all happen during the walk
+    /// anyway, so the paths' own order is the only stable one.
     pub changes: Vec<LocalChange>,
     /// Files skipped for exceeding [`MAX_SHARED_FILE_BYTES`], with their
     /// sizes in bytes.

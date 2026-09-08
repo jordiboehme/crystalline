@@ -3146,7 +3146,8 @@ async fn collect_amend_changes(
                 // all (a layer above may have retired it since); an unreadable
                 // one simply falls back to its bare path.
                 if description.is_none() {
-                    let wt_path = checked_working_path(state_dir, domain_root, &path)?;
+                    let wt_path =
+                        checked_working_path(state_dir, domain_root, fresh.disk_path(&path))?;
                     let content = read_optional_file(&wt_path)?.unwrap_or_default();
                     match file.change {
                         ProposedChange::Added => out.entries.added.push((path.clone(), content)),
