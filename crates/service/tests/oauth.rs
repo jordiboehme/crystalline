@@ -997,7 +997,9 @@ async fn a_good_authorize_request_lands_on_the_consent_page() {
     );
     let id = request_id(&location(&started));
 
-    // The prune clock only moves for a request that got all the way through.
+    // The prune clock does NOT move here. This route is an unauthenticated
+    // GET, so a caller sending one per row would keep the whole registration
+    // table alive forever; the stamp waits for somebody to allow something.
     assert!(
         ctx.auth
             .oauth_client(&client_id)
@@ -1005,8 +1007,8 @@ async fn a_good_authorize_request_lands_on_the_consent_page() {
             .unwrap()
             .unwrap()
             .last_used
-            .is_some(),
-        "a good authorization stamps the registration's last use"
+            .is_none(),
+        "an authorization request nobody has answered is not a use"
     );
 
     // A trailing slash on the resource is the same resource, and no `resource`
@@ -1066,6 +1068,16 @@ async fn a_good_authorize_request_lands_on_the_consent_page() {
     assert!(
         target.starts_with(&format!("{moved}?")),
         "the browser goes to the uri the client presented: {target}"
+    );
+    assert!(
+        ctx.auth
+            .oauth_client(&native_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .last_used
+            .is_some(),
+        "and an allowed consent is what stamps the registration's last use"
     );
 }
 
@@ -1480,7 +1492,7 @@ async fn allow_returns_a_code_and_deny_returns_access_denied() {
     );
 
     // Deny: the same round trip, and nothing granted.
-    let (_, id) = ctx.start_authorization(HOSTED_REDIRECT, Some(state)).await;
+    let (denied_client, id) = ctx.start_authorization(HOSTED_REDIRECT, Some(state)).await;
     let denied = ctx.decide(&id, &bob, "deny").await;
     assert_eq!(denied.status(), 200);
     let body: Value = denied.json().await.unwrap();
@@ -1495,6 +1507,23 @@ async fn allow_returns_a_code_and_deny_returns_access_denied() {
         Some(ctx.origin().as_str())
     );
     assert!(!query.contains_key("code"), "a refusal grants nothing");
+
+    // And a refusal is not a use: the registration's prune clock is untouched
+    // by a deny and by an authorization nobody ever answers, so a client that
+    // was never actually let in is still collected after thirty days.
+    let (abandoned_client, _) = ctx.start_authorization(HOSTED_REDIRECT, None).await;
+    for client_id in [&denied_client, &abandoned_client] {
+        assert!(
+            ctx.auth
+                .oauth_client(client_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .last_used
+                .is_none(),
+            "a registration nobody allowed has never been used"
+        );
+    }
 
     // The decision is any signed-in account's, and the code binds to whoever
     // made it: there is no account at the moment a client starts a request, so

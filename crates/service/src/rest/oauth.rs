@@ -1736,9 +1736,15 @@ fn redirect_error(
 /// redirect uri no registration named means an error sent there would be an
 /// open redirect with an OAuth error attached to it. So it is rendered here,
 /// in the mount's own problem-detail shape, and the browser stays.
-fn rendered_refusal(reason: &str, detail: &str) -> ApiError {
+/// `client_id` is `None` for the two refusals that have none to name - a
+/// request that sent no client id, and one that named a registration this
+/// server does not hold - and `Some` for the third, which is the one an
+/// operator actually debugs: a client whose redirect uri does not match what
+/// it registered.
+fn rendered_refusal(reason: &str, client_id: Option<&str>, detail: &str) -> ApiError {
     tracing::warn!(
         reason,
+        client_id = client_id.unwrap_or("none"),
         "an authorization request was refused before any redirect"
     );
     ApiError::bad_request(detail)
@@ -1829,6 +1835,7 @@ pub async fn authorize(
     else {
         return Err(rendered_refusal(
             "no client id",
+            None,
             "this authorization request names no client_id, so there is no registration to \
              check its redirect uri against - the client registers first, at \
              POST /api/v1/oauth/register",
@@ -1845,6 +1852,7 @@ pub async fn authorize(
         .ok_or_else(|| {
             rendered_refusal(
                 "unknown client",
+                None,
                 "no client is registered here under that client_id - it may have been collected \
                  after thirty days without use, in which case the client registers again",
             )
@@ -1862,6 +1870,7 @@ pub async fn authorize(
     else {
         return Err(rendered_refusal(
             "redirect uri not registered",
+            Some(client_id),
             "this authorization request names no redirect_uri, or one this client did not \
              register - an authorization is only ever sent to an address the registration \
              named, so nothing can be sent anywhere from here",
@@ -1944,15 +1953,12 @@ pub async fn authorize(
         return refuse("temporarily_unavailable");
     }
 
-    // Only now, and deliberately: the thirty-day prune clock is "when did a
-    // client last get an authorization under way", so a caller that never got
-    // past PKCE must not be able to keep a registration alive with rubbish.
-    if let Err(error) = state.auth.touch_oauth_client(client_id).await {
-        // Not worth failing a good request for: the stamp decides when an
-        // unused registration is collected, and one collected a little early
-        // is a client that registers again.
-        tracing::warn!("a registration's last use could not be stamped: {error:#}");
-    }
+    // The registration's `last_used` is deliberately NOT stamped here. This
+    // route is an unauthenticated GET, so a caller sending one per row would
+    // keep every registration in the table alive forever and defeat the
+    // thirty-day prune. The stamp belongs to the moment a registration is
+    // actually of use to somebody: a consent ALLOWED (see [`decide`]), or a
+    // grant issued or refreshed at the token endpoint.
     tracing::info!(
         client_id = %client_id,
         "an mcp client started an authorization"
@@ -2153,6 +2159,18 @@ pub async fn decide(
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .issue(sha256_hex(&code), code_for(&record, &account.name));
+            // Here and nowhere earlier: the thirty-day prune collects a
+            // registration nobody has any use for, and the first moment one is
+            // of use to somebody is a person allowing it. Stamping it at the
+            // authorize leg instead would let an unauthenticated GET per row
+            // keep the whole table alive; a denied or abandoned request leaves
+            // it exactly as it was.
+            if let Err(error) = state.auth.touch_oauth_client(&record.client_id).await {
+                // Not worth failing a granted consent for. The stamp decides
+                // when an unused registration is collected, and one collected
+                // a little early is a client that registers again.
+                tracing::warn!("a registration's last use could not be stamped: {error:#}");
+            }
             tracing::info!(
                 account = %account.name,
                 client_id = %record.client_id,
