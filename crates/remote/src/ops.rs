@@ -360,6 +360,28 @@ pub async fn subscribe(
     // bytes, so the base is never read back. The working tree only receives
     // upstream files that do not exist locally: on a fresh target that is the
     // whole tree, on an adopted one every local file stays exactly as it was.
+    //
+    // **"Do not exist locally" is `exists()` at the upstream spelling, and on
+    // a case-sensitive filesystem that is not the same question as "is this
+    // engram already here".** Adopting a folder that holds `notes.md` while
+    // the origin holds `Notes.md` writes the origin's copy beside the local
+    // one, and the domain ends up with two files where its owner means one.
+    // Not silently, at least: the next detection sees two disk paths folding
+    // to one name, declines to adopt either, and reports the local spelling as
+    // an addition, so the extra file is visible rather than confused with the
+    // tracked one - and what is written is a file the origin really carries,
+    // never a snapshot copy over work somebody moved on from.
+    //
+    // It is not fixed here because there is nothing to fix it with. A base
+    // snapshot is what carries recorded-to-disk spellings, and this is the
+    // operation that creates the first one; `detect_local_changes` against an
+    // empty base reports every file as an addition and adopts nothing. Making
+    // this site answer the folded question would take a walk of the working
+    // tree before the loop that returns its paths indexed by folded name -
+    // the walk `detect_local_changes` already performs, with its case pass run
+    // against the extracted tree instead of a base - handed in here so the
+    // existence test could consult it. That is a new function rather than a
+    // new argument, which is why it is named rather than written.
     let mut files = BTreeMap::new();
     let mut files_written = 0usize;
     for (rel, content) in &extracted {
@@ -3864,6 +3886,7 @@ pub async fn withdraw(
                 spec,
                 domain_root,
                 state_dir,
+                &state.files,
                 &proposal,
                 &below,
                 &mut report,
@@ -3893,6 +3916,7 @@ pub async fn withdraw(
             spec,
             domain_root,
             state_dir,
+            &state.files,
             &proposal,
             &below,
             &mut report,
@@ -3924,17 +3948,54 @@ pub async fn withdraw(
 /// does not hash to what was recorded all leave the path exactly as it stands
 /// and name it in [`WithdrawReport::skipped_reverts`]. A withdrawal is never
 /// failed over a file that cannot be put back.
+///
+/// **Every path here is opened at its spelling on disk, never at the recorded
+/// one.** A proposal records the base snapshot's spelling, and on a
+/// case-sensitive filesystem that spelling opens nothing once the file has
+/// been re-cased. Without the detector's map the `Deleted` arm reads an absent
+/// file, calls it undiverged and writes the base content back - which lands a
+/// second copy of an engram inside a tracked domain, beside the real one. That
+/// is a write into somebody's knowledge rather than a read that fails loudly,
+/// so this is the one place in a withdrawal where the two channels may not be
+/// confused. The reports keep naming the recorded spelling, which is the one
+/// the forge and every other surface know.
+///
+/// The spellings are resolved against the trunk with the layers `below` laid
+/// over it ([`tip_files_over`]), not against the trunk alone. Both write arms
+/// need that: the first restores from the base snapshot, whose paths are the
+/// trunk's, and the second restores a path only a lower layer ever carried, so
+/// a trunk-only detection would return that path's recorded spelling
+/// unchanged and duplicate exactly the file it was meant to leave alone.
+/// [`LocalChanges::disk_paths`] records an adoption even where it produced no
+/// change, which is what makes a map built for detection answer a question
+/// about replay.
+///
+/// One residue: a path this layer *added* is in neither the trunk nor a layer
+/// below, so no adoption can be recorded for it and an added file that was
+/// re-cased after sharing is left standing rather than removed. That fails
+/// towards keeping a file, and the alternative would be deleting one on a
+/// guess.
+///
+/// The detection walks and hashes the domain, and its failure is a new one
+/// after the forge proposal has already been closed. That is the same
+/// inconsistency a failing [`write_working_file`] here has always been able to
+/// produce, so it is not new in kind: the withdrawal is recorded on the forge
+/// and the working tree is left as it stands.
+#[allow(clippy::too_many_arguments)]
 async fn revert_layer_files(
     provider: &dyn Provider,
     spec: &OriginSpec,
     domain_root: &Path,
     state_dir: &Path,
+    base: &BTreeMap<String, BaseStamp>,
     proposal: &Proposal,
     below: &[Proposal],
     report: &mut WithdrawReport,
 ) -> Result<(), RemoteError> {
+    let layers: Vec<&Proposal> = below.iter().collect();
+    let local = detect_local_changes(domain_root, &tip_files_over(base, &layers))?;
     for pf in &proposal.files {
-        let wt_path = checked_working_path(state_dir, domain_root, &pf.path)?;
+        let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(&pf.path))?;
         let current = read_optional_file(&wt_path)?;
         let current_sha = current.as_deref().map(state::sha256_hex);
 
@@ -4142,6 +4203,21 @@ async fn settle_up_to_date(
 /// local change against the new base), replaces the base snapshot wholesale
 /// and keeps conflicts as they are.
 ///
+/// **"No local counterpart" is asked at the spelling on disk.** The outgoing
+/// base is detected against the working tree before it is replaced, so an
+/// upstream path this domain already tracked under a spelling that differs
+/// only in case resolves to the file that is really there and is left alone.
+/// Without that, a re-cased file on a case-sensitive filesystem is invisible
+/// to `exists()` at the upstream spelling and the head's copy lands beside it:
+/// two files where the domain means one, written into somebody's knowledge
+/// rather than reported.
+///
+/// The reach of that is exactly the outgoing base's key space, which is the
+/// right one - it is what says this domain already had the path. An upstream
+/// path that is new at this head and happens to case-collide with an untracked
+/// local file is outside it, and stays a genuine second file that the next
+/// detection reports as a local addition.
+///
 /// Merged proposals are consumed here exactly as the other two arms of
 /// [`pull`] consume them, and for the same reason: a merged record left in the
 /// chain blocks every repair around it ([`merged_layer_blocking_repair`]), and
@@ -4175,9 +4251,13 @@ async fn rebaseline(
     // with the previous mirror intact.
     refresh_artifact_mirror(state_dir, spec.subpath.as_deref(), &bytes)?;
 
+    // Detected against the base that is about to go, since that is the map
+    // from a recorded spelling to the one on disk. See this function's own
+    // doc comment for why the question has to be asked that way round.
+    let local = detect_local_changes(domain_root, &state.files)?;
     let mut applied = Vec::new();
     for (rel, content) in &extracted {
-        let wt_path = checked_working_path(state_dir, domain_root, rel)?;
+        let wt_path = checked_working_path(state_dir, domain_root, local.disk_path(rel))?;
         if !wt_path.exists() {
             write_working_file(&wt_path, content)?;
             applied.push(rel.clone());

@@ -802,6 +802,64 @@ async fn scenario_10_declined_proposal_without_movement() {
 // re-baselines onto head: upstream-only files materialize, a locally differing
 // file is left untouched and later shows as a local change.
 
+/// A re-baseline does not materialize a second copy of a file the domain
+/// already holds under another spelling of the same name.
+///
+/// The head tree's paths are the origin's spellings; the working tree's are
+/// this machine's. On a case-sensitive filesystem a re-cased file is invisible
+/// to an existence test at the origin's spelling, so the head's copy lands
+/// beside it. The outgoing base snapshot is what maps one spelling to the
+/// other, and it is still in hand at that moment.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; demonstrated on a case-sensitive APFS image.
+#[tokio::test]
+async fn a_re_baseline_writes_no_duplicate_at_a_recased_path() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"a v1\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The one local change is a re-case, which the folding detector treats as
+    // the same file rather than a delete and an add.
+    std::fs::remove_file(sub.domain_root.join("notes/a.md")).unwrap();
+    write(&sub.domain_root.join("notes/A.md"), b"a v1\n");
+
+    // Head moves, still carrying the origin's spelling, and the recorded base
+    // commit is gone so the pull re-baselines.
+    let c2 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"a v2\n")]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    set_base_commit(&sub.state_dir, "ghost-commit");
+    mock.gc_commit("ghost-commit");
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(report.re_baselined);
+    assert!(
+        !report.applied.contains(&"notes/a.md".to_string()),
+        "the file is already here under the other spelling: {:?}",
+        report.applied
+    );
+
+    let names: Vec<String> = std::fs::read_dir(sub.domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("a.md"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["A.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/A.md")), b"a v1\n");
+}
+
 #[tokio::test]
 async fn scenario_11_missing_base_commit_re_baselines() {
     let mock = MockProvider::new();
@@ -1613,6 +1671,87 @@ async fn scenario_20_withdraw_revert_restores_undiverged_files() {
     assert_eq!(
         read(&sub.domain_root.join("notes/added.md")),
         b"kept working on it\n"
+    );
+}
+
+/// A revert never writes a second copy of a file that is already there under
+/// another spelling of the same name.
+///
+/// The withdrawal's reads are keyed on the proposal's recorded path, which is
+/// the base snapshot's spelling. On a case-sensitive filesystem that spelling
+/// opens nothing when the file has been re-cased, so the `Deleted` arm sees an
+/// absent file, calls it undiverged and writes the base content back - landing
+/// a duplicate engram inside a tracked domain beside the real one. Routing the
+/// read through the detector's disk spelling is what makes the arm see the
+/// file that is really there and report it as diverged instead.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; the volume this was demonstrated on was a case-sensitive APFS
+/// image.
+#[tokio::test]
+async fn scenario_20_withdraw_revert_writes_no_duplicate_at_a_recased_path() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/gone.md", b"bye\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("{other:?}"),
+    };
+
+    // The file comes back after the share, under a different spelling of the
+    // same name - the shape a re-case makes, and the one the folding detector
+    // now treats as the same file.
+    write(&sub.domain_root.join("notes/Gone.md"), b"back, renamed\n");
+
+    let w = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(report.number),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        w.skipped_diverged,
+        vec!["notes/gone.md".to_string()],
+        "the file is there under the other spelling, so it is newer work"
+    );
+    assert!(
+        w.restored.is_empty(),
+        "and nothing was put back over it: {:?}",
+        w.restored
+    );
+    let names: Vec<String> = std::fs::read_dir(sub.domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("gone.md"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Gone.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/Gone.md")),
+        b"back, renamed\n"
     );
 }
 
@@ -5522,6 +5661,61 @@ async fn an_interrupted_repair_resumes_on_the_next_withdraw() {
             )),
         "the layer the repair settled: {:?}",
         state.history
+    );
+}
+
+/// The other write arm of a revert - the one that restores from a layer below
+/// rather than from the trunk - is protected the same way.
+///
+/// A path only a lower layer ever carried is not in the base snapshot, so a
+/// trunk-only detection cannot say where it lives on disk and the recorded
+/// spelling comes back unchanged. On a case-sensitive filesystem the arm then
+/// writes the lower layer's blob beside the re-cased file. Resolving against
+/// the trunk with the layers below laid over it is what reaches this arm.
+///
+/// Passes either way on a case-insensitive filesystem; demonstrated on a
+/// case-sensitive APFS image.
+#[tokio::test]
+async fn a_stacked_revert_writes_no_duplicate_at_a_recased_lower_layer_path() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    // A path the trunk never carried: added by the middle layer, retired by
+    // the top one, so its pre-share content lives only in the middle layer's
+    // recorded blob.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+    std::fs::remove_file(sub.domain_root.join("notes/b.md")).unwrap();
+    let third = proposed(stacked_share(&mock, &sub).await);
+
+    // It comes back under the other spelling of the same name.
+    write(&sub.domain_root.join("notes/B.md"), b"back, renamed\n");
+
+    let report = stacked_withdraw(&mock, &sub, Some(third.number), true).await;
+    assert_eq!(
+        report.skipped_diverged,
+        vec!["notes/b.md".to_string()],
+        "the file is there under the other spelling, so it is newer work"
+    );
+    assert!(
+        report.restored.is_empty(),
+        "nothing was put back over it: {:?}",
+        report.restored
+    );
+    let names: Vec<String> = std::fs::read_dir(sub.domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("b.md"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["B.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/B.md")),
+        b"back, renamed\n"
     );
 }
 
