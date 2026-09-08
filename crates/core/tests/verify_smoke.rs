@@ -521,3 +521,89 @@ fn clean_tag_aliases_section_emits_no_m107() {
     );
     assert_eq!(report.exit_code(), 0);
 }
+
+#[test]
+fn a_domain_whose_paths_differ_only_in_case_reports_e009() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Apex classes\n\n## When to Use\n\n- When asked about a class\n",
+    );
+    let engram = "---\ntype: engram\ntitle: Custom Header Module\npermalink: custom-header-module\ntags:\n- apex\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Custom Header Module\n\nThe header module the community pages render above every record list.\n";
+    write(
+        dir.path(),
+        "Platform.Components.Common/CustomHeaderModule.md",
+        engram,
+    );
+    write(
+        dir.path(),
+        "platform.components.common/CustomHeaderModule.md",
+        engram,
+    );
+
+    // The pair this rule reports is exactly the pair a case-insensitive
+    // filesystem cannot hold, so on macOS and Windows the second write landed
+    // on the first file and there is nothing here to find. The rule's own
+    // behaviour is pinned without a filesystem in `verify::format`'s unit
+    // tests; this one adds the scanner and the reporter on the Linux legs of
+    // CI, where the two paths really do coexist.
+    if report_files(dir.path()) < 3 {
+        eprintln!(
+            "skipped: this filesystem is case-insensitive, so the colliding pair cannot be created"
+        );
+        return;
+    }
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    let e009: Vec<&verify::Issue> = report.issues.iter().filter(|i| i.rule == "E009").collect();
+    assert_eq!(e009.len(), 1, "unexpected issues: {:#?}", report.issues);
+    assert_eq!(e009[0].severity, Severity::Error);
+    assert!(
+        e009[0]
+            .message
+            .contains("Platform.Components.Common/CustomHeaderModule.md")
+            && e009[0]
+                .message
+                .contains("platform.components.common/CustomHeaderModule.md"),
+        "both paths must be named: {}",
+        e009[0].message
+    );
+    assert_eq!(report.exit_code(), 1);
+}
+
+#[test]
+fn a_domain_with_no_case_collision_reports_no_e009() {
+    let dir = tempdir().unwrap();
+    write(
+        dir.path(),
+        "MANIFEST.md",
+        "---\ntype: manifest\ntitle: MANIFEST\npermalink: manifest\ntags:\n- manifest\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n## Scope\n\n- Apex classes\n\n## When to Use\n\n- When asked about a class\n",
+    );
+    write(
+        dir.path(),
+        "Platform.Components.Common/CustomHeaderModule.md",
+        "---\ntype: engram\ntitle: Custom Header Module\npermalink: custom-header-module\ntags:\n- apex\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Custom Header Module\n\nThe header module the community pages render above every record list.\n",
+    );
+    write(
+        dir.path(),
+        "Platform.Components.Utils/DateUtils.md",
+        "---\ntype: engram\ntitle: Date Utils\npermalink: date-utils\ntags:\n- apex\nstatus: current\nrecorded_at: 2026-01-01\ntimestamp: 2026-01-01T00:00:00+00:00\n---\n\n# Date Utils\n\nDate arithmetic shared by the scheduling batch jobs.\n",
+    );
+
+    let report = verify::verify_paths([dir.path()], &VerifyOptions::default()).unwrap();
+    assert!(
+        report.issues.iter().all(|i| i.rule != "E009"),
+        "unexpected issues: {:#?}",
+        report.issues
+    );
+}
+
+/// How many markdown files the scan actually finds under `root`, which on a
+/// case-insensitive filesystem is fewer than were written.
+fn report_files(root: &Path) -> usize {
+    verify::verify_paths([root], &VerifyOptions::default())
+        .unwrap()
+        .summary
+        .files_scanned
+}
