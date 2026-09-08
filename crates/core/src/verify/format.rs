@@ -203,17 +203,18 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
 /// Renaming one of the pair is the fix for both problems, which is what this
 /// rule asks for.
 ///
-/// The folding here must match `crystalline_remote::changes::fold_case`, which
-/// asks the same question of a domain's paths on the sharing side. `core` may
-/// not depend on that crate, so the two `to_lowercase` calls are kept in step
-/// by hand, and each says so.
+/// The folding is [`crate::fold_path_case`], the one both sides call:
+/// `crystalline_remote::changes::detect_local_changes` asks the same question
+/// of the same paths on the sharing side, and a rule that folded differently
+/// from the detector would either report a pair the detector happily folds or
+/// stay quiet about one it refuses to.
 pub(crate) fn check_domain(domain: &Domain, sink: &mut Sink) {
     // `domain.files` is sorted by path, so each group's paths come out in a
     // stable order and the reported message does not depend on walk order.
     let mut folded: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     for (i, file) in domain.files.iter().enumerate() {
         folded
-            .entry(file.rel_path.to_string_lossy().to_lowercase())
+            .entry(crate::fold_path_case(&file.rel_path.to_string_lossy()))
             .or_default()
             .push(i);
     }

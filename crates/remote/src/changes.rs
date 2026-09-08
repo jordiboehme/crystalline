@@ -518,23 +518,18 @@ fn is_excluded_name(name: &str) -> bool {
 }
 
 /// Two paths' case-insensitive identity: what macOS and Windows treat as one
-/// path. Full Unicode lowercase rather than ASCII, since both filesystems fold
-/// well beyond ASCII, and locale-independent, so the answer is the same on
-/// every machine looking at the same domain.
-///
-/// This is not any one filesystem's folding table and does not try to be. It
-/// only has to be coarse enough to catch the pairs a real checkout would
-/// collapse: folding two paths together that a filesystem would keep apart
-/// trips the ambiguity guard in [`detect_local_changes`], which then changes
-/// nothing at all.
+/// path, from [`crystalline_core::fold_path_case`].
 ///
 /// Verify rule `E009` (`crystalline_core::verify`, `format::check_domain`)
-/// answers the same question about one domain's files and must fold the same
-/// way, or the rule and this function disagree about which paths collide. It
-/// cannot share this helper - `core` may not depend on this crate - so the two
-/// are kept in step by hand, and each says so.
+/// asks the same question about one domain's files, and the two must fold the
+/// same way or the rule and this function disagree about which paths collide.
+/// They call one implementation rather than being kept in step by hand.
+///
+/// Folding coarsely is the safe direction here: two paths folded together
+/// that a filesystem would keep apart trip the ambiguity guard in
+/// [`detect_local_changes`], which then changes nothing at all.
 fn fold_case(path: &str) -> String {
-    path.to_lowercase()
+    crystalline_core::fold_path_case(path)
 }
 
 /// The forward-slash relative path of `path` under `root`.
