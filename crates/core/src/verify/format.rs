@@ -197,9 +197,16 @@ pub(crate) fn check(file: &ScannedFile, domain_name: &str, sink: &mut Sink) {
 /// `crystalline_remote::changes::detect_local_changes` folds a walked path
 /// onto a recorded one whose only difference is case, but only where exactly
 /// one recorded path folds that way. A domain holding both spellings is the
-/// ambiguous half it declines to guess at, so it keeps reporting the spelling
-/// that is not on disk as a deletion. Renaming one of the pair is the fix for
-/// both problems, which is what this rule asks for.
+/// ambiguous half it declines to guess at: on a case-insensitive filesystem it
+/// cannot tell the checked-out file from the spelling that was left behind, so
+/// it reports neither rather than offer to delete the one the user can see.
+/// Renaming one of the pair is the fix for both problems, which is what this
+/// rule asks for.
+///
+/// The folding here must match `crystalline_remote::changes::fold_case`, which
+/// asks the same question of a domain's paths on the sharing side. `core` may
+/// not depend on that crate, so the two `to_lowercase` calls are kept in step
+/// by hand, and each says so.
 pub(crate) fn check_domain(domain: &Domain, sink: &mut Sink) {
     // `domain.files` is sorted by path, so each group's paths come out in a
     // stable order and the reported message does not depend on walk order.
@@ -223,7 +230,7 @@ pub(crate) fn check_domain(domain: &Domain, sink: &mut Sink) {
             "E009",
             Severity::Error,
             format!(
-                "path `{}` differs only in case from `{others}`; no macOS or Windows checkout can hold both, so one of them disappears there without warning",
+                "path `{}` differs only in case from `{others}`; no macOS or Windows checkout can hold them all, so all but one disappear there without warning",
                 paths[0]
             ),
             Some("rename one of them so the paths differ by more than case".into()),
@@ -276,7 +283,7 @@ mod tests {
         assert_eq!(issue.severity, Severity::Error);
         assert_eq!(
             issue.message,
-            "path `classes/Platform.Components.Common/CustomHeaderModule.md` differs only in case from `classes/platform.components.common/CustomHeaderModule.md`; no macOS or Windows checkout can hold both, so one of them disappears there without warning"
+            "path `classes/Platform.Components.Common/CustomHeaderModule.md` differs only in case from `classes/platform.components.common/CustomHeaderModule.md`; no macOS or Windows checkout can hold them all, so all but one disappear there without warning"
         );
         assert_eq!(
             issue.fix.as_deref(),
@@ -304,12 +311,10 @@ mod tests {
         ]);
 
         assert_eq!(issues.len(), 1, "{issues:#?}");
-        assert!(
-            issues[0].message.contains("`notes/Alpha.md`")
-                && issues[0].message.contains("`notes/alpha.md`")
-                && issues[0].message.starts_with("path `notes/ALPHA.md`"),
-            "{}",
-            issues[0].message
+        assert_eq!(
+            issues[0].message,
+            "path `notes/ALPHA.md` differs only in case from `notes/Alpha.md`, `notes/alpha.md`; no macOS or Windows checkout can hold them all, so all but one disappear there without warning",
+            "the wording has to stay true when the group is larger than a pair"
         );
     }
 }
