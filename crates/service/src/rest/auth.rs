@@ -51,7 +51,7 @@ use super::auth_store::{
     AuthStore, DEFAULT_OIDC_ROLE, PasswordCheck, RefusalKind, Role, SessionMint, StoreRefusal,
     User, dummy_verify, normalize_account_name,
 };
-use super::oidc::{FALLBACK_ACCOUNT_NAME, sanitize_account_name};
+use super::oidc::sanitize_account_name;
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
 use crate::scope::Scope;
 
@@ -604,19 +604,26 @@ fn forwarded_subject(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
 /// client's copy - the half-satisfied version of the trust boundary this mode
 /// documents - would serve whichever won, with nothing anywhere saying so.
 /// Refusing costs nothing and turns a silent compromise into a visible
-/// failure, so all four headers are refused on a duplicate, not only the one
-/// that names the person: a duplicate anywhere in the quartet is the same tell
-/// about the proxy in front.
+/// failure, so the three single-valued headers are refused on a duplicate, not
+/// only the one that names the person: a duplicate anywhere among them is the
+/// same tell about the proxy in front. The refusal names which header it was,
+/// because "the proxy sends this one twice" is the fact an operator has to act
+/// on and the message otherwise describes a fault they cannot locate.
+///
+/// `Remote-Groups` is NOT one of them and does not come through here: a list
+/// header is legitimately repeated once per element, and refusing a proxy for
+/// spelling one group per line would be refusing correct behaviour. See
+/// [`forwarded_group_list`].
 fn forwarded_header<'h>(headers: &'h HeaderMap, name: &str) -> Result<Option<&'h str>, ApiError> {
     let mut values = headers.get_all(name).iter();
     let Some(value) = values.next() else {
         return Ok(None);
     };
     if values.next().is_some() {
-        return Err(ApiError::forbidden(
-            "the forward-auth headers arrived more than once: the proxy must strip \
-             client-supplied copies and set them itself",
-        ));
+        return Err(ApiError::forbidden(format!(
+            "the forward-auth header '{name}' arrived more than once: the proxy must strip \
+             client-supplied copies and set them itself"
+        )));
     }
     Ok(value
         .to_str()
@@ -637,6 +644,27 @@ fn forwarded_groups(raw: &str) -> Vec<String> {
         .map(str::trim)
         .filter(|group| !group.is_empty())
         .map(str::to_string)
+        .collect()
+}
+
+/// Every group the proxy forwarded, however it chose to spell the list.
+///
+/// A list-valued header may arrive as one comma-separated value or as one
+/// header line per element, and both are correct: RFC 9110 says a recipient may
+/// join repeated field lines of a list-valued field with commas without
+/// changing the meaning. So this joins rather than refuses, which is the whole
+/// difference between this reader and [`forwarded_header`] - the other three
+/// headers name one thing each, and a second copy of one of those is a fault.
+///
+/// A value that is not readable as text is skipped rather than refused: no
+/// group decides anything yet, so an unusable one costs nothing, while
+/// refusing the request over it would turn a cosmetic header into an outage.
+fn forwarded_group_list(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(REMOTE_GROUPS_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(forwarded_groups)
         .collect()
 }
 
@@ -683,14 +711,12 @@ async fn proxy_header_user(
 ) -> Result<User, ApiError> {
     let display = forwarded_header(headers, REMOTE_NAME_HEADER)?;
     let email = forwarded_header(headers, REMOTE_EMAIL_HEADER)?;
-    if let Some(raw) = forwarded_header(headers, REMOTE_GROUPS_HEADER)? {
-        let groups = forwarded_groups(raw);
-        if !groups.is_empty() {
-            tracing::debug!(
-                groups = groups.join(","),
-                "groups seen but claim mapping is not built"
-            );
-        }
+    let groups = forwarded_group_list(headers);
+    if !groups.is_empty() {
+        tracing::debug!(
+            groups = groups.join(","),
+            "groups seen but claim mapping is not built"
+        );
     }
     let user = match state.auth.linked_user(PROXY_ISSUER, subject).await? {
         Some(user) => user,
@@ -729,8 +755,17 @@ async fn proxy_header_user(
 /// which is the key the next request arrives with. Only the human-facing name
 /// is derived, and the store uniquifies it from there.
 fn desired_account_name(subject: &str) -> String {
-    sanitize_account_name(subject).unwrap_or_else(|| FALLBACK_ACCOUNT_NAME.to_string())
+    sanitize_account_name(subject).unwrap_or_else(|| PROXY_FALLBACK_ACCOUNT_NAME.to_string())
 }
+
+/// The login name a forwarded identity falls back to when its subject carries
+/// nothing name-shaped at all.
+///
+/// Not the sign-on path's `sso-user`: this account never met a sign-on
+/// provider, and the name is what an operator reads in the user list when they
+/// go looking for whoever this is. Uniquified like any other derived name, so a
+/// second such identity becomes `proxy-user-2`.
+pub(super) const PROXY_FALLBACK_ACCOUNT_NAME: &str = "proxy-user";
 
 /// Mint the account behind a forwarded identity, linking it to
 /// `(proxy, subject)` in the same transaction.
@@ -2118,13 +2153,17 @@ mod tests {
 
     #[test]
     fn a_forwarded_name_is_derived_the_way_a_sign_ons_is() {
+        use super::super::oidc::FALLBACK_ACCOUNT_NAME;
         // Addressable: nothing a path or a query would read as structure.
         assert_eq!(desired_account_name("ada/../bob"), "ada-..-bob");
         assert_eq!(desired_account_name("ada"), "ada");
         // Bounded: a header value is not a name budget.
         assert_eq!(desired_account_name(&"l".repeat(200)).chars().count(), 60);
-        // A value with nothing name-shaped left in it still gets a name.
-        assert_eq!(desired_account_name("!!!"), FALLBACK_ACCOUNT_NAME);
+        // A value with nothing name-shaped left in it still gets a name, and
+        // it is this path's own: an account that arrived through a proxy never
+        // met a sign-on provider, and the user list is read by a person.
+        assert_eq!(desired_account_name("!!!"), PROXY_FALLBACK_ACCOUNT_NAME);
+        assert_ne!(PROXY_FALLBACK_ACCOUNT_NAME, FALLBACK_ACCOUNT_NAME);
     }
 
     #[test]
@@ -2135,6 +2174,33 @@ mod tests {
             "the parse exists so claim mapping can slot in later"
         );
         assert!(forwarded_groups("  ,, ").is_empty());
+    }
+
+    /// A list header may arrive as one line or as one line per element, and
+    /// both mean the same list. The duplicate refusal the other three headers
+    /// carry would refuse a proxy for spelling it the second way, which is not
+    /// a fault, so `Remote-Groups` is read as multi-valued instead.
+    #[test]
+    fn remote_groups_may_arrive_once_per_group() {
+        let mut headers = HeaderMap::new();
+        headers.append(REMOTE_GROUPS_HEADER, "eng".parse().unwrap());
+        headers.append(REMOTE_GROUPS_HEADER, "ops, admins".parse().unwrap());
+        assert_eq!(
+            forwarded_group_list(&headers),
+            vec!["eng".to_string(), "ops".to_string(), "admins".to_string()],
+            "repeated lines and a comma list are one list"
+        );
+        // The single-valued headers are unchanged, and the refusal now names
+        // which one arrived twice.
+        let mut headers = HeaderMap::new();
+        headers.append(REMOTE_USER_HEADER, "ada".parse().unwrap());
+        headers.append(REMOTE_USER_HEADER, "bob".parse().unwrap());
+        let err = forwarded_header(&headers, REMOTE_USER_HEADER).unwrap_err();
+        assert!(
+            err.detail.contains(REMOTE_USER_HEADER),
+            "the refusal names the header: {}",
+            err.detail
+        );
     }
 
     #[test]

@@ -1291,6 +1291,24 @@ async fn a_forward_auth_header_that_arrived_twice_is_refused() {
         fixture.auth.list_users().await.unwrap().is_empty(),
         "a refused request provisions nothing"
     );
+
+    // Remote-Groups is the exception, and it is not an exception to the rule:
+    // a list header is legitimately one line per element, so a proxy that
+    // spells the list that way is correct and is served.
+    let listed = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Groups", "eng")
+        .header("Remote-Groups", "ops")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.status(),
+        200,
+        "a repeated list header is how a list is spelled: {:?}",
+        listed.text().await
+    );
 }
 
 /// A forwarded value that cannot be a login name is refused `403` naming why,

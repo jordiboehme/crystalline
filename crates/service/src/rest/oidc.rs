@@ -525,6 +525,13 @@ struct PendingStore {
     order: VecDeque<(Instant, String)>,
 }
 
+/// How much slack the chronological order may carry over the records it
+/// indexes before a whole-order sweep is worth its cost. Small enough that the
+/// order cannot grow by much on a quiet instance, large enough that a store
+/// holding a handful of sign-ins never sweeps at all. See
+/// [`PendingStore::compact_if_slack`].
+const COMPACT_SLACK: usize = 16;
+
 /// The map is full of sign-ins too young to evict. See [`MIN_EVICT_AGE`].
 #[derive(Debug)]
 struct PendingFull;
@@ -559,6 +566,7 @@ impl PendingStore {
     fn insert(&mut self, state: String, pending: Pending) -> Result<(), PendingFull> {
         let now = Instant::now();
         self.purge_expired(now);
+        self.compact_if_slack(now);
         while self.records.len() >= MAX_PENDING {
             let Some((started, key)) = self.order.front() else {
                 break;
@@ -614,6 +622,35 @@ impl PendingStore {
             let (_, key) = self.order.pop_front().expect("checked just above");
             self.records.remove(&key);
         }
+    }
+
+    /// Sweep the whole order when it has grown far past the map it indexes.
+    ///
+    /// [`PendingStore::purge_expired`] walks from the front and stops at the
+    /// first live record, which is what makes it O(1) per record - and what
+    /// leaves one abandoned consent tab pinning everything behind it: a browser
+    /// that opened a sign-in and never came back holds the front of the order
+    /// for the whole TTL, and every spent entry behind it waits there with it.
+    /// Nothing is leaked (the TTL still ends it) and no sign-in is displaced
+    /// (eviction reads the same entries), but the order can hold several times
+    /// the sign-ins actually in flight for ten minutes at a time.
+    ///
+    /// So the front walk keeps its cheap common case and this pays for the
+    /// rare one, amortized: only when the order carries more than twice the
+    /// live records plus a slack that keeps a nearly-empty store from ever
+    /// sweeping, and only on insert, which is the path that grows it.
+    fn compact_if_slack(&mut self, now: Instant) {
+        if self.order.len() <= self.records.len() * 2 + COMPACT_SLACK {
+            return;
+        }
+        let PendingStore { records, order } = self;
+        order.retain(|(started, key)| {
+            if now.duration_since(*started) >= PENDING_TTL {
+                records.remove(key);
+                return false;
+            }
+            records.contains_key(key)
+        });
     }
 }
 
@@ -1985,9 +2022,14 @@ pub(super) fn presentation_text(value: &str) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// The account name a provisioning falls back to when a provider sends
+/// The account name a sign-on provisioning falls back to when a provider sends
 /// nothing usable to derive one from. Uniquified like any other name, so a
 /// second such person becomes `sso-user-2`.
+///
+/// The forward-auth path has its own
+/// ([`super::auth::PROXY_FALLBACK_ACCOUNT_NAME`]): a name is what an operator
+/// reads in the user list, and an account that arrived through a proxy never
+/// touched a sign-on provider.
 pub(super) const FALLBACK_ACCOUNT_NAME: &str = "sso-user";
 
 /// How long a derived name may be before it is cut. Long enough for a full
@@ -2780,6 +2822,40 @@ mod tests {
             "spent entries piled up in the order: {}",
             store.order_len()
         );
+    }
+
+    /// One abandoned consent tab must not pin the order behind it.
+    ///
+    /// The front walk stops at the first live record, so a sign-in that was
+    /// started and never finished holds the front for the whole TTL while every
+    /// spent entry behind it waits with it. The whole-order sweep is what keeps
+    /// that bounded, and it is what this test would notice the absence of: the
+    /// order would otherwise grow one entry per cycle for ten minutes.
+    #[test]
+    fn an_abandoned_sign_in_does_not_pin_the_spent_entries_behind_it() {
+        let mut store = PendingStore::default();
+        let record = || Pending {
+            nonce: Nonce::new("n".to_string()),
+            verifier: PkceCodeVerifier::new("v".repeat(43)),
+            redirect_uri: RedirectUrl::new("https://example.test/cb".to_string()).unwrap(),
+            link_for: None,
+            started: Instant::now(),
+        };
+        // The tab somebody opened and walked away from, at the front and live.
+        store.insert("abandoned".to_string(), record()).unwrap();
+        for i in 0..200 {
+            let state = format!("cycle-{i}");
+            store.insert(state.clone(), record()).unwrap();
+            assert!(store.take(&state).is_ok());
+        }
+        assert_eq!(store.len(), 1, "the abandoned sign-in is still in flight");
+        assert!(
+            store.order_len() <= COMPACT_SLACK + 2,
+            "spent entries piled up behind the abandoned one: {}",
+            store.order_len()
+        );
+        // And it is still takeable: compaction forgets nothing that is live.
+        assert!(store.take("abandoned").is_ok());
     }
 
     /// `common`, `organizations` and `consumers` are refused where the
