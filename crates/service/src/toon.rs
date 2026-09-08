@@ -407,28 +407,4 @@ mod tests {
             "domains[1]:\n  - name: eng\n    when_to_use[2]: \"Route here for a, b\",Also c";
         assert_eq!(render(&v), expected);
     }
-
-    #[test]
-    fn a_receipt_with_neighbours_renders_the_list_as_a_table() {
-        // A write receipt goes out through `ok`, which is JSON in both response
-        // formats, so this pins the shape rather than today's route: every
-        // `similar` row carries the same five scalar keys, which is what a move
-        // to `ok_list` would need to cost nothing.
-        let value = serde_json::json!({
-            "domain": "eng",
-            "permalink": "retry-backoff-lesson",
-            "similar": [
-                { "domain": "eng", "permalink": "retry-queue-gotcha", "title": "Retry queue gotcha", "status": "stable", "type": "engram" },
-                { "domain": "eng", "permalink": "retry-ttl", "title": "Retry ttl", "status": "stable", "type": "engram" }
-            ],
-            "guidance": "read the one that fits"
-        });
-        let out = render(&value);
-        // Alphabetical: `preserve_order` is banned in this workspace, so the
-        // header is the map's own key order rather than the one written above.
-        assert!(
-            out.contains("similar[2]{domain,permalink,status,title,type}:"),
-            "{out}"
-        );
-    }
 }

@@ -1393,12 +1393,30 @@ fn v301_keeps_its_findings_when_the_pair_guard_bites() {
         f.lead_vector = Some(unit(&[1.0, 0.002 * i as f32]));
         facts.push(f);
     }
+    // The closest two of the twelve are word-for-word near-duplicates as well.
+    // Closest, so their pair is the first the guard retains and the first the
+    // finding loop would reach - which is what makes this the combination
+    // worth pinning: the retained set holds a pair `V201` already owns, and
+    // the suppression drops it from inside the emitted window rather than the
+    // cap quietly doing the work.
+    facts[10].body = long_body("release");
+    facts[11].body = long_body("release").replace("pages whoever", "wakes whoever");
     let mut sweep = input(facts);
     sweep.options.max_twin_pairs = 12;
     let report = detect(&sweep);
-    assert_eq!(
-        report.findings.iter().filter(|f| f.rule == "V301").count(),
-        10
+    assert!(fired(&report).contains(&"V201"), "{:?}", fired(&report));
+    let twins: Vec<&Finding> = report
+        .findings
+        .iter()
+        .filter(|f| f.rule == "V301")
+        .collect();
+    assert_eq!(twins.len(), 10);
+    assert!(
+        !twins.iter().any(|f| {
+            f.scope.contains("engineering/twin-10") && f.scope.contains("engineering/twin-11")
+        }),
+        "the pair the cluster already prescribes a merge for is not doubled as a twin: {:?}",
+        twins.iter().map(|f| f.scope.as_str()).collect::<Vec<_>>()
     );
 }
 

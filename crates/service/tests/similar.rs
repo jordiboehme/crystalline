@@ -246,9 +246,15 @@ async fn a_hidden_domains_engram_never_reaches_a_stranger() {
     assert_eq!(permalinks(&machine), vec!["lab/retry-secrets"]);
 }
 
-/// The two guards that make the probe answer nothing, each with a neighbour
-/// sitting there to be found so an empty answer is the guard's doing and not
-/// the store's.
+/// The three ways the probe answers nothing: no provider, nothing embedded,
+/// and embeddings under another model.
+///
+/// The first and the third have a neighbour sitting there to be found, so an
+/// empty answer is the guard's doing and not the store's. The middle one
+/// cannot be shown that way and does not pretend to be: with nothing embedded
+/// at all there is no neighbour for a guard to be hiding, and the case is here
+/// because a store in that state has to stay quiet rather than because it
+/// discriminates a guard.
 #[tokio::test]
 async fn no_provider_and_no_embeddings_both_mean_no_neighbours() {
     let probe = format!("Retry queue gotcha\n{RETRY}");

@@ -1368,6 +1368,11 @@ async fn serve_with_a_virtual_domain() -> Fixture {
     let config_path = root.join("config.yaml");
     crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
     let store = TursoStore::open_in_memory().await.unwrap();
+    // No embedding provider, deliberately: this fixture exists for the virtual
+    // domain's write and manifest routes, and none of them probe. A neighbours
+    // test written against it would come back quiet for that reason rather
+    // than for the one it was asserting, so install a provider here first (as
+    // `serve` does) before writing one.
     let engine = Arc::new(Engine::new(
         Arc::new(Mutex::new(store)),
         cfg,
@@ -2740,6 +2745,36 @@ async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
     // The stranger writes first, while `eng` still holds no retry engram of its
     // own: an empty advisory here means "nothing visible", not "nothing near".
     let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // The save leg of the same rule, taken here rather than in its own test
+    // because this is the only fixture that holds a neighbour a caller may not
+    // see. `eng` has no retry engram yet, so the one engram close to what eddy
+    // is saving is the closed domain's - and an absent advisory covers both
+    // legs the create proves: quiet when nothing visible is near.
+    let (etag, content) = read_alpha(fx.addr, &eddy).await;
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &eddy,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({
+        "content": content.replace("A rule about alpha.", RETRY_AGAIN)
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved: serde_json::Value = saved.json().await.unwrap();
+    assert_eq!(
+        saved["permalink"], "alpha",
+        "the save landed, so an absent advisory is a scoped one: {saved}"
+    );
+    assert!(
+        saved.get("similar").is_none(),
+        "a closed domain's engram is nobody else's neighbour on a save either: {saved}"
+    );
     let stranger = as_session(
         fx.addr,
         reqwest::Method::POST,
