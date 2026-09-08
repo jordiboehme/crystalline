@@ -968,22 +968,31 @@ pub async fn origin_update(
 /// Report where one origin-connected domain (or every one) stands relative to
 /// its origin, plus this machine's GitHub connection: over the daemon when
 /// one owns the index, else against a directly opened store.
+///
+/// `detail` asks for each domain's unshared files to be named and grouped by
+/// kind rather than only counted, at the cost of a second walk of the working
+/// tree per domain.
 pub async fn origin_status(
     domain: Option<&str>,
+    detail: bool,
     db: Option<&Path>,
     config_path: Option<&Path>,
 ) -> anyhow::Result<Value> {
     use serde_json::json;
     if use_daemon(db, config_path)
-        && let Some(data) =
-            ctl_if_running(json!({ "v": 1, "cmd": "origin_status", "domain": domain })).await?
+        && let Some(data) = ctl_if_running(
+            json!({ "v": 1, "cmd": "origin_status", "domain": domain, "detail": detail }),
+        )
+        .await?
     {
         return Ok(data);
     }
     let loaded = overlay::load(config_path)?;
     let db_path = resolve_db(db)?;
     let engine = open_standalone(loaded, &db_path, false).await?;
-    Ok(engine.origin_status(domain, &Scope::Unrestricted).await?)
+    Ok(engine
+        .origin_status(domain, detail, &Scope::Unrestricted)
+        .await?)
 }
 
 /// Propose one team domain's local changes as a pull request against its

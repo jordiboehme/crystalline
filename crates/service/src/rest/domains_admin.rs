@@ -789,7 +789,7 @@ pub async fn sync_status(
     require_team_domain(&state, &domain, Refusal::Missing)?;
     let aggregate = state
         .engine
-        .origin_status(Some(&domain), &identity.scope())
+        .origin_status(Some(&domain), false, &identity.scope())
         .await?;
     // Lifted before `single_domain` takes the per-domain entry, which is all
     // that survives of the aggregate.
@@ -958,7 +958,10 @@ pub async fn sync_summary(
     if !state.engine.github_enabled() {
         return Err(github_off_conflict());
     }
-    let aggregate = state.engine.origin_status(None, &identity.scope()).await?;
+    let aggregate = state
+        .engine
+        .origin_status(None, false, &identity.scope())
+        .await?;
     // This one route enumerates domains rather than addressing one, and a team
     // domain the caller may not see must be absent from the rows AND from the
     // errors - a failure naming a domain would name it just as well as a

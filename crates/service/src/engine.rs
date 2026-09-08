@@ -10546,9 +10546,17 @@ impl Engine {
     /// filesystem root) never aborts the others: it is collected into the
     /// `errors` array instead, mirroring `origin_update`. Allowed on a
     /// read-only instance (a pure read).
+    ///
+    /// `detail` names the unshared work instead of only counting it: each
+    /// domain entry then carries a `detail` block grouping the changed paths
+    /// by kind (see [`origin::local_change_detail`]). It is opt-in because it
+    /// costs a second walk of every domain's working tree, so `local_changes`
+    /// stays the bare count for every caller that only wants to know whether
+    /// there is anything to share.
     pub async fn origin_status(
         &self,
         domain: Option<&str>,
+        detail: bool,
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
@@ -10561,7 +10569,7 @@ impl Engine {
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
-            match self.origin_status_one(&name, &entry).await {
+            match self.origin_status_one(&name, &entry, detail).await {
                 Ok(v) => domains.push(v),
                 Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
             }
@@ -10592,7 +10600,18 @@ impl Engine {
     /// instance-credential write the wave promises never happens, so permission
     /// is withheld and the debt stays recorded until the next share, amend or
     /// withdrawal pays it off on the acting identity's own credential.
-    async fn origin_status_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+    ///
+    /// `detail` is threaded through both arms on purpose. The retry arm is the
+    /// offline one, and offline is exactly when a caller cannot look the change
+    /// list up anywhere else, so a status that degrades to local state still
+    /// names what is unshared rather than dropping the one answer it can still
+    /// give from the working tree alone.
+    async fn origin_status_one(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        detail: bool,
+    ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
@@ -10603,8 +10622,18 @@ impl Engine {
             let config = self.config.read().unwrap();
             config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
         };
+        let change_detail = || {
+            detail
+                .then(|| origin::local_change_detail(&root, &state_dir))
+                .flatten()
+        };
         match ops::status(&spec, &root, &state_dir, probe.as_deref(), settle_owed_link).await {
-            Ok(report) => Ok(origin::status_report_json(name, &report, None)),
+            Ok(report) => Ok(origin::status_report_json(
+                name,
+                &report,
+                None,
+                change_detail(),
+            )),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
                 // (see `origin::is_probe_transport_error`), so a probe that
@@ -10617,6 +10646,7 @@ impl Engine {
                     name,
                     &report,
                     Some(e.to_string()),
+                    change_detail(),
                 ))
             }
             Err(e) => Err(e.into()),
@@ -16231,7 +16261,7 @@ mod share_actor_tests {
         write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
 
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["share_identity"], "instance");
@@ -16248,7 +16278,7 @@ mod share_actor_tests {
             .await
             .unwrap();
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["share_identity"], "personal");
@@ -16264,7 +16294,7 @@ mod share_actor_tests {
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["owner_identity"]["connected"], true);
@@ -16292,7 +16322,7 @@ mod share_actor_tests {
 
         // Instance mode has no personal slot in play at all, agent or owner.
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert!(
@@ -16308,7 +16338,7 @@ mod share_actor_tests {
             .await
             .unwrap();
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         let agent = &status["connection"]["agent_identity"];
@@ -16321,7 +16351,7 @@ mod share_actor_tests {
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert_eq!(status["connection"]["agent_identity"]["connected"], true);
@@ -16353,7 +16383,7 @@ mod share_actor_tests {
             .unwrap();
 
         let status = engine
-            .origin_status(None, &crate::scope::Scope::Unrestricted)
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
             .await
             .unwrap();
         assert!(

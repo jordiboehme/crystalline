@@ -2036,6 +2036,7 @@ async fn run_origin(command: OriginCommand, db: Option<PathBuf>, json: bool) -> 
         OriginCommand::Status { domain, config } => {
             let data = crystalline_service::origin_status(
                 domain.as_deref(),
+                false,
                 db.as_deref(),
                 config.as_deref(),
             )

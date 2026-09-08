@@ -13,14 +13,17 @@
 //! token-store host key, a validated conflict resolution) and the outputs
 //! (aggregate JSON) around those calls.
 //!
-//! Two things here read the working tree. A share plan says who last wrote each
-//! changed file ([`last_author`]), which is a line of the file's own
+//! Three things here read the working tree. A share plan says who last wrote
+//! each changed file ([`last_author`]), which is a line of the file's own
 //! frontmatter and nowhere else; it is a read of files the plan already names,
 //! and every failure of it is an absent author rather than a failed plan.
 //! [`unshared_work`] walks a team domain's tree against its base snapshot to
 //! answer "what does this domain owe its origin, and since when" offline, which
-//! the sweep, the owned-changes enrichment and the Stop hook all ask. Neither
-//! touches the network.
+//! the sweep, the owned-changes enrichment and the Stop hook all ask.
+//! [`local_change_detail`] walks the same tree to answer the other half of that
+//! question, "which files, and what happened to each", for the caller that asks
+//! a status for detail rather than a count. None of the three touches the
+//! network.
 
 use std::path::{Path, PathBuf};
 
@@ -185,10 +188,17 @@ pub(crate) fn proposal_transitions_json(
 /// by sharing or checking status again, `repair_pending` and
 /// `stack_link_pending`. All four are always present, quiet rather than
 /// absent off the stacked path, so one reader handles either path.
+///
+/// `detail` is the one key here that is opt-in: `local_changes` stays the bare
+/// count it has always been, and only a caller that asked for the file list
+/// pays for it (see [`local_change_detail`] for its shape). `None` leaves the
+/// key out altogether, so a payload nobody asked detail of is exactly the
+/// payload it was before.
 pub(crate) fn status_report_json(
     domain: &str,
     report: &OriginStatusReport,
     probe_error: Option<String>,
+    detail: Option<Value>,
 ) -> Value {
     let open: Vec<Value> = report
         .open_proposals
@@ -199,7 +209,7 @@ pub(crate) fn status_report_json(
             v
         })
         .collect();
-    json!({
+    let mut value = json!({
         "domain": domain,
         "repo": report.repo,
         "branch": report.branch,
@@ -217,7 +227,76 @@ pub(crate) fn status_report_json(
         "stack_wedged": report.stack_wedged,
         "repair_pending": report.repair_pending,
         "stack_link_pending": report.stack_link_pending,
-    })
+    });
+    if let Some(detail) = detail
+        && let Some(object) = value.as_object_mut()
+    {
+        object.insert("detail".to_string(), detail);
+    }
+    value
+}
+
+/// One team domain's unshared work named rather than counted: the same delta
+/// `local_changes` counts, grouped by what happened to each file.
+///
+/// `{ added: [...], modified: [...], deleted: [...], generated_indexes: n }`,
+/// every path domain-relative and forward-slash normalized. The three arrays
+/// carry substantive work only and their lengths sum to the report's
+/// `local_changes`; a refreshed folder listing is counted in
+/// `generated_indexes` and named in no array, the one quiet line every surface
+/// draws for the files that ride along with a share.
+///
+/// That sum holds for a tree nobody is writing to. This is a second walk,
+/// moments after the one the status itself made, and the origin lock excludes
+/// other origin operations but not an engram written between the two - so a
+/// report can name three files beside a count of two. The answer is a beat
+/// stale rather than wrong, which is the same thing every other offline read
+/// here promises.
+///
+/// Deletions are why this exists. A caller holding only a count goes to the
+/// filesystem to find out what actually changed, and a deleted file is not on
+/// the filesystem, so a timestamp scan is blind to exactly the change kind a
+/// bare number hides - and a scan whose result happens to match the count
+/// reads as confirmation, which turns a guess into a confident wrong answer.
+///
+/// `None` when the domain has no recorded origin state and when the working
+/// tree cannot be walked, the same silence [`unshared_work`] keeps for the
+/// same reasons. The caller then omits the key rather than emitting three
+/// empty arrays: "nothing is unshared" and "this could not be told" must never
+/// render the same. That is the opposite of the rule `merged_unconsumed`
+/// follows, and deliberately so - an empty merged list is a fact somebody
+/// measured, while an empty list here would be a walk that never happened.
+///
+/// The cost is one walk of the domain root with a hash per file, the same walk
+/// the status itself performs, so a caller that asks for detail pays for two.
+/// That is the price of the decision recorded at [`unshared_work`]: the
+/// aggregate report carries counts, and a change list is fetched by asking
+/// rather than threaded through every reader who did not.
+pub(crate) fn local_change_detail(domain_root: &Path, state_dir: &Path) -> Option<Value> {
+    let state = OriginState::load(state_dir).ok().flatten()?;
+    let detected =
+        crystalline_remote::changes::detect_local_changes(domain_root, &state.files).ok()?;
+    let mut added: Vec<&str> = Vec::new();
+    let mut modified: Vec<&str> = Vec::new();
+    let mut deleted: Vec<&str> = Vec::new();
+    let mut generated_indexes = 0usize;
+    for change in &detected.changes {
+        if change.is_generated_index() {
+            generated_indexes += 1;
+            continue;
+        }
+        match change {
+            LocalChange::Added { path, .. } => added.push(path),
+            LocalChange::Modified { path, .. } => modified.push(path),
+            LocalChange::Deleted { path } => deleted.push(path),
+        }
+    }
+    Some(json!({
+        "added": added,
+        "modified": modified,
+        "deleted": deleted,
+        "generated_indexes": generated_indexes,
+    }))
 }
 
 /// Whether `err` is the kind of error a live probe raises when the network
@@ -775,6 +854,81 @@ mod tests {
         assert!(work.oldest_change.is_some(), "a written file has an mtime");
     }
 
+    /// The whole point of the detail block, over the delta that misled a
+    /// reader: one added file, one modified file, one deleted file and two
+    /// refreshed folder listings.
+    ///
+    /// Each path lands in its own bucket, the listings are counted and named
+    /// nowhere, and the three arrays sum to exactly the `local_changes` the
+    /// bare count reports - so a reader can trust that naming the work and
+    /// counting it are the same measurement. The deletion is the assertion
+    /// that earns the test: it is on nobody's filesystem, so it is the one
+    /// change kind a caller cannot find any other way.
+    #[test]
+    fn local_change_detail_names_each_change_in_its_own_bucket() {
+        let (_dir, root, state_dir) = tracked_domain();
+        std::fs::create_dir_all(root.join("runbooks")).unwrap();
+        std::fs::write(root.join("added.md"), engram_source("Added", None)).unwrap();
+        std::fs::write(root.join("modified.md"), engram_source("Modified", None)).unwrap();
+        std::fs::write(root.join("index.md"), "# listing\n").unwrap();
+        std::fs::write(root.join("runbooks/index.md"), "# listing\n").unwrap();
+
+        // The base snapshot knows a different `modified.md` and a `gone.md`
+        // that is no longer on disk at all.
+        let mut state = OriginState::load(&state_dir).unwrap().unwrap();
+        for path in ["modified.md", "gone.md"] {
+            state.files.insert(
+                path.to_string(),
+                crystalline_remote::state::BaseStamp {
+                    sha256: "aa".repeat(32),
+                    size: 1,
+                },
+            );
+        }
+        state.save(&state_dir).unwrap();
+
+        let detail = local_change_detail(&root, &state_dir).expect("the domain has origin state");
+        assert_eq!(detail["added"], json!(["added.md"]));
+        assert_eq!(detail["modified"], json!(["modified.md"]));
+        assert_eq!(
+            detail["deleted"],
+            json!(["gone.md"]),
+            "a deleted file is on no filesystem, so this is the only place it can be seen"
+        );
+        assert_eq!(detail["generated_indexes"], json!(2));
+
+        let named = ["added", "modified", "deleted"]
+            .iter()
+            .map(|key| detail[*key].as_array().unwrap().len())
+            .sum::<usize>();
+        let counted = unshared_work(&root, &state_dir).unwrap().count();
+        assert_eq!(
+            named, counted,
+            "naming the work and counting it are one measurement: {detail}"
+        );
+        assert_eq!(named, 3);
+    }
+
+    /// A domain whose tree matches its origin says so in three empty arrays,
+    /// which is a measurement. A domain that could not be measured at all says
+    /// nothing, so the caller can leave the key out rather than claim there is
+    /// nothing to share.
+    #[test]
+    fn local_change_detail_tells_an_empty_delta_from_an_unmeasurable_one() {
+        let (dir, root, state_dir) = tracked_domain();
+        let detail = local_change_detail(&root, &state_dir).expect("a tracked domain measures");
+        assert_eq!(detail["added"], json!([]));
+        assert_eq!(detail["modified"], json!([]));
+        assert_eq!(detail["deleted"], json!([]));
+        assert_eq!(detail["generated_indexes"], json!(0));
+
+        assert_eq!(
+            local_change_detail(&root, &dir.path().join("no-state")),
+            None,
+            "a domain with no origin state is not a domain with nothing unshared"
+        );
+    }
+
     #[test]
     fn unshared_work_is_absent_for_a_domain_with_no_origin_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -1073,7 +1227,7 @@ mod tests {
             repair_pending: false,
             stack_link_pending: false,
         };
-        let v = status_report_json("eng", &report, None);
+        let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["domain"], "eng");
         assert_eq!(v["repo"], "acme/brand-knowledge");
         assert_eq!(v["behind"], true);
@@ -1092,7 +1246,7 @@ mod tests {
         let mut report = poll_status_fixture();
         report.merged_unconsumed = vec![4, 9];
         assert_eq!(
-            status_report_json("eng", &report, None)["merged_unconsumed"],
+            status_report_json("eng", &report, None, None)["merged_unconsumed"],
             json!([4, 9])
         );
         assert_eq!(
@@ -1121,7 +1275,7 @@ mod tests {
             repair_pending: true,
             stack_link_pending: true,
         };
-        let v = status_report_json("eng", &report, None);
+        let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["stack_number"], 42);
         assert_eq!(v["stack_wedged"], json!([7]));
         assert_eq!(v["repair_pending"], true);
@@ -1148,7 +1302,7 @@ mod tests {
             repair_pending: false,
             stack_link_pending: false,
         };
-        let v = status_report_json("eng", &report, None);
+        let v = status_report_json("eng", &report, None, None);
         assert!(v["stack_number"].is_null(), "{v}");
         assert_eq!(v["stack_wedged"], json!([]));
         assert_eq!(v["repair_pending"], false);
@@ -1176,7 +1330,7 @@ mod tests {
             stack_link_pending: false,
         };
         let message = RemoteError::Offline.to_string();
-        let v = status_report_json("eng", &report, Some(message.clone()));
+        let v = status_report_json("eng", &report, Some(message.clone()), None);
         assert_eq!(v["probe_error"], message);
     }
 
@@ -1799,7 +1953,7 @@ mod tests {
             repair_pending: false,
             stack_link_pending: false,
         };
-        let v = status_report_json("eng", &report, None);
+        let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["open_proposals"][0]["number"], 1);
         assert_eq!(v["open_proposals"][0]["amended_upstream"], false);
         assert_eq!(v["open_proposals"][1]["number"], 2);
@@ -1840,7 +1994,7 @@ mod tests {
             repair_pending: false,
             stack_link_pending: false,
         };
-        let v = status_report_json("eng", &report, None);
+        let v = status_report_json("eng", &report, None, None);
         assert_eq!(v["open_proposals"][0]["author_login"], "alice");
         assert!(
             v["open_proposals"][1]["author_login"].is_null(),

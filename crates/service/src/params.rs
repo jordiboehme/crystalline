@@ -571,6 +571,13 @@ pub struct OriginStatusParams {
     /// domain.
     #[serde(default)]
     pub domain: Option<String>,
+    /// Name the unshared files instead of only counting them: each domain
+    /// then carries a detail block listing the changed paths grouped as
+    /// added, modified and deleted, plus how many generated folder listings
+    /// ride along. Ask for it whenever you have to say WHAT is unshared;
+    /// leave it off when the count is all you need.
+    #[serde(default)]
+    pub detail: bool,
 }
 
 /// Parameters for `resolve_conflict`.

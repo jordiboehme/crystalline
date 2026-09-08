@@ -325,9 +325,12 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // relative to its origin, plus this machine's GitHub connection.
         "origin_status" => {
             let domain = req.get("domain").and_then(Value::as_str);
+            // Absent reads as false: a client from before detail existed asks
+            // for the counts it already knew how to render.
+            let detail = req.get("detail").and_then(Value::as_bool).unwrap_or(false);
             match shared
                 .engine
-                .origin_status(domain, &crate::scope::Scope::Unrestricted)
+                .origin_status(domain, detail, &crate::scope::Scope::Unrestricted)
                 .await
             {
                 Ok(data) => (envelope_ok(data), false),

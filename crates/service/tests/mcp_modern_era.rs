@@ -3260,7 +3260,7 @@ async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three()
     // And the conflict is still open.
     let status = h
         .engine
-        .origin_status(Some("kb"), &crystalline_service::Scope::Unrestricted)
+        .origin_status(Some("kb"), false, &crystalline_service::Scope::Unrestricted)
         .await
         .unwrap();
     assert_eq!(

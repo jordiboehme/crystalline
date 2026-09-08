@@ -2246,6 +2246,8 @@ async fn origin_status_tool_wires_through_to_origin_status() {
     .await
     .unwrap();
 
+    std::fs::write(root.join("gone.md"), engram("Gone", "gone", "local only")).unwrap();
+
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
     let out = call(peer, "origin_status", json!({})).await.unwrap();
@@ -2253,6 +2255,23 @@ async fn origin_status_tool_wires_through_to_origin_status() {
     let domains = out["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], json!("brand"));
+    assert_eq!(domains[0]["local_changes"], json!(1));
+    assert!(
+        domains[0].get("detail").is_none(),
+        "nobody asked for detail: {}",
+        domains[0]
+    );
+
+    // The parameter an agent has to be able to reach, all the way through the
+    // tool and back out past the lean trim.
+    let named = call(peer, "origin_status", json!({ "detail": true }))
+        .await
+        .unwrap();
+    assert_eq!(
+        named["domains"][0]["detail"]["added"],
+        json!(["gone.md"]),
+        "detail: true must reach the engine and survive the trim: {named}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
