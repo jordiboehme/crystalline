@@ -22,7 +22,15 @@ import { Link } from "react-router";
 
 import type { SimilarEngram } from "../api/engram";
 import { engramRoute } from "../paths";
-import { Chip, IconButton, statusVariant } from "./primitives";
+import { Chip, FOCUS_RING, IconButton, statusVariant } from "./primitives";
+
+/**
+ * The app's own link face: `CreateDomainDialogBody.tsx`'s "Connect GitHub in
+ * settings" is where it is measured (accent-700 on white is 5.47:1,
+ * accent-400 on slate-900 is 9.59:1), and every non-document link in the app
+ * wears it rather than the browser default.
+ */
+const LINK = `text-accent-700 underline underline-offset-2 hover:no-underline dark:text-accent-400 ${FOCUS_RING}`;
 
 export interface SimilarEngramsPanelProps {
   similar: SimilarEngram[];
@@ -61,7 +69,7 @@ export function SimilarEngramsPanel({
           >
             <Link
               to={engramRoute(entry.domain, entry.permalink)}
-              className="underline"
+              className={LINK}
             >
               {entry.title}
             </Link>

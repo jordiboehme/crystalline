@@ -729,6 +729,12 @@ describe("the engram editor", () => {
     expect(
       screen.queryByRole("status", { name: "Similar engrams" }),
     ).not.toBeInTheDocument();
+    // Dismissing takes the Dismiss button itself out of the document, and
+    // a reader who reached it from the keyboard should land back in the
+    // buffer they were editing rather than at document.body, which would
+    // restart the next Tab from the top of the page.
+    expect(document.body).not.toHaveFocus();
+    expect(screen.getByLabelText("Engram source")).toHaveFocus();
   });
 
   it("carries no neighbours advisory when the save answers with none", async () => {

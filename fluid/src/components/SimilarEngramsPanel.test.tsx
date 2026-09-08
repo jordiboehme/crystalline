@@ -14,6 +14,7 @@ import type { ReactElement } from "react";
 import { MemoryRouter } from "react-router";
 import { describe, expect, it, vi } from "vitest";
 
+import { engramRoute } from "../paths";
 import { Tooltips } from "./primitives";
 import { SimilarEngramsPanel } from "./SimilarEngramsPanel";
 
@@ -45,7 +46,7 @@ describe("SimilarEngramsPanel", () => {
     expect(screen.getByText("read the one that fits")).toBeInTheDocument();
     expect(
       screen.getByRole("link", { name: /Retry queue gotcha/ }),
-    ).toHaveAttribute("href", "/d/eng/e/retry-queue-gotcha");
+    ).toHaveAttribute("href", engramRoute("eng", "retry-queue-gotcha"));
     await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
     expect(onDismiss).toHaveBeenCalledOnce();
   });

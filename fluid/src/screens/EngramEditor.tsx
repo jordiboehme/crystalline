@@ -1119,6 +1119,12 @@ function Surface({
           guidance={advisory.guidance}
           onDismiss={() => {
             setAdvisory(null);
+            // The Dismiss control is what held focus, and it leaves the
+            // document with the panel; without this the browser drops
+            // focus to `document.body` and the next Tab restarts at the
+            // top of the page instead of continuing from the buffer a
+            // keyboard reader was just in.
+            view?.focus();
           }}
         />
       )}
