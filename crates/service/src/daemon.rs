@@ -59,12 +59,17 @@ const BANNER: &str = r"
  ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
 ";
 
-/// The copyright line the foreground banner and the daemon log both print,
-/// right after the `crystalline {version} serving on ...` line. AGPL section
-/// 13 is why it names the source: a network-served copy has to offer its
-/// users the source, so the link belongs where a user of a running instance
-/// can see it. Read from the environment rather than retyped, matching
-/// `crates/cli/src/main.rs`'s `VERSION_BLOCK`.
+/// The copyright line the foreground banner prints right after the
+/// `crystalline {version} serving on ...` line - outside the `is_terminal`
+/// guard, so a foreground run whose stderr is redirected to a file carries
+/// it too. (`--daemon` never reaches this branch at all: there is no
+/// terminal to print a banner to, and its own, separate startup output below
+/// is limited to the `tracing::info!` lines a backgrounded first-run wizard
+/// still needs.) AGPL section 13 is why it names the source: a
+/// network-served copy has to offer its users the source, so the link
+/// belongs where a user of a running instance can see it. Read from the
+/// environment rather than retyped, matching `crates/cli/src/main.rs`'s
+/// `VERSION_BLOCK`.
 const COPYRIGHT_LINE: &str = concat!(
     "Copyright (C) 2026 Jordi Boehme - ",
     env!("CARGO_PKG_LICENSE"),
@@ -2609,11 +2614,13 @@ mod tests {
         );
     }
 
-    /// The banner's copyright line, printed right after
+    /// The foreground banner's copyright line, printed right after
     /// `crystalline {version} serving on ...` outside the `is_terminal`
-    /// guard so a captured log carries it too. Names the same copyright
-    /// holder, license and source `crates/cli/src/main.rs`'s `VERSION_BLOCK`
-    /// does, both read from the environment so a Cargo.toml change carries.
+    /// guard so a redirected foreground run's stderr still carries it (see
+    /// [`COPYRIGHT_LINE`] for why `--daemon` does not). Names the same
+    /// copyright holder, license and source `crates/cli/src/main.rs`'s
+    /// `VERSION_BLOCK` does, both read from the environment so a Cargo.toml
+    /// change carries.
     #[test]
     fn the_banner_copyright_line_names_the_license_and_the_source() {
         assert_eq!(
