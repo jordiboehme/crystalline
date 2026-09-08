@@ -294,9 +294,19 @@ const MAX_PENDING_PER_CLIENT: usize = 4;
 
 /// The most registrations that can be alive at once without a single consent
 /// behind them: the burst rate carried across the unauthorized lifetime.
+///
+/// The division rounds up, and both directions of that matter for a number
+/// whose whole job is to be an upper bound. Rounding down understates it
+/// whenever the lifetime is not a whole number of windows - a seven minute
+/// window inside an hour floors to eight bursts where nine can be alive -
+/// and a window raised past the lifetime floors to zero, which would leave the
+/// assert below comparing nothing against the map size and passing however the
+/// other three numbers moved, while the real ceiling is one whole burst. A
+/// bound that rounds the safe way holds through an edit to any of them instead
+/// of having to be re-derived.
 const UNSTAMPED_CLIENT_CEILING: usize = REGISTRATION_BURST
-    * (crate::rest::auth_store::OAUTH_CLIENT_UNAUTHORIZED_SECS as usize
-        / REGISTRATION_WINDOW.as_secs() as usize);
+    * (crate::rest::auth_store::OAUTH_CLIENT_UNAUTHORIZED_SECS as usize)
+        .div_ceil(REGISTRATION_WINDOW.as_secs() as usize);
 
 // The two bounds compose or the per-client cap buys nothing: an unauthenticated
 // flood must not be able to fill the map even with every registration it can
