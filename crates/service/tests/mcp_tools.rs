@@ -5,6 +5,8 @@
 //! engine shares an in-memory store; domains are real temp directories because
 //! files are the source of truth.
 
+mod support;
+
 use std::sync::Arc;
 
 use crystalline_core::config::{
@@ -103,6 +105,26 @@ impl Harness {
             tokio::spawn(
                 async move { rmcp::serve_server(McpServer::new(engine), server_io).await },
             );
+        let client = rmcp::serve_client((), client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// [`Harness::connect`] over the HTTP transport, which with no identity
+    /// extension inserted is [`crystalline_service::Scope::Anonymous`] - the
+    /// legacy open tier, the one scope reachable in-process that is narrower
+    /// than the machine owner's.
+    async fn connect_http(
+        &self,
+    ) -> (
+        RunningService<RoleClient, ()>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let server_task = tokio::spawn(async move {
+            rmcp::serve_server(McpServer::new_http(engine), server_io).await
+        });
         let client = rmcp::serve_client((), client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
         (client, server)
@@ -4776,5 +4798,177 @@ async fn remove_domain_is_hidden_and_refused_on_a_read_only_instance() {
     assert!(
         listed.to_string().contains("eng"),
         "and nothing was unregistered: {listed}"
+    );
+}
+
+// --- the neighbours advisory on a write receipt ------------------------------
+
+const RETRY: &str = "The retry queue doubles its backoff on every failure.\nA dead-letter ttl bounds how long a retry waits.\nRaising the ttl fixed the stuck retries last time.";
+const RETRY_AGAIN: &str = "Retries wait on a backoff that doubles each time.\nThe dead-letter ttl is the bound on a stuck retry.\nWe raised the ttl and the queue drained.";
+
+#[tokio::test]
+async fn write_and_content_edit_receipts_name_their_neighbours() {
+    let h = Harness::new(&["eng"]).await;
+    h.engine.set_provider(Arc::new(support::TopicEmbedder));
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let first = call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry queue gotcha", "content": RETRY, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        first.get("similar").is_none(),
+        "nothing near the first capture: {first}"
+    );
+    h.engine.embed_pending().await.unwrap();
+
+    let second = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Retry backoff lesson",
+            "content": RETRY_AGAIN,
+            "tags": ["t"]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{second}"
+    );
+    assert_eq!(second["similar"][0]["type"], "engram");
+    assert_eq!(second["similar"][0]["status"], "stable");
+    assert_eq!(second["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert!(second["similar"].as_array().unwrap().len() <= 3);
+
+    let appended = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "retry-backoff-lesson", "domain": "eng", "operation": "append",
+            "content": "- [lesson] a retry storm needs a longer dead-letter ttl and a wider backoff on the queue #retry"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        appended["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{appended}"
+    );
+    assert_eq!(appended["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+
+    let flipped = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "retry-backoff-lesson", "domain": "eng",
+            "operation": "set_frontmatter", "key": "salience", "value": "7"
+        }),
+    )
+    .await
+    .unwrap();
+    // `call` hands back a bare `Value::String` for a tool-level refusal, and
+    // `.get` on a string is always `None`, so the receipt is pinned before the
+    // absence is read: a refused edit must not read as a silent one.
+    assert_eq!(
+        flipped["operation"], "set_frontmatter",
+        "the flip landed: {flipped}"
+    );
+    assert!(
+        flipped.get("similar").is_none(),
+        "set_frontmatter never probes: {flipped}"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it() {
+    // The one property this file can prove that the engine tests cannot: the
+    // handler passes the CALLER's scope rather than a hard-coded
+    // `Scope::Unrestricted`. `lab` is private, so it is a neighbour over stdio
+    // (the machine owner) and invisible over the open HTTP tier.
+    let h = Harness::new(&["eng", "lab"]).await;
+    h.engine.set_provider(Arc::new(support::TopicEmbedder));
+    h.engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "lab".to_string(),
+            title: "Retry secrets".to_string(),
+            content: RETRY.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["t".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    h.engine.embed_pending().await.unwrap();
+
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&h.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "owner",
+        "owner",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    auth.set_domain_visibility("lab", true, "owner")
+        .await
+        .unwrap();
+    h.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+
+    // The open tier first, while `eng` still holds no retry engram of its own:
+    // an empty advisory here means "nothing visible", not "nothing near".
+    let (anon, _s1) = h.connect_http().await;
+    let stranger = call(
+        anon.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    // Same guard as above, and it carries more here: without it a write the
+    // open tier REFUSED would read exactly like one that was scoped.
+    assert_eq!(
+        stranger["permalink"], "retry-backoff-lesson",
+        "the open tier's write landed: {stranger}"
+    );
+    assert!(
+        stranger.get("similar").is_none(),
+        "a private domain's engram never reaches the open tier: {stranger}"
+    );
+    h.engine.embed_pending().await.unwrap();
+
+    let (owner, _s2) = h.connect().await;
+    let machine = call(
+        owner.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry ttl note", "content": RETRY_AGAIN, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = machine["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["permalink"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"retry-secrets"),
+        "the machine owner sees the private domain's neighbour: {machine}"
     );
 }

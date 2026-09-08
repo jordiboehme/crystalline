@@ -37,6 +37,27 @@ async fn engine() -> (tempfile::TempDir, Arc<Engine>) {
     (tmp, engine)
 }
 
+/// [`engine`] with a live embed worker behind it: the channel is wired into
+/// [`build`] and `run_embed_worker` is listening on the other end by the time
+/// this returns. The pair a write's nudge needs to be observable at all - with
+/// no channel `request_embed` is a no-op and there is nothing to watch drain.
+async fn engine_with_worker() -> (tempfile::TempDir, Arc<Engine>) {
+    let (tmp, store) = fresh_store().await;
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let engine = build(
+        &tmp,
+        store,
+        Some(Arc::new(support::TopicEmbedder)),
+        Some(tx),
+        None,
+    );
+    tokio::spawn(crystalline_service::engine::run_embed_worker(
+        engine.clone(),
+        rx,
+    ));
+    (tmp, engine)
+}
+
 /// A fresh in-memory store and the temp directory its config lives in, kept
 /// apart from [`build`] so two engines can be raised over the same store.
 async fn fresh_store() -> (tempfile::TempDir, Arc<Mutex<TursoStore>>) {
@@ -564,4 +585,54 @@ async fn a_cancelled_probe_leaves_the_engine_answering() {
         .await
         .unwrap();
     assert_eq!(permalinks(&after), vec!["open/retry-backoff-lesson"]);
+}
+
+/// A poll with a ceiling and no fixed sleep: the property is "well before the
+/// 300-second tick", and the loop returns the moment it holds.
+async fn backlog_drains(engine: &Engine, within: Duration) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if engine.embedding_backlog().await.unwrap() == 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_write_is_embedded_long_before_the_tick() {
+    let (_tmp, engine) = engine_with_worker().await;
+    engine
+        .write_engram(&write("open", "Retry queue gotcha", RETRY, None))
+        .await
+        .unwrap();
+    assert!(
+        backlog_drains(&engine, Duration::from_secs(5)).await,
+        "the write nudged the worker; nothing waited for the tick"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn back_to_back_writes_see_each_other() {
+    let (_tmp, engine) = engine_with_worker().await;
+    engine
+        .write_engram(&write("open", "Retry queue gotcha", RETRY, None))
+        .await
+        .unwrap();
+    let second = write("open", "Retry backoff lesson", RETRY_AGAIN, None);
+    let mut receipt = engine.write_engram(&second).await.unwrap();
+    engine
+        .attach_similar(
+            &mut receipt,
+            SimilarProbe::for_write(&second),
+            &Scope::Unrestricted,
+        )
+        .await;
+    assert_eq!(
+        receipt["similar"][0]["permalink"], "retry-queue-gotcha",
+        "the probe waited for the worker: {receipt}"
+    );
 }

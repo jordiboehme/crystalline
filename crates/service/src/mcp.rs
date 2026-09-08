@@ -971,6 +971,7 @@ use crate::engine::{
 use crate::params::*;
 use crate::rest::member_level_word;
 use crate::scope::{DomainRight, Scope};
+use crate::similar::SimilarProbe;
 
 /// The connected client's identity in the OKF agent form `name/version`, read
 /// from the initialize handshake rmcp keeps on the peer.
@@ -1411,6 +1412,23 @@ impl McpServer {
             },
         }
     }
+
+    /// A write receipt with the neighbours advisory attached, for the two
+    /// verbs whose caller is an agent in the loop. Scoped by the caller, so a
+    /// private domain's engram is a neighbour only to someone who may see it.
+    ///
+    /// Called from here rather than from inside the engine verb on purpose:
+    /// the probe takes the store lock, which is not reentrant, so it may only
+    /// run once the write has returned and released it.
+    async fn with_similar(
+        &self,
+        mut receipt: Value,
+        probe: SimilarProbe<'_>,
+        scope: &Scope,
+    ) -> Value {
+        self.engine.attach_similar(&mut receipt, probe, scope).await;
+        receipt
+    }
 }
 
 #[tool_router]
@@ -1418,7 +1436,7 @@ impl McpServer {
     #[tool(
         name = "write_engram",
         title = "Capture engram",
-        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing.",
+        description = "Capture a new engram - a unit of knowledge - into a domain. Writes the markdown file and indexes it. Body bullets: '- [decision] we chose X #tag' become observations, '- rel_type [[Target]]' become relations. domain is required so an engram never lands in the wrong place. Pass folder to file the engram under a topic prefix: reuse the domain's existing layout (browse_domain shows it), start a subfolder when a topic cluster is forming and keep singletons at the root; the folder path becomes the permalink prefix build_context globs as crystalline://domain/folder/*. permalink, status, recorded_at and generated (who wrote it and when) are filled in; valid_from/valid_to are never auto-set - absence means always valid; to bound validity pass them inside metadata as plain ISO dates (YYYY-MM-DD). Any other date format is rejected; a sentinel far-future valid_to and an explicit null are dropped, since absence already means valid forever. Recommended type values: engram, guide, decision, architecture, runbook, reference. Recommended status values (guidance, not enforced): stable, implemented, draft, proposed, idea, poc, deprecated, superseded, archived, legacy. stable is the default and the word for knowledge that holds now; current is the legacy alias for the same state, and a status filter on either word matches engrams carrying either. Of those, deprecated, superseded, archived and legacy are the recognized retirement set: a status inside it softly fades in search ranking, any other value ranks at full strength. Errors if the permalink exists unless overwrite is true, and refuses a title that would file the engram as the reserved index.md or log.md (Crystalline generates the folder index itself). On a 2026-07-28 peer that declared an elicitation capability a permalink collision is not the bare error: the call writes nothing and answers input_required instead, a single-select question offering overwrite or cancel, which the client puts to the user and answers by re-sending the same call with the choice; cancel leaves the existing engram exactly as it is, and an explicit overwrite=true never asks. The vocabulary tool lists tags already in use; reuse one before coining a new tag. Set an optional numeric salience metadata key (0-10) to mark exceptionally valuable knowledge; salient engrams are lifted in hybrid search ranking. Raise it later to elevate an engram that proved load-bearing. The receipt may carry a similar list: up to three existing engrams closest in meaning to what was just written, with guidance - read the one that fits and merge into it, supersede it or link it, and say so; never ignore the list silently.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1432,10 +1450,8 @@ impl McpServer {
         responses: InputResponses,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
-        if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
-            .await?
-        {
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
             return refuse(refusal).map(CallToolResponse::from);
         }
         let actor = acting_actor(&ctx);
@@ -1480,10 +1496,11 @@ impl McpServer {
             _ => None,
         };
         let Some(permalink) = collision else {
-            return written
-                .map_err(to_error)
-                .and_then(ok_written)
-                .map(CallToolResponse::from);
+            let receipt = written.map_err(to_error)?;
+            let receipt = self
+                .with_similar(receipt, SimilarProbe::for_write(&p), &scope)
+                .await;
+            return ok_written(receipt).map(CallToolResponse::from);
         };
 
         match resolved_overwrite(&responses.0) {
@@ -1502,12 +1519,15 @@ impl McpServer {
             Some(true) => {
                 let mut retry = p.clone();
                 retry.overwrite = true;
-                self.engine
+                let receipt = self
+                    .engine
                     .write_engram_as(&retry, actor.as_deref())
                     .await
-                    .map_err(to_error)
-                    .and_then(ok_written)
-                    .map(CallToolResponse::from)
+                    .map_err(to_error)?;
+                let receipt = self
+                    .with_similar(receipt, SimilarProbe::for_write(&retry), &scope)
+                    .await;
+                ok_written(receipt).map(CallToolResponse::from)
             }
         }
     }
@@ -1538,7 +1558,7 @@ impl McpServer {
     #[tool(
         name = "edit_engram",
         title = "Edit engram",
-        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it errors when the engram carries no entry for that rule and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
+        description = "Refine an existing engram in place as understanding evolves. Sections are addressed by heading path such as '## API > ### Auth'; replace_section keeps deeper subsections unless include_subsections is set. operation is one of append, prepend, find_replace, replace_section, insert_before_section, insert_after_section, set_frontmatter. find_replace takes find_text and an optional expected_replacements guard that fails on a count mismatch. set_frontmatter assigns one lifecycle field by key and value instead of text-substituting a frontmatter line: the settable keys are status, valid_from, valid_to, stale_after, source_date, salience, verified and evolve_ack, and nothing else (identity, tags, recorded_at and the generated block are refused). Use it to retire an engram, close or reopen a validity window, push a review date forward, mark knowledge salient or record that you re-checked something. Omit value to remove the field (that is how a valid_to that should never have been set is cleared); status cannot be removed. The four date keys take a plain ISO date (YYYY-MM-DD) and salience a number from 0 to 10. verified never removes: it stamps { by, at } with the current instant, taking value as the verifying actor and falling back to your own identity when value is omitted. evolve_ack is never cleared by an omitted value either: it acknowledges an evolve finding the user ruled intentional, taking value as the rule id optionally followed by a note ('V101' or 'V101 lineage citation, keep'), and the server records what evidence the finding fired on so the acknowledgment holds while that evidence holds and comes back marked stale when it changes; acknowledging the same rule again replaces the entry. To unacknowledge a finding - to unack it, to take back an acknowledgment so the finding resurfaces on the next sweep - pass the value 'remove <rule-id>' ('remove V101') on the same key; it errors when the engram carries no entry for that rule and the receipt reports evolve_ack_removed. Take an acknowledgment back only when the user asks. On a 2026-07-28 peer that declared an elicitation capability, an evolve_ack assignment - recording one or taking one back, and only that key - writes nothing on the first call and answers input_required instead: a confirmation question naming the rule and the engram, which the client puts to the user and answers by re-sending the same call with the confirmation; every other operation and key runs on the first call as before. Pass expected_checksum (from read_engram) to guard an edit against a change since your read: a conflict is refused if it changed, so re-read and retry; omit it for last-write-wins. The generated provenance block is refreshed with who edited it and when. A content edit's receipt may carry a similar list, the existing engrams closest in meaning to the text just added, with guidance to merge, supersede, link or leave them; set_frontmatter never probes. Status values to reflect a changed lifecycle (recommended values: see write_engram). Temporal frontmatter fields (recorded_at, valid_from, valid_to, source_date, stale_after, plus the legacy last_verified and review_after spellings) must stay plain ISO dates (YYYY-MM-DD): an edit that leaves one malformed is rejected and a sentinel far-future valid_to or an explicit null is dropped, except recorded_at which is required and cannot be nulled.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1556,10 +1576,8 @@ impl McpServer {
         // engram in a domain the caller may not see is the leak this gate
         // exists to prevent, and a question about a write that would be
         // refused is a question nobody should be asked.
-        if let Some(refusal) = self
-            .refuse_unwritable(&p.domain, &self.scope_of(&ctx))
-            .await?
-        {
+        let scope = self.scope_of(&ctx);
+        if let Some(refusal) = self.refuse_unwritable(&p.domain, &scope).await? {
             return refuse(refusal).map(CallToolResponse::from);
         }
         // One key arms the round and every other edit runs untouched. The
@@ -1581,12 +1599,18 @@ impl McpServer {
                 Some(true) => {}
             }
         }
-        self.engine
+        let receipt = self
+            .engine
             .edit_engram_as(&p, acting_actor(&ctx).as_deref())
             .await
-            .map_err(to_error)
-            .and_then(ok_written)
-            .map(CallToolResponse::from)
+            .map_err(to_error)?;
+        // `for_edit` is `None` for `set_frontmatter` and for any operation that
+        // carried no content, which is what keeps a lifecycle flip silent.
+        let receipt = match SimilarProbe::for_edit(&p) {
+            Some(probe) => self.with_similar(receipt, probe, &scope).await,
+            None => receipt,
+        };
+        ok_written(receipt).map(CallToolResponse::from)
     }
 
     #[tool(

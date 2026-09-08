@@ -2400,6 +2400,7 @@ impl Engine {
         }
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
+        self.nudge_embed();
 
         Ok(json!({
             "domain": p.domain,
@@ -2564,6 +2565,7 @@ impl Engine {
             self.refresh_routing_cache().await;
         }
         self.refresh_index_files(&desc.domain).await;
+        self.nudge_embed();
 
         Ok(json!({
             "domain": desc.domain,
@@ -2654,6 +2656,7 @@ impl Engine {
                 });
             receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
+        self.nudge_embed();
         Ok(json!({
             "domain": domain,
             "permalink": permalink,
@@ -3518,6 +3521,7 @@ impl Engine {
             }
             self.refresh_index_files(&succ_desc.domain).await;
         }
+        self.nudge_embed();
 
         Ok(json!({
             "domain": desc.domain,
@@ -4357,6 +4361,10 @@ impl Engine {
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;
+        // One call for both arms, and exactly right there: this tail is
+        // reached only when the arm that ran committed its bytes, so a refused
+        // edit never schedules a pass for a chunk that was not rewritten.
+        self.nudge_embed();
         Ok(())
     }
 
@@ -8729,6 +8737,16 @@ impl Engine {
             Some(tx) => tx.send(()).is_ok(),
             None => false,
         }
+    }
+
+    /// Ask the embed worker to pick up what a write just chunked, without
+    /// waiting for it. A write never embeds inline: the point of the worker is
+    /// that a write returns at the speed of the disk, and a virtual domain -
+    /// never watched - would otherwise sit unembedded until the self-heal
+    /// tick. With no worker wired this is a no-op, as [`Engine::request_embed`]
+    /// already is.
+    fn nudge_embed(&self) {
+        let _ = self.request_embed();
     }
 
     // --- configure -------------------------------------------------------------
