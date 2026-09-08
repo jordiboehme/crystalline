@@ -2203,6 +2203,24 @@ fn write_ops() -> Vec<WriteOp> {
             min_role: Role::Viewer,
             read_only_exempt: true,
         },
+        // Revoking a connected client: the profile-card counterpart of the
+        // MCP token surface above, on the exact same settlement - every
+        // account may revoke its own, viewers included, and a read-only
+        // instance still serves it because a grant is account state in the
+        // accounts database rather than knowledge. Unlike the MCP token rows,
+        // nothing in this matrix mints a real oauth grant, so there is no
+        // small id to collide with; `10` is the next free literal after the
+        // consent row's `9` (see `write_ops`'s oauth/authorizations row). The
+        // fixture instance serves no OAuth at all, so every allowed leg
+        // answers 404 - past authorization, which is what this matrix
+        // asserts - revoking nothing.
+        WriteOp {
+            method: Method::DELETE,
+            path: "/api/v1/me/oauth-grants/10",
+            body: None,
+            min_role: Role::Viewer,
+            read_only_exempt: true,
+        },
         // The self-service identity-link surface, on the same settlement as
         // the tokens above: every account may give up its own link, and an
         // identity link is account state rather than knowledge, so a
@@ -2419,6 +2437,13 @@ fn canonicalize(path: &str) -> String {
     // the token ids above are.
     if path.starts_with("/api/v1/oauth/authorizations/") {
         return "/api/v1/oauth/authorizations/{id}".to_string();
+    }
+    // The connected-clients route's id is a numeric grant row id, which the
+    // per-segment pass below cannot tell apart from the share surface's
+    // proposal number either: named here for the same reason the token ids
+    // above are.
+    if path.starts_with("/api/v1/me/oauth-grants/") {
+        return "/api/v1/me/oauth-grants/{id}".to_string();
     }
     // The identity-link route takes an issuer url percent-encoded into one
     // segment, which no per-segment name could match: it is spelled out here

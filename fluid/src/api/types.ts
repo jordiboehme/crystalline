@@ -1079,6 +1079,46 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/me/oauth-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's own OAuth grants, newest first.
+         * @description Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge.
+         */
+        get: operations["list_my_oauth_grants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/oauth-grants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one of the caller's own connected clients.
+         * @description Both of the grant's tokens stop resolving at once: the next request either presents at the MCP gate is refused at the door. Only the caller's own grants can be named - any other id is 404, the same answer an unknown one gets, so another account's connections cannot be probed for.
+         */
+        delete: operations["revoke_my_oauth_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/oauth/authorizations/{id}": {
         parameters: {
             query?: never;
@@ -2109,6 +2149,39 @@ export interface components {
              * @example a redirect uri must be an https url, or an http url on a loopback address
              */
             error_description: string;
+        };
+        /**
+         * @description One row of an account's OAuth grant list: which client is connected, since
+         *     when, and until when it may keep refreshing. Never carries a token - only
+         *     hashes are stored, so there is nothing to show back.
+         */
+        OauthGrantInfo: {
+            /** @description The registration this grant belongs to. */
+            client_id: string;
+            /**
+             * @description The name that registration gave for itself, or a stand-in when the
+             *     registration is gone.
+             */
+            client_name: string;
+            /** @description RFC 3339, when the grant was created. */
+            created_at: string;
+            /**
+             * Format: int64
+             * @description The grant's id, which is what revokes it.
+             */
+            id: number;
+            /** @description RFC 3339, when one of its access tokens last resolved a request. */
+            last_used?: string | null;
+            /**
+             * @description The host the client is redirected back to, for a person deciding
+             *     whether they recognize this connection.
+             */
+            redirect_host: string;
+            /**
+             * @description RFC 3339, when the refresh token stops working unless it is rotated
+             *     before then.
+             */
+            refresh_expires_at: string;
         };
         /** @description The configured single sign-on provider as the sign-in screen needs it: whether to draw the button and what to write on it. Never the issuer, the client id or the secret. */
         OidcProviderView: {
@@ -6996,6 +7069,92 @@ export interface operations {
                 };
             };
             /** @description No token of the caller's carries that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_my_oauth_grants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This account's connected clients. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthGrantInfo"][];
+                };
+            };
+            /** @description No identity, or an anonymous one: the anonymous viewer has no account and so holds no grants. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    revoke_my_oauth_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description One of the caller's own grant ids. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The grant is gone; both its tokens are dead. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No grant of the caller's carries that id. */
             404: {
                 headers: {
                     [name: string]: unknown;

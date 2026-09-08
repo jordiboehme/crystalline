@@ -20,6 +20,7 @@ mod identity_links;
 mod mcp_tokens;
 mod members;
 mod oauth;
+mod oauth_grants;
 mod oidc;
 mod users_api;
 
@@ -173,6 +174,8 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::authorize,
         oauth::authorization,
         oauth::decide,
+        oauth_grants::list,
+        oauth_grants::revoke,
         identity_links::list,
         identity_links::unlink,
     ),
@@ -233,6 +236,7 @@ use crate::scope::{DomainAccess, DomainRight};
         oauth::DecisionBody,
         oauth::Decision,
         oauth::DecisionResponse,
+        OauthGrantInfo,
     )),
 )]
 struct ApiDoc;
@@ -732,6 +736,14 @@ pub fn router(state: RestState) -> Router {
         )
         .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
         .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
+        // The caller's own OAuth grants - the clients connected through
+        // `/oauth/authorize` - on the exact settlement the two routes above
+        // carry: self-service, every account included, served on a
+        // read-only instance because a grant is account state rather than
+        // knowledge. Revoking deletes the row outright, so both of its
+        // tokens stop resolving at the MCP gate on the very next request.
+        .route("/me/oauth-grants", get(oauth_grants::list))
+        .route("/me/oauth-grants/{id}", delete(oauth_grants::revoke))
         // The caller's own single sign-on identities, on the same settlement
         // as the tokens above: self-service, every account included, and
         // served on a read-only instance because a link is account state

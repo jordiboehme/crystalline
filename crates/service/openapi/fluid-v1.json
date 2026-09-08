@@ -5526,6 +5526,108 @@
         }
       }
     },
+    "/api/v1/me/oauth-grants": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The caller's own OAuth grants, newest first.",
+        "description": "Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge.",
+        "operationId": "list_my_oauth_grants",
+        "responses": {
+          "200": {
+            "description": "This account's connected clients.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OauthGrantInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: the anonymous viewer has no account and so holds no grants.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/oauth-grants/{id}": {
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Revoke one of the caller's own connected clients.",
+        "description": "Both of the grant's tokens stop resolving at once: the next request either presents at the MCP gate is refused at the door. Only the caller's own grants can be named - any other id is 404, the same answer an unknown one gets, so another account's connections cannot be probed for.",
+        "operationId": "revoke_my_oauth_grant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "One of the caller's own grant ids.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The grant is gone; both its tokens are dead."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No grant of the caller's carries that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/oauth/authorizations/{id}": {
       "get": {
         "tags": [
@@ -7965,6 +8067,52 @@
             "type": "string",
             "description": "What is wrong, in words.",
             "example": "a redirect uri must be an https url, or an http url on a loopback address"
+          }
+        }
+      },
+      "OauthGrantInfo": {
+        "type": "object",
+        "description": "One row of an account's OAuth grant list: which client is connected, since\nwhen, and until when it may keep refreshing. Never carries a token - only\nhashes are stored, so there is nothing to show back.",
+        "required": [
+          "id",
+          "client_id",
+          "client_name",
+          "redirect_host",
+          "created_at",
+          "refresh_expires_at"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The registration this grant belongs to."
+          },
+          "client_name": {
+            "type": "string",
+            "description": "The name that registration gave for itself, or a stand-in when the\nregistration is gone."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339, when the grant was created."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The grant's id, which is what revokes it."
+          },
+          "last_used": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339, when one of its access tokens last resolved a request."
+          },
+          "redirect_host": {
+            "type": "string",
+            "description": "The host the client is redirected back to, for a person deciding\nwhether they recognize this connection."
+          },
+          "refresh_expires_at": {
+            "type": "string",
+            "description": "RFC 3339, when the refresh token stops working unless it is rotated\nbefore then."
           }
         }
       },
