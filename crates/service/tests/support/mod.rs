@@ -1330,6 +1330,19 @@ impl StubConnectAuth {
         self.start_results.lock().unwrap().push_back(start);
     }
 
+    /// Re-arm the one-shot run and validate outcomes.
+    ///
+    /// The constructors set each once, which is right for a test that drives
+    /// exactly one sign-in. A test whose flow may legitimately run a second
+    /// time - a restart that abandons the first and starts again - would
+    /// otherwise panic inside the double on the used-up outcome, and a panic in
+    /// a double reads as a bug in the code under test. Pairs with
+    /// [`StubConnectAuth::queue_start`], which does the same for the code.
+    pub fn rearm(&self, run: Result<String, RemoteError>, validate: Result<String, RemoteError>) {
+        *self.run_result.lock().unwrap() = Some(run);
+        *self.validate_result.lock().unwrap() = Some(validate);
+    }
+
     /// Whether a `run_device_flow` future was dropped before it answered -
     /// the shape an abandoned flow's aborted task has from in here. Polled
     /// rather than awaited: an abort takes effect at the task's next poll.

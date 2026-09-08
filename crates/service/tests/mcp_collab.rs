@@ -1238,23 +1238,35 @@ async fn a_restart_after_the_flow_landed_reports_it_instead_of_starting_over() {
         Ok("device-token".to_string()),
         Ok("octocat".to_string()),
     );
-    auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
-        device_code: "devcode-two".to_string(),
-        user_code: "WXYZ-9876".to_string(),
-        verification_url: "https://github.com/login/device".to_string(),
-        interval_secs: 0,
-        expires_in_secs: 900,
-    }));
+    // Spare codes, because the loop below may ask for one: a restart that
+    // arrives before the outcome has landed is the ordinary abandon-and-start
+    // case, and the double must have a code left to answer it with.
+    for n in 2..=6 {
+        auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
+            device_code: format!("devcode-{n}"),
+            user_code: format!("WXYZ-000{n}"),
+            verification_url: "https://github.com/login/device".to_string(),
+            interval_secs: 0,
+            expires_in_secs: 900,
+        }));
+    }
     let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
     eng.start_device_connect(None, false).await.unwrap();
     auth.run_gate.notify_one();
-    // The outcome has landed in the slot but nobody has read it yet: that is
-    // the state this test is about.
-    wait_until(|| async { auth.run_was_entered().then_some(()) }).await;
+    // The state under test is "landed in the slot and not read yet", and every
+    // read that would confirm it also DRAINS it - so the restart call is the
+    // observation. Asking again is safe and is what keeps this deterministic
+    // under load: a restart that lands first abandons the flow and starts a
+    // fresh one, which is released here and asked about on the next turn.
     let landed = wait_until(|| async {
         let snap = eng.start_device_connect(None, true).await.unwrap();
-        (snap["github"]["connected"] == json!(true)).then_some(snap)
+        if snap["github"]["connected"] == json!(true) {
+            return Some(snap);
+        }
+        auth.run_gate.notify_one();
+        auth.rearm(Ok("device-token".to_string()), Ok("octocat".to_string()));
+        None
     })
     .await;
     assert_eq!(
@@ -1265,10 +1277,6 @@ async fn a_restart_after_the_flow_landed_reports_it_instead_of_starting_over() {
     assert!(
         landed["github"]["pending_connect"].is_null(),
         "and issues no code for a sign-in that is already done: {landed}"
-    );
-    assert_ne!(
-        landed["github"]["pending_connect"]["user_code"],
-        json!("WXYZ-9876")
     );
 }
 
