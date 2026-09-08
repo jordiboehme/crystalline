@@ -3792,7 +3792,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own read payload for the new engram. */
+            /** @description The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. */
             201: {
                 headers: {
                     /** @description The quoted checksum of the engram as written, the token a later save carries in `If-Match`. */
@@ -3996,7 +3996,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own read payload for the saved engram. */
+            /** @description The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. */
             200: {
                 headers: {
                     /** @description The quoted checksum of the engram as saved, the token the next save carries. */

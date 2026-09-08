@@ -1693,7 +1693,7 @@
         },
         "responses": {
           "201": {
-            "description": "The engine's own read payload for the new engram.",
+            "description": "The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string.",
             "headers": {
               "etag": {
                 "schema": {
@@ -1963,7 +1963,7 @@
         },
         "responses": {
           "200": {
-            "description": "The engine's own read payload for the saved engram.",
+            "description": "The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string.",
             "headers": {
               "etag": {
                 "schema": {

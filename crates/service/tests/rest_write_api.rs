@@ -29,6 +29,9 @@ struct Options {
 struct Fixture {
     addr: std::net::SocketAddr,
     auth: Arc<AuthStore>,
+    /// The engine the router serves, so a test can seed a second domain, drain
+    /// the embedding backlog or otherwise set up a state no route reaches.
+    engine: Arc<Engine>,
     /// Every successful write on this surface marks its domain pending in the
     /// maintenance state file under the state directory, so every fixture here
     /// redirects that directory into a scratch home for the test's duration.
@@ -104,6 +107,12 @@ async fn serve(opts: Options) -> Fixture {
             .with_connect_auth(Arc::new(support::StubConnectAuth::accepting("octo"))),
     );
     engine.sync(None).await.unwrap();
+    // A deterministic embedder, so the neighbours advisory on create and save
+    // is assertable at all: without a provider the probe returns empty before
+    // it does any work, and every write here would look quiet for the wrong
+    // reason. No embed worker is wired, so nothing is embedded until a test
+    // asks for it with `embed_pending`.
+    engine.set_provider(Arc::new(support::TopicEmbedder));
 
     let auth = Arc::new(
         AuthStore::open(&tmp.path().join("web-auth.db"))
@@ -138,7 +147,7 @@ async fn serve(opts: Options) -> Fixture {
         .unwrap();
 
     let router = http_router(
-        engine,
+        engine.clone(),
         Arc::new(AtomicUsize::new(0)),
         &[],
         auth.clone(),
@@ -163,6 +172,7 @@ async fn serve(opts: Options) -> Fixture {
     Fixture {
         addr,
         auth,
+        engine,
         state,
         _tmp: tmp,
     }
@@ -1387,7 +1397,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
         .unwrap();
 
     let router = http_router(
-        engine,
+        engine.clone(),
         Arc::new(AtomicUsize::new(0)),
         &[],
         auth.clone(),
@@ -1412,6 +1422,7 @@ async fn serve_with_a_virtual_domain() -> Fixture {
     Fixture {
         addr,
         auth,
+        engine,
         state,
         _tmp: tmp,
     }
@@ -2490,5 +2501,223 @@ fn write_ops_covers_every_mutating_route_mounted() {
     assert!(
         extra.is_empty(),
         "these write_ops() rows match no mounted route: {extra:?}"
+    );
+}
+
+// --- the neighbours advisory on the create and save answers ------------------
+
+/// Two documents about one topic, close in meaning and different in wording.
+/// Under `support::TopicEmbedder` both land on the retry axis, so one is a
+/// neighbour of the other and a manifest or the alpha fixture is not.
+const RETRY: &str = "The retry queue doubles its backoff on every failure.\nA dead-letter ttl bounds how long a retry waits.\nRaising the ttl fixed the stuck retries last time.";
+const RETRY_AGAIN: &str = "Retries wait on a backoff that doubles each time.\nThe dead-letter ttl is the bound on a stuck retry.\nWe raised the ttl and the queue drained.";
+
+/// The permalinks the advisory of `body` names, in the order it names them.
+fn similar_permalinks(body: &serde_json::Value) -> Vec<&str> {
+    body["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["permalink"].as_str())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn create_and_save_answer_with_the_neighbours_advisory() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+
+    // Nothing is embedded yet, so the first capture has nothing to be near.
+    let first = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry queue gotcha", "content": RETRY, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(first.status(), 201);
+    let first: serde_json::Value = first.json().await.unwrap();
+    assert!(
+        first.get("similar").is_none(),
+        "nothing near the first capture: {first}"
+    );
+    fx.engine.embed_pending().await.unwrap();
+
+    // Fluid's create dialog sends an empty body, so the probe text is the bare
+    // title: under the 80-character floor, and therefore no probe at all. The
+    // title carries the `retry` marker deliberately - were the floor not doing
+    // the work here, this would match the engram above at cosine 1.0 and name
+    // it, so do not "simplify" the title to something off-topic.
+    let scratch = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({ "title": "Retry scratch", "content": "" }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(scratch.status(), 201);
+    let scratch: serde_json::Value = scratch.json().await.unwrap();
+    assert_eq!(
+        scratch["permalink"], "retry-scratch",
+        "the empty-body create landed: {scratch}"
+    );
+    assert!(
+        scratch.get("similar").is_none(),
+        "an empty body is under the probe floor: {scratch}"
+    );
+
+    let second = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(second.status(), 201);
+    let created_etag = second.headers()["etag"].to_str().unwrap().to_string();
+    let second: serde_json::Value = second.json().await.unwrap();
+    assert_eq!(
+        second["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{second}"
+    );
+    assert_eq!(second["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert_eq!(
+        second["permalink"], "retry-backoff-lesson",
+        "the detail keys are still there"
+    );
+    // The advisory rides beside the detail read, and the ETag is still the
+    // version of the engram: it is taken from the payload's `checksum` rather
+    // than hashed over the body the advisory was attached to, so a client that
+    // saves what it read is still holding the right token.
+    assert_eq!(
+        created_etag,
+        format!("\"{}\"", second["checksum"].as_str().unwrap()),
+        "the advisory did not move the ETag off the engram's checksum"
+    );
+
+    let (etag, content) = read_alpha(fx.addr, &eddy).await;
+    let edited = content.replace("A rule about alpha.", RETRY);
+    let saved = as_session(
+        fx.addr,
+        reqwest::Method::PUT,
+        "/api/v1/domains/eng/engrams/alpha",
+        &eddy,
+    )
+    .header("if-match", format!("\"{etag}\""))
+    .json(&serde_json::json!({ "content": edited }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(saved.status(), 200);
+    let saved_etag = saved.headers()["etag"].to_str().unwrap().to_string();
+    let saved: serde_json::Value = saved.json().await.unwrap();
+    assert_eq!(
+        saved["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{saved}"
+    );
+    assert_eq!(saved["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert_eq!(
+        saved["permalink"], "alpha",
+        "the detail keys are still there"
+    );
+    assert_eq!(
+        saved_etag,
+        format!("\"{}\"", saved["checksum"].as_str().unwrap()),
+        "the saved ETag is the new version, advisory or not"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hidden_domains_engram_never_reaches_a_strangers_receipt() {
+    // Serialized against every other test here that writes the shared
+    // maintenance state file. See `support::maintenance_guard`.
+    let _serialized = support::maintenance_guard().await;
+    let fx = serve(Options::default()).await;
+    // `scrap` gets one retry engram and is then closed under `root`. Eddy is an
+    // instance editor and no member of it, so it is not his to see; root is an
+    // admin, and an admin sees every domain. The advisory has to answer both
+    // the way a search would.
+    fx.engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "scrap".to_string(),
+            title: "Retry secrets".to_string(),
+            content: RETRY.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["t".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    fx.engine.embed_pending().await.unwrap();
+    fx.auth
+        .set_domain_visibility("scrap", true, "root")
+        .await
+        .unwrap();
+
+    // The stranger writes first, while `eng` still holds no retry engram of its
+    // own: an empty advisory here means "nothing visible", not "nothing near".
+    let eddy = login(fx.addr, "eddy", "eddypw").await;
+    let stranger = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &eddy,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(stranger.status(), 201);
+    let stranger: serde_json::Value = stranger.json().await.unwrap();
+    assert_eq!(
+        stranger["permalink"], "retry-backoff-lesson",
+        "the create landed, so an absent advisory is a scoped one: {stranger}"
+    );
+    assert!(
+        stranger.get("similar").is_none(),
+        "a closed domain's engram is nobody else's neighbour: {stranger}"
+    );
+
+    let root = login(fx.addr, "root", "rootpw").await;
+    let owner = as_session(
+        fx.addr,
+        reqwest::Method::POST,
+        "/api/v1/domains/eng/engrams",
+        &root,
+    )
+    .json(&serde_json::json!({
+        "title": "Retry ledger", "content": RETRY_AGAIN, "tags": ["t"]
+    }))
+    .send()
+    .await
+    .unwrap();
+    assert_eq!(owner.status(), 201);
+    let owner: serde_json::Value = owner.json().await.unwrap();
+    assert!(
+        similar_permalinks(&owner).contains(&"retry-secrets"),
+        "the same engram is a neighbour to a caller who may see it: {owner}"
     );
 }

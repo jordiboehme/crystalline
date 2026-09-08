@@ -43,6 +43,7 @@ use crate::engine::EngineError;
 use crate::params::{
     DeleteParams, MoveParams, ReadParams, RetireParams, SaveParams, SearchParams, WriteParams,
 };
+use crate::similar::SimilarProbe;
 
 /// The query string `GET /domains/{domain}/engrams` takes: the filter side of
 /// [`SearchParams`], minus the domain the path already names and minus the
@@ -609,7 +610,11 @@ pub struct MoveBody {
 /// The answer is the detail read rather than the write verb's own receipt, so
 /// a client that has just created an engram holds the same payload the detail
 /// route serves, `ETag` included, and can go straight to editing it without a
-/// second round trip.
+/// second round trip. One thing rides beside it: when the neighbours probe
+/// found engrams close in meaning to what just landed, the `similar` list and
+/// its `guidance` string are copied off the receipt onto the answer, so a
+/// create is also the search the author did not run. Both keys are absent when
+/// there is nothing to say.
 ///
 /// A permalink already taken is the engine's `Conflict`, answered 409: this
 /// route never overwrites, so a client that means to replace something saves it
@@ -632,7 +637,11 @@ pub struct MoveBody {
     responses(
         (
             status = 201,
-            description = "The engine's own read payload for the new engram.",
+            description = "The engine's own read payload for the new engram, \
+                           plus - when the `capture.similar` advisory found \
+                           neighbours - a `similar` list of up to three \
+                           engrams {domain, permalink, title, status, type} \
+                           and a `guidance` string.",
             body = Object,
             headers(("etag" = String, description = "The quoted checksum of the \
                      engram as written, the token a later save carries in \
@@ -711,24 +720,25 @@ pub async fn create(
     // is the only place that knows what would actually be written. Repeating
     // the check here would mean repeating that derivation, which is the kind of
     // second copy that drifts.
-    let written = state
+    // Bound rather than passed inline: the neighbours probe below reads the
+    // title and the body back out of it, and borrows them, so the params have
+    // to outlive the write that consumed them.
+    let params = WriteParams {
+        domain: domain.clone(),
+        title: body.title,
+        content: body.content,
+        folder: body.folder,
+        engram_type: body.engram_type,
+        tags: body.tags,
+        status: body.status,
+        metadata: body.metadata,
+        // Never from this route: replacing an engram goes through the PUT,
+        // which demands the token of the version being replaced.
+        overwrite: false,
+    };
+    let mut written = state
         .engine
-        .write_engram_as(
-            &WriteParams {
-                domain: domain.clone(),
-                title: body.title,
-                content: body.content,
-                folder: body.folder,
-                engram_type: body.engram_type,
-                tags: body.tags,
-                status: body.status,
-                metadata: body.metadata,
-                // Never from this route: replacing an engram goes through the
-                // PUT, which demands the token of the version being replaced.
-                overwrite: false,
-            },
-            Some(&actor),
-        )
+        .write_engram_as(&params, Some(&actor))
         .await
         // The engine reports a taken permalink as a conflict, which this
         // surface answers 409 rather than the 422 its generic classification
@@ -747,6 +757,16 @@ pub async fn create(
     // restoring a backup is administration rather than authoring and would put
     // a whole domain on the queue for work nobody did.
     crate::maintenance::record_pending(&domain);
+    // What the author already knows about this topic, asked for after the write
+    // has landed and released the store lock rather than inside the engine
+    // verb: the probe takes that lock again and it is not reentrant. It never
+    // fails and never delays the answer past its own two-second ceiling; a
+    // probe that finds nothing leaves the receipt untouched.
+    let scope = identity.scope();
+    state
+        .engine
+        .attach_similar(&mut written, SimilarProbe::for_write(&params), &scope)
+        .await;
     let permalink = written["permalink"]
         .as_str()
         .ok_or_else(|| ApiError::internal("the write did not report a permalink to read back"))?
@@ -756,7 +776,8 @@ pub async fn create(
         &domain,
         &permalink,
         StatusCode::CREATED,
-        &identity.scope(),
+        &scope,
+        Some(&written),
     )
     .await
 }
@@ -776,7 +797,9 @@ pub async fn create(
 /// - **412** when the token no longer matches, carrying the version the server
 ///   holds now (`current_etag`, `current_content`) so a client can show a merge
 ///   view instead of asking its author to retype the edit.
-/// - **200** with the detail read of what landed and its new `ETag`.
+/// - **200** with the detail read of what landed and its new `ETag`, carrying
+///   the same `similar` and `guidance` keys a create does when the neighbours
+///   probe found anything.
 ///
 /// One consequence of writing the text verbatim is worth knowing: an author who
 /// edits the `permalink` in the frontmatter moves the engram's address, since
@@ -828,7 +851,11 @@ pub async fn create(
     responses(
         (
             status = 200,
-            description = "The engine's own read payload for the saved engram.",
+            description = "The engine's own read payload for the saved engram, \
+                           plus - when the `capture.similar` advisory found \
+                           neighbours - a `similar` list of up to three \
+                           engrams {domain, permalink, title, status, type} \
+                           and a `guidance` string.",
             body = Object,
             headers(("etag" = String, description = "The quoted checksum of the \
                      engram as saved, the token the next save carries.")),
@@ -932,29 +959,51 @@ pub async fn save(
         )));
     }
     let token = if_match(&headers)?;
-    match state
-        .engine
-        .save_engram(&SaveParams {
-            domain: domain.clone(),
-            identifier: permalink.clone(),
-            content: body.content,
-            expected_checksum: token,
-        })
-        .await
-    {
+    // Bound rather than passed inline: the neighbours probe below is over the
+    // document that landed, and it borrows that text rather than copying it, so
+    // the params have to outlive the save.
+    let params = SaveParams {
+        domain: domain.clone(),
+        identifier: permalink.clone(),
+        content: body.content,
+        expected_checksum: token,
+    };
+    let scope = identity.scope();
+    match state.engine.save_engram(&params).await {
         // Read back from the receipt rather than reusing the URL's permalink:
         // the text landed verbatim, so an author who edited the `permalink`
         // line has moved the address, and the detail read has to follow it or
         // answer 404 for a write that succeeded.
-        Ok(receipt) => {
+        Ok(mut receipt) => {
             crate::maintenance::record_pending(&domain);
+            // Same contract as the create above: asked after the write, off the
+            // saved document (the frontmatter is stripped before it is probed),
+            // bounded, and silent when it finds nothing.
+            state
+                .engine
+                .attach_similar(
+                    &mut receipt,
+                    SimilarProbe::Markdown {
+                        text: &params.content,
+                    },
+                    &scope,
+                )
+                .await;
             let moved = receipt["permalink"]
                 .as_str()
                 .ok_or_else(|| {
                     ApiError::internal("the save did not report a permalink to read back")
                 })?
                 .to_string();
-            detail_response(&state, &domain, &moved, StatusCode::OK, &identity.scope()).await
+            detail_response(
+                &state,
+                &domain,
+                &moved,
+                StatusCode::OK,
+                &scope,
+                Some(&receipt),
+            )
+            .await
         }
         // The one conflict this route translates rather than propagates. Keyed
         // on the prefix `stale_edit_message` owns, which is the seam both
@@ -970,7 +1019,7 @@ pub async fn save(
                         identifier: permalink,
                         domain: Some(domain),
                     },
-                    &identity.scope(),
+                    &scope,
                 )
                 .await?;
             let checksum = current["checksum"].as_str().ok_or_else(|| {
@@ -1586,14 +1635,20 @@ const STALE_EDIT: &str = "stale edit";
 /// there is exactly one payload shape for an engram on this surface and a
 /// client that has just written one holds what the detail route would have
 /// given it.
+///
+/// `advisory` is the write receipt the engine handed back, when the caller has
+/// one: everything it carries beyond the detail read - today the neighbours
+/// advisory - is copied across by [`carry_advisory`]. A plain read passes
+/// `None`.
 async fn detail_response(
     state: &RestState,
     domain: &str,
     permalink: &str,
     status: StatusCode,
     scope: &crate::scope::Scope,
+    advisory: Option<&Value>,
 ) -> Result<Response, ApiError> {
-    let value = state
+    let mut value = state
         .engine
         .read_engram(
             &ReadParams {
@@ -1603,10 +1658,31 @@ async fn detail_response(
             scope,
         )
         .await?;
+    if let Some(receipt) = advisory {
+        carry_advisory(&mut value, receipt);
+    }
     let etag = etag(&value)?;
     let mut resp = (status, Json(value)).into_response();
     resp.headers_mut().insert(ETAG, etag);
     Ok(resp)
+}
+
+/// Copy the neighbours advisory off a write receipt onto the detail read the
+/// route answers with, when the receipt carries one. The detail is what the
+/// editor renders; the advisory rides beside it under the same two keys the
+/// MCP receipt uses, so one reader learns one shape.
+///
+/// Safe to do before [`etag`] runs: the tag is taken from the payload's own
+/// `checksum`, which is the version of the engram on disk, rather than hashed
+/// over the body being served, so two extra keys cannot move it.
+fn carry_advisory(detail: &mut Value, receipt: &Value) {
+    let (Value::Object(detail), Some(similar), Some(guidance)) =
+        (detail, receipt.get("similar"), receipt.get("guidance"))
+    else {
+        return;
+    };
+    detail.insert("similar".to_string(), similar.clone());
+    detail.insert("guidance".to_string(), guidance.clone());
 }
 
 /// The strong validator for the engram this read returned: the checksum the
