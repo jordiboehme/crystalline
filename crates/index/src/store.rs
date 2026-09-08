@@ -1664,9 +1664,17 @@ pub trait Store: Send + Sync {
     /// twice over at the peak (the database rows and the decoded output are
     /// both live inside the call). At the default model's 384 dims that is
     /// roughly 1.5 KB an engram, so a hundred thousand of them is hundreds of
-    /// megabytes. A caller with a ceiling - the sweep's `MAX_TWIN_VECTORS`,
-    /// say - must count first and skip, rather than fetch everything and
-    /// discard it above the cap.
+    /// megabytes.
+    ///
+    /// The one caller, the sweep's per-domain fact assembly, takes the whole
+    /// fetch knowingly: it already parses every engram in the domain and holds
+    /// each body, so the vectors add a fraction to a cost that was linear in
+    /// domain size anyway, and a domain over the sweep's `MAX_TWIN_VECTORS`
+    /// pays for vectors it then declines to compare. There is deliberately no
+    /// count method to skip on - adding one, or pushing the sweep's rule filter
+    /// down so a run that cannot emit `V301` never asks, is the named follow-up
+    /// in the backlog. Until it lands, a new caller with a ceiling should
+    /// assume this returns everything.
     async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>>;
 
     /// Delete all indexed data, keeping the schema. The corruption-recovery and

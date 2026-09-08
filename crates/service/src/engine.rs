@@ -7291,7 +7291,8 @@ impl Engine {
     /// dropping to a scope-less entry.
     ///
     /// **The unacknowledged finding wins when the rule fires more than once
-    /// here**, which a set-scoped rule does: an engram that twins two others
+    /// here**, which only the pair-scoped rule does
+    /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
     /// carries two `V301` findings and neither one is "the" finding. Taking
     /// the first row every time made the second acknowledgment re-record the
     /// pair the first already covered, so the other pair could never be
@@ -14070,31 +14071,39 @@ fn without_ack(source: &str, rule: &str) -> String {
     set_evolve_ack(source, &kept)
 }
 
-/// The engram's acknowledgments with `entry` folded in: one entry per rule
-/// **and scope**, so re-acknowledging the same finding replaces what it said
-/// rather than stacking a second line nobody reads, while a second finding of
-/// the same rule given for different evidence is recorded beside the first. The
-/// replacement keeps the original position, which keeps a hand-ordered list
-/// hand-ordered.
+/// The engram's acknowledgments with `entry` folded in: **one entry per rule,
+/// except for a pair-scoped rule, which keeps one per pair**. Re-acknowledging
+/// replaces what the entry said rather than stacking a second line nobody
+/// reads. The replacement keeps the original position, which keeps a
+/// hand-ordered list hand-ordered.
 ///
-/// Keyed by the pair rather than by the rule because a set-scoped rule fires
-/// more than once on one engram: an engram that twins two others carries two
-/// `V301` findings, and `V103` two half-finished pairs. Keying by rule alone
-/// made the second acknowledgment overwrite the first, which silenced one pair
-/// and left the other standing with somebody else's note on it. A scope-less
-/// entry - what a hand-written line or an acknowledgment given before the rule
-/// fires carries - is its own key too, and keeps matching whatever the rule
-/// finds.
+/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` - and it
+/// exists because that rule fires more than once on one engram: an engram that
+/// twins two others carries two twin findings and neither is the engram's
+/// answer about the rule. Keying those by rule alone made the second
+/// acknowledgment overwrite the first, which silenced one pair and left the
+/// other standing with somebody else's note on it. Every other rule fires at
+/// most once per engram, so its entry **is** that answer: replacing it on
+/// re-acknowledgment is what keeps exactly one entry there however often the
+/// evidence moves, and that in turn is what lets a later drift come back
+/// marked stale (the sweep can only call an entry stale when it is the only
+/// one for its rule).
+///
+/// A scope-less entry - what a hand-written line or an acknowledgment given
+/// before the rule fires carries - is a pair of its own under the pair-scoped
+/// rule, and keeps matching whatever that rule finds.
 fn merged_acks(source: &str, entry: EvolveAck) -> Vec<EvolveAck> {
+    let per_pair = crystalline_index::is_pair_scoped(&entry.rule);
     let mut entries = acks_of(source);
     let mut replaced = false;
     entries.retain_mut(|existing| {
-        if !existing.rule.eq_ignore_ascii_case(&entry.rule) || existing.scope != entry.scope {
+        if !existing.rule.eq_ignore_ascii_case(&entry.rule)
+            || (per_pair && existing.scope != entry.scope)
+        {
             return true;
         }
-        // A hand-edited file may name one rule and scope twice; the entry just
-        // written is the survivor and the rest go, so the list stays one entry
-        // per rule and scope.
+        // A hand-edited file may name one key twice; the entry just written is
+        // the survivor and the rest go, so the list stays one entry per key.
         if replaced {
             return false;
         }

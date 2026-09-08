@@ -226,14 +226,13 @@ async fn three_twins(engine: &Engine) {
 async fn acknowledging_one_pair_leaves_the_other_standing() {
     let (_tmp, engine) = engine(true).await;
     three_twins(&engine).await;
-    let before = rules_of(&sweep(&engine).await);
-    let twins_before = before.iter().filter(|(r, _)| r == "V301").count();
-    assert!(twins_before >= 2, "{before:?}");
-
-    // The ack is stamped on the engram a twin finding fires on, and the scope
-    // it records is that finding's pair, resolved by the same `sweep_domain`
-    // this task wires - which is the point of this test.
+    // One sweep serves both the count and the row to acknowledge: the ack is
+    // stamped on the engram a twin finding fires on, and the scope it records
+    // is that finding's pair, resolved by the same `sweep_domain` this task
+    // wires - which is the point of this test.
     let value = sweep(&engine).await;
+    let twins_before = rules_of(&value).iter().filter(|(r, _)| r == "V301").count();
+    assert!(twins_before >= 2, "{value}");
     let lead = value["queue"]
         .as_array()
         .unwrap()
@@ -270,7 +269,7 @@ async fn acknowledging_one_pair_leaves_the_other_standing() {
             .unwrap()
             .iter()
             .filter(|f| f["rule"] == "V301")
-            .all(|f| f.get("ack_stale").is_none() && f.get("ack_note").is_none()),
+            .all(|f| f["ack_stale"] != true && f["ack_note"].is_null()),
         "{after}"
     );
 }
@@ -329,7 +328,7 @@ async fn two_pairs_on_one_hub_are_acknowledged_side_by_side() {
         "the standing finding is the pair the hub does not lead"
     );
     assert!(
-        rows[0].get("ack_stale").is_none(),
+        rows[0]["ack_stale"] != true && rows[0]["ack_note"].is_null(),
         "a pair nobody acknowledged is not stale: {}",
         rows[0]
     );

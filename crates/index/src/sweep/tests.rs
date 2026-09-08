@@ -1322,7 +1322,12 @@ fn v301_acknowledgment_is_scoped_to_the_pair() {
         .collect();
     assert_eq!(twins.len(), 1, "{:?}", fired(&report));
     assert_eq!(twins[0].permalink, "twin-one");
+    // The two acknowledged pairs are quiet and the third is a plain finding:
+    // it hangs on an engram with no entry of its own, and two entries on the
+    // hub lend nothing to anybody.
     assert!(!twins[0].ack_stale);
+    assert_eq!(twins[0].ack_note, None);
+    assert_eq!(twins[0].ack_scope, None);
 }
 
 #[test]

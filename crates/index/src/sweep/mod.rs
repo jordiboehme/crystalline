@@ -474,6 +474,23 @@ pub fn rule_info(id: &str) -> Option<&'static RuleInfo> {
 /// avoid commas for.
 const SCOPE_SEPARATOR: &str = ", ";
 
+/// Whether `rule` is acknowledged **per pair** rather than per engram.
+///
+/// `V301` is the one, and the distinction is about how often a rule can fire on
+/// one engram. Every other rule fires at most once there, so its acknowledgment
+/// is the engram's answer about that rule: re-acknowledging replaces the entry,
+/// and an entry whose scope no longer matches is that answer gone stale, which
+/// is what [`apply_acknowledgments`] reports. An engram that twins two others
+/// carries two `V301` findings and neither one is the engram's answer, so a
+/// twin acknowledgment is stored per pair and a pair with no entry of its own
+/// is a plain finding rather than a stale one - nobody has answered it yet.
+///
+/// Read by the sweep here and by the engine's `evolve_ack` write path, which
+/// keys its entries the same way. One predicate, so the two cannot drift.
+pub fn is_pair_scoped(rule: &str) -> bool {
+    rule.eq_ignore_ascii_case("V301")
+}
+
 /// The stable discriminator for a finding: the evidence an acknowledgment was
 /// given for, in a form that survives an unrelated edit and changes the moment
 /// the evidence does.
@@ -1117,6 +1134,14 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
 /// Sort findings into queue order: priority descending, then rule, domain and
 /// permalink ascending. The sort is stable, so findings a rule emitted in a
 /// deterministic order keep that order when every key ties.
+///
+/// **That stability is load-bearing, not a convenience.** Two `V301` findings
+/// on one engram tie on every key here - same anchor, so the same priority -
+/// and the engine's `evolve_ack` write path acknowledges "the first finding
+/// still standing" for a rule on an engram. A switch to `sort_unstable_by`
+/// would make which twin pair an acknowledgment lands on depend on the sort's
+/// internals, so keep the stable sort and let `find_twins`' deterministic
+/// emission order settle the ties.
 pub fn rank(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.priority
@@ -1160,16 +1185,19 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 ///
 /// - the entry's scope is absent, or equals the finding's scope: **suppressed**,
 ///   counted, and returned only when the caller asked for the suppressed ones;
-/// - the rule fires once here, on one entry, and the two scopes differ:
-///   **returned**, flagged [`Finding::ack_stale`] and carrying the old note,
-///   because "somebody ruled this intentional and the evidence has since
-///   changed" is a different thing to read than a fresh finding;
-/// - the rule fires more than once here, or the engram carries more than one
-///   entry for it, and none of them matches: **returned plain**. Staleness is
-///   judged per scope, and a set-scoped rule firing twice on one engram - two
-///   twin pairs under `V301`, two half-finished supersedes under `V103` -
-///   carries one entry per pair, so an entry given for another pair has nothing
-///   to say about this finding and must not lend it a note;
+/// - the engram's one entry for the rule has a different scope: **returned**,
+///   flagged [`Finding::ack_stale`] and carrying the old note, because
+///   "somebody ruled this intentional and the evidence has since changed" is a
+///   different thing to read than a fresh finding. One entry is what a rule
+///   acknowledged per engram always has, since the write path replaces it;
+/// - nothing matches and the rule is pair-scoped ([`is_pair_scoped`], which is
+///   `V301`): **returned plain**. A twin acknowledgment answers one pair, so a
+///   pair with no entry of its own is unanswered rather than stale, and lending
+///   it another pair's note would tell a reader they have seen evidence they
+///   have not;
+/// - nothing matches and the engram carries several entries for the rule, which
+///   only a hand-edited file can hold for a rule acknowledged per engram:
+///   **returned plain**, since which of them went stale is unknowable;
 /// - no entry for the rule: untouched.
 ///
 /// A finding with no anchor engram - `V203`'s vocabulary, `V108`'s attachment -
@@ -1183,17 +1211,6 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
         .collect();
     if acks.is_empty() {
         return;
-    }
-
-    // How often each rule fires on each acknowledging engram, so a finding that
-    // matches no entry can tell drift from a second pair. Keyed on an owned
-    // permalink because this borrow has to end before the findings are walked
-    // mutably below.
-    let mut fires: HashMap<(String, &'static str), usize> = HashMap::new();
-    for f in &report.findings {
-        if acks.contains_key(f.permalink.as_str()) {
-            *fires.entry((f.permalink.clone(), f.rule)).or_default() += 1;
-        }
     }
 
     let mut counts = AckCounts::default();
@@ -1216,17 +1233,20 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
             return include;
         }
         // Nothing matches, so the question is whether this finding is the
-        // drifted self of an acknowledgment or a pair nobody has answered yet.
-        // Only one entry against one finding can be the first: a set-scoped
-        // rule firing twice on this engram (two twin pairs under `V301`, two
-        // half-finished supersedes under `V103`) keeps one entry per pair, and
-        // lending this row another pair's note would tell a reader they have
-        // seen evidence they have not.
-        let alone = fires.get(&(finding.permalink.clone(), finding.rule)) == Some(&1);
+        // drifted self of an acknowledgment or one nobody has answered yet. A
+        // pair-scoped rule is always the second: its entries answer one pair
+        // each, and the pair in front of us has none. Any other rule is
+        // acknowledged per engram and the write path keeps exactly one entry
+        // for it, so a lone entry that no longer matches is this finding's own
+        // answer gone stale. Several entries there means a hand-edited file,
+        // and which one drifted is unknowable, so none of them lends a note.
+        if is_pair_scoped(finding.rule) {
+            return true;
+        }
         let mut for_rule = entries
             .iter()
             .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule));
-        if let (true, Some(stale), None) = (alone, for_rule.next(), for_rule.next()) {
+        if let (Some(stale), None) = (for_rule.next(), for_rule.next()) {
             finding.ack_stale = true;
             finding.ack_note = stale.note.clone();
             // The entry's own scope, not the finding's: a stale row exists

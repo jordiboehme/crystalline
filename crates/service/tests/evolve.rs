@@ -1222,6 +1222,84 @@ async fn an_ack_whose_evidence_changed_comes_back_stale() {
     assert_eq!(after["acknowledged"]["total"], 1);
 }
 
+/// A single-scope rule keeps exactly one acknowledgment however often its
+/// evidence moves, so the drift row survives a re-acknowledgment: acknowledge,
+/// drift, re-acknowledge, drift again, and the finding is still stale and still
+/// carries the note somebody wrote for it.
+///
+/// The pair-scoped `V301` is the one rule that stores a second entry, and it
+/// stores it per pair. Every other rule replacing its entry is what keeps this
+/// path working: two entries for one rule would leave the second drift with no
+/// entry to point at and downgrade it to a fresh finding, losing "somebody
+/// ruled this intentional and the evidence has since changed" for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_acknowledged_rule_keeps_one_entry_and_stays_stale_on_the_next_drift() {
+    let (tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    // First drift: a second retired target.
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Retired thing]]",
+            "- relates_to [[Retired thing]]\n- relates_to [[Old deploy pipeline]]",
+        ),
+    )
+    .unwrap();
+    let old = tmp.path().join("eng/deploy/old-pipeline.md");
+    let source = std::fs::read_to_string(&old).unwrap();
+    std::fs::write(&old, source.replace("status: stable", "status: deprecated")).unwrap();
+    engine.sync(None).await.unwrap();
+
+    // Re-acknowledged on the new evidence: one entry in the file, the fresh one.
+    acknowledge(&engine, "live-doc", "V101 both are deliberate").await;
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        on_disk.matches("rule: V101").count(),
+        1,
+        "one entry per single-scope rule: {on_disk}"
+    );
+
+    // Second drift: a third retired target.
+    std::fs::write(
+        tmp.path().join("eng/legacy-note.md"),
+        "---\ntype: engram\ntitle: Legacy note\npermalink: legacy-note\ntags:\n  - legacy-notes\nstatus: superseded\nrecorded_at: 2026-07-25\n---\n\nKept only for the record.\n\n- [context] nothing points here any more\n",
+    )
+    .unwrap();
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Old deploy pipeline]]",
+            "- relates_to [[Old deploy pipeline]]\n- relates_to [[Legacy note]]",
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let row = rows_on(&v, "live-doc")[0];
+    assert_eq!(row["ack_stale"], true, "{row}");
+    assert_eq!(row["ack_note"], "both are deliberate");
+    assert_eq!(
+        row["ack_scope"], "eng/deploy/old-pipeline, eng/retired-thing",
+        "the row says what was acknowledged, not what it fires on now"
+    );
+    assert_eq!(v["acknowledged"]["total"], 0, "nothing was suppressed");
+}
+
 /// A hand-written entry with no scope suppresses whatever the rule finds, and
 /// withdrawing it brings the finding straight back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -428,7 +428,13 @@ export async function acknowledgeFinding(
   });
 }
 
-/** Take an acknowledgment back, leaving the engram's others alone. */
+/**
+ * Take an acknowledgment back, leaving the engram's other rules alone.
+ *
+ * A rule has one acknowledgment, so this takes back one - except `V301`, which
+ * has one per twin pair and loses every pair here. The body names a rule and
+ * has no way to name a pair.
+ */
 export async function unacknowledgeFinding(
   domain: string,
   permalink: string,

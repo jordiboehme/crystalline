@@ -48,7 +48,7 @@ pub use store::{
 pub use sweep::{
     AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
     RULES, RuleInfo, SHARE_STALE_DAYS, ShareFacts, SweepInput, SweepOptions, SweepReport,
-    UnresolvedRef, content_line_count, detect, rank, rule_info,
+    UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
     DomainScan, SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, scan_domain,

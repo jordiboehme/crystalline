@@ -423,10 +423,12 @@ pub async fn acknowledge(
     tag = "maintenance",
     operation_id = "unacknowledge_finding",
     summary = "Withdraw an acknowledgment.",
-    description = "Removes the engram's `evolve_ack` entry for that rule, \
-                   leaving its other entries alone. 404 when the engram carries \
-                   none for the rule, rather than reporting a removal that did \
-                   not happen.",
+    description = "Removes the engram's `evolve_ack` entries for that rule, \
+                   leaving the other rules' alone. A rule has one entry, except \
+                   `V301`, which has one per twin pair and loses all of them \
+                   here: there is no way to name a single pair on this route. \
+                   404 when the engram carries none for the rule, rather than \
+                   reporting a removal that did not happen.",
     params(("domain" = String, Path, description = "The engram's domain.")),
     request_body = AckBody,
     responses(
