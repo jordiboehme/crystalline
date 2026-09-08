@@ -37,9 +37,12 @@
 //! written by an older release does not: an entry whose leading words are
 //! ours is ours whatever trails it. Rewriting one is a separate and much
 //! narrower question - only a spelling this project itself has ever written
-//! is rewritten in place to the current one, so an install heals itself on
-//! the first run of a new version while a command somebody typed by hand
-//! keeps every flag they gave it. The MCP registration shells out to the
+//! is rewritten in place to the current one, so an install heals its hook
+//! commands on the first run of a new version while a command somebody typed
+//! by hand keeps every flag they gave it. The command string is all that
+//! heals: an existing group's matcher and timeout are left exactly as they
+//! were found, so a group an older release wrote with a narrower matcher
+//! keeps it. The MCP registration shells out to the
 //! harness's own CLI (`claude`,
 //! `codex` or `copilot`); a missing or failing CLI is never fatal - it prints
 //! the command to run by hand and the rest of the install still proceeds.
@@ -311,6 +314,13 @@ fn group_has_managed(group: &Value) -> bool {
 /// Whether the parsed settings root already runs `command` under `event`,
 /// matcher-insensitively. The filesystem-free presence predicate that both
 /// the install report and (in a later milestone) the doctor read from.
+///
+/// Ask it with a base constant, never with a command
+/// [`managed_hook_commands`] built. The flag tolerance is directional: a
+/// stored command may extend the one being asked for, never the other way
+/// round. So probing with the parametrized spelling would stop matching a
+/// bare stored entry and start reporting an existing install as absent, which
+/// appends a duplicate beside it.
 pub(crate) fn hook_present(root: &Map<String, Value>, event: &str, command: &str) -> bool {
     root.get("hooks")
         .and_then(Value::as_object)

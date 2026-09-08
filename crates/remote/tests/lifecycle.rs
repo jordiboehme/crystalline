@@ -8457,3 +8457,73 @@ async fn a_case_only_directory_rename_shares_at_the_recorded_spelling() {
         "the edited bytes travel upstream under the name the repository knows"
     );
 }
+
+// The same rename, shared by name. A selection is checked against the delta,
+// which is reported at the base snapshot's spelling - so a person typing what
+// `ls` shows them would have their own file refused. Both spellings select it,
+// and both resolve to the one the repository knows; a path that is neither is
+// still refused by name.
+#[tokio::test]
+async fn a_case_folded_change_can_be_selected_by_either_spelling() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            (
+                "Platform.Components.Common/CustomHeaderModule.md",
+                b"header module\n",
+            ),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    std::fs::remove_dir_all(sub.domain_root.join("Platform.Components.Common")).unwrap();
+    write(
+        &sub.domain_root
+            .join("platform.components.common/CustomHeaderModule.md"),
+        b"header module, revised\n",
+    );
+
+    let typo = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            files: Some(&["platform.components.common/Nothing.md".to_string()]),
+            ..ShareOptions::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(&typo, Err(e) if e.to_string().contains("platform.components.common/Nothing.md")),
+        "a path that is neither spelling is still refused by name: {typo:?}"
+    );
+
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            // The spelling on disk, which is the only one this working tree
+            // can show a person.
+            files: Some(&["platform.components.common/CustomHeaderModule.md".to_string()]),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("the spelling the user can see selects the change");
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    assert_eq!(
+        report.updated,
+        vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()],
+        "and it travels upstream under the name the repository knows"
+    );
+}

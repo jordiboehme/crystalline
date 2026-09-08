@@ -3451,15 +3451,14 @@ fn run_prompt(
     db: Option<PathBuf>,
     json_flag: bool,
     format: Option<PromptFormat>,
-    harness: Option<String>,
+    // Accepted and deliberately unread: the routing block does not vary by
+    // harness today. The flag is on the command so both managed hook commands
+    // are spelled the same way, and never reading it is what makes an id this
+    // binary does not know inert - an older binary running a hook a newer one
+    // wrote must behave exactly as it always did, never fail. The day the
+    // block does vary, this is where the id gets resolved.
+    _harness: Option<String>,
 ) -> anyhow::Result<()> {
-    // Resolved and then deliberately unused: the routing block does not vary
-    // by harness today. The flag is on the command so both managed hook
-    // commands are spelled the same way, and resolving it here is what makes
-    // an id this binary does not know inert - an older binary running a hook a
-    // newer one wrote must behave exactly as it always did, never fail.
-    let _harness = harness.as_deref().and_then(HarnessKind::from_id);
-
     // An explicit --format wins; the global --json keeps selecting the JSON
     // shape it always has; the default is plain text.
     let format = match format {
@@ -3678,6 +3677,21 @@ mod tests {
         assert_eq!(
             ahead_line(&entry(&["a.md", "b.md"], &[], &[], 4)),
             "  ahead: 2 local change(s)"
+        );
+    }
+
+    /// Additions are the only single-kind set that keeps the short form. A
+    /// set of only modifications or only deletions names its kind, because
+    /// there the plain reading of a bare count is the wrong one.
+    #[test]
+    fn the_ahead_line_names_a_single_kind_that_is_not_additions() {
+        assert_eq!(
+            ahead_line(&entry(&[], &["a.md", "b.md"], &[], 0)),
+            "  ahead: 2 local change(s) (2 modified)"
+        );
+        assert_eq!(
+            ahead_line(&entry(&[], &[], &["a.md"], 0)),
+            "  ahead: 1 local change(s) (1 deleted)"
         );
     }
 

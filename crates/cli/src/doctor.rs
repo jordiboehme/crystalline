@@ -950,7 +950,12 @@ fn markdown_rel_paths(root: &Path) -> Vec<String> {
 /// paths naming the same file end up in the same shape either way. If even
 /// that fails (one side no longer exists, a permission error), the file's
 /// own name is returned - still relative, in the shape callers expect,
-/// rather than the absolute string a silent mismatch used to produce.
+/// rather than the absolute string a silent mismatch used to produce. That
+/// last fallback is the one answer this function cannot vouch for: a bare
+/// name does not equal a nested key, and two files of the same name in
+/// different folders collapse onto one. Both would land a finding in the
+/// wrong bucket exactly as the original bug did, so the fallback logs a
+/// warning and the next double fault leaves a trail instead of nothing.
 fn relative_slash_path(root: &Path, p: &Path) -> String {
     if let Some(rel) = strip_to_slash(root, p) {
         return rel;
@@ -960,6 +965,15 @@ fn relative_slash_path(root: &Path, p: &Path) -> String {
     {
         return rel;
     }
+    // The double fault: neither the literal strip nor the canonicalized retry
+    // could relate the two. A bare file name is the best answer left, and it
+    // may not match the key the caller compares it against, so the fallback
+    // says so rather than repeating the silence this helper exists to end.
+    tracing::warn!(
+        root = %root.display(),
+        path = %p.display(),
+        "could not relate a path to its domain root, falling back to its file name"
+    );
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default()
