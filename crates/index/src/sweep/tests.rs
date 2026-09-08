@@ -1941,6 +1941,49 @@ fn a_second_retired_link_changes_the_scope_and_the_ack_goes_stale() {
     assert_eq!(report.acknowledged.total, 0);
 }
 
+/// A rule that is not pair-scoped keeps one entry however many findings it
+/// raises on one engram, and this is what that costs: acknowledging the second
+/// `V103` finding replaces the entry the first was given for, so that one
+/// comes back marked stale wearing the note it never asked for.
+///
+/// Deliberate, and pinned here because two documents claim it - the
+/// `merged_acks` doc and the `edit_engram` description an agent reads. Only
+/// [`is_pair_scoped`] buys the other behaviour.
+#[test]
+fn a_rule_firing_twice_on_one_engram_shares_the_one_acknowledgment() {
+    // Two one-sided reciprocal pairs pointing at the same engram: a summary
+    // and a split, so the hub owes two back-links and V103 fires twice on it.
+    let hub = fact(1, "mix-b-decision");
+    let summary = fact(2, "release-summary");
+    let split_out = fact(3, "purge-procedure");
+    let mut sweep = input(vec![hub, summary, split_out]);
+    sweep.graph.edges = vec![rel(2, 1, "summarizes"), rel(3, 1, "derived_from")];
+    assert_eq!(
+        fired_on(&detect(&sweep), "mix-b-decision"),
+        vec!["V103", "V103"],
+        "the fixture has to raise both halves on the one engram"
+    );
+
+    sweep.engrams[0].acks = vec![ack(
+        "V103",
+        Some("engineering/release-summary"),
+        "the summary owns the link",
+    )];
+
+    let report = detect(&sweep);
+    let finding = only(&report, "V103");
+    assert_eq!(finding.scope, "engineering/purge-procedure");
+    assert!(
+        finding.ack_stale,
+        "the pair nobody acknowledged wears the other's entry as stale"
+    );
+    assert_eq!(
+        finding.ack_note.as_deref(),
+        Some("the summary owns the link")
+    );
+    assert_eq!(report.acknowledged.total, 1);
+}
+
 #[test]
 fn a_scopeless_ack_matches_whatever_the_evidence_becomes() {
     let mut sweep = v101_fixture();

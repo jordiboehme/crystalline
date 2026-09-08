@@ -476,14 +476,18 @@ const SCOPE_SEPARATOR: &str = ", ";
 
 /// Whether `rule` is acknowledged **per pair** rather than per engram.
 ///
-/// `V301` is the one, and the distinction is about how often a rule can fire on
-/// one engram. Every other rule fires at most once there, so its acknowledgment
-/// is the engram's answer about that rule: re-acknowledging replaces the entry,
-/// and an entry whose scope no longer matches is that answer gone stale, which
-/// is what [`apply_acknowledgments`] reports. An engram that twins two others
-/// carries two `V301` findings and neither one is the engram's answer, so a
-/// twin acknowledgment is stored per pair and a pair with no entry of its own
-/// is a plain finding rather than a stale one - nobody has answered it yet.
+/// `V301` is the one, and the distinction is about what an acknowledgment
+/// answers for rather than about how often a rule fires. Every other rule's
+/// acknowledgment is the engram's answer about that rule: re-acknowledging
+/// replaces the entry, and an entry whose scope no longer matches is that
+/// answer gone stale, which is what [`apply_acknowledgments`] reports. That
+/// holds even where such a rule fires more than once on one engram, as `V103`
+/// does over the three [`RECIPROCAL_PAIRS`]: those findings share the one
+/// answer, so acknowledging the second replaces the first and leaves the other
+/// marked stale wearing its note. An engram that twins two others carries two
+/// `V301` findings and neither one is an answer about the engram, so a twin
+/// acknowledgment is stored per pair and a pair with no entry of its own is a
+/// plain finding rather than a stale one - nobody has answered it yet.
 ///
 /// Read by the sweep here and by the engine's `evolve_ack` write path, which
 /// keys its entries the same way. One predicate, so the two cannot drift.

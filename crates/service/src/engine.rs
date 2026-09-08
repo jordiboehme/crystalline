@@ -14203,16 +14203,19 @@ fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
 /// hand-ordered list hand-ordered.
 ///
 /// The exception is [`crystalline_index::is_pair_scoped`] - `V301` - and it
-/// exists because that rule fires more than once on one engram: an engram that
-/// twins two others carries two twin findings and neither is the engram's
-/// answer about the rule. Keying those by rule alone made the second
+/// exists because a twin finding is about a pair rather than about the engram:
+/// an engram that twins two others carries two twin findings and neither is the
+/// engram's answer about the rule. Keying those by rule alone made the second
 /// acknowledgment overwrite the first, which silenced one pair and left the
-/// other standing with somebody else's note on it. Every other rule fires at
-/// most once per engram, so its entry **is** that answer: replacing it on
-/// re-acknowledgment is what keeps exactly one entry there however often the
-/// evidence moves, and that in turn is what lets a later drift come back
-/// marked stale (the sweep can only call an entry stale when it is the only
-/// one for its rule).
+/// other standing with somebody else's note on it. Every other rule's entry
+/// **is** that answer, so replacing it on re-acknowledgment is what keeps
+/// exactly one entry there however often the evidence moves, and that in turn
+/// is what lets a later drift come back marked stale (the sweep can only call
+/// an entry stale when it is the only one for its rule). That is the rule even
+/// for one that can fire more than once on an engram - `V103` fires once per
+/// reciprocal pair - and the cost is deliberate: those findings share the one
+/// entry, so the second acknowledgment replaces the first and the finding it
+/// was not given for comes back stale wearing that note.
 ///
 /// A scope-less entry - what a hand-written line or an acknowledgment given
 /// before the rule fires carries - is a pair of its own under the pair-scoped

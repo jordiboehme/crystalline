@@ -643,6 +643,44 @@ async fn tool_descriptions_teach_salience() {
     );
 }
 
+/// How often an acknowledgment stacks is a rule-by-rule fact, and `edit_engram`
+/// is where an agent learns it. The stacking clause has to name `V301`: it is
+/// the only rule whose entries are kept per pair. Stated generally it is false
+/// of `V103`, which fires once per reciprocal pair and so can raise several
+/// findings on one engram whose acknowledgments replace one another - an agent
+/// reading the general form would expect a second note to sit beside the first
+/// and find it had overwritten it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_which_rule_acknowledges_per_pair() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let edit = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram tool present");
+    let text = edit.description.as_deref().unwrap_or("");
+    // Clause by clause rather than as one string, so the check is about which
+    // claim names the rule and not about how the rest of the copy is worded.
+    let stacking: Vec<&str> = text
+        .split(['.', ';'])
+        .filter(|clause| clause.contains("beside the first"))
+        .collect();
+    assert_eq!(
+        stacking.len(),
+        1,
+        "edit_engram teaches stacking exactly once: {text}"
+    );
+    assert!(
+        stacking[0].contains("V301"),
+        "the clause that says a second acknowledgment is kept has to name the \
+         one rule that keeps it: {}",
+        stacking[0]
+    );
+}
+
 /// Folder hierarchy inside a domain is invisible to an agent unless the tool
 /// copy teaches it: `write_engram` documents the `folder` argument and the
 /// `build_context` glob it unlocks, and `move_engram` says a destination
