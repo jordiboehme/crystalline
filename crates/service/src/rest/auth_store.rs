@@ -2767,7 +2767,8 @@ impl AuthStore {
     }
 
     /// How many registrations are stored, for the cap the registration
-    /// endpoint enforces and for the settings surface that reports it.
+    /// endpoint enforces. That one caller is the whole of it; nothing reports
+    /// this number on a settings surface.
     pub async fn count_oauth_clients(&self) -> Result<usize> {
         let _guard = self.guard.lock().await;
         // A count this method cannot read fails the call rather than reading

@@ -1021,10 +1021,16 @@ pub struct MeResponse {
     /// A rendering signal for the profile's connected-clients card, the same
     /// role `can_share` plays for the share surfaces above: an instance that
     /// never turned OAuth on draws no card asking somebody to manage clients
-    /// that can never exist. It is not a gate - `/me/oauth-grants` and
-    /// `/oauth/*` refuse on their own, off `auth.oauth` itself, regardless of
-    /// what this probe says - so a stale or forged `true` costs a 404 rather
-    /// than access.
+    /// that can never exist. It is not a gate: every `/oauth/*` route refuses
+    /// on its own, off `auth.oauth` itself, regardless of what this probe
+    /// says, so a stale or forged `true` costs a 404 rather than access.
+    ///
+    /// `/me/oauth-grants` deliberately does not refuse on the setting. A grant
+    /// is the caller's own account state, served like the personal MCP token
+    /// surface beside it, so an operator who turns OAuth off leaves every
+    /// account still able to see and revoke what it granted - and the grants
+    /// are inert at the gate meanwhile. Forging this flag reaches nothing
+    /// there either: the route answers the caller's own rows and no others.
     oauth: bool,
     /// The server version, so a mismatched UI can say so.
     #[schema(example = "0.12.0")]

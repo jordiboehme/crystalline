@@ -8053,7 +8053,7 @@
           },
           "oauth": {
             "type": "boolean",
-            "description": "Whether this instance serves OAuth for MCP clients, from the effective\n`auth.oauth` setting.\n\nA rendering signal for the profile's connected-clients card, the same\nrole `can_share` plays for the share surfaces above: an instance that\nnever turned OAuth on draws no card asking somebody to manage clients\nthat can never exist. It is not a gate - `/me/oauth-grants` and\n`/oauth/*` refuse on their own, off `auth.oauth` itself, regardless of\nwhat this probe says - so a stale or forged `true` costs a 404 rather\nthan access."
+            "description": "Whether this instance serves OAuth for MCP clients, from the effective\n`auth.oauth` setting.\n\nA rendering signal for the profile's connected-clients card, the same\nrole `can_share` plays for the share surfaces above: an instance that\nnever turned OAuth on draws no card asking somebody to manage clients\nthat can never exist. It is not a gate: every `/oauth/*` route refuses\non its own, off `auth.oauth` itself, regardless of what this probe\nsays, so a stale or forged `true` costs a 404 rather than access.\n\n`/me/oauth-grants` deliberately does not refuse on the setting. A grant\nis the caller's own account state, served like the personal MCP token\nsurface beside it, so an operator who turns OAuth off leaves every\naccount still able to see and revoke what it granted - and the grants\nare inert at the gate meanwhile. Forging this flag reaches nothing\nthere either: the route answers the caller's own rows and no others."
           },
           "read_only": {
             "type": "boolean",

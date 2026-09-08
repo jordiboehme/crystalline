@@ -745,7 +745,11 @@ pub struct AuthConfig {
     /// registration, authorization with a consent page and a token endpoint,
     /// so a hosted client such as Claude.ai connects without a pasted token.
     /// Requires `auth.mcp`, since the tokens it issues are checked at that
-    /// gate. Absent means off.
+    /// gate. Absent follows `auth.mcp` where the UI is served, so a shared
+    /// instance with agents authenticating and a consent page to show them
+    /// gets OAuth without asking; `false` turns it off and `true` insists,
+    /// and the startup guards refuse to serve where an explicit `true` cannot
+    /// be met. See [`GlobalConfig::auth_oauth`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<bool>,
     /// `auth.max_users`. How many accounts trusted-header provisioning may
