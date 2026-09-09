@@ -1840,6 +1840,33 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
+        // `IN ()` is a syntax error, and an empty configuration is a legitimate
+        // one, so stamping nothing touches no SQL at all.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut params: Vec<Value> = vec![Value::Text(when.to_string())];
+        let placeholders: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                params.push(Value::Text((*name).to_string()));
+                format!("?{}", i + 2)
+            })
+            .collect();
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE domain SET last_registered=?1 WHERE name IN ({})",
+                    placeholders.join(",")
+                ),
+                params,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path in this milestone is always the candidate
         // scan. `fts_native` records the probe outcome for diagnostics; when a
@@ -1868,7 +1895,8 @@ impl Store for TursoStore {
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
-             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
+             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
+             d.last_registered \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
         )
@@ -1889,6 +1917,7 @@ impl Store for TursoStore {
                 host_instance_id: cell_text(r, 11),
                 host_label: cell_text(r, 12),
                 host_heartbeat_at: cell_text(r, 13),
+                last_registered: cell_text(r, 14),
             })
             .collect())
     }

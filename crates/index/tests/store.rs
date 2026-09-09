@@ -4986,3 +4986,113 @@ parity!(
     a_colon_in_a_title_resolves_at_home_on_both_backends,
     colon_title_resolution
 );
+
+// --- the registration stamp --------------------------------------------------
+
+/// The `last_registered` stamp: a domain the configuration still names is
+/// marked as seen, restamping moves the mark forward, a domain nobody stamped
+/// reads as `None`, and the value travels on `domain_stats`.
+///
+/// `None` is the load-bearing case. It means "never stamped", not "stamped
+/// long ago": a domain row written before the column existed, or one written
+/// by a sync that ran before the first stamping sweep, carries no evidence
+/// about its age at all. A caller that ages the stamp must leave such a row
+/// alone rather than treat it as infinitely old.
+async fn registration_stamp(store: &dyn Store) {
+    let _ = store
+        .upsert_domain("alpha", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("beta", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("gamma", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+
+    // Fresh rows are unstamped: nobody has said they were registered yet.
+    let stamp = |stats: &Vec<crystalline_index::DomainStats>, name: &str| {
+        stats
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} is in domain_stats"))
+            .last_registered
+            .clone()
+    };
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stamp(&stats, "alpha"), None, "a fresh row is unstamped");
+    assert_eq!(stamp(&stats, "beta"), None);
+    assert_eq!(stamp(&stats, "gamma"), None);
+
+    // Stamping names two of the three. Times are fixed-width RFC 3339 strings,
+    // the same convention `last_sync` uses, so they compare lexically.
+    store
+        .stamp_registered(&["alpha", "beta"], "2026-09-01T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "the stamp travels on domain_stats"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z")
+    );
+    assert_eq!(
+        stamp(&stats, "gamma"),
+        None,
+        "a domain nobody stamped stays unstamped: never seen, not seen long ago"
+    );
+
+    // Stamping again moves the mark forward for the named domains only.
+    store
+        .stamp_registered(&["alpha"], "2026-09-08T12:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "restamping moves the mark forward"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "a domain the second call did not name keeps its earlier stamp"
+    );
+
+    // An empty set is a no-op, not a syntax error: a configuration that
+    // registers nothing is a configuration, and the sweep still runs.
+    store
+        .stamp_registered(&[], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "an empty stamp set changes nothing"
+    );
+
+    // A name with no row is a silent no-op: the configuration may register a
+    // domain that has never been synced, and stamping must not invent a row.
+    store
+        .stamp_registered(&["never-synced", "gamma"], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats.len(), 3, "stamping an unknown name creates no row");
+    assert_eq!(
+        stamp(&stats, "gamma").as_deref(),
+        Some("2026-09-09T00:00:00Z"),
+        "the known name beside it was still stamped"
+    );
+}
+parity!(
+    registration_stamp_records_when_a_domain_was_last_seen,
+    registration_stamp
+);

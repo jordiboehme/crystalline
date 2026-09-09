@@ -1120,6 +1120,16 @@ pub struct DomainStats {
     /// The host's last heartbeat, RFC 3339, when hosted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_heartbeat_at: Option<String>,
+    /// When this domain was last seen registered in the configuration, RFC
+    /// 3339, or `None` when it has never been stamped. Written by
+    /// [`Store::stamp_registered`].
+    ///
+    /// `None` means never stamped. It is emphatically not an old timestamp: a
+    /// caller comparing ages treats `None` as no evidence of staleness, never
+    /// as infinitely old. Every domain row written before the column existed
+    /// reads `None`, so a fresh upgrade must find nothing collectable on its
+    /// first sweep.
+    pub last_registered: Option<String>,
 }
 
 /// The instance currently holding a file domain's host lock in a shared
@@ -1699,6 +1709,30 @@ pub trait Store: Send + Sync {
 
     /// Record that a domain finished syncing at the given RFC 3339 instant.
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;
+
+    /// Record that every named domain was seen registered at the given RFC
+    /// 3339 instant, writing `last_registered` on each matching row.
+    ///
+    /// Domains are named rather than identified because the caller is the
+    /// configuration, which knows names. A name with no row in the index is a
+    /// silent no-op: this stamps rows, it never creates them. An empty set is
+    /// a no-op too, so a configuration that registers nothing is not an error.
+    ///
+    /// The caller must pass the configuration's own registrations, read the
+    /// way a named lookup resolves them (including a re-read of the config
+    /// file on disk), not a cached or narrower approximation of that set. A
+    /// domain that is genuinely registered but missing from the set handed in
+    /// here goes unstamped, ages, and is indistinguishable from one that was
+    /// removed - which, for a caller that collects on the stamp, is data loss.
+    ///
+    /// The stamp is how a later reader tells a domain removed a week ago from
+    /// one whose configuration was edited an hour ago. Absence of a stamp
+    /// (`DomainStats::last_registered` reading `None`) means *never stamped*,
+    /// not *stamped infinitely long ago*: a caller aging the stamp must treat
+    /// `None` as no evidence of staleness and leave the row alone, so the
+    /// first sweep after an upgrade, when every pre-existing row reads `None`,
+    /// collects nothing.
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()>;
 
     /// Diagnostics about the open store.
     async fn store_info(&self) -> Result<StoreInfo>;

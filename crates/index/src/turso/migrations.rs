@@ -72,6 +72,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "raw reference text",
         sql: SCHEMA_V10,
     },
+    Migration {
+        version: 11,
+        label: "domain registration stamp",
+        sql: SCHEMA_V11,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -326,6 +331,19 @@ ALTER TABLE relation ADD COLUMN to_raw TEXT;
 ALTER TABLE link ADD COLUMN to_raw TEXT;
 "#;
 
+// When this domain was last seen in the configuration, RFC 3339, the same text
+// convention `last_sync` uses so the two compare lexically.
+//
+// Nullable with no default and no backfill, and that is the point: every row
+// that predates this migration reads NULL, and NULL means "never stamped", not
+// "stamped infinitely long ago". A caller that ages the stamp to decide whether
+// a domain has been gone long enough to collect must read NULL as no evidence
+// at all and leave the row alone, so the first sweep after an upgrade collects
+// nothing. Rows earn a stamp only by being seen registered.
+const SCHEMA_V11: &str = r#"
+ALTER TABLE domain ADD COLUMN last_registered TEXT;
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -439,6 +457,69 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The v11 column against a domain row that predates it.
+    ///
+    /// The whole grace-period design rests on this reading: a row written
+    /// before the stamp existed comes out of the migration with
+    /// `last_registered` NULL, and NULL is "never stamped", not "stamped
+    /// infinitely long ago". Nothing backfills it, so on the first sweep after
+    /// an upgrade every domain in the index is unstamped and none of them is
+    /// old enough to collect. The row stamped afterwards is the control that
+    /// proves the column accepts a value at all.
+    #[tokio::test]
+    async fn v11_leaves_a_domain_row_written_before_it_unstamped() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for m in &MIGRATIONS[..10] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[10].version, 11, "the eleventh migration is v11");
+
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path) VALUES (1,'old','/tmp/old'),(2,'seen','/tmp/seen');",
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[10].sql).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE last_registered IS NULL"
+            )
+            .await,
+            2,
+            "no backfill: both pre-existing rows read NULL, meaning never stamped"
+        );
+
+        // Only the domain seen in the configuration is stamped, and the row
+        // beside it stays NULL rather than aging into a date.
+        conn.execute(
+            "UPDATE domain SET last_registered='2026-09-09T00:00:00Z' WHERE name='seen'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE last_registered IS NOT NULL"
+            )
+            .await,
+            1,
+            "the stamped row carries a value and the unstamped one still does not"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE name='old' AND last_registered IS NULL"
+            )
+            .await,
+            1,
+        );
     }
 
     /// The v10 column against a row that predates it.

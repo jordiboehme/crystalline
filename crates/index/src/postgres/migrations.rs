@@ -71,6 +71,11 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "raw reference text",
         sql: SCHEMA_V9,
     },
+    Migration {
+        version: 10,
+        label: "domain registration stamp",
+        sql: SCHEMA_V10,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -310,6 +315,20 @@ CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
 const SCHEMA_V9: &str = r#"
 ALTER TABLE relation ADD COLUMN IF NOT EXISTS to_raw TEXT;
 ALTER TABLE link ADD COLUMN IF NOT EXISTS to_raw TEXT;
+"#;
+
+// When this domain was last seen in the configuration. TEXT RFC 3339 rather
+// than `timestamptz`, matching `last_sync` and the Turso twin so the column
+// compares lexically and identically on both backends.
+//
+// Nullable with no default and no backfill, and that is the point: every row
+// that predates this migration reads NULL, and NULL means "never stamped", not
+// "stamped infinitely long ago". A caller that ages the stamp to decide whether
+// a domain has been gone long enough to collect must read NULL as no evidence
+// at all and leave the row alone, so the first sweep after an upgrade collects
+// nothing. Rows earn a stamp only by being seen registered.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS last_registered TEXT;
 "#;
 
 const SCHEMA_V8: &str = r#"

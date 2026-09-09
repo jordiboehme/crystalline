@@ -2124,6 +2124,24 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
+        // An empty configuration is a legitimate one; stamping nothing runs no
+        // statement, matching the Turso backend, where `IN ()` is a syntax
+        // error.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET last_registered=$1 WHERE name = ANY($2)")
+            .bind(when)
+            .bind(&owned)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path is the candidate scan on both backends, so
         // hybrid ranking and every search test match across them.
@@ -2145,7 +2163,8 @@ impl Store for PostgresStore {
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
-             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
+             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
+             d.last_registered \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
         )
         .fetch_all(conn.as_mut())
@@ -2167,6 +2186,7 @@ impl Store for PostgresStore {
                 host_instance_id: cell_text(r, 11),
                 host_label: cell_text(r, 12),
                 host_heartbeat_at: cell_text(r, 13),
+                last_registered: cell_text(r, 14),
             })
             .collect())
     }
