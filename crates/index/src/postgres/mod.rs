@@ -2171,6 +2171,15 @@ impl Store for PostgresStore {
             .collect())
     }
 
+    async fn domain_names(&self) -> Result<Vec<String>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query("SELECT name FROM domain ORDER BY name COLLATE \"C\"")
+            .fetch_all(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
     async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
         // Six grouped scans mirroring the Turso backend exactly: engram tags,
         // observation tags, observation categories, relation types and the

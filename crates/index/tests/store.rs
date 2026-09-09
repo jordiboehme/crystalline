@@ -3081,6 +3081,49 @@ parity!(
     descriptor_lookups_order_by_bytes
 );
 
+/// The name list and the counted stats describe the same set of domains, in the
+/// same byte order.
+///
+/// `domain_names` exists so the serving screen - which asks on every read which
+/// domains the index holds - does not pay for `domain_stats`' six correlated
+/// counting scans per domain to learn a name. Two answers for one question is
+/// how they drift, so this pins them together; the mixed case is here because a
+/// Postgres locale collation would order the two differently without the
+/// explicit `COLLATE "C"`.
+async fn names_and_stats_describe_the_same_domains(store: &dyn Store) {
+    assert!(
+        store.domain_names().await.unwrap().is_empty(),
+        "an empty index holds no domain names"
+    );
+    for name in ["Zed", "eng", "alpha"] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", &engram("A", "a", "engram", "", "b\n"));
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["Zed".to_string(), "alpha".to_string(), "eng".to_string()],
+        "sorted in byte order, so a capitalized name comes first"
+    );
+    let mut counted: Vec<String> = store
+        .domain_stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    counted.sort();
+    assert_eq!(
+        counted,
+        store.domain_names().await.unwrap(),
+        "the cheap answer names exactly the domains the counted one does"
+    );
+}
+parity!(
+    domain_names_matches_domain_stats,
+    names_and_stats_describe_the_same_domains
+);
+
 async fn wipe_clears(store: &dyn Store) {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();

@@ -3,8 +3,9 @@
 #
 # The `db` service runs Postgres with pgvector; Crystalline points at it purely
 # through CRYSTALLINE_DATABASE_BACKEND and CRYSTALLINE_DATABASE_URL, no mounted
-# config file needed. Every instance searches and reads everything in the
-# shared database. Writes follow the single-writer rule: each file domain has
+# config file needed. Every instance searches and reads every domain it has
+# registered, so register the same domains on each instance that should answer
+# for them; a domain an instance has no registration for is not served there. Writes follow the single-writer rule: each file domain has
 # exactly one hosting instance that syncs and watches it (arbitrated by a host
 # lock with a heartbeat), while a virtual domain keeps its engrams in the
 # database itself, so any instance may write to it under a per-engram
@@ -72,7 +73,8 @@ services:
     restart: unless-stopped
 
   # A second instance sharing the same Postgres, the collaboration case. It
-  # searches and reads everything the first instance indexed and can host its own
+  # searches and reads every domain registered on it - register the ones the
+  # first instance indexed and it answers for those too - and can host its own
   # file domains and write the shared virtual domains, while the host lock keeps
   # exactly one instance syncing each file domain. Give it its own knowledge
   # mount if it hosts file domains. `serve --take-over` migrates hosting of a

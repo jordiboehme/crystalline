@@ -1276,6 +1276,11 @@ impl Engine {
     /// [`Scope::Unrestricted`]. Everything else gets a set to subtract, empty
     /// on an installation where nobody has made a domain private.
     ///
+    /// The privacy answer alone, and it is not the serving screen. A read that
+    /// answers from the index takes [`Engine::hidden_for`], which adds the
+    /// domains whose rows outlived their registration; this one is for a caller
+    /// reasoning about who may see what rather than about what may be served.
+    ///
     /// [`Scope::Unrestricted`]: crate::scope::Scope::Unrestricted
     pub async fn hidden_domains(
         &self,
@@ -1335,15 +1340,21 @@ impl Engine {
         })
     }
 
-    /// Refuse a domain this caller may not see, and say nothing about one that
-    /// is merely unregistered.
+    /// Refuse a domain this caller must not be answered from, and say nothing
+    /// about a name the index has never heard of.
     ///
     /// The narrow half of [`Engine::require_domain`], for a verb that already
     /// has its own words for a domain nobody registered and its own order for
-    /// saying them. A hidden domain is refused here with exactly the bytes an
+    /// saying them. A screened domain is refused here with exactly the bytes an
     /// unregistered one gets, which is the whole point; anything else falls
     /// through untouched, so adding this gate to a verb cannot change what that
-    /// verb answered before on any input but a private domain.
+    /// verb answered before on any input the index holds rows for.
+    ///
+    /// [`Engine::hidden_for`] screens two things and both are refused here: a
+    /// private domain, and a domain whose rows outlived their registration. The
+    /// second is a name the verb behind this gate would have refused for itself
+    /// a line later, since nothing unregistered resolves to a content source -
+    /// so this is one line earlier, not one refusal more.
     pub async fn refuse_hidden_domain(
         &self,
         name: &str,
@@ -1356,26 +1367,70 @@ impl Engine {
         Ok(())
     }
 
-    /// [`Engine::hidden_domains`] as a plain set, with "no filtering at all"
-    /// folded into "nothing is hidden".
+    /// Every domain name a read must answer as though it were not there: the
+    /// private domains this caller may not see, plus every domain the index
+    /// still holds that nobody has registered here.
     ///
-    /// The two are one instruction to a read path - subtract these names, of
-    /// which there may be none - and folding them here is what keeps every verb
-    /// from re-deciding it. A scoped read holds this set for the whole call and
-    /// hands it to each helper, so one call resolves the caller once.
+    /// **The two are one rule, which is why they are one set.** A caller naming
+    /// a private domain gets what naming a domain nobody registered gets, which
+    /// is nothing; this says the same thing about a caller who named no domain
+    /// at all. An index row whose domain is unregistered is not a hit, not a
+    /// count and not a facet value - it is left in the index (a filter, never a
+    /// deletion, so nothing here can lose knowledge) and simply stops being an
+    /// answer. That matters because a removal used to leave rows behind
+    /// deliberately, and those rows went on outranking the knowledge their owner
+    /// still keeps.
     ///
-    /// A resolver error propagates rather than resolving to an empty set: a
-    /// read that cannot learn what its caller may see refuses, and never widens.
+    /// Resolved once per call and threaded inward. Every verb that answers from
+    /// the index asks for it here rather than deciding for itself, so a read
+    /// added later inherits the screen instead of having to remember it.
+    ///
+    /// Either half failing propagates rather than resolving to an empty set: a
+    /// read that cannot learn what it may answer from refuses, and never widens.
     async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
-        Ok(self.hidden_domains(scope).await?.unwrap_or_default())
+        let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
+        hidden.extend(self.unregistered_domains().await?);
+        Ok(hidden)
     }
 
-    /// [`Engine::hidden_for`] and the set of private domain names, from one
+    /// The domains the index holds that this instance has no registration for.
+    ///
+    /// Asked of the index on every call rather than cached, so a domain removed
+    /// or registered while this engine runs takes effect on the next read rather
+    /// than at the next restart. It is one column of a table with a row per
+    /// domain ([`Store::domain_names`], deliberately not `domain_stats`, whose
+    /// per-domain counts this would pay for and never look at).
+    ///
+    /// "Registered" is [`Engine::known_domain_names`]: the startup snapshot plus
+    /// whatever has been discovered since, which is the same set
+    /// [`Engine::sync_targets`] syncs and [`Engine::domain_entry`] resolves
+    /// against. So a domain this instance does not index is also one it does not
+    /// serve, and the named and unnamed answers agree.
+    ///
+    /// [`Store::domain_names`]: crystalline_index::Store::domain_names
+    async fn unregistered_domains(&self) -> Result<HashSet<String>> {
+        let registered: HashSet<String> = self.known_domain_names().into_iter().collect();
+        let names = {
+            let store = self.store.lock().await;
+            store.domain_names().await?
+        };
+        Ok(names
+            .into_iter()
+            .filter(|name| !registered.contains(name))
+            .collect())
+    }
+
+    /// The private domain names and the ones this caller may not see, from one
     /// read of the visibility records.
     ///
     /// For the one caller that needs both: a domain listing subtracts the
     /// hidden names and then marks each row it kept private or shared. Asking
     /// for the two separately would sweep the same table twice for one answer.
+    ///
+    /// The privacy half only, unlike [`Engine::hidden_for`], and it needs no
+    /// more: the only caller is [`Engine::list_domains`], which builds its rows
+    /// from the registrations rather than from the index, so a domain nobody
+    /// registered has no row there to keep back in the first place.
     ///
     /// An engine with no resolver installed - a one-shot CLI command, the
     /// embedded stdio stack, a test engine - answers with two empty sets:
@@ -1396,18 +1451,26 @@ impl Engine {
     }
 
     /// The domain list a scoped store query is given: the caller's own filter
-    /// with the hidden names subtracted, or - when the caller named none and
-    /// something is hidden - every domain the store holds minus those.
+    /// with the screened names subtracted, or - when the caller named none and
+    /// something is screened out - every domain the store holds minus those.
     ///
-    /// [`ScopedDomains::AsAsked`] is the machine owner's answer and the answer
-    /// on any installation with no private domains: nothing is subtracted, no
-    /// extra query runs and the store sees exactly the filter it always saw.
+    /// `hidden` is [`Engine::hidden_for`]'s whole answer, so "screened out"
+    /// covers both halves of it: a private domain this caller may not see, and
+    /// a domain the index holds that nobody registered here. An unnamed sweep
+    /// therefore narrows to the registered domains that have rows, which is the
+    /// same rule a named read gets from [`Engine::domain_entry_scoped`].
+    ///
+    /// [`ScopedDomains::AsAsked`] is the answer when there is nothing to screen
+    /// out at all: nothing is subtracted, no extra query runs and the store sees
+    /// exactly the filter it always saw. That is the ordinary installation - no
+    /// private domains and no rows outliving their registration - so the sweep
+    /// below is a cost only where something actually has to be kept back.
     ///
     /// [`ScopedDomains::Nothing`] is the case an empty list would silently
-    /// widen. A caller that named only hidden domains has asked for nothing it
-    /// may read, and `Some(vec![])` is not that request - the search verbs drop
-    /// an empty filter and sweep everything. So it is its own answer, and the
-    /// caller returns the empty page a name nobody registered would have
+    /// widen. A caller that named only screened-out domains has asked for
+    /// nothing it may read, and `Some(vec![])` is not that request - the search
+    /// verbs drop an empty filter and sweep everything. So it is its own answer,
+    /// and the caller returns the empty page a name nobody registered would have
     /// produced.
     async fn scoped_domains(
         &self,
@@ -1429,19 +1492,17 @@ impl Engine {
                 ScopedDomains::Only(kept)
             });
         }
-        // The store's own domain list rather than the registered one: a shared
-        // database can hold a domain this instance never registered, and a read
-        // that turned an unfiltered sweep into a list of local registrations
-        // would quietly stop answering for those. The other side of that choice
-        // is that a registered domain with no rows yet is absent from the list -
-        // which costs nothing, since a domain with no rows has nothing to
-        // return to any query this list narrows.
+        // The store's own domain list, intersected with what may be served
+        // rather than assumed to be servable: every name it returns that this
+        // instance has no registration for is already in `hidden`, so the
+        // filter below is the whole of the rule. A registered domain with no
+        // rows yet is absent from the list, which costs nothing - a domain with
+        // no rows has nothing to return to any query this list narrows.
         let store = self.store.lock().await;
-        let stats = store.domain_stats().await?;
+        let names = store.domain_names().await?;
         drop(store);
-        let visible: Vec<String> = stats
+        let visible: Vec<String> = names
             .into_iter()
-            .map(|d| d.name)
             .filter(|name| !hidden.contains(name))
             .collect();
         Ok(if visible.is_empty() {

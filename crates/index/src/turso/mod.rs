@@ -1893,6 +1893,11 @@ impl Store for TursoStore {
             .collect())
     }
 
+    async fn domain_names(&self) -> Result<Vec<String>> {
+        let rows = query_all(&self.conn, "SELECT name FROM domain ORDER BY name", vec![]).await?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
+    }
+
     async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {
         // Six grouped scans: engram tags, observation tags, observation
         // categories, relation types and the engram `type` and `status` columns.

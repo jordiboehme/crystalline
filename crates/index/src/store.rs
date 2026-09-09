@@ -1706,6 +1706,15 @@ pub trait Store: Send + Sync {
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
 
+    /// Every domain name the index holds, sorted.
+    ///
+    /// The cheap half of [`Store::domain_stats`], for the caller that needs to
+    /// know *which* domains have rows rather than how many rows each has. One
+    /// column of a table with a row per domain, against six correlated counting
+    /// scans per domain - which matters because the serving screen asks this on
+    /// every read, and a domain name is all it wants.
+    async fn domain_names(&self) -> Result<Vec<String>>;
+
     /// The vocabulary in use: tag, observation-category, relation-type, engram
     /// `type` and engram `status` usage counts, for one domain or (when
     /// `domain` is `None`) across every domain.
