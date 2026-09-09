@@ -32,8 +32,17 @@
 //! service artifacts; the rest, including the whole GitHub, environment,
 //! harnesses and provisioning sections, are report-only, and every finding
 //! that has a fix points at the right next command.
+//!
+//! The index reads are socket-first, the same shape `sync_dispatch` uses: a
+//! running daemon holds the index file, so its stamps are asked for over ctl
+//! and only a machine with no daemon (or an invocation an explicit
+//! `--db`/`--config` sends down the direct path) opens the file here. When
+//! neither route can read it, doctor does not abort: every check that does
+//! not need the index still runs, [`DoctorReport::index`] names what stopped
+//! the ones that do and what to do about it, and that counts as one
+//! unresolved problem so the exit code still says something is wrong.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
@@ -41,7 +50,9 @@ use crystalline_core::config::{self, DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_core::provision;
 use crystalline_core::verify::{self, VerifyOptions};
 use crystalline_core::{HarnessKind, harness_paths};
-use crystalline_index::{Store, TagCluster, configured_model_id, tag_clusters_with_aliases};
+use crystalline_index::{
+    FileStamp, Store, TagCluster, configured_model_id, tag_clusters_with_aliases,
+};
 use crystalline_remote::TokenStore;
 use crystalline_remote::github::auth::auth_base;
 use crystalline_remote::state::{OriginState, verify_base};
@@ -52,6 +63,40 @@ use serde::Serialize;
 use crate::cmd;
 use crate::install;
 use crate::receipt;
+
+/// How `doctor` read the index this run.
+///
+/// Every index-backed check - orphan rows, unindexed files, a virtual
+/// domain's engram count, the embedding summary, tag hygiene - needs one of
+/// these routes to be open, and a diagnostic tool must not abort because
+/// none of them was. The report therefore says which route it took, and the
+/// human render reads the same field rather than guessing why a section is
+/// thin.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(tag = "source", rename_all = "snake_case")]
+pub enum IndexAccess {
+    /// No index file exists yet: a fresh install that has never synced.
+    /// Neither an error nor a problem.
+    #[default]
+    Absent,
+    /// Opened here, in this process. The route a machine with no running
+    /// daemon takes, and the one an explicit `--db` or `--config` always
+    /// takes (see [`crystalline_service::use_daemon`]).
+    Direct,
+    /// Served by the running daemon over its control socket, because that
+    /// daemon holds the index file. Orphan rows and unindexed files come
+    /// from its stamps and read exactly as they do on the direct path; the
+    /// checks that need the open store itself (embedding coverage, tag
+    /// hygiene, a virtual domain's engram count) sit this run out.
+    Daemon,
+    /// Neither route could read the index. Every check that does not need it
+    /// still ran.
+    Unavailable {
+        /// What stopped the index-backed checks and what to do about it, as
+        /// guidance a person can act on rather than a bare locking error.
+        reason: String,
+    },
+}
 
 /// One domain's diagnostics.
 #[derive(Debug, Clone, Default, Serialize)]
@@ -69,6 +114,12 @@ pub struct DomainDoctor {
     /// on-disk orphan and unindexed checks.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub engrams: Option<i64>,
+    /// Whether this domain's index-backed checks ran at all: the orphan and
+    /// unindexed sets below, and a virtual domain's engram count. False when
+    /// no route to the index was open, in which case `orphans` and
+    /// `unindexed` are empty because nothing was read, not because nothing
+    /// was found - [`DoctorReport::index`] says why.
+    pub index_checked: bool,
     /// Whether the path exists on disk.
     pub path_exists: bool,
     /// Whether `MANIFEST.md` is present at the root.
@@ -77,8 +128,14 @@ pub struct DomainDoctor {
     pub orphans: Vec<String>,
     /// How many of `orphans` were removed by `--fix`.
     pub orphans_removed: usize,
-    /// On-disk `.md` files not yet present in the index.
+    /// On-disk `.md` files not yet present in the index. Holds only files that
+    /// parse; a file whose frontmatter fails to parse is never merely
+    /// unsynced, so it is reported under `unsyncable` instead.
     pub unindexed: Vec<String>,
+    /// On-disk `.md` files that cannot be indexed at all, because their
+    /// frontmatter fails to parse (`verify` rule `E001`). Running `sync`
+    /// again never resolves these; the frontmatter itself needs a fix.
+    pub unsyncable: Vec<UnsyncableFile>,
     /// Encoding problems, sourced from `verify`'s `E006` rule.
     pub encoding_issues: Vec<EncodingIssue>,
     /// The instance currently hosting this file domain in a shared database, or
@@ -99,6 +156,16 @@ pub struct EncodingIssue {
     /// The source line, when known.
     pub line: Option<usize>,
     /// The human message from `verify`.
+    pub message: String,
+}
+
+/// One `E001` finding: a file whose frontmatter does not parse at all, so no
+/// `sync` will ever index it until the frontmatter itself is fixed.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnsyncableFile {
+    /// The file path, relative to the domain root, forward-slashed.
+    pub path: String,
+    /// The human message from `verify`'s `E001` rule.
     pub message: String,
 }
 
@@ -180,7 +247,9 @@ pub struct GithubDoctor {
 /// filtered to drop `domain.*` and `github.token` rows: those get the richer
 /// dedicated [`EnvironmentDoctor::domains`] and
 /// [`EnvironmentDoctor::github_token`] fields instead, so the flat list never
-/// duplicates them. `database.url` already arrives masked as `"(set)"`.
+/// duplicates them. A credential-carrying key already arrives masked as
+/// `"(set)"` (see `EnvOverlay::active_overrides`, which reads the registry's
+/// secret flag).
 #[derive(Debug, Clone, Serialize)]
 pub struct EnvOverride {
     /// The environment variable, for example `CRYSTALLINE_DATABASE_BACKEND`.
@@ -188,7 +257,8 @@ pub struct EnvOverride {
     /// The settings registry key it overrides, for example
     /// `database.backend`.
     pub key: String,
-    /// The overridden value, masked to `"(set)"` for `database.url`.
+    /// The overridden value, masked to `"(set)"` for a credential-carrying
+    /// key.
     pub value: String,
 }
 
@@ -210,9 +280,9 @@ pub struct EnvDomainReport {
 /// for visibility: never counted as a problem, and never present at all
 /// (`None`) when the environment overlay carries nothing (mirroring how
 /// [`DoctorReport::github`] is absent when collaboration is off). No value
-/// here is a secret: `database.url` and the GitHub token are masked exactly
-/// as [`EnvOverlay::active_overrides`] masks them, and the token itself is
-/// reduced to a boolean.
+/// here is a secret: every credential-carrying key and the GitHub token are
+/// masked exactly as [`EnvOverlay::active_overrides`] masks them, and the
+/// token itself is reduced to a boolean.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct EnvironmentDoctor {
     /// The `CRYSTALLINE_CONFIG` value, when set. A path, never a secret.
@@ -376,6 +446,8 @@ pub struct TagsDoctor {
 /// The full `doctor` report.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DoctorReport {
+    /// How the index was read this run, and, when it could not be, why.
+    pub index: IndexAccess,
     /// Per-domain diagnostics.
     pub domains: Vec<DomainDoctor>,
     /// Service lock and socket diagnostics.
@@ -408,12 +480,21 @@ impl DoctorReport {
     /// when this is nonzero, 0 otherwise.
     pub fn remaining_problems(&self) -> usize {
         let mut n = 0;
+        // An index nobody could read is one problem, counted once for the
+        // machine rather than once per domain: the cause is shared, and the
+        // per-domain `index_checked` flags only record which checks it took
+        // down with it. Counting it at all is what keeps the exit code
+        // honest, since a partial report otherwise looks like a clean one.
+        if matches!(self.index, IndexAccess::Unavailable { .. }) {
+            n += 1;
+        }
         for d in &self.domains {
             if !d.path_exists || !d.manifest_present {
                 n += 1;
             }
             n += d.orphans.len().saturating_sub(d.orphans_removed);
             n += d.unindexed.len();
+            n += d.unsyncable.len();
             n += d.encoding_issues.len();
         }
         if self.service.lock_stale && !self.service.lock_removed {
@@ -487,31 +568,38 @@ pub async fn run(
     // the process causing it - the one state where doctor matters most.
     let service = check_service(fix).await?;
 
-    let store = if db.is_file() {
-        Some(
-            crystalline_index::open_store(&cfg.database(), Some(&db), false)
-                .await
-                .map_err(|e| {
-                    let hint = if service.daemon_unresponsive && !service.daemon_dislodged {
-                        let pid = service
-                            .lock_pid
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "unknown".to_string());
-                        format!(
-                            ". An unresponsive daemon (pid {pid}) holds the index and answers nothing; rerun with --fix to replace it"
-                        )
-                    } else {
-                        String::new()
-                    };
-                    anyhow!(
-                        "could not open the index at {}: {e}{hint}",
-                        db.display()
-                    )
-                })?,
-        )
-    } else {
+    // The index read, socket-first, in the same shape `sync_dispatch` uses. A
+    // healthy daemon holds the index file, so asking it for the stamps is the
+    // only way the ordinary case (a diagnosis run while the service is up)
+    // gets a report at all. Probed after `check_service` and never before it:
+    // a `--fix` that just dislodged a wedged holder has already run, so this
+    // answer is the current one and the ordering above is preserved.
+    let bypassed = !crystalline_service::use_daemon(db_override, config_override);
+    let mut daemon_stamps = if bypassed {
         None
+    } else {
+        daemon_file_stamps(domain_filter).await
     };
+
+    let mut index = IndexAccess::Absent;
+    let mut store = None;
+    if daemon_stamps.is_some() {
+        index = IndexAccess::Daemon;
+    } else if db.is_file() {
+        match crystalline_index::open_store(&cfg.database(), Some(&db), false).await {
+            Ok(opened) => {
+                index = IndexAccess::Direct;
+                store = Some(opened);
+            }
+            // Not an abort. Every check that does not need the index still
+            // runs below, and the reason travels in the report as guidance.
+            Err(e) => {
+                index = IndexAccess::Unavailable {
+                    reason: index_unavailable_reason(&db, &e.to_string(), &service, bypassed),
+                };
+            }
+        }
+    }
     // Lock once for the whole diagnostic pass: a one-shot CLI command has no
     // concurrent store users, and the helpers take a plain `&dyn Store`.
     let guard = match &store {
@@ -522,7 +610,14 @@ pub async fn run(
 
     let mut domains = Vec::with_capacity(targets.len());
     for (name, entry) in &targets {
-        domains.push(check_domain(name, entry, store_ref, fix).await?);
+        // Taken out of the daemon's answer rather than borrowed, so each
+        // domain's stamps are consumed once. A file domain the daemon
+        // answered for but has no rows for reads as an empty set, which is
+        // exactly what the direct path produces for an unsynced domain.
+        let stamps = daemon_stamps
+            .as_mut()
+            .map(|by_domain| by_domain.remove(name).unwrap_or_default());
+        domains.push(check_domain(name, entry, store_ref, stamps, fix).await?);
     }
 
     let environment = check_environment(&loaded.overlay);
@@ -545,6 +640,7 @@ pub async fn run(
     let tags = check_tags(store_ref).await?;
 
     Ok(DoctorReport {
+        index,
         domains,
         service,
         environment,
@@ -555,6 +651,62 @@ pub async fn run(
         tags,
         fix,
     })
+}
+
+/// The per-domain file stamps a running daemon serves over its ctl socket,
+/// keyed by domain name and then by domain-relative path, or `None` when no
+/// daemon answered.
+///
+/// Never an error: a daemon that is not running, one that refuses the request
+/// and one whose answer does not parse all mean the same thing to the caller,
+/// which is that the direct open is the route to try next.
+async fn daemon_file_stamps(
+    domain: Option<&str>,
+) -> Option<HashMap<String, HashMap<String, FileStamp>>> {
+    let data = crystalline_service::ctl_if_running(
+        serde_json::json!({ "v": 1, "cmd": "file_stamps", "domain": domain }),
+    )
+    .await
+    .ok()??;
+    serde_json::from_value(data.get("domains")?.clone()).ok()
+}
+
+/// Why the index-backed checks did not run, written as guidance: what holds
+/// the index, and the command that gets a full report. A person who runs
+/// `doctor` while a daemon is up used to see nothing but the raw locking
+/// error, which named neither.
+fn index_unavailable_reason(
+    db: &Path,
+    error: &str,
+    service: &ServiceDoctor,
+    bypassed: bool,
+) -> String {
+    let db = db.display();
+    let pid = service
+        .lock_pid
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let skipped = "so the orphan, unindexed, embedding and tag checks did not run";
+    // The wedge first: it is the one holder `--fix` can do something about.
+    if service.daemon_unresponsive && !service.daemon_dislodged {
+        return format!(
+            "an unresponsive daemon (pid {pid}) holds the index at {db} and answers nothing on its socket, {skipped}. Rerun `crystalline doctor --fix` to replace it. The index reported: {error}"
+        );
+    }
+    let live_daemon = instance::read_lock_info().is_some_and(|i| instance::process_alive(i.pid));
+    if live_daemon && bypassed {
+        return format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {db}, and --db or --config told doctor to read that file directly instead of asking the daemon, {skipped}. Run `crystalline doctor` without --db and --config to have the daemon answer them, or stop it first with `crystalline ctl shutdown`. The index reported: {error}"
+        );
+    }
+    if live_daemon {
+        return format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {db} and did not answer doctor's request for its file stamps, {skipped}. Stop it with `crystalline ctl shutdown` and run `crystalline doctor` again. The index reported: {error}"
+        );
+    }
+    format!(
+        "the index at {db} could not be opened, {skipped}. Check that the file is readable and that no other process is holding it; `crystalline doctor --fix` clears a lock or socket file a killed daemon left behind. The index reported: {error}"
+    )
 }
 
 fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
@@ -574,10 +726,18 @@ fn select_domains(cfg: &GlobalConfig, only: Option<&str>) -> Result<Vec<(String,
     }
 }
 
+/// One domain's diagnostics. `daemon_stamps` carries the file stamps a
+/// running daemon served for this domain, which is the index read whenever
+/// the daemon holds the index file; `store` is the direct open, used when
+/// there is no daemon to ask. At most one of the two is ever `Some`, and both
+/// produce the identical orphan, unindexed and unsyncable sets - the split
+/// between "not indexed yet" and "cannot be indexed until the frontmatter is
+/// fixed" is computed here, off the stamps, whichever route delivered them.
 async fn check_domain(
     name: &str,
     entry: &DomainEntry,
     store: Option<&dyn Store>,
+    daemon_stamps: Option<HashMap<String, FileStamp>>,
     fix: bool,
 ) -> Result<DomainDoctor> {
     // A virtual domain has no filesystem, so the on-disk checks (path, MANIFEST,
@@ -593,6 +753,8 @@ async fn check_domain(
             manifest_present: true,
             ..Default::default()
         };
+        // The count needs the store itself, so a run served by the daemon
+        // leaves it absent rather than reporting a fabricated zero.
         if let Some(store) = store {
             let count = store
                 .list_engrams(name, None, None)
@@ -600,6 +762,7 @@ async fn check_domain(
                 .map(|e| e.len() as i64)
                 .unwrap_or(0);
             d.engrams = Some(count);
+            d.index_checked = true;
         }
         return Ok(d);
     }
@@ -623,35 +786,62 @@ async fn check_domain(
         return Ok(d);
     }
 
-    // (c) Encoding problems: delegate to verify's E006 rather than
-    // re-implementing BOM/null-byte detection.
+    // (c) Encoding problems and (b') unsyncable files: one verify_paths call
+    // sources both. Encoding delegates to E006 rather than re-implementing
+    // BOM/null-byte detection; E001 (frontmatter that fails to parse at all)
+    // is kept keyed by its root-relative, forward-slashed path so it can be
+    // matched against the unindexed set below - `verify` reports an absolute
+    // path, the unindexed set does not, so they are normalised to the same
+    // shape before comparing.
+    let mut unsyncable_by_path: BTreeMap<String, String> = BTreeMap::new();
     if let Ok(report) = verify::verify_paths([&path], &VerifyOptions::default()) {
-        d.encoding_issues = report
-            .issues
-            .into_iter()
-            .filter(|i| i.rule == "E006")
-            .map(|i| EncodingIssue {
-                path: i.path.display().to_string(),
-                line: i.line,
-                message: i.message,
-            })
-            .collect();
+        for issue in report.issues {
+            match issue.rule {
+                "E006" => {
+                    d.encoding_issues.push(EncodingIssue {
+                        path: issue.path.display().to_string(),
+                        line: issue.line,
+                        message: issue.message,
+                    });
+                }
+                "E001" => {
+                    unsyncable_by_path
+                        .insert(relative_slash_path(&path, &issue.path), issue.message);
+                }
+                _ => {}
+            }
+        }
     }
 
-    // (a) + (b): DB orphans and unindexed files.
-    if let Some(store) = store {
-        let domain_id = store
-            .upsert_domain(
-                name,
-                Some(&path.to_string_lossy()),
-                crystalline_index::DomainKind::File,
-            )
-            .await
-            .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
-        let stamps = store
-            .file_stamps(domain_id)
-            .await
-            .map_err(|e| anyhow!("could not read file stamps for '{name}': {e}"))?;
+    // (a) + (b): DB orphans and unindexed files, from whichever route reached
+    // the index. `domain_id` stays `None` on the daemon-served route, which is
+    // what keeps `--fix` from pretending it can delete rows through it.
+    let mut domain_id = None;
+    let stamps = match daemon_stamps {
+        Some(stamps) => Some(stamps),
+        None => match store {
+            Some(store) => {
+                let id = store
+                    .upsert_domain(
+                        name,
+                        Some(&path.to_string_lossy()),
+                        crystalline_index::DomainKind::File,
+                    )
+                    .await
+                    .map_err(|e| anyhow!("could not read domain '{name}': {e}"))?;
+                domain_id = Some(id);
+                Some(
+                    store
+                        .file_stamps(id)
+                        .await
+                        .map_err(|e| anyhow!("could not read file stamps for '{name}': {e}"))?,
+                )
+            }
+            None => None,
+        },
+    };
+    if let Some(stamps) = stamps {
+        d.index_checked = true;
         let on_disk = markdown_rel_paths(&path);
         let disk_set: HashSet<&str> = on_disk.iter().map(String::as_str).collect();
         let db_set: HashSet<&str> = stamps.keys().map(String::as_str).collect();
@@ -668,7 +858,25 @@ async fn check_domain(
             .collect();
         unindexed.sort();
 
-        if fix {
+        // A path with an E001 finding is not merely unsynced, it cannot be
+        // indexed at all until its frontmatter is fixed - split it out.
+        let mut unsyncable: Vec<UnsyncableFile> = Vec::new();
+        unindexed.retain(|p| match unsyncable_by_path.remove(p) {
+            Some(message) => {
+                unsyncable.push(UnsyncableFile {
+                    path: p.clone(),
+                    message,
+                });
+                false
+            }
+            None => true,
+        });
+        d.unsyncable = unsyncable;
+
+        // Only the direct route can delete. Over a daemon the orphans are
+        // still reported, with the render saying plainly what removing them
+        // takes, rather than being silently left in place.
+        if let (true, Some(store), Some(domain_id)) = (fix, store, domain_id) {
             for p in &orphans {
                 store.delete_engram(domain_id, p).await?;
                 d.orphans_removed += 1;
@@ -679,7 +887,9 @@ async fn check_domain(
 
         // Ownership: who hosts this file domain in a shared database. Unhosted
         // (single-instance) domains leave this `None`.
-        if let Ok(Some(host)) = store.domain_host(domain_id).await {
+        if let (Some(store), Some(domain_id)) = (store, domain_id)
+            && let Ok(Some(host)) = store.domain_host(domain_id).await
+        {
             d.host_instance_id = Some(host.instance_id);
             d.host_heartbeat_at = Some(host.heartbeat_at);
         }
@@ -711,17 +921,74 @@ fn markdown_rel_paths(root: &Path) -> Vec<String> {
         {
             continue;
         }
-        let rel = entry
-            .path()
-            .strip_prefix(root)
-            .unwrap_or(entry.path())
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy().into_owned())
-            .collect::<Vec<_>>()
-            .join("/");
-        out.push(rel);
+        out.push(relative_slash_path(root, entry.path()));
     }
     out
+}
+
+/// `p`, relative to `root` and forward-slashed, matching the shape the sync
+/// engine's own walk produces (and, in turn, what the unindexed and orphan
+/// sets are keyed by). `verify::Issue::path` is constructed from the same
+/// root but stays a platform `PathBuf`, so any comparison against those sets
+/// goes through this first.
+///
+/// The fast path is a literal component-prefix strip: free, and exact for
+/// every caller that built `p` by walking `root` itself (`markdown_rel_paths`
+/// below, always). It can still fail for a path that names the same file but
+/// was produced by a second, independent walk of "the same" root -
+/// `check_domain` passes its own `path` into `verify::verify_paths` by
+/// reference, but a config-round-tripped or Windows-verbatim-prefixed
+/// (`\\?\C:\...`) form can disagree with a plain one even when both resolve
+/// to the identical file (seen on Windows CI: a duplicate-key E001 finding
+/// fell back into `unindexed` instead of `unsyncable`, because keeping the
+/// unstripped absolute path on a failed strip can never equal a relative
+/// entry, so the mismatch produced a wrong bucket with nothing on screen to
+/// say so). Canonicalizing both sides and retrying converges them regardless
+/// of which one carries the mismatched form - `dunce::canonicalize`
+/// specifically, not `std::fs::canonicalize`, because it strips a Windows
+/// verbatim prefix from its result rather than risking adding one, so two
+/// paths naming the same file end up in the same shape either way. If even
+/// that fails (one side no longer exists, a permission error), the file's
+/// own name is returned - still relative, in the shape callers expect,
+/// rather than the absolute string a silent mismatch used to produce. That
+/// last fallback is the one answer this function cannot vouch for: a bare
+/// name does not equal a nested key, and two files of the same name in
+/// different folders collapse onto one. Both would land a finding in the
+/// wrong bucket exactly as the original bug did, so the fallback logs a
+/// warning and the next double fault leaves a trail instead of nothing.
+fn relative_slash_path(root: &Path, p: &Path) -> String {
+    if let Some(rel) = strip_to_slash(root, p) {
+        return rel;
+    }
+    if let (Ok(canon_root), Ok(canon_p)) = (dunce::canonicalize(root), dunce::canonicalize(p))
+        && let Some(rel) = strip_to_slash(&canon_root, &canon_p)
+    {
+        return rel;
+    }
+    // The double fault: neither the literal strip nor the canonicalized retry
+    // could relate the two. A bare file name is the best answer left, and it
+    // may not match the key the caller compares it against, so the fallback
+    // says so rather than repeating the silence this helper exists to end.
+    tracing::warn!(
+        root = %root.display(),
+        path = %p.display(),
+        "could not relate a path to its domain root, falling back to its file name"
+    );
+    p.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The literal, zero-cost half of [`relative_slash_path`]: `Some` only when
+/// `root` is exactly a component prefix of `p`.
+fn strip_to_slash(root: &Path, p: &Path) -> Option<String> {
+    let rel = p.strip_prefix(root).ok()?;
+    Some(
+        rel.components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 fn is_hidden(name: &str) -> bool {
@@ -1212,6 +1479,23 @@ pub fn render_human(report: &DoctorReport) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
 
+    // The index route first, so a reader meets the reason before the thin
+    // domain sections it explains. A plain direct open, and a machine with no
+    // index yet, say nothing here: only a route worth knowing about does.
+    match &report.index {
+        IndexAccess::Daemon => {
+            let _ = writeln!(
+                out,
+                "index: read through the running daemon, which owns the index file"
+            );
+        }
+        IndexAccess::Unavailable { reason } => {
+            let _ = writeln!(out, "index:");
+            let _ = writeln!(out, "  [problem] {reason}");
+        }
+        IndexAccess::Absent | IndexAccess::Direct => {}
+    }
+
     for d in &report.domains {
         let _ = writeln!(out, "{} ({})", d.name, d.path);
         // Ownership in a shared database: who hosts this file domain. Unhosted
@@ -1225,11 +1509,17 @@ pub fn render_human(report: &DoctorReport) -> String {
             let _ = writeln!(out, "  hosted by instance {host}{hb}");
         }
         if d.is_virtual {
-            let _ = writeln!(
-                out,
-                "  ok (virtual, {} engram(s) in the database)",
-                d.engrams.unwrap_or(0)
-            );
+            match d.engrams {
+                Some(n) => {
+                    let _ = writeln!(out, "  ok (virtual, {n} engram(s) in the database)");
+                }
+                // A virtual domain lives entirely in the index, so with no
+                // route to it there is nothing to count and nothing to
+                // claim.
+                None => {
+                    let _ = writeln!(out, "  ok (virtual, engram count not read)");
+                }
+            }
             continue;
         }
         if !d.path_exists {
@@ -1239,12 +1529,32 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.manifest_present {
             let _ = writeln!(out, "  [problem] no MANIFEST.md at the domain root");
         }
+        // Said once per domain so an empty orphan and unindexed list is never
+        // mistaken for a clean bill of health. The cause, and its remedy, are
+        // in the index section above.
+        if !d.index_checked && matches!(report.index, IndexAccess::Unavailable { .. }) {
+            let _ = writeln!(
+                out,
+                "  index checks skipped (orphan rows, unindexed files); see the index section above"
+            );
+        }
         if !d.orphans.is_empty() {
             if d.orphans_removed > 0 {
                 let _ = writeln!(
                     out,
                     "  removed {} orphan row(s): {}",
                     d.orphans_removed,
+                    d.orphans.join(", ")
+                );
+            } else if report.index == IndexAccess::Daemon {
+                // Removing a row is a write, and this run reached the index
+                // through a read verb on the daemon that holds it. Say what
+                // that takes instead of pointing at a --fix that would do
+                // nothing.
+                let _ = writeln!(
+                    out,
+                    "  [problem] {} orphan row(s) (file missing on disk): {}. The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`",
+                    d.orphans.len(),
                     d.orphans.join(", ")
                 );
             } else {
@@ -1259,11 +1569,23 @@ pub fn render_human(report: &DoctorReport) -> String {
         if !d.unindexed.is_empty() {
             let _ = writeln!(
                 out,
-                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}: {}",
+                "  [problem] {} file(s) not indexed yet, run: crystalline sync --domain {}",
                 d.unindexed.len(),
-                d.name,
-                d.unindexed.join(", ")
+                d.name
             );
+            for p in &d.unindexed {
+                let _ = writeln!(out, "    {p}");
+            }
+        }
+        if !d.unsyncable.is_empty() {
+            let _ = writeln!(
+                out,
+                "  [problem] {} file(s) cannot be indexed until the frontmatter is fixed (verify rule E001):",
+                d.unsyncable.len()
+            );
+            for f in &d.unsyncable {
+                let _ = writeln!(out, "    {}: {}", f.path, f.message);
+            }
         }
         if !d.encoding_issues.is_empty() {
             let _ = writeln!(
@@ -1275,10 +1597,14 @@ pub fn render_human(report: &DoctorReport) -> String {
                 let _ = writeln!(out, "    {}: {}", e.path, e.message);
             }
         }
+        // "ok" is a claim about everything, so a domain whose index checks
+        // never ran does not get to make it.
         if d.manifest_present
             && d.orphans.is_empty()
             && d.unindexed.is_empty()
+            && d.unsyncable.is_empty()
             && d.encoding_issues.is_empty()
+            && (d.index_checked || !matches!(report.index, IndexAccess::Unavailable { .. }))
         {
             let _ = writeln!(out, "  ok");
         }
@@ -1426,7 +1752,25 @@ pub fn render_human(report: &DoctorReport) -> String {
             e["stale_chunks"]
         );
     } else {
-        let _ = writeln!(out, "embeddings: no index yet");
+        // Absent for three different reasons, and a person acts on each of
+        // them differently, so none of them may print as "no index yet".
+        match &report.index {
+            IndexAccess::Daemon => {
+                let _ = writeln!(
+                    out,
+                    "embeddings: not read here, the running daemon owns the index; run: crystalline status"
+                );
+            }
+            IndexAccess::Unavailable { .. } => {
+                let _ = writeln!(
+                    out,
+                    "embeddings: not read, the index checks did not run (see the index section above)"
+                );
+            }
+            IndexAccess::Absent | IndexAccess::Direct => {
+                let _ = writeln!(out, "embeddings: no index yet");
+            }
+        }
     }
 
     if let Some(harnesses) = &report.harnesses {
@@ -1623,6 +1967,89 @@ mod tests {
         );
     }
 
+    /// One file domain with `orphans` recorded and nothing else wrong, read
+    /// through `index`.
+    fn report_with_orphans(index: IndexAccess, orphans: &[&str]) -> DoctorReport {
+        DoctorReport {
+            index,
+            domains: vec![DomainDoctor {
+                name: "eng".to_string(),
+                kind: "file".to_string(),
+                path: "/kb/eng".to_string(),
+                index_checked: true,
+                path_exists: true,
+                manifest_present: true,
+                orphans: orphans.iter().map(|p| p.to_string()).collect(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    /// Over a daemon the doctor reads the index through a read verb, so
+    /// `--fix` cannot delete an orphan row however it is spelled. The finding
+    /// is still reported, with what removing it actually takes, rather than
+    /// pointing at a flag that would silently do nothing.
+    #[test]
+    fn an_orphan_found_over_a_daemon_says_what_removing_it_takes() {
+        let daemon = render_human(&report_with_orphans(IndexAccess::Daemon, &["gone.md"]));
+        assert!(
+            daemon.contains("[problem] 1 orphan row(s) (file missing on disk): gone.md."),
+            "{daemon}"
+        );
+        assert!(
+            daemon.contains(
+                "The running daemon owns the index, so removing them needs it stopped: run `crystalline ctl shutdown`, then `crystalline doctor --fix`"
+            ),
+            "{daemon}"
+        );
+        assert!(
+            !daemon.contains("rerun with --fix to remove"),
+            "the direct path's advice would be false here: {daemon}"
+        );
+
+        let direct = render_human(&report_with_orphans(IndexAccess::Direct, &["gone.md"]));
+        assert!(
+            direct.contains("rerun with --fix to remove: gone.md"),
+            "the direct path keeps the advice that works there: {direct}"
+        );
+    }
+
+    /// An index nobody could read counts once for the machine, so the exit
+    /// code says something is wrong without inflating the count by one per
+    /// domain.
+    #[test]
+    fn an_unreadable_index_counts_as_exactly_one_problem() {
+        let mut report = DoctorReport {
+            index: IndexAccess::Unavailable {
+                reason: "the index at /kb/index.db could not be opened".to_string(),
+            },
+            domains: vec![
+                DomainDoctor {
+                    name: "eng".to_string(),
+                    path_exists: true,
+                    manifest_present: true,
+                    ..Default::default()
+                },
+                DomainDoctor {
+                    name: "docs".to_string(),
+                    path_exists: true,
+                    manifest_present: true,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(report.remaining_problems(), 1);
+
+        report.index = IndexAccess::Daemon;
+        assert_eq!(
+            report.remaining_problems(),
+            0,
+            "a run served by the daemon read the index, so there is nothing to report"
+        );
+    }
+
     #[tokio::test]
     async fn a_declared_alias_suppresses_its_cluster() {
         let doctor = tags_doctor_over("\n## Tag Aliases\n\n- colours -> colour\n").await;
@@ -1634,5 +2061,82 @@ mod tests {
             "the alias folds colours onto colour, so the cluster is suppressed: {:?}",
             doctor.clusters
         );
+    }
+
+    // `relative_slash_path` - the E001-to-unindexed matching helper. These run
+    // on every platform, including the Windows CI leg the regression showed up
+    // on: a duplicate-key finding was silently falling back into `unindexed`
+    // instead of `unsyncable` because a failed `strip_prefix` used to keep the
+    // absolute path, which can never equal a relative entry.
+
+    #[test]
+    fn relative_slash_path_matches_a_nested_file_under_the_same_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let nested = root.join("a").join("b").join("c.md");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "x").unwrap();
+
+        // The fast path: `nested` was built by literally joining `root`, the
+        // shape every real caller (`markdown_rel_paths`'s own walk) produces,
+        // so this must resolve without ever touching the canonicalize fallback.
+        assert_eq!(relative_slash_path(root, &nested), "a/b/c.md");
+    }
+
+    #[test]
+    fn relative_slash_path_falls_back_to_a_file_name_rather_than_an_absolute_path() {
+        // A multi-component absolute path (forward slashes parse as
+        // separators on every platform, Windows included) that shares no
+        // component prefix with `root` and does not exist, so both the fast
+        // path and the canonicalize fallback miss. This is the "verbatim
+        // prefix disagrees with a plain root" failure's general shape - two
+        // absolute paths that cannot be reconciled at all - proving the
+        // degrade-safely half: a total non-match still returns a short,
+        // non-empty, root-relative-looking value (just the file name) rather
+        // than the full absolute string the old code kept on a failed strip,
+        // which could never equal a relative `unindexed` entry and was the
+        // bug. The Windows-specific `\\?\C:\...` prefix parsing itself is not
+        // reproducible on a non-Windows path (backslashes are plain filename
+        // characters there, not separators) - that trigger is only provable
+        // by Windows CI; this test and the next one prove the fallback
+        // mechanism handles a genuine mismatch correctly once one occurs.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let unrelated = Path::new("/definitely/not/under/root/a/b/bad.md");
+
+        let result = relative_slash_path(root, unrelated);
+        assert_eq!(
+            result, "bad.md",
+            "falls back to just the file name, never the full absolute path"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relative_slash_path_matches_when_the_root_and_the_path_reach_the_same_file_through_different_forms()
+     {
+        // A symlink stands in for the Windows failure's actual shape: two
+        // absolute paths, both real and both naming the same file, that do
+        // not share a literal component prefix (the verbatim-prefixed root
+        // config canonicalized against a plain re-walk, there; a symlinked
+        // root against its real target, here). `strip_prefix` fails on both
+        // for the same reason - the component sequences genuinely differ -
+        // and `dunce::canonicalize` is what reconciles them in both cases, so
+        // this proves the fallback mechanism the Windows fix relies on
+        // actually works, even though it cannot reproduce the Windows-only
+        // verbatim-prefix trigger itself (Windows CI is the proof for that).
+        let dir = tempfile::tempdir().unwrap();
+        let real_root = dir.path().join("real");
+        std::fs::create_dir_all(real_root.join("a").join("b")).unwrap();
+        std::fs::write(real_root.join("a").join("b").join("c.md"), "x").unwrap();
+
+        let linked_root = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_root, &linked_root).unwrap();
+
+        // `root` is given through the symlink; `p` is the file's canonical,
+        // non-symlinked path - the same mismatch shape a canonicalized config
+        // path and a plain re-walked one would produce.
+        let p = real_root.join("a").join("b").join("c.md");
+        assert_eq!(relative_slash_path(&linked_root, &p), "a/b/c.md");
     }
 }

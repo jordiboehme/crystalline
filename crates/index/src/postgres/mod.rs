@@ -41,11 +41,13 @@
 //!   cache of the one connection that ran it (`clear_cached_statements` in
 //!   `ensure_embedding_width`), so any other pooled connection with a stale plan
 //!   still cached raises Postgres's "cached plan must not change result type" on
-//!   its next use. `replace_chunks`' carry SELECT is the only statement in this
-//!   module (or in `search`) that returns that raw column - an expression over
-//!   it (the `<=>` distance operator, which yields `float8`) or a statement that
-//!   only binds a vector parameter is unaffected and stays cached - so it is the
-//!   one exposed to the hazard.
+//!   its next use. Two statements in this module return that raw column and are
+//!   therefore the ones exposed to the hazard: `replace_chunks`' carry SELECT
+//!   and `lead_vectors`' SELECT. Nothing in `search` is - an expression over
+//!   the column (the `<=>` distance operator, which yields `float8`) or a
+//!   statement that only binds a vector parameter is unaffected and stays
+//!   cached. Any statement added later that selects `chunk.embedding` itself
+//!   joins that list and needs the same treatment.
 //!
 //!   Two fixes were tried and rejected before landing on the one below.
 //!   `.persistent(false)` (never cache the statement) looked right but breaks on
@@ -65,13 +67,13 @@
 //!
 //!   The fix instead prevents the stale plan from ever being reused:
 //!   `embedding_generation`, an `AtomicU64` on `PostgresStore`, is bumped every
-//!   time `ensure_embedding_width` actually runs its ALTER. `replace_chunks`
-//!   folds the current generation into its carry SELECT's SQL text as a
-//!   trailing comment, so a width change gives the statement different SQL
-//!   text and therefore a different sqlx cache key; every connection, not just
-//!   the one that ran the DDL, prepares fresh the next time it runs the carry
-//!   SELECT after a resize, and the plan it had cached under the old
-//!   generation's text simply ages out of the LRU unused.
+//!   time `ensure_embedding_width` actually runs its ALTER. Both exposed
+//!   statements fold the current generation into their SQL text as a trailing
+//!   comment, so a width change gives each of them different SQL text and
+//!   therefore a different sqlx cache key; every connection, not just the one
+//!   that ran the DDL, prepares fresh the next time it runs one of them after
+//!   a resize, and the plan it had cached under the old generation's text
+//!   simply ages out of the LRU unused.
 
 mod migrations;
 mod search;
@@ -93,9 +95,9 @@ use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, folder_slash, page_window,
+    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
+    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -334,11 +336,12 @@ impl PostgresStore {
     /// not change result type"). The `clear_cached_statements` at the end
     /// sheds `conn`'s own stale plans but cannot reach the pool's other
     /// connections, so on a successful resize this bumps
-    /// `embedding_generation`: `replace_chunks`' carry SELECT folds the new
-    /// value into its SQL text, which changes sqlx's cache key and forces a
+    /// `embedding_generation`: the two statements that return that raw column
+    /// (`replace_chunks`' carry SELECT and `lead_vectors`' SELECT) fold the new
+    /// value into their SQL text, which changes sqlx's cache key and forces a
     /// fresh prepare everywhere, on this connection and every other one,
     /// without needing to reach them. See the module doc for the full hazard
-    /// and why that statement cannot instead retry in place.
+    /// and why those statements cannot instead retry in place.
     async fn ensure_embedding_width(&self, conn: &mut PgConnection, dims: usize) -> Result<()> {
         let dims = dims as i64;
         if *self.embedding_width.lock().unwrap() == Some(dims) {
@@ -382,8 +385,9 @@ impl PostgresStore {
         // column is now stale. `clear_cached_statements` sheds `conn`'s own
         // stale plans directly; it only reaches this one connection, so it is
         // a courtesy for whichever statements this connection still might run
-        // under the old SQL text (there are none, `replace_chunks` is the only
-        // one and it always carries the current generation), not what makes
+        // under the old SQL text (there are none: the two statements returning
+        // that raw column, `replace_chunks`' carry SELECT and `lead_vectors`'
+        // SELECT, both always carry the current generation), not what makes
         // the pool's other connections safe. `embedding_generation` below is
         // what does that, by changing the cache key everywhere at once.
         Connection::clear_cached_statements(&mut *conn)
@@ -874,7 +878,7 @@ impl Store for PostgresStore {
         }
 
         for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 7);
             for rel in batch {
                 params.push(Param::Int(engram_id));
                 params.push(Param::Int(domain.0));
@@ -882,26 +886,28 @@ impl Store for PostgresStore {
                 params.push(Param::Text(rel.rel_type.clone()));
                 params.push(Param::Text(rel.to_target.clone()));
                 params.push(Param::TextOpt(rel.to_domain.clone()));
+                params.push(Param::Text(rel.to_raw.clone()));
             }
             let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) VALUES {}",
-                value_rows(6, batch.len(), Some("NULL"))
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(7, batch.len(), Some("NULL"))
             );
             exec(&mut *c, &sql, params).await?;
         }
 
         for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 5);
+            let mut params: Vec<Param> = Vec::with_capacity(batch.len() * 6);
             for link in batch {
                 params.push(Param::Int(engram_id));
                 params.push(Param::Int(domain.0));
                 params.push(Param::Int(link.line as i64));
                 params.push(Param::Text(link.to_target.clone()));
                 params.push(Param::TextOpt(link.to_domain.clone()));
+                params.push(Param::Text(link.to_raw.clone()));
             }
             let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) VALUES {}",
-                value_rows(5, batch.len(), Some("NULL"))
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
             );
             exec(&mut *c, &sql, params).await?;
         }
@@ -1083,19 +1089,13 @@ impl Store for PostgresStore {
 
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
         // One statement. Target domain is `to_domain` when set, else the
-        // relation's own domain. Prefer a permalink match, then a title match.
-        let tgt_dom = "COALESCE((SELECT d.id FROM domain d WHERE d.name = relation.to_domain), relation.domain_id)";
-        let by_perma = format!(
-            "(SELECT e.id FROM engram e WHERE e.permalink = relation.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
-        let by_title = format!(
-            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(relation.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
+        // relation's own domain. Prefer a permalink match, then a title match,
+        // then the whole bracket text at home - see `reference_match`.
         let sql = format!(
-            "UPDATE relation SET to_id = COALESCE({by_perma}, {by_title}) \
+            "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = $1 \
-             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = relation.to_target AND e.domain_id = {tgt_dom}) \
-                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(relation.to_target) AND e.domain_id = {tgt_dom}))"
+             AND {resolved} IS NOT NULL",
+            resolved = reference_match("relation")
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1107,22 +1107,13 @@ impl Store for PostgresStore {
     }
 
     async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
-        // The wikilink twin of resolve_pending_relations over the `link` table.
-        // Target domain is `to_domain` when set, else the link's own domain.
-        // Prefer a permalink match, then a title match. Links carry no rel_type.
-        let tgt_dom =
-            "COALESCE((SELECT d.id FROM domain d WHERE d.name = link.to_domain), link.domain_id)";
-        let by_perma = format!(
-            "(SELECT e.id FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
-        let by_title = format!(
-            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
+        // The wikilink twin of resolve_pending_relations over the `link` table,
+        // matching by the same rule. Links carry no rel_type.
         let sql = format!(
-            "UPDATE link SET to_id = COALESCE({by_perma}, {by_title}) \
+            "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = $1 \
-             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom}) \
-                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom}))"
+             AND {resolved} IS NOT NULL",
+            resolved = reference_match("link")
         );
         let mut conn = self.acquire().await?;
         let done = sqlx::query(AssertSqlSafe(sql))
@@ -1446,16 +1437,16 @@ impl Store for PostgresStore {
         // Turso does. Turso keeps the flat positional form because BINARY is
         // already its default.
         let rows = sqlx::query(
-            "SELECT i.name, i.domain_id, i.path, i.to_target, i.kind FROM ( \
+            "SELECT i.name, i.domain_id, i.path, i.to_target, i.kind, i.to_domain FROM ( \
                SELECT d.name AS name, r.domain_id AS domain_id, e.path AS path, \
-                      r.to_target AS to_target, 0::int8 AS kind \
+                      r.to_target AS to_target, 0::int8 AS kind, r.to_domain AS to_domain \
                FROM relation r JOIN engram e ON e.id=r.engram_id \
                     JOIN domain d ON d.id=e.domain_id \
                WHERE r.to_id=$1 \
                   OR (r.to_id IS NULL AND r.domain_id=$2 AND r.to_domain IS NULL \
                       AND (r.to_target=$3 OR lower(r.to_target)=lower($4))) \
                UNION ALL \
-               SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8 \
+               SELECT d.name, l.domain_id, e.path, l.to_target, 1::int8, l.to_domain \
                FROM link l JOIN engram e ON e.id=l.engram_id \
                     JOIN domain d ON d.id=e.domain_id \
                WHERE l.to_id=$1 \
@@ -1477,6 +1468,7 @@ impl Store for PostgresStore {
                 src_domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
                 src_path: cell_text(r, 2).unwrap_or_default(),
                 to_target: cell_text(r, 3).unwrap_or_default(),
+                to_domain: cell_text(r, 5),
                 kind: if cell_i64(r, 4).unwrap_or(0) == 0 {
                     EdgeKind::Relation
                 } else {
@@ -1528,6 +1520,27 @@ impl Store for PostgresStore {
             .map(|text| format!("%{}%", like_escape(&text.to_lowercase())));
         let mut clauses: Vec<String> = Vec::new();
         let mut n = 5;
+        // The visibility exclusion, bound first so the summary below - which
+        // takes no reader-chosen filter - can bind exactly this prefix.
+        let mut exclude_sql = String::new();
+        if !query.exclude_domains.is_empty() {
+            let holes: Vec<String> = query
+                .exclude_domains
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("${}", n + i))
+                .collect();
+            exclude_sql = format!("i.domain NOT IN ({})", holes.join(", "));
+            clauses.push(exclude_sql.clone());
+            n += query.exclude_domains.len();
+        }
+        let excluded = || {
+            let mut params = target();
+            for domain in query.exclude_domains {
+                params.push(Param::Text(domain.clone()));
+            }
+            params
+        };
         if rel.is_some() {
             clauses.push(format!("i.rel=${n}"));
             n += 1;
@@ -1545,7 +1558,7 @@ impl Store for PostgresStore {
             format!(" WHERE {}", clauses.join(" AND "))
         };
         let filtered = || {
-            let mut params = target();
+            let mut params = excluded();
             if let Some(rel) = &rel {
                 params.push(Param::Text(rel.clone()));
             }
@@ -1594,13 +1607,20 @@ impl Store for PostgresStore {
             })
             .collect();
 
+        // The Turso twin's summary: over the unfiltered set, because the
+        // caller filters *with* it, minus the domains the caller may not see.
+        let summary_sql = if exclude_sql.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {exclude_sql}")
+        };
         let summary = query_all(
             conn.as_mut(),
             &format!(
-                "SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel \
+                "SELECT i.rel, COUNT(*) FROM ({source}) i{summary_sql} GROUP BY i.rel \
                  ORDER BY COUNT(*) DESC, i.rel COLLATE \"C\""
             ),
-            target(),
+            excluded(),
         )
         .await?;
         let types = summary
@@ -2016,6 +2036,57 @@ impl Store for PostgresStore {
         Ok(cov)
     }
 
+    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
+        let mut conn = self.acquire().await?;
+        // This selects the raw `embedding` column, whose type includes the
+        // column's typmod, so it is the second of the two statements in this
+        // module exposed to `ensure_embedding_width`'s DDL-vs-cached-plan
+        // hazard (see the module doc, and `replace_chunks` for the first). It
+        // carries the same trailing `/* w{generation} */` comment for the same
+        // reason: inert to Postgres, but it changes sqlx's cache key on every
+        // resize, so whichever pooled connection runs this next prepares
+        // against the current column shape instead of raising "cached plan
+        // must not change result type".
+        let generation = self.embedding_generation.load(Ordering::Relaxed);
+        let sql = format!(
+            "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+             JOIN engram e ON e.id=c.engram_id \
+             WHERE e.domain_id=$1 AND c.seq=0 AND c.model=$2 AND c.embedding IS NOT NULL \
+             ORDER BY c.engram_id ASC /* w{generation} */"
+        );
+        let rows = query_all(
+            conn.as_mut(),
+            &sql,
+            vec![Param::Int(domain.0), Param::Text(model.to_string())],
+        )
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let (Some(id), Some(dims)) = (cell_i64(r, 0), cell_i64(r, 1)) else {
+                continue;
+            };
+            let Some(vector) = r.try_get::<Option<pgvector::Vector>, _>(2).ok().flatten() else {
+                continue;
+            };
+            let vector = vector.to_vec();
+            if vector.len() != dims as usize {
+                tracing::warn!(
+                    engram_id = id,
+                    dims,
+                    stored = vector.len(),
+                    "skipping a lead vector whose stored width disagrees with its dims column"
+                );
+                continue;
+            }
+            out.push(LeadVector {
+                engram_id: EngramId(id),
+                dims: dims as usize,
+                vector,
+            });
+        }
+        Ok(out)
+    }
+
     async fn wipe(&self) -> Result<()> {
         // Deletes every chunk, so the coverage snapshot is now stale.
         self.invalidate_coverage();
@@ -2053,6 +2124,24 @@ impl Store for PostgresStore {
         Ok(())
     }
 
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
+        // An empty configuration is a legitimate one; stamping nothing runs no
+        // statement, matching the Turso backend, where `IN ()` is a syntax
+        // error.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let owned: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+        let mut conn = self.acquire().await?;
+        sqlx::query("UPDATE domain SET last_registered=$1 WHERE name = ANY($2)")
+            .bind(when)
+            .bind(&owned)
+            .execute(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(())
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path is the candidate scan on both backends, so
         // hybrid ranking and every search test match across them.
@@ -2074,7 +2163,8 @@ impl Store for PostgresStore {
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
-             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
+             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
+             d.last_registered \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
         )
         .fetch_all(conn.as_mut())
@@ -2096,8 +2186,18 @@ impl Store for PostgresStore {
                 host_instance_id: cell_text(r, 11),
                 host_label: cell_text(r, 12),
                 host_heartbeat_at: cell_text(r, 13),
+                last_registered: cell_text(r, 14),
             })
             .collect())
+    }
+
+    async fn domain_names(&self) -> Result<Vec<String>> {
+        let mut conn = self.acquire().await?;
+        let rows = sqlx::query("SELECT name FROM domain ORDER BY name COLLATE \"C\"")
+            .fetch_all(conn.as_mut())
+            .await
+            .map_err(IndexError::from)?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
     }
 
     async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {

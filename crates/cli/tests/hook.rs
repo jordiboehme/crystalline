@@ -702,3 +702,86 @@ fn an_env_defined_domain_alone_earns_the_nudge() {
         "a writable node whose only domain comes from the environment is nudgeable"
     );
 }
+
+/// The exact sentence Claude Code renders as `Stop says: <text>`, duplicated
+/// here for the reason [`NUDGE_REASON`] is: this is a black-box check on what
+/// the subprocess printed.
+const STOP_SYSTEM_MESSAGE: &str =
+    "Crystalline is checking this session for anything worth keeping.";
+
+/// A Stop hook wired for Claude Code answers in the shape that version
+/// honours: the top-level pair that delivers the nudge, the plain sentence a
+/// person reads beside the harness's own unconditional error line, and the
+/// block the documentation describes, carried for the version that implements
+/// it.
+#[test]
+fn the_claude_code_nudge_carries_the_message_and_the_documented_block() {
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let config = work.path().join("config.yaml");
+    write_domain_config(&config);
+    let transcript = substantial_transcript(work.path());
+
+    let mut cmd = bin();
+    isolate(&mut cmd, &home);
+    let out = cmd
+        .env("CRYSTALLINE_CONFIG", &config)
+        .args(["hook", "stop", "--harness", "claude-code"])
+        .write_stdin(stop_payload("session-claude-code", Some(&transcript)))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let printed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(printed["decision"], "block");
+    assert_eq!(printed["reason"], NUDGE_REASON);
+    assert_eq!(printed["systemMessage"], STOP_SYSTEM_MESSAGE);
+    assert_eq!(printed["hookSpecificOutput"]["hookEventName"], "Stop");
+    assert_eq!(printed["hookSpecificOutput"]["decision"], "block");
+    assert_eq!(printed["hookSpecificOutput"]["stopReason"], NUDGE_REASON);
+}
+
+/// Every harness whose Stop parser nobody here has measured gets byte-for-byte
+/// the line it has always got: no flag at all (an install written before the
+/// flag existed), a harness that is not Claude Code, and an id this binary does
+/// not know (a hook a newer release wired up, run by an older binary). All
+/// three answer identically, and a hand invocation keeps working unchanged.
+#[test]
+fn an_unmeasured_or_unknown_harness_gets_the_line_it_always_got() {
+    let expected = serde_json::to_string(&serde_json::json!({
+        "decision": "block",
+        "reason": NUDGE_REASON,
+    }))
+    .unwrap();
+
+    for (session, flag) in [
+        ("session-no-flag", None),
+        ("session-codex", Some("codex")),
+        ("session-unknown", Some("a-harness-from-a-future-release")),
+    ] {
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let config = work.path().join("config.yaml");
+        write_domain_config(&config);
+        let transcript = substantial_transcript(work.path());
+
+        let mut args = vec!["hook", "stop"];
+        if let Some(flag) = flag {
+            args.extend_from_slice(&["--harness", flag]);
+        }
+        let mut cmd = bin();
+        isolate(&mut cmd, &home);
+        let out = cmd
+            .env("CRYSTALLINE_CONFIG", &config)
+            .args(&args)
+            .write_stdin(stop_payload(session, Some(&transcript)))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag:?} must still exit 0");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap().trim(),
+            expected,
+            "{flag:?} must get exactly the fields it always got"
+        );
+    }
+}

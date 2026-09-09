@@ -19,7 +19,7 @@ use std::io::{IsTerminal, Read, Write};
 
 use anyhow::{Context, Result, bail};
 
-use crystalline_service::rest::{AuthStore, Role, User};
+use crystalline_service::rest::{AuthStore, LINKED_BY_CLI, Role, User};
 
 use crate::UsersCommand;
 
@@ -113,6 +113,108 @@ pub async fn run(command: UsersCommand, json: bool) -> Result<()> {
                 println!("'{}' is now {role}.", stored_name(&name));
             }
         }
+        UsersCommand::McpToken {
+            name,
+            label,
+            list,
+            revoke,
+            rotate,
+        } => {
+            // Issuing checks the account inside its own transaction; the
+            // other three branches would otherwise answer about an account
+            // that does not exist - an empty listing, or "no such token" - and
+            // a typo would read as a fact.
+            if (list || revoke.is_some() || rotate.is_some()) && store.user(&name).await?.is_none()
+            {
+                bail!("no such user: '{}'", stored_name(&name));
+            }
+            if list {
+                let tokens = store.list_mcp_tokens(&name).await?;
+                if json {
+                    crate::print_value(&serde_json::json!({ "tokens": tokens }), true);
+                } else {
+                    print_mcp_tokens(&tokens, &stored_name(&name));
+                }
+            } else if let Some(id) = revoke {
+                if !store.revoke_mcp_token(&name, id).await? {
+                    bail!(
+                        "'{}' holds no MCP token {id}; list them with \
+                         `crystalline users mcp-token {} --list`",
+                        stored_name(&name),
+                        stored_name(&name)
+                    );
+                }
+                println!(
+                    "Revoked MCP token {id} of '{}'. An agent still sending it is refused.",
+                    stored_name(&name)
+                );
+            } else if let Some(id) = rotate {
+                let issued = store.rotate_mcp_token(&name, id).await?;
+                print_issued_token(&issued, &stored_name(&name), json, Some(id));
+            } else {
+                // The account must exist before a token is minted for it; the
+                // store says so itself, so a mistyped name is reported rather
+                // than silently issuing against nothing.
+                let label = label.unwrap_or_else(|| "cli".to_string());
+                let issued = store.issue_mcp_token(&name, &label).await?;
+                print_issued_token(&issued, &stored_name(&name), json, None);
+            }
+        }
+        UsersCommand::Link {
+            name,
+            issuer,
+            subject,
+        } => {
+            store
+                .link_identity(&issuer, &subject, &name, LINKED_BY_CLI)
+                .await?;
+            println!(
+                "Linked subject '{}' at {} to '{}'. A sign-in with that identity now lands \
+                 in this account.",
+                subject.trim(),
+                issuer.trim(),
+                stored_name(&name)
+            );
+        }
+        UsersCommand::Unlink {
+            name,
+            issuer,
+            force,
+        } => {
+            // The store owns the last-way-in rule, so `--force` is the only
+            // thing decided here: which of its two entry points to call. The
+            // refusal, when it comes, is the store's own sentence, which names
+            // `crystalline users passwd`.
+            let removed = if force {
+                store.unlink_identity_force(&issuer, &name).await?
+            } else {
+                store.unlink_identity(&issuer, &name).await?
+            };
+            if !removed {
+                bail!(
+                    "'{}' holds no identity at {}",
+                    stored_name(&name),
+                    issuer.trim()
+                );
+            }
+            println!(
+                "Unlinked '{}' from {}. A sign-in from it now provisions a new account.",
+                stored_name(&name),
+                issuer.trim()
+            );
+            // Only reachable with --force, since that is the only way past the
+            // guard, and worth saying out loud: the operator has just made an
+            // account nobody can sign in to, on purpose, and either link step
+            // or a password ends that.
+            if store.identity_links(&name).await?.is_empty() && !store.has_password(&name).await? {
+                println!(
+                    "'{}' now has no way in at all: link an identity again, or give it a \
+                     password with `crystalline users passwd {}`.",
+                    stored_name(&name),
+                    stored_name(&name)
+                );
+            }
+        }
         UsersCommand::Remove { name, force } => {
             if force {
                 store.remove_user_force(&name).await?;
@@ -188,6 +290,111 @@ async fn sweep_personal_credential(name: &str) {
     {
         tracing::debug!("a running daemon still holds the swept credential: {e}");
     }
+}
+
+/// Print a freshly issued (or rotated) token, which is the one and only time
+/// anybody sees it, and say what to do with it.
+///
+/// The teaching line is the point of the command: a token nobody knows where
+/// to paste is a token that gets pasted somewhere worse. `replaced` names the
+/// id a rotation retired, so the operator can tell the two ids apart.
+///
+/// `--json` prints the same three fields as an object, for provisioning
+/// scripts; the teaching goes to stderr there, so a piped stdout stays valid
+/// JSON.
+fn print_issued_token(
+    issued: &crystalline_service::rest::IssuedMcpToken,
+    account: &str,
+    json: bool,
+    replaced: Option<i64>,
+) {
+    if json {
+        crate::print_value(
+            &serde_json::json!({
+                "id": issued.id,
+                "token": issued.token,
+                "label": issued.label,
+            }),
+            true,
+        );
+        eprintln!("{TOKEN_TEACHING}");
+        return;
+    }
+    match replaced {
+        Some(old) => println!(
+            "Rotated MCP token {old} of '{account}': it stops working now. \
+             The replacement is id {} (label '{}'), shown once:",
+            issued.id, issued.label
+        ),
+        None => println!(
+            "Issued MCP token {} for '{account}' (label '{}'), shown once:",
+            issued.id, issued.label
+        ),
+    }
+    println!();
+    println!("  {}", issued.token);
+    println!();
+    println!("{TOKEN_TEACHING}");
+}
+
+/// What to do with a token that was just printed. One sentence, worded the
+/// same as the refusal an unauthenticated agent gets from the MCP gate, so the
+/// person reading either one recognizes the other.
+const TOKEN_TEACHING: &str =
+    "Add it to the agent's MCP registration as header 'Authorization: Bearer <token>'.";
+
+/// One line per token: id, label, when it was issued and when it was last
+/// presented. Never a token: only its hash is stored, so there is nothing to
+/// print.
+fn print_mcp_tokens(tokens: &[crystalline_service::rest::McpTokenInfo], account: &str) {
+    if tokens.is_empty() {
+        println!(
+            "'{account}' holds no MCP tokens. Issue one with: \
+             crystalline users mcp-token {account}"
+        );
+        return;
+    }
+    let rows: Vec<[String; 4]> = tokens
+        .iter()
+        .map(|t| {
+            [
+                t.id.to_string(),
+                t.label.clone(),
+                t.created_at.clone(),
+                t.last_used.clone().unwrap_or_else(|| "never".to_string()),
+            ]
+        })
+        .collect();
+    let header = ["ID", "LABEL", "CREATED", "LAST USED"];
+    // The last column is never padded, so no line carries trailing whitespace.
+    let widths: Vec<usize> = (0..3)
+        .map(|c| {
+            rows.iter()
+                .map(|r| r[c].chars().count())
+                .chain(std::iter::once(header[c].len()))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let line = |cells: [&str; 4]| {
+        let mut out = String::new();
+        for (c, cell) in cells.iter().enumerate().take(3) {
+            out.push_str(&format!("{cell:<width$}  ", width = widths[c]));
+        }
+        out.push_str(cells[3]);
+        println!("{}", out.trim_end());
+    };
+    line(header);
+    for row in &rows {
+        line([&row[0], &row[1], &row[2], &row[3]]);
+    }
+    println!();
+    println!(
+        "{} token{} for '{account}'. Revoke one with: \
+         crystalline users mcp-token {account} --revoke <id>",
+        tokens.len(),
+        if tokens.len() == 1 { "" } else { "s" }
+    );
 }
 
 /// The form the store keys on, for confirmation messages only: it is what the

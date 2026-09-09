@@ -21,7 +21,8 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::engine::ProvisionAction;
-use crystalline_service::{Engine, EngineError, EnvOverlay};
+use crystalline_service::rest::{AuthStore, Role};
+use crystalline_service::{DomainAccess, Engine, EngineError, EnvOverlay, Scope};
 use tokio::sync::Mutex as TokioMutex;
 
 /// Serializes every `HOME`/`XDG_STATE_HOME`-mutating test in this binary. A
@@ -154,9 +155,12 @@ async fn allow_persists_the_decision_into_the_config_file_and_returns_a_report()
     let engine = engine_at(&config_path, config_with_harbor(&harbor_dir), false).await;
 
     let data = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "harbor".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "harbor".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -203,9 +207,12 @@ async fn read_only_refuses_allow_but_answers_status() {
     let engine = engine_at(&config_path, config_with_harbor(&harbor_dir), true).await;
 
     let err = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "harbor".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "harbor".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::ReadOnly), "{err}");
@@ -214,12 +221,18 @@ async fn read_only_refuses_allow_but_answers_status() {
     assert!(!config_path.exists());
     assert!(!home.join(".claude").exists());
 
-    let err = engine.provision(&ProvisionAction::Apply).await.unwrap_err();
+    let err = engine
+        .provision(&ProvisionAction::Apply, &Scope::Unrestricted)
+        .await
+        .unwrap_err();
     assert!(matches!(err, EngineError::ReadOnly), "{err}");
 
     // status is still answered on a read-only instance, the same "Show is
     // always allowed" carve-out `configure` documents.
-    let data = engine.provision(&ProvisionAction::Status).await.unwrap();
+    let data = engine
+        .provision(&ProvisionAction::Status, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = data["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1, "{data}");
     assert_eq!(domains[0]["domain"], "harbor");
@@ -252,9 +265,12 @@ async fn allow_on_an_unknown_or_virtual_domain_errors_through_the_normal_mapping
     let engine = engine_at(&config_path, cfg, false).await;
 
     let err = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "does-not-exist".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "does-not-exist".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::UnknownDomain { .. }), "{err}");
@@ -263,9 +279,12 @@ async fn allow_on_an_unknown_or_virtual_domain_errors_through_the_normal_mapping
     assert!(message.contains("harbor"), "{message}");
 
     let err = engine
-        .provision(&ProvisionAction::Deny {
-            domain: "notes".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Deny {
+                domain: "notes".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Invalid(_)), "{err}");
@@ -319,9 +338,12 @@ async fn env_defined_domain_decisions_are_refused_naming_the_variable() {
     // written to the file would be silently discarded on the next overlay
     // apply - refused up front, naming the variable.
     let err = engine
-        .provision(&ProvisionAction::Allow {
-            domain: "harbor".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Allow {
+                domain: "harbor".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Conflict(_)), "{err}");
@@ -333,9 +355,12 @@ async fn env_defined_domain_decisions_are_refused_naming_the_variable() {
     // Env-only: the env message too, never UnknownDomain - status lists the
     // domain, so "not registered" would be a lie.
     let err = engine
-        .provision(&ProvisionAction::Deny {
-            domain: "cove".to_string(),
-        })
+        .provision(
+            &ProvisionAction::Deny {
+                domain: "cove".to_string(),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, EngineError::Conflict(_)), "{err}");
@@ -343,6 +368,106 @@ async fn env_defined_domain_decisions_are_refused_naming_the_variable() {
 
     // Neither refused decision touched the config file.
     assert!(!config_path.exists());
+
+    restore_env(previous);
+}
+
+/// **The reconcile runs over the machine; the report goes to one caller.**
+///
+/// `provision` with `action: "apply"` names no domain, so nothing refuses it
+/// up front and every caller reaches it - an authenticated stranger, and on an
+/// instance with `auth.mcp` off every anonymous agent. What comes back is not
+/// only a list of actions: `notices` is free prose raised while reconciling,
+/// and several of those notices name the domain they are about. A private
+/// domain that ships something a harness has no surface for, or that is
+/// virtual, or that collides with another domain, would announce itself there
+/// to anybody who asked - through the one arm of `provision` that takes no
+/// argument to gate.
+///
+/// The virtual-domain skip is the cheapest of those notices to raise and needs
+/// no harness at all, so it is the one this pins. `shed` is the control: it
+/// raises the same notice, it is not private, and it has to survive.
+#[tokio::test]
+async fn an_apply_report_names_no_domain_the_caller_may_not_see() {
+    let _guard = HOME_LOCK.lock().await;
+    let work = tempfile::tempdir().unwrap();
+    let home = work.path().join("home");
+    let xdg_state_home = work.path().join("state");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg_state_home).unwrap();
+    let previous = set_env(&home, &xdg_state_home);
+
+    // No install receipt is written, so this machine has no harness onboarded:
+    // `apply` raises its notices and stops without touching a single file.
+    let harbor_dir = work.path().join("kb-harbor");
+    write_harbor(&harbor_dir);
+    let mut cfg = config_with_harbor(&harbor_dir);
+    for name in ["shed", "vault"] {
+        cfg.domains.insert(
+            name.to_string(),
+            DomainEntry {
+                provision: Some(true),
+                ..DomainEntry::virtual_domain()
+            },
+        );
+    }
+
+    let config_path = work.path().join("config.yaml");
+    let engine = engine_at(&config_path, cfg, false).await;
+
+    let auth = Arc::new(
+        AuthStore::open(&work.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user("owner", "owner", None, Role::Admin, "pw12345678")
+        .await
+        .unwrap();
+    auth.set_domain_visibility("vault", true, "owner")
+        .await
+        .unwrap();
+    engine.set_domain_access(Arc::new(DomainAccess::new(auth)));
+
+    // Guard against a vacuous pass: the assertions below say nothing unless
+    // this caller really does have `vault` hidden from it.
+    assert_eq!(
+        engine.hidden_domains(&Scope::Anonymous).await.unwrap(),
+        Some(std::collections::HashSet::from(["vault".to_string()])),
+    );
+
+    let theirs = engine
+        .provision(&ProvisionAction::Apply, &Scope::Anonymous)
+        .await
+        .unwrap();
+    let notices = theirs["notices"].to_string();
+    assert!(
+        notices.contains("`shed`"),
+        "the report is a real one, with the notice a visible domain raises:\n{notices}"
+    );
+    assert!(
+        !notices.contains("vault"),
+        "and no notice about the domain this caller may not see:\n{notices}"
+    );
+    assert!(
+        !theirs.to_string().contains("vault"),
+        "nor anywhere else in the report:\n{theirs}"
+    );
+    assert_eq!(
+        theirs["pending"][0]["domain"], "harbor",
+        "the rest of the report is untouched:\n{theirs}"
+    );
+
+    // The machine owner sees both, which is what says the filter is about the
+    // caller rather than about the notice.
+    let mine = engine
+        .provision(&ProvisionAction::Apply, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let notices = mine["notices"].to_string();
+    assert!(
+        notices.contains("`shed`") && notices.contains("`vault`"),
+        "the machine owner is told about both:\n{notices}"
+    );
 
     restore_env(previous);
 }

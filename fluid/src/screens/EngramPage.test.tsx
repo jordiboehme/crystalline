@@ -327,6 +327,38 @@ describe("the engram page", () => {
     expect(within(banner).queryByRole("link")).toBeNull();
   });
 
+  it("labels a successor written by permalink with its title", async () => {
+    serve({
+      "/domains/eng/engrams/alpha": () =>
+        detailResponse({
+          content: BODY.replace(
+            "- superseded_by [[Beta]]",
+            "- superseded_by [[notes/beta]]",
+          ),
+          relations: [
+            {
+              line: 10,
+              rel_type: "superseded_by",
+              resolved: true,
+              target: { domain: null, target: "notes/beta" },
+            },
+          ],
+        }),
+    });
+
+    renderApp("/d/eng/e/alpha");
+
+    const banner = await screen.findByRole("note");
+    await waitFor(() => {
+      expect(
+        within(banner).getByRole("link", { name: "Beta" }),
+      ).toHaveAttribute("href", "/d/eng/e/notes/beta");
+    });
+    // The engine writes the permalink because it is the stable identity and
+    // cannot be misread as a domain prefix. What a reader sees is the name.
+    expect(banner).not.toHaveTextContent("notes/beta");
+  });
+
   it("shows a successor that declared the relation from its own side", async () => {
     serve({
       "/domains/eng/engrams/alpha": () =>

@@ -430,6 +430,13 @@ sharper measurement of the same behavior does not, so it is a correction edited 
 place. A value that genuinely changed in the world does, and that is a
 supersession - the next chapter.
 
+The agent does not rely on remembering to search. Every capture and every content
+edit comes back with the three engrams closest in meaning to what just landed - a
+second search it did not have to run - and a fixed line on what to do: merge into
+the one that owns the topic, supersede the one the new fact makes false, link the
+one that is related but distinct, or say unrelated. A quiet receipt means nothing
+was near. Fluid shows the same list after a save.
+
 Vocabulary drifts the same way. Two engrams now touch the hyperdrive - the recall
 notice tagged `hyperdrive` and the install guide tagged `hyper-drive` - the same
 topic split under two spellings. The agent surveys the vocabulary and surfaces the
@@ -518,6 +525,89 @@ The status words each mean one thing: `deprecated` says do not do this again,
 `superseded` says a newer engram replaced this one, `archived` says retired but
 kept for the record and `legacy` says still deployed and true of old
 installations but not to be built on. `delete` is for mistakes, not history.
+
+## Split
+
+That retirement was the easy case: everything in the mix B engram expired at
+once. More often an engram bundles facts on different clocks. Back when the aft
+bay heater failed, somebody recorded the whole cold-season routine as one note:
+
+```markdown
+# Aft bay heater outage routine
+
+## Observations
+
+- [gotcha] While the aft bay heater is out, pre-warm clamp 3 on the auxiliary line before docking #docking
+- [fact] The coolant loop needs a 40 minute purge before any mix swap, warm bay or cold #coolant
+- [convention] Log the purge start time in the ship register #coolant
+```
+
+The heater is fixed now, so the routine is over - but the purge time and the
+register habit are as true as they ever were. Validity is set per engram rather
+than per bullet, so retiring this note whole would take both down with it, and
+the crew would re-learn the purge the next time somebody swapped a mix. Say so
+before you retire:
+
+```text
+The bay heater is repaired, so that routine is done - but the purge time and the
+register rule still hold. Split those out first, then retire the rest.
+```
+
+*The agent reads the engram to see which line each observation sits on, then
+makes one `split_engram` call: the source, a title for the new engram and the
+lines that move.* Everything the call can refuse it refuses before it writes a
+byte, and if the edit to the old note fails before that note has changed, the
+new engram is taken back out again. Once the old note has been rewritten
+nothing is undone: the moved bullets live in the new engram by then, so a
+failure after that point keeps both files and says which one the index has yet
+to catch up with.
+
+```markdown
+---
+type: engram
+title: Coolant loop purge
+permalink: coolant-loop-purge
+tags:
+- docking
+- coolant
+status: stable
+recorded_at: 2026-09-14
+generated: { by: claude-code/1.0.5, at: 2026-09-14T11:02:00+00:00 }
+---
+
+# Coolant loop purge
+
+- [fact] The coolant loop needs a 40 minute purge before any mix swap, warm bay or cold #coolant
+- [convention] Log the purge start time in the ship register #coolant
+
+- derived_from [[Aft bay heater outage routine]]
+```
+
+The new engram carries the moved bullets, the source's tags and type, a `stable`
+status and no validity window - the facts moving out are the ones that still
+hold - and the old note keeps what is left and gains the other half of the pair:
+
+```markdown
+- split_into [[Coolant loop purge]]
+```
+
+Only then does the routine retire, by the recipe above, and what it carries into
+retirement is exactly what expired. Nothing was re-typed, so the purge keeps its
+own history rather than starting life as a copy, and the pair reads the same
+from both ends.
+
+Two guardrails come with the verb. Hand it the checksum from your read and a
+source somebody else changed meanwhile refuses the split instead of quietly
+dropping their edit. And a selection that would leave the source under three
+content lines is refused outright: an engram with nothing left worth keeping is
+one to retire whole, not to hollow out.
+
+The split you skip does not go unnoticed. The sweep in the next chapter reads a
+retired engram's observations against every live engram in the domain and raises
+a carry-forward gap for the ones that survive nowhere, naming the lines to move
+and the verb to move them with - a text comparison, never a judgment about
+meaning, so a fact carried forward in different words looks missing there and is
+worth acknowledging rather than moving.
 
 ## Evolve
 
@@ -629,13 +719,15 @@ shift ends between step two and step three.
 
 Which is the honest limit of the whole thing. The sweep reads dates, links and
 graph shape: a status, a validity window, an edge that resolves or does not, a
-tag spelled two ways. It never reads for meaning. It found item 1 because a
+tag spelled two ways. It never forms a view about what an engram says. It found item 1 because a
 `supersedes` edge points at an engram still marked stable, not because it
 compared the recall with the swap and formed a view about which one is right. It
 will hand you a half-finished retirement every time and it will never tell you
-that two engrams contradict each other - even the duplicate detection is
-lexical, so two engrams saying the same thing in different words stay invisible
-to it. It finds the work; you still decide it.
+that two engrams contradict each other. It does see meaning in one narrow way: a
+`V301` semantic twin is two current engrams whose lead embeddings sit close
+together, the same thing said twice in different words. That is agreement about
+a topic, not a verdict on a fact - read both and decide. It finds the work; you
+still decide it.
 
 When the queue is worked, ask again:
 
@@ -781,6 +873,7 @@ Hard-won knowledge is worth the review.
 | To do this | Say to your agent |
 |---|---|
 | Commission a domain | "Create a new Crystalline domain called ship-ops for everything about the ship." |
+| Retire a whole domain | "We are done with the shuttle-ops domain - unregister it, the files can stay." |
 | Capture a fact | "Remember this: the port clamp sticks in the cold." |
 | Recall, scoped | "What do we know about docking?" |
 | Recall, everywhere | "Any single points of failure we should worry about?" |
@@ -790,6 +883,7 @@ Hard-won knowledge is worth the review.
 | Ingest a source | "Read this recall page and remember only what affects us." |
 | Correct a fact | "Update the clamp threshold, do not start a new note." |
 | Retire a fact | "The old coolant mix is retired - supersede it, keep why." |
+| Split before retiring | "That routine is over, but the purge time still holds - split it out first." |
 | Tidy vocabulary | "Have our hyperdrive tags drifted?" |
 | Ask what needs work | "Sweep ship-ops and tell me what the archive needs." |
 | Share with the team | "Share the clamp findings as a proposal for review." |

@@ -186,12 +186,12 @@ async fn embed_worker_checkpoints_the_wal_after_a_pass() {
         embed_rx,
     ));
 
-    // write_engram indexes and chunks synchronously but, like the real MCP
-    // and watcher paths, does not itself request a background pass; that is
-    // the self-heal tick's job (daemon::run_embed_tick) or, here, an explicit
-    // request mirroring it. The spawned worker consumes the signal, embeds
-    // via the provider and, per the change under test, checkpoints the WAL
-    // once the pass embeds a non-zero count.
+    // write_engram indexes and chunks synchronously and nudges the wired
+    // channel once it has; the explicit request below is kept anyway, so this
+    // test observes the checkpoint whether the pass it watches is the write's
+    // or its own. The spawned worker consumes the signal, embeds via the
+    // provider and, per the change under test, checkpoints the WAL once the
+    // pass embeds a non-zero count.
     engine
         .write_engram(&write_params(
             "Note",

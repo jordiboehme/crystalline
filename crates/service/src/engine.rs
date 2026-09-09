@@ -14,7 +14,7 @@
 //! reprocesses it (the idempotency guard, see `research/single-instance-ipc.md`).
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -37,11 +37,12 @@ use crystalline_core::{
 use crystalline_index::{
     AckCounts, AckEntry, AttachmentRow, ChunkParams, DEFAULT_RETIRED_WEIGHT,
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, EMBED_PAGE_SIZE, EdgeKind,
-    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, Family, FileStamp,
-    Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES, RecentFilter, SearchMode,
-    SearchQuery, ShareFacts, Store, SweepInput, SweepOptions, SweepReport, SyncReport, apply_scan,
-    chunk_engram, configured_model_id, detect, order_jobs_for_batching, parse_metadata_filters,
-    provider_from_config, rank, retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
+    EmbeddingProvider, EngramDescriptor, EngramFacts, EngramId, EngramRecord, FactObservation,
+    Family, FileStamp, Finding, GraphNode, GraphSlice, HostClaim, InboundQuery, RULES,
+    RecentFilter, SearchMode, SearchQuery, ShareFacts, Store, SweepInput, SweepOptions,
+    SweepReport, SyncReport, apply_scan, chunk_engram, configured_model_id, detect,
+    is_retired_status, order_jobs_for_batching, parse_metadata_filters, provider_from_config, rank,
+    retired_factor, rule_info, salience_prior, scan_domain, scan_paths,
 };
 use crystalline_remote::ops;
 use crystalline_remote::{
@@ -56,6 +57,10 @@ use crate::overlay::{self, EnvOverlay, LoadedConfig};
 use crate::params::*;
 use crate::poller;
 use crate::settings;
+use crate::similar::{
+    self, SIMILAR_BACKLOG_POLL, SIMILAR_BACKLOG_WAIT, SIMILAR_LIMIT, SIMILAR_PAGE, SIMILAR_TIMEOUT,
+    SimilarEngram, SimilarProbe,
+};
 
 /// How many chunks are embedded per background batch.
 const EMBED_BATCH: usize = 16;
@@ -164,7 +169,7 @@ pub const EVOLVE_GUIDANCE: &str = "This queue changes nothing by itself. Present
      Items marked mechanical complete intent the archive already records - fix those directly and summarize once. \
      Items marked judgment change what the archive claims - read the engram, propose and wait for a yes, one at a time. \
      A lifecycle finding never knows whether a change is a correction or a replacement; read and decide with the edit-versus-supersede test. \
-     Act only on the evidence stated: this sweep detects by dates, links and graph shape, never by meaning, so it cannot confirm a contradiction. \
+     Act only on the evidence stated: this sweep detects by dates, links, graph shape and embedding similarity, and similarity is not a contradiction - it cannot confirm that two engrams disagree. \
      Re-run the same scope when done.";
 
 /// The frontmatter keys `edit_engram`'s `set_frontmatter` operation may write:
@@ -200,18 +205,27 @@ pub const DEFAULT_ACTOR: &str = "crystalline/mcp";
 /// the spec's `process:name` form.
 pub const CLI_ACTOR: &str = "process:crystalline-cli";
 
+/// The ceiling [`sanitize_actor`] keeps an actor token to, in kept characters.
+/// Exposed with it, because a caller composing an actor out of two halves has
+/// to budget against the same number to know what will survive the pass.
+pub(crate) const ACTOR_MAX_CHARS: usize = 120;
+
 /// Normalize a client-supplied identity into an OKF actor token: whitespace
 /// runs collapse to a single hyphen, control characters and the flow-mapping
 /// punctuation that would need quoting are dropped and the result is capped, so
 /// a client that calls itself "Some Client (beta)" still yields a clean
 /// `generated.by`.
-fn sanitize_actor(raw: &str) -> String {
-    const MAX_CHARS: usize = 120;
+///
+/// `pub(crate)` because an actor composed out of two halves has to sanitize
+/// each half on its own rather than the composition (`mcp::acting_actor`): a
+/// single pass over the joined string lets the client-supplied half spend the
+/// whole budget and truncate away the half the server asserts.
+pub(crate) fn sanitize_actor(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     let mut kept = 0usize;
     let mut pending_gap = false;
     for c in raw.trim().chars() {
-        if kept >= MAX_CHARS {
+        if kept >= ACTOR_MAX_CHARS {
             break;
         }
         if c.is_whitespace() {
@@ -286,6 +300,22 @@ pub enum EngineError {
     /// A content mutation was attempted against a read-only instance.
     #[error("this instance is read-only; content mutations are disabled")]
     ReadOnly,
+    /// The caller is known, may see the thing they addressed, and is not
+    /// allowed to do this to it. Distinct from [`EngineError::UnknownDomain`],
+    /// which is what a caller who may not see it gets: this variant is only
+    /// ever raised about something the caller can already see, so it discloses
+    /// nothing by existing. The message names who *can*, because "forbidden"
+    /// on a domain somebody reads every day is otherwise indistinguishable
+    /// from a bug.
+    #[error("{0}")]
+    Forbidden(String),
+    /// The request would destroy knowledge that only exists here, and it did
+    /// not say so. Not a permission problem and not a malformed request: the
+    /// caller may do this and asked for it correctly, and the server is
+    /// refusing to guess that the loss was intended. The message names the flag
+    /// that says it was, on every surface that has one.
+    #[error("{0}")]
+    ConfirmationRequired(String),
     /// An interactive connect action (`connect_with_token`,
     /// `start_device_connect`) was attempted while `CRYSTALLINE_GITHUB_TOKEN`
     /// is set. This machine's identity is fixed by the environment, so there
@@ -594,10 +624,17 @@ pub struct Engine {
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
     model_id: String,
     chunk_params: ChunkParams,
-    // When true the four content-mutating methods refuse early with
+    // When true the content-mutating methods refuse early with
     // `EngineError::ReadOnly`. Set at construction from the effective mode
     // (explicit flag or `service.read_only`). Index maintenance is unaffected.
     read_only: bool,
+    // The one test seam in this file: when armed, the next source edit fails on
+    // its far side, once. See `Engine::fail_next_source_edit`. Compiled only
+    // into a test build (`cfg(test)` for this crate's unit tests, the `testing`
+    // feature for its integration tests), so a released binary carries neither
+    // the flag nor the branches that read it.
+    #[cfg(any(test, feature = "testing"))]
+    fail_next_source_edit: std::sync::atomic::AtomicBool,
     // The effective `skills.serve` value, snapshotted while this engine is
     // built and never re-read. See `Engine::skills_serve` for why it is frozen
     // and `Engine::with_env_overlay` for why the snapshot is taken twice.
@@ -707,6 +744,79 @@ pub struct Engine {
     // request and the engine is the only thing the subscriber and the flipper
     // share; see `crate::subscribers`.
     list_subscribers: Arc<crate::subscribers::ListSubscribers>,
+    // Serializes a domain registration against a domain removal, for the
+    // whole of each: `Engine::unregister_domain` holds it across its sweep and
+    // its tail, and the REST create holds it across its own registration
+    // (`RestState::domain_admin` delegates here). It lives on the engine
+    // rather than on one surface's state because MCP and REST reach the same
+    // verbs and a lock held by only one of them serializes only that one.
+    // What it does NOT close is the bare `domain_add_*`/`origin_add` verbs,
+    // which take no lock of their own; see `Engine::domain_remove`'s known
+    // race.
+    domain_admin: tokio::sync::Mutex<()>,
+    // The fence a removal raises against new co-editing joins while it sweeps
+    // the domain's rooms. Write-held by `Engine::unregister_domain`, read-held
+    // by each collab join (`RestState::join_pass` delegates here), so a join
+    // and a removal of the same domain cannot interleave.
+    join_fence: tokio::sync::RwLock<()>,
+    // The open co-editing rooms, so a removal can save and close the rooms of
+    // the domain it is about to unregister. A `Weak`, because
+    // `CollabSessions` holds an `Arc<Engine>` and a strong handle here would
+    // be a cycle neither side ever drops; `None` (nothing installed) is every
+    // engine that serves no web surface, which has no rooms to close.
+    collab: std::sync::OnceLock<std::sync::Weak<crate::collab::session::CollabSessions>>,
+    // The private-domain resolver every scoped read is filtered through,
+    // installed once when the HTTP surface starts (`daemon::http_base`, the
+    // one funnel both router builders reach, right after the `AuthStore` it
+    // wraps exists).
+    //
+    // A `OnceLock` rather than a field on the constructor because the engine
+    // is built long before - and often without - an accounts database: a
+    // one-shot CLI command, the embedded stdio MCP stack and every test engine
+    // never install one, and `Engine::hidden_domains` answers `None` for them,
+    // which is the same answer the `Scope::Unrestricted` those surfaces pass
+    // would have produced anyway. Set once and never replaced, so a second
+    // router built over one engine keeps the first store rather than silently
+    // swapping the authority mid-flight.
+    domain_access: std::sync::OnceLock<Arc<crate::scope::DomainAccess>>,
+}
+
+/// What a scoped read hands the store as its domain filter, once the caller's
+/// own filter and the domains it may not see have been reconciled.
+///
+/// Three answers rather than an `Option<Vec<String>>`, because the empty vector
+/// is ambiguous where it matters most: the store reads "no filter" as "every
+/// domain", so a caller whose entire filter was hidden would be answered with a
+/// sweep of everything. [`ScopedDomains::Nothing`] is that case, named.
+#[derive(Debug, PartialEq)]
+enum ScopedDomains {
+    /// Nothing is hidden from this caller, so the query keeps the filter it was
+    /// given - empty (every domain) or not. The machine owner's answer, and the
+    /// answer on any installation where nobody made a domain private.
+    AsAsked,
+    /// Query exactly these domains.
+    Only(Vec<String>),
+    /// Nothing in range is readable by this caller. The answer is an empty
+    /// result, which is what a domain nobody registered already produces.
+    Nothing,
+}
+
+/// Cut every node in a hidden domain out of a graph slice, and with it every
+/// edge that had an end there.
+///
+/// A dangling edge is as much of a disclosure as the node it points at - it
+/// says an engram exists, in a domain the caller was told nothing about - so
+/// the two go together, and this runs before anything ranks or caps the slice.
+/// A no-op when nothing is hidden, which is every unscoped read.
+fn retain_visible(slice: &mut GraphSlice, hidden: &HashSet<String>) {
+    if hidden.is_empty() {
+        return;
+    }
+    slice.nodes.retain(|node| !hidden.contains(&node.domain));
+    let kept: HashSet<i64> = slice.nodes.iter().map(|node| node.id.0).collect();
+    slice
+        .edges
+        .retain(|edge| kept.contains(&edge.from.0) && kept.contains(&edge.to.0));
 }
 
 /// One identity's cached GitHub credential for one host: the resolved store
@@ -728,11 +838,50 @@ struct CachedGithub {
 pub enum ShareActor {
     /// The machine owner: the CLI, control-socket clients and stdio MCP.
     Owner,
-    /// An authenticated account: Fluid and the REST API.
+    /// An authenticated account: Fluid, the REST API and an HTTP MCP session
+    /// that authenticated at the door (`auth.mcp`), which acts as the account
+    /// whose token opened it.
     Account(String),
-    /// An agent over HTTP MCP, a transport with no user auth of its own:
-    /// resolved through the `github.agent_identity` setting.
+    /// An agent over HTTP MCP on an instance that does not make agents
+    /// authenticate, so the transport carries no user auth and there is nobody
+    /// to be: resolved through the `github.agent_identity` setting.
     HttpAgent,
+}
+
+/// What a removal knows about how much knowledge is at stake.
+///
+/// The two absent cases are not the same fact, and keeping them apart is the
+/// whole point of the type: a domain the index holds no row for has synced
+/// nothing, while a count that could not be read is a number that exists and is
+/// unavailable. Collapsing them into one `None` is how a purge gate fails open,
+/// and it is what leaves a confirmation question quietly missing the figure it
+/// promises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RemovalCount {
+    /// The index answered: this many engrams.
+    Known(i64),
+    /// The index answered and holds no row for this domain.
+    Absent,
+    /// The index could not be read. For a virtual domain this only reaches a
+    /// caller that already set `purge`; without it the unknown count is a
+    /// refusal.
+    Unreadable,
+}
+
+impl RemovalCount {
+    /// The count as a preview reports it: the number, or null for either
+    /// absent case. `engrams_unknown` beside it is what tells them apart.
+    fn as_json(self) -> Value {
+        match self {
+            RemovalCount::Known(n) => Value::from(n),
+            RemovalCount::Absent | RemovalCount::Unreadable => Value::Null,
+        }
+    }
+
+    /// Whether the count is absent because the index could not be read.
+    fn is_unreadable(self) -> bool {
+        matches!(self, RemovalCount::Unreadable)
+    }
 }
 
 /// Which credential a SHARE PREVIEW may compute on when the acting identity has
@@ -848,6 +997,12 @@ fn is_personal_token_missing(e: &EngineError) -> bool {
 /// instruction is to reconnect their own identity rather than to run the
 /// machine-wide connect. Every other error passes through: an offline machine
 /// or a rate limit is the same event whoever was acting.
+///
+/// The collaborator rewrite is deliberately keyed to `Api { status: 403 }`
+/// alone. An organization-policy refusal ([`RemoteError::SsoAuthorizationRequired`],
+/// [`RemoteError::OauthAppRestricted`]) is also a 403 upstream, but the
+/// provider has already turned it into the accurate instruction, and adding
+/// a collaborator would not clear either of them.
 fn enrich_write_error(e: RemoteError, login: Option<&str>, repo: &str) -> RemoteError {
     let Some(login) = login else {
         return e;
@@ -978,6 +1133,8 @@ impl Engine {
             model_id,
             chunk_params,
             read_only: false,
+            #[cfg(any(test, feature = "testing"))]
+            fail_next_source_edit: std::sync::atomic::AtomicBool::new(false),
             skills_serve,
             instance_id: String::new(),
             label: String::new(),
@@ -997,7 +1154,362 @@ impl Engine {
             routing_virtual: std::sync::RwLock::new(BTreeMap::new()),
             activity: Arc::default(),
             list_subscribers: Arc::default(),
+            domain_admin: tokio::sync::Mutex::new(()),
+            join_fence: tokio::sync::RwLock::new(()),
+            collab: std::sync::OnceLock::new(),
+            domain_access: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Arm a one-shot failure of the next source edit, on its far side.
+    ///
+    /// A test seam, and the only one in this file. It stands for one thing - a
+    /// fault at the moment the source's bytes are committed - and each storage
+    /// kind answers that differently, which is the whole point of arming it:
+    ///
+    /// - a **file** domain fails the reindex that follows the rename, so the
+    ///   bytes are already on disk and nothing may be undone;
+    /// - a **virtual** domain is handed a compare-and-swap token nothing can
+    ///   match, so the store raises its own conflict and rolls the transaction
+    ///   back, exactly as a concurrent edit would, and the caller may undo
+    ///   whatever it wrote first.
+    ///
+    /// Neither is reachable from a test any other way: a rename either happens
+    /// or does not, a real concurrent edit cannot be timed to land between one
+    /// call's read and its write, and every input-shaped failure of the reindex
+    /// is refused earlier by [`Engine::plan_split`]. The seam exists because
+    /// [`Engine::split_engram_as`] must never undo its own new engram once the
+    /// source has been rewritten, and must still undo it when the source is
+    /// untouched, and an invariant nothing exercises is an invariant that rots.
+    ///
+    /// Nothing in the daemon, the CLI or the MCP surface calls this, and the two
+    /// branches that read it are one relaxed swap each, one per storage kind. It
+    /// is consumed by the next source edit on any domain rather than by the next
+    /// split, so arm it immediately before the call under test.
+    #[cfg(any(test, feature = "testing"))]
+    pub fn fail_next_source_edit(&self) {
+        self.fail_next_source_edit
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether the seam above is armed, consuming the arming. Constant `false`
+    /// outside a test build, where the flag does not exist: the two source-edit
+    /// branches then compile to what they would have been without a seam at
+    /// all.
+    fn take_armed_failure(&self) -> bool {
+        #[cfg(any(test, feature = "testing"))]
+        {
+            self.fail_next_source_edit
+                .swap(false, std::sync::atomic::Ordering::Relaxed)
+        }
+        #[cfg(not(any(test, feature = "testing")))]
+        {
+            false
+        }
+    }
+
+    /// Install the co-editing registry, so a removal can close the rooms of the
+    /// domain it unregisters.
+    ///
+    /// Held as a `Weak`: the registry owns an `Arc<Engine>`, so a strong handle
+    /// here would be a cycle neither half ever drops. Called once, by
+    /// `RestState::new`, which is the only thing that builds a registry. A
+    /// second call is ignored, for the reason
+    /// [`Engine::set_domain_access`] gives.
+    pub fn set_collab_sessions(&self, sessions: &Arc<crate::collab::session::CollabSessions>) {
+        let _ = self.collab.set(Arc::downgrade(sessions));
+    }
+
+    /// Hold the domain-admin lock for the whole of a registration or a removal.
+    ///
+    /// One lock on the engine rather than one per surface: REST's create takes
+    /// it, [`Engine::unregister_domain`] takes it, and both surfaces reach the
+    /// same verbs, so a lock held by only one of them would serialize only that
+    /// one. See the field for what it does not close.
+    ///
+    /// Lock order where both are taken (a removal): this one, then
+    /// [`Engine::fence_joins`]. Nothing else takes both.
+    pub async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.domain_admin.lock().await
+    }
+
+    /// Raise the join fence: while this guard lives, no collab upgrade may open
+    /// a room, because [`Engine::join_pass`] is what the upgrade route waits on
+    /// before it joins.
+    ///
+    /// Held by a removal across its sweep and the unregistration, which is what
+    /// makes the sweep final rather than a snapshot: a join already in flight
+    /// finishes and inserts its room before the guard is granted (so the sweep
+    /// collects it), and a join that arrives afterwards waits, then finds a
+    /// domain that no longer exists and is refused. Process-wide rather than
+    /// per-domain because a removal is short and a second primitive per domain
+    /// name would buy nothing measurable.
+    pub async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
+        self.join_fence.write().await
+    }
+
+    /// The pass a collab upgrade holds across its join, so a join and a removal
+    /// of the same domain cannot interleave. See [`Engine::fence_joins`] for
+    /// the argument this half completes; the guard is dropped as soon as the
+    /// join returns, never held across the socket's life.
+    pub async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
+        self.join_fence.read().await
+    }
+
+    /// Install the private-domain resolver. Called once, when the HTTP surface
+    /// starts and the accounts store it reads exists.
+    ///
+    /// A second call is ignored rather than refused: the surfaces that build a
+    /// router are the only callers, and an engine that already knows how to
+    /// resolve a scope must not have that authority replaced by a later,
+    /// possibly different, store.
+    pub fn set_domain_access(&self, access: Arc<crate::scope::DomainAccess>) {
+        let _ = self.domain_access.set(access);
+    }
+
+    /// The private domains `scope` may not see, or `None` for no filtering at
+    /// all.
+    ///
+    /// `None` in two cases, which are the same case in practice: no resolver is
+    /// installed (a one-shot CLI command, the embedded stdio stack, a test
+    /// engine - all of which are the machine owner), or the scope is
+    /// [`Scope::Unrestricted`]. Everything else gets a set to subtract, empty
+    /// on an installation where nobody has made a domain private.
+    ///
+    /// The privacy answer alone, and it is not the serving screen. A read that
+    /// answers from the index takes [`Engine::hidden_for`], which adds the
+    /// domains whose rows outlived their registration; this one is for a caller
+    /// reasoning about who may see what rather than about what may be served.
+    ///
+    /// [`Scope::Unrestricted`]: crate::scope::Scope::Unrestricted
+    pub async fn hidden_domains(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<Option<HashSet<String>>> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(None);
+        };
+        access
+            .hidden_domains(scope)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))
+    }
+
+    /// What `scope` may do on one domain, for a surface that has to refuse a
+    /// write rather than hide the domain.
+    ///
+    /// [`DomainRight::Own`] when no resolver is installed, which is the same
+    /// answer [`Engine::hidden_domains`] gives on that engine: a one-shot CLI
+    /// command, the embedded stdio stack and a test engine are all the machine
+    /// owner. A resolver that cannot answer is an error rather than a
+    /// permissive default - a write that cannot learn what its caller may do
+    /// refuses instead of proceeding on an assumption, exactly as the REST
+    /// write gate does.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    pub async fn domain_right(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+    ) -> Result<crate::scope::DomainRight> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(crate::scope::DomainRight::Own);
+        };
+        access.right(scope, domain).await.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
+    /// What `scope` may do on one domain when the request is a write: the
+    /// domain answer capped by the instance role, which is the rule the JSON
+    /// API has always applied and the one the MCP write gate reads here.
+    ///
+    /// Same two special cases [`Engine::domain_right`] carries, for the same
+    /// reasons: no resolver installed is the machine owner, and a resolver that
+    /// cannot answer is an error rather than a permissive default.
+    pub async fn write_right(
+        &self,
+        scope: &crate::scope::Scope,
+        domain: &str,
+    ) -> Result<crate::scope::DomainRight> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok(crate::scope::DomainRight::Own);
+        };
+        access.write_right(scope, domain).await.map_err(|e| {
+            EngineError::Internal(format!("this domain's membership is unreadable: {e:#}"))
+        })
+    }
+
+    /// Refuse a domain this caller must not be answered from, and say nothing
+    /// about a name the index has never heard of.
+    ///
+    /// The narrow half of [`Engine::require_domain`], for a verb that already
+    /// has its own words for a domain nobody registered and its own order for
+    /// saying them. A screened domain is refused here with exactly the bytes an
+    /// unregistered one gets, which is the whole point; anything else falls
+    /// through untouched, so adding this gate to a verb cannot change what that
+    /// verb answered before on any input the index holds rows for.
+    ///
+    /// [`Engine::hidden_for`] screens two things and both are refused here: a
+    /// private domain, and a domain whose rows outlived their registration. The
+    /// second is a name the verb behind this gate would have refused for itself
+    /// a line later, since nothing unregistered resolves to a content source -
+    /// so this is one line earlier, not one refusal more.
+    pub async fn refuse_hidden_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        let hidden = self.hidden_for(scope).await?;
+        if hidden.contains(name) {
+            self.domain_entry_scoped(name, &hidden)?;
+        }
+        Ok(())
+    }
+
+    /// Every domain name a read must answer as though it were not there: the
+    /// private domains this caller may not see, plus every domain the index
+    /// still holds that nobody has registered here.
+    ///
+    /// **The two are one rule, which is why they are one set.** A caller naming
+    /// a private domain gets what naming a domain nobody registered gets, which
+    /// is nothing; this says the same thing about a caller who named no domain
+    /// at all. An index row whose domain is unregistered is not a hit, not a
+    /// count and not a facet value - it is left in the index (a filter, never a
+    /// deletion, so nothing here can lose knowledge) and simply stops being an
+    /// answer. That matters because a removal used to leave rows behind
+    /// deliberately, and those rows went on outranking the knowledge their owner
+    /// still keeps.
+    ///
+    /// Resolved once per call and threaded inward. Every verb that answers from
+    /// the index asks for it here rather than deciding for itself, so a read
+    /// added later inherits the screen instead of having to remember it.
+    ///
+    /// Either half failing propagates rather than resolving to an empty set: a
+    /// read that cannot learn what it may answer from refuses, and never widens.
+    async fn hidden_for(&self, scope: &crate::scope::Scope) -> Result<HashSet<String>> {
+        let mut hidden = self.hidden_domains(scope).await?.unwrap_or_default();
+        hidden.extend(self.unregistered_domains().await?);
+        Ok(hidden)
+    }
+
+    /// The domains the index holds that this instance has no registration for.
+    ///
+    /// Asked of the index on every call rather than cached, so a domain removed
+    /// or registered while this engine runs takes effect on the next read rather
+    /// than at the next restart. It is one column of a table with a row per
+    /// domain ([`Store::domain_names`], deliberately not `domain_stats`, whose
+    /// per-domain counts this would pay for and never look at).
+    ///
+    /// "Registered" is [`Engine::known_domain_names`]: the startup snapshot plus
+    /// whatever has been discovered since, which is the same set
+    /// [`Engine::sync_targets`] syncs and [`Engine::domain_entry`] resolves
+    /// against. So a domain this instance does not index is also one it does not
+    /// serve, and the named and unnamed answers agree.
+    ///
+    /// [`Store::domain_names`]: crystalline_index::Store::domain_names
+    async fn unregistered_domains(&self) -> Result<HashSet<String>> {
+        let registered: HashSet<String> = self.known_domain_names().into_iter().collect();
+        let names = {
+            let store = self.store.lock().await;
+            store.domain_names().await?
+        };
+        Ok(names
+            .into_iter()
+            .filter(|name| !registered.contains(name))
+            .collect())
+    }
+
+    /// The private domain names and the ones this caller may not see, from one
+    /// read of the visibility records.
+    ///
+    /// For the one caller that needs both: a domain listing subtracts the
+    /// hidden names and then marks each row it kept private or shared. Asking
+    /// for the two separately would sweep the same table twice for one answer.
+    ///
+    /// The privacy half only, unlike [`Engine::hidden_for`], and it needs no
+    /// more: the only caller is [`Engine::list_domains`], which builds its rows
+    /// from the registrations rather than from the index, so a domain nobody
+    /// registered has no row there to keep back in the first place.
+    ///
+    /// An engine with no resolver installed - a one-shot CLI command, the
+    /// embedded stdio stack, a test engine - answers with two empty sets:
+    /// there is no accounts database on those, so no domain has ever been made
+    /// private through one.
+    async fn visibility_for(
+        &self,
+        scope: &crate::scope::Scope,
+    ) -> Result<(HashSet<String>, HashSet<String>)> {
+        let Some(access) = self.domain_access.get() else {
+            return Ok((HashSet::new(), HashSet::new()));
+        };
+        let visibility = access
+            .visibility(scope)
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        Ok((visibility.private, visibility.hidden.unwrap_or_default()))
+    }
+
+    /// The domain list a scoped store query is given: the caller's own filter
+    /// with the screened names subtracted, or - when the caller named none and
+    /// something is screened out - every domain the store holds minus those.
+    ///
+    /// `hidden` is [`Engine::hidden_for`]'s whole answer, so "screened out"
+    /// covers both halves of it: a private domain this caller may not see, and
+    /// a domain the index holds that nobody registered here. An unnamed sweep
+    /// therefore narrows to the registered domains that have rows, which is the
+    /// same rule a named read gets from [`Engine::domain_entry_scoped`].
+    ///
+    /// [`ScopedDomains::AsAsked`] is the answer when there is nothing to screen
+    /// out at all: nothing is subtracted, no extra query runs and the store sees
+    /// exactly the filter it always saw. That is the ordinary installation - no
+    /// private domains and no rows outliving their registration - so the sweep
+    /// below is a cost only where something actually has to be kept back.
+    ///
+    /// [`ScopedDomains::Nothing`] is the case an empty list would silently
+    /// widen. A caller that named only screened-out domains has asked for
+    /// nothing it may read, and `Some(vec![])` is not that request - the search
+    /// verbs drop an empty filter and sweep everything. So it is its own answer,
+    /// and the caller returns the empty page a name nobody registered would have
+    /// produced.
+    async fn scoped_domains(
+        &self,
+        requested: &[String],
+        hidden: &HashSet<String>,
+    ) -> Result<ScopedDomains> {
+        if hidden.is_empty() {
+            return Ok(ScopedDomains::AsAsked);
+        }
+        if !requested.is_empty() {
+            let kept: Vec<String> = requested
+                .iter()
+                .filter(|name| !hidden.contains(*name))
+                .cloned()
+                .collect();
+            return Ok(if kept.is_empty() {
+                ScopedDomains::Nothing
+            } else {
+                ScopedDomains::Only(kept)
+            });
+        }
+        // The store's own domain list, intersected with what may be served
+        // rather than assumed to be servable: every name it returns that this
+        // instance has no registration for is already in `hidden`, so the
+        // filter below is the whole of the rule. A registered domain with no
+        // rows yet is absent from the list, which costs nothing - a domain with
+        // no rows has nothing to return to any query this list narrows.
+        let store = self.store.lock().await;
+        let names = store.domain_names().await?;
+        drop(store);
+        let visible: Vec<String> = names
+            .into_iter()
+            .filter(|name| !hidden.contains(name))
+            .collect();
+        Ok(if visible.is_empty() {
+            ScopedDomains::Nothing
+        } else {
+            ScopedDomains::Only(visible)
+        })
     }
 
     /// Turn on shared-database collaboration for this engine by giving it a
@@ -1146,6 +1658,14 @@ impl Engine {
     /// a full snapshot.
     pub fn github_enabled(&self) -> bool {
         self.config.read().unwrap().github_enabled()
+    }
+
+    /// Whether the MCP endpoint authenticates (`auth.mcp`), read the same cheap
+    /// way as [`Engine::github_enabled`]. This is the setting that creates the
+    /// legacy open tier, and a write gate reads it once per write, so it must
+    /// not clone the whole config to get at one bool.
+    pub fn auth_mcp(&self) -> bool {
+        self.config.read().unwrap().auth_mcp()
     }
 
     /// Whose GitHub identity a share on this instance runs as, read live from
@@ -1359,8 +1879,15 @@ impl Engine {
     /// selected nothing. Search itself deliberately does not resolve its
     /// `domains` filter - an unmatched name there is simply a narrower filter -
     /// and that stays as it is.
-    pub fn require_domain(&self, name: &str) -> Result<()> {
-        self.domain_entry(name)?;
+    ///
+    /// Scoped, and async for it: this raises the one error that names every
+    /// other domain, so an unfiltered answer here would tell a caller asking
+    /// for a domain that does not exist the name of every private domain on the
+    /// instance. A domain the caller may not see is refused as an unregistered
+    /// one, and the set the refusal lists is the visible set.
+    pub async fn require_domain(&self, name: &str, scope: &crate::scope::Scope) -> Result<()> {
+        let hidden = self.hidden_for(scope).await?;
+        self.domain_entry_scoped(name, &hidden)?;
         Ok(())
     }
 
@@ -1384,6 +1911,15 @@ impl Engine {
     /// mirroring [`Engine::domain_entry`].
     fn content_source(&self, name: &str) -> Result<ContentSource> {
         let entry = self.domain_entry(name)?;
+        Ok(self.source_of(&entry))
+    }
+
+    /// [`Engine::content_source`] for a scoped read: a domain the caller may
+    /// not see resolves to no source at all, with the same
+    /// [`EngineError::UnknownDomain`] a name nobody registered gets, its
+    /// `registered` list filtered to the visible set.
+    fn content_source_scoped(&self, name: &str, hidden: &HashSet<String>) -> Result<ContentSource> {
+        let entry = self.domain_entry_scoped(name, hidden)?;
         Ok(self.source_of(&entry))
     }
 
@@ -1427,22 +1963,47 @@ impl Engine {
         })
     }
 
+    /// [`Engine::domain_entry`] for a scoped read: a domain the caller may not
+    /// see is answered exactly as a domain nobody registered.
+    ///
+    /// Both halves matter. The hidden name errors instead of resolving, and the
+    /// error's `registered` list has the hidden names taken out of it - an
+    /// unfiltered list would name every private domain on the instance in the
+    /// error text of a request for a domain that does not exist.
+    fn domain_entry_scoped(&self, name: &str, hidden: &HashSet<String>) -> Result<DomainEntry> {
+        if hidden.contains(name) {
+            return Err(self.unknown_domain(name, hidden));
+        }
+        match self.domain_entry(name) {
+            Err(EngineError::UnknownDomain { domain, .. }) => {
+                Err(self.unknown_domain(&domain, hidden))
+            }
+            other => other,
+        }
+    }
+
+    /// The [`EngineError::UnknownDomain`] a scoped caller gets: the registered
+    /// set it names, minus what the caller may not see. A hidden domain and a
+    /// name nobody ever registered produce the same bytes, which is the point -
+    /// existence is the secret being kept.
+    fn unknown_domain(&self, name: &str, hidden: &HashSet<String>) -> EngineError {
+        EngineError::UnknownDomain {
+            domain: name.to_string(),
+            registered: self
+                .known_domain_names()
+                .into_iter()
+                .filter(|known| !hidden.contains(known))
+                .collect(),
+        }
+    }
+
     /// Re-read the global config from disk looking for a domain registered
     /// after this engine started. A hit is cached in `discovered_domains` and,
     /// for a file domain on the daemon, reported over `watch_tx` so the watcher
     /// starts watching its root without a restart. A virtual domain has no root,
     /// so it is cached but never watched.
     fn refresh_domain(&self, name: &str) -> Option<DomainEntry> {
-        // Re-read the same file this engine persists to (its `--config`
-        // override, else the default global path) and layer the overlay back
-        // on, so a post-startup re-read sees the same effective config a fresh
-        // load would, environment overrides included.
-        let path = match &self.config_path {
-            Some(p) => p.clone(),
-            None => crystalline_core::config::global_config_path().ok()?,
-        };
-        let file = overlay::load_file(&path).ok()?;
-        let fresh = self.overlay.apply(&file);
+        let fresh = self.reread_config()?;
         let entry = fresh.domains.get(name)?.clone();
         self.discovered_domains
             .write()
@@ -1455,6 +2016,65 @@ impl Engine {
             let _ = tx.send(WatchEvent::Add(name.to_string(), root));
         }
         Some(entry)
+    }
+
+    /// The effective config as the file has it right now: the same file this
+    /// engine persists to (its `--config` override, else the default global
+    /// path) with the environment overlay layered back on, so a post-startup
+    /// re-read sees what a fresh load would, environment overrides included.
+    /// `None` when the path cannot be resolved or the file cannot be read.
+    ///
+    /// Shared by [`Engine::refresh_domain`], which caches what it finds and
+    /// arms a watch for it, and [`Engine::diagnostic_file_domains`], which
+    /// deliberately does neither. Keep the two together: they read the same
+    /// file the same way and only differ in what they do with the answer.
+    fn reread_config(&self) -> Option<GlobalConfig> {
+        let path = match &self.config_path {
+            Some(p) => p.clone(),
+            None => crystalline_core::config::global_config_path().ok()?,
+        };
+        let file = overlay::load_file(&path).ok()?;
+        Some(self.overlay.apply(&file))
+    }
+
+    /// The file domains a diagnostic read covers, as `(name, root)` pairs:
+    /// everything [`Engine::sync_targets`] would sync, plus every file domain
+    /// the config file names right now, so a domain registered after this
+    /// daemon started is diagnosed rather than reported as entirely
+    /// unindexed. `only` narrows the set to one domain; naming a virtual
+    /// domain is an empty answer (a virtual domain has no files to stamp),
+    /// and naming a domain nobody registered is an error.
+    ///
+    /// Deliberately not routed through [`Engine::domain_entry`]: that path
+    /// ends in [`Engine::refresh_domain`], which caches the hit and arms a
+    /// watch, so merely diagnosing a domain would start indexing it and the
+    /// "not indexed yet" a report just printed would quietly fix itself
+    /// behind the reader's back. A diagnosis only reads.
+    fn diagnostic_file_domains(&self, only: Option<&str>) -> Result<Vec<(String, PathBuf)>> {
+        let mut targets = self.sync_targets(None)?;
+        let fresh = self.reread_config();
+        if let Some(fresh) = &fresh {
+            for (name, entry) in &fresh.domains {
+                if targets.iter().any(|(n, _)| n == name) {
+                    continue;
+                }
+                if let Some(root) = entry.file_path().filter(|_| !entry.is_virtual()) {
+                    targets.push((name.clone(), root));
+                }
+            }
+        }
+        if let Some(name) = only {
+            let registered = self.known_domain_names().iter().any(|n| n == name)
+                || fresh.is_some_and(|c| c.domains.contains_key(name));
+            if !registered {
+                return Err(EngineError::UnknownDomain {
+                    domain: name.to_string(),
+                    registered: self.known_domain_names(),
+                });
+            }
+            targets.retain(|(n, _)| n == name);
+        }
+        Ok(targets)
     }
 
     /// Every domain name this engine currently knows about: the startup
@@ -1498,25 +2118,104 @@ impl Engine {
         identifier: &str,
         domain: Option<&str>,
     ) -> Result<(EngramDescriptor, ContentSource)> {
+        self.resolve_scoped(identifier, domain, &HashSet::new())
+            .await
+    }
+
+    /// [`Engine::resolve`] for a call that has already named the domain it acts
+    /// on: an identifier may not move the call to a different one.
+    ///
+    /// Every write verb takes a `domain` beside its identifier, and every
+    /// surface gates on THAT name - the REST layer resolves the caller's rights
+    /// for it before the verb runs, and an MCP tool call is gated the same way.
+    /// The absolute `crystalline://` form, though, overrides the domain hint
+    /// wherever it is accepted ([`Engine::resolve_scoped`]'s first branch), so
+    /// a write that resolved it would act on a domain nobody gated: a move out
+    /// of a private domain into a readable one, a superseded pair written into
+    /// a private engram's file, an `evolve_ack` stamped into one. The reads
+    /// are safe because they resolve through the scoped resolver and a hidden
+    /// domain is simply absent from it; the writes have no scope to resolve
+    /// with, and this is the boundary that makes one not needed.
+    ///
+    /// So the rule is the narrow one that costs nothing legitimate: on a call
+    /// that names a domain, an absolute identifier naming a DIFFERENT one is
+    /// refused. The same-domain absolute form still resolves, and a bare
+    /// permalink or title is domain-relative as it always was. The refusal is
+    /// the [`EngineError::NotFound`] a missing engram produces, built from the
+    /// caller's own words, so it discloses nothing about whether that domain
+    /// exists at all - a hidden domain, an unregistered one and a permalink
+    /// nobody wrote are one answer.
+    ///
+    /// The comparison is exact. Domain names are matched exactly everywhere
+    /// else in this engine (the registry is a map keyed by the name as
+    /// written), so folding case here would be this one place disagreeing with
+    /// the lookup it stands in front of.
+    ///
+    /// **The completeness claim this buys**, which the surfaces above rely on:
+    /// a write verb resolves only inside the domain its parameters name, so
+    /// gating those names - `domain`, plus `destination_domain` on a move,
+    /// which are the only domain-valued fields any write parameter carries -
+    /// gates the whole call.
+    async fn resolve_in(
+        &self,
+        identifier: &str,
+        domain: &str,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
+        if let Some(url) = CrystallineUrl::parse(identifier)
+            && url.domain != domain
+        {
+            return Err(EngineError::NotFound(format!(
+                "no engram '{}' in domain '{}'",
+                url.permalink, url.domain
+            )));
+        }
+        self.resolve(identifier, Some(domain)).await
+    }
+
+    /// [`Engine::resolve`] with the domains the caller may not see subtracted.
+    ///
+    /// A hidden domain resolves as an empty one rather than as a refusal: the
+    /// lookup is skipped and the miss falls through to the very same
+    /// [`EngineError::NotFound`] an engram that was never written produces,
+    /// byte for byte, because it is produced by the same line. That equality is
+    /// the property this whole path exists for - a caller must not be able to
+    /// tell "you may not see this" from "there is nothing here" - and it holds
+    /// by construction rather than by two messages being kept in step.
+    ///
+    /// The bare cross-domain form filters its matches before it counts them, so
+    /// a hidden domain neither makes an identifier ambiguous nor gets its name
+    /// printed into the ambiguity error.
+    async fn resolve_scoped(
+        &self,
+        identifier: &str,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<(EngramDescriptor, ContentSource)> {
         if let Some(url) = CrystallineUrl::parse(identifier) {
-            let store = self.store.lock().await;
-            let d = store
-                .find_engram(&url.domain, &url.permalink)
-                .await?
-                .ok_or_else(|| {
-                    EngineError::NotFound(format!(
-                        "no engram '{}' in domain '{}'",
-                        url.permalink, url.domain
-                    ))
-                })?;
-            drop(store);
+            let found = if hidden.contains(&url.domain) {
+                None
+            } else {
+                let store = self.store.lock().await;
+                store.find_engram(&url.domain, &url.permalink).await?
+            };
+            let d = found.ok_or_else(|| {
+                EngineError::NotFound(format!(
+                    "no engram '{}' in domain '{}'",
+                    url.permalink, url.domain
+                ))
+            })?;
             let source = self.read_source(&url.domain);
             return Ok((d, source));
         }
 
         if let Some(dom) = domain {
-            let store = self.store.lock().await;
-            let d = store.find_engram(dom, identifier).await?.ok_or_else(|| {
+            let found = if hidden.contains(dom) {
+                None
+            } else {
+                let store = self.store.lock().await;
+                store.find_engram(dom, identifier).await?
+            };
+            let d = found.ok_or_else(|| {
                 // The one wrong shape agents keep producing is the domain
                 // glued onto the permalink; the error teaches the fix so a
                 // stumble recovers in one step.
@@ -1533,15 +2232,17 @@ impl Engine {
                     )),
                 }
             })?;
-            drop(store);
             let source = self.read_source(dom);
             return Ok((d, source));
         }
 
-        // Bare identifier across all domains.
+        // Bare identifier across all domains, minus the ones this caller may
+        // not see. Filtered before the count, so a hidden twin neither turns a
+        // single match into an ambiguity nor names itself in the error.
         let store = self.store.lock().await;
         let mut matches = store.find_engram_any(identifier).await?;
         drop(store);
+        matches.retain(|d| !hidden.contains(&d.domain));
         match matches.len() {
             0 => Err(EngineError::NotFound(format!(
                 "no engram matches '{identifier}'"
@@ -1708,34 +2409,15 @@ impl Engine {
 
     // --- write ---------------------------------------------------------------
 
-    /// Create or overwrite an engram, then index it. A file domain writes the
-    /// markdown file first (files-are-truth) then reindexes it from disk; a
-    /// virtual domain builds the markdown in memory and indexes it straight into
-    /// the database, touching no filesystem.
-    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
-        self.write_engram_as(p, None).await
-    }
-
-    /// [`Engine::write_engram`] with the writer's identity: `client` is the
-    /// caller's own idea of who is writing (an MCP client's
-    /// `clientname/version` from the initialize handshake, or the CLI's process
-    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
-    /// setting before it lands in the engram's `generated.by`.
-    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
-        if self.read_only {
-            return Err(EngineError::ReadOnly);
-        }
-        let actor = self.actor(client);
-        let source = self.content_source(&p.domain)?;
-        let engram_type = p
-            .engram_type
-            .clone()
-            .unwrap_or_else(|| "engram".to_string());
-        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
-        let tags = p.tags.clone();
-
-        let folder = p.folder.clone().unwrap_or_default();
-        let title_slug = slugify(&p.title);
+    /// Where an engram titled `title` under `folder` would be written: the
+    /// domain-relative path and the permalink it will answer to.
+    ///
+    /// One function because two verbs create engrams - [`Engine::write_engram`]
+    /// and [`Engine::split_engram`] - and a second copy of these screens is a
+    /// second chance to leave one of them out.
+    fn engram_destination(folder: Option<&str>, title: &str) -> Result<(String, String)> {
+        let folder = folder.map(str::to_string).unwrap_or_default();
+        let title_slug = slugify(title);
         if title_slug.is_empty() {
             return Err(EngineError::Invalid(
                 "title does not slugify to a permalink; provide a title with letters or digits"
@@ -1767,6 +2449,36 @@ impl Engine {
             return Err(EngineError::Invalid(assets_reserved_error(&rel)));
         }
         let permalink = slugify(&rel);
+        Ok((rel, permalink))
+    }
+
+    /// Create or overwrite an engram, then index it. A file domain writes the
+    /// markdown file first (files-are-truth) then reindexes it from disk; a
+    /// virtual domain builds the markdown in memory and indexes it straight into
+    /// the database, touching no filesystem.
+    pub async fn write_engram(&self, p: &WriteParams) -> Result<Value> {
+        self.write_engram_as(p, None).await
+    }
+
+    /// [`Engine::write_engram`] with the writer's identity: `client` is the
+    /// caller's own idea of who is writing (an MCP client's
+    /// `clientname/version` from the initialize handshake, or the CLI's process
+    /// actor), which [`Engine::actor`] resolves against the `identity.actor`
+    /// setting before it lands in the engram's `generated.by`.
+    pub async fn write_engram_as(&self, p: &WriteParams, client: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let actor = self.actor(client);
+        let source = self.content_source(&p.domain)?;
+        let engram_type = p
+            .engram_type
+            .clone()
+            .unwrap_or_else(|| "engram".to_string());
+        let status = p.status.clone().unwrap_or_else(|| "stable".to_string());
+        let tags = p.tags.clone();
+
+        let (rel, permalink) = Self::engram_destination(p.folder.as_deref(), &p.title)?;
 
         // The whole existence-check-then-write, for a file domain, under that
         // file's lock: the check and the write it authorizes must be one step,
@@ -1840,6 +2552,7 @@ impl Engine {
         }
         // The new engram belongs in its folder's generated index.
         self.refresh_index_files(&p.domain).await;
+        self.nudge_embed();
 
         Ok(json!({
             "domain": p.domain,
@@ -1899,7 +2612,7 @@ impl Engine {
                     .into(),
             ));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         // A reserved name never resolves to an engram today (sync skips both),
         // so this is defence in depth rather than a reachable branch: the
         // generated `index.md` is derived from its folder and would be
@@ -2004,6 +2717,7 @@ impl Engine {
             self.refresh_routing_cache().await;
         }
         self.refresh_index_files(&desc.domain).await;
+        self.nudge_embed();
 
         Ok(json!({
             "domain": desc.domain,
@@ -2094,6 +2808,7 @@ impl Engine {
                 });
             receipt_permalink(found, path.trim_end_matches(".md").to_string())
         };
+        self.nudge_embed();
         Ok(json!({
             "domain": domain,
             "permalink": permalink,
@@ -2737,9 +3452,13 @@ impl Engine {
     /// status is checked against [`Self::RETIREMENT_STATUSES`], the
     /// successor rule (required for `superseded`, refused otherwise) is
     /// enforced, `valid_to` is parsed and, when a successor is named, it is
-    /// resolved in the same domain so a missing successor is `NotFound`
-    /// before the target is touched. The target is then written first, and
-    /// only then the successor's reciprocal `- supersedes [[..]]` line
+    /// resolved before the target is touched, so a missing successor is
+    /// `NotFound` rather than a half-written pair. That resolution goes
+    /// through [`Engine::resolve_in`], which is what actually holds the
+    /// successor to this domain: the absolute `crystalline://` form overrides
+    /// a domain hint wherever it is accepted, so "the same domain" is a rule
+    /// enforced there rather than a property of passing the name in. The
+    /// target is then written first, and only then the successor's reciprocal `- supersedes [[..]]` line
     /// (appended only when not already present, so a repeat call is
     /// idempotent). A failure on the successor write leaves the target
     /// retired with a one-sided pair; nothing here rolls that back, since the
@@ -2784,12 +3503,12 @@ impl Engine {
             .transpose()?;
 
         let actor = self.actor(client);
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
 
         // Resolved before the target is touched: a missing successor must
         // never leave the target half-retired.
         let successor = match &p.successor {
-            Some(identifier) => Some(self.resolve(identifier, Some(&p.domain)).await?),
+            Some(identifier) => Some(self.resolve_in(identifier, &p.domain).await?),
             None => None,
         };
         // A successor that resolves to the target itself would append a
@@ -2806,6 +3525,16 @@ impl Engine {
                 p.successor.as_deref().unwrap_or_default()
             )));
         }
+        // The permalink, not the title. A title is prose and may carry a
+        // colon, which `[[...]]` parses as a cross-domain prefix (issue #65);
+        // a permalink is the stable identity and never carries one. Fluid goes
+        // on rendering the title, which it reads off the engram the link lands
+        // on rather than off the bracket text.
+        //
+        // The title comes along only to recognize the bullet a previous
+        // retirement wrote in the older spelling, so re-retiring an engram
+        // that already declares its successor by title appends nothing.
+        let successor_permalink = successor.as_ref().map(|(d, _)| d.permalink.clone());
         let successor_title = successor.as_ref().map(|(d, _)| d.title.clone());
 
         // -- target: status, optional valid_to, optional superseded_by line --
@@ -2826,6 +3555,7 @@ impl Engine {
                     &current,
                     &p.status,
                     valid_to,
+                    successor_permalink.as_deref(),
                     successor_title.as_deref(),
                     &actor,
                 );
@@ -2852,6 +3582,7 @@ impl Engine {
                     &current,
                     &p.status,
                     valid_to,
+                    successor_permalink.as_deref(),
                     successor_title.as_deref(),
                     &actor,
                 );
@@ -2877,7 +3608,12 @@ impl Engine {
 
         // -- successor: reciprocal supersedes line, appended once --
         if let Some((succ_desc, succ_source)) = &successor {
-            let line = format!("- supersedes [[{}]]", desc.title);
+            let line = format!("- supersedes [[{}]]", desc.permalink);
+            // Recognized in either spelling, for the reason `declares` gives:
+            // a successor wired by an older retirement carries the title form.
+            let already = |current: &str| {
+                Self::declares(current, "supersedes", &desc.permalink, Some(&desc.title))
+            };
             match succ_source {
                 ContentSource::File { root } => {
                     let abs = join_rel(root, &succ_desc.path);
@@ -2892,7 +3628,7 @@ impl Engine {
                             path: abs.display().to_string(),
                             source,
                         })?;
-                    if !current.contains(&line) {
+                    if !already(&current) {
                         let edited =
                             touch_generated(&append_body(&current, &line), &actor, now_offset());
                         write_file(&abs, &edited)?;
@@ -2914,7 +3650,7 @@ impl Engine {
                                 ))
                             })?
                     };
-                    if !current.contains(&line) {
+                    if !already(&current) {
                         let edited =
                             touch_generated(&append_body(&current, &line), &actor, now_offset());
                         let stamp = virtual_stamp(&edited);
@@ -2937,6 +3673,7 @@ impl Engine {
             }
             self.refresh_index_files(&succ_desc.domain).await;
         }
+        self.nudge_embed();
 
         Ok(json!({
             "domain": desc.domain,
@@ -2959,6 +3696,7 @@ impl Engine {
         current: &str,
         status: &str,
         valid_to: Option<NaiveDate>,
+        successor_permalink: Option<&str>,
         successor_title: Option<&str>,
         actor: &str,
     ) -> String {
@@ -2967,13 +3705,285 @@ impl Engine {
             edited =
                 set_frontmatter_field(&edited, "valid_to", &date.format("%Y-%m-%d").to_string());
         }
-        if let Some(title) = successor_title {
-            let line = format!("- superseded_by [[{title}]]");
-            if !current.contains(&line) {
+        if let Some(permalink) = successor_permalink {
+            let line = format!("- superseded_by [[{permalink}]]");
+            if !Self::declares(current, "superseded_by", permalink, successor_title) {
                 edited = append_body(&edited, &line);
             }
         }
         touch_generated(&edited, actor, now_offset())
+    }
+
+    /// Whether the text already declares this relation to this engram, in
+    /// either spelling.
+    ///
+    /// The engine writes the permalink form now and wrote the title form
+    /// before, so an archive holds both and a re-retirement must recognize the
+    /// one it finds rather than appending a second bullet saying what the first
+    /// already says. Exact on both, because both are spellings the engine
+    /// itself produced: this recognizes its own past output, it does not try to
+    /// parse what a person may have typed.
+    fn declares(current: &str, rel_type: &str, permalink: &str, title: Option<&str>) -> bool {
+        let mut forms = vec![format!("- {rel_type} [[{permalink}]]")];
+        if let Some(title) = title {
+            forms.push(format!("- {rel_type} [[{title}]]"));
+        }
+        forms.iter().any(|line| current.contains(line.as_str()))
+    }
+
+    /// Move part of an engram into a new one, in a single guided step: the
+    /// selected observations and sections leave the source, land in a new
+    /// engram carrying the source's tags and a `stable` status, and the two are
+    /// wired together with `derived_from` on the new engram and `split_into` on
+    /// the source.
+    ///
+    /// The verb behind "split before you retire". Validity is set per engram
+    /// rather than per bullet, so an engram that bundles facts with different
+    /// lifecycles has to give up its still-valid facts when the one fact that
+    /// expired retires the file. Doing that by hand is a write, two edits and a
+    /// pair of links, with every step a chance to lose a bullet; this is that
+    /// sequence as one call, and `V010` is the sweep rule that finds the
+    /// engrams needing it.
+    pub async fn split_engram(&self, p: &SplitParams) -> Result<Value> {
+        self.split_engram_as(p, None).await
+    }
+
+    /// [`Engine::split_engram`] with the splitting identity, resolved by
+    /// [`Engine::actor`] and stamped into both engrams' `generated` block.
+    ///
+    /// **Everything that can be refused is refused before anything is
+    /// written**: the source resolves inside the domain the request named (see
+    /// [`Engine::resolve_in`]), its checksum is compared, every selected line is
+    /// checked to be an observation the source really carries, every section
+    /// path is resolved, and the remainder is measured against verify's `Q001`
+    /// minimum so a split can never quietly empty an engram. Only then does the
+    /// new engram get written, and only then the source edited.
+    ///
+    /// **The new engram goes first, and a failed source edit takes it back out
+    /// only while the source is untouched.** First because the failure that
+    /// leaves the knowledge in two places is survivable and the one that leaves
+    /// it in none is not. The source edit carries the checksum of the text this
+    /// call planned against, so a concurrent edit refuses it rather than
+    /// dropping somebody's work; a refusal before the source's bytes change -
+    /// that conflict, a read that fails, a write the filesystem refuses -
+    /// deletes the new engram again and hands the caller the failure with the
+    /// archive exactly as it was.
+    ///
+    /// **Once the source has been rewritten, nothing is undone**, and that is
+    /// the invariant rather than an omission: the source no longer holds the
+    /// moved observations, so deleting the engram that does hold them is the
+    /// one outcome this verb must never produce. `apply_source_edit_staged`
+    /// reports which side of the write it failed on
+    /// ([`SourceEditFailure::wrote`]), and on the far side both engrams are
+    /// kept and the error names them and says the source's index row may be
+    /// stale. What is left then is a correct pair with a stale index row for
+    /// the source, which a sync, a watcher tick or `reindex` repairs.
+    ///
+    /// **Only a file domain can reach that state.** A virtual source is edited
+    /// inside one store transaction that rolls back on any error, so a failure
+    /// there is always the untouched case: a concurrent edit comes back as the
+    /// `Conflict` it is and the new engram is taken back out, with the stored
+    /// bytes exactly as they were.
+    ///
+    /// **A moved section takes its relation bullets with it**, since a section
+    /// moves as text. That can leave a relation the source declared one-sided;
+    /// the evolve sweep raises it as `V103` and the fix is one append.
+    ///
+    /// **What the new engram inherits, and what it does not.** The moved
+    /// content, the source's tags and the source's `type` carry over, because
+    /// splitting a guide into two guides is what a reader expects. The
+    /// lifecycle does not: the new engram is `stable` with no validity window,
+    /// since the facts being moved out are the ones that still hold. Nothing
+    /// else from the source's frontmatter follows it.
+    pub async fn split_engram_as(&self, p: &SplitParams, client: Option<&str>) -> Result<Value> {
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let actor = self.actor(client);
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
+        let content = self.load_content(&source, &desc).await?;
+        let checksum = sha256_hex(content.as_bytes());
+        if let Some(expected) = p.expected_checksum.as_deref()
+            && expected != checksum
+        {
+            return Err(EngineError::Conflict(stale_edit_message(
+                expected, &checksum,
+            )));
+        }
+        let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
+        let plan = Self::plan_split(&content, &engram, p, &desc.permalink)?;
+
+        // One trimmed title everywhere: the heading, the link the source gets
+        // and the receipt all name the engram the same way.
+        let title = p.title.trim().to_string();
+
+        // The new engram, written through the ordinary capture path so the
+        // permalink screens, the collision refusal and the provenance stamp are
+        // the ones every other new engram gets.
+        let body = format!(
+            "# {title}\n\n{}\n\n- derived_from [[{}]]",
+            plan.moved, desc.permalink
+        );
+        let created = self
+            .write_engram_as(
+                &WriteParams {
+                    domain: p.domain.clone(),
+                    title: title.clone(),
+                    content: body,
+                    folder: p.folder.clone(),
+                    engram_type: Some(engram.frontmatter.engram_type.clone()),
+                    tags: engram.frontmatter.tags.clone(),
+                    status: Some("stable".to_string()),
+                    metadata: None,
+                    overwrite: false,
+                },
+                client,
+            )
+            .await?;
+        // Where the capture path put it, which is also what the rollback below
+        // has to address. Absent means the receipt shape changed under this
+        // code: the rollback is skipped and said out loud rather than run
+        // against an empty identifier, which would delete nothing and report
+        // nothing.
+        let new_permalink = created["permalink"].as_str().map(str::to_string);
+        let new_path = created["path"].as_str().unwrap_or_default().to_string();
+
+        // By permalink, for the reason `derived_from` above is: a title is
+        // prose and may carry a colon that `[[...]]` reads as a cross-domain
+        // prefix (issue #65). The fallback for the one case with no permalink
+        // to name - a receipt whose shape changed under this code, which the
+        // rollback below reports rather than acts on - is the slug of the
+        // title, which is what the capture path would have derived anyway, and
+        // never the title itself: that would write the very shape this change
+        // is about.
+        let back_link = new_permalink
+            .clone()
+            .unwrap_or_else(|| crystalline_core::slugify(&title));
+        let remaining = append_body(&plan.remaining, &format!("- split_into [[{back_link}]]"));
+        let edited = self
+            .apply_source_edit_staged(&desc, &source, Some(&checksum), &actor, move |_| {
+                Ok(remaining)
+            })
+            .await;
+        if let Err(failure) = edited {
+            if failure.wrote {
+                // The source's bytes are the edited ones, so the moved
+                // observations live in the new engram and nowhere else.
+                // Deleting it here is the one thing that would lose them.
+                return Err(EngineError::Internal(format!(
+                    "the split wrote both engrams but the index update for '{}' failed: {}. Both are kept and neither was undone ({} and {}); the index row for '{}' may be stale until the next sync or reindex picks it up",
+                    desc.permalink, failure.error, desc.path, new_path, desc.permalink
+                )));
+            }
+            // The source is untouched, so the new engram is knowledge the
+            // archive now holds twice. Take it back, and report the underlying
+            // failure rather than the cleanup: what the caller has to act on is
+            // that the source moved under them.
+            match new_permalink {
+                Some(permalink) => {
+                    let _ = self
+                        .delete_engram(&DeleteParams {
+                            identifier: permalink,
+                            domain: p.domain.clone(),
+                            expected_checksum: None,
+                        })
+                        .await;
+                }
+                None => tracing::warn!(
+                    receipt = %created,
+                    "split rollback skipped: the capture receipt named no permalink"
+                ),
+            }
+            return Err(failure.error);
+        }
+
+        Ok(json!({
+            "domain": desc.domain,
+            "source": {
+                "permalink": desc.permalink,
+                "path": desc.path,
+                "title": desc.title,
+            },
+            "new": {
+                "permalink": created["permalink"],
+                "path": created["path"],
+                "title": title,
+            },
+            "moved_observations": plan.observations,
+            "moved_sections": plan.sections,
+        }))
+    }
+
+    /// Work out what a split would move and what it would leave, or refuse.
+    /// Pure text over the parsed source, so every refusal happens before the
+    /// first write.
+    fn plan_split(
+        content: &str,
+        engram: &Engram,
+        p: &SplitParams,
+        permalink: &str,
+    ) -> Result<SplitPlan> {
+        let mut moving: BTreeSet<usize> = BTreeSet::new();
+        // Both counts answer the same question - how many distinct things
+        // moved - so both are collected as sets: a line named twice moves once,
+        // and two paths that resolve to the same heading move one section.
+        let mut observations: BTreeSet<usize> = BTreeSet::new();
+        let mut sections: BTreeSet<(usize, usize)> = BTreeSet::new();
+        for line in &p.observations {
+            if !engram.observations.iter().any(|o| o.line == *line) {
+                return Err(EngineError::Invalid(format!(
+                    "line {line} is not an observation bullet on '{permalink}'; \
+                     read_engram reports the line of every observation it carries"
+                )));
+            }
+            moving.insert(*line);
+            observations.insert(*line);
+        }
+        for path in &p.sections {
+            let (start, end) =
+                crystalline_core::emit::section_line_range(content, path).map_err(section_err)?;
+            moving.extend(start..end);
+            sections.insert((start, end));
+        }
+        if moving.is_empty() {
+            return Err(EngineError::Invalid(
+                "split_engram needs something to move: pass observations (the line numbers \
+                 read_engram reports) or sections (heading paths such as '## Notes')"
+                    .into(),
+            ));
+        }
+
+        let mut moved: Vec<&str> = Vec::new();
+        let mut kept: Vec<&str> = Vec::new();
+        for (i, line) in content.split('\n').enumerate() {
+            if moving.contains(&(i + 1)) {
+                moved.push(line);
+            } else {
+                kept.push(line);
+            }
+        }
+        let remaining = kept.join("\n");
+        // Measured on the knowledge that would be left, before the
+        // `split_into` line is appended: a bookkeeping relation is not what
+        // makes an engram worth keeping.
+        let left = parse_engram(&remaining)
+            .map(|e| crystalline_index::content_line_count(&e.body))
+            .unwrap_or(0);
+        if left < crystalline_index::MIN_CONTENT_LINES {
+            return Err(EngineError::Invalid(format!(
+                "that selection would leave '{permalink}' with {left} content line(s), under the \
+                 {} verify rule Q001 requires; move less, or retire the whole engram instead of \
+                 splitting it",
+                crystalline_index::MIN_CONTENT_LINES
+            )));
+        }
+
+        Ok(SplitPlan {
+            moved: moved.join("\n").trim_matches('\n').to_string(),
+            remaining,
+            observations: observations.len(),
+            sections: sections.len(),
+        })
     }
 
     // --- read ----------------------------------------------------------------
@@ -2983,7 +3993,7 @@ impl Engine {
     /// Deliberately thin - [`Engine::read_engram`] resolves references and
     /// builds hints this caller never reads.
     pub async fn engram_text(&self, domain: &str, identifier: &str) -> Result<EngramText> {
-        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let (desc, source) = self.resolve_in(identifier, domain).await?;
         let content = self.load_content(&source, &desc).await?;
         let checksum = sha256_hex(content.as_bytes());
         Ok(EngramText {
@@ -3059,8 +4069,16 @@ impl Engine {
     /// database (virtual domains, and non-host reads over a shared database). The
     /// returned `checksum` is the CAS token an `edit_engram` can pass back as
     /// `expected_checksum` to detect a change since this read.
-    pub async fn read_engram(&self, p: &ReadParams) -> Result<Value> {
-        let (desc, source) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+    ///
+    /// `scope` decides what may be read at all: an engram in a domain the
+    /// caller may not see is [`EngineError::NotFound`], the same miss an engram
+    /// nobody wrote produces, and the inbound sample below never names a domain
+    /// the caller cannot see.
+    pub async fn read_engram(&self, p: &ReadParams, scope: &crate::scope::Scope) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let (desc, source) = self
+            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
+            .await?;
         let content = self.load_content(&source, &desc).await?;
         let engram = parse_engram(&content).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let checksum = sha256_hex(content.as_bytes());
@@ -3071,9 +4089,16 @@ impl Engine {
         let (outbound, inbound) = {
             let store = self.store.lock().await;
             let outbound = store.outbound_refs(desc.id).await?;
-            let inbound = store
+            let mut inbound = store
                 .inbound_refs(desc.id, desc.domain_id, &desc.permalink, &desc.title)
                 .await?;
+            // Who points here is answered for the caller asking: a reference
+            // out of a domain this caller may not see names that domain and one
+            // of its file paths, so it is dropped before the count as well as
+            // before the sample. The count states what the sample is drawn
+            // from, and a count of references that cannot be shown would be a
+            // second, quieter way of saying the domain is there.
+            inbound.retain(|r| !hidden.contains(&r.src_domain));
             (outbound, inbound)
         };
 
@@ -3204,6 +4229,15 @@ impl Engine {
     ///
     /// An engram nobody wrote is [`EngineError::NotFound`], the same resolution
     /// every other read of one identifier opens with.
+    ///
+    /// Scoped: the anchor resolves through [`Engine::resolve_scoped`], so an
+    /// engram in a domain the caller may not see is the not-found a missing
+    /// one produces, and the domains it may not see are subtracted inside the
+    /// query rather than from its answer. This list names other domains by
+    /// name and path - it is the one read on this surface whose *rows* are
+    /// mostly about somewhere else - so a referrer inside a hidden domain is
+    /// absent from the page, from the total and from the per-relation summary
+    /// alike. [`crate::scope::Scope::Unrestricted`] subtracts nothing.
     pub async fn inbound_references(
         &self,
         p: &ReadParams,
@@ -3211,8 +4245,12 @@ impl Engine {
         rel: Option<&str>,
         page: Option<usize>,
         limit: Option<usize>,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
-        let (desc, _) = self.resolve(&p.identifier, p.domain.as_deref()).await?;
+        let hidden = self.hidden_for(scope).await?;
+        let (desc, _) = self
+            .resolve_scoped(&p.identifier, p.domain.as_deref(), &hidden)
+            .await?;
         // Clamped rather than refused, the way the listing clamps its own: a
         // hand-written page number below one is answered with the first page,
         // and a page size past [`MAX_INBOUND_LIMIT`] is answered with that
@@ -3221,6 +4259,11 @@ impl Engine {
         // back at it.
         let page = page.unwrap_or(1).max(1);
         let limit = limit.unwrap_or(10).clamp(1, MAX_INBOUND_LIMIT);
+        // Sorted so the query text is stable for one caller across calls,
+        // which keeps a prepared-statement cache and a log line honest; the
+        // set itself is unordered.
+        let mut exclude: Vec<String> = hidden.iter().cloned().collect();
+        exclude.sort();
         let found = {
             let store = self.store.lock().await;
             store
@@ -3231,6 +4274,7 @@ impl Engine {
                     title: &desc.title,
                     q,
                     rel,
+                    exclude_domains: &exclude,
                     page,
                     limit,
                 })
@@ -3285,7 +4329,7 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let actor = self.actor(client);
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         // An `evolve_ack` assignment is the one set_frontmatter key whose value
         // the server completes rather than takes: the scope comes from running
         // detection over this engram's domain, which needs the store and so
@@ -3338,14 +4382,41 @@ impl Engine {
     where
         F: FnOnce(&str) -> Result<String>,
     {
+        self.apply_source_edit_staged(desc, source, expected_checksum, actor, apply)
+            .await
+            .map_err(|failure| failure.error)
+    }
+
+    /// [`Engine::apply_source_edit`], reporting whether the source's bytes were
+    /// already replaced when it failed.
+    ///
+    /// One caller needs that, and only one: [`Engine::split_engram_as`] writes a
+    /// second engram before this runs and may only take that engram back while
+    /// the source is provably untouched. No error kind answers the question -
+    /// the reindex that follows the rename reads the file back and raises the
+    /// same `Io` a refused write raises - so the stage is reported by the code
+    /// that knows it rather than guessed from the error afterwards.
+    async fn apply_source_edit_staged<F>(
+        &self,
+        desc: &EngramDescriptor,
+        source: &ContentSource,
+        expected_checksum: Option<&str>,
+        actor: &str,
+        apply: F,
+    ) -> std::result::Result<(), SourceEditFailure>
+    where
+        F: FnOnce(&str) -> Result<String>,
+    {
         match source {
             ContentSource::File { root } => {
                 let abs = join_rel(root, &desc.path);
                 let lock = self.write_lock(&abs);
                 let _guard = lock.lock().await;
-                let current = std::fs::read_to_string(&abs).map_err(|source| EngineError::Io {
-                    path: abs.display().to_string(),
-                    source,
+                let current = std::fs::read_to_string(&abs).map_err(|source| {
+                    SourceEditFailure::before(EngineError::Io {
+                        path: abs.display().to_string(),
+                        source,
+                    })
                 })?;
                 // The CAS token, when the caller presents one: compared inside
                 // the lock, against the bytes just read, exactly as save_engram
@@ -3353,38 +4424,67 @@ impl Engine {
                 if let Some(expected) = expected_checksum {
                     let found = sha256_hex(current.as_bytes());
                     if found != expected {
-                        return Err(EngineError::Conflict(stale_edit_message(expected, &found)));
+                        return Err(SourceEditFailure::before(EngineError::Conflict(
+                            stale_edit_message(expected, &found),
+                        )));
                     }
                 }
-                let edited = apply(&current)?;
+                let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, now_offset());
-                let edited = Self::enforce_temporal(edited)?;
-                write_file(&abs, &edited)?;
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
+                // The last step that can fail with the file as it was:
+                // `write_bytes` renames a sibling temp into place, and a rename
+                // either happens or does not, so a refusal here leaves the
+                // source's bytes untouched.
+                write_file(&abs, &edited).map_err(SourceEditFailure::before)?;
+                if self.take_armed_failure() {
+                    return Err(SourceEditFailure::after(EngineError::Internal(
+                        "reindex failed (test seam)".to_string(),
+                    )));
+                }
                 let store = self.store.lock().await;
                 self.reindex_file(&*store, desc.domain_id, root, &desc.path)
-                    .await?;
+                    .await
+                    .map_err(SourceEditFailure::after)?;
             }
             ContentSource::Virtual => {
                 let current = {
                     let store = self.store.lock().await;
                     store
                         .engram_content(desc.domain_id, &desc.path)
-                        .await?
+                        .await
+                        .map_err(|e| SourceEditFailure::before(EngineError::from(e)))?
                         .ok_or_else(|| {
-                            EngineError::NotFound(format!(
+                            SourceEditFailure::before(EngineError::NotFound(format!(
                                 "no content stored for '{}' in domain '{}'",
                                 desc.permalink, desc.domain
-                            ))
+                            )))
                         })?
                 };
                 let expected = expected_checksum
                     .map(str::to_string)
                     .unwrap_or_else(|| sha256_hex(current.as_bytes()));
-                let edited = apply(&current)?;
+                let edited = apply(&current).map_err(SourceEditFailure::before)?;
                 let edited = touch_generated(&edited, actor, now_offset());
-                let edited = Self::enforce_temporal(edited)?;
+                let edited = Self::enforce_temporal(edited).map_err(SourceEditFailure::before)?;
                 let stamp = virtual_stamp(&edited);
+                // The seam, on this arm: a token nothing can match, so the
+                // store raises its own compare-and-swap conflict and rolls the
+                // transaction back. See `Engine::fail_next_source_edit`.
+                let expected = if self.take_armed_failure() {
+                    "0".repeat(64)
+                } else {
+                    expected
+                };
                 let store = self.store.lock().await;
+                // Every failure here is a `before`, and that is exact rather
+                // than generous: `index_markdown` runs the compare and swap,
+                // the chunking and the reference resolution inside one store
+                // transaction and rolls it back on any error, so a virtual
+                // source that refuses still holds the bytes it held. A
+                // concurrent edit therefore comes back as the `Conflict` it is
+                // and the caller may undo whatever it wrote first, which is the
+                // failure that actually happens in the field.
                 self.index_markdown(
                     &*store,
                     desc.domain_id,
@@ -3394,7 +4494,8 @@ impl Engine {
                     Some(&expected),
                     true,
                 )
-                .await?;
+                .await
+                .map_err(SourceEditFailure::before)?;
             }
         }
 
@@ -3406,6 +4507,10 @@ impl Engine {
         // An edit can change the title or the description the folder's
         // generated index lists this engram under.
         self.refresh_index_files(&desc.domain).await;
+        // One call for both arms, and exactly right there: this tail is
+        // reached only when the arm that ran committed its bytes, so a refused
+        // edit never schedules a pass for a chunk that was not rewritten.
+        self.nudge_embed();
         Ok(())
     }
 
@@ -3598,15 +4703,18 @@ impl Engine {
                     AckDraft::Record(entry) => entry,
                     // A removal reads the entries the file holds right now,
                     // under the lock, so a concurrent acknowledgment is either
-                    // fully there or not there at all when it filters.
+                    // fully there or not there at all when it filters. It
+                    // names a rule and never a pair: `remove <rule-id>` is the
+                    // whole of the value form an agent writes here, so every
+                    // entry the rule has goes.
                     AckDraft::Remove(rule) => {
-                        if !has_ack(source, rule) {
+                        if !has_ack(source, rule, None) {
                             return Err(EngineError::Invalid(format!(
                                 "no acknowledgment for {rule} on '{permalink}'; nothing to remove"
                             )));
                         }
                         return guarded_ack_write(
-                            without_ack(source, rule),
+                            without_ack(source, rule, None),
                             "removal",
                             &p.identifier,
                         );
@@ -3680,16 +4788,39 @@ impl Engine {
     /// domain, so a move carries content between the two truths: a same-domain
     /// move is a rename (no reparse), a cross-domain move reads the source
     /// content and re-indexes it into the destination's source.
-    pub async fn move_engram(&self, p: &MoveParams) -> Result<Value> {
+    ///
+    /// `scope` bounds the *side effect*, which is the half a surface cannot
+    /// gate for itself. Whether this caller may write either end is decided at
+    /// the edge (the REST write gate, the MCP domain gate); what only this
+    /// function can decide is which other domains it rewrites a link inside.
+    /// A cross-domain move rewrites every bare `[[target]]` that pointed at the
+    /// moved engram into the prefixed form, and those linking engrams live in
+    /// domains the mover may never have been shown. So the rewrite skips a
+    /// domain this caller may not see: its link is left as it was - dangling,
+    /// which its own members see as an unresolved-reference finding on the next
+    /// sweep - rather than silently edited by somebody with no access to it,
+    /// and `links_rewritten` counts the visible rewrites only, so a receipt
+    /// never counts a file its reader may not know exists.
+    pub async fn move_engram(&self, p: &MoveParams, scope: &crate::scope::Scope) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let (src, src_source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        // Resolved once, before anything is written, and used twice below: to
+        // look the destination up, and to bound the inbound rewrite.
+        let hidden = self.hidden_for(scope).await?;
+        let (src, src_source) = self.resolve_in(&p.identifier, &p.domain).await?;
         let dest_domain = p
             .destination_domain
             .clone()
             .unwrap_or_else(|| p.domain.clone());
-        let dest_source = self.content_source(&dest_domain)?;
+        // Scoped, and that is load bearing rather than tidy. This lookup raises
+        // the one error that names every registered domain, and a surface gate
+        // above it can only check the spelling it normalizes: a padded or empty
+        // `destination_domain` passes a gate that trims or skips it and arrives
+        // here verbatim. Resolving it against the caller's own visible set
+        // closes that for every spelling, present and future, instead of asking
+        // one more pair of normalizers to agree.
+        let dest_source = self.content_source_scoped(&dest_domain, &hidden)?;
         let dest_rel = normalize_md(&p.destination);
         if dest_rel.is_empty() {
             return Err(EngineError::Invalid("destination path is empty".into()));
@@ -3844,6 +4975,36 @@ impl Engine {
         let mut rewritten = 0usize;
         for r in inbound {
             if r.src_domain == dest_domain || r.to_target.contains(':') {
+                continue;
+            }
+            // A reference that named a domain in its brackets is not a bare
+            // link and is left alone. The needle below is built from
+            // `to_target`, which is the text AFTER the colon, so for
+            // `[[open:Thing]]` - or for a colon title like
+            // `[[Log: Weekly Notes]]`, which parses the same way and resolves
+            // by title - the file does not hold `[[Thing]]` at that spot. The
+            // usual outcome is a miss and a `continue`; the outcome this guard
+            // exists for is a hit somewhere else in the same file, where a
+            // genuinely bare `[[Thing]]` pointing at something entirely
+            // different would be rewritten and counted as a success. The
+            // unresolved half of `inbound_refs` filters on `to_domain IS NULL`
+            // already; the resolved half cannot, because a reader wants every
+            // reference that points here, so the filter belongs to the rewrite.
+            if r.to_domain.is_some() {
+                continue;
+            }
+            // A linking engram in a domain this caller may not see is left
+            // exactly as it was: see the scope note on this function.
+            //
+            // Defensive since the guard above landed, and kept for that
+            // reason. A reference reaching this point is bare, and a bare
+            // reference resolves in its own domain, so an inbound bare
+            // reference to the moved engram is in the domain the engram is
+            // LEAVING - which the mover had to be able to see in order to move
+            // out of it. There is no input today that reaches this `continue`;
+            // it is what keeps the rule true if the query above ever widens
+            // again.
+            if hidden.contains(&r.src_domain) {
                 continue;
             }
             let needle = format!("[[{}]]", r.to_target);
@@ -4234,7 +5395,7 @@ impl Engine {
                 "deleted": true,
             }));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         // Held across the comparison and the removal, so a guarded delete
         // cannot check a file that a concurrent save then rewrites underneath
         // it. See `Engine::write_lock`.
@@ -4343,7 +5504,7 @@ impl Engine {
                 "attachment": true,
             }));
         }
-        let (desc, source) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, source) = self.resolve_in(&p.identifier, &p.domain).await?;
         let content = self.load_content(&source, &desc).await?;
         let attachments = self.previewable_attachments(&desc, &content).await;
         Ok(json!({
@@ -4497,8 +5658,17 @@ impl Engine {
     // --- search --------------------------------------------------------------
 
     /// Search across domains, embedding the query when the mode needs it.
-    pub async fn search_engrams(&self, p: &SearchParams) -> Result<Value> {
-        self.search_engrams_under(p, None).await
+    ///
+    /// `scope` decides which domains are in range at all: a caller that named a
+    /// domain it may not see gets what naming an unregistered domain gets - no
+    /// hits from it, and no error saying it is there - and a caller that named
+    /// none searches every domain minus those.
+    pub async fn search_engrams(
+        &self,
+        p: &SearchParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        self.search_engrams_under(p, None, scope).await
     }
 
     /// [`Engine::search_engrams`] narrowed to one domain-relative folder, which
@@ -4521,8 +5691,11 @@ impl Engine {
         &self,
         p: &SearchParams,
         folder: Option<&str>,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let requested = parse_mode(p.search_type.as_deref())?;
+        let hidden = self.hidden_for(scope).await?;
+        let scoped = self.scoped_domains(&p.domains, &hidden).await?;
         let text = p.query.clone().filter(|s| !s.trim().is_empty());
         let mut query = SearchQuery {
             text: text.clone(),
@@ -4561,6 +5734,25 @@ impl Engine {
                 .await?
         };
         query.mode = effective;
+
+        // The visibility filter is applied after the mode is settled and before
+        // the query is embedded: a search of nothing this caller may read costs
+        // no embedding call and no store round trip, and still reports the mode
+        // the same search over a visible domain would have reported.
+        match scoped {
+            ScopedDomains::AsAsked => {}
+            ScopedDomains::Only(domains) => query.domains = Some(domains),
+            ScopedDomains::Nothing => {
+                return Ok(json!({
+                    "mode": mode_str(effective),
+                    "total": 0,
+                    "page": query.page,
+                    "limit": query.limit,
+                    "count": 0,
+                    "hits": Value::Array(Vec::new()),
+                }));
+            }
+        }
         if matches!(effective, SearchMode::Semantic | SearchMode::Hybrid)
             && let Some(provider) = &provider
         {
@@ -4583,6 +5775,174 @@ impl Engine {
             "count": page.items.len(),
             "hits": serde_json::to_value(&page.items).unwrap_or(Value::Null),
         }))
+    }
+
+    /// The nearest current engrams to `probe_text` that `scope` may see: the
+    /// retrieval behind the write receipt's `similar` list.
+    ///
+    /// Vector-only on purpose - prose never goes through the lexical parser,
+    /// where parentheses and AND/OR/NOT in an ordinary sentence read as
+    /// operators. The mode is settled the way search settles it, so with no
+    /// provider or no active embeddings for this model the answer is empty
+    /// rather than a text search in disguise. `exclude` is the engram that was
+    /// just written, matched on domain and permalink; the retirement set is
+    /// dropped after the page comes back, which is why the page is one wider
+    /// than the list. Ranking only: no score leaves this function.
+    ///
+    /// The scoping reconciliation, the mode decision and the phasing that never
+    /// holds the store lock across the embed call are all
+    /// [`Engine::search_engrams_under`]'s, repeated here rather than shared: the
+    /// two bodies differ enough (no text, vector only, no envelope, typed rows,
+    /// two post-filters) that a common helper would cost more than it saves, so
+    /// a change to either belongs in both. One thing differs on purpose. That
+    /// function settles the mode before it applies the scoping, so its envelope
+    /// reports a truthful mode even to a caller who may see nothing; this one
+    /// scopes first, because it has no envelope to be truthful in and would
+    /// rather skip the coverage read for a caller with nothing to search.
+    pub async fn similar_engrams(
+        &self,
+        probe_text: &str,
+        exclude: Option<(&str, &str)>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Vec<SimilarEngram>> {
+        let Some(provider) = self.provider() else {
+            return Ok(Vec::new());
+        };
+        let hidden = self.hidden_for(scope).await?;
+        let domains = match self.scoped_domains(&[], &hidden).await? {
+            ScopedDomains::AsAsked => None,
+            ScopedDomains::Only(domains) => Some(domains),
+            ScopedDomains::Nothing => return Ok(Vec::new()),
+        };
+        let effective = {
+            let store = self.store.lock().await;
+            self.effective_mode(&*store, SearchMode::Semantic, true, true)
+                .await?
+        };
+        if !matches!(effective, SearchMode::Semantic) {
+            return Ok(Vec::new());
+        }
+        let vecs = provider
+            .embed_queries(&[probe_text.to_string()])
+            .await
+            .map_err(|e| EngineError::Internal(e.to_string()))?;
+        let Some(embedding) = vecs.into_iter().next() else {
+            return Ok(Vec::new());
+        };
+        let query = SearchQuery {
+            domains,
+            mode: SearchMode::Semantic,
+            query_embedding: Some(embedding),
+            active_model: Some(self.model_id.clone()),
+            // Pure cosine order: the fade would only reorder hits this drops.
+            retired_weight: Some(1.0),
+            limit: SIMILAR_PAGE,
+            page: 1,
+            ..SearchQuery::default()
+        };
+        let page = {
+            let store = self.store.lock().await;
+            store.search(&query).await?
+        };
+        Ok(page
+            .items
+            .into_iter()
+            .filter(|hit| !is_retired_status(&hit.status))
+            .filter(|hit| exclude.is_none_or(|(d, p)| !(hit.domain == d && hit.permalink == p)))
+            .take(SIMILAR_LIMIT)
+            .map(|hit| SimilarEngram {
+                domain: hit.domain,
+                permalink: hit.permalink,
+                title: hit.title,
+                status: hit.status,
+                engram_type: hit.engram_type,
+            })
+            .collect())
+    }
+
+    /// Put the neighbours advisory on a write receipt, or leave it alone.
+    ///
+    /// Runs after the write has landed and can neither fail nor delay it past
+    /// [`SIMILAR_TIMEOUT`]: every failure - no provider, no embeddings, a
+    /// store error, the clock - is a debug line and an unchanged receipt. Off
+    /// when `capture.similar` is off. The probe first waits, briefly, for the
+    /// embed worker to drain what was just written, so a capture made a moment
+    /// ago can be a neighbour of this one.
+    ///
+    /// The receipt must already name the engram that landed, as top-level
+    /// string `domain` and `permalink` keys: they are what the advisory
+    /// excludes itself by, and what an edit looks its title up from. A receipt
+    /// shaped any other way is left untouched.
+    pub async fn attach_similar(
+        &self,
+        receipt: &mut Value,
+        probe: SimilarProbe<'_>,
+        scope: &crate::scope::Scope,
+    ) {
+        if !self.config.read().unwrap().capture_similar() {
+            return;
+        }
+        let (Some(domain), Some(permalink)) = (
+            receipt
+                .get("domain")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            receipt
+                .get("permalink")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        ) else {
+            return;
+        };
+        let work = async {
+            let text = match probe {
+                SimilarProbe::Write {
+                    title,
+                    description,
+                    body,
+                } => similar::write_probe_text(title, description, body),
+                SimilarProbe::Markdown { text } => similar::markdown_probe_text(text),
+                SimilarProbe::Edit { new_text } => {
+                    let title = {
+                        let store = self.store.lock().await;
+                        store
+                            .find_engram(&domain, &permalink)
+                            .await
+                            .ok()
+                            .flatten()
+                            .map(|d| d.title)
+                    };
+                    title.and_then(|t| similar::edit_probe_text(&t, new_text))
+                }
+            };
+            let Some(text) = text else {
+                return Ok(Vec::new());
+            };
+            self.await_embed_backlog(SIMILAR_BACKLOG_WAIT).await;
+            self.similar_engrams(&text, Some((&domain, &permalink)), scope)
+                .await
+        };
+        match tokio::time::timeout(SIMILAR_TIMEOUT, work).await {
+            Ok(Ok(found)) => similar::attach(receipt, &found),
+            Ok(Err(e)) => tracing::debug!("similar probe skipped: {e}"),
+            Err(_) => tracing::debug!("similar probe cut at {SIMILAR_TIMEOUT:?}"),
+        }
+    }
+
+    /// Wait, at most `budget`, for the embed worker to clear the backlog.
+    /// Without a worker there is nothing to wait for and no wait happens.
+    async fn await_embed_backlog(&self, budget: std::time::Duration) {
+        if self.embed_tx.is_none() {
+            return;
+        }
+        let deadline = tokio::time::Instant::now() + budget;
+        loop {
+            match self.embedding_backlog().await {
+                Ok(0) | Err(_) => return,
+                Ok(_) if tokio::time::Instant::now() >= deadline => return,
+                Ok(_) => tokio::time::sleep(SIMILAR_BACKLOG_POLL).await,
+            }
+        }
     }
 
     async fn effective_mode(
@@ -4609,24 +5969,49 @@ impl Engine {
     // --- context -------------------------------------------------------------
 
     /// Traverse the graph around a `crystalline://` anchor.
-    pub async fn build_context(&self, p: &ContextParams) -> Result<Value> {
+    ///
+    /// `scope` bounds the neighbourhood twice over: an anchor in a domain the
+    /// caller may not see is the not-found an anchor that matched nothing gets,
+    /// and a neighbour in such a domain is cut out of the slice before anything
+    /// is ranked, so it neither appears nor lends its mass to what does.
+    pub async fn build_context(
+        &self,
+        p: &ContextParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let url = CrystallineUrl::parse(&p.anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{}' is not a crystalline:// URL", p.anchor))
         })?;
         let depth = p.depth.unwrap_or(1).clamp(1, 3);
         let max_related = p.max_related.unwrap_or(10);
         let domain_filter = Some(p.domains.clone()).filter(|d| !d.is_empty());
+        let hidden = self.hidden_for(scope).await?;
 
         let store = self.store.lock().await;
+        // A hidden domain skips the lookup and keeps the branch: a glob over one
+        // falls into the same "matched no engrams" an empty glob produces, and a
+        // named anchor into the same not-found a missing engram produces. Both
+        // are reached by the same lines a visible domain reaches, which is what
+        // makes the two indistinguishable.
+        let visible_anchor = !hidden.contains(&url.domain);
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            store
-                .list_engrams(&url.domain, None, None)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            if visible_anchor {
+                store
+                    .list_engrams(&url.domain, None, None)
+                    .await?
+                    .into_iter()
+                    .filter(|d| url.matches(&d.domain, &d.permalink))
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
-            match store.find_engram(&url.domain, &url.permalink).await? {
+            let found = if visible_anchor {
+                store.find_engram(&url.domain, &url.permalink).await?
+            } else {
+                None
+            };
+            match found {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -4644,7 +6029,14 @@ impl Engine {
         }
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let slice = store.neighbors(&ids, depth).await?;
+        let mut slice = store.neighbors(&ids, depth).await?;
+        // Cut before the ranking, not at output selection like the caller's own
+        // `domains` filter below. The two look alike and are not: a presentation
+        // filter leaves a node in the graph so it still conducts mass as a
+        // bridge, and a node this caller may not see must not be in the graph at
+        // all - a path that only exists through a private engram is a fact about
+        // that engram.
+        retain_visible(&mut slice, &hidden);
 
         // Rank the full slice before any filtering so a domain-filtered node
         // still conducts mass as a bridge; the domain filter applies only at
@@ -4758,23 +6150,38 @@ impl Engine {
         anchor: &str,
         depth: u8,
         max_nodes: usize,
+        scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let url = CrystallineUrl::parse(anchor).ok_or_else(|| {
             EngineError::Invalid(format!("anchor '{anchor}' is not a crystalline:// URL"))
         })?;
         let depth = depth.clamp(1, 2);
         let max_nodes = max_nodes.clamp(1, MAX_GRAPH_NODES);
+        let hidden = self.hidden_for(scope).await?;
 
         let store = self.store.lock().await;
+        // A hidden domain skips the lookup and keeps the branch, so it answers
+        // with the same miss a visible domain with nothing in it answers with.
+        // See [`Engine::build_context`], which seeds the same way.
+        let visible_anchor = !hidden.contains(&url.domain);
         let seeds: Vec<EngramDescriptor> = if url.glob {
-            store
-                .list_engrams(&url.domain, None, None)
-                .await?
-                .into_iter()
-                .filter(|d| url.matches(&d.domain, &d.permalink))
-                .collect()
+            if visible_anchor {
+                store
+                    .list_engrams(&url.domain, None, None)
+                    .await?
+                    .into_iter()
+                    .filter(|d| url.matches(&d.domain, &d.permalink))
+                    .collect()
+            } else {
+                Vec::new()
+            }
         } else {
-            match store.find_engram(&url.domain, &url.permalink).await? {
+            let found = if visible_anchor {
+                store.find_engram(&url.domain, &url.permalink).await?
+            } else {
+                None
+            };
+            match found {
                 Some(d) => vec![d],
                 None => {
                     return Err(EngineError::NotFound(format!(
@@ -4793,7 +6200,11 @@ impl Engine {
 
         let seed_ids: HashSet<i64> = seeds.iter().map(|d| d.id.0).collect();
         let ids: Vec<EngramId> = seeds.iter().map(|d| d.id).collect();
-        let slice = self.sweep_neighbors(&ids, depth).await?;
+        let mut slice = self.sweep_neighbors(&ids, depth).await?;
+        // Before the ranking and before the cap, so a hidden neighbour is
+        // neither drawn nor counted in `hidden` - that number reports what the
+        // cap cut, and a node this caller may not see was never in the picture.
+        retain_visible(&mut slice, &hidden);
 
         let mass = context_rank(&slice, &seed_ids);
         let weight = {
@@ -4871,11 +6282,32 @@ impl Engine {
 
     // --- recent --------------------------------------------------------------
 
-    /// Recent engrams within a timeframe.
-    pub async fn recent_activity(&self, p: &RecentParams) -> Result<Value> {
+    /// Recent engrams within a timeframe, from the domains `scope` may read.
+    ///
+    /// The visibility filter is pushed into the query rather than applied to
+    /// what comes back: the row limit is enforced in SQL, so dropping rows
+    /// afterwards would quietly shorten a scoped caller's answer instead of
+    /// filling it with the next visible engram.
+    pub async fn recent_activity(
+        &self,
+        p: &RecentParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         let timeframe = p.timeframe.clone().unwrap_or_else(|| "7d".to_string());
+        let hidden = self.hidden_for(scope).await?;
+        let domains = match self.scoped_domains(&p.domains, &hidden).await? {
+            ScopedDomains::AsAsked => Some(p.domains.clone()).filter(|d| !d.is_empty()),
+            ScopedDomains::Only(domains) => Some(domains),
+            ScopedDomains::Nothing => {
+                return Ok(json!({
+                    "timeframe": timeframe,
+                    "count": 0,
+                    "engrams": Value::Array(Vec::new()),
+                }));
+            }
+        };
         let filter = RecentFilter {
-            domains: Some(p.domains.clone()).filter(|d| !d.is_empty()),
+            domains,
             after: timeframe_cutoff(&timeframe),
             engram_types: Some(p.types.clone()).filter(|t| !t.is_empty()),
             limit: 50,
@@ -4901,7 +6333,32 @@ impl Engine {
     /// [`crystalline_core::behavior_bullets`]. Remote clients never show the
     /// model the initialize instructions, so this one call is their whole
     /// onboarding - the routing lines and the rules that govern them together.
-    pub async fn list_domains(&self, p: &ListDomainsParams) -> Result<Value> {
+    ///
+    /// A domain `scope` may not see is absent from the listing, not marked as
+    /// withheld: this is the index a caller routes by, and a name in it is the
+    /// whole of what a private domain keeps.
+    ///
+    /// Each row it does keep carries `private`, so a client that draws a badge
+    /// reads it off the listing rather than asking after every domain in it.
+    /// That is not the same fact as the one above and it is not a leak of it:
+    /// a caller who may not see a domain never gets a row for it to read.
+    ///
+    /// The rows come back sorted by name, case-insensitively, so the sidebar
+    /// and the CLI inherit one order rather than settling it three times.
+    /// Registration order is what the config map preserves and it is
+    /// meaningless to anybody reading the listing.
+    ///
+    /// The routing prompt sorts the same way and by the same comparison, in
+    /// [`crystalline_core::generate_prompt_unscoped`], rather than through this
+    /// call: it builds its block from the config directly. The two are the same
+    /// index seen twice - once at session start, once when an agent asks again
+    /// mid-session - so they agree.
+    pub async fn list_domains(
+        &self,
+        p: &ListDomainsParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let (private, hidden) = self.visibility_for(scope).await?;
         let store = self.store.lock().await;
         let stats = store.domain_stats().await.unwrap_or_default();
         drop(store);
@@ -4910,7 +6367,17 @@ impl Engine {
         // Cloned out from behind the lock before any `.await` below, matching
         // the `hosted`/`discovered_domains` convention elsewhere in this file.
         let domains = self.config.read().unwrap().domains.clone();
-        for (name, entry) in &domains {
+        // Sorted by name rather than left in registration order, which is what
+        // the map preserves and what a reader scanning a sidebar has no use
+        // for. Case-insensitive first, so capitalization never sorts a domain
+        // away from its neighbours, then exact as the tie-break so two names
+        // differing only in case have one settled order.
+        let mut listed: Vec<_> = domains
+            .iter()
+            .filter(|(name, _)| !hidden.contains(*name))
+            .collect();
+        listed.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
+        for (name, entry) in listed {
             let source = self.source_of(entry);
             let s = stats.iter().find(|d| &d.name == name);
             let mut obj = json!({
@@ -4921,6 +6388,15 @@ impl Engine {
                 "observations": s.map(|d| d.observations),
                 "relations": s.map(|d| d.relations),
                 "last_sync": s.and_then(|d| d.last_sync.clone()),
+                // Whether this domain is private, so a client badges the row it
+                // already has instead of asking after each one. Every domain a
+                // caller may not read was dropped above, so this only ever says
+                // "private" about a domain that caller can already see.
+                //
+                // False on an installation with no accounts database, which is
+                // every domain on it: privacy is a membership record, and a
+                // machine with no accounts has none.
+                "private": private.contains(name),
             });
             // In a shared database a file domain names its current host so an
             // agent and an operator see who syncs what; `hosted_here` is true when
@@ -5230,6 +6706,29 @@ impl Engine {
     /// `None` branch below. So the re-read stays for as long as `domain
     /// remove` is the one mutation path that does not refresh `self.config`.
     pub fn routing_text(&self) -> String {
+        crystalline_core::render_instructions(&self.routing_output(&HashSet::new()))
+    }
+
+    /// [`Engine::routing_text`] with the domain lines replaced by the count
+    /// line: every behavior rule, no domain named.
+    ///
+    /// What the legacy `initialize` handshake serves over HTTP. `get_info` is
+    /// synchronous and rmcp calls it with no request context, so that one
+    /// channel has no caller to resolve and cannot leave a private domain's
+    /// bullets out of a per-caller block; it hands out the countable half
+    /// instead and points at `list_domains`, which does resolve a caller. See
+    /// [`crystalline_core::render_counted_instructions`] for the residue that
+    /// leaves. Stdio never calls this: a local session is the machine owner.
+    pub fn routing_text_counted(&self) -> String {
+        crystalline_core::render_counted_instructions(&self.routing_output(&HashSet::new()))
+    }
+
+    /// The routing block's model over every registered domain except the named
+    /// ones. The body of [`Engine::routing_text`],
+    /// [`Engine::routing_text_counted`] and [`Engine::routing_text_scoped`], so
+    /// a filtered block is the unfiltered one minus some bullets rather than a
+    /// second rendering.
+    fn routing_output(&self, hidden: &HashSet<String>) -> crystalline_core::PromptOutput {
         // (1) The effective config, composed the same way a fresh load would
         // see it. With a config path this is a fresh file read plus the overlay;
         // a read error falls back to the in-memory effective config.
@@ -5259,10 +6758,47 @@ impl Engine {
 
         // (2) Generate over every registered domain from the cached virtual map,
         // (3) force the engine's effective read-only mode, then (4) render.
+        // A domain the caller may not see is dropped from both halves: out of
+        // the config so it names no routing line, and out of the cached bullets
+        // so nothing of its MANIFEST is rendered.
+        let mut global = global;
         let virtual_bullets = self.routing_virtual.read().unwrap().clone();
+        let virtual_bullets = if hidden.is_empty() {
+            virtual_bullets
+        } else {
+            global.domains.retain(|name, _| !hidden.contains(name));
+            virtual_bullets
+                .into_iter()
+                .filter(|(name, _)| !hidden.contains(name))
+                .collect()
+        };
         let mut output = crystalline_core::generate_prompt_unscoped(&global, &virtual_bullets);
         output.read_only = self.read_only();
-        crystalline_core::render_instructions(&output)
+        output
+    }
+
+    /// [`Engine::routing_text`] for a caller who may not see every domain: the
+    /// same block, with the hidden domains' routing bullets left out.
+    ///
+    /// Async because resolving a scope reads the accounts database, which is
+    /// also why the sync render cannot do this and does not try. The sync one
+    /// stays, and stays unfiltered, for the surfaces that have no caller to
+    /// resolve: the CLI and the control socket are the machine owner, and they
+    /// already have the files on disk.
+    ///
+    /// The MCP handshake (`get_info`, which rmcp calls without a request
+    /// context) is the one channel that is neither - an HTTP peer whose
+    /// initialize instructions this server cannot key on anybody - and it is
+    /// answered by [`Engine::routing_text_counted`] rather than by this: no
+    /// caller to resolve means no bullets at all rather than everybody's. The
+    /// era's own instructions channel (`server/discover`) does carry a request
+    /// context, and the `onboarding` prompt carries one too, so both are
+    /// scoped through here.
+    pub async fn routing_text_scoped(&self, scope: &crate::scope::Scope) -> Result<String> {
+        let hidden = self.hidden_for(scope).await?;
+        Ok(crystalline_core::render_instructions(
+            &self.routing_output(&hidden),
+        ))
     }
 
     // --- browse --------------------------------------------------------------
@@ -5291,10 +6827,18 @@ impl Engine {
     /// it selects within the cap rather than across the whole folder. The tree
     /// is a navigation aid; a folder too big to draw is what the paged listing
     /// is for.
-    pub async fn browse_domain(&self, p: &BrowseParams) -> Result<Value> {
+    ///
+    /// A domain `scope` may not see is refused exactly as an unregistered one,
+    /// down to the registered set the error names.
+    pub async fn browse_domain(
+        &self,
+        p: &BrowseParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         // A domain-exists check, not a filesystem-root requirement, so a virtual
         // domain browses.
-        self.domain_entry(&p.domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        self.domain_entry_scoped(&p.domain, &hidden)?;
         let raw = p.path.clone().unwrap_or_else(|| "/".to_string());
         let prefix = folder_prefix(&raw);
         let depth = p.depth.unwrap_or(1).clamp(1, TREE_MAX_DEPTH);
@@ -5358,8 +6902,17 @@ impl Engine {
     /// Validate a domain's engrams against its schema engrams. Engram content is
     /// loaded from disk for a file domain and from the database for a virtual
     /// domain, so validation covers both kinds.
-    pub async fn validate_engrams(&self, p: &ValidateParams) -> Result<Value> {
-        let source = self.content_source(&p.domain)?;
+    ///
+    /// A domain `scope` may not see is refused as an unregistered one before
+    /// anything is listed: the report names permalinks, paths and per-engram
+    /// messages, which is a reading of the domain's contents by another route.
+    pub async fn validate_engrams(
+        &self,
+        p: &ValidateParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let schema_descs = store.list_engrams(&p.domain, None, Some("schema")).await?;
         let targets = if let Some(id) = &p.identifier {
@@ -5479,8 +7032,12 @@ impl Engine {
     ///
     /// The recording is best effort by design - see [`crate::maintenance`] -
     /// and the response is returned exactly as detection built it.
-    pub async fn evolve_engrams(&self, p: &EvolveParams) -> Result<Value> {
-        let value = self.evolve_detect(p).await?;
+    pub async fn evolve_engrams(
+        &self,
+        p: &EvolveParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let value = self.evolve_detect(p, scope).await?;
         // The swept scope is read back out of the response rather than
         // re-derived from the parameters: an unscoped call defaults to every
         // registered domain, and only the response knows which those were.
@@ -5517,7 +7074,7 @@ impl Engine {
     /// shapes the merged result. Nothing is written and nothing is remembered,
     /// so "what is left" is re-derived by calling again with the same scope.
     ///
-    /// Six details of the assembly are load-bearing, each guarding a class of
+    /// Seven details of the assembly are load-bearing, each guarding a class of
     /// silently wrong finding:
     ///
     /// - the resolved degrees are counted over the **merged** graph slices, so
@@ -5546,8 +7103,18 @@ impl Engine {
     ///   and would report claimed attachments as orphans. This is the same
     ///   split [`Engine::peer_engram_text`] makes for the move's referent
     ///   count, and the two agree on what a reference is: an `assets/` link in
-    ///   the body or the `analyzes` key, compared as exact paths.
-    pub async fn evolve_detect(&self, p: &EvolveParams) -> Result<Value> {
+    ///   the body or the `analyzes` key, compared as exact paths;
+    /// - the lead vectors reach `V301` only when a provider is installed, so
+    ///   meaning is compared on exactly the machines that compute it. A machine
+    ///   with an index full of embeddings and no provider says nothing about
+    ///   meaning rather than scoring against whatever an older model left
+    ///   behind.
+    pub async fn evolve_detect(
+        &self,
+        p: &EvolveParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
         let today = match p.today.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             Some(s) => NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
                 EngineError::Invalid(format!("today '{s}' is not an ISO date (YYYY-MM-DD)"))
@@ -5557,23 +7124,29 @@ impl Engine {
         let families = parse_families(&p.families)?;
         let rules = parse_rules(&p.rules)?;
 
-        // Every registered domain, both as the default scope and as `V102`'s
-        // idea of which `[[domain:Target]]` prefixes name a real domain.
+        // Every registered domain this caller may see, both as the default
+        // scope and as `V102`'s idea of which `[[domain:Target]]` prefixes name
+        // a real domain. Filtered on both counts deliberately: a finding names
+        // the domain, permalink and file path it fired on, and `V102`'s verdict
+        // on a cross-domain target is itself an answer about whether that
+        // domain exists.
         let mut known_domains = self.known_domain_names();
+        known_domains.retain(|name| !hidden.contains(name));
         known_domains.sort();
         known_domains.dedup();
 
-        let mut scope: Vec<String> = Vec::new();
+        let mut swept_scope: Vec<String> = Vec::new();
         if p.domains.is_empty() {
-            scope = known_domains.clone();
+            swept_scope = known_domains.clone();
         } else {
             for name in &p.domains {
                 // The same resolution every other tool uses, so an unknown name
                 // errors identically and a domain registered after startup is
-                // still found.
-                self.domain_entry(name)?;
-                if !scope.contains(name) {
-                    scope.push(name.clone());
+                // still found - and a domain this caller may not see is one of
+                // the names that errors.
+                self.domain_entry_scoped(name, &hidden)?;
+                if !swept_scope.contains(name) {
+                    swept_scope.push(name.clone());
                 }
             }
         }
@@ -5587,7 +7160,7 @@ impl Engine {
         // One domain at a time: `SweepInput` is domain-scoped (two rules are
         // domain-relative) and processing them in turn bounds the memory an
         // unscoped sweep needs to whatever the largest domain costs.
-        for name in &scope {
+        for name in &swept_scope {
             let Some(swept) = self
                 .sweep_domain(name, today, &known_domains, p.include_acknowledged)
                 .await?
@@ -5667,6 +7240,17 @@ impl Engine {
                     "evidence": f.evidence,
                     "fix": f.fix,
                 });
+                // The pair a twin row is about, which is the value an
+                // acknowledgment for it is given for and the value the ack
+                // route takes back. Only a pair-scoped rule carries it: it is
+                // the one rule that fires more than once on an engram, so it
+                // is the one whose rows a caller has to be able to tell apart.
+                // Every other rule's acknowledgment is named by the engram and
+                // the rule alone, and a column repeating what those two fields
+                // already say would cost every queue tokens for nothing.
+                if crystalline_index::is_pair_scoped(f.rule) && !f.scope.is_empty() {
+                    row["scope"] = Value::String(f.scope.clone());
+                }
                 // The acknowledgment columns ride along only when they say
                 // something, so an ordinary queue row stays the flat shape every
                 // renderer already knows.
@@ -5680,8 +7264,10 @@ impl Engine {
                 // stale row is deliberately not what the finding fires on now:
                 // the row's own evidence and fix columns say that, and the pair
                 // is what shows a reader why the acknowledgment stopped
-                // matching. Named beside `ack_note` rather than plain `scope`,
-                // which at the top level already names the swept domains.
+                // matching. Named beside `ack_note` rather than sharing the
+                // `scope` above it, because the two disagree on exactly the
+                // rows that matter - and it is this one a withdrawal names,
+                // since it is the entry the file holds.
                 if let Some(scope) = f.ack_scope.as_deref().filter(|s| !s.is_empty()) {
                     row["ack_scope"] = Value::String(scope.to_string());
                 }
@@ -5711,7 +7297,7 @@ impl Engine {
 
         Ok(json!({
             "scope": {
-                "domains": scope,
+                "domains": swept_scope,
                 "families": families.iter().map(|f| f.as_str()).collect::<Vec<_>>(),
                 "rules": rules,
                 "min_priority": p.min_priority,
@@ -5781,7 +7367,7 @@ impl Engine {
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        let (desc, _) = self.resolve(&p.identifier, Some(&p.domain)).await?;
+        let (desc, _) = self.resolve_in(&p.identifier, &p.domain).await?;
         Ok(json!({
             "domain": desc.domain,
             "permalink": desc.permalink,
@@ -5797,6 +7383,14 @@ impl Engine {
     /// which matches whatever it finds later. That is the honest reading of
     /// "acknowledge this before it appears".
     ///
+    /// **A caller that names the pair gets that pair**, which is what
+    /// [`EditParams::ack_scope`] carries. It is honoured for a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule and ignored for
+    /// every other, whose acknowledgment answers for the engram and so has
+    /// nothing to choose between; and it is checked rather than trusted, by
+    /// [`Engine::named_scope`]. So detection still runs on this path - it just
+    /// validates a request instead of resolving one.
+    ///
     /// A removal needs none of that: it names an entry that is already on the
     /// engram, so it travels to the text edit as the rule id alone and the
     /// filtering happens there, under the lock, against what the file holds.
@@ -5809,16 +7403,62 @@ impl Engine {
         Ok(match Self::ack_intent(p)? {
             None => None,
             Some(AckIntent::Remove { rule }) => Some(AckDraft::Remove(rule)),
-            Some(AckIntent::Record { rule, note }) => Some(AckDraft::Record(EvolveAck {
-                scope: self
-                    .firing_scope(&desc.domain, &desc.permalink, &rule)
-                    .await?,
-                rule,
-                note,
-                by: actor.to_string(),
-                at: Some(now_offset()),
-            })),
+            Some(AckIntent::Record { rule, note }) => {
+                let named = p
+                    .ack_scope
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
+                let scope = match named {
+                    Some(named) => Some(
+                        self.named_scope(&desc.domain, &desc.permalink, &rule, named)
+                            .await?,
+                    ),
+                    None => {
+                        self.firing_scope(&desc.domain, &desc.permalink, &rule)
+                            .await?
+                    }
+                };
+                Some(AckDraft::Record(EvolveAck {
+                    scope,
+                    rule,
+                    note,
+                    by: actor.to_string(),
+                    at: Some(now_offset()),
+                }))
+            }
         })
+    }
+
+    /// `named` back, once detection confirms `rule` is really firing on
+    /// `permalink` for it. The refusal is the point: an acknowledgment is a
+    /// record that somebody read a finding and ruled it intentional, so one
+    /// given for evidence no sweep can see is a claim about nothing.
+    ///
+    /// What it protects against is a queue read too long ago. Two twin
+    /// findings on one engram differ only by their pair, so a page still
+    /// showing yesterday's rows would otherwise silence a pair its reader
+    /// never saw, with their note on it - the exact confusion the pair is
+    /// carried to prevent.
+    ///
+    /// Compared as the whole string, because a scope **is** one value: the
+    /// sweep sorts and joins its parts before it renders one, so two callers
+    /// naming the same pair send the same bytes, and a pair that gained a
+    /// member is a different scope rather than a near miss.
+    async fn named_scope(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+        named: &str,
+    ) -> Result<String> {
+        let firing = self.firing_findings(domain, permalink, rule).await?;
+        if firing.iter().any(|f| f.scope == named) {
+            return Ok(named.to_string());
+        }
+        Err(EngineError::Invalid(format!(
+            "no {rule} finding on '{permalink}' for '{named}'; re-read the queue and acknowledge a row it still shows"
+        )))
     }
 
     /// What `rule` is currently firing on `permalink` for, as the scope an
@@ -5830,12 +7470,42 @@ impl Engine {
     /// re-acknowledging a finding an older entry already silences still sees
     /// the evidence it fires on and records the current scope rather than
     /// dropping to a scope-less entry.
+    ///
+    /// **The unacknowledged finding wins when the rule fires more than once
+    /// here**, which only the pair-scoped rule does
+    /// ([`crystalline_index::is_pair_scoped`]): an engram that twins two others
+    /// carries two `V301` findings and neither one is "the" finding. Taking
+    /// the first row every time made the second acknowledgment re-record the
+    /// pair the first already covered, so the other pair could never be
+    /// acknowledged at all. With every pair acknowledged the first row wins
+    /// again, which is what makes a re-acknowledgment update a note in place.
     async fn firing_scope(
         &self,
         domain: &str,
         permalink: &str,
         rule: &str,
     ) -> Result<Option<String>> {
+        let firing = self.firing_findings(domain, permalink, rule).await?;
+        Ok(firing
+            .iter()
+            .find(|f| !f.acknowledged)
+            .or(firing.first())
+            .map(|f| f.scope.clone())
+            .filter(|scope| !scope.is_empty()))
+    }
+
+    /// Every finding `rule` is raising on `permalink` right now, in queue
+    /// order and with the suppressed ones included, which is what both readers
+    /// need: [`Engine::firing_scope`] to resolve a scope and
+    /// [`Engine::named_scope`] to check one. A domain that sweeps to nothing
+    /// answers with no findings rather than an error - there is no evidence
+    /// there to name.
+    async fn firing_findings(
+        &self,
+        domain: &str,
+        permalink: &str,
+        rule: &str,
+    ) -> Result<Vec<Finding>> {
         let mut known_domains = self.known_domain_names();
         known_domains.sort();
         known_domains.dedup();
@@ -5844,15 +7514,14 @@ impl Engine {
             .sweep_domain(domain, today, &known_domains, true)
             .await?
         else {
-            return Ok(None);
+            return Ok(Vec::new());
         };
         Ok(swept
             .report
             .findings
             .into_iter()
-            .find(|f| f.rule == rule && f.permalink == permalink)
-            .map(|f| f.scope)
-            .filter(|scope| !scope.is_empty()))
+            .filter(|f| f.rule == rule && f.permalink == permalink)
+            .collect())
     }
 
     /// Acknowledge a finding: record on the engram that this rule's finding was
@@ -5874,12 +7543,19 @@ impl Engine {
     /// without another lookup - the catalog is right there in the message - and
     /// an acknowledgment of a rule nobody has could not be recorded even on an
     /// engram that does exist.
+    ///
+    /// `scope` names the pair the acknowledgment is for, which only a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule has more than one
+    /// of; it is ignored for every other rule and checked rather than trusted
+    /// for that one (see [`Engine::named_scope`]). `None` leaves the choice to
+    /// the server, which is what an agent's `set_frontmatter` does.
     pub async fn acknowledge_finding_as(
         &self,
         domain: &str,
         identifier: &str,
         rule: &str,
         note: Option<&str>,
+        scope: Option<&str>,
         client: Option<&str>,
     ) -> Result<Value> {
         let screened = rule.trim().to_ascii_uppercase();
@@ -5896,6 +7572,7 @@ impl Engine {
             operation: "set_frontmatter".to_string(),
             key: Some(EVOLVE_ACK_KEY.to_string()),
             value: Some(value),
+            ack_scope: scope.map(str::to_string),
             ..EditParams::default()
         };
         let result = self.edit_engram_as(&params, client).await?;
@@ -5903,17 +7580,26 @@ impl Engine {
     }
 
     /// Withdraw an acknowledgment, leaving the engram's other entries alone.
-    /// `false` when the engram carries none for that rule, which the surface
+    /// `false` when the engram carries none this names, which the surface
     /// answers as a 404 rather than pretending a removal happened.
     ///
+    /// `scope` narrows the withdrawal to the one entry given for that pair,
+    /// and like the recording half it speaks only for a
+    /// [pair-scoped](crystalline_index::is_pair_scoped) rule: every other rule
+    /// keeps one entry, so there is nothing to narrow. `None` takes every
+    /// entry the rule has, which is the whole of it for the ten and all pairs
+    /// at once for the one.
+    ///
     /// Fluid's half of the take-back an agent asks for with the `remove
-    /// <rule-id>` value form; both filter through [`without_ack`], and they
-    /// differ only in how an entry that is not there is reported.
+    /// <rule-id>` value form; both filter through [`without_ack`]. They differ
+    /// in how an entry that is not there is reported, and in that the agent's
+    /// form names a rule and never a pair.
     pub async fn unacknowledge_finding_as(
         &self,
         domain: &str,
         identifier: &str,
         rule: &str,
+        scope: Option<&str>,
         client: Option<&str>,
     ) -> Result<bool> {
         if self.read_only {
@@ -5924,16 +7610,19 @@ impl Engine {
             return Err(EngineError::Invalid(unknown_rule_message(&rule)));
         }
         let actor = self.actor(client);
-        let (desc, source) = self.resolve(identifier, Some(domain)).await?;
+        let scope = scope
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && crystalline_index::is_pair_scoped(&rule));
+        let (desc, source) = self.resolve_in(identifier, domain).await?;
         // Checked before the write so an engram carrying no such entry answers
         // "nothing to withdraw" without a rewrite, a reindex or a touched
         // generated block.
         let current = self.load_source(&source, &desc).await?;
-        if !has_ack(&current, &rule) {
+        if !has_ack(&current, &rule, scope) {
             return Ok(false);
         }
         self.apply_source_edit(&desc, &source, None, &actor, |current| {
-            Ok(without_ack(current, &rule))
+            Ok(without_ack(current, &rule, scope))
         })
         .await?;
         Ok(true)
@@ -5997,12 +7686,29 @@ impl Engine {
             *inbound.entry(edge.to.0).or_default() += 1;
         }
 
+        // Read before the store lock is taken: the provider lives behind its
+        // own guard and the sweep has no reason to hold both.
+        let embedded = self.provider().is_some();
+
         let store = self.store.lock().await;
         let unresolved = store.unresolved_refs(domain_id).await?;
         let vocab = store.vocabulary(Some(name)).await?;
         // Metadata only, one query: the attachment rules compare paths,
         // sizes and hashes and never read a byte of any file.
         let attachments = store.list_attachments(domain_id).await?;
+        // Lead vectors for V301, only with a provider installed: without one
+        // the rule stays silent whatever a previous run left embedded, so a
+        // sweep on a machine that never embeds never speaks about meaning.
+        let mut lead_vectors: HashMap<i64, Vec<f32>> = if embedded {
+            store
+                .lead_vectors(domain_id, &self.model_id)
+                .await?
+                .into_iter()
+                .map(|lv| (lv.engram_id.0, lv.vector))
+                .collect()
+        } else {
+            HashMap::new()
+        };
         drop(store);
 
         let verify_config = domain_verify_config(&source);
@@ -6062,6 +7768,21 @@ impl Engine {
                     .map(str::to_string),
                 asset_refs: crystalline_core::find_asset_refs(&engram.body),
                 acks: ack_entries(fm),
+                // Filled in by the caller that has the store: the sweep is
+                // pure, so the lead embeddings are handed to it, never fetched
+                // from inside it. Removed rather than cloned - one engram is
+                // assembled once, and the vector is the largest field here.
+                lead_vector: lead_vectors.remove(&d.id.0),
+                // The parser's own bullets, so `V010` compares what an
+                // observation asserts rather than re-deriving it from the body.
+                observations: engram
+                    .observations
+                    .iter()
+                    .map(|o| FactObservation {
+                        line: o.line,
+                        text: o.content.clone(),
+                    })
+                    .collect(),
                 body: engram.body,
             });
         }
@@ -6078,6 +7799,12 @@ impl Engine {
             attachments,
             share: self.share_facts(name).await,
             include_acknowledged,
+            // The sweep module's own constants, never literals repeated here:
+            // the thresholds and the twin caps are one place, and nothing
+            // configures them yet. The twin caps hold an invariant the defaults
+            // satisfy and a future settings surface has to keep - the pairs
+            // retained bound the findings emitted, so `max_twin_pairs` stays
+            // above `max_twin_findings` or the cap on findings is unreachable.
             options: SweepOptions::default(),
         };
         let report = detect(&input);
@@ -6164,8 +7891,17 @@ impl Engine {
     /// Infer a Picoschema from a domain's engrams of a type. Engram content is
     /// loaded from disk for a file domain and from the database for a virtual
     /// domain.
-    pub async fn infer_schema(&self, p: &InferParams) -> Result<Value> {
-        let source = self.content_source(&p.domain)?;
+    ///
+    /// Scoped like [`Engine::validate_engrams`]: the inferred field names are
+    /// generalized out of the domain's own engrams, so a domain the caller may
+    /// not see is refused as an unregistered one.
+    pub async fn infer_schema(
+        &self,
+        p: &InferParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let source = self.content_source_scoped(&p.domain, &hidden)?;
         let store = self.store.lock().await;
         let descs = store
             .list_engrams(&p.domain, None, Some(&p.engram_type))
@@ -6197,10 +7933,51 @@ impl Engine {
     /// rather than erroring, matching the store contract, so an agent can probe a
     /// fresh domain safely. `domain` echoes the request, `null` for an all-domain
     /// sweep.
-    pub async fn vocabulary(&self, p: &VocabularyParams) -> Result<Value> {
-        let store = self.store.lock().await;
-        let vocab = store.vocabulary(p.domain.as_deref()).await?;
-        drop(store);
+    ///
+    /// Scoped: a named domain the caller may not see reports the same empty
+    /// lists an unknown one does, and an all-domain sweep covers the domains the
+    /// caller may read. Tag names and their counts are content, so a sweep that
+    /// summed a private domain into its totals would publish that domain's
+    /// vocabulary to everyone who asked for the whole picture.
+    ///
+    /// The sweep is one query per visible domain, merged by
+    /// [`crystalline_index::merge_vocabularies`], and only when something is
+    /// hidden - the store's own sweep is all-domains or one domain, with no
+    /// domain list to hand it. Every unscoped caller keeps the single query.
+    pub async fn vocabulary(
+        &self,
+        p: &VocabularyParams,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        let hidden = self.hidden_for(scope).await?;
+        let vocab = match (&p.domain, hidden.is_empty()) {
+            (_, true) => {
+                let store = self.store.lock().await;
+                store.vocabulary(p.domain.as_deref()).await?
+            }
+            (Some(domain), false) if hidden.contains(domain) => {
+                crystalline_index::Vocabulary::default()
+            }
+            (Some(domain), false) => {
+                let store = self.store.lock().await;
+                store.vocabulary(Some(domain)).await?
+            }
+            (None, false) => {
+                let names = match self.scoped_domains(&[], &hidden).await? {
+                    ScopedDomains::Only(names) => names,
+                    // `AsAsked` cannot arrive with something hidden, and
+                    // `Nothing` means there is no domain to sweep.
+                    _ => Vec::new(),
+                };
+                let store = self.store.lock().await;
+                let mut parts = Vec::with_capacity(names.len());
+                for name in &names {
+                    parts.push(store.vocabulary(Some(name)).await?);
+                }
+                drop(store);
+                crystalline_index::merge_vocabularies(parts)
+            }
+        };
         // Every count list is present unconditionally, empty when nothing is in
         // use, so a client reads a list rather than testing for a missing key.
         // Only the two advisory keys below (clusters, aliases) are omitted when
@@ -7044,6 +8821,41 @@ impl Engine {
         }
     }
 
+    /// The recorded file stamps of one or every registered file domain, keyed
+    /// by domain name and then by domain-relative path: what a caller
+    /// compares the files on disk against to tell an indexed file from one
+    /// the index has never seen. `crystalline doctor`'s orphan and unindexed
+    /// checks read it over ctl, since this daemon holds the index file itself
+    /// and a second opener would only collide with it.
+    ///
+    /// A store read, not a pure one: it upserts each domain row exactly as
+    /// [`Engine::sync_take_over`] does, because stamps are keyed by domain id
+    /// and a domain nobody has synced yet has no row to read. Nothing about
+    /// what this daemon watches, syncs or caches changes here (see
+    /// [`Engine::diagnostic_file_domains`]).
+    ///
+    /// Each entry carries the engram's mtime, size and checksum, more than a
+    /// presence check needs, because a stamp is what the index records: a
+    /// caller comparing content rather than presence should not need a second
+    /// verb for it.
+    pub async fn domain_file_stamps(&self, only: Option<&str>) -> Result<Value> {
+        let targets = self.diagnostic_file_domains(only)?;
+        let mut domains = serde_json::Map::new();
+        let store = self.store.lock().await;
+        for (name, root) in &targets {
+            let domain = store
+                .upsert_domain(name, Some(&root.to_string_lossy()), DomainKind::File)
+                .await?;
+            let stamps = store.file_stamps(domain).await?;
+            domains.insert(
+                name.clone(),
+                serde_json::to_value(&stamps).unwrap_or(Value::Null),
+            );
+        }
+        drop(store);
+        Ok(json!({ "domains": Value::Object(domains) }))
+    }
+
     /// Diagnostics for ctl `status`: per-domain stats, embedding coverage and the
     /// active full-text mode.
     pub async fn status_report(&self) -> Result<Value> {
@@ -7285,6 +9097,16 @@ impl Engine {
         }
     }
 
+    /// Ask the embed worker to pick up what a write just chunked, without
+    /// waiting for it. A write never embeds inline: the point of the worker is
+    /// that a write returns at the speed of the disk, and a virtual domain -
+    /// never watched - would otherwise sit unembedded until the self-heal
+    /// tick. With no worker wired this is a no-op, as [`Engine::request_embed`]
+    /// already is.
+    fn nudge_embed(&self) {
+        let _ = self.request_embed();
+    }
+
     // --- configure -------------------------------------------------------------
 
     /// Show, set or reset an agent-adjustable setting from the
@@ -7467,7 +9289,28 @@ impl Engine {
     /// receipt (`crystalline install`'s own memory of which harnesses are
     /// onboarded), never a caller-supplied list: provisioning targets every
     /// harness this machine has actually wired up.
-    pub async fn provision(&self, action: &ProvisionAction) -> Result<Value> {
+    pub async fn provision(
+        &self,
+        action: &ProvisionAction,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
+        // Resolved once, and used two different ways below because the two
+        // arms owe different things. `Status` is a pure read, so it must not
+        // even compute over a domain this caller may not see: the config it is
+        // given is narrowed first. `Allow`, `Deny` and `Apply` reconcile this
+        // *machine's* harnesses, and narrowing what they reconcile over would
+        // make a stranger's call retire a hidden domain's installed artifacts -
+        // worse than the disclosure it would close - so those keep the whole
+        // config and only their report is narrowed.
+        //
+        // One consequence of narrowing `Status` at the input, recorded because
+        // it is a choice rather than an accident: a hidden domain's artifacts
+        // fall out of the desired set with it, so its installed files read back
+        // as orphaned or drifted in that caller's `harnesses` counts. Numbers
+        // only - `HarnessStatus` carries no name - and the alternative is
+        // computing the harness rows over a config the caller may not see,
+        // which trades a count nobody acts on for the disclosure this closes.
+        let hidden = self.hidden_for(scope).await?;
         let install_receipt = crystalline_core::provision::install_receipt_path()
             .map_err(|e| EngineError::Internal(e.to_string()))?;
         let harnesses = crystalline_core::provision::installed_harnesses(&install_receipt);
@@ -7482,7 +9325,15 @@ impl Engine {
 
         match action {
             ProvisionAction::Status => {
-                let config = self.config.read().unwrap().clone();
+                let mut config = self.config.read().unwrap().clone();
+                // The whole of the scoping for this arm: `provision::status`
+                // walks `config.domains` and pushes one entry per registered
+                // domain whether or not it declares anything, so its report is
+                // a complete list of domain names. Subtracting first drops a
+                // hidden domain out of `domains`, `pending` and
+                // `virtual_with_decision` at once, and out of the counts that
+                // are derived from them.
+                config.domains.retain(|name, _| !hidden.contains(name));
                 let report = crystalline_core::provision::status(
                     &config,
                     &receipt_path,
@@ -7522,13 +9373,13 @@ impl Engine {
                     *file_guard = file;
                     *self.config.write().unwrap() = effective;
                 }
-                self.run_provision_apply(&receipt_path, &harnesses)
+                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
             ProvisionAction::Apply => {
                 if self.read_only {
                     return Err(EngineError::ReadOnly);
                 }
-                self.run_provision_apply(&receipt_path, &harnesses)
+                self.run_provision_apply(&receipt_path, &harnesses, &hidden)
             }
         }
     }
@@ -7536,7 +9387,12 @@ impl Engine {
     /// Reconcile every opted-in domain's declared artifacts into `harnesses`
     /// through the real system MCP runner - the shared tail of
     /// `provision`'s `Allow`, `Deny` and `Apply` arms.
-    fn run_provision_apply(&self, receipt_path: &Path, harnesses: &[HarnessKind]) -> Result<Value> {
+    fn run_provision_apply(
+        &self,
+        receipt_path: &Path,
+        harnesses: &[HarnessKind],
+        hidden: &HashSet<String>,
+    ) -> Result<Value> {
         let config = self.config.read().unwrap().clone();
         let mut mcp = crate::harness_cli::SystemMcpRunner;
         let env_domains: HashSet<&str> = self
@@ -7552,7 +9408,39 @@ impl Engine {
             &env_domains,
         )
         .map_err(|e| EngineError::Internal(e.to_string()))?;
-        Ok(apply_report_json(&report))
+        let mut value = apply_report_json(&report);
+        // The reconcile ran over the whole machine, as it must; the report goes
+        // back to one caller, so it names only the domains that caller may see.
+        // Two of the three arrays carry a domain name and both are narrowed
+        // here. `harnesses[].actions[].target` is the third and carries none -
+        // its keys are `{kind}/{rel}` built from the artifact's own filename.
+        if let Some(pending) = value["pending"].as_array_mut() {
+            pending.retain(|entry| {
+                entry["domain"]
+                    .as_str()
+                    .is_none_or(|name| !hidden.contains(name))
+            });
+        }
+        // `notices` is free prose, so it is filtered by what the prose does
+        // rather than by a field: every notice that names a domain writes it
+        // between backticks (the virtual-domain skip, the unsupported-kind
+        // skip, both collision notices, the foreign-file keep and the
+        // already-registered MCP server), so a backtick-anchored match drops
+        // exactly those and leaves a notice about a visible domain that merely
+        // happens to contain the hidden name as a substring. Anchored rather
+        // than bare on purpose: a bare match would silence a visible domain's
+        // own collision notice whenever a hidden domain's name appeared inside
+        // one of the file names it reports.
+        if let Some(notices) = value["notices"].as_array_mut() {
+            notices.retain(|notice| {
+                notice.as_str().is_none_or(|text| {
+                    !hidden
+                        .iter()
+                        .any(|name| text.contains(&format!("`{name}`")))
+                })
+            });
+        }
+        Ok(value)
     }
 
     // --- domain add (local and virtual) ---------------------------------------
@@ -7749,6 +9637,340 @@ impl Engine {
         }))
     }
 
+    /// What a caller is told when they may see a domain and may not end it.
+    ///
+    /// One sentence for both surfaces, naming who can rather than saying only
+    /// that the caller cannot: an instance admin always, and for a private
+    /// domain its owner. The owner is never named - who owns a domain is a
+    /// membership fact, and a refusal is not the place to hand it out.
+    fn removal_refusal(name: &str) -> EngineError {
+        EngineError::Forbidden(format!(
+            "unregistering domain '{name}' is for an instance admin, or for the owner of a \
+             private domain; ask an admin to remove it"
+        ))
+    }
+
+    /// What a caller is told when a removal would delete a virtual domain's
+    /// engrams and nothing said the loss was intended.
+    ///
+    /// One sentence for every surface, naming the flag in each of their
+    /// spellings, because the rule is one rule and the surfaces are three. It
+    /// speaks only about a virtual domain: a file or team domain's markdown is
+    /// never touched by a removal, so there is nothing there to confirm.
+    /// `held` is `None` when the count could not be read at all, which is a
+    /// refusal in its own right: an unreadable index is not an empty one, and
+    /// the one branch that decides whether knowledge is deleted must not read
+    /// a failure as "there was nothing there".
+    fn purge_refusal(name: &str, held: Option<i64>) -> EngineError {
+        let holding = match held {
+            Some(1) => "holding 1 engram".to_string(),
+            Some(n) => format!("holding {n} engrams"),
+            None => "whose engrams could not be counted, because the index could not be read"
+                .to_string(),
+        };
+        EngineError::ConfirmationRequired(format!(
+            "domain '{name}' is a virtual domain {holding}: its knowledge lives in the \
+             database, so unregistering it DELETES those engrams and leaves no files to \
+             re-adopt. Export or share what is worth keeping first, then repeat the removal \
+             with purge set - 'purge: true' over MCP, '?purge=true' on the JSON API, '--purge' \
+             at the command line. A file or team domain needs no purge, since a removal never \
+             touches its files."
+        ))
+    }
+
+    /// The kind a removal speaks about: three, where the registry itself knows
+    /// two.
+    ///
+    /// A team domain is a file domain carrying an origin, and for every other
+    /// purpose that distinction is the origin's business. It matters here
+    /// because the recovery differs: re-adding the FOLDER of a team domain
+    /// registers a plain local one and drops the origin, the base commit and
+    /// the team connection, so a confirmation that offered that recovery would
+    /// be telling somebody the wrong thing on the way to a destructive act.
+    fn removal_kind(entry: &DomainEntry) -> &'static str {
+        if entry.is_virtual() {
+            "virtual"
+        } else if entry.origin.is_some() {
+            "team"
+        } else {
+            "file"
+        }
+    }
+
+    /// How many engrams the index holds for `name`, refusing a virtual domain
+    /// that holds knowledge unless `purge` says the loss was intended.
+    ///
+    /// The count and the refusal come out of one read on purpose: they are the
+    /// same fact asked twice, and a preview whose count disagreed with the
+    /// refusal that follows it would be worse than either alone.
+    ///
+    /// **The KIND is the primary key of this decision, and it comes from the
+    /// config entry, which cannot fail to be read.** Only a virtual domain can
+    /// lose knowledge to a removal, so a file or team domain never reaches the
+    /// refusal at all and its count is a display value: an unreadable index
+    /// costs it nothing more than an absent number. That ordering is what keeps
+    /// this gate from failing open, and it is why the kind is tested before the
+    /// count rather than after it.
+    ///
+    /// **For a virtual domain, a count that cannot be read is a refusal.** An
+    /// error from the index is not the same fact as an empty index, and reading
+    /// it as one would delete somebody's only copy of their knowledge on the
+    /// strength of a failed query - `domain_stats` is an aggregate sweep over
+    /// every domain and can time out on a database whose targeted delete would
+    /// have succeeded, so "the clear would probably have failed too" is not an
+    /// argument a confirmation gate may rest on. With `purge` already set there
+    /// is nothing left to confirm, so the error costs the caller only the
+    /// number in the receipt.
+    ///
+    /// A `None` count for a virtual domain that COULD be read is a domain the
+    /// index has no row for, which is one nothing ever synced; it is not
+    /// knowledge to protect, since there is nothing recorded to lose. In
+    /// practice that case is unreachable for a domain a caller could be looking
+    /// at, because `domain_add_virtual` scaffolds a MANIFEST engram into the
+    /// database from the moment the domain exists.
+    async fn removal_engrams(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        purge: bool,
+    ) -> Result<RemovalCount> {
+        let store = self.store.lock().await;
+        let stats = store.domain_stats().await;
+        drop(store);
+        let counted = match &stats {
+            Ok(rows) => match rows.iter().find(|d| d.name == name) {
+                Some(row) => RemovalCount::Known(row.engrams),
+                None => RemovalCount::Absent,
+            },
+            Err(_) => RemovalCount::Unreadable,
+        };
+        // The kind first: a file or team domain loses no knowledge here, so a
+        // read that failed only costs it the number.
+        if !entry.is_virtual() {
+            return Ok(counted);
+        }
+        match (counted, purge) {
+            (RemovalCount::Unreadable, false) => return Err(Engine::purge_refusal(name, None)),
+            (RemovalCount::Unreadable, true) => {
+                // Already confirmed: the removal proceeds. Nothing is lost
+                // from the removal's own receipt, which never carried a count -
+                // the number belongs to the PREVIEW, and a preview that could
+                // not read it says so with `engrams_unknown`. What is lost is
+                // the chance to have shown the figure before the decision, and
+                // that decision was already taken. Logged rather than swallowed
+                // silently, because an index that cannot be swept is worth
+                // knowing about.
+                tracing::warn!(
+                    domain = name,
+                    error = stats
+                        .as_ref()
+                        .err()
+                        .map(|e| format!("{e:#}"))
+                        .unwrap_or_default(),
+                    "the engram count for '{name}' could not be read; the confirmed removal \
+                     proceeds without it"
+                );
+            }
+            (RemovalCount::Known(n), false) if n > 0 => {
+                return Err(Engine::purge_refusal(name, Some(n)));
+            }
+            _ => {}
+        }
+        Ok(counted)
+    }
+
+    /// Whether `name` is a domain the environment defines, as the conflict both
+    /// surfaces answer with.
+    ///
+    /// An environment-defined domain is immune to unregistration: the variable
+    /// is its source of truth, so no version of this request would succeed and
+    /// the way out is to unset the variable. Spelled once here so a preview and
+    /// the removal itself cannot word it differently.
+    fn env_domain_conflict(&self, name: &str) -> Option<EngineError> {
+        self.overlay.env_domain(name).map(|env| {
+            EngineError::Conflict(format!(
+                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
+                env.var
+            ))
+        })
+    }
+
+    /// The one gate on ending a domain, for every surface.
+    ///
+    /// Two steps, in this order and for the reason the write gate states:
+    ///
+    /// 1. **A domain this caller may not see is the not-found.** Decided first,
+    ///    so a stranger naming a private domain learns exactly what a stranger
+    ///    naming a domain nobody registered learns. A permission refusal here
+    ///    would be an existence oracle.
+    /// 2. **Then the right, which must be [`DomainRight::Own`].** That is the
+    ///    whole of Jordi's rule, and it falls out of the ladder rather than
+    ///    being restated: an instance admin owns every domain, a private
+    ///    domain's owner owns theirs, and nobody else ever reaches `Own` - a
+    ///    manager stops at `Manage`, and on a shared domain the best a
+    ///    non-admin gets is `Write`. So "owner-of-private or admin, shared
+    ///    domains admins only" is one comparison.
+    ///
+    /// [`Scope::Anonymous`] is refused by an arm of its own rather than by the
+    /// fold. The fold would refuse it too, but only because a resolver happens
+    /// to be installed; nobody in particular does not end a domain on an
+    /// instance that never made anyone authenticate either, and that is a rule
+    /// rather than a consequence.
+    ///
+    /// [`DomainRight::Own`]: crate::scope::DomainRight::Own
+    /// [`Scope::Anonymous`]: crate::scope::Scope::Anonymous
+    pub async fn require_domain_owner(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+    ) -> Result<()> {
+        self.require_domain(name, scope).await?;
+        if matches!(scope, crate::scope::Scope::Anonymous) {
+            return Err(Engine::removal_refusal(name));
+        }
+        if self.domain_right(scope, name).await? < crate::scope::DomainRight::Own {
+            return Err(Engine::removal_refusal(name));
+        }
+        Ok(())
+    }
+
+    /// What a removal would end, for a surface that asks before it acts.
+    ///
+    /// `{ domain, kind, engrams, files_kept }` - the three things somebody
+    /// needs in order to answer the question, plus the one that decides how it
+    /// is worded: a file or team domain's files stay on disk and a virtual
+    /// domain's rows ARE its knowledge.
+    ///
+    /// Every refusal the removal itself would raise is raised here first, in
+    /// the same order - the gate, the environment conflict, the unconfirmed
+    /// purge - so a question is never put about a removal that would refuse
+    /// anyway. Advisory rather than authoritative: the removal re-decides all
+    /// of it under its own lock, which is where the decision has to hold.
+    pub async fn domain_remove_preview(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+        purge: bool,
+    ) -> Result<Value> {
+        self.require_domain_owner(name, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(name) {
+            return Err(conflict);
+        }
+        let entry = self.domain_entry(name)?;
+        let engrams = self.removal_engrams(name, &entry, purge).await?;
+        Ok(json!({
+            "domain": name,
+            "kind": Engine::removal_kind(&entry),
+            "engrams": engrams.as_json(),
+            // Why the count is absent, so the question can say which: an index
+            // that could not be read is a number that exists and is
+            // unavailable, and it reads nothing like a domain that has synced
+            // nothing yet.
+            "engrams_unknown": engrams.is_unreadable(),
+            "files_kept": !entry.is_virtual(),
+        }))
+    }
+
+    /// Unregister a domain, gate and ordering included: the one entry point
+    /// every surface calls.
+    ///
+    /// [`Engine::domain_remove`] below is the registry step alone. This is the
+    /// whole of it, and the order of the four steps is not free to rearrange
+    /// (see [`crate::collab::session::CollabSessions::dispose_domain`], which
+    /// records the argument in full):
+    ///
+    /// 1. The domain-admin lock and the join fence go up, so no socket can open
+    ///    a room in this domain from here on and no registration of the same
+    ///    name can interleave. Without the fence the sweep would close what is
+    ///    open and a join arriving one instant later would open a fresh room
+    ///    over a domain that is about to vanish.
+    /// 2. Every refusal is decided **inside** those guards: the gate
+    ///    ([`Engine::require_domain_owner`]), the environment conflict, and the
+    ///    unconfirmed purge of a virtual domain's engrams. That ordering is the
+    ///    point of holding the lock at all - a gate decided outside it is a
+    ///    check somebody's ownership transfer can land behind - and it is what
+    ///    makes the preview above advisory rather than authoritative.
+    /// 3. The rooms are swept while the domain is STILL registered, so each
+    ///    room's final save lands in the file that stays on disk.
+    /// 4. Only then is the domain unregistered, and only then are its
+    ///    visibility and membership records swept.
+    ///
+    /// **The records go last, and that direction is deliberate.** They live in
+    /// the accounts database and the registration lives in the config file, so
+    /// there is no transaction spanning both and there cannot be one. Sweeping
+    /// first and then failing the unregistration would leave a domain that is
+    /// still registered and now SHARED - visible to everyone, the opposite of
+    /// what its owner asked for. Failing the other way round leaves an acl row
+    /// for a domain nobody has registered, which grants nothing until a domain
+    /// of that name exists again; it is logged, and the residue is that a later
+    /// re-add of the same name comes back private under the old owner rather
+    /// than shared. That is the safe direction, and it is the same shape as the
+    /// store's own domain row, which [`Engine::domain_remove`] also leaves in
+    /// place.
+    ///
+    /// The report is [`Engine::domain_remove`]'s plus `rooms_closed`, so a
+    /// client can say how many co-editing sessions it just ended.
+    pub async fn unregister_domain(
+        &self,
+        name: &str,
+        scope: &crate::scope::Scope,
+        purge: bool,
+    ) -> Result<Value> {
+        // Ahead of the guards, and only this one: its answer is the same for
+        // every caller and every name, so it discloses nothing and there is
+        // nothing for a concurrent change to move.
+        if self.read_only {
+            return Err(EngineError::ReadOnly);
+        }
+        let _admin = self.domain_admin().await;
+        let _fence = self.fence_joins().await;
+        self.require_domain_owner(name, scope).await?;
+        if let Some(conflict) = self.env_domain_conflict(name) {
+            return Err(conflict);
+        }
+        // Before the sweep, not after: a removal that is going to refuse must
+        // not have closed somebody's co-editing room on the way to refusing.
+        let entry = self.domain_entry(name)?;
+        self.removal_engrams(name, &entry, purge).await?;
+        let rooms_closed = match self.collab.get().and_then(std::sync::Weak::upgrade) {
+            Some(sessions) => sessions.dispose_domain(name).await,
+            None => 0,
+        };
+        let mut report = self.domain_remove(name).await?;
+        self.forget_domain_records(name).await;
+        if let Value::Object(map) = &mut report {
+            map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
+        }
+        Ok(report)
+    }
+
+    /// Retire the visibility and membership records of a domain that is no
+    /// longer registered.
+    ///
+    /// Best effort, and deliberately not a failure of the removal it follows:
+    /// by the time this runs the domain is gone, and answering with an error
+    /// would tell the caller their removal did not happen when it did. A
+    /// failure is logged and the residue is documented on
+    /// [`Engine::unregister_domain`].
+    ///
+    /// A no-op on an engine with no resolver installed, which is every
+    /// installation with no accounts database: privacy is a membership record,
+    /// and a machine with no accounts has none.
+    async fn forget_domain_records(&self, name: &str) {
+        let Some(access) = self.domain_access.get() else {
+            return;
+        };
+        if let Err(e) = access.forget_domain(name).await {
+            tracing::warn!(
+                domain = name,
+                error = format!("{e:#}"),
+                "domain '{name}' was unregistered but its visibility and membership records \
+                 could not be cleared; a domain later re-added under this name will come back \
+                 private under its old owner until an admin makes it shared"
+            );
+        }
+    }
+
     /// Unregister a domain: the config entry goes, the watcher and discovery
     /// forget it and its index rows are cleared so search stops serving it.
     /// Files are never touched - for a file domain they stay on disk exactly
@@ -7771,11 +9993,26 @@ impl Engine {
     /// its freshly-indexed rows wiped by this call's tail, since both resolve
     /// the same `DomainId` by name. Closing this needs the add verbs to take
     /// the same per-name lock this verb would need to hold across its own
-    /// tail, which is a cross-verb change out of scope here; a caller that
-    /// cannot tolerate the window should serialize admin mutations for a
-    /// given name at its own layer - which the REST surface does, in
-    /// `RestState::domain_admin`: one mutex held across the whole of a create
-    /// and the whole of an unregister.
+    /// tail, which is a cross-verb change out of scope here.
+    ///
+    /// [`Engine::domain_admin`] narrows the window without closing it, and it
+    /// is worth being exact about which half. [`Engine::unregister_domain`] -
+    /// the entry point every surface goes through - holds it across this whole
+    /// call, and the REST create holds it across its own registration, so those
+    /// two cannot interleave whichever surface each arrives on. The bare
+    /// `domain_add_local`, `domain_add_virtual` and `origin_add` verbs take no
+    /// lock at all, so an add reaching the engine directly can still race a
+    /// removal for the same name. That is the residue above, and it is the same
+    /// residue as before the lock moved onto this type; what changed is that
+    /// the lock is no longer one surface's, so it no longer leaves a second
+    /// surface's callers unserialized against each other.
+    ///
+    /// **This is the registry step alone.** [`Engine::unregister_domain`] is
+    /// the entry point: it decides who may end a domain, raises the join fence,
+    /// sweeps the co-editing rooms and retires the domain's visibility records
+    /// around this call. Reaching for this one directly skips all of that; the
+    /// only caller that does so on purpose is the REST create's rollback, which
+    /// already holds the lock the entry point would take.
     pub async fn domain_remove(&self, name: &str) -> Result<Value> {
         if self.read_only {
             return Err(EngineError::ReadOnly);
@@ -8156,11 +10393,16 @@ impl Engine {
     /// never aborts the others, each per-domain failure is collected into the
     /// `errors` array instead. Allowed on a read-only instance: a pull is a
     /// derived-truth update like sync, not a user-authored content write.
-    pub async fn origin_update(&self, domain: Option<&str>) -> Result<Value> {
+    pub async fn origin_update(
+        &self,
+        domain: Option<&str>,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
-        let targets = self.origin_targets(domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
 
         let mut domains = Vec::new();
         let mut errors = Vec::new();
@@ -8365,17 +10607,30 @@ impl Engine {
     /// filesystem root) never aborts the others: it is collected into the
     /// `errors` array instead, mirroring `origin_update`. Allowed on a
     /// read-only instance (a pure read).
-    pub async fn origin_status(&self, domain: Option<&str>) -> Result<Value> {
+    ///
+    /// `detail` names the unshared work instead of only counting it: each
+    /// domain entry then carries a `detail` block grouping the changed paths
+    /// by kind (see [`origin::local_change_detail`]). It is opt-in because it
+    /// costs a second walk of every domain's working tree, so `local_changes`
+    /// stays the bare count for every caller that only wants to know whether
+    /// there is anything to share.
+    pub async fn origin_status(
+        &self,
+        domain: Option<&str>,
+        detail: bool,
+        scope: &crate::scope::Scope,
+    ) -> Result<Value> {
         if !self.config.read().unwrap().github_enabled() {
             return Err(RemoteError::NotEnabled.into());
         }
-        let targets = self.origin_targets(domain)?;
+        let hidden = self.hidden_for(scope).await?;
+        let targets = self.origin_targets(domain, &hidden)?;
         let connection = self.origin_status_connection().await?;
 
         let mut domains = Vec::new();
         let mut errors = Vec::new();
         for (name, entry) in targets {
-            match self.origin_status_one(&name, &entry).await {
+            match self.origin_status_one(&name, &entry, detail).await {
                 Ok(v) => domains.push(v),
                 Err(e) => errors.push(json!({ "domain": name, "error": e.to_string() })),
             }
@@ -8406,7 +10661,18 @@ impl Engine {
     /// instance-credential write the wave promises never happens, so permission
     /// is withheld and the debt stays recorded until the next share, amend or
     /// withdrawal pays it off on the acting identity's own credential.
-    async fn origin_status_one(&self, name: &str, entry: &DomainEntry) -> Result<Value> {
+    ///
+    /// `detail` is threaded through both arms on purpose. The retry arm is the
+    /// offline one, and offline is exactly when a caller cannot look the change
+    /// list up anywhere else, so a status that degrades to local state still
+    /// names what is unshared rather than dropping the one answer it can still
+    /// give from the working tree alone.
+    async fn origin_status_one(
+        &self,
+        name: &str,
+        entry: &DomainEntry,
+        detail: bool,
+    ) -> Result<Value> {
         let lock = self.origin_lock(name);
         let _guard = lock.lock().await;
         let (spec, root, state_dir) = self.origin_spec_for(name, entry)?;
@@ -8417,8 +10683,18 @@ impl Engine {
             let config = self.config.read().unwrap();
             config.github_stacks() && config.github_share_identity() == ShareIdentityMode::Instance
         };
+        let change_detail = || {
+            detail
+                .then(|| origin::local_change_detail(&root, &state_dir))
+                .flatten()
+        };
         match ops::status(&spec, &root, &state_dir, probe.as_deref(), settle_owed_link).await {
-            Ok(report) => Ok(origin::status_report_json(name, &report, None)),
+            Ok(report) => Ok(origin::status_report_json(
+                name,
+                &report,
+                None,
+                change_detail(),
+            )),
             Err(e) if probe.is_some() && origin::is_probe_transport_error(&e) => {
                 // AuthExpired is one of the transport errors this arm catches
                 // (see `origin::is_probe_transport_error`), so a probe that
@@ -8431,6 +10707,7 @@ impl Engine {
                     name,
                     &report,
                     Some(e.to_string()),
+                    change_detail(),
                 ))
             }
             Err(e) => Err(e.into()),
@@ -8484,7 +10761,9 @@ impl Engine {
             }
             return;
         }
-        let Ok(targets) = self.origin_targets(None) else {
+        // The poller is the machine itself rather than a caller, so nothing is
+        // subtracted: it polls every origin this daemon hosts.
+        let Ok(targets) = self.origin_targets(None, &HashSet::new()) else {
             return;
         };
         let github_poll_secs = self
@@ -8618,7 +10897,11 @@ impl Engine {
     async fn origins_status_block(&self) -> Value {
         let (connected, token_store) = self.origin_connection_offline();
         let rate_limit_wait_until = self.origin_poller.rate_limited_until();
-        let targets = self.origin_targets(None).unwrap_or_default();
+        // `status`'s own block, which the CLI and the control socket read: the
+        // machine owner, so nothing is subtracted.
+        let targets = self
+            .origin_targets(None, &HashSet::new())
+            .unwrap_or_default();
 
         let mut domains = Vec::new();
         for (name, entry) in targets {
@@ -9107,10 +11390,25 @@ impl Engine {
     /// (erroring if it is not registered or has no origin) or every
     /// registered domain with an origin, mirroring `sync_targets`'s
     /// config-then-discovered layering.
-    fn origin_targets(&self, domain: Option<&str>) -> Result<Vec<(String, DomainEntry)>> {
+    ///
+    /// `hidden` is the caller's own set of domains it may not see, and it binds
+    /// both arms. A named one is refused exactly as an unregistered one, with
+    /// the registered list in the error filtered to what this caller may see.
+    /// The unnamed arm - "every domain with an origin" - drops them, which is
+    /// the whole of what makes the aggregate form safe: without it a stranger
+    /// asking for the standing of "every shared domain" is handed a private
+    /// team domain's name, its open proposals and its conflicts, and
+    /// `origin_update` additionally pulls into it. Every machine-owner caller
+    /// (the CLI, the control socket, the poller, the status block) passes an
+    /// empty set, which is the answer they would resolve to anyway.
+    fn origin_targets(
+        &self,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<Vec<(String, DomainEntry)>> {
         match domain {
             Some(name) => {
-                let entry = self.domain_entry(name)?;
+                let entry = self.domain_entry_scoped(name, hidden)?;
                 if entry.origin.is_none() {
                     return Err(EngineError::Invalid(format!(
                         "domain '{name}' has no origin; connect it with `crystalline domain add --origin`"
@@ -9122,7 +11420,7 @@ impl Engine {
                 let mut out: Vec<(String, DomainEntry)> = Vec::new();
                 let config = self.config.read().unwrap();
                 for (name, entry) in &config.domains {
-                    if entry.origin.is_some() {
+                    if entry.origin.is_some() && !hidden.contains(name) {
                         out.push((name.clone(), entry.clone()));
                     }
                 }
@@ -9130,7 +11428,7 @@ impl Engine {
                     if config.domains.contains_key(name) {
                         continue;
                     }
-                    if entry.origin.is_some() {
+                    if entry.origin.is_some() && !hidden.contains(name) {
                         out.push((name.clone(), entry.clone()));
                     }
                 }
@@ -9398,9 +11696,10 @@ impl Engine {
     /// The personal identity name a write runs under, in personal mode.
     ///
     /// The machine owner has no account to be, so it gets the one fixed local
-    /// name; an account is itself; an HTTP-MCP agent is whoever
-    /// `github.agent_identity` names, or a refusal that says which setting to
-    /// write.
+    /// name; an account is itself, whether it signed in to Fluid or
+    /// authenticated an MCP session; an unauthenticated HTTP-MCP agent is
+    /// whoever `github.agent_identity` names, or a refusal that says which
+    /// setting to write.
     fn acting_identity_name(
         &self,
         actor: &ShareActor,
@@ -9743,20 +12042,21 @@ impl Engine {
     }
 
     /// [`Engine::pending_view`] for one identity.
+    ///
+    /// `expires_in_secs` is what is LEFT of the code's life, not the flow's
+    /// original expiry: a caller that polls sees the number fall, which is
+    /// what tells a person (or a model relaying to one) that the flow is
+    /// alive rather than wedged. It saturates at 0 rather than going
+    /// negative; a code whose clock has run out stays reported until the
+    /// background task lands its own expiry error, which is the outcome that
+    /// clears the slot.
     fn pending_view_for(&self, identity: &TokenIdentity) -> Option<Value> {
         self.pending_connect
             .lock()
             .unwrap()
             .as_ref()
             .filter(|p| p.identity == *identity)
-            .map(|p| {
-                json!({
-                    "pending": true,
-                    "user_code": p.user_code,
-                    "verification_url": p.verification_url,
-                    "expires_in_secs": p.expires_in_secs,
-                })
-            })
+            .map(PendingConnect::view)
     }
 
     /// Takes the pending INSTANCE flow's outcome if it has landed, clearing
@@ -9786,6 +12086,20 @@ impl Engine {
         landed
     }
 
+    /// The stored guidance for `identity`'s pending flow, read without
+    /// taking anything. Called BEFORE [`Engine::take_finished_pending_for`]
+    /// on the same identity: that call clears the slot the guidance lives
+    /// on, so a caller that wants both the outcome and the guidance it
+    /// landed with has to read this one first.
+    fn pending_next_steps_for(&self, identity: &TokenIdentity) -> Option<String> {
+        self.pending_connect
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|p| p.identity == *identity)
+            .map(|p| p.next_steps.clone())
+    }
+
     /// Drops a pending flow belonging to `identity`, leaving another
     /// identity's alone. What a connect that settles the same credential by
     /// another route (a pasted token) and a disconnect both do: the flow in
@@ -9803,9 +12117,21 @@ impl Engine {
     /// user reports `pending_connect`; one that landed since the last call
     /// is reported here exactly once and the slot is cleared - a successful
     /// sign-in folds into `connected`/`user`, while an expired or declined
-    /// one surfaces as an error (its message is already actionable) instead
-    /// of being silently swallowed.
+    /// one is built from [`Engine::origin_connection_json`] the same way the
+    /// success case is, so a re-connect attempt on an instance that already
+    /// has a working credential still reports `connected: true` and that
+    /// credential's `user`/`token_store` - with `error` and `next_steps` (the
+    /// guidance the flow started with, see [`Engine::pending_next_steps_for`])
+    /// added beside them, telling the caller to connect again and click
+    /// Authorize this time, rather than surfacing a bare error a model has
+    /// nothing to act on.
     async fn configure_connection_block(&self) -> Result<Value> {
+        // Read before `take_finished_pending` below, which clears the very
+        // slot this comes from: an outcome cannot land without a
+        // `PendingConnect` first existing for the same identity, so the
+        // `unwrap_or_default` a few lines down is unreachable in practice -
+        // kept only so a landed outcome can never itself fail this call.
+        let landed_guidance = self.pending_next_steps_for(&TokenIdentity::Instance);
         if let Some(outcome) = self.take_finished_pending() {
             return match outcome {
                 Ok(_user) => {
@@ -9813,7 +12139,16 @@ impl Engine {
                     github["pending_connect"] = Value::Null;
                     Ok(github)
                 }
-                Err(e) => Err(e.into()),
+                Err(e) => {
+                    let mut github = self.origin_connection_json().await?;
+                    github["pending_connect"] = Value::Null;
+                    github["error"] = json!(e.to_string());
+                    github["next_steps"] = json!(Self::retry_guidance(
+                        &e,
+                        landed_guidance.as_deref().unwrap_or_default()
+                    ));
+                    Ok(github)
+                }
             };
         }
         if let Some(view) = self.pending_view() {
@@ -9827,6 +12162,39 @@ impl Engine {
         let mut github = self.origin_connection_json().await?;
         github["pending_connect"] = Value::Null;
         Ok(github)
+    }
+
+    /// What to tell the caller after a device flow lands as a failure: retry
+    /// wording that names the reason distinctly for an expired code versus a
+    /// declined one where the outcome can tell them apart, falling back to a
+    /// generic reason otherwise, followed by `landed_guidance` (the same
+    /// confirmation guidance the flow started with, so the authorized-apps
+    /// url and the Authorize reminder are never phrased twice). Its only
+    /// caller is [`Engine::configure_connection_block`] right above; kept as
+    /// an associated function (it needs no `self`) rather than a free one so
+    /// it stays beside that caller.
+    fn retry_guidance(e: &RemoteError, landed_guidance: &str) -> String {
+        let reason = match e {
+            RemoteError::AuthExpired => "the code expired before it was authorized",
+            // `poll_device_flow_once` (crates/remote/src/github/auth.rs) maps
+            // GitHub's `access_denied` to exactly this status and message; a
+            // 403 from elsewhere in the same background task
+            // (validate_token, an enterprise SAML/token restriction) is a 403
+            // too, so the message is matched as well as the status rather
+            // than assuming every 403 here is a declined device-flow
+            // confirmation.
+            RemoteError::Api {
+                status: 403,
+                message,
+            } if message.as_str() == "the sign-in was declined on GitHub" => {
+                "the sign-in was declined on GitHub"
+            }
+            _ => "the sign-in did not complete",
+        };
+        format!(
+            "{reason}. Call configure with connect \"github\" again to start a new sign-in, \
+             and this time click Authorize on the page after the code. {landed_guidance}"
+        )
     }
 
     /// The token-store host this connect targets: `github.api_url`'s bare
@@ -10003,12 +12371,16 @@ impl Engine {
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan(token_host.as_deref())?;
-        plan.save(&StoredToken {
-            access_token: token.to_string(),
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user: user.clone(),
-            created_at: chrono::Utc::now(),
-        })?;
+        save_off_runtime(
+            plan,
+            StoredToken {
+                access_token: token.to_string(),
+                host: token_host.unwrap_or_else(|| "github.com".to_string()),
+                user: user.clone(),
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await?;
         self.clear_pending_for(&TokenIdentity::Instance);
 
         let mut github = self.origin_connection_json().await?;
@@ -10030,7 +12402,13 @@ impl Engine {
     /// the flow, never blocking on the user confirming the code. Refuses up
     /// front, before starting anything, when `CRYSTALLINE_GITHUB_TOKEN` is
     /// set: this machine's identity is already fixed by the environment.
-    pub async fn start_device_connect(&self, host: Option<&str>) -> Result<Value> {
+    ///
+    /// `restart` abandons a sign-in already pending and starts a fresh code,
+    /// for the person who never saw the first one or let it go stale. Without
+    /// it a second call reports the outstanding code as before, now with one
+    /// sentence naming `restart` so the way out is in the response rather
+    /// than in somebody's memory.
+    pub async fn start_device_connect(&self, host: Option<&str>, restart: bool) -> Result<Value> {
         if self.overlay.github_token().is_some() {
             return Err(EngineError::EnvTokenConnect);
         }
@@ -10038,10 +12416,18 @@ impl Engine {
             return Err(EngineError::ReadOnly);
         }
         let Some(view) = self
-            .begin_device_flow(&TokenIdentity::Instance, host)
+            .begin_device_flow(&TokenIdentity::Instance, host, restart)
             .await?
         else {
-            let github = self.configure_connection_block().await?;
+            let mut github = self.configure_connection_block().await?;
+            // The code is the one already outstanding, so say how to give up
+            // on it. Only on this branch: the sentence is about a SECOND
+            // connect call, and repeating it on a first one would advertise
+            // abandoning a code the caller has not even relayed yet.
+            if let Some(next_steps) = github["pending_connect"]["next_steps"].as_str() {
+                let extended = format!("{next_steps} {RESTART_SENTENCE}");
+                github["pending_connect"]["next_steps"] = json!(extended);
+            }
             return self.configure_snapshot_with(github);
         };
 
@@ -10073,14 +12459,52 @@ impl Engine {
     /// saved and every status reads the store, so the only thing dropped is an
     /// unread error line for a flow nobody came back to look at - and the slot
     /// is taken over.
+    ///
+    /// `restart` is the escape hatch for the one case that used to have none:
+    /// a flow whose code the person lost, or never saw, with a slot that only
+    /// ever answered with that same unusable code. With it set, this identity's
+    /// pending flow is ABANDONED - its background task aborted and its record
+    /// dropped, so the fresh `outcome` slot below cannot be written by the old
+    /// task - and a new sign-in is started. It abandons only this identity's
+    /// flow: another identity's still refuses with
+    /// [`EngineError::ConnectInProgress`], since a restart is a statement
+    /// about one's own sign-in, never a licence to cancel somebody else's.
     async fn begin_device_flow(
         &self,
         identity: &TokenIdentity,
         host: Option<&str>,
+        restart: bool,
     ) -> Result<Option<Value>> {
         {
             let mut guard = self.pending_connect.lock().unwrap();
             match guard.as_ref() {
+                // A landed outcome is not a flow to abandon, so the
+                // restart arm asks for one that is still running. Without
+                // that, `restart: true` against a sign-in that already
+                // finished threw away its one-shot report and answered with a
+                // fresh code beside `connected: true`. Falling through to the
+                // arm below instead answers `None`, which is what makes the
+                // caller's status read drain the outcome and say what
+                // happened; the slot is clear afterwards, so a second restart
+                // starts fresh.
+                Some(p)
+                    if p.identity == *identity
+                        && restart
+                        && p.outcome.lock().unwrap().is_none() =>
+                {
+                    // Abort first, then drop: the task stops at its next poll
+                    // and the record it would have written into is gone
+                    // either way, since the fresh flow below builds its own
+                    // outcome slot.
+                    if let Some(handle) = &p.abort {
+                        handle.abort();
+                    }
+                    tracing::info!(
+                        identity = %identity_label(identity),
+                        "github device sign-in abandoned on request; starting a fresh code"
+                    );
+                    *guard = None;
+                }
                 Some(p) if p.identity == *identity => return Ok(None),
                 Some(p) if p.outcome.lock().unwrap().is_some() => *guard = None,
                 Some(_) => return Err(EngineError::ConnectInProgress),
@@ -10091,50 +12515,123 @@ impl Engine {
         let api_url = self.connect_api_url(host);
         let auth_base = crystalline_remote::github::auth::auth_base(api_url.as_deref());
         let client_id = self.oauth_client_id();
-        let start = self
-            .connect_auth
-            .start_device_flow(&auth_base, &client_id)
-            .await?;
-
-        let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
-            Arc::new(std::sync::Mutex::new(None));
-        let pending = PendingConnect {
-            identity: identity.clone(),
-            user_code: start.user_code.clone(),
-            verification_url: start.verification_url.clone(),
-            expires_in_secs: start.expires_in_secs,
-            outcome: outcome_slot.clone(),
-        };
-        let view = json!({
-            "pending": true,
-            "user_code": pending.user_code,
-            "verification_url": pending.verification_url,
-            "expires_in_secs": pending.expires_in_secs,
-        });
-        *self.pending_connect.lock().unwrap() = Some(pending);
-
-        let auth = self.connect_auth.clone();
+        let label = identity_label(identity);
+        // Where this identity's token will be saved, resolved BEFORE anything
+        // is started. It is fallible, and it used to run after the pending
+        // record was already in the slot, which left a failure holding a slot
+        // with no task in it. Resolved here, a failure costs nothing at all:
+        // no code has been asked for and no record exists.
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(identity, token_host.as_deref())?;
-        tokio::spawn(async move {
-            let result: std::result::Result<String, RemoteError> = async {
-                let access_token = auth.run_device_flow(&auth_base, &client_id, &start).await?;
+        let start = match self
+            .connect_auth
+            .start_device_flow(&auth_base, &client_id)
+            .await
+        {
+            Ok(start) => start,
+            Err(e) => {
+                tracing::warn!(
+                    identity = %label,
+                    step = "start",
+                    error = %e,
+                    "github device sign-in could not be started"
+                );
+                return Err(e.into());
+            }
+        };
+        tracing::info!(
+            identity = %label,
+            user_code = %start.user_code,
+            expires_in_secs = start.expires_in_secs,
+            "github device sign-in started",
+        );
+
+        let next_steps = crystalline_remote::github::auth::confirmation_guidance(&auth_base);
+        let outcome_slot: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        let auth = self.connect_auth.clone();
+        let task_label = label.clone();
+        // Cloned for the record below, which is now built after the spawn: the
+        // task owns the poll's copy of the start and the outcome slot.
+        let user_code = start.user_code.clone();
+        let verification_url = start.verification_url.clone();
+        let expires_in_secs = start.expires_in_secs;
+        let record_slot = outcome_slot.clone();
+        let task = tokio::spawn(async move {
+            let result: std::result::Result<String, (&'static str, RemoteError)> = async {
+                let access_token = auth
+                    .run_device_flow(&auth_base, &client_id, &start)
+                    .await
+                    .map_err(|e| ("poll", e))?;
+                tracing::info!(
+                    identity = %task_label,
+                    "github device sign-in: access token received from GitHub"
+                );
                 let user = auth
                     .validate_token(api_url.as_deref(), &access_token)
-                    .await?;
-                plan.save(&StoredToken {
+                    .await
+                    .map_err(|e| ("validate", e))?;
+                tracing::info!(
+                    identity = %task_label,
+                    login = %user,
+                    "github device sign-in: token validated"
+                );
+                let stored = StoredToken {
                     access_token,
                     host: token_host
                         .clone()
                         .unwrap_or_else(|| "github.com".to_string()),
                     user: user.clone(),
                     created_at: chrono::Utc::now(),
-                })?;
+                };
+                // The save touches the OS keychain, which is a blocking call
+                // with a bound but no cancellation: off the runtime's worker
+                // it goes, so a slow keychain cannot stall unrelated work.
+                save_off_runtime(plan, stored)
+                    .await
+                    .map_err(|e| ("save", e))?;
                 Ok(user)
             }
             .await;
+            let result = match result {
+                Ok(user) => Ok(user),
+                Err((step, e)) => {
+                    tracing::warn!(
+                        identity = %task_label,
+                        step,
+                        error = %e,
+                        "github device sign-in failed"
+                    );
+                    Err(e)
+                }
+            };
             *outcome_slot.lock().unwrap() = Some(result);
         });
+
+        // The record is built and inserted AFTER the task, complete, under one
+        // lock. It used to be inserted first and have its abort handle written
+        // back under a second acquisition, which left a window: two concurrent
+        // restarts of the same identity could store the first task's handle on
+        // the second record, and a later restart would then abort a task that
+        // was already dead while a live one kept polling GitHub. One
+        // acquisition, one whole record, no window.
+        let pending = PendingConnect {
+            identity: identity.clone(),
+            user_code,
+            verification_url,
+            expires_in_secs,
+            started_at: tokio::time::Instant::now(),
+            next_steps: next_steps.clone(),
+            outcome: record_slot,
+            abort: Some(task.abort_handle()),
+        };
+        // The view comes from the record in hand rather than from a read-back
+        // of the slot. A `clear_pending_for` landing in that window - a pasted
+        // token, a disconnect - made the read-back answer `None`, and a flow
+        // that HAD started was then reported as no flow at all.
+        let view = pending.view();
+        *self.pending_connect.lock().unwrap() = Some(pending);
         Ok(Some(view))
     }
 
@@ -10207,12 +12704,16 @@ impl Engine {
             .await?;
         let token_host = origin::token_host(api_url.as_deref());
         let plan = self.github_save_plan_for(&identity, token_host.as_deref())?;
-        plan.save(&StoredToken {
-            access_token: token.to_string(),
-            host: token_host.unwrap_or_else(|| "github.com".to_string()),
-            user,
-            created_at: chrono::Utc::now(),
-        })?;
+        save_off_runtime(
+            plan,
+            StoredToken {
+                access_token: token.to_string(),
+                host: token_host.unwrap_or_else(|| "github.com".to_string()),
+                user,
+                created_at: chrono::Utc::now(),
+            },
+        )
+        .await?;
         // A pasted token settles this identity now, so a device flow of this
         // person's still in flight must not land on top of it later.
         self.clear_pending_for(&identity);
@@ -10226,13 +12727,20 @@ impl Engine {
     ///
     /// One sign-in at a time across the whole engine: a second account's
     /// connect while this one runs is [`EngineError::ConnectInProgress`], and
-    /// the same account asking again reports the code already outstanding.
-    pub async fn start_github_identity_device_flow(&self, account: &str) -> Result<GithubIdentity> {
+    /// the same account asking again reports the code already outstanding -
+    /// unless `restart` is set, which abandons this account's own pending
+    /// flow and issues a fresh code. A restart never touches another
+    /// identity's flow; that is still refused.
+    pub async fn start_github_identity_device_flow(
+        &self,
+        account: &str,
+        restart: bool,
+    ) -> Result<GithubIdentity> {
         let identity = personal_identity(account)?;
         if self.read_only {
             return Err(EngineError::ReadOnly);
         }
-        self.begin_device_flow(&identity, None).await?;
+        self.begin_device_flow(&identity, None, restart).await?;
         self.github_identity_status(account).await
     }
 
@@ -10395,6 +12903,14 @@ fn context_rank(slice: &GraphSlice, seed_ids: &HashSet<i64>) -> HashMap<i64, f64
     ids.into_iter().zip(rank).collect()
 }
 
+/// What a second connect call adds to the outstanding flow's guidance: the
+/// way to give up on a code the person cannot use. Appended only on that
+/// branch (see [`Engine::start_device_connect`]), so a first connect never
+/// advertises abandoning a code nobody has tried yet.
+const RESTART_SENTENCE: &str = "If this code is not usable - it was never seen, or it has gone \
+                                stale - call configure again with connect \"github\" and restart \
+                                true to abandon it and get a fresh one.";
+
 /// The one-line status paired with `github_enabled` in a fresh connect
 /// response (see [`Engine::connect_with_token`] and
 /// [`Engine::start_device_connect`]), so an agent narrates enablement from
@@ -10436,10 +12952,17 @@ pub struct GithubConnection {
     pub error: Option<String>,
 }
 
+/// The half of a running device flow a surface has to show: the code, where
+/// to enter it, and how long is LEFT to do so.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct GithubPending {
     pub user_code: String,
     pub verification_url: String,
+    /// Seconds REMAINING before the code expires, recomputed on every read
+    /// and saturating at 0 - not the flow's original lifetime. A caller that
+    /// polls therefore watches it fall, which is what distinguishes a live
+    /// sign-in from a wedged one; a countdown in a UI can simply start from
+    /// this number.
     pub expires_in_secs: u64,
 }
 
@@ -10487,11 +13010,60 @@ struct PendingConnect {
     /// Where the user confirms the code.
     verification_url: String,
     /// How many seconds from when the flow started it stops being valid.
+    /// Never reported as such: every surface reports what is LEFT of it,
+    /// derived here against `started_at` (see [`Engine::pending_view_for`]).
     expires_in_secs: u64,
+    /// When the flow started, so a pending view counts down instead of
+    /// repeating the original expiry on every call. A frozen number is what
+    /// made a live sign-in look stuck; a falling one is the cheapest possible
+    /// proof that the flow is still running.
+    ///
+    /// `tokio::time::Instant` rather than `std::time::Instant` deliberately:
+    /// the daemon's clock here is the runtime's, so a test can pause it and
+    /// advance it rather than sleeping through a real code lifetime.
+    started_at: tokio::time::Instant,
+    /// The background task running this flow, so a restart can abandon it
+    /// rather than leave it to land on top of the fresh sign-in. Filled in
+    /// immediately after the spawn (the handle does not exist yet when this
+    /// record is built), and `None` only in that instant.
+    abort: Option<tokio::task::AbortHandle>,
+    /// What to do after the code is entered and how to tell whether it
+    /// landed, computed once at flow start from that flow's own auth base
+    /// (see [`crystalline_remote::github::auth::confirmation_guidance`]) so
+    /// a GHES sign-in and a github.com one each carry their own applications
+    /// url. Read back by every surface that reports this pending flow.
+    next_steps: String,
     /// `None` while still waiting on the user; set once by the background
     /// task that runs the flow to completion, to either the signed-in login
     /// or the error that ended the flow (expired, declined, offline).
     outcome: Arc<std::sync::Mutex<Option<std::result::Result<String, RemoteError>>>>,
+}
+
+impl PendingConnect {
+    /// How many seconds of this code's life are left, saturating at 0. The
+    /// one place the countdown is computed, so the MCP view and the REST one
+    /// can never report different numbers for the same flow.
+    fn remaining_secs(&self) -> u64 {
+        self.expires_in_secs
+            .saturating_sub(self.started_at.elapsed().as_secs())
+    }
+
+    /// What a caller is shown about this flow: the code, where to type it, how
+    /// long it lives and what to do next.
+    ///
+    /// A method on the record rather than on the engine, so the answer can be
+    /// built from a record in hand as well as from one read back out of the
+    /// slot - which is what keeps a flow that HAS started from being reported
+    /// as no flow when something clears the slot in between.
+    fn view(&self) -> Value {
+        json!({
+            "pending": true,
+            "user_code": self.user_code,
+            "verification_url": self.verification_url,
+            "expires_in_secs": self.remaining_secs(),
+            "next_steps": self.next_steps,
+        })
+    }
 }
 
 /// How a connect flow persists a freshly issued token: where it writes and the
@@ -10528,12 +13100,59 @@ enum SaveTarget {
     },
 }
 
+/// How a credential's owner is named in a log line: `instance` for the
+/// machine's own, `personal:<account>` for one person's. Never a token, never
+/// a device code - just enough to tell two concurrent sign-ins apart in a
+/// daemon log a colleague pastes into a support thread.
+fn identity_label(identity: &TokenIdentity) -> String {
+    match identity {
+        TokenIdentity::Instance => "instance".to_string(),
+        TokenIdentity::Personal(name) => format!("personal:{name}"),
+    }
+}
+
+/// Runs a [`TokenSavePlan`] on the blocking pool, so the OS keychain write it
+/// performs never occupies an async worker. `crystalline_remote::token` bounds
+/// every keychain call at fifteen seconds, so this cannot park a blocking
+/// thread forever either; the two together are why a wedged keychain now
+/// degrades a sign-in instead of freezing the daemon.
+///
+/// A panic in the save is reported as a credential failure rather than
+/// unwrapped: the caller is a background flow whose whole job is to land an
+/// outcome, and a task that disappeared without one is exactly the silence
+/// this change exists to remove.
+async fn save_off_runtime(
+    plan: TokenSavePlan,
+    token: StoredToken,
+) -> std::result::Result<(), RemoteError> {
+    // Where the token landed is only known after the write - `save_resolving`
+    // falls through to the file store on its own - so the line is emitted
+    // here, back on the runtime, rather than inside the blocking closure.
+    // Both connect paths save through this function, so both get the line.
+    let identity = identity_label(&plan.identity);
+    match tokio::task::spawn_blocking(move || plan.save(&token)).await {
+        Ok(Ok(store)) => {
+            tracing::info!(identity = %identity, store, "github token saved");
+            Ok(())
+        }
+        Ok(Err(e)) => Err(e),
+        Err(e) => Err(RemoteError::Credential {
+            detail: format!("could not save the GitHub token: {e}"),
+        }),
+    }
+}
+
 impl TokenSavePlan {
     /// Writes `token` once (through the override file or `save_resolving`) then
     /// refreshes this host's cache entry, so the very next `github_credential`
     /// serves the new identity without another keychain read. A connect is
     /// therefore one keychain write and zero reads.
-    fn save(&self, token: &StoredToken) -> std::result::Result<(), RemoteError> {
+    ///
+    /// Answers WHERE the token landed (`"keyring"` or `"file"`), which only
+    /// this call knows: `save_resolving` falls through to the file store by
+    /// itself when the keychain refuses or does not answer in time.
+    /// [`save_off_runtime`] turns that into the one "token saved" log line.
+    fn save(&self, token: &StoredToken) -> std::result::Result<&'static str, RemoteError> {
         let store = match &self.target {
             SaveTarget::File(store) => {
                 store.save(token)?;
@@ -10550,6 +13169,7 @@ impl TokenSavePlan {
         // refreshed the instance entry would both strand the stale personal
         // client (the very next share would use the token just replaced) and
         // hand the machine's reads somebody's personal credential.
+        let kind = store.kind();
         let key = credential_cache_key(&self.identity, self.host.as_deref());
         self.cache.lock().unwrap().insert(
             key,
@@ -10558,7 +13178,7 @@ impl TokenSavePlan {
                 token: token.clone(),
             },
         );
-        Ok(())
+        Ok(kind)
     }
 }
 
@@ -10882,8 +13502,8 @@ fn parse_families(requested: &[String]) -> Result<Vec<Family>> {
 }
 
 /// Parse the requested rule ids into their catalog spellings, erroring on an
-/// unknown id with the whole catalog named. The reserved `V3xx` range is not in
-/// the catalog, so asking for it errors here rather than returning silence.
+/// unknown id with the whole catalog named. An id outside the catalog errors
+/// here rather than returning silence.
 fn parse_rules(requested: &[String]) -> Result<Vec<&'static str>> {
     let mut out: Vec<&'static str> = Vec::new();
     for raw in requested {
@@ -10954,6 +13574,58 @@ fn host_refusal(name: &str, host: &DomainHost) -> String {
         "domain '{name}' is hosted by instance {} (last heartbeat {}); this instance serves it read-from-database only. Pass --take-over to migrate hosting here.",
         host.instance_id, host.heartbeat_at
     )
+}
+
+/// A source edit that failed, and whether the source may already carry the new
+/// bytes when it did.
+///
+/// The flag is the whole point of the type. [`Engine::split_engram_as`] writes a
+/// second engram before it edits the source, and it may only take that engram
+/// back while the source is provably as it was; once the source has been
+/// rewritten, deleting the new engram is what would lose the moved
+/// observations, since the source no longer holds them.
+struct SourceEditFailure {
+    /// Whether the source's stored bytes may already be the edited ones.
+    wrote: bool,
+    /// The failure itself, reported to the caller unchanged.
+    error: EngineError,
+}
+
+impl SourceEditFailure {
+    /// A failure with the source still as it was: the read, the checksum
+    /// compare, the edit itself, the temporal enforcement or a refused write.
+    fn before(error: EngineError) -> SourceEditFailure {
+        SourceEditFailure {
+            wrote: false,
+            error,
+        }
+    }
+
+    /// A failure with the source's bytes already replaced, or possibly
+    /// replaced: the reindex that follows a file write, and any failure of the
+    /// virtual store call that both swaps and indexes.
+    fn after(error: EngineError) -> SourceEditFailure {
+        SourceEditFailure { wrote: true, error }
+    }
+}
+
+/// What a split resolved to: the text leaving the source, the text staying and
+/// how much of each kind of thing moved.
+struct SplitPlan {
+    /// The selected lines, in source order, with surrounding blank lines
+    /// trimmed off.
+    moved: String,
+    /// The source with those lines gone, frontmatter and all.
+    remaining: String,
+    /// How many distinct observation bullets moved. A bullet that also sits
+    /// inside a moved section is counted here as well, since the caller named
+    /// it both ways.
+    observations: usize,
+    /// How many distinct sections moved: line ranges rather than paths, so two
+    /// spellings of one heading count once. A path naming a subsection of
+    /// another moved section is a different range and counts separately, which
+    /// is the honest answer to "how many sections did you name that moved".
+    sections: usize,
 }
 
 fn section_err(e: crystalline_core::emit::EditError) -> EngineError {
@@ -11652,47 +14324,90 @@ fn acks_of(source: &str) -> Vec<EvolveAck> {
         .unwrap_or_default()
 }
 
-/// Whether the engram acknowledges `rule` at all.
+/// Whether the engram acknowledges `rule` at all, or - when `scope` names a
+/// pair - acknowledges that pair.
 ///
-/// Case-folded, like every other rule comparison on this path: a hand-written
-/// `- { rule: v101 }` suppresses findings, so it has to be findable - and
-/// withdrawable - too.
-fn has_ack(source: &str, rule: &str) -> bool {
-    acks_of(source)
-        .iter()
-        .any(|a| a.rule.eq_ignore_ascii_case(rule))
+/// Case-folded on the rule, like every other rule comparison on this path: a
+/// hand-written `- { rule: v101 }` suppresses findings, so it has to be
+/// findable - and withdrawable - too. The scope is compared exactly, being one
+/// value the sweep renders rather than something anybody types.
+fn has_ack(source: &str, rule: &str, scope: Option<&str>) -> bool {
+    acks_of(source).iter().any(|a| ack_names(a, rule, scope))
 }
 
-/// The engram's markdown with `rule`'s acknowledgment dropped and every other
-/// entry left exactly as it was. Removing the last one removes the key rather
-/// than leaving an empty one ([`set_evolve_ack`] on an empty slice).
+/// Whether one entry is what `rule` and an optional `scope` name. The scope
+/// half is what makes a withdrawal able to take one twin pair back and leave
+/// the engram's other pair silenced; without one, every entry for the rule is
+/// named.
+///
+/// An entry that carries no scope of its own - a hand-written line, or an
+/// acknowledgment given before its rule fired - is never what a named pair
+/// means: it was given for nothing in particular, so a request naming a pair
+/// leaves it alone rather than removing an answer it did not ask about.
+fn ack_names(entry: &EvolveAck, rule: &str, scope: Option<&str>) -> bool {
+    entry.rule.eq_ignore_ascii_case(rule)
+        && match scope {
+            Some(scope) => entry.scope.as_deref() == Some(scope),
+            None => true,
+        }
+}
+
+/// The engram's markdown with the acknowledgment `rule` and an optional
+/// `scope` name dropped, and every other entry left exactly as it was.
+/// Removing the last one removes the key rather than leaving an empty one
+/// ([`set_evolve_ack`] on an empty slice).
 ///
 /// The one removal both surfaces run: Fluid's withdraw
 /// ([`Engine::unacknowledge_finding_as`]) and an agent's `remove <rule-id>`
-/// value. They differ only in how they report an entry that is not there - a
+/// value. They differ in how they report an entry that is not there - a
 /// `false` the REST layer answers as a 404, an error the agent reads - which is
-/// why the presence test is [`has_ack`] beside this rather than folded into it.
-fn without_ack(source: &str, rule: &str) -> String {
+/// why the presence test is [`has_ack`] beside this rather than folded into it,
+/// and in that only the first can name a pair: the agent's value form carries a
+/// rule id and nothing else, so it takes every entry the rule has.
+fn without_ack(source: &str, rule: &str, scope: Option<&str>) -> String {
     let kept: Vec<EvolveAck> = acks_of(source)
         .into_iter()
-        .filter(|a| !a.rule.eq_ignore_ascii_case(rule))
+        .filter(|a| !ack_names(a, rule, scope))
         .collect();
     set_evolve_ack(source, &kept)
 }
 
-/// The engram's acknowledgments with `entry` folded in: one entry per rule, so
-/// re-acknowledging a finding replaces what it said rather than stacking a
-/// second line nobody reads. The replacement keeps the original position, which
-/// keeps a hand-ordered list hand-ordered.
+/// The engram's acknowledgments with `entry` folded in: **one entry per rule,
+/// except for a pair-scoped rule, which keeps one per pair**. Re-acknowledging
+/// replaces what the entry said rather than stacking a second line nobody
+/// reads. The replacement keeps the original position, which keeps a
+/// hand-ordered list hand-ordered.
+///
+/// The exception is [`crystalline_index::is_pair_scoped`] - `V301` - and it
+/// exists because a twin finding is about a pair rather than about the engram:
+/// an engram that twins two others carries two twin findings and neither is the
+/// engram's answer about the rule. Keying those by rule alone made the second
+/// acknowledgment overwrite the first, which silenced one pair and left the
+/// other standing with somebody else's note on it. Every other rule's entry
+/// **is** that answer, so replacing it on re-acknowledgment is what keeps
+/// exactly one entry there however often the evidence moves, and that in turn
+/// is what lets a later drift come back marked stale (the sweep can only call
+/// an entry stale when it is the only one for its rule). That is the rule even
+/// for one that can fire more than once on an engram - `V103` fires once per
+/// reciprocal pair - and the cost is deliberate: those findings share the one
+/// entry, so the second acknowledgment replaces the first and the finding it
+/// was not given for comes back stale wearing that note.
+///
+/// A scope-less entry - what a hand-written line or an acknowledgment given
+/// before the rule fires carries - is a pair of its own under the pair-scoped
+/// rule, and keeps matching whatever that rule finds.
 fn merged_acks(source: &str, entry: EvolveAck) -> Vec<EvolveAck> {
+    let per_pair = crystalline_index::is_pair_scoped(&entry.rule);
     let mut entries = acks_of(source);
     let mut replaced = false;
     entries.retain_mut(|existing| {
-        if !existing.rule.eq_ignore_ascii_case(&entry.rule) {
+        if !existing.rule.eq_ignore_ascii_case(&entry.rule)
+            || (per_pair && existing.scope != entry.scope)
+        {
             return true;
         }
-        // A hand-edited file may name one rule twice; the entry just written is
-        // the survivor and the rest go, so the list stays one entry per rule.
+        // A hand-edited file may name one key twice; the entry just written is
+        // the survivor and the rest go, so the list stays one entry per key.
         if replaced {
             return false;
         }
@@ -12967,12 +15682,12 @@ mod share_actor_tests {
             .with_connect_auth(Arc::new(HangingAuth));
 
         engine
-            .start_github_identity_device_flow("alice")
+            .start_github_identity_device_flow("alice", false)
             .await
             .expect("the flow starts and stays pending");
         assert!(
             matches!(
-                engine.start_github_identity_device_flow("bob").await,
+                engine.start_github_identity_device_flow("bob", false).await,
                 Err(EngineError::ConnectInProgress)
             ),
             "a standing flow is what blocks the next one"
@@ -12981,7 +15696,7 @@ mod share_actor_tests {
         engine.forget_cached_credential(Some("alice")).unwrap();
 
         engine
-            .start_github_identity_device_flow("bob")
+            .start_github_identity_device_flow("bob", false)
             .await
             .expect("alice's flow was cancelled, so the slot is free");
     }
@@ -13230,7 +15945,7 @@ mod share_actor_tests {
         for err in [
             engine.github_identity_status("ann+lee").await.unwrap_err(),
             engine
-                .start_github_identity_device_flow("ann+lee")
+                .start_github_identity_device_flow("ann+lee", false)
                 .await
                 .unwrap_err(),
             engine
@@ -13548,6 +16263,35 @@ mod share_actor_tests {
         );
     }
 
+    /// The two organization-policy refusals are 403s upstream too, but the
+    /// provider has already said what actually has to happen, and adding a
+    /// collaborator clears neither. They reach the caller word for word.
+    #[test]
+    fn organization_policy_refusals_survive_personal_mode_unchanged() {
+        let sso = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+        };
+        let expected = sso.to_string();
+        let enriched = enrich_write_error(sso, Some("alice"), "acme/knowledge");
+        assert_eq!(enriched.to_string(), expected);
+        assert!(
+            !enriched.to_string().contains("ask a maintainer"),
+            "{enriched}"
+        );
+
+        let restricted = RemoteError::OauthAppRestricted {
+            org: "acme".to_string(),
+        };
+        let expected = restricted.to_string();
+        let enriched = enrich_write_error(restricted, Some("alice"), "acme/knowledge");
+        assert_eq!(enriched.to_string(), expected);
+        assert!(
+            !enriched.to_string().contains("ask a maintainer"),
+            "{enriched}"
+        );
+    }
+
     /// An expired personal token names the reconnect flow: the instance-level
     /// "use configure to sign in again" is the wrong instruction for a person
     /// whose own connection lapsed.
@@ -13577,7 +16321,10 @@ mod share_actor_tests {
         let tokens = tmp.path().join("tokens");
         write_token(&tokens, &TokenIdentity::Instance, "instance-gh");
 
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["share_identity"], "instance");
         assert!(
             status["connection"].get("owner_identity").is_none(),
@@ -13591,7 +16338,10 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["share_identity"], "personal");
         assert_eq!(
             status["connection"]["owner_identity"]["account"],
@@ -13604,7 +16354,10 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal(OWNER_IDENTITY_NAME), "owner-gh");
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["owner_identity"]["connected"], true);
         assert_eq!(status["connection"]["owner_identity"]["user"], "owner-gh");
     }
@@ -13629,7 +16382,10 @@ mod share_actor_tests {
             .unwrap();
 
         // Instance mode has no personal slot in play at all, agent or owner.
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert!(
             status["connection"].get("agent_identity").is_none(),
             "instance mode reports no personal slot: {status}"
@@ -13642,7 +16398,10 @@ mod share_actor_tests {
             })
             .await
             .unwrap();
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         let agent = &status["connection"]["agent_identity"];
         assert_eq!(agent["account"], "share-bot");
         assert_eq!(agent["connected"], false, "nothing is on file for it yet");
@@ -13652,7 +16411,10 @@ mod share_actor_tests {
         );
 
         write_token(&tokens, &personal("share-bot"), "bot-gh");
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert_eq!(status["connection"]["agent_identity"]["connected"], true);
         assert_eq!(status["connection"]["agent_identity"]["user"], "bot-gh");
         assert_eq!(
@@ -13681,7 +16443,10 @@ mod share_actor_tests {
             .await
             .unwrap();
 
-        let status = engine.origin_status(None).await.unwrap();
+        let status = engine
+            .origin_status(None, false, &crate::scope::Scope::Unrestricted)
+            .await
+            .unwrap();
         assert!(
             status["connection"].get("agent_identity").is_none(),
             "{status}"

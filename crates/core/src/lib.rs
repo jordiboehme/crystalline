@@ -25,6 +25,7 @@ pub mod import;
 pub mod index;
 pub mod manifest;
 pub mod parse;
+pub mod path;
 pub mod prompt;
 pub mod provision;
 pub mod schema;
@@ -57,10 +58,11 @@ pub use manifest::{
     append_tag_alias, in_root_artifact_dirs, manifest_template, tag_alias_pairs,
 };
 pub use parse::{LosslessEngram, ParseError, parse_engram, parse_engram_lossless};
+pub use path::fold_path_case;
 pub use prompt::{
     CONNECTOR_SNIPPET, INSTRUCTIONS_BUDGET, PromptDomain, PromptOutput, behavior_bullets,
-    generate_prompt, generate_prompt_unscoped, render_instructions, render_json,
-    render_minimal_instructions, render_text,
+    generate_prompt, generate_prompt_unscoped, render_counted_instructions, render_instructions,
+    render_json, render_minimal_instructions, render_text,
 };
 pub use provision::{
     ActionStatus, Agent, ArtifactAction, ArtifactFile, Command, DeferringMcpRunner, DesiredFile,

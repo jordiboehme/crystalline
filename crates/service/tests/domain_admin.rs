@@ -10,6 +10,7 @@ use crystalline_core::config::{
 };
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::{ListDomainsParams, ReadParams, SearchParams};
 use tokio::sync::Mutex;
 
@@ -64,10 +65,13 @@ async fn unregister_keeps_files_and_clears_the_index() {
     let (tmp, engine) = engine().await;
     // Indexed before: the engram is findable.
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("alpha".to_string()),
-            ..Default::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("alpha".to_string()),
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(hits.to_string().contains("alpha"), "{hits}");
@@ -79,15 +83,18 @@ async fn unregister_keeps_files_and_clears_the_index() {
     // The files survive; the registration and the index rows do not.
     assert!(tmp.path().join("eng/alpha.md").exists());
     let listing = engine
-        .list_domains(&ListDomainsParams::default())
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
         .await
         .unwrap();
     assert!(!listing.to_string().contains("\"eng\""), "{listing}");
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("alpha".to_string()),
-            ..Default::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("alpha".to_string()),
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -341,20 +348,26 @@ async fn import_files_walks_the_classification_on_a_file_domain() {
         .unwrap();
     assert!(tmp.path().join("eng/beta.md").exists());
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("beta".to_string()),
-            ..Default::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("beta".to_string()),
+                ..Default::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(hits.to_string().contains("beta"), "{hits}");
     // Findable by identifier too: the targeted sync really indexed the file,
     // rather than the query text merely echoing in the response.
     engine
-        .read_engram(&ReadParams {
-            identifier: "beta".to_string(),
-            domain: Some("eng".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "beta".to_string(),
+                domain: Some("eng".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -456,10 +469,13 @@ async fn import_files_lands_in_a_virtual_domain_too() {
     assert_eq!(preview["created"], 1, "{preview}");
     assert!(
         engine
-            .read_engram(&ReadParams {
-                identifier: "beta".to_string(),
-                domain: Some("pad".to_string()),
-            })
+            .read_engram(
+                &ReadParams {
+                    identifier: "beta".to_string(),
+                    domain: Some("pad".to_string()),
+                },
+                &Scope::Unrestricted
+            )
             .await
             .is_err(),
         "dry_run writes nothing on the virtual arm either"
@@ -476,10 +492,13 @@ async fn import_files_lands_in_a_virtual_domain_too() {
         .unwrap();
     assert_eq!(done["created"], 1, "{done}");
     let read = engine
-        .read_engram(&ReadParams {
-            identifier: "beta".to_string(),
-            domain: Some("pad".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "beta".to_string(),
+                domain: Some("pad".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(read.to_string().contains("The beta rule."), "{read}");
@@ -567,4 +586,205 @@ async fn github_ready_requires_enabled_and_a_credential() {
     assert!(engine.github_ready().await);
     engine.github_disconnect().await.unwrap();
     assert!(!engine.github_ready().await);
+}
+
+/// Issue #67: the listing used to come back in registration order.
+///
+/// A map that preserves insertion order plus a loop over it means the sidebar
+/// showed whatever sequence `add_domain` happened to be called in - not
+/// alphabetical, not by sync time, nothing a reader scanning for a name can
+/// use. Sorted by name here, once, so every consumer of the listing inherits
+/// it: the sidebar, the CLI and the routing prompt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_domain_listing_is_sorted_by_name() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    // Registered in the order somebody happened to add them. `Falcon` and
+    // `falconry` are the pair that pins the comparison: case-insensitive, so
+    // capitalization never sorts a domain away from its neighbours.
+    for name in ["zebra", "mercury", "Falcon", "falconry"] {
+        cfg.domains
+            .insert(name.to_string(), DomainEntry::virtual_domain());
+    }
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open_in_memory().await.unwrap();
+    let engine = Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ));
+
+    let listing = engine
+        .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let names: Vec<&str> = listing["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["Falcon", "falconry", "mercury", "zebra"]);
+}
+
+// --- the purge gate, and what it does when the index cannot be read ----------
+
+/// A file-backed engine over `path`, registering `virtual_domain` as a virtual
+/// domain and `file_domain` as a file domain.
+///
+/// File-backed rather than in-memory because the fault below is injected by
+/// re-opening the same database between two `TursoStore::open` calls, which
+/// needs a file to re-open.
+async fn engine_over(
+    path: &std::path::Path,
+    root: &std::path::Path,
+    virtual_domain: &str,
+    file_domain: &str,
+) -> Arc<Engine> {
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert(virtual_domain.to_string(), DomainEntry::virtual_domain());
+    let dir = root.join(file_domain);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("MANIFEST.md"), MANIFEST).unwrap();
+    cfg.domains
+        .insert(file_domain.to_string(), DomainEntry::file(dir));
+    cfg.service = Some(ServiceConfig {
+        response_format: Some(ResponseFormat::Json),
+        ..ServiceConfig::default()
+    });
+    let config_path = root.join("config.yaml");
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+    let store = TursoStore::open(path).await.unwrap();
+    Arc::new(Engine::new(
+        Arc::new(Mutex::new(store)),
+        cfg,
+        None,
+        Some(config_path),
+    ))
+}
+
+/// Break `domain_stats` on an already-migrated database, leaving every other
+/// query intact.
+///
+/// `domain_stats` is the only read in the removal path that joins `domain_lock`
+/// (`SELECT ... FROM domain d LEFT JOIN domain_lock dl ...`), so dropping that
+/// table makes exactly that one query fail while the targeted delete a removal
+/// performs afterwards still works. Sequential by construction, like
+/// `mcp_auth.rs`'s `break_the_visibility_table`: the store that created the
+/// schema is closed before this connection opens, and this connection is closed
+/// before the store re-opens. The migrations are recorded in
+/// `schema_migration`, so the re-opened store does not put the table back.
+async fn break_domain_stats(path: &std::path::Path) {
+    let name = path.to_string_lossy().to_string();
+    let db = match turso::Builder::new_local(&name)
+        .experimental_multiprocess_wal(true)
+        .build()
+        .await
+    {
+        Ok(db) => db,
+        Err(_) => turso::Builder::new_local(&name).build().await.unwrap(),
+    };
+    let conn = db.connect().unwrap();
+    conn.execute_batch("DROP TABLE domain_lock;").await.unwrap();
+}
+
+/// **An engram count that cannot be read is a refusal, not a zero.**
+///
+/// The gate that decides whether a virtual domain's knowledge is deleted must
+/// not read a failed query as "there was nothing there". An index error and an
+/// empty index are different facts, and only one of them means the removal is
+/// safe: `domain_stats` is an aggregate sweep over every domain and can fail on
+/// a database whose targeted delete would have succeeded, so a swallowed error
+/// here deletes somebody's only copy of their knowledge with no confirmation on
+/// any surface.
+///
+/// The second half is what keeps the first from being over-broad: the KIND is
+/// the primary key of the decision and comes from the config entry, so a file
+/// domain - which loses no knowledge to a removal at all - is unaffected by the
+/// same unreadable index and still unregisters.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_domain_whose_engrams_cannot_be_counted_is_refused_without_purge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let db = root.join("index.db");
+
+    // Phase one creates the schema and records the migrations; phase two runs
+    // against the same file with `domain_stats`' join partner missing.
+    let engine = engine_over(&db, &root, "mind", "eng").await;
+    drop(engine);
+    break_domain_stats(&db).await;
+    let engine = engine_over(&db, &root, "mind", "eng").await;
+
+    let refused = engine
+        .unregister_domain("mind", &Scope::Unrestricted, false)
+        .await
+        .expect_err("an unreadable count must not read as an empty domain");
+    let text = refused.to_string();
+    assert!(
+        text.contains("purge"),
+        "the refusal names the flag that would let it through: {text}"
+    );
+    assert!(
+        text.contains("could not be read"),
+        "and says the count is unknown rather than claiming one: {text}"
+    );
+    assert!(
+        engine
+            .list_domains(&ListDomainsParams::default(), &Scope::Unrestricted)
+            .await
+            .unwrap()
+            .to_string()
+            .contains("mind"),
+        "and the domain is still registered"
+    );
+
+    // A file domain loses no knowledge to a removal, so the same broken index
+    // costs it only the number in its receipt.
+    let removed = engine
+        .unregister_domain("eng", &Scope::Unrestricted, false)
+        .await
+        .expect("a file domain never needed the count to decide anything");
+    assert_eq!(removed["unregistered"], serde_json::json!(true));
+    assert_eq!(removed["files_kept"], serde_json::json!(true));
+    assert!(
+        tmp.path().join("eng/MANIFEST.md").exists(),
+        "and its files are where they were"
+    );
+
+    // And on the confirmed path, where the count is a figure in a question
+    // rather than a gate, the preview says the number is missing instead of
+    // letting the question fall silent about how much is at stake.
+    let preview = engine
+        .domain_remove_preview("mind", &Scope::Unrestricted, true)
+        .await
+        .expect("a confirmed removal previews even with the count unavailable");
+    assert_eq!(preview["engrams"], serde_json::Value::Null);
+    assert_eq!(
+        preview["engrams_unknown"],
+        serde_json::json!(true),
+        "the absence has a reason and the preview carries it: {preview}"
+    );
+
+    // With the loss already confirmed there is nothing left to ask about, so
+    // the same unreadable count no longer stands in the way.
+    let purged = engine
+        .unregister_domain("mind", &Scope::Unrestricted, true)
+        .await
+        .expect("purge is the confirmation the refusal asked for");
+    assert_eq!(purged["unregistered"], serde_json::json!(true));
+    assert_eq!(purged["files_kept"], serde_json::json!(false));
 }

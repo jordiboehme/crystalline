@@ -17,10 +17,12 @@
 //! are pure functions of their inputs (the config file and the MANIFESTs on
 //! disk). No timestamps, process IDs, environment variables or other
 //! environment-dependent values ever enter the output, and no unordered
-//! iteration (a hash map, a hash set) drives ordering. Domain order comes
-//! from the config's own registered order: `generate_prompt` filters it
-//! through a sorted inclusion set and reorders preferred-first, while
-//! `generate_prompt_unscoped` emits that registered order verbatim.
+//! iteration (a hash map, a hash set) drives ordering. `generate_prompt`
+//! filters the config's registered order through a sorted inclusion set and
+//! reorders preferred-first, while `generate_prompt_unscoped` sorts by name,
+//! case-insensitively - the same comparison the domain listing applies, so the
+//! onboarding block served at session start and the same index re-fetched
+//! mid-session present the domains in one order.
 //! `render_json` relies on `serde_json`'s stable field order. Identical
 //! config plus identical on-disk MANIFESTs must render byte-identical output
 //! every time, whether rendered twice in one process or by two separate
@@ -167,7 +169,15 @@ pub fn generate_prompt_unscoped(
 ) -> PromptOutput {
     let mut domains = Vec::with_capacity(global.domains.len());
     let mut warnings = Vec::new();
-    for (name, entry) in &global.domains {
+    // Sorted by name, case-insensitively, the same comparison the domain
+    // listing applies. The config map preserves registration order, which is
+    // meaningless to a reader; more to the point, the onboarding block served
+    // at session start and the same index re-fetched mid-session through
+    // `list_domains` are two views of one thing and must not disagree about
+    // the order they present it in.
+    let mut registered: Vec<_> = global.domains.iter().collect();
+    registered.sort_by_cached_key(|(name, _)| (name.to_lowercase(), (*name).clone()));
+    for (name, entry) in registered {
         let (bullets, warning) = if entry.is_virtual() {
             virtual_routing_bullets(name, virtual_bullets.get(name))
         } else {
@@ -390,8 +400,10 @@ fn render_behavior_block(output: &PromptOutput, out: &mut String) {
 
 /// The behavior rules an agent follows when working with this server's tools,
 /// one string per rule, without the leading `- ` and without a trailing
-/// newline. The read-only set drops the four content-mutating tools and the
-/// capture language; the read-write set names them.
+/// newline. The read-only set drops the four content-mutating tools this block
+/// names and the capture language; the read-write set names them. Four rather
+/// than every write verb on the surface: `split_engram` is taught by the skills
+/// rather than here, so the routing block stays inside its truncation budget.
 ///
 /// This is the single source of the rule set: [`render_routing_body`] renders
 /// it as the Behavior block of both onboarding renderers, and the MCP
@@ -480,20 +492,7 @@ pub const INSTRUCTIONS_BUDGET: usize = 1900;
 /// function of the rendered sizes, so the determinism contract holds and the
 /// cost is at most three renders of the same small strings.
 pub fn render_instructions(output: &PromptOutput) -> String {
-    let mut head = String::new();
-    head.push_str(ROUTING_HEADER);
-    if output.read_only {
-        head.push_str(
-            "Crystalline is your crystallized intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
-        );
-    } else {
-        head.push_str(
-            "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
-        );
-    }
-    render_behavior_block(output, &mut head);
-    head.push('\n');
-    head.push_str("Domains:\n");
+    let head = instructions_head(output);
 
     // Tier 1: every routing line, up to three bullets each.
     let mut full = head.clone();
@@ -511,12 +510,65 @@ pub fn render_instructions(output: &PromptOutput) -> String {
 
     // Tier 3: a single count line; the index itself is one tool call away.
     let mut counted = head;
+    push_count_line(output, &mut counted);
+    counted
+}
+
+/// The fixed half of [`render_instructions`]: header, intro, the Behavior
+/// block and the `Domains:` label the variable half hangs under. Shared so the
+/// two renderers below cannot grow an intro or a rule the other lacks.
+fn instructions_head(output: &PromptOutput) -> String {
+    let mut head = String::new();
+    head.push_str(ROUTING_HEADER);
+    if output.read_only {
+        head.push_str(
+            "Crystalline is your crystallized intelligence across sessions: the domains below hold curated knowledge as engrams you search and read (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+        );
+    } else {
+        head.push_str(
+            "Crystalline is your crystallized intelligence across sessions: the domains below hold knowledge as engrams you read, write and refine (your harness may prefix tool names, for example mcp__crystalline__search_engrams). Search them before answering from memory and before writing; list_domains with include_routing=true returns this index and its behavior rules at any time.\n\n",
+        );
+    }
+    render_behavior_block(output, &mut head);
+    head.push('\n');
+    head.push_str("Domains:\n");
+    head
+}
+
+/// The single line that stands in for the domain list: how many are
+/// registered, and the one call that returns them. One writer, so
+/// [`render_instructions`]'s last tier and [`render_counted_instructions`]
+/// cannot word it differently.
+fn push_count_line(output: &PromptOutput, out: &mut String) {
     let n = output.domains.len();
     let noun = if n == 1 { "domain" } else { "domains" };
     let _ = writeln!(
-        counted,
+        out,
         "{n} {noun} registered; list_domains with include_routing=true returns the full index and its behavior rules."
     );
+}
+
+/// [`render_instructions`] with the domain lines always replaced by the count
+/// line: the whole of the behavior rules, none of the names.
+///
+/// **For the one onboarding channel that cannot know who is asking.** The
+/// legacy `initialize` handshake is answered from `get_info`, which rmcp calls
+/// with no request context at all, so an HTTP server has no caller to scope the
+/// block to and cannot leave a private domain's name out of it. Naming every
+/// registered domain to every anonymous peer that opens a session is exactly
+/// what a private domain is not, so that channel renders this instead and
+/// points at `list_domains`, which does resolve a caller and does filter.
+///
+/// Stdio is unaffected and keeps the full block: a local session is the machine
+/// owner, which already has the files on disk.
+///
+/// The count itself is deliberately the count of *registered* domains rather
+/// than of visible ones - there is nobody here to make it visible to - so this
+/// channel still says how many exist. That is the residue of the split, and it
+/// is one integer against the full index this used to hand out.
+pub fn render_counted_instructions(output: &PromptOutput) -> String {
+    let mut counted = instructions_head(output);
+    push_count_line(output, &mut counted);
     counted
 }
 
@@ -716,7 +768,8 @@ mod tests {
             text.contains("read-only and curated externally"),
             "read-only line expected:\n{text}"
         );
-        // None of the four content-mutating tool names appear anywhere.
+        // None of the four content-mutating tool names this block writes
+        // appear anywhere.
         for tool in [
             "write_engram",
             "edit_engram",
@@ -780,12 +833,41 @@ mod tests {
     fn unscoped_ignores_prompt_rules_and_marks_nothing_preferred() {
         let (_tmp, global) = fixture_with_prompt_rules();
         let output = generate_prompt_unscoped(&global, &BTreeMap::new());
-        // Every registered domain is present in config order, `beta` included
-        // despite the include-only rule that would drop it in the scoped path.
+        // Every registered domain is present, `beta` included despite the
+        // include-only rule that would drop it in the scoped path.
         let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta"]);
         // No workspace means no preferred reorder: nothing is ever preferred.
         assert!(output.domains.iter().all(|d| !d.preferred));
+    }
+
+    /// The onboarding block is in the same order the domain listing is.
+    ///
+    /// Registration order is what the config map preserves and it means
+    /// nothing to a reader; worse, the block served at session start and the
+    /// index an agent re-fetches mid-session through `list_domains` are two
+    /// views of one thing, and two orders would read as two answers.
+    #[test]
+    fn unscoped_sorts_the_domains_by_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut domains = indexmap::IndexMap::new();
+        // Registered in the order somebody happened to add them. `Falcon` and
+        // `falconry` are the pair that pins the comparison as case-insensitive
+        // rather than byte-wise.
+        for name in ["zebra", "mercury", "Falcon", "falconry"] {
+            let root = tmp.path().join(name);
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("MANIFEST.md"), manifest_source(&["when routing"])).unwrap();
+            domains.insert(name.to_string(), DomainEntry::file(root));
+        }
+        let global = GlobalConfig {
+            domains,
+            ..GlobalConfig::default()
+        };
+
+        let output = generate_prompt_unscoped(&global, &BTreeMap::new());
+        let names: Vec<&str> = output.domains.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["Falcon", "falconry", "mercury", "zebra"]);
     }
 
     #[test]

@@ -19,7 +19,7 @@ use utoipa::IntoParams;
 use super::auth::Identity;
 use super::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, RestState,
-    if_match, if_none_match_matches, precondition_failed,
+    if_match, if_none_match_matches, precondition_failed, require_domain_read,
 };
 use crate::engine::EngineError;
 use crate::params::{BrowseParams, ListDomainsParams};
@@ -53,6 +53,7 @@ use crate::params::{BrowseParams, ListDomainsParams};
                     "observations": 12,
                     "relations": 3,
                     "last_sync": "2026-08-05T09:14:22Z",
+                    "private": false,
                     "when_to_use": ["Route here for eng questions."]
                 }]
             }),
@@ -71,12 +72,18 @@ use crate::params::{BrowseParams, ListDomainsParams};
         ),
     ),
 )]
-pub async fn list(State(state): State<RestState>) -> Result<Json<Value>, ApiError> {
+pub async fn list(
+    State(state): State<RestState>,
+    identity: Identity,
+) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .list_domains(&ListDomainsParams {
-            include_routing: true,
-        })
+        .list_domains(
+            &ListDomainsParams {
+                include_routing: true,
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }
@@ -187,17 +194,21 @@ pub struct TreeQuery {
 )]
 pub async fn tree(
     State(state): State<RestState>,
+    identity: Identity,
     ApiPath(domain): ApiPath<String>,
     ApiQuery(query): ApiQuery<TreeQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .browse_domain(&BrowseParams {
-            domain,
-            path: query.path,
-            depth: query.depth,
-            glob: query.glob,
-        })
+        .browse_domain(
+            &BrowseParams {
+                domain,
+                path: query.path,
+                depth: query.depth,
+                glob: query.glob,
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }
@@ -280,9 +291,14 @@ pub async fn tree(
 )]
 pub async fn manifest(
     State(state): State<RestState>,
+    identity: Identity,
     headers: HeaderMap,
     ApiPath(domain): ApiPath<String>,
 ) -> Result<Response, ApiError> {
+    // A MANIFEST is a domain's own text - its scope, its routing bullets -
+    // so a caller who may not see the domain may not read it either, and is
+    // told what a caller asking for a domain nobody registered is told.
+    require_domain_read(&state, &identity, &domain).await?;
     let markdown = state.engine.manifest_markdown(&domain).await?;
     let checksum = manifest_checksum(&markdown);
     if if_none_match_matches(&headers, &checksum) {

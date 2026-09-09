@@ -32,7 +32,18 @@
 //! Presence is decided by command string, ignoring the hook group's matcher,
 //! so the README's hand-written `startup` recipe counts as already installed
 //! (no duplicate is added) and is removed on uninstall like any managed
-//! entry. The MCP registration shells out to the harness's own CLI (`claude`,
+//! entry. That test is on the command's leading words, not the whole string,
+//! because a managed command now carries `--harness <id>` and an install
+//! written by an older release does not: an entry whose leading words are
+//! ours is ours whatever trails it. Rewriting one is a separate and much
+//! narrower question - only a spelling this project itself has ever written
+//! is rewritten in place to the current one, so an install heals its hook
+//! commands on the first run of a new version while a command somebody typed
+//! by hand keeps every flag they gave it. The command string is all that
+//! heals: an existing group's matcher and timeout are left exactly as they
+//! were found, so a group an older release wrote with a narrower matcher
+//! keeps it. The MCP registration shells out to the
+//! harness's own CLI (`claude`,
 //! `codex` or `copilot`); a missing or failing CLI is never fatal - it prints
 //! the command to run by hand and the rest of the install still proceeds.
 //!
@@ -69,14 +80,35 @@ pub(crate) const STOP_COMMAND: &str = "crystalline hook stop";
 /// other harnesses get.
 pub(crate) const SESSION_START_COMMAND_COPILOT: &str = "crystalline prompt system --format copilot";
 
-/// The `SessionStart` command a harness's managed hook runs, reused by
-/// `doctor` so its presence test asks for the same spelling `install`
-/// writes.
+/// The `SessionStart` command a harness's managed hook runs, without the
+/// harness flag: the base spelling every presence test asks for, so both an
+/// install written before `--harness` existed and one written after it read
+/// as present. `doctor` calls this for exactly that reason.
 pub(crate) fn session_start_command(harness: HarnessKind) -> &'static str {
     match harness {
         HarnessKind::ClaudeCode | HarnessKind::Codex => SESSION_START_COMMAND,
         HarnessKind::Copilot => SESSION_START_COMMAND_COPILOT,
     }
+}
+
+/// The two commands a harness's managed hooks run, in `[SessionStart, Stop]`
+/// order: that harness's base spelling plus `--harness <id>`, so a hook knows
+/// at run time which harness it is answering and can reply in the shape that
+/// harness honours. Install, the session-start reconcile and every rewrite go
+/// through this, so no call site builds the string itself.
+///
+/// `--format copilot` deliberately stays a flag of its own on the routing
+/// command rather than being folded into `--harness`. It selects an output
+/// shape, and the two coincide today only because Copilot is the single
+/// harness that needs an envelope; the day a second one does, or Copilot
+/// wants a different shape, the flags would have to come apart again. They
+/// can merge later if that day never arrives.
+pub(crate) fn managed_hook_commands(harness: HarnessKind) -> [String; 2] {
+    let id = harness.id();
+    [
+        format!("{} --harness {id}", session_start_command(harness)),
+        format!("{STOP_COMMAND} --harness {id}"),
+    ]
 }
 
 /// The `SessionStart` matcher: re-route on a fresh start, after `/clear` and
@@ -163,43 +195,111 @@ pub struct InstallOptions {
 
 /// The managed `SessionStart` group: the routing command with the widened
 /// matcher and the shared timeout.
-fn session_start_group() -> Value {
+fn session_start_group(command: &str) -> Value {
     json!({
         "matcher": SESSION_START_MATCHER,
-        "hooks": [ { "type": "command", "command": SESSION_START_COMMAND, "timeout": HOOK_TIMEOUT_SECS } ],
+        "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ],
     })
 }
 
 /// The managed `Stop` group: the nudge command with the shared timeout. A
 /// `Stop` group carries no matcher (the event has no matchable subject).
-fn stop_group() -> Value {
+fn stop_group(command: &str) -> Value {
     json!({
-        "hooks": [ { "type": "command", "command": STOP_COMMAND, "timeout": HOOK_TIMEOUT_SECS } ],
+        "hooks": [ { "type": "command", "command": command, "timeout": HOOK_TIMEOUT_SECS } ],
     })
 }
 
 // --- pure merge / remove algorithm -------------------------------------------
 
+/// Which of the two managed commands a stored command string is, decided on
+/// its leading words alone. The Copilot routing form extends
+/// [`SESSION_START_COMMAND`], so it needs no arm of its own.
+///
+/// Ownership is deliberately broad: a command whose leading words are ours
+/// runs our binary, whatever flags trail it, so it counts as present (no
+/// duplicate is appended beside it) and it comes out on uninstall. Rewriting
+/// one is the narrow question [`is_own_spelling`] answers.
+fn managed_command_kind(command: &str) -> Option<ManagedCommand> {
+    if extends_command(command, SESSION_START_COMMAND) {
+        Some(ManagedCommand::SessionStart)
+    } else if extends_command(command, STOP_COMMAND) {
+        Some(ManagedCommand::Stop)
+    } else {
+        None
+    }
+}
+
+/// The two lifecycle commands `install` writes, as the identity a stored
+/// command string is matched to.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum ManagedCommand {
+    SessionStart,
+    Stop,
+}
+
+/// Whether `command` is `base` itself or `base` followed by arguments: a
+/// prefix that ends on a word boundary. The boundary is the whole point -
+/// `crystalline hook stopwatch` shares every character of the nudge command
+/// and is somebody else's hook, so a bare `starts_with` would claim it and
+/// uninstall would carry it off.
+fn extends_command(command: &str, base: &str) -> bool {
+    command
+        .strip_prefix(base)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+}
+
+/// Whether `command` is a spelling this project itself has ever written, and
+/// so one a newer binary may rewrite in place to the current spelling: a bare
+/// base, the Copilot routing form, or any of those followed by `--harness
+/// <id>` for an id this binary knows, and nothing else.
+///
+/// The split from [`managed_command_kind`] is where the foreign-data rule
+/// lands in this file. A hand-written `crystalline prompt system --workspace
+/// /repo` is ours by its leading words - counted present, removed on
+/// uninstall - but it is not a spelling we wrote, so it is left
+/// byte-identical instead of being rewritten into one that silently drops
+/// the flag its author meant.
+fn is_own_spelling(command: &str) -> bool {
+    [
+        SESSION_START_COMMAND_COPILOT,
+        SESSION_START_COMMAND,
+        STOP_COMMAND,
+    ]
+    .iter()
+    .any(|base| match command.strip_prefix(base) {
+        Some("") => true,
+        Some(rest) => rest
+            .strip_prefix(" --harness ")
+            .is_some_and(|id| HarnessKind::from_id(id).is_some()),
+        None => false,
+    })
+}
+
 /// Whether a single hook object is one Crystalline manages, by command string
-/// alone: either the routing command or the nudge command.
+/// alone: the routing command or the nudge command, in any spelling.
 fn is_managed_hook(hook: &Value) -> bool {
     matches!(
         hook.get("command").and_then(Value::as_str),
-        Some(c) if c == SESSION_START_COMMAND || c == STOP_COMMAND
+        Some(c) if managed_command_kind(c).is_some()
     )
 }
 
 /// Whether a hook group's `hooks` array runs `command`, ignoring the group's
-/// matcher. This is the matcher-insensitive presence test that lets a
-/// hand-written recipe count as already installed.
+/// matcher and any flags trailing the command. This is the matcher-insensitive
+/// presence test that lets a hand-written recipe count as already installed,
+/// and the flag tolerance is what lets it recognize both an install written
+/// before `--harness` existed and one written after it.
 fn group_runs_command(group: &Value, command: &str) -> bool {
     group
         .get("hooks")
         .and_then(Value::as_array)
         .is_some_and(|hooks| {
-            hooks
-                .iter()
-                .any(|h| h.get("command").and_then(Value::as_str) == Some(command))
+            hooks.iter().any(|h| {
+                h.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| extends_command(c, command))
+            })
         })
 }
 
@@ -214,6 +314,13 @@ fn group_has_managed(group: &Value) -> bool {
 /// Whether the parsed settings root already runs `command` under `event`,
 /// matcher-insensitively. The filesystem-free presence predicate that both
 /// the install report and (in a later milestone) the doctor read from.
+///
+/// Ask it with a base constant, never with a command
+/// [`managed_hook_commands`] built. The flag tolerance is directional: a
+/// stored command may extend the one being asked for, never the other way
+/// round. So probing with the parametrized spelling would stop matching a
+/// bare stored entry and start reporting an existing install as absent, which
+/// appends a duplicate beside it.
 pub(crate) fn hook_present(root: &Map<String, Value>, event: &str, command: &str) -> bool {
     root.get("hooks")
         .and_then(Value::as_object)
@@ -222,17 +329,44 @@ pub(crate) fn hook_present(root: &Map<String, Value>, event: &str, command: &str
         .is_some_and(|groups| groups.iter().any(|g| group_runs_command(g, command)))
 }
 
-/// Append the managed group for one event when it is not already present.
-/// Returns whether the root changed. Never reorders foreign entries: the new
-/// group is pushed onto the end of the event's array. A `hooks` value or an
-/// event value of an unexpected JSON type is left entirely untouched (foreign
-/// data is never coerced), reported as no change.
+/// Bring one event's managed hook up to `command`: rewrite the spelling of a
+/// managed hook this project wrote, and append the managed group only when
+/// the event runs no hook of ours at all. Returns whether the root changed.
+///
+/// Three outcomes, and the difference between them is the foreign-data rule.
+/// A hook of ours in an older spelling is rewritten in place, which is what
+/// makes an existing install heal itself on the first run of a new version.
+/// A hook of ours in a spelling we never wrote (a hand-written recipe
+/// carrying somebody's own flags) counts as present and is left exactly as it
+/// is: no duplicate beside it, and not a character of it changed. Only an
+/// event with no hook of ours gets the managed group appended, pushed onto
+/// the end so foreign entries are never reordered.
+///
+/// A `hooks` value or an event value of an unexpected JSON type is left
+/// entirely untouched (foreign data is never coerced), reported as no change,
+/// and a command that is not one of ours is refused outright rather than
+/// matching every foreign hook in the file.
+///
+/// Only the first hook of ours in the event is rewritten, which is the same
+/// rule [`ensure_owned_entry`] follows: rewriting every one of them can bring
+/// a second spelling up to a command that then runs beside the first. Where
+/// the two sides part company is the cleanup. The owned file drops the
+/// duplicate, because there the second entry was a spelling of ours that
+/// produced nothing until the rewrite made it live. Here it does not: two
+/// managed hooks of the same kind in one event can only be hand-written (an
+/// install appends at most one, and only when the event runs none), and both
+/// of them already ran before this rule existed. Deleting one would be new
+/// data loss rather than a fix, so a later hook of ours is left exactly as
+/// its author wrote it.
 fn ensure_group(
     root: &mut Map<String, Value>,
     event: &str,
     command: &str,
-    group: fn() -> Value,
+    group: fn(&str) -> Value,
 ) -> bool {
+    let Some(kind) = managed_command_kind(command) else {
+        return false;
+    };
     let hooks_entry = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -245,25 +379,49 @@ fn ensure_group(
     let Some(groups) = event_entry.as_array_mut() else {
         return false;
     };
-    if groups.iter().any(|g| group_runs_command(g, command)) {
-        return false;
+    let mut present = false;
+    let mut changed = false;
+    let mut ours_seen = false;
+    for group_value in groups.iter_mut() {
+        let Some(hooklist) = group_value.get_mut("hooks").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for hook in hooklist.iter_mut() {
+            let Some(stored) = hook.get("command").and_then(Value::as_str) else {
+                continue;
+            };
+            if managed_command_kind(stored) != Some(kind) {
+                continue;
+            }
+            present = true;
+            if ours_seen || !is_own_spelling(stored) {
+                continue;
+            }
+            ours_seen = true;
+            // Compared before it is assigned, so a file already carrying the
+            // current spelling reports no change and a second install stays a
+            // byte-identical no-op.
+            if stored != command {
+                hook["command"] = Value::String(command.to_string());
+                changed = true;
+            }
+        }
     }
-    groups.push(group());
-    true
+    if !present {
+        groups.push(group(command));
+        changed = true;
+    }
+    changed
 }
 
 /// Merge both managed hook groups into the settings root, returning whether
-/// anything changed. Idempotent: a root that already carries both commands
-/// (under any matcher) is returned unchanged.
-pub(crate) fn add_managed_hooks(root: &mut Map<String, Value>) -> bool {
+/// anything changed. Idempotent: a root that already carries both commands in
+/// this harness's current spelling (under any matcher) is returned unchanged.
+pub(crate) fn add_managed_hooks(root: &mut Map<String, Value>, harness: HarnessKind) -> bool {
+    let [session_start, stop] = managed_hook_commands(harness);
     let mut changed = false;
-    changed |= ensure_group(
-        root,
-        "SessionStart",
-        SESSION_START_COMMAND,
-        session_start_group,
-    );
-    changed |= ensure_group(root, "Stop", STOP_COMMAND, stop_group);
+    changed |= ensure_group(root, "SessionStart", &session_start, session_start_group);
+    changed |= ensure_group(root, "Stop", &stop, stop_group);
     changed
 }
 
@@ -324,22 +482,23 @@ pub(crate) fn remove_managed_hooks(root: &mut Map<String, Value>) -> bool {
 /// One managed flat entry in the Copilot-owned hooks file. PascalCase event
 /// names select Copilot's VS Code compatible payloads (snake_case fields),
 /// the same shape Claude Code and Codex send, so `crystalline hook stop`
-/// serves all three harnesses unchanged. `command` is Copilot's
+/// reads all three harnesses' payloads with one parser (what it answers with
+/// is the part that varies, and the `--harness` flag on the command is what
+/// tells it which). `command` is Copilot's
 /// cross-platform field and `timeoutSec` its spelling of the shared timeout.
 fn owned_entry(command: &str) -> Value {
     json!({ "type": "command", "command": command, "timeoutSec": HOOK_TIMEOUT_SECS })
 }
 
-/// Whether a flat entry is one Crystalline manages, by its `command` string.
-/// The plain routing command (without `--format copilot`) is claimed too: in
-/// a Copilot hooks file its text output would be silently dropped, so a
-/// hand-written plain entry is broken and ours to remove.
+/// Whether a flat entry is one Crystalline manages, by its `command` string,
+/// in any spelling. The plain routing command (without `--format copilot`) is
+/// claimed too: in a Copilot hooks file its text output would be silently
+/// dropped, so a hand-written plain entry is broken and ours to repair or
+/// remove.
 fn is_managed_owned_entry(entry: &Value) -> bool {
     matches!(
         entry.get("command").and_then(Value::as_str),
-        Some(c) if c == SESSION_START_COMMAND_COPILOT
-            || c == SESSION_START_COMMAND
-            || c == STOP_COMMAND
+        Some(c) if managed_command_kind(c).is_some()
     )
 }
 
@@ -358,26 +517,53 @@ pub(crate) fn harness_hook_present(
     }
 }
 
-/// Whether the parsed owned file already runs `command` under `event`, by
-/// exact match on each flat entry's `command` field. Also the doctor's
-/// presence predicate for the owned style.
+/// Whether the parsed owned file already runs `command` under `event`,
+/// matching each flat entry's `command` field on its leading words so both an
+/// install written before `--harness` existed and one written after it read as
+/// present. Also the doctor's presence predicate for the owned style.
+///
+/// Asking for the Copilot routing form still means the Copilot routing form: a
+/// plain `crystalline prompt system` does not extend it, so an owned file
+/// carrying only the plain entry is correctly reported as not yet carrying the
+/// envelope-producing one.
 pub(crate) fn owned_hook_present(root: &Map<String, Value>, event: &str, command: &str) -> bool {
     root.get("hooks")
         .and_then(Value::as_object)
         .and_then(|hooks| hooks.get(event))
         .and_then(Value::as_array)
         .is_some_and(|entries| {
-            entries
-                .iter()
-                .any(|e| e.get("command").and_then(Value::as_str) == Some(command))
+            entries.iter().any(|e| {
+                e.get("command")
+                    .and_then(Value::as_str)
+                    .is_some_and(|c| extends_command(c, command))
+            })
         })
 }
 
-/// Append one managed flat entry when its command is not already present.
-/// Same contract as [`ensure_group`]: returns whether the root changed, and
-/// a `hooks` value or event value of an unexpected JSON type is left
-/// entirely untouched, reported as no change.
+/// Bring one event's managed flat entry up to `command`, appending it only
+/// when the event carries no entry of ours at all. Exactly the contract
+/// [`ensure_group`] follows, entry for group: a spelling this project wrote is
+/// rewritten in place, a spelling somebody else wrote is left alone and
+/// counted present, and a `hooks` value or event value of an unexpected JSON
+/// type is left entirely untouched, reported as no change. Both sides go
+/// through the same rule so the owned file and the merged file can never
+/// disagree about what is already installed.
+///
+/// Exactly one entry of ours survives per event. A file carrying two
+/// spellings we wrote for the same event - reachable by hand, and reachable
+/// for real in a Copilot file holding both the plain routing entry and the
+/// `--format copilot` one - keeps the first and drops the rest. Rewriting
+/// every one of them instead would leave two entries running the same
+/// command, and Copilot would inject the routing block twice per session:
+/// the plain entry used to produce output Copilot dropped on the floor, so
+/// bringing it up to the current spelling is what would make the second copy
+/// live. Only spellings we wrote are dropped, never a hand-written variant
+/// carrying somebody's own flags, which is counted present and left exactly
+/// as it is.
 fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str) -> bool {
+    let Some(kind) = managed_command_kind(command) else {
+        return false;
+    };
     let hooks_entry = root
         .entry("hooks")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -390,28 +576,75 @@ fn ensure_owned_entry(root: &mut Map<String, Value>, event: &str, command: &str)
     let Some(entries) = event_entry.as_array_mut() else {
         return false;
     };
-    if entries
-        .iter()
-        .any(|e| e.get("command").and_then(Value::as_str) == Some(command))
-    {
-        return false;
+    // Presence stays a question about the kind, never about the spelling, so
+    // an event carrying only a hand-written variant of ours is present and
+    // gets nothing appended beside it.
+    let mut present = false;
+    let mut ours: Vec<usize> = Vec::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let Some(stored) = entry.get("command").and_then(Value::as_str) else {
+            continue;
+        };
+        if managed_command_kind(stored) != Some(kind) {
+            continue;
+        }
+        present = true;
+        if is_own_spelling(stored) {
+            ours.push(i);
+        }
     }
-    entries.push(owned_entry(command));
-    true
+    let mut changed = false;
+    if let Some(&first) = ours.first() {
+        // Compared before it is assigned, so a file already carrying the
+        // current spelling reports no change and a second install stays a
+        // byte-identical no-op.
+        if entries[first].get("command").and_then(Value::as_str) != Some(command) {
+            entries[first]["command"] = Value::String(command.to_string());
+            changed = true;
+        }
+        // A dropped entry may be the only one carrying a timeout, and the
+        // shape this really happens in is the one above: a Copilot file
+        // holding the plain routing entry first and the `--format copilot`
+        // one second, where the second is the entry with `timeoutSec` on it.
+        // The survivor is about to run that entry's command, so it inherits
+        // that entry's timeout rather than falling back to Copilot's own
+        // default. A timeout already on the survivor is somebody's own answer
+        // and is left exactly as it is, and a set of dropped entries that
+        // carried none loses nothing and gains nothing.
+        if entries[first].get("timeoutSec").is_none()
+            && let Some(inherited) = ours[1..]
+                .iter()
+                .find_map(|&i| entries[i].get("timeoutSec").cloned())
+        {
+            entries[first]["timeoutSec"] = inherited;
+            changed = true;
+        }
+        // Reverse order, so each removal leaves the indexes below it valid.
+        for &i in ours[1..].iter().rev() {
+            entries.remove(i);
+            changed = true;
+        }
+    }
+    if !present {
+        entries.push(owned_entry(command));
+        changed = true;
+    }
+    changed
 }
 
 /// Merge the managed entries plus the file's `version` marker into the owned
 /// root, returning whether anything changed. Idempotent like
 /// [`add_managed_hooks`]. `version` is only ever written when absent, so a
 /// value a person set by hand is not fought over.
-pub(crate) fn add_owned_hooks(root: &mut Map<String, Value>) -> bool {
+pub(crate) fn add_owned_hooks(root: &mut Map<String, Value>, harness: HarnessKind) -> bool {
+    let [session_start, stop] = managed_hook_commands(harness);
     let mut changed = false;
     if !root.contains_key("version") {
         root.insert("version".to_string(), json!(1));
         changed = true;
     }
-    changed |= ensure_owned_entry(root, "SessionStart", SESSION_START_COMMAND_COPILOT);
-    changed |= ensure_owned_entry(root, "Stop", STOP_COMMAND);
+    changed |= ensure_owned_entry(root, "SessionStart", &session_start);
+    changed |= ensure_owned_entry(root, "Stop", &stop);
     changed
 }
 
@@ -556,8 +789,19 @@ fn path_binary_notice() -> Option<String> {
                 .to_string(),
         ),
         Ok(out) => {
-            let version = String::from_utf8_lossy(&out.stdout);
-            let version = version.trim().strip_prefix("crystalline ").unwrap_or("");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // `--version` now answers three lines (copyright, license,
+            // source); only the first one carries the version to compare, so
+            // take that line before stripping the `crystalline ` prefix -
+            // trimming the whole string first would fold all three lines
+            // into one and this could never match.
+            let version = stdout
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .strip_prefix("crystalline ")
+                .unwrap_or("");
             if !out.status.success() || version.is_empty() {
                 Some(
                     "The hooks run `crystalline` from your PATH, but it did not answer --version. Check which binary the PATH resolves."
@@ -935,8 +1179,8 @@ fn uninstall_mcp(harness: HarnessKind, project: bool) -> McpReport {
 /// style.
 fn install_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
     match hooks_style(harness) {
-        HooksStyle::Merged => install_merged_hooks(path),
-        HooksStyle::Owned => install_owned_hooks(path),
+        HooksStyle::Merged => install_merged_hooks(harness, path),
+        HooksStyle::Owned => install_owned_hooks(harness, path),
     }
 }
 
@@ -950,11 +1194,14 @@ fn uninstall_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksRep
 
 /// Merge the managed hooks into the shared settings file, writing only on
 /// change.
-fn install_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+fn install_merged_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
     let mut root = read_settings(path)?;
+    // Asked with the base spelling, so a hook an older release wrote reports
+    // as already present rather than as freshly added: what the rewrite below
+    // changes is how it is spelled, not whether it is there.
     let had_session_start = hook_present(&root, "SessionStart", SESSION_START_COMMAND);
     let had_stop = hook_present(&root, "Stop", STOP_COMMAND);
-    let changed = add_managed_hooks(&mut root);
+    let changed = add_managed_hooks(&mut root, harness);
     if changed {
         write_settings(path, &root)?;
     }
@@ -996,12 +1243,12 @@ fn uninstall_merged_hooks(path: &Path) -> anyhow::Result<HooksReport> {
 /// on change. The file is Crystalline's by name, but an unparseable one is
 /// still a hard error naming the path rather than an overwrite: a person may
 /// have edited it.
-fn install_owned_hooks(path: &Path) -> anyhow::Result<HooksReport> {
+fn install_owned_hooks(harness: HarnessKind, path: &Path) -> anyhow::Result<HooksReport> {
     let mut root = read_settings(path)?;
     let had_session_start =
         owned_hook_present(&root, "SessionStart", SESSION_START_COMMAND_COPILOT);
     let had_stop = owned_hook_present(&root, "Stop", STOP_COMMAND);
-    let changed = add_owned_hooks(&mut root);
+    let changed = add_owned_hooks(&mut root, harness);
     if changed {
         write_settings(path, &root)?;
     }
@@ -2222,32 +2469,217 @@ mod tests {
         value.as_object().unwrap().clone()
     }
 
+    /// The two commands `install` writes for Claude Code, the harness the
+    /// merged-file tests stand in for. Spelled through the same helper the
+    /// install path uses, so a change to the spelling reaches every test at
+    /// once rather than being retyped in twenty places.
+    fn cc() -> [String; 2] {
+        managed_hook_commands(HarnessKind::ClaudeCode)
+    }
+
+    // --- ownership recognition -----------------------------------------------
+
+    /// Ownership is decided on leading words, so every spelling any release
+    /// has written is ours - and a longer word starting with one of them is
+    /// not. `crystalline hook stopwatch` is the whole reason the boundary is
+    /// a space rather than a bare `starts_with`.
+    #[test]
+    fn ownership_reads_leading_words_and_stops_at_a_word_boundary() {
+        for ours in [
+            SESSION_START_COMMAND,
+            STOP_COMMAND,
+            SESSION_START_COMMAND_COPILOT,
+            "crystalline prompt system --harness claude-code",
+            "crystalline hook stop --harness codex",
+            "crystalline prompt system --format copilot --harness copilot",
+            "crystalline hook stop --harness from-a-future-release",
+            "crystalline prompt system --workspace /repo",
+        ] {
+            assert!(
+                managed_command_kind(ours).is_some(),
+                "ours by leading words: {ours}"
+            );
+        }
+        for theirs in [
+            "crystalline hook stopwatch",
+            "crystalline prompt systemd",
+            "run crystalline prompt system please",
+            "crystalline",
+            "crystalline verify",
+        ] {
+            assert_eq!(managed_command_kind(theirs), None, "not ours: {theirs}");
+        }
+        assert_eq!(
+            managed_command_kind("crystalline hook stop --harness codex"),
+            Some(ManagedCommand::Stop)
+        );
+        assert_eq!(
+            managed_command_kind(SESSION_START_COMMAND_COPILOT),
+            Some(ManagedCommand::SessionStart)
+        );
+    }
+
+    /// Rewriting is the narrow half: only a spelling this project itself has
+    /// ever written may be replaced in place. Anything else that is ours by
+    /// leading words is left byte-identical, flags and all.
+    #[test]
+    fn only_a_spelling_we_wrote_may_be_rewritten() {
+        for ours in [
+            SESSION_START_COMMAND,
+            STOP_COMMAND,
+            SESSION_START_COMMAND_COPILOT,
+            "crystalline prompt system --harness claude-code",
+            "crystalline prompt system --format copilot --harness copilot",
+            "crystalline hook stop --harness codex",
+        ] {
+            assert!(is_own_spelling(ours), "we wrote this spelling: {ours}");
+        }
+        for theirs in [
+            "crystalline prompt system --workspace /repo",
+            "crystalline hook stop --harness pretend-harness",
+            "crystalline hook stop --harness claude-code --quiet",
+            "crystalline hook stop --verbose",
+            "crystalline hook stopwatch",
+        ] {
+            assert!(
+                !is_own_spelling(theirs),
+                "never rewritten out from under its author: {theirs}"
+            );
+        }
+    }
+
+    /// Each harness's pair carries its own id, and the Copilot routing form
+    /// keeps `--format copilot` beside the new flag rather than folding into
+    /// it.
+    #[test]
+    fn the_managed_commands_name_their_harness() {
+        assert_eq!(
+            managed_hook_commands(HarnessKind::ClaudeCode),
+            [
+                "crystalline prompt system --harness claude-code".to_string(),
+                "crystalline hook stop --harness claude-code".to_string(),
+            ]
+        );
+        assert_eq!(
+            managed_hook_commands(HarnessKind::Codex),
+            [
+                "crystalline prompt system --harness codex".to_string(),
+                "crystalline hook stop --harness codex".to_string(),
+            ]
+        );
+        assert_eq!(
+            managed_hook_commands(HarnessKind::Copilot),
+            [
+                "crystalline prompt system --format copilot --harness copilot".to_string(),
+                "crystalline hook stop --harness copilot".to_string(),
+            ]
+        );
+        for harness in [
+            HarnessKind::ClaudeCode,
+            HarnessKind::Codex,
+            HarnessKind::Copilot,
+        ] {
+            for command in managed_hook_commands(harness) {
+                assert!(
+                    is_own_spelling(&command),
+                    "what install writes is what a later version may rewrite: {command}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn add_creates_both_groups_and_is_idempotent() {
+        let [start, stop] = cc();
         let mut root = Map::new();
-        assert!(add_managed_hooks(&mut root), "first add changes the root");
+        assert!(
+            add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
+            "first add changes the root"
+        );
         assert!(hook_present(&root, "SessionStart", SESSION_START_COMMAND));
         assert!(hook_present(&root, "Stop", STOP_COMMAND));
-        // The exact managed shape, matcher and timeout included.
+        // The exact managed shape, matcher, harness flag and timeout included.
         assert_eq!(
             root["hooks"]["SessionStart"][0]["matcher"],
             SESSION_START_MATCHER
         );
         assert_eq!(
             root["hooks"]["SessionStart"][0]["hooks"][0]["command"],
-            SESSION_START_COMMAND
+            start.as_str()
         );
         assert_eq!(root["hooks"]["SessionStart"][0]["hooks"][0]["timeout"], 10);
         assert_eq!(
             root["hooks"]["Stop"][0]["hooks"][0]["command"],
-            STOP_COMMAND
+            stop.as_str()
         );
         // A Stop group carries no matcher.
         assert!(root["hooks"]["Stop"][0].get("matcher").is_none());
-        // Second add is a no-op.
+        // Second add is a no-op: the rewrite compares before it assigns.
         assert!(
-            !add_managed_hooks(&mut root),
+            !add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
             "second add must not change the root"
+        );
+    }
+
+    /// The upgrade case, and the whole point of the parametrized command: a
+    /// settings file written before `--harness` existed ends with exactly one
+    /// hook per event, carrying the current spelling, under whatever matcher
+    /// it already had.
+    #[test]
+    fn a_bare_command_from_an_older_release_is_rewritten_in_place() {
+        let [start, stop] = cc();
+        let mut root = root(json!({
+            "hooks": {
+                "SessionStart": [
+                    { "matcher": SESSION_START_MATCHER, "hooks": [ { "type": "command", "command": SESSION_START_COMMAND, "timeout": 10 } ] }
+                ],
+                "Stop": [
+                    { "hooks": [ { "type": "command", "command": STOP_COMMAND, "timeout": 10 } ] }
+                ]
+            }
+        }));
+        assert!(
+            add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
+            "an older spelling is a change"
+        );
+        let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1, "no second SessionStart group");
+        assert_eq!(session_start[0]["hooks"][0]["command"], start.as_str());
+        let stop_groups = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop_groups.len(), 1, "no second Stop group");
+        assert_eq!(stop_groups[0]["hooks"][0]["command"], stop.as_str());
+        // And the healed file is stable: a second pass changes nothing.
+        assert!(!add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+    }
+
+    /// A hook of ours carrying flags we never wrote is somebody's own
+    /// invocation: counted present, so nothing is appended beside it, and left
+    /// byte-identical, so the flags its author meant are not dropped. It is
+    /// still ours to remove on uninstall.
+    #[test]
+    fn a_hand_written_variant_is_recognized_but_never_rewritten() {
+        let hand_written = "crystalline prompt system --workspace /repo";
+        let mut root = root(json!({
+            "hooks": {
+                "SessionStart": [
+                    { "matcher": "startup", "hooks": [ { "type": "command", "command": hand_written } ] }
+                ]
+            }
+        }));
+        assert!(
+            add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
+            "only the Stop group is new"
+        );
+        let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1, "no duplicate beside it");
+        assert_eq!(
+            session_start[0]["hooks"][0]["command"], hand_written,
+            "a flag we never wrote is never dropped"
+        );
+        assert!(remove_managed_hooks(&mut root));
+        assert!(
+            !root.contains_key("hooks"),
+            "it is still ours to take back out on uninstall"
         );
     }
 
@@ -2262,8 +2694,10 @@ mod tests {
                 ]
             }
         }));
-        let changed = add_managed_hooks(&mut root);
-        // Only the Stop hook is new; SessionStart is already present.
+        let changed = add_managed_hooks(&mut root, HarnessKind::ClaudeCode);
+        // Only the Stop hook is new; SessionStart is already present, so its
+        // group is kept with its own matcher and only the command spelling is
+        // brought up to date.
         assert!(changed);
         let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(
@@ -2272,6 +2706,7 @@ mod tests {
             "no duplicate SessionStart group is added"
         );
         assert_eq!(session_start[0]["matcher"], "startup");
+        assert_eq!(session_start[0]["hooks"][0]["command"], cc()[0].as_str());
         assert!(hook_present(&root, "Stop", STOP_COMMAND));
     }
 
@@ -2287,7 +2722,7 @@ mod tests {
                 ]
             }
         }));
-        assert!(add_managed_hooks(&mut root));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
         // Foreign PreToolUse survives verbatim.
         assert_eq!(
             root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
@@ -2297,14 +2732,14 @@ mod tests {
         let stop = root["hooks"]["Stop"].as_array().unwrap();
         assert_eq!(stop.len(), 2);
         assert_eq!(stop[0]["hooks"][0]["command"], "my-own-stop");
-        assert_eq!(stop[1]["hooks"][0]["command"], STOP_COMMAND);
+        assert_eq!(stop[1]["hooks"][0]["command"], cc()[1].as_str());
         assert!(hook_present(&root, "SessionStart", SESSION_START_COMMAND));
     }
 
     #[test]
     fn remove_deletes_managed_and_prunes_the_hooks_object() {
         let mut root = Map::new();
-        add_managed_hooks(&mut root);
+        add_managed_hooks(&mut root, HarnessKind::ClaudeCode);
         assert!(remove_managed_hooks(&mut root));
         assert!(
             !root.contains_key("hooks"),
@@ -2321,7 +2756,7 @@ mod tests {
                 ]
             }
         }));
-        add_managed_hooks(&mut root);
+        add_managed_hooks(&mut root, HarnessKind::ClaudeCode);
         assert!(remove_managed_hooks(&mut root));
         assert!(!hook_present(&root, "SessionStart", SESSION_START_COMMAND));
         assert!(!hook_present(&root, "Stop", STOP_COMMAND));
@@ -2400,7 +2835,7 @@ mod tests {
             "model": "opus",
             "permissions": { "allow": ["Bash"] }
         }));
-        assert!(add_managed_hooks(&mut root));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
         assert_eq!(root["model"], "opus");
         assert_eq!(root["permissions"]["allow"][0], "Bash");
         assert!(hook_present(&root, "SessionStart", SESSION_START_COMMAND));
@@ -2420,7 +2855,7 @@ mod tests {
         let mut root = root(json!({ "hooks": 5 }));
         let before = root.clone();
         assert!(
-            !add_managed_hooks(&mut root),
+            !add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
             "a scalar hooks value blocks the add"
         );
         assert_eq!(
@@ -2443,7 +2878,7 @@ mod tests {
         // so the foreign string survives even though a fresh Stop group lands
         // beside it, and remove strips that Stop group again untouched.
         let mut root = root(json!({ "hooks": { "SessionStart": "not-an-array" } }));
-        assert!(add_managed_hooks(&mut root));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
         assert_eq!(
             root["hooks"]["SessionStart"], "not-an-array",
             "add never coerces the foreign scalar event value"
@@ -2466,13 +2901,13 @@ mod tests {
             { "matcher": "x", "hooks": [ { "type": "command", "command": "foreign" } ] }
         ]);
         let mut root = root(json!({ "hooks": { "SessionStart": foreign } }));
-        assert!(add_managed_hooks(&mut root));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
         let groups = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups[0], "a-string");
         assert_eq!(groups[1], 42);
         assert!(groups[2].is_null());
         assert_eq!(groups[3]["hooks"][0]["command"], "foreign");
-        assert_eq!(groups[4]["hooks"][0]["command"], SESSION_START_COMMAND);
+        assert_eq!(groups[4]["hooks"][0]["command"], cc()[0].as_str());
         // Remove strips only our appended group; the four foreign entries stay
         // in place and in order.
         assert!(remove_managed_hooks(&mut root));
@@ -2500,11 +2935,11 @@ mod tests {
                 ]
             }
         }));
-        assert!(add_managed_hooks(&mut root));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
         let groups = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups[0], json!({ "matcher": "x" }));
         assert_eq!(groups[1], json!({ "hooks": 7 }));
-        assert_eq!(groups[2]["hooks"][0]["command"], SESSION_START_COMMAND);
+        assert_eq!(groups[2]["hooks"][0]["command"], cc()[0].as_str());
         assert!(remove_managed_hooks(&mut root));
         assert_eq!(
             root["hooks"]["SessionStart"],
@@ -2538,9 +2973,9 @@ mod tests {
 
     #[test]
     fn a_command_that_only_contains_ours_is_never_matched() {
-        // Presence is an exact string test, not a substring one: a foreign
-        // command with our routing command embedded in it is neither counted as
-        // present by add nor pulled out by remove.
+        // Presence reads the command's leading words, never a substring: a
+        // foreign command with our routing command embedded in the middle of it
+        // is neither counted as present by add nor pulled out by remove.
         let foreign_cmd = "run crystalline prompt system please";
         let mut root = root(json!({
             "hooks": {
@@ -2557,11 +2992,11 @@ mod tests {
         assert_eq!(root, before, "remove leaves the substring command in place");
         // Add does not read it as already present, so our own group is appended
         // beside it.
-        assert!(add_managed_hooks(&mut root));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
         let groups = root["hooks"]["SessionStart"].as_array().unwrap();
         assert_eq!(groups.len(), 2, "ours is added beside the foreign group");
         assert_eq!(groups[0]["hooks"][0]["command"], foreign_cmd);
-        assert_eq!(groups[1]["hooks"][0]["command"], SESSION_START_COMMAND);
+        assert_eq!(groups[1]["hooks"][0]["command"], cc()[0].as_str());
         // Remove drops only ours; the substring command is still there.
         assert!(remove_managed_hooks(&mut root));
         let groups = root["hooks"]["SessionStart"].as_array().unwrap();
@@ -2603,21 +3038,25 @@ mod tests {
 
     #[test]
     fn add_owned_hooks_creates_the_exact_file_shape_and_is_idempotent() {
+        let [copilot_start, copilot_stop] = managed_hook_commands(HarnessKind::Copilot);
         let mut root = Map::new();
-        assert!(add_owned_hooks(&mut root), "first add changes the root");
+        assert!(
+            add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "first add changes the root"
+        );
         // The exact managed shape: the version marker, both PascalCase
-        // events, flat command entries with Copilot's field spellings and no
-        // matcher anywhere.
+        // events, flat command entries with Copilot's field spellings, the
+        // harness flag beside the format flag and no matcher anywhere.
         assert_eq!(root["version"], 1);
         let session_start = &root["hooks"]["SessionStart"][0];
         assert_eq!(session_start["type"], "command");
-        assert_eq!(session_start["command"], SESSION_START_COMMAND_COPILOT);
+        assert_eq!(session_start["command"], copilot_start.as_str());
         assert_eq!(session_start["timeoutSec"], 10);
         assert!(session_start.get("matcher").is_none());
         assert!(session_start.get("hooks").is_none(), "entries are flat");
         let stop = &root["hooks"]["Stop"][0];
         assert_eq!(stop["type"], "command");
-        assert_eq!(stop["command"], STOP_COMMAND);
+        assert_eq!(stop["command"], copilot_stop.as_str());
         assert_eq!(stop["timeoutSec"], 10);
         assert!(owned_hook_present(
             &root,
@@ -2626,7 +3065,7 @@ mod tests {
         ));
         assert!(owned_hook_present(&root, "Stop", STOP_COMMAND));
         assert!(
-            !add_owned_hooks(&mut root),
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
             "second add must not change the root"
         );
     }
@@ -2634,14 +3073,14 @@ mod tests {
     #[test]
     fn add_owned_hooks_keeps_a_hand_set_version_value() {
         let mut root = root(json!({ "version": 2 }));
-        assert!(add_owned_hooks(&mut root));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
         assert_eq!(root["version"], 2, "a present version is not fought over");
     }
 
     #[test]
     fn remove_owned_hooks_strips_ours_and_keeps_user_entries() {
         let mut root = Map::new();
-        add_owned_hooks(&mut root);
+        add_owned_hooks(&mut root, HarnessKind::Copilot);
         // A user entry inside our file, under a managed event and under an
         // event of their own.
         root["hooks"]["Stop"]
@@ -2680,25 +3119,269 @@ mod tests {
         // the version marker still counts as a change, but the hooks value
         // itself is never coerced.
         let mut root = root(json!({ "hooks": "not an object" }));
-        assert!(add_owned_hooks(&mut root), "the version marker is added");
+        assert!(
+            add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "the version marker is added"
+        );
         assert_eq!(root["hooks"], "not an object");
         assert!(!owned_hook_present(&root, "Stop", STOP_COMMAND));
     }
 
+    /// The upgrade path every existing Copilot install actually takes: the
+    /// owned file already carries the right commands in the spelling an older
+    /// release wrote, and both are brought up to the current one in place -
+    /// one entry per event, never a second appended beside the first.
     #[test]
-    fn owned_hook_present_is_an_exact_command_match() {
-        let mut root = Map::new();
-        add_owned_hooks(&mut root);
-        assert!(!owned_hook_present(
+    fn an_older_copilot_file_is_rewritten_in_place() {
+        let [copilot_start, copilot_stop] = managed_hook_commands(HarnessKind::Copilot);
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [ { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 10 } ],
+                "Stop": [ { "type": "command", "command": STOP_COMMAND, "timeoutSec": 10 } ]
+            }
+        }));
+        assert!(
+            add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "an older spelling is a change"
+        );
+        let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 1, "rewritten, not doubled");
+        assert_eq!(session_start[0]["command"], copilot_start.as_str());
+        assert_eq!(
+            session_start[0]["timeoutSec"], 10,
+            "the entry is repaired in place, timeout and all"
+        );
+        let stop = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(stop.len(), 1, "rewritten, not doubled");
+        assert_eq!(stop[0]["command"], copilot_stop.as_str());
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "the healed file is stable"
+        );
+    }
+
+    /// Presence tolerates flags trailing the command it is asked for, but
+    /// never the other way round: asking for the Copilot routing form means
+    /// the Copilot routing form. A plain `crystalline prompt system` in a
+    /// Copilot file produces text where an envelope is required, so it must
+    /// not satisfy the requirement - and install repairs it in place rather
+    /// than adding a second entry beside it.
+    #[test]
+    fn a_plain_routing_entry_in_a_copilot_file_is_upgraded_not_accepted() {
+        let [copilot_start, _] = managed_hook_commands(HarnessKind::Copilot);
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [ { "type": "command", "command": SESSION_START_COMMAND } ]
+            }
+        }));
+        assert!(
+            !owned_hook_present(&root, "SessionStart", SESSION_START_COMMAND_COPILOT),
+            "the plain command does not satisfy the envelope requirement"
+        );
+        assert!(
+            !owned_hook_present(
+                &root,
+                "SessionStart",
+                "crystalline prompt system --format copilot --extra"
+            ),
+            "nor does it satisfy a longer command it is only a prefix of"
+        );
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "repaired in place, not doubled");
+        assert_eq!(entries[0]["command"], copilot_start.as_str());
+        assert!(owned_hook_present(
             &root,
             "SessionStart",
-            SESSION_START_COMMAND
+            SESSION_START_COMMAND_COPILOT
         ));
-        assert!(!owned_hook_present(
-            &root,
-            "SessionStart",
-            "crystalline prompt system --format copilot --extra"
-        ));
+    }
+
+    /// A Copilot file holding both spellings of ours ends with one entry, not
+    /// two identical ones. The plain entry produced text Copilot drops, so
+    /// only the `--format copilot` entry was ever live; bringing both up to
+    /// the current command would make the second one live too and inject the
+    /// routing block twice per session.
+    #[test]
+    fn two_entries_of_ours_in_one_event_are_reduced_to_one() {
+        let [copilot_start, _] = managed_hook_commands(HarnessKind::Copilot);
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": SESSION_START_COMMAND },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 10 }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "the duplicate is dropped, not rewritten");
+        assert_eq!(entries[0]["command"], copilot_start.as_str());
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "the healed file is stable"
+        );
+    }
+
+    /// The surviving entry keeps the dropped one's timeout.
+    ///
+    /// The survivor is chosen by position and takes over the dropped entry's
+    /// command, so without this the real shape - a plain routing entry written
+    /// first and the `--format copilot` one, with the timeout on it, written
+    /// second - would leave a managed hook running on Copilot's default rather
+    /// than ours, with nothing that ever puts it back.
+    #[test]
+    fn the_surviving_entry_inherits_the_dropped_ones_timeout() {
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": SESSION_START_COMMAND },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 7 }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0]["timeoutSec"], 7,
+            "the timeout came from the entry that was dropped, not from its position"
+        );
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "and the healed file is stable"
+        );
+    }
+
+    /// A timeout the survivor already carries is its own, never overwritten by
+    /// one from a dropped entry.
+    #[test]
+    fn a_timeout_on_the_survivor_is_left_alone() {
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": SESSION_START_COMMAND, "timeoutSec": 3 },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT, "timeoutSec": 7 }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["timeoutSec"], 3);
+    }
+
+    /// Dropping the duplicate is a change even when the entry that survives
+    /// needed no rewriting, and the file is a byte-identical no-op once it
+    /// holds exactly one current entry.
+    #[test]
+    fn dropping_a_duplicate_entry_counts_as_a_change() {
+        let [copilot_start, copilot_stop] = managed_hook_commands(HarnessKind::Copilot);
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": copilot_start },
+                    { "type": "command", "command": copilot_start }
+                ],
+                "Stop": [ { "type": "command", "command": copilot_stop } ]
+            }
+        }));
+        assert!(
+            add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "a dropped duplicate is a change even with nothing to rewrite"
+        );
+        assert_eq!(root["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "and the reduced file is then a no-op"
+        );
+    }
+
+    /// The reduction only ever drops a spelling we wrote. A hand-written
+    /// variant beside one of ours keeps every character its author typed, and
+    /// an event carrying only such a variant still gets nothing appended
+    /// beside it.
+    #[test]
+    fn a_hand_written_owned_entry_is_never_dropped_as_a_duplicate() {
+        let [copilot_start, _] = managed_hook_commands(HarnessKind::Copilot);
+        let hand_written = "crystalline prompt system --workspace /repo";
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [
+                    { "type": "command", "command": hand_written },
+                    { "type": "command", "command": SESSION_START_COMMAND_COPILOT }
+                ]
+            }
+        }));
+        assert!(add_owned_hooks(&mut root, HarnessKind::Copilot));
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "the hand-written entry is not a duplicate"
+        );
+        assert_eq!(entries[0]["command"], hand_written);
+        assert_eq!(entries[1]["command"], copilot_start.as_str());
+    }
+
+    /// An owned file carrying only hand-written variants of ours is counted
+    /// present on both events: nothing is appended beside them and not a
+    /// character of them is rewritten.
+    #[test]
+    fn an_owned_file_of_hand_written_variants_alone_is_left_untouched() {
+        let hand_written = "crystalline prompt system --workspace /repo";
+        let hand_written_stop = "crystalline hook stop --quiet";
+        let mut root = root(json!({
+            "version": 1,
+            "hooks": {
+                "SessionStart": [ { "type": "command", "command": hand_written } ],
+                "Stop": [ { "type": "command", "command": hand_written_stop } ]
+            }
+        }));
+        assert!(
+            !add_owned_hooks(&mut root, HarnessKind::Copilot),
+            "counted present, so nothing is appended and nothing is rewritten"
+        );
+        let entries = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], hand_written);
+        assert_eq!(root["hooks"]["Stop"][0]["command"], hand_written_stop);
+    }
+
+    /// The merged path holds the same rewrite rule and deliberately not the
+    /// same cleanup: two hand-written hooks of ours in one event both ran
+    /// before this rule existed, so neither is deleted, and only the first is
+    /// brought up to the current spelling.
+    #[test]
+    fn a_second_managed_hook_in_one_event_is_left_as_its_author_wrote_it() {
+        let [start, _] = cc();
+        let mut root = root(json!({
+            "hooks": {
+                "SessionStart": [
+                    { "matcher": "startup", "hooks": [ { "type": "command", "command": SESSION_START_COMMAND } ] },
+                    { "matcher": "resume", "hooks": [ { "type": "command", "command": SESSION_START_COMMAND } ] }
+                ]
+            }
+        }));
+        assert!(add_managed_hooks(&mut root, HarnessKind::ClaudeCode));
+        let session_start = root["hooks"]["SessionStart"].as_array().unwrap();
+        assert_eq!(session_start.len(), 2, "no group is deleted");
+        assert_eq!(session_start[0]["hooks"][0]["command"], start.as_str());
+        assert_eq!(
+            session_start[1]["hooks"][0]["command"], SESSION_START_COMMAND,
+            "the second is left exactly as it was found"
+        );
+        assert!(
+            !add_managed_hooks(&mut root, HarnessKind::ClaudeCode),
+            "and it is not rewritten on the next run either"
+        );
     }
 
     // --- skill reconcile ------------------------------------------------

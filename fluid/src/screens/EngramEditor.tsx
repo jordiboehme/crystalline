@@ -26,7 +26,8 @@ import * as Y from "yjs";
 
 import { problemDetail } from "../api/client";
 import { domainTreeKey } from "../api/domain";
-import type { EngramDetail } from "../api/engram";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
+import type { EngramDetail, SimilarEngram } from "../api/engram";
 import { engramDetailKey, fetchEngramDetail } from "../api/engram";
 import { NEIGHBORHOOD_DEPTH, fetchGraph, graphKey } from "../api/graph";
 import type { Vocabulary } from "../api/vocabulary";
@@ -40,6 +41,7 @@ import { fileSpace, useCollabSession } from "../collab/useCollabSession";
 import { Breadcrumbs, crumbsOf } from "../components/Breadcrumbs";
 import { BUTTON, ICON_TOGGLE, Tooltip } from "../components/primitives";
 import { Skeleton } from "../components/Skeleton";
+import { SimilarEngramsPanel } from "../components/SimilarEngramsPanel";
 import CmEditor from "../editor/CmEditor";
 import { ConfirmLeaveDialog } from "../editor/ConfirmLeaveDialog";
 import { ConflictDialog } from "../editor/ConflictDialog";
@@ -551,6 +553,18 @@ function Surface({
    */
   const [attachError, setAttachError] = useState<string | null>(null);
   /**
+   * The nearest existing engrams the last save found itself close to, and
+   * the server's words on what to do about them - null when there is
+   * nothing to show, whether because the last save carried no advisory or
+   * because this one has already been dismissed. Local to this tab and
+   * never round-tripped: dismissing it does not tell the server anything,
+   * and the next save asks again from scratch.
+   */
+  const [advisory, setAdvisory] = useState<{
+    similar: SimilarEngram[];
+    guidance: string | null;
+  } | null>(null);
+  /**
    * The live buffer, for the upload flow. A ref rather than the `view` state
    * above, because the extensions are read once at mount and the handlers
    * inside them have to reach whatever view exists when a file is dropped.
@@ -568,9 +582,20 @@ function Surface({
     queryKey: graphKey(engram.domain, engram.permalink, NEIGHBORHOOD_DEPTH),
     queryFn: () => fetchGraph(engram.domain, engram.permalink),
   });
+  // Under the sidebar's own key, so this is a cache read rather than a
+  // request: the chips need it to tell `[[Log: Weekly Notes]]`, a title, from
+  // `[[ops:Runbook]]`, a domain, and only the registry knows which is which.
+  const domains = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
+  const domainNames = useMemo(
+    () => domains.data?.domains.map((entry) => entry.name),
+    [domains.data],
+  );
   const resolver = useMemo(
-    () => buildWikilinkResolver(engram, graph.data),
-    [engram, graph.data],
+    () => buildWikilinkResolver(engram, graph.data, domainNames),
+    [engram, graph.data, domainNames],
   );
   // `fullVocabularyKey` rather than `vocabularyKey`: `DomainHome` caches
   // `fetchTags` under the latter, a different shape, and the two landing on
@@ -678,6 +703,15 @@ function Surface({
       queryClient.setQueryData(
         engramDetailKey(saved.domain, saved.permalink),
         saved,
+      );
+      // What this save found itself close to, if anything: a fresh save
+      // answers with its own advisory or none, so this replaces whatever the
+      // last save (or this tab's own dismiss) left standing rather than
+      // merging with it.
+      setAdvisory(
+        saved.similar.length > 0
+          ? { similar: saved.similar, guidance: saved.guidance }
+          : null,
       );
       // A save is the fourth write that moves the tree, after create, move and
       // retire: the whole file is the document here, so one save can change
@@ -1069,6 +1103,31 @@ function Surface({
           )}
         </div>
       </header>
+      {/*
+        The save receipt's own advisory, drawn as a full-width panel like the
+        other post-header notices below rather than squeezed into the button
+        row the "Saved" tick stands in - that row is a line of small
+        controls, and a panel with a guidance sentence and a list of links
+        needs its own line. Guarded to the solo surface for the same reason
+        `advisory` is only ever set there: a room's autosave never reaches
+        the REST save route (3.2), so this can never fire while `inRoom`, but
+        the guard keeps that true by construction rather than by accident.
+      */}
+      {!inRoom && advisory && (
+        <SimilarEngramsPanel
+          similar={advisory.similar}
+          guidance={advisory.guidance}
+          onDismiss={() => {
+            setAdvisory(null);
+            // The Dismiss control is what held focus, and it leaves the
+            // document with the panel; without this the browser drops
+            // focus to `document.body` and the next Tab restarts at the
+            // top of the page instead of continuing from the buffer a
+            // keyboard reader was just in.
+            view?.focus();
+          }}
+        />
+      )}
       {session.hardErrors > 0 && (
         <p role="alert" className="text-sm text-red-800 dark:text-red-200">
           {String(session.hardErrors)} hard{" "}

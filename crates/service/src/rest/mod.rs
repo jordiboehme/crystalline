@@ -16,6 +16,12 @@ mod files;
 mod github_identity;
 mod github_settings;
 mod graph;
+mod identity_links;
+mod mcp_tokens;
+mod members;
+mod oauth;
+mod oauth_grants;
+mod oidc;
 mod users_api;
 
 use std::sync::Arc;
@@ -33,8 +39,20 @@ pub use error::{
     ApiError, ApiJson, ApiPath, ApiQuery, ConflictDetail, ProblemDetail, REVALIDATE, if_match,
     if_none_match_matches, precondition_failed,
 };
+/// The loopback names every tier answers to, shared with `daemon::http_config`
+/// so the transport's allow-list and the origin rule's cannot come apart.
+pub(crate) use oauth::ALWAYS_ALLOWED_HOSTS;
+pub use oauth::{
+    AUTHORIZATION_SERVER_PATH, AUTHORIZATIONS_PATH, AUTHORIZE_PATH, CONSENT_PAGE,
+    MAX_OAUTH_CLIENTS, MAX_REGISTER_BYTES, MAX_TOKEN_BYTES, OauthError, OauthServer, OriginRule,
+    PROTECTED_RESOURCE_PATH, REGISTER_PATH, REGISTRATION_BURST, REGISTRATION_WINDOW,
+    RegistrationLimiter, TOKEN_PATH, redirect_matches, redirect_uri_problem, resource_metadata_url,
+    well_known_routes,
+};
+pub use oidc::{OidcClaims, OidcClient, OidcSettings};
 
 use crate::engine::Engine;
+use crate::scope::{DomainAccess, DomainRight};
 
 /// The OpenAPI 3.1 document for this surface, assembled from the
 /// `#[utoipa::path]` annotation on every handler.
@@ -57,7 +75,10 @@ use crate::engine::Engine;
                        editor account and the `If-Match` token of the version \
                        being replaced, and account management needs an \
                        admin.\n\nEvery path but `/auth/login`, `/auth/logout`, \
-                       `/auth/me` and `/auth/setup` is closed by default: a \
+                       `/auth/me`, `/auth/setup`, `/auth/providers`, \
+                       `/oauth/register`, `/oauth/authorize`, \
+                       `/oauth/token` and the \
+                       two `/auth/oidc/*` routes is closed by default: a \
                        request that \
                        carries no identity is answered 401 ahead of routing, so \
                        an unauthenticated caller never learns which paths \
@@ -80,6 +101,7 @@ use crate::engine::Engine;
         (name = "maintenance", description = "The consolidation queue: what the knowledge needs next. Read-only."),
         (name = "users", description = "Account management. Admin only."),
         (name = "settings", description = "Instance settings. Admin only."),
+        (name = "oauth", description = "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."),
     ),
     paths(
         openapi_json,
@@ -87,9 +109,17 @@ use crate::engine::Engine;
         auth::logout,
         auth::me,
         auth::setup,
+        oidc::login,
+        oidc::callback,
+        oidc::providers,
         domains::list,
         domains_admin::create,
         domains_admin::remove,
+        domains_admin::set_visibility,
+        members::list,
+        members::set_member,
+        members::remove_member,
+        members::set_owner,
         domains_admin::sync_status,
         domains_admin::sync_now,
         domains_admin::sync_summary,
@@ -139,6 +169,20 @@ use crate::engine::Engine;
         github_identity::connect,
         github_identity::token,
         github_identity::disconnect,
+        mcp_tokens::list,
+        mcp_tokens::issue,
+        mcp_tokens::rotate,
+        mcp_tokens::revoke,
+        oidc::start_link,
+        oauth::register,
+        oauth::authorize,
+        oauth::authorization,
+        oauth::decide,
+        oauth_grants::list,
+        oauth_grants::revoke,
+        oauth::token,
+        identity_links::list,
+        identity_links::unlink,
     ),
     components(schemas(
         ProblemDetail,
@@ -147,6 +191,12 @@ use crate::engine::Engine;
         Role,
         domains::SaveManifestBody,
         domains_admin::CreateDomainBody,
+        domains_admin::VisibilityBody,
+        MemberLevel,
+        DomainMember,
+        members::MembersResponse,
+        members::MemberBody,
+        members::OwnerBody,
         domains_admin::ShareBody,
         domains_admin::WithdrawBody,
         domains_admin::ResolveBody,
@@ -167,6 +217,11 @@ use crate::engine::Engine;
         auth::LogoutResponse,
         auth::MeResponse,
         auth::SetupBody,
+        oidc::StartLinkResponse,
+        oidc::ProvidersResponse,
+        oidc::OidcProviderView,
+        IdentityLink,
+        identity_links::IdentityLinksResponse,
         users_api::CreateBody,
         users_api::PatchBody,
         users_api::PasswordBody,
@@ -176,6 +231,19 @@ use crate::engine::Engine;
         github_settings::GithubStatusResponse,
         github_settings::GithubPendingView,
         github_identity::GithubIdentityResponse,
+        McpTokenInfo,
+        mcp_tokens::IssueBody,
+        mcp_tokens::IssuedTokenResponse,
+        oauth::RegisterBody,
+        oauth::RegisteredClient,
+        oauth::OauthErrorBody,
+        oauth::AuthorizationView,
+        oauth::DecisionBody,
+        oauth::Decision,
+        oauth::DecisionResponse,
+        OauthGrantInfo,
+        oauth::TokenForm,
+        oauth::TokenResponse,
     )),
 )]
 struct ApiDoc;
@@ -201,8 +269,25 @@ pub struct RestState {
     /// than opened per request: it serializes its own database access, so a
     /// second store would only add handles on one small file.
     pub auth: Arc<AuthStore>,
+    /// The private-domain resolver this surface asks before it serves anything
+    /// a domain name addresses. Over the same store as `auth` above, and the
+    /// same resolver the engine holds, so a membership change takes effect on
+    /// the next request rather than at the next restart and both layers cannot
+    /// answer differently.
+    pub access: Arc<DomainAccess>,
     /// The auth settings as of startup. See [`AuthCfg`].
     pub auth_cfg: AuthCfg,
+    /// The OAuth surface, when `auth.oauth` is on. `None` is every instance
+    /// that has not turned it on, and the routes read this option rather than
+    /// the setting, so a running daemon serves the tier it came up in. See
+    /// [`oauth`].
+    pub oauth: Option<Arc<OauthServer>>,
+    /// The single sign-on relying party, when `auth.oidc` names a usable
+    /// provider. `None` is an instance with local accounts only, which is
+    /// every instance until someone configures one. Resolved at startup with
+    /// the rest of `auth.*`, so a running daemon serves the provider it came
+    /// up with. See [`oidc`].
+    pub oidc: Option<Arc<OidcClient>>,
     /// The open co-editing sessions, one registry for this process: the
     /// collab upgrade route joins rooms in it, and every save it makes goes
     /// back through the engine above.
@@ -217,30 +302,48 @@ pub struct RestState {
     /// Caps how many password verifications run at once. See
     /// [`LOGIN_SLOTS`].
     login_slots: Arc<Semaphore>,
-    /// Serializes domain create against domain unregister, process-wide. See
-    /// [`RestState::domain_admin`].
-    domain_admin: Arc<tokio::sync::Mutex<()>>,
-    /// The fence an unregistration raises against new co-editing joins. See
-    /// [`RestState::fence_joins`].
-    join_fence: Arc<tokio::sync::RwLock<()>>,
 }
 
 impl RestState {
     /// Assemble the state, resolving and validating the auth settings out of
     /// the engine's config. Fails when `auth.trusted_header` is not a usable
-    /// HTTP header name: the HTTP surface then refuses to come up, naming the
-    /// setting, rather than serving with a header that silently never matches.
-    pub fn new(engine: Arc<Engine>, auth: Arc<AuthStore>) -> anyhow::Result<RestState> {
-        let auth_cfg = AuthCfg::resolve(&engine.config())?;
+    /// HTTP header name, and when both header modes are configured at once:
+    /// the HTTP surface then refuses to come up, naming the settings, rather
+    /// than serving with a header that silently never matches or with two
+    /// answers to one question. The daemon itself keeps running and keeps
+    /// serving MCP over its socket; see `daemon::run`.
+    pub fn new(
+        engine: Arc<Engine>,
+        auth: Arc<AuthStore>,
+        allowed_hosts: &[String],
+    ) -> anyhow::Result<RestState> {
+        let config = engine.config();
+        let auth_cfg = AuthCfg::resolve(&config)?;
+        let oidc = OidcClient::new(&config)?;
+        let oauth = OauthServer::new(&config, allowed_hosts);
+        if oauth.is_some() {
+            // The registrations nobody used, collected once at startup as well
+            // as at every registration: an instance nobody connects to again
+            // would otherwise keep its abandoned rows forever. Detached; see
+            // [`oauth::prune_at_start`].
+            oauth::prune_at_start(auth.clone());
+        }
+        let collab = crate::collab::session::CollabSessions::new(engine.clone());
+        // The engine closes co-editing rooms itself when it unregisters a
+        // domain, whichever surface asked for the removal, so it needs the
+        // registry this state has just built. A `Weak` handle: see
+        // `Engine::set_collab_sessions`.
+        engine.set_collab_sessions(&collab);
         Ok(RestState {
-            collab: crate::collab::session::CollabSessions::new(engine.clone()),
+            collab,
             engine,
+            oauth,
+            oidc,
+            access: Arc::new(DomainAccess::new(auth.clone())),
             auth,
             auth_cfg,
             setup_token: None,
             login_slots: auth::login_slots(),
-            domain_admin: Arc::new(tokio::sync::Mutex::new(())),
-            join_fence: Arc::new(tokio::sync::RwLock::new(())),
         })
     }
 
@@ -274,58 +377,31 @@ impl RestState {
 
     /// Hold the domain-admin lock for the whole of a create or an unregister.
     ///
-    /// The engine has no serialization of its own across a same-name
-    /// `domain_add_*` and `domain_remove` (its `domain_remove` doc comment
-    /// records the race and points here): the remove persists the config,
-    /// releases both config locks and only then forgets the watcher entry and
-    /// clears the index rows, so an add of the same name landing inside that
-    /// window has its fresh registration and its freshly-indexed rows wiped
-    /// by the remove's tail. One lock over both handlers closes it for this
-    /// surface, which is the layer that has more than one caller.
+    /// The lock itself lives on the engine ([`Engine::domain_admin`]), which is
+    /// what makes this serialization real rather than surface-local: an
+    /// unregistration over MCP takes the same lock, so a REST create and an
+    /// agent's removal of the same name can no longer interleave. What it does
+    /// NOT close is a bare `domain_add_local`/`domain_add_virtual`/`origin_add`
+    /// racing a removal: those verbs take no lock of their own, and closing
+    /// that needs a per-name lock inside the engine (see
+    /// `Engine::domain_remove`'s known race).
     ///
     /// Deliberately NOT the join fence below. A team-domain create downloads
     /// and indexes a repository inside the request, which can run for
     /// minutes, and fencing co-editing joins for that long would hang every
     /// editor on the instance over a registration that closes no rooms. A
     /// create never sweeps anything, so it has no join window to close.
-    ///
-    /// Serializing "for this surface" is the whole claim: the mutex lives in
-    /// `RestState`, so it does NOT serialize the other callers of the same
-    /// engine verbs - MCP's `add_domain` (and the CLI) reach
-    /// `domain_add_local`/`domain_add_virtual` with no REST state in hand and
-    /// can still race a REST unregister into the engine window above. That is
-    /// accepted: closing it needs the per-name lock inside the engine, and
-    /// the REST surface is the one with more than one concurrent caller.
-    ///
-    /// Lock order where both are taken (unregister): this one, then
-    /// [`RestState::fence_joins`]. Nothing else takes both.
     pub(super) async fn domain_admin(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.domain_admin.lock().await
-    }
-
-    /// Raise the join fence: while this guard lives, no collab upgrade may
-    /// open a room, because [`RestState::join_pass`] is what the upgrade
-    /// route waits on before it joins.
-    ///
-    /// Held by an unregistration across its sweep and the engine's
-    /// `domain_remove`, which is what makes the sweep final rather than a
-    /// snapshot: a join already in flight finishes and inserts its room
-    /// before the guard is granted (so the sweep collects it), and a join
-    /// that arrives afterwards waits, then finds a domain that no longer
-    /// exists and is refused 404. The fence is process-wide rather than
-    /// per-domain because an unregistration is short and a second primitive
-    /// per domain name would buy nothing measurable.
-    pub(super) async fn fence_joins(&self) -> tokio::sync::RwLockWriteGuard<'_, ()> {
-        self.join_fence.write().await
+        self.engine.domain_admin().await
     }
 
     /// The pass a collab upgrade holds across its join, so a join and an
-    /// unregistration of the same domain cannot interleave. See
-    /// [`RestState::fence_joins`] for the argument this half completes; the
-    /// guard is dropped as soon as the join returns, never held across the
-    /// socket's life.
+    /// unregistration of the same domain cannot interleave. The fence's other
+    /// half is raised inside [`Engine::unregister_domain`]; see
+    /// [`Engine::fence_joins`] for the argument. The guard is dropped as soon
+    /// as the join returns, never held across the socket's life.
     pub(crate) async fn join_pass(&self) -> tokio::sync::RwLockReadGuard<'_, ()> {
-        self.join_fence.read().await
+        self.engine.join_pass().await
     }
 
     /// Run `work` holding one of the [`LOGIN_SLOTS`] password-work permits.
@@ -417,11 +493,92 @@ pub fn router(state: RestState) -> Router {
         // The first-run path: public, CSRF-exempt by path like login, and 410
         // for good once any account exists. See [`auth::setup`].
         .route("/auth/setup", post(auth::setup))
+        // Single sign-on: three public GETs, for the reason the four routes
+        // above are public. The callback's protection is the single-use state
+        // it generated and the cookie it bound to this browser, not a session
+        // that does not exist yet. See [`oidc`].
+        // One path, two verbs, and the difference is the whole security
+        // story: the GET starts an ordinary sign-in and is public, the POST
+        // starts a link and is an unsafe request by a signed-in account, so
+        // the CSRF gate covers it and no other origin can start one.
+        .route(oidc::LOGIN_PATH, get(oidc::login).post(oidc::start_link))
+        .route(oidc::CALLBACK_PATH, get(oidc::callback))
+        .route(oidc::PROVIDERS_PATH, get(oidc::providers))
+        // Dynamic client registration, public by path for the reason the four
+        // routes above are public: a client registers before anybody has
+        // signed in anywhere, so there is no session it could carry. It is
+        // NOT CSRF-exempt - a browser that happens to hold one still echoes
+        // its token - and it is bounded four ways rather than by an identity
+        // it cannot have. See [`oauth::register`].
+        //
+        // The body limit is its own, far below the mount's, and it is the
+        // route's first bound rather than a refinement: axum resolves
+        // extractors before a handler runs, so the burst limiter inside the
+        // handler cannot decline to have buffered and parsed what arrived.
+        // This can. The largest legal registration is ten 2048-character uris
+        // beside a 100-character name, so 64 KiB is room to spare, and this is
+        // the one write on the surface an anonymous caller can make.
+        .route(
+            oauth::REGISTER_PATH,
+            post(oauth::register).route_layer(DefaultBodyLimit::max(oauth::MAX_REGISTER_BYTES)),
+        )
+        // The authorization endpoint, public by path for the reason
+        // registration is: the browser a client sends here may have no session
+        // yet, and Fluid carries it to the login page and back. Nothing is
+        // granted by it - it answers a redirect to the consent screen, which
+        // is where an account appears. See [`oauth::authorize`].
+        .route(oauth::AUTHORIZE_PATH, get(oauth::authorize))
+        // The consent pair, and NOT public: the whole point is that a person
+        // decides, so both verbs need an account (any role), and the POST is
+        // an unsafe request that the guard's CSRF rule covers like every
+        // other.
+        .route(
+            oauth::AUTHORIZATIONS_PATH,
+            get(oauth::authorization).post(oauth::decide),
+        )
+        // The token endpoint, public by path for the reason the two routes
+        // above it are: the caller is a program that has never signed in here
+        // and never will - what it takes away from this route is what it
+        // authenticates with afterwards. It is NOT CSRF-exempt either, so a
+        // page on another origin cannot drive an exchange from a signed-in
+        // visitor's browser. Its own body limit, for the reason registration
+        // has one: an anonymous caller decides how much of it arrives, and the
+        // extractor has parsed the body before any rule in the handler runs.
+        .route(
+            oauth::TOKEN_PATH,
+            post(oauth::token).route_layer(DefaultBodyLimit::max(oauth::MAX_TOKEN_BYTES)),
+        )
         .route("/domains", get(domains::list).post(domains_admin::create))
         // Admin only, enforced in the handler like every other admin route
         // here. Registered before the domain sub-paths for readability only;
         // axum's router is order-independent.
         .route("/domains/{domain}", delete(domains_admin::remove))
+        // Whether a domain is private, and the two directions are gated
+        // differently. PRIVATIZING is admin only: it hands the domain to the
+        // caller, so a shared domain would otherwise be seized by whoever
+        // asked first. RE-SHARING is served to the domain's own OWNER as well
+        // as to an admin - they already see everything in it. A manager does
+        // neither: it invites people and changes their levels, and deciding
+        // who holds a domain is not one domain's administration to settle.
+        // The split is documented in full on
+        // [`domains_admin::set_visibility`].
+        .route(
+            "/domains/{domain}/visibility",
+            put(domains_admin::set_visibility),
+        )
+        // Who may reach a private domain. The listing is open to anyone who
+        // may see the domain at all (a viewer-level member sees who else is
+        // here); inviting, re-levelling and evicting need `Manage`, with the
+        // one exception that a member may always remove ITSELF; and handing
+        // the domain on needs `Own`. Every one of them answers 404 for a
+        // domain the caller may not see, exactly as an unregistered name
+        // does. See [`members`].
+        .route("/domains/{domain}/members", get(members::list))
+        .route(
+            "/domains/{domain}/members/{principal}",
+            put(members::set_member).delete(members::remove_member),
+        )
+        .route("/domains/{domain}/owner", put(members::set_owner))
         // Admin only as well. The GET is a pure read and stays served on a
         // read-only instance; the POST is a pull that writes, and does not.
         .route(
@@ -582,6 +739,45 @@ pub fn router(state: RestState) -> Router {
             post(github_identity::connect),
         )
         .route("/me/github-identity/token", put(github_identity::token))
+        // The other half of the same self-service idea: the tokens this
+        // account's AGENTS authenticate with when `auth.mcp` is on. Open to
+        // every signed-in account, viewers included - an agent acts as the
+        // account that issued its token, so a viewer's agent is read-only by
+        // construction - and to no anonymous caller, which has no account to
+        // issue for. No name in the path, for the reason the identity routes
+        // above carry none: the session already names the account, so a
+        // caller can only ever reach its own. All four are served on a
+        // read-only instance, which is this surface's one departure from the
+        // rule that read-only refuses every unsafe method: that setting
+        // protects the knowledge, a token is account state in the accounts
+        // database rather than knowledge, and a read-only team server with
+        // `auth.mcp` on is exactly where an agent cannot connect at all
+        // without one.
+        .route(
+            "/me/mcp-tokens",
+            get(mcp_tokens::list).post(mcp_tokens::issue),
+        )
+        .route("/me/mcp-tokens/{id}/rotate", post(mcp_tokens::rotate))
+        .route("/me/mcp-tokens/{id}", delete(mcp_tokens::revoke))
+        // The caller's own OAuth grants - the clients connected through
+        // `/oauth/authorize` - on the exact settlement the token routes above
+        // carry: self-service, every account included, served on a
+        // read-only instance because a grant is account state rather than
+        // knowledge. Revoking deletes the row outright, so both of its
+        // tokens stop resolving at the MCP gate on the very next request.
+        .route("/me/oauth-grants", get(oauth_grants::list))
+        .route("/me/oauth-grants/{id}", delete(oauth_grants::revoke))
+        // The caller's own single sign-on identities, on the same settlement
+        // as the tokens above: self-service, every account included, and
+        // served on a read-only instance because a link is account state
+        // rather than knowledge. Making one is not here - that is the sign-on
+        // itself, which is the only thing that can prove the identity is the
+        // caller's.
+        .route("/me/identity-links", get(identity_links::list))
+        .route(
+            "/me/identity-links/{issuer}",
+            delete(identity_links::unlink),
+        )
         .fallback(unknown_path)
         // Applies to every method router registered above it, so it stays
         // below the routes and above the guard.
@@ -654,8 +850,18 @@ async fn wrong_method() -> ApiError {
     ApiError::method_not_allowed()
 }
 
-/// Refuse a mutation on a read-only instance, ahead of every other check that
-/// would otherwise touch the store, the config or a credential.
+/// Refuse a mutation on a read-only instance, ahead of every check that reads
+/// the config, a credential or the domain's content.
+///
+/// The one thing that may run before it is the domain gate below, and on four
+/// routes it does ([`files::write`], [`files::remove`] and the two evolve
+/// acknowledgments): a domain the caller may not see must answer the 404 an
+/// unregistered name answers, on a read-only instance exactly as on a writable
+/// one, and it cannot do that from behind a 403 that names the instance's
+/// mode. It costs two membership reads on a request that was going to be
+/// refused; it buys an answer that does not vary with a setting the caller can
+/// observe. The routes that kept the old order are the ones where both checks
+/// answer 403 anyway, so nothing there is worth reordering.
 ///
 /// One spelling for every admin module rather than one per module, so a
 /// read-only instance answers the same way whichever settings surface was
@@ -670,6 +876,109 @@ pub(super) fn refuse_read_only(state: &RestState) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+/// Refuse a request that names a domain this caller may not see, in the words
+/// a domain nobody registered is refused with.
+///
+/// The equality is the point, so it is one call rather than two messages kept
+/// in step: `Engine::require_domain` raises its `UnknownDomain` for a hidden
+/// name and for an unregistered one alike, and the registered set that error
+/// lists already has the caller's hidden domains taken out of it. A hidden
+/// domain therefore answers 404 and never 403 - being told "forbidden" would
+/// confirm the existence the privacy is for.
+///
+/// Every domain-addressed route whose engine verb is not itself scoped opens
+/// with this: the MANIFEST read, the attachment listing and bytes, the inbound
+/// list's siblings. A resolver that cannot answer propagates as a 500 through
+/// the engine's `EngineError::Internal`, so this fails closed.
+pub(super) async fn require_domain_read(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<(), ApiError> {
+    state
+        .engine
+        .require_domain(domain, &identity.scope())
+        .await?;
+    Ok(())
+}
+
+/// The caller, when the request may mutate content in `domain`.
+///
+/// Three refusals in the order they have to happen:
+///
+/// 1. a domain this caller may not see is the 404 above, decided before
+///    anything else, so a stranger writing to a private domain learns exactly
+///    what a stranger writing to a domain nobody registered learns;
+/// 2. then the instance role, unchanged: a domain invitation widens what an
+///    account may *reach*, never what its instance role lets it *do*, so a
+///    domain editor who is an instance viewer is still refused here;
+/// 3. then the membership level, which is what a private domain adds. The
+///    message names the level the caller holds, because "forbidden" on a
+///    domain they can see and read is otherwise indistinguishable from a bug.
+///
+/// Step 3 can only fire on a private domain. On a shared one the right is the
+/// instance role's own (the policy in `crate::scope`), so a caller past step 2
+/// holds `Write` or better by construction.
+///
+/// Two routes carry no domain gate of any kind, deliberately: saving a domain's
+/// MANIFEST and the origin pull. Both are `require_admin`, and an instance
+/// admin resolves to [`DomainRight::Own`] on every domain, private ones
+/// included, so a gate there is a store round trip that cannot refuse. If that
+/// early return is ever narrowed, those two are what has to be revisited -
+/// which is why this sentence sits here rather than nowhere.
+///
+/// `DELETE /domains/{domain}` used to be the third. It is not admin-only any
+/// more: it runs `Identity::require_account` and hands the decision to
+/// `Engine::unregister_domain`, whose `require_domain_owner` is owner-or-admin
+/// and is the same rule the MCP verb and the CLI remove through. So its gate is
+/// the engine's rather than absent. The share surfaces beside them are NOT in that set: their gate
+/// moves with `github.share_identity`, so an instance editor reaches them in
+/// personal mode, and they carry a domain gate of their own.
+pub(super) async fn require_domain_write(
+    state: &RestState,
+    identity: &Identity,
+    domain: &str,
+) -> Result<Caller, ApiError> {
+    let scope = identity.scope();
+    state.engine.require_domain(domain, &scope).await?;
+    let caller = identity.require_editor()?;
+    // The capped right rather than the bare domain answer, so this gate and the
+    // MCP one are one rule with one spelling (`DomainAccess::write_right`).
+    // `require_editor` above already refuses every account the cap would catch,
+    // so nothing here changes what this route answers; what it buys is that the
+    // rule cannot drift apart from the other surface's copy of it again.
+    let right = state
+        .access
+        .write_right(&scope, domain)
+        .await
+        // Never a fallback: a write that cannot learn what its caller may do
+        // refuses rather than proceeding on an assumption.
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Write {
+        return Err(ApiError::forbidden(format!(
+            "your membership on this domain is {}, and editor access is required",
+            member_level_word(right)
+        )));
+    }
+    Ok(caller)
+}
+
+/// What a caller holding this right is called on the domain, for a refusal
+/// that has to name it. Only [`DomainRight::Read`] reaches a message today;
+/// the rest are spelled out so the mapping is complete rather than a default
+/// arm that would print "viewer" for something else one day.
+pub(crate) fn member_level_word(right: DomainRight) -> &'static str {
+    match right {
+        DomainRight::None => "none",
+        DomainRight::Read => "viewer",
+        DomainRight::Write => "editor",
+        DomainRight::Manage => "manager",
+        DomainRight::Own => "owner",
+    }
 }
 
 /// Refuse an empty password before it is hashed into an account nobody can log
@@ -734,7 +1043,7 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        (dir, RestState::new(engine, auth).unwrap())
+        (dir, RestState::new(engine, auth, &[]).unwrap())
     }
 
     /// The cap the admin routes borrow: whatever calls

@@ -353,9 +353,15 @@ const components: Components = {
     <ol className="my-3 list-decimal pl-6 leading-relaxed">{children}</ol>
   ),
   li: ({ children }) => <li className="my-1">{structuredBullet(children)}</li>,
-  span: ({ children, node }) =>
-    // The only spans in this tree are the wikilink rewrite's own: raw HTML
-    // stays text here, so nothing in an engram can write one.
+  span: ({ children, className, node }) =>
+    // Two sources make spans in this tree, both plugin-generated rather than
+    // raw HTML an engram could write: the wikilink rewrite's own markers, and
+    // rehype-highlight's per-token spans inside a fenced code block (the
+    // `.hljs-string` etc. classes `index.css`'s syntax palette styles). The
+    // wikilink case gets its own fixed look; everything else has to keep
+    // whatever class it arrived with; passing an incoming `className` through
+    // unconditionally, rather than dropping it, is what makes a code fence
+    // render in color instead of the page's plain text color.
     wikilinkKind(node) === "unresolved" ? (
       <span
         title="not resolved"
@@ -364,7 +370,7 @@ const components: Components = {
         {children}
       </span>
     ) : (
-      <span>{children}</span>
+      <span className={className}>{children}</span>
     ),
   blockquote: ({ children }) => (
     <blockquote className="my-3 border-l-2 border-slate-300 pl-4 text-slate-600 dark:border-slate-700 dark:text-slate-300">

@@ -92,8 +92,12 @@ async fn serve(opts: Options) -> Fixture {
         domains_root: Some(root.join("domains-root")),
         auth: Some(AuthConfig {
             trusted_header: None,
+            proxy_headers: None,
             anonymous: Some(opts.anonymous),
+            mcp: None,
+            oauth: None,
             max_users: None,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };

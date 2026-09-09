@@ -5,7 +5,7 @@
 //! it well organized?". This module is that third question, expressed as
 //! detectors over prepared facts.
 //!
-//! Three families, one letter each way:
+//! Three families, four letters:
 //!
 //! - `V0xx` **temporal and lifecycle** - a validity window that closed, a
 //!   staleness date that elapsed, a replacement that landed without the
@@ -13,11 +13,13 @@
 //! - `V1xx` **structural integrity** - unresolved references, one-sided
 //!   reciprocal relations, orphans, stubs, oversized engrams;
 //! - `V2xx` **redundancy and drift** - near-duplicate bodies, colliding titles,
-//!   tag spellings that drifted apart.
-//!
-//! `V3xx` is reserved for semantic contradiction between engram pairs and is
-//! deliberately not implemented here: this sweep detects by dates, links and
-//! graph shape, never by meaning, so it can never confirm a contradiction.
+//!   tag spellings that drifted apart;
+//! - `V3xx` **meaning** - `V301`, two current engrams whose lead embeddings
+//!   sit at or above the twin threshold: knowledge that says the same thing
+//!   twice in different words. Filed under the redundancy family, because
+//!   that is what it is. It compares meaning to find twins and still never
+//!   confirms a contradiction, which no rule here can: two texts close in
+//!   embedding space agree about their topic, not about what is true.
 //!
 //! # Detect and guide, never auto-consolidate
 //!
@@ -44,6 +46,7 @@
 //! living in the index crate because its inputs speak the index's vocabulary.
 
 pub mod dedupe;
+pub mod twins;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -77,6 +80,32 @@ pub const ORPHAN_MIN_AGE_DAYS: i64 = 14;
 /// for `V201`. Higher than verify's `Q004` section threshold because a whole
 /// engram has far more room to agree by accident than one section does.
 pub const DUP_THRESHOLD: f64 = 0.80;
+
+/// The lead-vector cosine at or above which `V301` calls two engrams twins.
+/// Above the band where the one published measurement put ordinary related
+/// neighbours (median 0.84, p95 0.90), so a twin is a strong claim; the
+/// finding is judgment class and pair-scoped, so a wrong one costs one
+/// acknowledgment.
+pub const TWIN_THRESHOLD: f64 = 0.88;
+
+/// The most lead vectors `V301` will compare in one domain. All pairs is
+/// quadratic; above this the rule reports a truncation and skips.
+pub const MAX_TWIN_VECTORS: usize = 5000;
+
+/// The most pairs `V301`'s twin pass keeps while it scans, closest first. The
+/// vector cap bounds the comparisons; this bounds what they produce, because a
+/// scope dense enough that most pairs clear the threshold would otherwise
+/// materialize millions of them to hand back ten.
+///
+/// Far above [`MAX_TWIN_FINDINGS`] on purpose. The `V201` suppression runs
+/// after the pass returns, so the retained list has to carry enough clustered
+/// pairs for ten unclustered ones to survive; a cluster of `k` members
+/// contributes only `k * (k - 1) / 2` of them, so this slack covers any
+/// plausible one and still costs about 24 KB.
+pub const MAX_TWIN_PAIRS: usize = 1000;
+
+/// The most `V301` findings one domain sweep emits, closest pairs first.
+pub const MAX_TWIN_FINDINGS: usize = 10;
 
 /// The shortest normalized body `V201` will score. Below this the Dice
 /// coefficient is dominated by common English bigrams and two unrelated stubs
@@ -174,9 +203,16 @@ pub const SHARE_STALE_DAYS: i64 = 7;
 
 /// The reciprocal relation pairs `V103` checks, forward first. A resolved
 /// forward edge without its converse is a half-wired relation.
-pub const RECIPROCAL_PAIRS: [(&str, &str); 2] = [
+///
+/// The split pair reads the same way round as the other two: the engram that
+/// was split out declares `derived_from` pointing at its source, so the source
+/// is the engram that owes the `split_into` back-link and the finding attaches
+/// there. `split_engram` writes both halves at once, so a one-sided split pair
+/// only ever comes from a link somebody wrote by hand.
+pub const RECIPROCAL_PAIRS: [(&str, &str); 3] = [
     ("supersedes", "superseded_by"),
     ("summarizes", "summarized_by"),
+    ("derived_from", "split_into"),
 ];
 
 // ---------------------------------------------------------------------------
@@ -191,7 +227,8 @@ pub enum Family {
     Temporal,
     /// `V1xx`: references, reciprocity, orphans, stubs and size.
     Structure,
-    /// `V2xx`: duplicate content, colliding titles and tag drift.
+    /// `V2xx` and `V301`: duplicate content, semantic twins, colliding titles
+    /// and tag drift.
     Redundancy,
 }
 
@@ -269,7 +306,7 @@ pub struct RuleInfo {
 
 /// The full rule catalog, in id order. The single place a base priority or a
 /// prescribed action is written down.
-pub const RULES: [RuleInfo; 20] = [
+pub const RULES: [RuleInfo; 22] = [
     RuleInfo {
         id: "V001",
         family: Family::Temporal,
@@ -332,6 +369,13 @@ pub const RULES: [RuleInfo; 20] = [
         base: 40,
         summary: "unshared work aging",
         instruction: "Knowledge written here has not reached the team's copy. Propose sharing it with share_changes (the CLI verb is `crystalline origin share`) so the domain owner can review it and the team's archive stays current, and wait for a yes. Sharing publishes somebody's work under review, so it is never done unasked. A generated folder listing never counts as a reason to share.",
+    },
+    RuleInfo {
+        id: "V010",
+        family: Family::Temporal,
+        base: 55,
+        summary: "carry-forward gap",
+        instruction: "A retired engram holds observations that appear in no live engram of its domain, so whatever still holds in them retires with it. Read them. Move the ones that still hold into their own engram with split_engram, which writes the derived_from and split_into pair for you, or acknowledge the drop with evolve_ack when they expired along with the rest. The comparison is on text alone and never on meaning, so a fact somebody carried forward in different words looks missing here.",
     },
     RuleInfo {
         id: "V101",
@@ -410,6 +454,13 @@ pub const RULES: [RuleInfo; 20] = [
         summary: "tag drift",
         instruction: "One concept is spelled several ways in the tag vocabulary. Hand the user the exact merge command and let them run it. Never bulk-rewrite tags across engrams.",
     },
+    RuleInfo {
+        id: "V301",
+        family: Family::Redundancy,
+        base: 75,
+        summary: "semantic twins",
+        instruction: "These two current engrams say close to the same thing by meaning though their wording differs. Similarity is not a contradiction: this sweep still cannot confirm one. Read both. If one owns the topic, merge into it and supersede the other after repointing every inbound link. If they disagree on a fact, reconcile per the capture skill's falsification test. If they are genuinely distinct, link them and acknowledge with evolve_ack V301 so the finding stops.",
+    },
 ];
 
 /// The catalog entry for a rule id, or `None` when the id is unknown.
@@ -423,6 +474,27 @@ pub fn rule_info(id: &str) -> Option<&'static RuleInfo> {
 /// avoid commas for.
 const SCOPE_SEPARATOR: &str = ", ";
 
+/// Whether `rule` is acknowledged **per pair** rather than per engram.
+///
+/// `V301` is the one, and the distinction is about what an acknowledgment
+/// answers for rather than about how often a rule fires. Every other rule's
+/// acknowledgment is the engram's answer about that rule: re-acknowledging
+/// replaces the entry, and an entry whose scope no longer matches is that
+/// answer gone stale, which is what [`apply_acknowledgments`] reports. That
+/// holds even where such a rule fires more than once on one engram, as `V103`
+/// does over the three [`RECIPROCAL_PAIRS`]: those findings share the one
+/// answer, so acknowledging the second replaces the first and leaves the other
+/// marked stale wearing its note. An engram that twins two others carries two
+/// `V301` findings and neither one is an answer about the engram, so a twin
+/// acknowledgment is stored per pair and a pair with no entry of its own is a
+/// plain finding rather than a stale one - nobody has answered it yet.
+///
+/// Read by the sweep here and by the engine's `evolve_ack` write path, which
+/// keys its entries the same way. One predicate, so the two cannot drift.
+pub fn is_pair_scoped(rule: &str) -> bool {
+    rule.eq_ignore_ascii_case("V301")
+}
+
 /// The stable discriminator for a finding: the evidence an acknowledgment was
 /// given for, in a form that survives an unrelated edit and changes the moment
 /// the evidence does.
@@ -430,11 +502,13 @@ const SCOPE_SEPARATOR: &str = ", ";
 /// One match for the whole catalog, deliberately. The rules that carry a scope
 /// pass their material in and this decides the shape:
 ///
-/// - `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
+/// - `V010` (the normalized text of the observations that survive nowhere),
+///   `V101` (the retired targets), `V102` (the unresolved targets), `V103` (the
 ///   counterparts), `V107` (the missing attachment paths), `V201` (the cluster
-///   members) and `V202` (the colliding titles) are **sets**, so the parts are
-///   sorted and deduplicated before joining: reordering the links in a body must
-///   not re-raise an acknowledged finding, while a new member must;
+///   members), `V202` (the colliding titles) and `V301` (the twin pair) are
+///   **sets**, so the parts are sorted and deduplicated before joining:
+///   reordering the links in a body must not re-raise an acknowledged finding,
+///   while a new member must;
 /// - `V007` and `V008` name **one attachment path**, so the first part is the
 ///   whole scope;
 /// - every other rule's identity is just (engram, rule) - the plain temporal
@@ -443,7 +517,7 @@ const SCOPE_SEPARATOR: &str = ", ";
 ///   looks like next time.
 fn scope_for(rule: &str, mut parts: Vec<String>) -> String {
     match rule {
-        "V101" | "V102" | "V103" | "V107" | "V201" | "V202" => {
+        "V010" | "V101" | "V102" | "V103" | "V107" | "V201" | "V202" | "V301" => {
             parts.sort();
             parts.dedup();
             parts.join(SCOPE_SEPARATOR)
@@ -485,7 +559,7 @@ pub struct AckCounts {
     pub temporal: usize,
     /// Suppressed `V1xx` findings.
     pub structure: usize,
-    /// Suppressed `V2xx` findings.
+    /// Suppressed redundancy findings: `V2xx` and `V301`.
     pub redundancy: usize,
 }
 
@@ -499,6 +573,22 @@ impl AckCounts {
             Family::Redundancy => self.redundancy += 1,
         }
     }
+}
+
+/// One observation bullet as `V010` reads it: where it sits and what it says.
+///
+/// The text is the parser's own [`crystalline_core::Observation::content`],
+/// which already has the `[category]` token and the trailing `#tags` taken off,
+/// so the rule compares what the bullet asserts rather than how it was
+/// decorated. Normalizing is the detector's job, not the assembler's, so the
+/// fact stays the verbatim line a reader would recognize.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FactObservation {
+    /// The one-based line in the source file, the number `read_engram` reports
+    /// and `split_engram` accepts.
+    pub line: usize,
+    /// The observation's content, tags and category already stripped.
+    pub text: String,
 }
 
 /// Everything the rules read about one engram, resolved once by the engine so
@@ -551,6 +641,10 @@ pub struct EngramFacts {
     pub verified_on: Option<NaiveDate>,
     /// The body text, frontmatter excluded.
     pub body: String,
+    /// The engram's top-level observation bullets, in file order. `V010` is
+    /// the only rule that reads them: every other rule that looks at content
+    /// looks at [`EngramFacts::body`].
+    pub observations: Vec<FactObservation>,
     /// The approximate token count, `body.chars() / 4`, the same estimate
     /// verify's `Q002` uses.
     pub tokens: usize,
@@ -583,6 +677,10 @@ pub struct EngramFacts {
     /// intentional. Malformed entries never reach here - the engine skips them
     /// rather than failing a sweep over a hand-edited line.
     pub acks: Vec<AckEntry>,
+    /// The embedding of the engram's first chunk for the active model, when
+    /// one is stored. `None` keeps the engram out of `V301` and nothing else;
+    /// the engine leaves it `None` when no provider is installed.
+    pub lead_vector: Option<Vec<f32>>,
 }
 
 impl EngramFacts {
@@ -611,6 +709,7 @@ impl EngramFacts {
             stale_on: None,
             verified_on: None,
             body: String::new(),
+            observations: Vec::new(),
             tokens: 0,
             token_budget: DEFAULT_TOKEN_BUDGET,
             inbound: 0,
@@ -620,6 +719,7 @@ impl EngramFacts {
             analyzed_hash: None,
             asset_refs: Vec::new(),
             acks: Vec::new(),
+            lead_vector: None,
         }
     }
 
@@ -714,6 +814,16 @@ pub struct SweepOptions {
     pub minhash_rows: usize,
     /// See [`SHARE_STALE_DAYS`].
     pub share_stale_days: i64,
+    /// See [`TWIN_THRESHOLD`].
+    pub twin_threshold: f64,
+    /// See [`MAX_TWIN_VECTORS`].
+    pub max_twin_vectors: usize,
+    /// See [`MAX_TWIN_PAIRS`]. Keep it above `max_twin_findings`: it bounds
+    /// what the pass retains, and the `V201` suppression eats into that
+    /// afterwards.
+    pub max_twin_pairs: usize,
+    /// See [`MAX_TWIN_FINDINGS`].
+    pub max_twin_findings: usize,
 }
 
 impl Default for SweepOptions {
@@ -731,6 +841,10 @@ impl Default for SweepOptions {
             minhash_bands: MINHASH_BANDS,
             minhash_rows: MINHASH_BAND_ROWS,
             share_stale_days: SHARE_STALE_DAYS,
+            twin_threshold: TWIN_THRESHOLD,
+            max_twin_vectors: MAX_TWIN_VECTORS,
+            max_twin_pairs: MAX_TWIN_PAIRS,
+            max_twin_findings: MAX_TWIN_FINDINGS,
         }
     }
 }
@@ -859,8 +973,15 @@ pub struct Finding {
     /// rule in [`RuleInfo::instruction`] rather than being repeated here.
     pub fix: String,
     /// The evidence discriminator an acknowledgment is matched against, per
-    /// [`scope_for`]. Internal: it exists so an acknowledgment can hold while
-    /// the evidence holds, and no surface renders it as a column.
+    /// [`scope_for`]. It exists so an acknowledgment can hold while the
+    /// evidence holds.
+    ///
+    /// Skipped by the derived serialization, and rendered as a column by one
+    /// surface only: the queue row of a [pair-scoped](is_pair_scoped) rule,
+    /// where it is what tells two findings on one engram apart and so what a
+    /// caller sends back to acknowledge the one it read. Every other rule
+    /// answers for its engram alone, so its scope stays the internal
+    /// discriminator it always was.
     #[serde(skip)]
     pub scope: String,
     /// An acknowledgment matched and this finding is only here because the
@@ -1024,6 +1145,14 @@ pub fn priority(base: u8, salience: Option<f64>, inbound: usize, human_authored:
 /// Sort findings into queue order: priority descending, then rule, domain and
 /// permalink ascending. The sort is stable, so findings a rule emitted in a
 /// deterministic order keep that order when every key ties.
+///
+/// **That stability is load-bearing, not a convenience.** Two `V301` findings
+/// on one engram tie on every key here - same anchor, so the same priority -
+/// and the engine's `evolve_ack` write path acknowledges "the first finding
+/// still standing" for a rule on an engram. A switch to `sort_unstable_by`
+/// would make which twin pair an acknowledgment lands on depend on the sort's
+/// internals, so keep the stable sort and let `find_twins`' deterministic
+/// emission order settle the ties.
 pub fn rank(findings: &mut [Finding]) {
     findings.sort_by(|a, b| {
         b.priority
@@ -1067,10 +1196,19 @@ pub fn detect(input: &SweepInput) -> SweepReport {
 ///
 /// - the entry's scope is absent, or equals the finding's scope: **suppressed**,
 ///   counted, and returned only when the caller asked for the suppressed ones;
-/// - the entry's scope differs: **returned**, flagged [`Finding::ack_stale`]
-///   and carrying the old note, because "somebody ruled this intentional and
-///   the evidence has since changed" is a different thing to read than a fresh
-///   finding;
+/// - the engram's one entry for the rule has a different scope: **returned**,
+///   flagged [`Finding::ack_stale`] and carrying the old note, because
+///   "somebody ruled this intentional and the evidence has since changed" is a
+///   different thing to read than a fresh finding. One entry is what a rule
+///   acknowledged per engram always has, since the write path replaces it;
+/// - nothing matches and the rule is pair-scoped ([`is_pair_scoped`], which is
+///   `V301`): **returned plain**. A twin acknowledgment answers one pair, so a
+///   pair with no entry of its own is unanswered rather than stale, and lending
+///   it another pair's note would tell a reader they have seen evidence they
+///   have not;
+/// - nothing matches and the engram carries several entries for the rule, which
+///   only a hand-edited file can hold for a rule acknowledged per engram:
+///   **returned plain**, since which of them went stale is unknowable;
 /// - no entry for the rule: untouched.
 ///
 /// A finding with no anchor engram - `V203`'s vocabulary, `V108`'s attachment -
@@ -1092,33 +1230,42 @@ fn apply_acknowledgments(input: &SweepInput, report: &mut SweepReport) {
         let Some(entries) = acks.get(finding.permalink.as_str()) else {
             return true;
         };
+        // The generous match wins over a stale one: an engram carrying both a
+        // scope-less entry and an outdated scoped one is acknowledged.
+        let matching = entries
+            .iter()
+            .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule))
+            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
+        if let Some(ack) = matching {
+            counts.add(finding.family);
+            finding.acknowledged = true;
+            finding.ack_note = ack.note.clone();
+            finding.ack_scope = ack.scope.clone();
+            return include;
+        }
+        // Nothing matches, so the question is whether this finding is the
+        // drifted self of an acknowledgment or one nobody has answered yet. A
+        // pair-scoped rule is always the second: its entries answer one pair
+        // each, and the pair in front of us has none. Any other rule is
+        // acknowledged per engram and the write path keeps exactly one entry
+        // for it, so a lone entry that no longer matches is this finding's own
+        // answer gone stale. Several entries there means a hand-edited file,
+        // and which one drifted is unknowable, so none of them lends a note.
+        if is_pair_scoped(finding.rule) {
+            return true;
+        }
         let mut for_rule = entries
             .iter()
             .filter(|a| a.rule.eq_ignore_ascii_case(finding.rule));
-        // The generous match wins over a stale one: an engram carrying both a
-        // scope-less entry and an outdated scoped one is acknowledged.
-        let matching = for_rule
-            .clone()
-            .find(|a| a.scope.as_deref().is_none_or(|s| s == finding.scope));
-        match matching.or_else(|| for_rule.next()) {
-            Some(ack) if matching.is_some() => {
-                counts.add(finding.family);
-                finding.acknowledged = true;
-                finding.ack_note = ack.note.clone();
-                finding.ack_scope = ack.scope.clone();
-                include
-            }
-            Some(stale) => {
-                finding.ack_stale = true;
-                finding.ack_note = stale.note.clone();
-                // The entry's own scope, not the finding's: a stale row exists
-                // precisely because those two have drifted apart, and the row
-                // is where a reader compares them.
-                finding.ack_scope = stale.scope.clone();
-                true
-            }
-            None => true,
+        if let (Some(stale), None) = (for_rule.next(), for_rule.next()) {
+            finding.ack_stale = true;
+            finding.ack_note = stale.note.clone();
+            // The entry's own scope, not the finding's: a stale row exists
+            // precisely because those two have drifted apart, and the row is
+            // where a reader compares them.
+            finding.ack_scope = stale.scope.clone();
         }
+        true
     });
     report.acknowledged = counts;
 }
@@ -1187,18 +1334,25 @@ impl<'a> Graph<'a> {
 
     /// The `[[Target]]` text that addresses `id` from inside `domain`: bare
     /// when both sit in the same domain, prefixed when they do not.
+    ///
+    /// By permalink, which is what every relation the engine writes for itself
+    /// now names. A title is prose and may carry a colon, and `[[...]]` reads
+    /// the first colon as a cross-domain prefix (issue #65), so a suggestion
+    /// spelled with a title is a suggestion to write a link that may not
+    /// resolve. This is the surface that tells an agent how to wire a relation
+    /// by hand, so it prescribes the spelling that always works.
     fn link_text(&self, id: EngramId, domain: &str) -> String {
-        let (d, title) = if let Some(f) = self.facts.get(&id.0) {
-            (f.domain.as_str(), f.title.as_str())
+        let (d, permalink) = if let Some(f) = self.facts.get(&id.0) {
+            (f.domain.as_str(), f.permalink.as_str())
         } else if let Some(n) = self.nodes.get(&id.0) {
-            (n.domain.as_str(), n.title.as_str())
+            (n.domain.as_str(), n.permalink.as_str())
         } else {
             return format!("id {}", id.0);
         };
         if d == domain {
-            format!("[[{title}]]")
+            format!("[[{permalink}]]")
         } else {
-            format!("[[{d}:{title}]]")
+            format!("[[{d}:{permalink}]]")
         }
     }
 
@@ -1360,7 +1514,147 @@ fn detect_lifecycle(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepRep
     }
 
     detect_aging(input, report);
+    detect_carry_forward(input, graph, report);
     detect_unshared(input, report);
+}
+
+/// `V010`: a retired engram whose observations survive nowhere current.
+///
+/// Validity is set per engram rather than per bullet, so an engram that mixed
+/// lifecycles takes its still-valid facts down with it when the one fact that
+/// expired retires the whole file. This rule is what notices that: for every
+/// retired engram, the observations whose text appears in no live engram of the
+/// same domain.
+///
+/// **Text only, never meaning.** Both sides go through
+/// [`crystalline_core::similarity::normalize`] - ASCII case folded, punctuation
+/// turned into spaces, whitespace runs collapsed - and the needle is then looked
+/// for inside the haystack with a space on either end, so a bullet matches a
+/// run of whole words and `mix b` does not find itself inside `mix boron`. The
+/// needle is the parsed observation content, which already has the `[category]`
+/// token and the trailing `#tags` off it; the haystack is the whole body of
+/// each live engram, so a fact carried forward as prose counts as carried
+/// forward just as much as one carried forward as a bullet. A fact reworded on
+/// its way into the successor looks missing here, which the instruction says
+/// out loud: the fix for a false positive is one `evolve_ack`.
+///
+/// **One quiet condition, and it is the archive's own record.** A retired
+/// engram that declares a resolved `split_into` has already been through this:
+/// it was split, so what remains is what somebody chose to leave behind.
+/// Reporting it again would fight the split the rule asks for. What the check
+/// establishes is that the decision was made, not that it was made about every
+/// bullet - a second still-valid fact stranded by a partial split stays quiet
+/// here, and that is the price of not flooding every clean retirement. Retirement with a successor is deliberately NOT a quiet condition:
+/// a successor that failed to carry the facts forward is exactly the case this
+/// rule exists to catch.
+///
+/// One finding per engram rather than per bullet: the fix is a single
+/// `split_engram` call naming the lines, so a queue row per line would be one
+/// action split into many.
+///
+/// **What it costs.** Nothing at all in a domain with no retired engram
+/// carrying observations, which is checked before anything is normalized. Past
+/// that, one normalized copy of the domain's live bodies plus a set of their
+/// normalized observation texts, and then one hash lookup per retired bullet -
+/// so a bullet carried forward as a bullet is O(1). Only a bullet that misses
+/// that set is scanned against the corpus, which bounds the substring work at
+/// (bullets carried as prose or missing entirely) x (corpus bytes).
+fn detect_carry_forward(input: &SweepInput, graph: &Graph<'_>, report: &mut SweepReport) {
+    // Nothing retired that carries observations means nothing to compare
+    // against, so the corpus is never built. A domain with no retirements is
+    // the common case and pays nothing for this rule.
+    let subjects: Vec<&EngramFacts> = input
+        .engrams
+        .iter()
+        .filter(|f| {
+            f.is_retired()
+                && !f.observations.is_empty()
+                && !graph.has_outbound_rel(f.id, "split_into")
+        })
+        .collect();
+    if subjects.is_empty() {
+        return;
+    }
+
+    // Two haystacks, cheapest first. A bullet carried forward as a bullet - the
+    // ordinary case, and what `split_engram` itself writes - is answered by one
+    // hash lookup. Only a bullet that misses that set reaches the substring
+    // scan, which is where a fact carried forward inside prose is found and
+    // which costs (missing bullets) x (corpus bytes).
+    let mut carried: BTreeSet<String> = BTreeSet::new();
+    let mut live: Vec<String> = Vec::new();
+    for fact in input.engrams.iter().filter(|f| !f.is_retired()) {
+        carried.extend(fact.observations.iter().map(|o| normalize(&o.text)));
+        live.push(format!(" {} ", normalize(&fact.body)));
+    }
+
+    for fact in subjects {
+        let missing: Vec<(&FactObservation, String)> = fact
+            .observations
+            .iter()
+            .filter_map(|o| {
+                let needle = normalize(&o.text);
+                if needle.is_empty() || carried.contains(&needle) {
+                    return None;
+                }
+                let padded = format!(" {needle} ");
+                live.iter()
+                    .all(|body| !body.contains(&padded))
+                    .then_some((o, needle))
+            })
+            .collect();
+        let Some((first, _)) = missing.first() else {
+            continue;
+        };
+        let count = missing.len();
+        let lines = missing
+            .iter()
+            .map(|(o, _)| o.line.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let evidence = join_semis(
+            missing
+                .iter()
+                .map(|(o, _)| format!("line {}: `{}`", o.line, ellipsize(&o.text)))
+                .chain(std::iter::once(format!(
+                    "status={}; matched as text never as meaning",
+                    fact.status
+                ))),
+        );
+        report.findings.push(
+            Finding::about("V010", fact)
+                .with(
+                    Class::Judgment,
+                    format!(
+                        "{count} observation(s) appear in no live engram of {}",
+                        fact.domain
+                    ),
+                    evidence,
+                    format!("split_engram observations={lines}"),
+                )
+                .at_line(Some(first.line))
+                // The bullets themselves, so acknowledging this drop says
+                // nothing about the next observation that goes missing.
+                .scoped(missing.into_iter().map(|(_, needle)| needle)),
+        );
+    }
+}
+
+/// An observation's text for an evidence cell: whole when it is short, cut at
+/// a word boundary with an ellipsis when it is not, so one long bullet never
+/// takes a queue row apart.
+fn ellipsize(text: &str) -> String {
+    const MAX: usize = 80;
+    let text = text.trim();
+    if text.chars().count() <= MAX {
+        return text.replace(';', ",");
+    }
+    let cut: String = text.chars().take(MAX).collect();
+    let head = match cut.rsplit_once(' ') {
+        Some((head, _)) => head,
+        None => cut.as_str(),
+    };
+    format!("{}...", head.replace(';', ","))
 }
 
 /// `V009`: substantive work that has sat unshared in a team domain past
@@ -1824,8 +2118,76 @@ fn detect_redundancy(input: &SweepInput, report: &mut SweepReport) {
         );
     }
 
+    detect_twins(&live, &cluster_of, input, report);
     detect_title_collisions(&live, &cluster_of, report);
     detect_tag_drift(input, report);
+}
+
+/// `V301`: pairs of eligible engrams whose lead vectors sit at or above the
+/// twin threshold and that `V201` did not already put in one cluster - a
+/// cluster already prescribes the merge, so a twin finding on top would be two
+/// findings for one fact. Indexed over `live` so the cluster map lines up.
+fn detect_twins(
+    live: &[&EngramFacts],
+    cluster_of: &HashMap<usize, usize>,
+    input: &SweepInput,
+    report: &mut SweepReport,
+) {
+    let vectors: Vec<Option<&[f32]>> = live
+        .iter()
+        .map(|f| {
+            if f.is_speculative() {
+                None
+            } else {
+                f.lead_vector.as_deref()
+            }
+        })
+        .collect();
+    let found = twins::find_twins(&vectors, &input.options);
+    if found.capped {
+        report.truncations.push(format!(
+            "V301 skipped: {} lead vectors over the {} cap",
+            found.compared, input.options.max_twin_vectors
+        ));
+        return;
+    }
+    let mut emitted = 0usize;
+    for pair in &found.pairs {
+        if let (Some(ca), Some(cb)) = (cluster_of.get(&pair.a), cluster_of.get(&pair.b))
+            && ca == cb
+        {
+            continue;
+        }
+        if emitted == input.options.max_twin_findings {
+            report.truncations.push(format!(
+                "V301 findings capped at {}",
+                input.options.max_twin_findings
+            ));
+            break;
+        }
+        let Some(lead) = leader(live, &[pair.a, pair.b]) else {
+            continue;
+        };
+        let other = if lead == pair.a { pair.b } else { pair.a };
+        report.findings.push(
+            Finding::about("V301", live[lead])
+                .with(
+                    Class::Judgment,
+                    format!("semantic twin of {}", live[other].address()),
+                    format!(
+                        "lead-vector cosine {:.2} at or above {:.2}; twin: {}",
+                        pair.cosine,
+                        input.options.twin_threshold,
+                        live[other].address()
+                    ),
+                    "read both then merge and supersede or link and acknowledge".to_string(),
+                )
+                // The pair is the evidence, so acknowledging one twin says
+                // nothing about the next.
+                .scoped(vec![live[pair.a].address(), live[pair.b].address()]),
+        );
+        emitted += 1;
+    }
 }
 
 /// `V202`: same-domain titles that collide after the vocabulary fold.
@@ -2200,7 +2562,12 @@ fn join_semis(items: impl Iterator<Item = impl std::fmt::Display>) -> String {
 /// parser's line walker is crate-private, so the fence tracking is mirrored
 /// here, including its rule that a closing fence must match the opening
 /// character, be at least as long and carry nothing after it.
-fn content_line_count(body: &str) -> usize {
+///
+/// Public because `V106` is not its only reader: `split_engram` refuses a
+/// selection that would leave the source below [`MIN_CONTENT_LINES`], and that
+/// refusal has to count lines exactly the way the rule that would flag the
+/// result counts them.
+pub fn content_line_count(body: &str) -> usize {
     let mut fence: Option<(char, usize)> = None;
     let mut count = 0usize;
     for raw in body.split('\n') {

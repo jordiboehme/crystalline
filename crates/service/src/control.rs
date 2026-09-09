@@ -3,7 +3,7 @@
 //! Each request is one JSON line `{ "v": 1, "cmd": ..., ... }`; each response is
 //! one line `{ "v": 1, "ok": true, "data": ... }` or
 //! `{ "v": 1, "ok": false, "error": ... }`. Commands: sync, status, reindex,
-//! sessions, tool, configure, origin_add, origin_update, origin_status,
+//! file_stamps, sessions, tool, configure, origin_add, origin_update, origin_status,
 //! origin_share, origin_withdraw, origin_resolve, provision, forget_domain,
 //! forget_credential, shutdown. This is the operator channel plus the `tool` command, which
 //! dispatches a daemon-attached CLI data verb to the shared engine and
@@ -115,6 +115,18 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                     maybe_embed(shared, embed, &mut data).await;
                     (envelope_ok(data), false)
                 }
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
+        // The recorded file stamps of one named domain, or of every registered
+        // file domain when none is named. Served from this daemon's own open
+        // store, so a caller that needs to read the index while the daemon
+        // holds the file never has to open it a second time: that is the
+        // collision `crystalline doctor` used to die on.
+        "file_stamps" => {
+            let domain = req.get("domain").and_then(Value::as_str);
+            match shared.engine.domain_file_stamps(domain).await {
+                Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
         }
@@ -245,6 +257,21 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         }
         // Connect a new domain to a GitHub repository: downloads its tracked
         // subtree, registers it in the global config and indexes it.
+        // Unregister a domain, the same entry point the JSON API and the MCP
+        // tool call. As the machine owner: whoever reaches this socket is on
+        // the machine that holds the files.
+        "domain_remove" => {
+            let domain = req.get("domain").and_then(Value::as_str).unwrap_or("");
+            let purge = req.get("purge").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .unregister_domain(domain, &crate::scope::Scope::Unrestricted, purge)
+                .await
+            {
+                Ok(data) => (envelope_ok(data), false),
+                Err(e) => (envelope_err(e.to_string()), false),
+            }
+        }
         "origin_add" => {
             let repo = req.get("repo").and_then(Value::as_str).unwrap_or("");
             let domain = req.get("domain").and_then(Value::as_str);
@@ -285,7 +312,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // Pull one origin-connected domain (or every one) up to date.
         "origin_update" => {
             let domain = req.get("domain").and_then(Value::as_str);
-            match shared.engine.origin_update(domain).await {
+            match shared
+                .engine
+                .origin_update(domain, &crate::scope::Scope::Unrestricted)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -294,7 +325,14 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         // relative to its origin, plus this machine's GitHub connection.
         "origin_status" => {
             let domain = req.get("domain").and_then(Value::as_str);
-            match shared.engine.origin_status(domain).await {
+            // Absent reads as false: a client from before detail existed asks
+            // for the counts it already knew how to render.
+            let detail = req.get("detail").and_then(Value::as_bool).unwrap_or(false);
+            match shared
+                .engine
+                .origin_status(domain, detail, &crate::scope::Scope::Unrestricted)
+                .await
+            {
                 Ok(data) => (envelope_ok(data), false),
                 Err(e) => (envelope_err(e.to_string()), false),
             }
@@ -401,7 +439,11 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
                 )),
             };
             match action {
-                Ok(action) => match shared.engine.provision(&action).await {
+                Ok(action) => match shared
+                    .engine
+                    .provision(&action, &crate::scope::Scope::Unrestricted)
+                    .await
+                {
                     Ok(data) => (envelope_ok(data), false),
                     Err(e) => (envelope_err(e.to_string()), false),
                 },
@@ -421,7 +463,8 @@ async fn handle(req: &Value, shared: &Arc<Shared>) -> (Value, bool) {
         other => (
             envelope_err(format!(
                 "unknown ctl command '{other}'; expected status, sessions, tool, sync, reindex, \
-                 routing_bullets, scaffold_manifest, domain_import, domain_export, retag, \
+                 routing_bullets, scaffold_manifest, domain_import, domain_export, \
+                 domain_remove, retag, \
                  configure, origin_add, origin_update, origin_status, origin_share, \
                  origin_withdraw, origin_resolve, provision, forget_domain or shutdown"
             )),

@@ -126,6 +126,19 @@ export interface EngramDetail {
   inboundCount: number;
   /** The capped sample of them the payload carries. */
   inboundRefs: InboundRef[];
+  /** The nearest existing engrams a write found; empty when none or when the advisory is off. */
+  similar: SimilarEngram[];
+  /** What to do about them, in the server's words; null when `similar` is empty. */
+  guidance: string | null;
+}
+
+/** One neighbour a write or save found itself close to. */
+export interface SimilarEngram {
+  domain: string;
+  permalink: string;
+  title: string;
+  status: string;
+  type: string;
 }
 
 /** The `crystalline://` address of one engram, which is what it is called. */
@@ -255,6 +268,30 @@ function readFrontmatter(
 }
 
 /**
+ * One entry of the `similar` list, or null when it names no address.
+ *
+ * `domain` and `permalink` are the two fields a link needs; anything missing
+ * either is dropped rather than rendered as a link to nowhere. `title` falls
+ * back to the permalink, and `status`/`type` fall back to empty strings, the
+ * same shape the rest of this reader gives an engram with no frontmatter.
+ */
+function readSimilar(value: unknown): SimilarEngram | null {
+  const entry = asObject(value);
+  const domain = asString(entry?.domain);
+  const permalink = asString(entry?.permalink);
+  if (domain === null || permalink === null) {
+    return null;
+  }
+  return {
+    domain,
+    permalink,
+    title: asString(entry?.title) ?? permalink,
+    status: asString(entry?.status) ?? "",
+    type: asString(entry?.type) ?? "",
+  };
+}
+
+/**
  * Read a detail payload.
  *
  * `domain` and `permalink` are what was asked for, used when the payload does
@@ -298,6 +335,10 @@ export function readEngramDetail(
       .filter((entry): entry is EngramReference => entry !== null),
     inboundCount: asNumber(inbound?.count) ?? inboundRefs.length,
     inboundRefs,
+    similar: asArray(record?.similar)
+      .map(readSimilar)
+      .filter((entry): entry is SimilarEngram => entry !== null),
+    guidance: asString(record?.guidance),
   };
 }
 

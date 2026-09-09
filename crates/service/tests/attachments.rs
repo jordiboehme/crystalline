@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use crystalline_core::config::{DomainEntry, GlobalConfig, ResponseFormat, ServiceConfig};
 use crystalline_index::TursoStore;
+use crystalline_service::Scope;
 use crystalline_service::params::WriteParams;
 use crystalline_service::{Engine, EngineError};
 use tokio::sync::Mutex;
@@ -488,13 +489,16 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     let (_tmp, engine, _root, _scratch) = engine_fixture().await;
 
     let err = engine
-        .move_engram(&crystalline_service::params::MoveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            destination: "assets/alpha.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                destination: "assets/alpha.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -506,13 +510,16 @@ async fn a_move_and_a_restore_refuse_the_reserved_assets_prefix() {
     // Same for the spellings that only look like something else.
     for destination in ["Assets/alpha.md", "a/../assets/alpha.md"] {
         let err = engine
-            .move_engram(&crystalline_service::params::MoveParams {
-                domain: "eng".to_string(),
-                identifier: "alpha".to_string(),
-                destination: destination.to_string(),
-                destination_domain: None,
-                update_links: None,
-            })
+            .move_engram(
+                &crystalline_service::params::MoveParams {
+                    domain: "eng".to_string(),
+                    identifier: "alpha".to_string(),
+                    destination: destination.to_string(),
+                    destination_domain: None,
+                    update_links: None,
+                },
+                &Scope::Unrestricted,
+            )
             .await
             .unwrap_err();
         assert!(
@@ -562,13 +569,16 @@ async fn an_engram_path_with_a_colon_still_moves_and_restores() {
     assert!(root.join("notes").join("plan: v2.md").exists());
 
     engine
-        .move_engram(&crystalline_service::params::MoveParams {
-            domain: "eng".to_string(),
-            identifier: "alpha".to_string(),
-            destination: "notes/rule: two.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                domain: "eng".to_string(),
+                identifier: "alpha".to_string(),
+                destination: "notes/rule: two.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(root.join("notes").join("rule: two.md").exists());
@@ -709,7 +719,10 @@ async fn a_cross_domain_move_carries_a_sole_referent_attachment() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -752,7 +765,10 @@ async fn a_same_domain_move_leaves_the_attachments_where_they_are() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "notes/note.md", None))
+        .move_engram(
+            &move_params("from", "note", "notes/note.md", None),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -793,7 +809,10 @@ async fn an_attachment_another_source_engram_references_is_copied_not_moved() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -839,7 +858,10 @@ async fn a_retired_referent_in_the_source_forces_a_copy() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -874,7 +896,10 @@ async fn a_claimed_attachment_travels_with_no_body_reference_at_all() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -910,7 +935,10 @@ async fn a_destination_holding_the_identical_file_reuses_it() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -960,7 +988,10 @@ async fn a_destination_collision_with_other_bytes_suffixes_and_rewrites_the_engr
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1011,7 +1042,10 @@ async fn a_reference_to_a_missing_file_never_fails_the_move() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1037,7 +1071,10 @@ async fn a_carry_that_cannot_land_surfaces_a_warning_in_the_move_result() {
         .unwrap();
 
     let result = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1084,7 +1121,10 @@ async fn an_exhausted_rename_warns_and_leaves_the_file_in_the_source() {
     }
 
     let result = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1159,7 +1199,10 @@ async fn a_move_accumulates_every_carry_warning() {
     }
 
     let result = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1228,13 +1271,19 @@ async fn a_clean_move_reports_an_empty_warnings_array() {
         .unwrap();
 
     let crossed = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(crossed["attachment_warnings"], serde_json::json!([]));
 
     let renamed = engine
-        .move_engram(&move_params("into", "note", "notes/note.md", None))
+        .move_engram(
+            &move_params("into", "note", "notes/note.md", None),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1262,7 +1311,10 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
 
     // File domain to virtual domain: the bytes land in the blob table.
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("vault")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("vault")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(engine.attachment_list("from").await.unwrap().is_empty());
@@ -1276,7 +1328,10 @@ async fn a_move_between_domain_kinds_carries_the_bytes_both_ways() {
 
     // And back the other way: the file materializes on disk.
     engine
-        .move_engram(&move_params("vault", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("vault", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -1323,7 +1378,10 @@ async fn a_case_variant_claim_in_the_source_still_forces_a_copy() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1372,7 +1430,10 @@ async fn a_collision_on_a_path_at_the_length_cap_lands_on_a_valid_name() {
         .unwrap();
 
     engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 
@@ -1419,7 +1480,10 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
     std::fs::remove_file(from.join("note.md")).unwrap();
 
     let err = engine
-        .move_engram(&move_params("from", "note", "note.md", Some("into")))
+        .move_engram(
+            &move_params("from", "note", "note.md", Some("into")),
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1438,10 +1502,13 @@ async fn a_cross_domain_move_with_an_unreadable_source_file_fails_loudly() {
     );
     assert!(
         engine
-            .read_engram(&crystalline_service::params::ReadParams {
-                identifier: "note".to_string(),
-                domain: Some("into".to_string()),
-            })
+            .read_engram(
+                &crystalline_service::params::ReadParams {
+                    identifier: "note".to_string(),
+                    domain: Some("into".to_string()),
+                },
+                &Scope::Unrestricted
+            )
             .await
             .is_err(),
         "and nothing was indexed there either"

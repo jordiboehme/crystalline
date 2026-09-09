@@ -204,7 +204,10 @@ impl Harness {
         }
         let c2 = mock.add_commit(origin_tree);
         mock.set_branch("main", &c2);
-        engine.origin_update(Some("kb")).await.unwrap();
+        engine
+            .origin_update(Some("kb"), &crystalline_service::Scope::Unrestricted)
+            .await
+            .unwrap();
         (
             Harness {
                 _tmp: tmp,
@@ -427,7 +430,7 @@ async fn a_modern_client_is_served_with_no_handshake_at_all() {
         .unwrap_or_else(|| panic!("no tool list in {answer}"));
     assert_eq!(
         tools.len(),
-        18,
+        20,
         "a default install's list, unchanged by the era"
     );
     assert_hinted("tools/list", &answer["result"]);
@@ -874,8 +877,9 @@ async fn a_modern_request_over_http_is_served_statelessly_with_its_hints() {
 ///
 /// A **bare** probe over HTTP is still the `422` `tests/http_stream.rs` pins:
 /// it carries no `_meta`, so it is classified legacy and takes the session
-/// branch. The era changes nothing about that, and the stdio bridge's
-/// normalization is what closes it there.
+/// branch. Over stdio the same probe is answered `-32602` by rmcp itself
+/// (since 3.1.4, rust-sdk #1157); nothing on our side rewrites it any more, so
+/// the two transports differ only in the shape of the refusal.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn discovery_over_http_answers_the_routing_block() {
     let h = Harness::new().await;
@@ -969,21 +973,20 @@ async fn the_http_subscription_stream_acknowledges_first_and_stays_silent() {
 /// **What a legacy-shaped handshake naming the era gets, recorded because it
 /// is the one shape the era leaves ragged.**
 ///
-/// Before this task an HTTP `initialize` declaring 2026-07-28 was refused
-/// `-32022`, because we did not serve the revision. Now it is served and
-/// echoed - and it gets **no session id**, because `is_legacy_request` routed
-/// it statelessly from the version in its own body (`tower.rs:358-408`,
-/// `:1727`) before any handler ran. A client that goes on to speak the era's
-/// request shape works; a client that sends a bare follow-up is asking for the
-/// session branch, has no session to present, and gets rmcp's
-/// `422 Unexpected message, expect initialize request`.
+/// A client using `initialize` while declaring 2026-07-28 is contradicting
+/// itself: the handshake is deleted from that schema. rmcp 3.2.0 resolves the
+/// contradiction in favour of the message actually sent - `is_legacy_request`
+/// (`tower.rs:359-416`) routes any `InitializeRequest` through the session
+/// branch before it looks at a version, and `negotiate_protocol_version`
+/// (`service/server.rs:479`) answers with the newest revision that still has a
+/// handshake. So the peer is served, as a legacy peer, with a session.
 ///
-/// That is the era's session model rather than a wedge this task introduced:
-/// the handshake is deleted from the 2026-07-28 schema, so a client using it
-/// while declaring that revision is contradicting itself. Pinned here so the
-/// behaviour is known rather than discovered.
+/// The era itself is unaffected and is reached the way the specification
+/// provides for: an inline request carrying the SEP-2575 `_meta`, stateless,
+/// on the same endpoint. Both halves are pinned below, so the behaviour is
+/// known rather than discovered.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_handshake_declaring_the_era_is_served_and_gets_no_session() {
+async fn a_handshake_declaring_the_era_is_served_as_a_legacy_session() {
     let h = Harness::new().await;
     let addr = h.http().await;
 
@@ -1005,10 +1008,15 @@ async fn a_handshake_declaring_the_era_is_served_and_gets_no_session() {
         head_of(&raw)
     );
     let answer = payload(&raw);
-    assert_eq!(answer["result"]["protocolVersion"], json!(ERA), "{answer}");
+    let newest_handshake = crystalline_service::mcp::newest_legacy_handshake_version();
+    assert_eq!(
+        answer["result"]["protocolVersion"],
+        json!(newest_handshake.as_str()),
+        "the era has no handshake, so one is answered with the newest that has: {answer}"
+    );
     assert!(
-        !has_session_header(&raw),
-        "a modern peer is sessionless:\n{}",
+        has_session_header(&raw),
+        "an initialize is legacy whatever it names, so it gets a session:\n{}",
         head_of(&raw)
     );
 
@@ -1017,7 +1025,8 @@ async fn a_handshake_declaring_the_era_is_served_and_gets_no_session() {
     assert!(served.starts_with("HTTP/1.1 200 OK"));
     assert!(payload(&served)["result"]["tools"].is_array());
 
-    // A legacy-shaped follow-up asks for the session branch there is none of.
+    // A legacy-shaped follow-up asks for the session branch without
+    // presenting the session it was just given.
     let bare = post(
         addr,
         r#"{"jsonrpc":"2.0","id":3,"method":"tools/list","params":{}}"#,
@@ -3146,7 +3155,11 @@ async fn conflicted_kb(h: &Harness, mock: &MockProvider) -> String {
         .collect(),
     );
     mock.set_branch("main", &c2);
-    let update = h.engine.origin_update(Some("kb")).await.unwrap();
+    let update = h
+        .engine
+        .origin_update(Some("kb"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
     let conflicts = update["domains"][0]["conflicts"].as_array().unwrap();
     assert_eq!(conflicts.len(), 1, "{update}");
     conflicts[0]["path"].as_str().unwrap().to_string()
@@ -3245,7 +3258,11 @@ async fn a_non_eliciting_resolve_without_a_resolution_refuses_naming_the_three()
     assert!(text.contains("theirs"), "{text}");
     assert!(text.contains("merged"), "{text}");
     // And the conflict is still open.
-    let status = h.engine.origin_status(Some("kb")).await.unwrap();
+    let status = h
+        .engine
+        .origin_status(Some("kb"), false, &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(
         status["domains"][0]["conflicts"].as_array().unwrap().len(),
         1
@@ -3661,5 +3678,143 @@ async fn calling_a_hidden_collaboration_tool_still_teaches_rather_than_vanishing
     assert!(
         text.contains("not enabled") && text.contains("github.enabled"),
         "the refusal names the setting to turn on: {answer}"
+    );
+}
+
+// --- the removal confirmation round -----------------------------------------
+
+/// The arguments that unregister the harness's one domain.
+fn remove_eng(responses: Option<Value>) -> Value {
+    let mut params = json!({
+        "name": "remove_domain",
+        "arguments": { "domain": "eng" },
+    });
+    if let Some(responses) = responses {
+        params["inputResponses"] = responses;
+    }
+    params
+}
+
+/// Round one: an eliciting peer is asked before the domain is unregistered,
+/// and the question says which domain, what kind it is and how much knowledge
+/// is in it - the three things somebody needs in order to answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_modern_eliciting_removal_asks_before_it_unregisters() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let written = wire
+        .open(modern(
+            1,
+            "tools/call",
+            json!({
+                "name": "write_engram",
+                "arguments": { "domain": "eng", "title": "Kept", "content": "Stays on disk." },
+            }),
+        ))
+        .await;
+    assert!(written["error"].is_null(), "{written}");
+
+    let asked = wire
+        .call(eliciting(2, "tools/call", remove_eng(None)))
+        .await;
+    let result = &asked["result"];
+    assert_eq!(
+        result["resultType"],
+        json!("input_required"),
+        "the call answers with a round rather than an unregistration: {asked}"
+    );
+    let message = result["inputRequests"]["confirm"]["params"]["message"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(message.contains("eng"), "the question names it: {message}");
+    assert!(
+        message.contains("file"),
+        "and says what kind it is: {message}"
+    );
+    assert!(
+        message.contains('2'),
+        "and how many engrams are in it (the MANIFEST and the write): {message}"
+    );
+    assert!(
+        message.contains("stay"),
+        "and that a file domain's files are left alone: {message}"
+    );
+
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "round one unregisters nothing: {listed}"
+    );
+}
+
+/// Round two, both answers: a yes unregisters and a no leaves everything
+/// exactly as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_confirmed_removal_lands_and_a_declined_one_does_nothing() {
+    let h = Harness::new().await;
+    let mut wire = h.stdio().await;
+    let asked = wire
+        .open(eliciting(1, "tools/call", remove_eng(None)))
+        .await;
+    assert_eq!(asked["result"]["resultType"], json!("input_required"));
+
+    let declined = wire
+        .call(eliciting(
+            2,
+            "tools/call",
+            remove_eng(Some(answer("decline", false))),
+        ))
+        .await;
+    assert_eq!(
+        declined["result"]["isError"],
+        json!(true),
+        "a no is a refusal the model reads: {declined}"
+    );
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "and the domain is still registered: {listed}"
+    );
+
+    let done = wire
+        .call(eliciting(
+            3,
+            "tools/call",
+            remove_eng(Some(answer("accept", true))),
+        ))
+        .await;
+    assert!(
+        done["error"].is_null() && done["result"]["isError"] != json!(true),
+        "the confirmed round unregisters: {done}"
+    );
+    let listed = h
+        .engine
+        .list_domains(
+            &crystalline_service::params::ListDomainsParams::default(),
+            &crystalline_service::Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    assert!(
+        !listed.to_string().contains("\"eng\""),
+        "and the domain is gone: {listed}"
+    );
+    assert!(
+        h.root.join("eng").join("MANIFEST.md").exists(),
+        "with its files left on disk"
     );
 }

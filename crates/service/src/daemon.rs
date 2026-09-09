@@ -33,23 +33,49 @@ pub(crate) const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:7411";
 
 /// Startup banner, shown on a foreground start when stderr is a terminal.
 const BANNER: &str = r"
-                                   ·              *
-                                 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-                                ▐░░░▒▒▒▒▓▓▓█▓▓▓▒▒▒▒░░░▌
-                                 ▀█░░░▒▒▒▓▓█▓▓▒▒▒░░░█▀   ·
-                                   ▀█░░▒▒▒▓█▓▒▒▒░░█▀
-                            *        ▀█░▒▒▓█▓▒▒░█▀
-                                       ▀█▒▒█▒▒█▀
-                                         ▀███▀     ·
-                                           ▀
+                                             ◆───◆───◆
+                                            ╱ ╲ ╱ ╲ ╱ ╲
+                                           ◆───◆───◆───◇
+                                          ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                                 ◆───◆───◆╌╌╌◆╌╌╌◆───◇───◇
+                                ╱ ╲ ╱ ╲ ╱ · · · · · ╱ ╲ ╱
+                               ◆───◆───◆───◇╌╌╌·╌╌╌◇───◇
+                              ╱ ╲ ╱ ╲ ╱ ╲ ╱ · · · · · ╱
+                             ◆╌╌╌◆╌╌╌◆───◇───◆╌╌╌◆╌╌╌◆
+                              · · · · · ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                               ·╌╌╌·╌╌╌◇───◆───◆───◆───◇
+                                · · · · · ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                                 ·╌╌╌·╌╌╌◆╌╌╌◆╌╌╌◆───◇───◇
+                                          · · · · · ╱ ╲ ╱
+                                           ·╌╌╌·╌╌╌◇───◇
+                                            · · · · · ╱
+                                             ·╌╌╌·╌╌╌◇
 
- ██████╗██████╗ ██╗   ██╗███████╗████████╗ █████╗ ██╗     ██╗     ██╗███╗   ██╗███████╗
-██╔════╝██╔══██╗╚██╗ ██╔╝██╔════╝╚══██╔══╝██╔══██╗██║     ██║     ██║████╗  ██║██╔════╝
-██║     ██████╔╝ ╚████╔╝ ███████╗   ██║   ███████║██║     ██║     ██║██╔██╗ ██║█████╗
+ ░░░░░░╗░░░░░░╗ ░░╗   ░░╗░░░░░░░╗░░░░░░░░╗ ░░░░░╗ ░░╗     ░░╗     ░░╗░░░╗   ░░╗░░░░░░░╗
+▒▒╔════╝▒▒╔══▒▒╗╚▒▒╗ ▒▒╔╝▒▒╔════╝╚══▒▒╔══╝▒▒╔══▒▒╗▒▒║     ▒▒║     ▒▒║▒▒▒▒╗  ▒▒║▒▒╔════╝
+▓▓║     ▓▓▓▓▓▓╔╝ ╚▓▓▓▓╔╝ ▓▓▓▓▓▓▓╗   ▓▓║   ▓▓▓▓▓▓▓║▓▓║     ▓▓║     ▓▓║▓▓╔▓▓╗ ▓▓║▓▓▓▓▓╗
 ██║     ██╔══██╗  ╚██╔╝  ╚════██║   ██║   ██╔══██║██║     ██║     ██║██║╚██╗██║██╔══╝
 ╚██████╗██║  ██║   ██║   ███████║   ██║   ██║  ██║███████╗███████╗██║██║ ╚████║███████╗
  ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
 ";
+
+/// The copyright line the foreground banner prints right after the
+/// `crystalline {version} serving on ...` line - outside the `is_terminal`
+/// guard, so a foreground run whose stderr is redirected to a file carries
+/// it too. (`--daemon` never reaches this branch at all: there is no
+/// terminal to print a banner to, and its own, separate startup output below
+/// is limited to the `tracing::info!` lines a backgrounded first-run wizard
+/// still needs.) AGPL section 13 is why it names the source: a
+/// network-served copy has to offer its users the source, so the link
+/// belongs where a user of a running instance can see it. Read from the
+/// environment rather than retyped, matching `crates/cli/src/main.rs`'s
+/// `VERSION_BLOCK`.
+const COPYRIGHT_LINE: &str = concat!(
+    "Copyright (C) 2026 Jordi Böhme - ",
+    env!("CARGO_PKG_LICENSE"),
+    " - ",
+    env!("CARGO_PKG_REPOSITORY"),
+);
 
 /// A tracked live session.
 #[derive(Clone, serde::Serialize)]
@@ -273,9 +299,13 @@ pub async fn run_serve(
             ownership.socket_display(),
             shared.pid
         );
+        eprintln!("{COPYRIGHT_LINE}");
         if let Some(addr) = &http_addr {
             eprintln!("crystalline HTTP endpoint on http://{addr}");
             eprintln!("{}", ui_startup_line(&loaded.effective, addr));
+            if let Some(line) = oauth_without_a_consent_page(&loaded.effective) {
+                eprintln!("crystalline warning: {line}");
+            }
             if let Some(token) = &setup_token {
                 for line in setup_token_lines(addr, token) {
                     eprintln!("{line}");
@@ -415,7 +445,7 @@ pub async fn run_serve(
                 Ok(router) => router,
                 Err(err) => {
                     tracing::warn!(
-                        "HTTP endpoint for {addr} could not start ({err}); MCP over the socket is unaffected"
+                        "HTTP endpoint for {addr} could not be built ({err:#}); this is the configuration it was built from rather than the address, and MCP over the socket is unaffected"
                     );
                     return;
                 }
@@ -873,6 +903,12 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
     CountingSessions<rmcp::transport::streamable_http_server::session::local::LocalSessionManager>,
 >;
 
+/// That transport with the identity gate in front of it, which is what every
+/// mount site actually mounts. With `auth.mcp` off the gate is a pass-through,
+/// so the type is the same either way and the router has one shape to reason
+/// about; see [`crate::mcp_gate`].
+type GatedMcpService = crate::mcp_gate::McpGate<McpService>;
+
 /// A session manager that counts the sessions it creates, wrapping the real
 /// one and delegating everything else untouched.
 ///
@@ -913,14 +949,34 @@ type McpService = rmcp::transport::streamable_http_server::tower::StreamableHttp
 /// still connecting. That is the honest reading of the name it already has, and
 /// on a modern-only fleet the number stops growing. A figure covering modern
 /// traffic would be a different metric, not a repair of this one.
+///
+/// # Why it also releases session claims
+///
+/// This is the one seam rmcp calls on *every* end of a session:
+/// `close_session` runs from the DELETE handler (`tower.rs:2073`) and from
+/// `spawn_session_worker`'s exit path (`tower.rs:1331`), which is where a
+/// session ended by the 300 second idle keep-alive or by a worker error lands.
+/// The identity gate's claim map has to be released on all three or it grows one
+/// permanent entry per connection that ever went idle, so the map is threaded
+/// through here rather than released only where the gate can see it - see
+/// [`crate::mcp_gate::SessionOwners`].
 pub(crate) struct CountingSessions<M> {
     inner: M,
     created: Arc<AtomicUsize>,
+    sessions: Arc<crate::mcp_gate::SessionOwners>,
 }
 
 impl<M> CountingSessions<M> {
-    fn new(inner: M, created: Arc<AtomicUsize>) -> CountingSessions<M> {
-        CountingSessions { inner, created }
+    fn new(
+        inner: M,
+        created: Arc<AtomicUsize>,
+        sessions: Arc<crate::mcp_gate::SessionOwners>,
+    ) -> CountingSessions<M> {
+        CountingSessions {
+            inner,
+            created,
+            sessions,
+        }
     }
 }
 
@@ -955,6 +1011,11 @@ impl<M: rmcp::transport::streamable_http_server::session::SessionManager>
         &self,
         id: &SessionId,
     ) -> impl Future<Output = Result<(), Self::Error>> + Send {
+        // Released before the inner manager is asked to close, so the claim is
+        // gone whether or not the close itself errors: a session rmcp has given
+        // up on must not keep refusing a later caller who legitimately gets its
+        // id, and the entry is worthless either way.
+        self.sessions.release(id);
         self.inner.close_session(id)
     }
 
@@ -1092,9 +1153,18 @@ pub fn http_router(
     {
         // No embed exists to serve, so the router is its pre-UI self: the
         // declared routes and the transport behind them.
-        let api = engine.config().api_enabled();
-        let (router, service) =
-            http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+        let config = engine.config();
+        let api = config.api_enabled();
+        let mcp_auth = config.auth_mcp().then(|| auth.clone());
+        let (router, service) = http_base(
+            engine,
+            http_sessions,
+            allowed_hosts,
+            auth,
+            api,
+            setup_token,
+            mcp_auth,
+        )?;
         Ok(router.fallback_service(service))
     }
 }
@@ -1111,15 +1181,25 @@ pub fn http_router_with_assets<E: rust_embed::RustEmbed + 'static>(
     auth: Arc<crate::rest::AuthStore>,
     setup_token: Option<String>,
 ) -> anyhow::Result<axum::Router> {
-    // One snapshot for both keys: they are read once when the HTTP surface
-    // starts, like `service.read_only` and the `auth.*` keys, and `ui_enabled`
+    // One snapshot for all three keys: they are read once when the HTTP surface
+    // starts, like `service.read_only`, and `ui_enabled`
     // already carries the coupling (`service.api=false` turns the UI off with
     // it, since a shell whose data routes are gone can only render a login
     // error).
     let config = engine.config();
     let (api, ui) = (config.api_enabled(), config.ui_enabled());
-    let (router, service) =
-        http_base(engine, http_sessions, allowed_hosts, auth, api, setup_token)?;
+    // Read here with the other two, and for the same reason: the `auth.*` keys
+    // are startup-effective, so a running daemon serves the tier it started in.
+    let mcp_auth = config.auth_mcp().then(|| auth.clone());
+    let (router, service) = http_base(
+        engine,
+        http_sessions,
+        allowed_hosts,
+        auth,
+        api,
+        setup_token,
+        mcp_auth,
+    )?;
     if !ui {
         return Ok(router.fallback_service(service));
     }
@@ -1203,6 +1283,11 @@ fn if_none_match(request: &axum::extract::Request) -> Option<&str> {
 /// service the caller mounts as (or behind) the fallback. `setup_token` is this
 /// process's first-run token, handed to the REST state that answers the setup
 /// route; `None` closes the token path, which is what a loopback bind wants.
+/// `mcp_auth` is the store the identity gate resolves agent tokens through,
+/// `Some` exactly when `auth.mcp` is on and `None` for the legacy open tier.
+///
+/// Also where the engine is handed its private-domain resolver, since this is
+/// the one place an accounts store and the engine meet on every HTTP path.
 fn http_base(
     engine: Arc<Engine>,
     http_sessions: Arc<AtomicUsize>,
@@ -1210,9 +1295,70 @@ fn http_base(
     auth: Arc<crate::rest::AuthStore>,
     api: bool,
     setup_token: Option<String>,
-) -> anyhow::Result<(axum::Router, McpService)> {
+    mcp_auth: Option<Arc<crate::rest::AuthStore>>,
+) -> anyhow::Result<(axum::Router, GatedMcpService)> {
     use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
     use rmcp::transport::streamable_http_server::tower::StreamableHttpService;
+
+    let config = engine.config();
+    // `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
+    // off there is nowhere for them to live, so the refusal happens here
+    // rather than waiting for `RestState::new` below, which never runs when
+    // `api` is false.
+    //
+    // Both guards below only ever fire on an explicit `true`: an unset
+    // `auth.oauth` follows `auth.mcp` where the UI is served
+    // (`GlobalConfig::auth_oauth`), so a derived value is `true` only where
+    // `ui_enabled()` already holds, and `ui_enabled()` implies `api_enabled()`
+    // - a config nobody set `auth.oauth` on can never trip either bail, which
+    // is what lets an upgrade turn OAuth on for a shared instance without
+    // also risking its daemon start.
+    let oauth = config.auth_oauth();
+    if oauth && !api {
+        anyhow::bail!("auth.oauth needs service.api: its endpoints live under /api/v1");
+    }
+    // `authorize` answers a redirect to `/authorize`, a Fluid route; with the
+    // embedded UI off, that address falls to the MCP transport instead
+    // (`ui_serving`'s own rule for every UI path once `service.ui` is off),
+    // and no consent can ever be given. Checked after the `service.api` guard
+    // above rather than folded into it: `ui_enabled()` is already false
+    // whenever `api` is, so that case is already caught there with the more
+    // specific word; this one is what catches `service.ui` turned off on its
+    // own, with the API still serving.
+    //
+    // **This guard reads the setting, not whether a bundle exists, and that is
+    // deliberate.** A binary built without `fluid-ui` (or over an empty
+    // `fluid/dist`) still has `ui_enabled()` true, so a derived `auth.oauth`
+    // comes up on with nowhere to consent. Detecting the bundle here would
+    // have to change what OAuth *is* on that build, and `auth.oauth()` is read
+    // independently by four places - the gate's `with_oauth`,
+    // `well_known_routes`, `OauthServer::new` and `AuthCfg::resolve` - whose
+    // agreement is the property that makes "is OAuth served" one answer. A
+    // fifth answer, disagreeing with the config for a build no release
+    // produces, would cost more than the case is worth. So the combination is
+    // named at startup instead (`oauth_without_a_consent_page`) and documented
+    // as unsupported in `docs/deployment.md`; an explicit `auth.oauth: false`
+    // is the fix, and nothing is granted meanwhile - the flow simply cannot
+    // complete.
+    if oauth && !config.ui_enabled() {
+        anyhow::bail!(
+            "auth.oauth needs service.ui: authorize redirects to /authorize, and with the UI off that address falls to the MCP transport, where no consent can ever happen"
+        );
+    }
+    // What this instance calls itself, resolved once with the other startup
+    // settings: the audience the gate checks an OAuth access token against and
+    // the origin the two well-known documents publish, which have to be one
+    // answer or a client is sent somewhere its token does not work.
+    let origin_rule = crate::rest::OriginRule::from_config(&config, allowed_hosts);
+
+    // Every HTTP caller is answered through a resolved scope, so the engine
+    // gets the resolver the moment the store behind it exists. Installed here,
+    // in the one function both router builders funnel through, rather than at
+    // either call site: a router built without it would serve private domains
+    // to anybody who could reach the port. It is a no-op on a second call, so
+    // an integration test that builds two routers over one engine keeps the
+    // first store.
+    engine.set_domain_access(Arc::new(crate::scope::DomainAccess::new(auth.clone())));
 
     // The session manager drives per-request stream priming (e.g. the
     // tools/list response); its own `session_config.sse_retry` default must be
@@ -1223,14 +1369,23 @@ fn http_base(
     // The counter lives here rather than in the factory below, so it counts
     // sessions rather than every construction rmcp asks for; see
     // [`CountingSessions`].
-    let session_manager = Arc::new(CountingSessions::new(session_manager, http_sessions));
+    // Constructed before the session manager, because both the manager wrapper
+    // and the gate hold the same handle: the manager releases a claim on every
+    // path rmcp ends a session, and the gate is what records one.
+    let session_owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+    let session_manager = Arc::new(CountingSessions::new(
+        session_manager,
+        http_sessions,
+        session_owners.clone(),
+    ));
     // The REST state is built only when the API is served. It is not free (it
     // resolves paths and can fail), and building it to then leave it unmounted
     // would mean `service.api=false` could still fail a start over a surface
     // that daemon is deliberately not offering.
     let rest = if api {
         Some(crate::rest::router(
-            crate::rest::RestState::new(engine.clone(), auth)?.with_setup_token(setup_token),
+            crate::rest::RestState::new(engine.clone(), auth, allowed_hosts)?
+                .with_setup_token(setup_token),
         ))
     } else {
         None
@@ -1240,7 +1395,26 @@ fn http_base(
         session_manager,
         http_config(allowed_hosts),
     );
-    let mut router = axum::Router::new().route("/health", axum::routing::get(health));
+    // The gate wraps the transport rather than the router, which is the whole
+    // of its scope: `/health` keeps answering an orchestrator's probe, the JSON
+    // API keeps its own session and trusted-header rules, and - where the UI is
+    // mounted - a browser navigation is answered by the shell middleware before
+    // the gate is ever reached. What is left for the gate is exactly the
+    // requests the transport would have served.
+    let mut service = crate::mcp_gate::McpGate::new(service, mcp_auth, session_owners);
+    if oauth {
+        service = service.with_oauth(origin_rule.clone());
+    }
+    // The two well-known documents are root documents by specification, so they
+    // are declared here beside `/health` rather than under the `/api/v1` nest -
+    // and declared whether or not `auth.oauth` is on, answering `404` while it
+    // is off. Mounting them conditionally would leave the paths to whatever is
+    // behind them, which is the app shell for a browser's `Accept` and this
+    // gate's own `401` for an API client's; neither reads as "there is no OAuth
+    // here". See `rest::oauth`.
+    let mut router = axum::Router::new()
+        .route("/health", axum::routing::get(health))
+        .merge(crate::rest::well_known_routes(oauth.then_some(origin_rule)));
     if let Some(rest) = rest {
         router = router.nest("/api/v1", rest);
     }
@@ -1334,22 +1508,56 @@ fn ui_startup_line(config: &GlobalConfig, addr: &str) -> String {
     if !config.ui_enabled() {
         return "web UI off (service.ui=false)".to_string();
     }
+    if ui_bundled() {
+        return format!("crystalline web UI at http://{addr}");
+    }
+    // Either built without the `fluid-ui` feature, so there is no bundle at
+    // all, or a dev build whose `fluid/dist` was never built (or was built
+    // after the last compile of this crate: see the note in `build.rs`).
+    "web UI not built into this binary".to_string()
+}
+
+/// Whether this binary actually carries a Fluid bundle, which is a different
+/// question from whether `service.ui` is on.
+///
+/// Both absences look the same from here and neither is a setting: the
+/// `fluid-ui` feature can be off, or it can be on over an empty embed because
+/// `fluid/dist` was never built. Every release binary and the container image
+/// carry the bundle, so this is false only in a hand-rolled build.
+fn ui_bundled() -> bool {
     #[cfg(feature = "fluid-ui")]
     {
-        if crate::ui::ui_available::<crate::ui::FluidAssets>() {
-            return format!("crystalline web UI at http://{addr}");
-        }
-        // A dev build whose `fluid/dist` was never built, or was built after
-        // the last compile of this crate: see the note in `build.rs`.
-        "web UI not built into this binary".to_string()
+        crate::ui::ui_available::<crate::ui::FluidAssets>()
     }
     #[cfg(not(feature = "fluid-ui"))]
     {
-        // Built without the `fluid-ui` feature, so there is no bundle at all
-        // and nothing to point an address at.
-        let _ = addr;
-        "web UI not built into this binary".to_string()
+        false
     }
+}
+
+/// The line a start prints when OAuth is served by a binary that carries no
+/// consent page, which is a combination nothing releases and nobody can use.
+///
+/// `None` for every ordinary start. The second startup guard in [`http_base`]
+/// carries the reasoning for why this is a line rather than a refusal.
+fn oauth_without_a_consent_page(config: &GlobalConfig) -> Option<&'static str> {
+    consent_page_warning(config, ui_bundled())
+}
+
+/// [`oauth_without_a_consent_page`] with the bundle answered rather than
+/// detected.
+///
+/// Split out so both arms are testable on any build. Asking `ui_bundled()`
+/// inside the decision would leave the warning branch unreachable from a test
+/// on every machine that has a bundle, which is every machine this is
+/// developed and released on - and this line is the only signal a build
+/// without one gets.
+fn consent_page_warning(config: &GlobalConfig, bundled: bool) -> Option<&'static str> {
+    (config.auth_oauth() && config.api_enabled() && config.ui_enabled() && !bundled).then_some(
+        "auth.oauth is on but this binary carries no web UI: /oauth/authorize redirects to \
+         the consent page and there is none, so no client can finish connecting - rebuild \
+         with the bundle or set auth.oauth: false",
+    )
 }
 
 /// Liveness probe for load balancers and uptime monitors: a static payload
@@ -1786,11 +1994,10 @@ fn http_config(
     if allowed_hosts.is_empty() {
         return base;
     }
-    let mut hosts = vec![
-        "localhost".to_string(),
-        "127.0.0.1".to_string(),
-        "::1".to_string(),
-    ];
+    let mut hosts = crate::rest::ALWAYS_ALLOWED_HOSTS
+        .iter()
+        .map(|host| host.to_string())
+        .collect::<Vec<_>>();
     hosts.extend(allowed_hosts.iter().cloned());
     base.with_allowed_hosts(hosts)
 }
@@ -1812,6 +2019,38 @@ pub(crate) async fn open_store(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every path rmcp ends a session on runs through `close_session`, so
+    /// releasing the identity claim there is what keeps the gate's map in step
+    /// with rmcp's own sessions. A client `DELETE` is one of those paths and is
+    /// covered end to end in `tests/mcp_auth.rs`; the other two - the 300 second
+    /// idle keep-alive and a worker error - are reached from inside
+    /// `spawn_session_worker`, with no seam a test can drive without standing up
+    /// a real session and waiting out a timer that is not on a pausable clock
+    /// from out here. So this drives `close_session` itself, which is the single
+    /// point all three arrive at (rmcp 3.2.0 `tower.rs:1331` and `:2073`).
+    #[tokio::test]
+    async fn closing_a_session_releases_the_identity_that_claimed_it() {
+        use rmcp::transport::streamable_http_server::session::SessionManager;
+        use rmcp::transport::streamable_http_server::session::local::LocalSessionManager;
+
+        let owners = Arc::new(crate::mcp_gate::SessionOwners::default());
+        let manager = CountingSessions::new(
+            LocalSessionManager::default(),
+            Arc::new(AtomicUsize::new(0)),
+            owners.clone(),
+        );
+        let (id, _transport) = manager.create_session().await.unwrap();
+        owners.claim(id.to_string(), "ada".to_string());
+        assert_eq!(owners.owner(&id).as_deref(), Some("ada"));
+
+        manager.close_session(&id).await.unwrap();
+        assert_eq!(
+            owners.owner(&id),
+            None,
+            "a session rmcp has given up on leaves no claim behind"
+        );
+    }
 
     // These pin down the exact `--http` semantics containers rely on: a
     // container must bind 0.0.0.0 (not the 127.0.0.1 default) to be reachable
@@ -1979,6 +2218,47 @@ mod tests {
             line, "web UI not built into this binary",
             "a binary built without the feature carries no bundle at all"
         );
+    }
+
+    /// A binary with no consent page in it says so when OAuth is on, rather
+    /// than serving a flow that cannot complete in silence.
+    ///
+    /// The combination is unsupported rather than guarded against: see the
+    /// second startup guard in `http_base` for why detecting the bundle there
+    /// would cost more than this case is worth.
+    #[test]
+    fn a_start_with_oauth_on_and_no_bundle_says_so() {
+        let mut config = config_with_ui(None, None);
+        config.auth = Some(crystalline_core::config::AuthConfig {
+            mcp: Some(true),
+            ..Default::default()
+        });
+        assert!(config.auth_oauth(), "derived on where the UI is served");
+        // Both arms, decided rather than detected, so neither depends on
+        // whether the machine running this test happens to hold a bundle.
+        let warned = consent_page_warning(&config, false).expect("no bundle, so a warning");
+        assert!(
+            warned.contains("auth.oauth"),
+            "the warning names the key to change: {warned}"
+        );
+        assert!(
+            !warned.contains("  "),
+            "a wrapped literal that lost its continuations reads with gaps in it: {warned}"
+        );
+        assert!(
+            consent_page_warning(&config, true).is_none(),
+            "and an ordinary build says nothing"
+        );
+        assert_eq!(
+            oauth_without_a_consent_page(&config).is_some(),
+            !ui_bundled(),
+            "the production predicate answers for this binary's own bundle"
+        );
+
+        // Never for an instance that is not serving OAuth at all.
+        let off = config_with_ui(None, None);
+        assert!(!off.auth_oauth());
+        assert!(consent_page_warning(&off, false).is_none());
     }
 
     fn config_with_allowed_hosts(hosts: Vec<String>) -> GlobalConfig {
@@ -2424,6 +2704,25 @@ mod tests {
         assert!(
             !lines[1].contains("a1b2c3d4e5f60718293a4b5c6d7e8f90"),
             "the caveat line carries no secret of its own"
+        );
+    }
+
+    /// The foreground banner's copyright line, printed right after
+    /// `crystalline {version} serving on ...` outside the `is_terminal`
+    /// guard so a redirected foreground run's stderr still carries it (see
+    /// [`COPYRIGHT_LINE`] for why `--daemon` does not). Names the same
+    /// copyright holder, license and source `crates/cli/src/main.rs`'s
+    /// `VERSION_BLOCK` does, both read from the environment so a Cargo.toml
+    /// change carries.
+    #[test]
+    fn the_banner_copyright_line_names_the_license_and_the_source() {
+        assert_eq!(
+            COPYRIGHT_LINE,
+            format!(
+                "Copyright (C) 2026 Jordi Böhme - {} - {}",
+                env!("CARGO_PKG_LICENSE"),
+                env!("CARGO_PKG_REPOSITORY")
+            )
         );
     }
 

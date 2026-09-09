@@ -9,23 +9,24 @@
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
 /*
- * The app's own design tokens. One accent (a crystalline teal, not the
- * framework's stock blue), and one five-step typographic scale; every screen
- * draws from these rather than inventing sizes. The caption step is the
- * floor: nothing in the app renders text below 12px.
+ * The app's own design tokens. One accent (the C64 blue the Crystalline
+ * Handbook wears, not the framework's stock blue), and one five-step
+ * typographic scale; every screen draws from these rather than inventing
+ * sizes. The caption step is the floor: nothing in the app renders text
+ * below 12px.
  */
 @theme {
-  --color-accent-50: #f0fdfa;
-  --color-accent-100: #ccfbf1;
-  --color-accent-200: #99f6e4;
-  --color-accent-300: #5eead4;
-  --color-accent-400: #2dd4bf;
-  --color-accent-500: #14b8a6;
-  --color-accent-600: #0d9488;
-  --color-accent-700: #0f766e;
-  --color-accent-800: #115e59;
-  --color-accent-900: #134e4a;
-  --color-accent-950: #042f2e;
+  --color-accent-50: #f6f4fc;
+  --color-accent-100: #ece8f9;
+  --color-accent-200: #d9d3f4;
+  --color-accent-300: #b9afe6;
+  --color-accent-400: #978bd3;
+  --color-accent-500: #6c5eb5;
+  --color-accent-600: #5747a0;
+  --color-accent-700: #45388c;
+  --color-accent-800: #352879;
+  --color-accent-900: #2a1f5f;
+  --color-accent-950: #1d1739;
 
   --text-display: 1.5rem;
   --text-display--line-height: 2rem;
@@ -51,10 +52,20 @@
   :root,
   [data-theme="light"] {
     color-scheme: light;
+    /*
+     * CodeMirror's highlight style is one static rule set for both schemes
+     * (see `editor/setup.ts`), not a `dark:` utility, so a token color that
+     * needs to differ per scheme has nowhere else to read that from. This
+     * custom property is that scheme switch: it tracks the same value
+     * `.hljs-string` uses below, per scheme, so the editor's string color and
+     * the reading view's stay the same color for the same text.
+     */
+    --color-code-string: #45388c;
   }
 
   [data-theme="dark"] {
     color-scheme: dark;
+    --color-code-string: #b9afe6;
   }
 
   body {
@@ -92,7 +103,7 @@
   .hljs-addition,
   .hljs-attribute,
   .hljs-meta .hljs-string {
-    color: #0f766e;
+    color: #45388c;
   }
 
   .hljs-number,
@@ -150,7 +161,7 @@
   [data-theme="dark"] .hljs-addition,
   [data-theme="dark"] .hljs-attribute,
   [data-theme="dark"] .hljs-meta .hljs-string {
-    color: #5eead4;
+    color: #b9afe6;
   }
 
   [data-theme="dark"] .hljs-number,
@@ -162,11 +173,18 @@
     color: #93c5fd;
   }
 
+  /*
+   * Fuchsia rather than the purple-300 the light-mode violet would suggest:
+   * that stop sat only 14.0 CIE76 units from the string color below (both
+   * pale lavenders, indistinguishable at 13px mono), which fuchsia clears to
+   * 24.6 without colliding with keyword red or attr yellow. See
+   * `theme/tokens.test.ts`'s hue-separation test.
+   */
   [data-theme="dark"] .hljs-title,
   [data-theme="dark"] .hljs-class .hljs-title,
   [data-theme="dark"] .hljs-type,
   [data-theme="dark"] .hljs-built_in {
-    color: #d8b4fe;
+    color: #f0abfc;
   }
 
   [data-theme="dark"] .hljs-attr,

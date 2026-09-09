@@ -19,12 +19,15 @@ mod index_files;
 pub mod instance;
 pub mod maintenance;
 pub mod mcp;
+pub mod mcp_gate;
 mod origin;
 pub mod overlay;
 pub mod params;
 mod poller;
 pub mod rest;
+pub mod scope;
 pub mod settings;
+pub mod similar;
 pub mod stub;
 pub mod subscribers;
 pub mod temp_store;
@@ -43,9 +46,9 @@ pub mod ui;
 pub const EVOLVE_TOOL_NAME: &str = "evolve_engrams";
 
 pub use client::{
-    configure, ctl_if_running, ctl_required, domain_export, domain_import, origin_add,
-    origin_resolve, origin_share, origin_status, origin_update, origin_withdraw, run_mcp, run_tool,
-    scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
+    configure, ctl_if_running, ctl_required, domain_export, domain_import, domain_remove,
+    origin_add, origin_resolve, origin_share, origin_status, origin_update, origin_withdraw,
+    run_mcp, run_tool, scaffold_virtual_manifest, tags_retag, use_daemon, virtual_routing_bullets,
 };
 pub use daemon::run_serve;
 pub use engine::{Engine, EngineError, ShareActor};
@@ -53,6 +56,11 @@ pub use harness_cli::{
     CliCapture, CliRun, SystemMcpRunner, run_harness_cli, run_harness_cli_capture,
 };
 pub use mcp::McpServer;
+pub use mcp_gate::{
+    MCP_AUTH_REQUIRED, MCP_SESSION_IDENTITY_MISMATCH, McpGate, McpIdentity, SessionOwners,
+};
 pub use origin::{UnsharedWork, default_domain_folder, parse_origin_spec, unshared_work};
 pub use overlay::{EnvDomain, EnvOverlay, LoadedConfig};
+pub use scope::{DomainAccess, DomainRight, DomainVisibility, Scope};
+pub use similar::{SIMILAR_GUIDANCE, SimilarEngram, SimilarProbe};
 pub use stub::{DegradedServer, StubStatus};

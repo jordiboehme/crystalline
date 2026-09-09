@@ -174,19 +174,25 @@ fn init_body(version: &str) -> String {
     )
 }
 
-/// Every revision we advertise is served at the HTTP handshake and echoed back
-/// verbatim - and the session model splits at the era, which is the transport
-/// half of adopting it.
+/// Every revision we advertise is served at the HTTP handshake, and an
+/// `initialize` always takes the session branch whatever revision it names.
 ///
-/// `is_legacy_request` (rmcp 3.1.2 `tower.rs:358-408`) routes anything below
-/// 2026-07-28 through the session branch, the only site that inserts
-/// `Mcp-Session-Id` (`tower.rs:1911`); at or above it the request routes
-/// statelessly and there is no session to issue. Driven off
-/// `SERVED_PROTOCOL_VERSIONS` rather than a literal list, so a revision added
-/// without a decision about its session model fails here.
+/// `is_legacy_request` (rmcp 3.2.0 `tower.rs:359-416`) returns `true` for an
+/// `InitializeRequest` before it looks at any version at all, because the
+/// handshake exists only in the revisions before 2026-07-28; the session branch
+/// is the only site that inserts `Mcp-Session-Id` (`tower.rs:1911`). The answer
+/// then comes from `negotiate_protocol_version` (`service/server.rs:479`),
+/// which echoes a legacy revision and substitutes the newest legacy one for
+/// anything else. A modern peer never sends `initialize` - it carries the
+/// SEP-2575 `_meta` on each request and routes statelessly, which
+/// `tests/mcp_modern_era.rs` covers. Driven off `SERVED_PROTOCOL_VERSIONS`
+/// rather than a literal list, so a revision added without a decision about its
+/// session model fails here.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn every_revision_we_serve_is_echoed_and_only_the_legacy_ones_get_a_session() {
+async fn every_revision_we_serve_is_handshaken_as_legacy_and_gets_a_session() {
     let addr = spawn_router().await;
+    let newest_handshake = crystalline_service::mcp::newest_legacy_handshake_version();
+    let newest_handshake = newest_handshake.as_str();
     for version in crystalline_service::mcp::SERVED_PROTOCOL_VERSIONS {
         let version = version.as_str();
         let response = post(addr, &init_body(version), None).await;
@@ -194,23 +200,20 @@ async fn every_revision_we_serve_is_echoed_and_only_the_legacy_ones_get_a_sessio
             response.starts_with("HTTP/1.1 200 "),
             "{version} initialize is served:\n{response}"
         );
-        assert!(
-            response.contains(&format!("\"protocolVersion\":\"{version}\"")),
-            "{version} is echoed back:\n{response}"
-        );
-        if version < "2026-07-28" {
-            assert!(
-                !extract_session_id(&response).is_empty(),
-                "{version} gets a session id:\n{response}"
-            );
+        let answered = if version < "2026-07-28" {
+            version
         } else {
-            assert!(
-                !response
-                    .split("\r\n")
-                    .any(|line| line.to_ascii_lowercase().starts_with("mcp-session-id")),
-                "{version} is sessionless by design (SEP-2575):\n{response}"
-            );
-        }
+            newest_handshake
+        };
+        assert!(
+            response.contains(&format!("\"protocolVersion\":\"{answered}\"")),
+            "{version} is answered {answered}:\n{response}"
+        );
+        assert!(
+            !extract_session_id(&response).is_empty(),
+            "{version} gets a session id, because an initialize is legacy \
+             whatever it names:\n{response}"
+        );
     }
 }
 
@@ -538,7 +541,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         .collect();
     assert_eq!(
         names.len(),
-        18,
+        20,
         "a default install's tools, the `skills` surface among them: {names:?}"
     );
     let mut sorted = names.clone();
@@ -643,7 +646,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
             .as_array()
             .unwrap()
             .len(),
-        18
+        20
     );
 
     // **Task 9 moved this assertion, deliberately.** The same shape at
@@ -654,7 +657,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
     // revision matches, which
     // `a_version_we_do_not_serve_is_refused_at_the_http_handshake` pins in both
     // of its shapes. Here the era is served: statelessly, with its caching
-    // hints, and with the same 18 tools every other client of this instance is
+    // hints, and with the same 20 tools every other client of this instance is
     // served (GitHub is off here, so the five collaboration tools are withheld
     // from every era alike).
     // `tests/mcp_modern_era.rs` is where the rest of that surface lives.
@@ -677,7 +680,7 @@ async fn the_wire_format_baseline_the_conformance_tasks_measure_against() {
         head_of(&era)
     );
     let era_result = &payload(&era)["result"];
-    assert_eq!(era_result["tools"].as_array().unwrap().len(), 18);
+    assert_eq!(era_result["tools"].as_array().unwrap().len(), 20);
     assert_eq!(era_result["resultType"], "complete");
     assert_eq!(era_result["ttlMs"], 0);
     assert_eq!(era_result["cacheScope"], "public");

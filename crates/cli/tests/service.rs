@@ -153,6 +153,19 @@ impl Env {
         )
     }
 
+    /// Like [`Self::run`], but also returns stderr - needed to see a command's
+    /// failure message, which never lands on stdout.
+    fn run_full(&self, args: &[&str]) -> (bool, String, String) {
+        let mut cmd = Command::new(bin());
+        self.apply(&mut cmd);
+        let out = cmd.args(args).output().unwrap();
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
     /// Poll ctl status until the daemon answers, or panic after ~8s.
     fn wait_ready(&self) {
         let start = Instant::now();
@@ -442,7 +455,9 @@ fn read_only_daemon_reports_hides_and_refuses() {
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
+        "remove_domain",
         "evolve_engrams",
     ] {
         assert!(
@@ -611,6 +626,309 @@ fn domain_add_while_daemon_running_syncs_and_watches_the_new_domain() {
     assert!(
         found,
         "the watcher picked up an external write in a domain added after daemon start"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The reported bug's exact shape: a bare `crystalline sync --domain <name>`
+/// with a daemon running. `sync_dispatch` (`main.rs`) routes this over the
+/// daemon's ctl socket instead of the direct path in `cmd.rs`, and a
+/// per-file failure used to ride inside the daemon's own `data.reports[].failed`
+/// as an ordinary field, so the ctl envelope around it stayed "ok" and the
+/// process exited 0 regardless. The daemon path now runs the identical
+/// failure check `cmd::sync` runs on the direct path, so a user cannot tell
+/// which one handled their command from the exit code or the message.
+#[test]
+fn sync_over_a_running_daemon_fails_when_a_file_could_not_be_indexed() {
+    let env = Env::new("syncfail");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // A file whose frontmatter repeats a key lands after the daemon started,
+    // so this sync is the first thing to see it - the same duplicate-`tags`
+    // shape the original report hit.
+    std::fs::write(
+        env.dir.join("kb-eng/bad.md"),
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["sync", "--domain", "eng"]);
+    assert!(
+        !ok,
+        "a partial failure over the daemon must fail the process, not exit 0: stdout={stdout} stderr={stderr}"
+    );
+    // The daemon path prints the full report before failing, same as the
+    // direct path - `sync_dispatch` always renders the daemon's JSON answer
+    // through `print_value`, so the shape differs from the direct path's
+    // plain-text summary line, but the evidence is the same either way: the
+    // report, the failing file's path and the reason are all still on
+    // stdout, printed before the process fails.
+    assert!(
+        stdout.contains("\"failed\""),
+        "the report still prints in full before the failure: {stdout}"
+    );
+    assert!(
+        stdout.contains("bad.md"),
+        "the failing file is named: {stdout}"
+    );
+    assert!(
+        stdout.contains("duplicate entry with key"),
+        "the reason travels with it: {stdout}"
+    );
+    assert!(
+        stderr.contains("failed to sync") && stderr.contains("eng"),
+        "the failure names the count and the domain on stderr: {stderr}"
+    );
+
+    // A clean sync over the same still-running daemon succeeds: the check
+    // only fires on an actual failure, so the two paths cannot drift apart
+    // on the happy path either.
+    std::fs::remove_file(env.dir.join("kb-eng/bad.md")).unwrap();
+    let (ok, out) = env.run(&["sync", "--domain", "eng"]);
+    assert!(ok, "a clean sync over the daemon still succeeds: {out}");
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The other failure class the daemon path used to ignore entirely: not one
+/// file with broken frontmatter, but a whole domain `Engine::sync_take_over`
+/// could not scan at all - it logs a warning, records `{"domain", "error"}`
+/// in the response's top-level `failed` array and moves on to the next
+/// domain, rather than aborting the sweep. That per-domain record rode in
+/// the ctl envelope exactly like a per-file one, so a daemon-routed sync
+/// with one unscannable domain among several still exited 0. A missing
+/// directory is the easy way to trigger it: `scan_domain` errors loudly the
+/// moment its walk root itself cannot be read (see its own comment), and a
+/// removed directory hits that same branch as a permission error would.
+#[test]
+fn sync_over_a_running_daemon_fails_when_a_domain_could_not_be_scanned() {
+    let env = Env::new("scanfail");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    // Registered while the daemon is up, exactly like the sibling
+    // `domain_add_while_daemon_running_...` test, so this domain is fully
+    // synced and known-good before its directory disappears out from under
+    // it.
+    env.setup_domain("broken");
+    std::fs::remove_dir_all(env.dir.join("kb-broken")).unwrap();
+
+    // No `--domain` filter: `Engine::sync_take_over` only soft-skips a
+    // domain whose scan failed when sweeping everything (`only.is_none()`);
+    // naming one domain that fails would abort with a plain error instead,
+    // which is not the shape this bug needs (multiple domains, one bad).
+    let (ok, stdout, stderr) = env.run_full(&["sync"]);
+    assert!(
+        !ok,
+        "a domain that could not be scanned at all must fail the process, not exit 0: stdout={stdout} stderr={stderr}"
+    );
+    // The full report still prints before the failure, "eng" included, so a
+    // healthy domain's result is never hidden by a sibling's failure.
+    assert!(
+        stdout.contains("\"eng\""),
+        "eng's own report still prints: {stdout}"
+    );
+    assert!(
+        stdout.contains("broken"),
+        "the daemon's failed-domains array still names it: {stdout}"
+    );
+    assert!(
+        stderr.contains("could not be scanned") && stderr.contains("broken"),
+        "the failure names the domain and says it could not be scanned, not that a file failed to parse: {stderr}"
+    );
+    assert!(
+        !stderr.contains("file(s) failed to sync"),
+        "the wrong failure class must not be claimed - no file parse failure happened here: {stderr}"
+    );
+
+    drop(c1);
+    let _ = env.run(&["ctl", "shutdown"]);
+}
+
+/// The colleague's fourth defect, exactly as reported: a healthy daemon is
+/// running and `crystalline doctor` used to die on
+/// `could not open the index ... File is locked by another process`, because
+/// doctor was the one index-touching command with no daemon route. It now
+/// asks the daemon for the file stamps its orphan and unindexed checks need,
+/// so the diagnosis a person runs while the service is up actually runs, and
+/// it still splits "not indexed yet" from "cannot be indexed until the
+/// frontmatter is fixed".
+///
+/// The second domain is registered by editing `config.yaml` directly rather
+/// than through `domain add`: `domain add` routes a sync through the running
+/// daemon, and a watched domain's well-formed file would be indexed within
+/// the debounce, so there would be no unindexed file left to report. The
+/// daemon never watches a domain it did not know at startup, which keeps
+/// `good.md` unindexed for the length of the test while `bad.md` stays
+/// unindexable whatever anyone runs.
+#[test]
+fn doctor_over_a_running_daemon_reports_instead_of_failing_on_the_index_lock() {
+    let env = Env::new("docdaemon");
+    env.setup_domain("eng");
+
+    let mut c1 = Mcp::spawn(&env);
+    c1.initialize();
+    env.wait_ready();
+
+    let docs = env.dir.join("kb-docs");
+    std::fs::create_dir_all(&docs).unwrap();
+    std::fs::write(
+        docs.join("MANIFEST.md"),
+        "---\ntype: manifest\ntitle: docs\npermalink: manifest\ntags:\n  - manifest\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# docs\n\n## Scope\n\n- docs\n\n## When to Use\n\n- Route here for docs\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("good.md"),
+        "---\ntype: engram\ntitle: Good\npermalink: good\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nA perfectly well-formed engram nobody has indexed yet.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        docs.join("bad.md"),
+        "---\ntype: engram\ntitle: Bad\npermalink: bad\ntags: [a]\ntags: [b]\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nBody.\n",
+    )
+    .unwrap();
+    let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    cfg.domains.insert(
+        "docs".to_string(),
+        crystalline_core::config::DomainEntry::file(&docs),
+    );
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["--json", "doctor"]);
+    assert!(
+        !stdout.contains("locked by another process")
+            && !stderr.contains("locked by another process"),
+        "doctor never collides with the service it diagnoses: stdout={stdout} stderr={stderr}"
+    );
+    assert!(
+        !ok,
+        "the two unhealthy files are problems, so doctor exits 1: stdout={stdout} stderr={stderr}"
+    );
+    let report: Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!("doctor still produced its report: {e}: stdout={stdout} stderr={stderr}")
+    });
+    assert_eq!(
+        report["index"]["source"],
+        json!("daemon"),
+        "the index reads went through the running daemon: {report}"
+    );
+    let docs_report = report["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == json!("docs"))
+        .expect("the second domain is in the report")
+        .clone();
+    assert_eq!(
+        docs_report["unindexed"],
+        json!(["MANIFEST.md", "good.md"]),
+        "the well-formed files are reported as not indexed yet, the manifest among them: {docs_report}"
+    );
+    assert_eq!(
+        docs_report["unsyncable"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["path"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>(),
+        vec!["bad.md".to_string()],
+        "the duplicate-key file is the other class, not merely unsynced: {docs_report}"
+    );
+    assert!(
+        docs_report["unsyncable"][0]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("duplicate entry with key"),
+        "the reason travels with it: {docs_report}"
+    );
+
+    // The domain the daemon does watch is clean, so the daemon-served stamps
+    // are read as stamps, not as "nothing is indexed".
+    let eng = report["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["name"] == json!("eng"))
+        .expect("the watched domain is in the report")
+        .clone();
+    assert_eq!(eng["unindexed"], json!([]), "{eng}");
+    assert_eq!(eng["index_checked"], json!(true), "{eng}");
+
+    // The human report says where its index answers came from, and keeps the
+    // two file classes apart there too.
+    let (_, human, _) = env.run_full(&["doctor"]);
+    assert!(
+        human.contains("index: read through the running daemon"),
+        "the report names the route it took: {human}"
+    );
+    assert!(
+        human.contains("run: crystalline sync --domain docs\n")
+            && human.contains("cannot be indexed until the frontmatter is fixed"),
+        "and gives each class its own guidance: {human}"
+    );
+
+    // `--domain` sends a name over the socket instead of asking for every
+    // domain, which is a different resolution on the daemon side. It must
+    // still be answered there: a refusal would fall through to the direct
+    // open, hit the same lock and report a partial run, which reads as
+    // "doctor works" from the outside while being the bug again.
+    let (_, filtered, stderr) = env.run_full(&["--json", "doctor", "--domain", "docs"]);
+    let report: Value = serde_json::from_str(&filtered)
+        .unwrap_or_else(|e| panic!("a filtered run still reports: {e}: {filtered} {stderr}"));
+    assert_eq!(
+        report["index"]["source"],
+        json!("daemon"),
+        "a named domain is served by the daemon too, not fallen back to a direct open: {report}"
+    );
+    let names: Vec<String> = report["domains"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|d| d["name"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(names, vec!["docs".to_string()], "{report}");
+    assert_eq!(
+        report["domains"][0]["unindexed"],
+        json!(["MANIFEST.md", "good.md"])
+    );
+
+    // A virtual domain has no files to stamp, so the daemon answers with
+    // nothing for it. That is an answer, not a refusal: the run stays on the
+    // daemon route and says the count was not read rather than printing a
+    // zero it never looked up.
+    let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    cfg.domains.insert(
+        "ideas".to_string(),
+        crystalline_core::config::DomainEntry {
+            kind: crystalline_core::config::DomainKind::Virtual,
+            path: None,
+            origin: None,
+            provision: None,
+        },
+    );
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+    let (ok, virtual_json, stderr) = env.run_full(&["--json", "doctor", "--domain", "ideas"]);
+    assert!(
+        ok,
+        "a virtual domain with nothing wrong exits 0: {virtual_json} {stderr}"
+    );
+    let report: Value = serde_json::from_str(&virtual_json).unwrap();
+    assert_eq!(report["index"]["source"], json!("daemon"), "{report}");
+    assert_eq!(report["domains"][0]["engrams"], Value::Null, "{report}");
+    let (_, virtual_human, _) = env.run_full(&["doctor", "--domain", "ideas"]);
+    assert!(
+        virtual_human.contains("ok (virtual, engram count not read)"),
+        "no fabricated count: {virtual_human}"
     );
 
     drop(c1);
@@ -950,7 +1268,7 @@ fn http_smoke_initialize_list_and_search() {
     // it, so the count here is the default one rather than every tool this
     // server implements (see crystalline-service's mcp_collab suite for the
     // full gating matrix).
-    assert_eq!(tools.len(), 18, "a default install's tools over HTTP");
+    assert_eq!(tools.len(), 20, "a default install's tools over HTTP");
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.contains(&"configure"), "{names:?}");
     assert!(names.contains(&"add_domain"), "{names:?}");

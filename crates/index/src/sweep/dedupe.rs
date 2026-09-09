@@ -22,9 +22,10 @@
 //! stops at [`super::MAX_CANDIDATE_PAIRS`].
 //!
 //! Known limit, deliberate: this is lexical. It finds copy-paste and edited
-//! copies, never a pure paraphrase. Rescoring the same candidate pairs with
-//! embeddings is the natural follow-up, and those pairs are also exactly where
-//! semantic contradiction detection would attach.
+//! copies, never a pure paraphrase. A paraphrase is [`super::twins`]'s to
+//! find, in an independent all-pairs pass over lead embeddings rather than a
+//! rescoring of the candidate pairs above; a pair the two rules both reach is
+//! reported once, as `V201`.
 
 use std::collections::{BTreeMap, BTreeSet};
 

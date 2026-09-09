@@ -1,16 +1,27 @@
 /**
- * The profile screen, which is one card: the GitHub identity this account
- * shares as.
+ * The profile screen, which is two cards: the GitHub identity this account
+ * shares as, and the MCP tokens an agent authenticates the daemon with, acting
+ * as this account.
  *
- * What is pinned here is what somebody about to share has to be able to trust:
+ * The GitHub half pins what somebody about to share has to be able to trust:
  * that both ways in are on offer, that the device flow shows the code and where
  * to type it, that a token typed in is sent once and left nowhere, that the
  * connected card names the account and since when, and that a refusal - a
  * viewer's, or a sign-in somebody else already started - is the server's own
  * sentence rather than a house message pasted over it.
+ *
+ * The agent access half pins the opposite direction: that the card is offered
+ * to a viewer exactly as it is to an editor and never gated by an instance's
+ * read-only setting, that a freshly issued or rotated secret is shown exactly
+ * once and gone from the DOM the moment its dialog is dismissed, that the
+ * listing never carries the secret at all, that every one of its four failure
+ * surfaces shows the server's own words, that a revoke abandoned by Escape or
+ * Keep hands focus back to the row's own Revoke button, and that a failed
+ * issue is never retried into a second, unseen token.
  */
 
-import { screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -24,6 +35,8 @@ import {
   renderApp,
   userFixture,
 } from "../test/harness";
+import { Tooltips } from "../components/primitives";
+import { AgentAccessCard } from "./Profile";
 
 vi.mock("../api/client", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../api/client")>();
@@ -72,9 +85,37 @@ function serveAs(
       "/auth/me": () => meResponse({ user: userFixture({ role }), ...me }),
       "/domains": domainsResponse,
       "/me/github-identity": () => identityPayload(),
+      "/me/mcp-tokens": () => [],
+      "/me/oauth-grants": () => [],
+      // The default is an instance with no provider and an account with no
+      // link, which is the shape in which the SSO card is not there at all.
+      "/auth/providers": () => ({ local: true, oidc: { enabled: false } }),
+      "/me/identity-links": () => ({ links: [], has_password: true }),
       ...routes,
     }),
   );
+}
+
+/** An instance with a provider configured, for the SSO card's own tests. */
+function withProvider(routes: Record<string, Answer> = {}) {
+  return {
+    "/auth/providers": () => ({
+      local: true,
+      oidc: { enabled: true, name: "Contoso" },
+    }),
+    ...routes,
+  };
+}
+
+/** One link, as the listing hands it back. */
+function linkPayload(overrides: Record<string, unknown> = {}) {
+  return {
+    issuer: "https://idp.example",
+    subject: "sub-1",
+    linked_at: "2026-09-01T09:12:44Z",
+    linked_by: "ada",
+    ...overrides,
+  };
 }
 
 /** Every call the app made to the personal identity surface. */
@@ -342,5 +383,853 @@ describe("the profile screen", () => {
     expect(
       await screen.findByText(/nothing here can be connected or disconnected/i),
     ).toBeInTheDocument();
+  });
+});
+
+describe("the agent access card", () => {
+  it("lists the caller's own tokens, never a secret", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 1,
+          label: "laptop",
+          created_at: "2026-08-29T09:12:44Z",
+          last_used: "2026-09-01T10:00:00Z",
+        },
+        {
+          id: 2,
+          label: "ci",
+          created_at: "2026-08-20T00:00:00Z",
+          last_used: null,
+        },
+      ],
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent access" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+    expect(screen.getByText("2026-08-29")).toBeInTheDocument();
+    expect(screen.getByText("ci")).toBeInTheDocument();
+    expect(screen.getByText("Never")).toBeInTheDocument();
+    expect(screen.queryByText(/cmt_/)).not.toBeInTheDocument();
+  });
+
+  it("says so when no token has been issued yet", async () => {
+    serveAs("viewer");
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/no tokens issued yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("is offered to a viewer too, since an agent acts as its user", async () => {
+    serveAs("viewer");
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Agent access" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Issue token" }),
+    ).toBeInTheDocument();
+  });
+
+  it("issues a token, reveals it exactly once, and never again after it is dismissed", async () => {
+    let tokens: Record<string, unknown>[] = [];
+    serveAs("editor", {
+      "/me/mcp-tokens": (_path, init) => {
+        if (init?.method === "POST") {
+          tokens = [
+            {
+              id: 9,
+              label: "laptop",
+              created_at: "2026-09-07T00:00:00Z",
+              last_used: null,
+            },
+          ];
+          return { id: 9, label: "laptop", token: "cmt_deadbeef" };
+        }
+        return tokens;
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+
+    await waitFor(() => {
+      expect(sentBody("/me/mcp-tokens", "POST")).toEqual({ label: "laptop" });
+    });
+    // The field clears once the server took the label, the same rule the
+    // GitHub token field above follows.
+    await waitFor(() => {
+      expect(field).toHaveValue("");
+    });
+
+    const dialog = await screen.findByRole("dialog", { name: "laptop" });
+    expect(within(dialog).getByText("cmt_deadbeef")).toBeInTheDocument();
+    expect(
+      within(dialog).getByText(
+        (_text, node) =>
+          node?.textContent ===
+          "Add this as header Authorization: Bearer cmt_deadbeef to the crystalline entry in your agent's MCP registration.",
+      ),
+    ).toBeInTheDocument();
+
+    await userEvent.click(within(dialog).getByRole("button", { name: "Done" }));
+    // Dismissed, and gone from the DOM for good - the secret is held nowhere
+    // this screen could show it back from.
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(screen.queryByText("cmt_deadbeef")).not.toBeInTheDocument();
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+  });
+
+  it("rotates a token and reveals the fresh secret", async () => {
+    const listing = [
+      {
+        id: 3,
+        label: "laptop",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+      },
+    ];
+    serveAs("editor", {
+      "/me/mcp-tokens": () => listing,
+      "/me/mcp-tokens/3/rotate": () => ({
+        id: 3,
+        label: "laptop",
+        token: "cmt_freshbeef",
+      }),
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Rotate laptop" }),
+    );
+
+    const dialog = await screen.findByRole("dialog", { name: "laptop" });
+    expect(within(dialog).getByText("cmt_freshbeef")).toBeInTheDocument();
+  });
+
+  it("revokes a token behind a two-step confirm", async () => {
+    let listing = [
+      {
+        id: 5,
+        label: "laptop",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+      },
+    ];
+    const revoked = vi.fn(() => {
+      listing = [];
+    });
+    serveAs("editor", {
+      "/me/mcp-tokens": () => listing,
+      "/me/mcp-tokens/5": (_path, init) => {
+        if (init?.method === "DELETE") {
+          revoked();
+        }
+        return undefined;
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke laptop" }),
+    );
+    expect(revoked).not.toHaveBeenCalled();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke laptop" }),
+    );
+    await waitFor(() => {
+      expect(revoked).toHaveBeenCalled();
+    });
+    expect(
+      await screen.findByText(/no tokens issued yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("offers issue, rotate and revoke on a read-only instance too, since a token is account state rather than knowledge", async () => {
+    serveAs(
+      "editor",
+      {
+        "/me/mcp-tokens": () => [
+          {
+            id: 1,
+            label: "laptop",
+            created_at: "2026-08-01T00:00:00Z",
+            last_used: null,
+          },
+        ],
+      },
+      { read_only: true },
+    );
+    renderApp("/profile");
+
+    // The read-only setting protects the knowledge base; it says nothing
+    // about a token, which is unrelated to it - every control here is drawn.
+    expect(await screen.findByText("laptop")).toBeInTheDocument();
+    expect(screen.getByLabelText("Label")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Issue token" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Rotate laptop" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Revoke laptop" }),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when issuing a token is refused", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": (_path, init) => {
+        if (init?.method === "POST") {
+          throw new ApiProblem(
+            422,
+            "unprocessable entity",
+            "you already hold the maximum number of tokens",
+          );
+        }
+        return [];
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+
+    expect(
+      await screen.findByText(/you already hold the maximum/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's own words when rotating a token is refused", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 4,
+          label: "laptop",
+          created_at: "2026-08-01T00:00:00Z",
+          last_used: null,
+        },
+      ],
+      "/me/mcp-tokens/4/rotate": () => {
+        throw new ApiProblem(
+          404,
+          "not found",
+          "no such MCP token: it may already have been revoked",
+        );
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Rotate laptop" }),
+    );
+
+    expect(await screen.findByText(/no such mcp token/i)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows the server's own words when revoking a token is refused", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 6,
+          label: "laptop",
+          created_at: "2026-08-01T00:00:00Z",
+          last_used: null,
+        },
+      ],
+      "/me/mcp-tokens/6": (_path, init) => {
+        if (init?.method === "DELETE") {
+          throw new ApiProblem(
+            404,
+            "not found",
+            "no such MCP token: it may already have been revoked",
+          );
+        }
+        return undefined;
+      },
+    });
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke laptop" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke laptop" }),
+    );
+
+    expect(await screen.findByText(/no such mcp token/i)).toBeInTheDocument();
+    // Refused, so the row nothing happened to is still there.
+    expect(screen.getByText("laptop")).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when the listing itself fails", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => {
+        throw new ApiProblem(
+          500,
+          "internal error",
+          "the account store could not be read",
+        );
+      },
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/the account store could not be read/i),
+    ).toBeInTheDocument();
+  });
+
+  it("returns focus to the row's own Revoke button after Escape and after Keep", async () => {
+    serveAs("editor", {
+      "/me/mcp-tokens": () => [
+        {
+          id: 7,
+          label: "laptop",
+          created_at: "2026-08-01T00:00:00Z",
+          last_used: null,
+        },
+      ],
+    });
+    renderApp("/profile");
+
+    const trigger = await screen.findByRole("button", {
+      name: "Revoke laptop",
+    });
+
+    await userEvent.click(trigger);
+    expect(
+      screen.getByRole("button", { name: "Confirm revoke laptop" }),
+    ).toBeInTheDocument();
+    await userEvent.keyboard("{Escape}");
+    expect(
+      screen.queryByRole("button", { name: "Confirm revoke laptop" }),
+    ).not.toBeInTheDocument();
+    // The trigger is rendered unconditionally for exactly this: its ref stays
+    // live while confirming, so abandoning has something real to focus.
+    expect(trigger).toHaveFocus();
+
+    await userEvent.click(trigger);
+    await userEvent.click(screen.getByRole("button", { name: "Keep" }));
+    expect(trigger).toHaveFocus();
+  });
+
+  /**
+   * The client's default retries once, after roughly a second, for anything
+   * that is not a 4xx - real time, since testing-library's waiter does not
+   * recognise vitest's fake clock. `retry: false` on `issue` is what keeps a
+   * dropped connection from minting a second, unseen token; this fails
+   * without it.
+   */
+  it("does not retry a failed issue, so a dropped connection never mints a second token", async () => {
+    const attempts = vi.fn();
+    serveAs("editor", {
+      "/me/mcp-tokens": (_path, init) => {
+        if (init?.method === "POST") {
+          attempts();
+          throw new ApiProblem(
+            0,
+            "network error",
+            "could not reach the server: it may be down",
+          );
+        }
+        return [];
+      },
+    });
+    renderApp("/profile");
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+
+    expect(
+      await screen.findByText(/could not reach the server/i),
+    ).toBeInTheDocument();
+    expect(attempts).toHaveBeenCalledTimes(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(attempts).toHaveBeenCalledTimes(1);
+  }, 8000);
+
+  it("never lets the issued secret become a value React Query itself retains", async () => {
+    apiMock.mockImplementation(
+      answersFor({
+        "/me/mcp-tokens": (_path, init) => {
+          if (init?.method === "POST") {
+            return { id: 11, label: "laptop", token: "cmt_deadbeef" };
+          }
+          return [];
+        },
+      }),
+    );
+    const client = new QueryClient({
+      defaultOptions: { mutations: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={client}>
+        <Tooltips>
+          <AgentAccessCard />
+        </Tooltips>
+      </QueryClientProvider>,
+    );
+
+    const field = await screen.findByLabelText("Label");
+    await userEvent.type(field, "laptop");
+    await userEvent.click(screen.getByRole("button", { name: "Issue token" }));
+    await screen.findByRole("dialog", { name: "laptop" });
+
+    // The mutation cache is inspected directly - not the DOM - because the
+    // point is what React Query itself retains, which the screen could not
+    // reveal either way.
+    expect(JSON.stringify(client.getMutationCache().getAll())).not.toContain(
+      "cmt_deadbeef",
+    );
+  });
+});
+
+describe("the connected clients card", () => {
+  it("lists grants with their client and last use", async () => {
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => [
+          {
+            id: 1,
+            client_id: "coc_1a2b3c",
+            client_name: "Claude",
+            redirect_host: "claude.ai",
+            created_at: "2026-08-29T09:12:44Z",
+            last_used: "2026-09-01T10:00:00Z",
+            refresh_expires_at: "2026-10-08T04:00:00Z",
+          },
+          {
+            id: 2,
+            client_id: "coc_4d5e6f",
+            client_name: "a local agent",
+            redirect_host: "127.0.0.1:51902",
+            created_at: "2026-08-20T00:00:00Z",
+            last_used: null,
+            refresh_expires_at: "2026-10-20T00:00:00Z",
+          },
+        ],
+      },
+      { oauth: true },
+    );
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Connected clients" }),
+    ).toBeInTheDocument();
+    expect(await screen.findByText("Claude")).toBeInTheDocument();
+    expect(screen.getByText("claude.ai")).toBeInTheDocument();
+    expect(screen.getByText("2026-08-29")).toBeInTheDocument();
+    expect(screen.getByText("2026-09-01")).toBeInTheDocument();
+    expect(screen.getByText("a local agent")).toBeInTheDocument();
+    expect(screen.getByText("127.0.0.1:51902")).toBeInTheDocument();
+    expect(screen.getByText("Never")).toBeInTheDocument();
+  });
+
+  it("says so when no client is connected yet", async () => {
+    serveAs("viewer", {}, { oauth: true });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("is absent on an instance that never turned OAuth on", async () => {
+    serveAs(
+      "editor",
+      {
+        // If the card ignored the gate and fetched anyway, this would be
+        // the listing it drew from - present so a leak reads as a real
+        // failure rather than an accidental empty-state pass.
+        "/me/oauth-grants": () => [
+          {
+            id: 1,
+            client_id: "coc_1a2b3c",
+            client_name: "Claude",
+            redirect_host: "claude.ai",
+            created_at: "2026-08-29T09:12:44Z",
+            last_used: null,
+            refresh_expires_at: "2026-10-08T04:00:00Z",
+          },
+        ],
+      },
+      { oauth: false },
+    );
+    renderApp("/profile");
+
+    // Agent access is the marker that the screen finished rendering, so the
+    // absence below is an absence rather than a race with the initial load.
+    await screen.findByRole("heading", { name: "Agent access" });
+    expect(
+      screen.queryByRole("heading", { name: "Connected clients" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Claude")).not.toBeInTheDocument();
+    // And the gate is on the fetch too, not only the render.
+    expect(
+      apiMock.mock.calls.some(([path]) => path === "/me/oauth-grants"),
+    ).toBe(false);
+  });
+
+  it("is present on an instance that serves OAuth", async () => {
+    serveAs("editor", { "/me/oauth-grants": () => [] }, { oauth: true });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "Connected clients" }),
+    ).toBeInTheDocument();
+  });
+
+  it("revokes a grant and shows the server's refusal word for word", async () => {
+    let listing = [
+      {
+        id: 9,
+        client_id: "coc_1a2b3c",
+        client_name: "Claude",
+        redirect_host: "claude.ai",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+        refresh_expires_at: "2026-10-08T04:00:00Z",
+      },
+    ];
+    let refuse = true;
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => listing,
+        "/me/oauth-grants/9": (_path, init) => {
+          if (init?.method === "DELETE") {
+            if (refuse) {
+              throw new ApiProblem(
+                404,
+                "not found",
+                "no such connected client: it may already have been revoked",
+              );
+            }
+            listing = [];
+          }
+          return undefined;
+        },
+      },
+      { oauth: true },
+    );
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke Claude (#9)" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude (#9)" }),
+    );
+
+    // The server's own refusal, word for word.
+    expect(
+      await screen.findByText(/no such connected client/i),
+    ).toBeInTheDocument();
+
+    refuse = false;
+    await userEvent.click(
+      screen.getByRole("button", { name: "Revoke Claude (#9)" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude (#9)" }),
+    );
+
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+  });
+
+  it("treats a 404 on revoke as already gone, not a red error left on screen", async () => {
+    let listing = [
+      {
+        id: 11,
+        client_id: "coc_1a2b3c",
+        client_name: "Claude",
+        redirect_host: "claude.ai",
+        created_at: "2026-08-01T00:00:00Z",
+        last_used: null,
+        refresh_expires_at: "2026-10-08T04:00:00Z",
+      },
+    ];
+    serveAs(
+      "editor",
+      {
+        "/me/oauth-grants": () => listing,
+        "/me/oauth-grants/11": (_path, init) => {
+          if (init?.method === "DELETE") {
+            // Already gone - revoked from another tab, say, or simply
+            // expired - so the store no longer holds it even though this
+            // is the first time THIS button asked. The server answers 404,
+            // and the button's job (make sure it is disconnected) is done
+            // either way.
+            listing = [];
+            throw new ApiProblem(
+              404,
+              "not found",
+              "no such connected client: it may already have been revoked",
+            );
+          }
+          return undefined;
+        },
+      },
+      { oauth: true },
+    );
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Revoke Claude (#11)" }),
+    );
+    await userEvent.click(
+      screen.getByRole("button", { name: "Confirm revoke Claude (#11)" }),
+    );
+
+    // The server's exact sentence, but as a neutral notice - never
+    // `role="alert"` - because a grant that is already gone is not a
+    // failure of this press.
+    const notice = await screen.findByText(/no such connected client/i);
+    expect(notice).toHaveAttribute("role", "status");
+    // And the list is refreshed rather than the stale row left behind.
+    expect(
+      await screen.findByText(/no client connected yet/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Claude")).not.toBeInTheDocument();
+  });
+});
+
+describe("the SSO identity card", () => {
+  it("is absent when there is no provider and no identity to show", async () => {
+    serveAs("editor");
+    renderApp("/profile");
+
+    // The GitHub card is the marker that the screen finished rendering, so
+    // the absence below is an absence rather than a race.
+    await screen.findByRole("heading", { name: "GitHub identity" });
+    expect(
+      screen.queryByRole("heading", { name: "SSO identity" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("starts a link with a POST rather than a navigable link", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/auth/oidc/login": () => ({ location: "https://idp.example/auth" }),
+      }),
+    );
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "SSO identity" }),
+    ).toBeInTheDocument();
+    expect(
+      await screen.findByText(/no provider identity linked/i),
+    ).toBeInTheDocument();
+    // Never an anchor: the session cookie is SameSite=Lax, so a GET that
+    // started a link could be started by any other origin. A POST cannot be
+    // sent cross-site with the cookie, and `api` attaches the CSRF token.
+    expect(
+      screen.queryByRole("link", { name: /^Link Contoso$/ }),
+    ).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Link Contoso" }));
+
+    await waitFor(() => {
+      expect(
+        apiMock.mock.calls.some(
+          ([path, init]) =>
+            path === "/auth/oidc/login" && init?.method === "POST",
+        ),
+      ).toBe(true);
+    });
+    // Where the browser goes next is the server's answer, navigated to as a
+    // whole page. jsdom cannot follow that, so what is asserted here is the
+    // request; `crates/service/tests/oidc.rs` drives the rest of the journey.
+  });
+
+  it("shows the server's words when a link cannot be started", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/auth/oidc/login": () => {
+          throw new ApiProblem(
+            404,
+            "not found",
+            "this instance has no single sign-on provider configured",
+          );
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Link Contoso" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "this instance has no single sign-on provider configured",
+    );
+  });
+
+  it("never claims nothing is linked while the read is in flight or failed", async () => {
+    // The read never lands. What must NOT appear is the sentence for an
+    // account with nothing linked, which for an account that signs in through
+    // a provider is the opposite of the truth, and the button that would
+    // start a second link beside the one it already holds.
+    let settle: (() => void) | undefined;
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () =>
+          new Promise((resolve) => {
+            settle = () => {
+              resolve({ links: [linkPayload()], has_password: false });
+            };
+          }),
+      }),
+    );
+    renderApp("/profile");
+
+    expect(
+      await screen.findByText(/reading your provider identities/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no provider identity linked/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link Contoso" })).toBeNull();
+
+    settle?.();
+    expect(await screen.findByText("https://idp.example")).toBeInTheDocument();
+  });
+
+  it("says so when the identity read fails, rather than that there is nothing", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () => {
+          throw new ApiProblem(
+            500,
+            "internal",
+            "the accounts database is busy",
+          );
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "the accounts database is busy",
+    );
+    expect(screen.queryByText(/no provider identity linked/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Link Contoso" })).toBeNull();
+  });
+
+  it("names an unfamiliar linker rather than calling it this profile", async () => {
+    serveAs("editor", {
+      "/me/identity-links": () => ({
+        links: [linkPayload({ linked_by: "migration" })],
+        has_password: true,
+      }),
+    });
+    renderApp("/profile");
+
+    expect(await screen.findByText(/linked by migration/i)).toBeInTheDocument();
+  });
+
+  it("shows a linked identity, who linked it, and unlinks it", async () => {
+    let links = [linkPayload({ linked_by: "jit" })];
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () => ({ links, has_password: true }),
+        "/me/identity-links/https%3A%2F%2Fidp.example": () => {
+          links = [];
+          return undefined;
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    expect(await screen.findByText("https://idp.example")).toBeInTheDocument();
+    expect(screen.getByText(/created by a first sign-on/i)).toBeInTheDocument();
+    // With one identity already held, there is nothing to link: one identity
+    // per provider is the rule.
+    expect(
+      screen.queryByRole("link", { name: "Link Contoso" }),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Unlink" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "The identity is unlinked.",
+    );
+    expect(
+      await screen.findByText(/no provider identity linked/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the server's own words when the last way in cannot be given up", async () => {
+    serveAs(
+      "editor",
+      withProvider({
+        "/me/identity-links": () => ({
+          links: [linkPayload({ linked_by: "jit" })],
+          has_password: false,
+        }),
+        "/me/identity-links/https%3A%2F%2Fidp.example": () => {
+          throw new ApiProblem(
+            409,
+            "conflict",
+            "this is the only way into account 'ada': it has no password, so unlinking " +
+              "its last identity would leave nobody able to sign in - give it a password " +
+              "first with `crystalline users passwd ada`",
+          );
+        },
+      }),
+    );
+    renderApp("/profile");
+
+    // The card says so before anybody presses anything, and the refusal says
+    // it again in the server's own sentence.
+    expect(
+      await screen.findByText(/this identity is its only way in/i),
+    ).toBeInTheDocument();
+
+    await userEvent.click(
+      await screen.findByRole("button", { name: "Unlink" }),
+    );
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "crystalline users passwd ada",
+    );
+    expect(screen.getByText("https://idp.example")).toBeInTheDocument();
+  });
+
+  it("keeps showing a link whose provider was turned off, so it can be given up", async () => {
+    serveAs("editor", {
+      "/me/identity-links": () => ({
+        links: [linkPayload({ linked_by: "cli" })],
+        has_password: true,
+      }),
+    });
+    renderApp("/profile");
+
+    expect(
+      await screen.findByRole("heading", { name: "SSO identity" }),
+    ).toBeInTheDocument();
+    expect(screen.getByText(/linked by an administrator/i)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Unlink" })).toBeInTheDocument();
   });
 });

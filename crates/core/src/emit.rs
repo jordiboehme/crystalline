@@ -787,6 +787,49 @@ pub fn replace_section(
     ))
 }
 
+/// The one-based line range a section occupies, its heading line included and
+/// every deeper subsection with it: `(start, end)` with `end` exclusive.
+///
+/// The read-only counterpart of [`replace_section`], for a caller that has to
+/// take a section out of a document rather than rewrite it in place, and that
+/// is addressing the rest of the document by line as well. Sharing the heading
+/// walker with the section edits is the point: a caller that scanned for
+/// headings itself would disagree with them about a `#` inside a fenced code
+/// block, and about which section a path resolves to.
+///
+/// The range never reaches into the frontmatter, because the walker starts at
+/// the body.
+pub fn section_line_range(source: &str, path: &str) -> Result<(usize, usize), EditError> {
+    let headings = heading_spans(source);
+    let p = resolve_path(&headings, path).ok_or_else(|| EditError::SectionNotFound {
+        path: path.to_string(),
+    })?;
+    let start = headings[p].line_start;
+    let end_idx = section_end_index(&headings, p);
+    let end = headings
+        .get(end_idx)
+        .map(|h| h.line_start)
+        .unwrap_or(source.len());
+    // A boundary always sits at the first byte of a line, so "the number of
+    // lines that end before it, plus one" is that line's number and, read as
+    // an exclusive end, is exactly right. The one exception is a source with
+    // no final newline, whose last byte ends a line rather than starting one.
+    let at_unterminated_end = end == source.len() && !source.ends_with('\n');
+    Ok((
+        line_at(source, start),
+        line_at(source, end) + usize::from(at_unterminated_end),
+    ))
+}
+
+/// The one-based line the byte at `offset` sits on.
+fn line_at(source: &str, offset: usize) -> usize {
+    source[..offset.min(source.len())]
+        .bytes()
+        .filter(|b| *b == b'\n')
+        .count()
+        + 1
+}
+
 /// Insert content immediately before a section's heading line.
 pub fn insert_before_section(source: &str, path: &str, content: &str) -> Result<String, EditError> {
     let headings = heading_spans(source);
@@ -836,6 +879,49 @@ pub fn prepend_body(source: &str, content: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A document whose body lines are numbered in the assertions below, with
+    /// the frontmatter taking lines 1 through 5 so a range that reached into it
+    /// would be obvious.
+    const SECTIONED: &str = "---\ntype: engram\ntitle: T\npermalink: t\n---\n\n# T\n\n## A\n\nUnder A.\n\n### B\n\nUnder B.\n\n## C\n\nUnder C.\n";
+
+    #[test]
+    fn a_section_range_carries_its_subsections_and_stops_at_the_next_peer() {
+        // `## A` starts on line 9 and runs to just before `## C` on line 17,
+        // taking `### B` with it.
+        assert_eq!(section_line_range(SECTIONED, "## A").unwrap(), (9, 17));
+        // The subsection addressed on its own is only its own lines.
+        assert_eq!(
+            section_line_range(SECTIONED, "## A > ### B").unwrap(),
+            (13, 17)
+        );
+    }
+
+    #[test]
+    fn a_heading_inside_a_fence_neither_starts_nor_ends_a_section() {
+        let fenced = "---\ntype: engram\ntitle: T\npermalink: t\n---\n\n## A\n\n```\n## Not a heading\n```\n\nStill under A.\n\n## C\n\nUnder C.\n";
+        assert_eq!(section_line_range(fenced, "## A").unwrap(), (7, 15));
+        assert!(section_line_range(fenced, "## Not a heading").is_err());
+    }
+
+    #[test]
+    fn the_last_section_runs_to_the_end_with_or_without_a_final_newline() {
+        // Terminated: the exclusive end is one past the last line, which is the
+        // empty string after the final newline.
+        assert_eq!(section_line_range(SECTIONED, "## C").unwrap(), (17, 20));
+        // Unterminated: the last line ends the file rather than starting a new
+        // one, so the exclusive end is one past it all the same.
+        let unterminated = SECTIONED.trim_end_matches('\n');
+        assert_eq!(section_line_range(unterminated, "## C").unwrap(), (17, 20));
+    }
+
+    #[test]
+    fn a_path_that_resolves_to_nothing_is_an_error_rather_than_a_guess() {
+        assert!(matches!(
+            section_line_range(SECTIONED, "## Missing"),
+            Err(EditError::SectionNotFound { .. })
+        ));
+    }
 
     #[test]
     fn flow_scalar_leaves_the_common_actor_and_instant_forms_bare() {

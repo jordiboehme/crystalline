@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Crystalline Fluid API",
-    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me` and `/auth/setup` is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
+    "description": "The JSON API the Crystalline daemon mounts at `/api/v1` on its HTTP endpoint (127.0.0.1:7411 by default), the surface the Fluid UI talks to. Reading is open to any signed-in viewer; writing content needs an editor account and the `If-Match` token of the version being replaced, and account management needs an admin.\n\nEvery path but `/auth/login`, `/auth/logout`, `/auth/me`, `/auth/setup`, `/auth/providers`, `/oauth/register`, `/oauth/authorize`, `/oauth/token` and the two `/auth/oidc/*` routes is closed by default: a request that carries no identity is answered 401 ahead of routing, so an unauthenticated caller never learns which paths exist. Every failure is an RFC 9457 problem detail sent as `application/problem+json`.\n\nThe payloads marked as generic objects are the engine's own JSON, passed through unchanged so this API and the MCP tools stay one source of truth; each carries an example of the shape it answers with.",
     "license": {
       "name": "AGPL-3.0-or-later"
     },
@@ -174,7 +174,7 @@
             }
           },
           "403": {
-            "description": "The trusted-header identity names a disabled account.",
+            "description": "The identity a proxy asserted names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -239,7 +239,7 @@
             }
           },
           "403": {
-            "description": "The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the trusted-header identity names a disabled account.",
+            "description": "The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the identity a proxy asserted names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -257,7 +257,7 @@
           "auth"
         ],
         "summary": "The capability probe a client calls before anything else: who it is, whether\nit is being served anonymously, whether this instance refuses content\nmutations, whether it has any accounts at all, whether this session may\ndrive the share surfaces, and which server version it is talking to, so a\nmismatched UI can say so instead of failing later.",
-        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.",
+        "description": "Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.",
         "operationId": "get_me",
         "responses": {
           "200": {
@@ -273,7 +273,7 @@
                 "schema": {
                   "type": "string"
                 },
-                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from a trusted-header identity whose account holds none; a later probe reuses that session and sets no cookie."
+                "description": "The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from an identity a proxy asserted (`auth.trusted_header` or `auth.proxy_headers`) whose account holds none; a later probe reuses that session and sets no cookie."
               }
             },
             "content": {
@@ -285,11 +285,327 @@
             }
           },
           "403": {
-            "description": "The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one.",
+            "description": "The identity a proxy asserted names a disabled account, or its headers arrived in a shape this instance will not believe. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one.",
             "content": {
               "application/problem+json": {
                 "schema": {
                   "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/oidc/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Finish a single sign-on the provider sent back.",
+        "description": "Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. A sign-on started by `POST /auth/oidc/login` instead ties the identity to the account that started it, which has to be the account finishing it too. The provider's own error text never reaches this response.",
+        "operationId": "oidc_callback",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "description": "The authorization code, on success.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The state this instance generated, echoed back.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "description": "The provider's error code, when it refused.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "error_description",
+            "in": "query",
+            "description": "The provider's human-readable reason, when it refused.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Signed in. The session cookie is set and `location` is the application root.",
+            "headers": {
+              "location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`/`."
+              },
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_session` cookie, HttpOnly and SameSite=Lax."
+              }
+            }
+          },
+          "401": {
+            "description": "The provider refused, the state did not match, the ID token did not validate, or a link was finished after its session was signed out. One message for every way the protocol can fail.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The identity names a disabled account, or a new account would pass `auth.max_users`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No provider is configured on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The sign-in was started to link an identity and could not be: it was finished on another account's session, the identity belongs to another account (which is never named), or this account already holds one at that provider. Nothing was linked and no account was created.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The provider could not be reached for the token exchange.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/oidc/login": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Start a single sign-on against the configured provider.",
+        "description": "Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance (starts with `/`, not `//`, no backslash, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on `/`.",
+        "operationId": "oidc_login",
+        "parameters": [
+          {
+            "name": "link",
+            "in": "query",
+            "description": "Recognized so that a request meaning to link is told where linking\nlives, rather than quietly started as an ordinary sign-in. Starting a\nlink is `POST /auth/oidc/login`; see [`start_link`] for why it cannot\nbe a GET.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "return_to",
+            "in": "query",
+            "description": "Where to send the browser once the sign-in completes: a path on this\ninstance, which the callback 302s to instead of `/`.\n\nThe OAuth consent page is what this exists for. A client sends a\nbrowser to `/authorize?request=<id>`, Fluid finds nobody signed in and\ncarries the intended location to the login page, and a provider sign-in\nhas to come back to that exact request: the pending authorization is\nonly reachable by its id, so landing anywhere else loses it.\n\nAnything [`safe_return_path`] does not accept is dropped rather than\nrefused, and the sign-in lands on `/`: the person did sign in, and only\nthe destination was unusable.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Follow `location` to the provider.",
+            "headers": {
+              "location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The provider's authorization endpoint."
+              },
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax."
+              }
+            }
+          },
+          "400": {
+            "description": "`link=true`, which is the POST's job; or a request with no Host header, or one that is not a bare host and port, so no redirect uri can be derived.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No provider is configured on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The provider's discovery document could not be fetched, or it names a tenant-independent issuer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many sign-ins are in flight to start another. Wait a moment and try again.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Start a single sign-on that links its identity to this account.",
+        "description": "Starts the same authorization-code flow the GET does, and records that it is for the calling account: the callback ties the provider identity to that account rather than signing in as whoever it turns out to be. Needs a signed-in account and the session's CSRF token, because starting a link is an unsafe act - a GET would be startable by another origin. Answers the authorization endpoint in `location`; navigate the whole page to it. Served on a read-only instance: an identity link is account state rather than knowledge.",
+        "operationId": "oidc_start_link",
+        "responses": {
+          "200": {
+            "description": "Navigate to `location`.",
+            "headers": {
+              "set-cookie": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax."
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StartLinkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The request carries no Host header, or one that is not a bare host and port, so no redirect uri can be derived.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No signed-in account to link to.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The session's CSRF token was missing or wrong.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No provider is configured on this instance.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "502": {
+            "description": "The provider's discovery document could not be fetched, or it names a tenant-independent issuer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Too many sign-ins are in flight to start another. Wait a moment and try again.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/providers": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Which ways into this instance exist.",
+        "description": "Read by the sign-in screen before anyone is signed in, so it is public like the login route. Carries whether a single sign-on provider is configured and the label for its button, and nothing else about it: no issuer, no client id, no secret.",
+        "operationId": "auth_providers",
+        "responses": {
+          "200": {
+            "description": "The ways in.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProvidersResponse"
                 }
               }
             }
@@ -655,6 +971,7 @@
                       "name": "eng",
                       "observations": 12,
                       "path": "/Users/ada/Documents/Crystalline/eng",
+                      "private": false,
                       "relations": 3,
                       "when_to_use": [
                         "Route here for eng questions."
@@ -781,7 +1098,7 @@
           "domains"
         ],
         "summary": "Unregister a domain. Files on disk are never touched.",
-        "description": "Admin only. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.",
+        "description": "An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its engrams are DELETED with it: that case is refused 409 unless the request carries `?purge=true`, so a client confirms the loss in words before it sends. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.",
         "operationId": "unregister_domain",
         "parameters": [
           {
@@ -792,6 +1109,16 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "purge",
+            "in": "query",
+            "description": "Confirm that a virtual domain's engrams are to be deleted with it.\nRequired for a virtual domain that holds any; ignored otherwise.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            },
+            "example": true
           }
         ],
         "responses": {
@@ -823,7 +1150,7 @@
             }
           },
           "403": {
-            "description": "The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "description": "The caller may see the domain and may not end it (an instance admin can, and so can a private domain's owner), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -833,7 +1160,7 @@
             }
           },
           "404": {
-            "description": "No such domain.",
+            "description": "No such domain, or one this caller may not see.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -843,7 +1170,7 @@
             }
           },
           "409": {
-            "description": "The domain is defined by an environment variable, which owns it: unset the variable instead.",
+            "description": "The domain is defined by an environment variable, which owns it (unset the variable instead), or it is a virtual domain holding engrams and the request did not carry `purge=true`.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1375,7 +1702,7 @@
         },
         "responses": {
           "201": {
-            "description": "The engine's own read payload for the new engram.",
+            "description": "The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string.",
             "headers": {
               "etag": {
                 "schema": {
@@ -1645,7 +1972,7 @@
         },
         "responses": {
           "200": {
-            "description": "The engine's own read payload for the saved engram.",
+            "description": "The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string.",
             "headers": {
               "etag": {
                 "schema": {
@@ -1865,7 +2192,7 @@
           "maintenance"
         ],
         "summary": "Acknowledge one evolve finding on one engram.",
-        "description": "Records `evolve_ack` on the engram: the rule, the evidence the server computed it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`.",
+        "description": "Records `evolve_ack` on the engram: the rule, the evidence it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`. The evidence is the server's, either picked by running detection or - when the body names the row's `scope`, which is how a caller says which of an engram's two `V301` findings it read - checked against it.",
         "operationId": "acknowledge_finding",
         "parameters": [
           {
@@ -1947,7 +2274,7 @@
             }
           },
           "422": {
-            "description": "The rule id is not one the sweep catalog holds.",
+            "description": "The rule id is not one the sweep catalog holds, or the `scope` names evidence the rule is not firing on here.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -1963,7 +2290,7 @@
           "maintenance"
         ],
         "summary": "Withdraw an acknowledgment.",
-        "description": "Removes the engram's `evolve_ack` entry for that rule, leaving its other entries alone. 404 when the engram carries none for the rule, rather than reporting a removal that did not happen.",
+        "description": "Removes the engram's `evolve_ack` entries for that rule, leaving the other rules' alone. A rule has one entry, except `V301`, which has one per twin pair: name the row's `scope` to take one pair back and leave the engram's other pairs silenced, or send none to take every pair at once. 404 when the engram carries no entry the body names, rather than reporting a removal that did not happen.",
         "operationId": "unacknowledge_finding",
         "parameters": [
           {
@@ -2011,7 +2338,7 @@
             }
           },
           "404": {
-            "description": "No such domain or engram, or no acknowledgment for that rule on it.",
+            "description": "No such domain or engram, or no acknowledgment the body names on it.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -2761,6 +3088,237 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/members": {
+      "get": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Who owns this domain and who is invited into it.",
+        "description": "Served to any account that may see the domain, which on a private one means its owner, its members at every level, and instance admins. A caller who may not see the domain is answered 404, exactly as for a domain nobody registered.\n\nA shared domain answers `shared` with no owner and no members: membership only decides anything while a domain is private.",
+        "operationId": "list_domain_members",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The domain's owner and members.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MembersResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity. The anonymous viewer, where `auth.anonymous` allows one, is served: it sees the shared domains it can already read, and no private one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/members/{principal}": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Invite an account to a private domain, or change its level.",
+        "description": "Needs manager access on the domain: its own manager, its owner, or an instance admin. The same call invites and re-levels, since both state what the membership should be.\n\nRefused on a shared domain (409): membership only decides anything while a domain is private. The owner cannot be named here either - it already holds every level - and an account that does not exist, or is disabled, is a 422 rather than a row waiting for somebody to claim the name.",
+        "operationId": "set_domain_member",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "principal",
+            "in": "path",
+            "description": "The account's login name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MemberBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The account is a member at that level."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is shared, or the principal owns it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "An unknown level, or a principal that names no enabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Remove a membership, or leave a domain.",
+        "description": "Needs manager access on the domain - its manager, its owner, or an instance admin - OR that the principal is the caller itself, which is how a member leaves.\n\nRefused on a shared domain (409), which has no membership to remove. The owner cannot be removed here: hand the domain on with `PUT /domains/{domain}/owner` first. A name that is not a member of this domain is a 404.",
+        "operationId": "remove_domain_member",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "principal",
+            "in": "path",
+            "description": "The account's login name.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "That account is no longer a member."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller is neither a manager here nor the principal itself, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, none this caller may see, or an account that is not a member of it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is shared, or the principal owns it.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/domains/{domain}/move": {
       "post": {
         "tags": [
@@ -2868,6 +3426,102 @@
           },
           "422": {
             "description": "The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`).",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/domains/{domain}/owner": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Hand a private domain to a different account.",
+        "description": "The domain's owner or an instance admin. A manager may not: handing a domain on decides who holds it, which is the same reason a manager may not change visibility.\n\nThe old owner keeps nothing - they are a stranger to the domain afterwards unless the new owner invites them back. The new owner's own membership row, if it had one, is dropped, since an owner already holds every level. Refused on a shared domain (409), which has no owner to hand on.",
+        "operationId": "set_domain_owner",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OwnerBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The domain has that owner now."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller neither owns this domain nor is an admin, the request did not echo its CSRF token, or this instance is read-only.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The domain is shared, so it has no owner.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The owner names no enabled account.",
             "content": {
               "application/problem+json": {
                 "schema": {
@@ -3856,13 +4510,79 @@
         }
       }
     },
+    "/api/v1/domains/{domain}/visibility": {
+      "put": {
+        "tags": [
+          "domains"
+        ],
+        "summary": "Make a domain private, or share it with the instance again.",
+        "description": "Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.\n\nMaking a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.\n\nPrivatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.\n\nMaking a domain shared again forgets its membership list.",
+        "operationId": "set_domain_visibility",
+        "parameters": [
+          {
+            "name": "domain",
+            "in": "path",
+            "description": "The registered domain.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/VisibilityBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "The visibility is now what was asked for. Answered for a domain that already held it too: privatizing an already-private domain changes nothing at all, its owner and its members included."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The caller may not make this change - not an admin when privatizing, neither the owner nor an admin when re-sharing - the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such domain, or none this caller may see.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/evolve": {
       "get": {
         "tags": [
           "maintenance"
         ],
         "summary": "`GET /evolve` - the consolidation queue: the ranked list of what the\nregistered domains need next, with the evidence behind each finding and the\ninstruction that says how to work it.",
-        "description": "A read and only a read. Detection runs over the scope and nothing at all is\nwritten, the maintenance state included: viewing the queue never counts as a\nconsolidation run, so opening this page does not stop a Stop hook from asking\nfor the sweep that is actually owed. The `evolve` MCP tool is the surface that\nrecords a run, because an agent calling it is about to do the work.\n\nEach row carries its rank across the whole result (`n`), its priority, the\nrule that fired, the engram it fired on, and a `class`: `mechanical` for work\nthat completes intent the knowledge already records, `judgment` for work that\nchanges what it claims. A client renders the two differently - a judgment\nfinding is a question for a person, never a change to apply.\n\nThe per-rule instruction rides `actions` rather than a column, so a page of\nfindings from one rule carries it once; only the rules on this page appear,\neach with the catalog's short `summary` beside its `instruction` so a\nrenderer has both a heading and a body without deriving one from the other.\n`families` counts the whole filtered result rather than the page, which is\nwhat section headings are drawn from, and `truncations` names any per-domain\ncap that fired so a short queue is never mistaken for a finished one.\n\n`acknowledged` counts what acknowledgments kept out of the queue, whole and\nper family, and those counts are domain-wide rather than page-wide: they are\ntaken before `families`, `rules` and `min_priority` narrow the result, so a\nshort queue is never mistaken for a healthy one. A row whose acknowledgment\nwas given for evidence that has since changed comes back carrying\n`ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass\n`include_acknowledged` to see the suppressed rows themselves, each marked\n`acknowledged` and carrying the same two fields.\n\n`today` is not exposed. The temporal rules are evaluated as of now, which is\nthe only question a page asks; the tool takes a pinned date for a run that\nhas to be reproducible.",
+        "description": "A read and only a read. Detection runs over the scope and nothing at all is\nwritten, the maintenance state included: viewing the queue never counts as a\nconsolidation run, so opening this page does not stop a Stop hook from asking\nfor the sweep that is actually owed. The `evolve` MCP tool is the surface that\nrecords a run, because an agent calling it is about to do the work.\n\nEach row carries its rank across the whole result (`n`), its priority, the\nrule that fired, the engram it fired on, and a `class`: `mechanical` for work\nthat completes intent the knowledge already records, `judgment` for work that\nchanges what it claims. A client renders the two differently - a judgment\nfinding is a question for a person, never a change to apply.\n\nThe per-rule instruction rides `actions` rather than a column, so a page of\nfindings from one rule carries it once; only the rules on this page appear,\neach with the catalog's short `summary` beside its `instruction` so a\nrenderer has both a heading and a body without deriving one from the other.\n`families` counts the whole filtered result rather than the page, which is\nwhat section headings are drawn from, and `truncations` names any per-domain\ncap that fired so a short queue is never mistaken for a finished one.\n\n`acknowledged` counts what acknowledgments kept out of the queue, whole and\nper family, and those counts are domain-wide rather than page-wide: they are\ntaken before `families`, `rules` and `min_priority` narrow the result, so a\nshort queue is never mistaken for a healthy one. A row whose acknowledgment\nwas given for evidence that has since changed comes back carrying\n`ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass\n`include_acknowledged` to see the suppressed rows themselves, each marked\n`acknowledged` and carrying the same two fields.\n\nA `V301` row carries one column the others do not: its own `scope`, the\ntwin pair it fired on. It is the one rule that fires more than once on an\nengram, so naming the engram and the rule does not name the finding - send\nthis value back on the acknowledgment route to silence the pair that was\nread rather than whichever one the server would have picked.\n\n`today` is not exposed. The temporal rules are evaluated as of now, which is\nthe only question a page asks; the tool takes a pinned date for a run that\nhas to be reproducible.",
         "operationId": "get_evolve_queue",
         "parameters": [
           {
@@ -4303,8 +5023,19 @@
           "settings"
         ],
         "summary": "Start a device-code sign-in for the caller's own identity.",
-        "description": "Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow; one made while another identity's sign-in is in flight is refused 409. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.",
+        "description": "Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow, unless `restart=true` is given, which abandons it and issues a fresh code; one made while another identity's sign-in is in flight is refused 409 either way. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.",
         "operationId": "connect_my_github_identity_device",
+        "parameters": [
+          {
+            "name": "restart",
+            "in": "query",
+            "description": "Abandon this account's pending sign-in and start a fresh code.\nDefaults to false, which reports the outstanding code instead.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "202": {
             "description": "The flow started (or this account's was already running): `pending` carries the code to confirm. Poll `GET /me/github-identity` for the outcome.",
@@ -4434,6 +5165,904 @@
               "application/problem+json": {
                 "schema": {
                   "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/identity-links": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The single sign-on identities the caller's account holds.",
+        "description": "Every signed-in account has this surface, viewers included. A row carries the issuer, the provider's stable subject, when the link was made and who made it - `jit` for a link a first sign-on created along with its account, `cli` for one an administrator made, otherwise the account that linked it to itself. `has_password` says whether the account has a second way in, which is what decides whether the last link may be given up. Served on a read-only instance: an identity link is account state rather than knowledge.",
+        "operationId": "list_my_identity_links",
+        "responses": {
+          "200": {
+            "description": "This account's links.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdentityLinksResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: the anonymous viewer has no account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/identity-links/{issuer}": {
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Unlink one single sign-on identity from the caller's account.",
+        "description": "Removes the identity this account holds at that issuer. A later sign-on from it then provisions a new account rather than reaching this one. Refused with 409 when it is this account's last way in - no password and no other identity - because unlinking would leave an account nobody can sign in to; the refusal names `crystalline users passwd`, which is what gives the account a password first. An administrator can force it from the command line, for the repair where a provider re-issued its subjects.",
+        "operationId": "unlink_my_identity",
+        "parameters": [
+          {
+            "name": "issuer",
+            "in": "path",
+            "description": "The provider's issuer url, percent-encoded as one path segment.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The link is gone."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This account holds no identity at that issuer.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "That link is the account's last way in.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/mcp-tokens": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The caller's own MCP tokens, newest first.",
+        "description": "Every signed-in account has this, viewers included: an agent acts as the account that issued its token, so a viewer's agent is read-only by construction. The rows carry the label, when the token was issued and when it was last presented - never the token, which exists in the clear only in the reply that issued it. Served on a read-only instance like the rest of this surface: a token is account state rather than knowledge.",
+        "operationId": "list_my_mcp_tokens",
+        "responses": {
+          "200": {
+            "description": "This account's tokens.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/McpTokenInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: the anonymous viewer has no account and so holds no tokens.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Issue an MCP token for the caller's own account.",
+        "description": "Every signed-in account may issue one, viewers included. The reply is the only place the token is ever readable: only its hash is stored, so a lost token is revoked and replaced rather than looked up. Send it from the agent's MCP registration as `Authorization: Bearer <token>`. Served on a read-only instance too: that setting protects the knowledge, and a token is account state rather than knowledge - a read-only server is where an agent most needs one.",
+        "operationId": "issue_my_mcp_token",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/IssueBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedTokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not JSON.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body is not `application/json`.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The label is empty.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/mcp-tokens/{id}": {
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Revoke one of the caller's own MCP tokens.",
+        "description": "The token stops resolving at once: the next request carrying it is refused at the door. Only the caller's own tokens can be named - any other id is 404, the same answer an unknown one gets, so another account's tokens cannot be probed for.",
+        "operationId": "revoke_my_mcp_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "One of the caller's own token ids.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The token is gone."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No token of the caller's carries that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/mcp-tokens/{id}/rotate": {
+      "post": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Replace one of the caller's MCP tokens with a fresh one.",
+        "description": "The old secret stops working and the new one exists in the same step, so a token that may have leaked is replaced without a window in which the agent holds none. The label rides along and the reply carries a new `id`. Only the caller's own tokens can be named: any other id is 404, so another account's cannot be probed for.",
+        "operationId": "rotate_my_mcp_token",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "One of the caller's own token ids.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The new token, this once.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IssuedTokenResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No token of the caller's carries that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/oauth-grants": {
+      "get": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "The caller's own OAuth grants, newest first.",
+        "description": "Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge.",
+        "operationId": "list_my_oauth_grants",
+        "responses": {
+          "200": {
+            "description": "This account's connected clients.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/OauthGrantInfo"
+                  }
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No identity, or an anonymous one: the anonymous viewer has no account and so holds no grants.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/me/oauth-grants/{id}": {
+      "delete": {
+        "tags": [
+          "settings"
+        ],
+        "summary": "Revoke one of the caller's own connected clients.",
+        "description": "Both of the grant's tokens stop resolving at once: the next request either presents at the MCP gate is refused at the door. Only the caller's own grants can be named - any other id is 404, the same answer an unknown one gets, so another account's connections cannot be probed for.",
+        "operationId": "revoke_my_oauth_grant",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "One of the caller's own grant ids.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The grant is gone; both its tokens are dead."
+          },
+          "401": {
+            "description": "No identity, or an anonymous one.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No grant of the caller's carries that id.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/authorizations/{id}": {
+      "get": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "What an MCP client is asking this account to grant.",
+        "description": "The consent screen's own read: the client's name and home page, the host the answer will be sent to and whether it is this machine, the account that would be granted, and how long is left. Never the authorization code, the PKCE challenge or the client's `state` - none of them is anything a person decides with. Needs a signed-in account, any role.",
+        "operationId": "oauth_authorization",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The pending authorization, from the consent screen's `request` parameter.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The request, as the consent screen shows it.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthorizationView"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No signed-in account: there is nobody to grant anything.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such pending request: it expired, it was already decided, or this instance serves no OAuth.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Allow or deny what an MCP client is asking for.",
+        "description": "Takes the pending request - once, so a second answer finds nothing - and answers where to send the browser. On `allow` that is the client's redirect uri carrying a single-use authorization code, the client's `state` and `iss`; the code is bound to this account, this client, this redirect uri, the PKCE challenge and this resource, and lives sixty seconds. On `deny` it is the same uri carrying `error=access_denied`. A grant is the whole account's rights until it is revoked from the profile page. Needs a signed-in account, any role, and the session's CSRF token; served on a read-only instance, like the personal token surface.",
+        "operationId": "oauth_decide",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The pending authorization being decided.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Navigate the whole page to `location`.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "No signed-in account: there is nobody to grant anything.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The session's CSRF token was missing or wrong.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No such pending request: it expired, it was already decided, or this instance serves no OAuth.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "The body is not `{\"decision\": \"allow\"}` or `{\"decision\": \"deny\"}`. The request is left undecided, because the body is read before it is taken.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/authorize": {
+      "get": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Start an authorization for an MCP client.",
+        "description": "The authorization endpoint the metadata advertises. `response_type=code` and PKCE `S256` are required - this server registers public clients only, so the challenge is what makes an intercepted code worthless. A good request answers 302 to the consent screen `/authorize?request=<id>`, where a signed-in person allows or denies it. An unknown `client_id`, or a `redirect_uri` the registration did not name, is answered here as a problem detail and is never redirected anywhere; every other refusal goes back to the client's redirect uri with `error`, `state` and `iss`.",
+        "operationId": "oauth_authorize",
+        "parameters": [
+          {
+            "name": "response_type",
+            "in": "query",
+            "description": "Always `code`: this server answers no other response type.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "client_id",
+            "in": "query",
+            "description": "The registration this request is made under.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "redirect_uri",
+            "in": "query",
+            "description": "Where to send the browser with the answer. Must be one the\nregistration named, port-agnostically for a loopback client.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code_challenge",
+            "in": "query",
+            "description": "The PKCE challenge: 43 to 128 unreserved characters.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "code_challenge_method",
+            "in": "query",
+            "description": "Always `S256`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "description": "The client's own value, carried back on the answer.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "scope",
+            "in": "query",
+            "description": "Accepted and ignored. See the struct's documentation.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "resource",
+            "in": "query",
+            "description": "Which resource a token is being asked for: absent, or this instance's\nown identifier (a trailing slash is tolerated).",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "302": {
+            "description": "Follow `location`: the consent screen for a good request, or the client's redirect uri carrying `error`, `state` and `iss`.",
+            "headers": {
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "`no-store`."
+              },
+              "location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "The consent screen, or the client's redirect uri."
+              }
+            }
+          },
+          "400": {
+            "description": "No usable `client_id` or `redirect_uri`, so there is nowhere this server is willing to send an error.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "The request's `Host` is not one this instance answers to, so it names no resource to authorize for: `service.allowed_hosts` decides, and an unlisted `Host` is refused before the request is looked at.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/register": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Register an MCP client as a public OAuth client.",
+        "description": "RFC 7591 dynamic client registration, the endpoint the authorization server metadata advertises. Open to any caller, because a client registers before it can authenticate as anything. The answer carries a `client_id` and no secret: every client here is a public client, so `token_endpoint_auth_method` is always `none` and the proof of possession at the token endpoint is PKCE. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`. Bounded four ways: a 64 KiB body, 30 registrations per 10 minutes per process, 1000 stored registrations, and a prune that collects a registration which never authorized within the hour and one that has gone 30 days since its last authorization.",
+        "operationId": "register_oauth_client",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RegisterBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "The registration, as stored.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RegisteredClient"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not the JSON client metadata (`invalid_request`), a redirect uri may not be stored (`invalid_redirect_uri`), or the metadata describes a client this server does not register (`invalid_client_metadata`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "The burst is spent. `Retry-After` says when to come back.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "This instance is holding as many registrations as it will, and none are old enough to collect.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/oauth/token": {
+      "post": {
+        "tags": [
+          "oauth"
+        ],
+        "summary": "Exchange an authorization code, or rotate a refresh token.",
+        "description": "The token endpoint the metadata advertises, form-encoded in and JSON out. `grant_type=authorization_code` takes the single-use `code` the consent screen issued, the `redirect_uri` it was issued for, the PKCE `code_verifier` and the `client_id`; `grant_type=refresh_token` takes a `refresh_token` and the `client_id`. Both may name a `resource`: on an exchange it must be this instance, and on a refresh it must be the audience the grant already holds, which on a deployment reached under two names is not the same sentence. The answer is an access token good for an hour and a refresh token good for thirty days; every refresh rotates both, and presenting a refresh token that was already rotated away revokes the whole grant. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`.",
+        "operationId": "oauth_token",
+        "requestBody": {
+          "description": "The token request.",
+          "content": {
+            "application/x-www-form-urlencoded": {
+              "schema": {
+                "$ref": "#/components/schemas/TokenForm"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The grant: an access token, its lifetime and the refresh token that mints the next pair.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The body is not a form or a parameter is missing (`invalid_request`), the code or refresh token cannot be exchanged (`invalid_grant`), the `grant_type` is not served here (`unsupported_grant_type`), or the `resource` names another server (`invalid_target`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "The `client_id` names no registration here (`invalid_client`).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "A cookie session did not echo its CSRF token.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "This instance does not serve OAuth: `auth.oauth` is off.",
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetail"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The accounts database could not be reached.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OauthErrorBody"
                 }
               }
             }
@@ -5571,7 +7200,7 @@
     "schemas": {
       "AckBody": {
         "type": "object",
-        "description": "Acknowledge one finding on one engram: the engram by permalink, the rule id that fired and an optional note saying why it is intentional. The scope an acknowledgment holds for is never sent - the server computes it by running detection.",
+        "description": "Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once.",
         "required": [
           "permalink",
           "rule"
@@ -5594,6 +7223,14 @@
             "type": "string",
             "description": "The rule id to acknowledge, for example `V101`.",
             "example": "V101"
+          },
+          "scope": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The evidence this acknowledgment is for, copied from the queue row's\nown `scope`.\n\nOnly `V301` sends one: it is the one rule that fires more than once on\nan engram (an engram can be the semantic twin of several others), so it\nis the one where naming the rule does not name the finding. On `POST`\nthe server checks the scope is really firing and refuses with a 422 if\nit is not, which is what a queue read too long ago looks like; on\n`DELETE` it takes back that pair's entry and leaves the engram's other\npairs silenced. Every other rule ignores it, and omitting it on `V301`\nmeans the whole rule: the server's own pick on `POST`, every pair at\nonce on `DELETE`.",
+            "example": "notes/backoff-lesson, notes/retry-queue-gotcha"
           }
         }
       },
@@ -5769,6 +7406,53 @@
           }
         }
       },
+      "AuthorizationView": {
+        "type": "object",
+        "description": "What the consent page shows: who is asking, where the answer goes, and who\nis about to grant it.\n\nDeliberately not the protocol: no code, no challenge, no state, no client\nid. A person deciding whether to trust something is helped by the client's\nname and the address the answer will be sent to, and by nothing else on\nthis list. `Debug` is derived because there is nothing here to redact,\nwhich is the property rather than an accident.",
+        "required": [
+          "client_name",
+          "redirect_host",
+          "loopback",
+          "account",
+          "expires_in"
+        ],
+        "properties": {
+          "account": {
+            "type": "string",
+            "description": "The account that will be granted. A client acts as the person who\nconsented, so this is what is actually being handed over.",
+            "example": "ada"
+          },
+          "client_name": {
+            "type": "string",
+            "description": "The client's name as it registered it, at most 100 characters of\nprintable text.",
+            "example": "Claude"
+          },
+          "client_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's home page, when it registered one.",
+            "example": "https://claude.ai"
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds until the request expires and has to be started again from the\nclient.",
+            "example": 587,
+            "minimum": 0
+          },
+          "loopback": {
+            "type": "boolean",
+            "description": "Whether that address is this machine, so the page can say that the\nclient is a program on this computer rather than a service elsewhere."
+          },
+          "redirect_host": {
+            "type": "string",
+            "description": "The host (and port, when it names one) the browser will be sent to.\nThe one fact that says where an authorization actually goes.",
+            "example": "claude.ai"
+          }
+        }
+      },
       "ConflictDetail": {
         "type": "object",
         "description": "The wire form of a 412: a problem detail carrying the version the server\nholds now, so a client can show a merge view instead of just failing.",
@@ -5882,6 +7566,11 @@
             "description": "Subfolder within the repository; github mode only.",
             "example": "domains/eng"
           },
+          "private": {
+            "type": "boolean",
+            "description": "Register the domain private, owned by the calling account. Applies to\nevery mode; defaults to false, which is a domain the whole instance\nshares.",
+            "example": false
+          },
           "repo": {
             "type": [
               "string",
@@ -5942,6 +7631,69 @@
             ],
             "description": "The engram `type`. Defaults to `engram`. Free form; recommended values\nare guidance.",
             "example": "decision"
+          }
+        }
+      },
+      "Decision": {
+        "type": "string",
+        "description": "Allow or deny, and there is nothing else to choose: a grant here is the\nwhole account's rights until it is revoked.",
+        "enum": [
+          "allow",
+          "deny"
+        ]
+      },
+      "DecisionBody": {
+        "type": "object",
+        "description": "What `POST /oauth/authorizations/{id}` takes.",
+        "required": [
+          "decision"
+        ],
+        "properties": {
+          "decision": {
+            "$ref": "#/components/schemas/Decision",
+            "description": "`allow` or `deny`. Anything else is not a decision and is refused\nbefore the pending request is touched, so an unreadable answer leaves\nit there to be answered again."
+          }
+        }
+      },
+      "DecisionResponse": {
+        "type": "object",
+        "description": "Where to send the browser once the decision is made.\n\nA body rather than a redirect, for the reason `POST /auth/oidc/login`\nanswers one: only a script can send the session's CSRF token, and a script\ncannot read where a redirect went, so a 302 here would hand the browser\nsomewhere the page could not learn. Fluid navigates the whole page to it.\n\n`Debug` is written rather than derived: on an allow this location carries\nthe authorization code.",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "The client's redirect uri with the answer on it: `code`, `state` and\n`iss` on an allow, `error=access_denied`, `state` and `iss` on a deny.",
+            "example": "https://claude.ai/api/mcp/auth_callback?code=...&state=...&iss=https://kb.example"
+          }
+        }
+      },
+      "DomainMember": {
+        "type": "object",
+        "description": "One membership row: who was invited to a private domain, at what level, by\nwhom and when.",
+        "required": [
+          "principal",
+          "level",
+          "added_by",
+          "added_at"
+        ],
+        "properties": {
+          "added_at": {
+            "type": "string",
+            "description": "RFC 3339, when this row was last written."
+          },
+          "added_by": {
+            "type": "string",
+            "description": "Who added or last changed this row. An audit field, stored as given:\nit is usually a login name but may name a non-account actor, the same\nlatitude the identity-link plan gives `linked_by`."
+          },
+          "level": {
+            "$ref": "#/components/schemas/MemberLevel",
+            "description": "What this member may do here."
+          },
+          "principal": {
+            "type": "string",
+            "description": "The member's login name, folded by [`normalize_account_name`]."
           }
         }
       },
@@ -6009,7 +7761,7 @@
       },
       "GithubPendingView": {
         "type": "object",
-        "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid.",
+        "description": "The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long is left to do so.",
         "required": [
           "user_code",
           "verification_url",
@@ -6019,8 +7771,8 @@
           "expires_in_secs": {
             "type": "integer",
             "format": "int64",
-            "description": "How many seconds from the flow's start the code stays valid.",
-            "example": 900,
+            "description": "Seconds REMAINING before the code expires, recomputed on every read\nand saturating at 0 - not the flow's original lifetime. Poll this\nroute and the number falls, which is how a live sign-in is told apart\nfrom a wedged one; a countdown just starts from this value.",
+            "example": 870,
             "minimum": 0
           },
           "user_code": {
@@ -6089,6 +7841,101 @@
           }
         }
       },
+      "IdentityLink": {
+        "type": "object",
+        "description": "One identity an external provider asserts, tied to one account.\n\n`(issuer, subject)` is the durable key: a username, an address and a\ndisplay name are all mutable presentation data, and none of them may move\nan account. An account may hold several links (one per issuer), and a link\npoints at exactly one account.",
+        "required": [
+          "issuer",
+          "subject",
+          "linked_at",
+          "linked_by"
+        ],
+        "properties": {
+          "issuer": {
+            "type": "string",
+            "description": "The provider that asserts this identity, as its ID tokens spell it.",
+            "example": "https://login.microsoftonline.com/<tenant>/v2.0"
+          },
+          "linked_at": {
+            "type": "string",
+            "description": "When the link was made, RFC 3339.",
+            "example": "2026-09-07T09:14:22Z"
+          },
+          "linked_by": {
+            "type": "string",
+            "description": "Who made it: the account that linked it, an admin's name, or `jit` for\na link a first sign-in created along with its account.",
+            "example": "jit"
+          },
+          "subject": {
+            "type": "string",
+            "description": "The provider's stable identifier for the person.",
+            "example": "0f8fad5b-d9cb-469f-a165-70867728950e"
+          }
+        }
+      },
+      "IdentityLinksResponse": {
+        "type": "object",
+        "description": "The single sign-on identities this account holds, and whether it has a password to fall back on. The two together are what the profile card needs: an account with no password and one identity cannot unlink it, because that link is its only way in.",
+        "required": [
+          "links",
+          "has_password"
+        ],
+        "properties": {
+          "has_password": {
+            "type": "boolean",
+            "description": "Whether this account can also sign in with a password. False for an\naccount a first sign-on provisioned, which has none until\n`crystalline users passwd` gives it one.",
+            "example": true
+          },
+          "links": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IdentityLink"
+            },
+            "description": "Every identity this account holds, by issuer."
+          }
+        }
+      },
+      "IssueBody": {
+        "type": "object",
+        "description": "A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again.",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "label": {
+            "type": "string",
+            "description": "What this token is for. Required and non-empty: an unlabeled row is\none nobody dares revoke.",
+            "example": "laptop"
+          }
+        }
+      },
+      "IssuedTokenResponse": {
+        "type": "object",
+        "description": "A freshly issued MCP token. `token` is shown here and nowhere else, ever: only its hash is stored. Send it as `Authorization: Bearer <token>` from the agent's MCP registration.",
+        "required": [
+          "id",
+          "token",
+          "label"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, used to rotate or revoke this token later.",
+            "example": 3
+          },
+          "label": {
+            "type": "string",
+            "description": "The label it was issued under, echoed so the reply is self-describing.",
+            "example": "laptop"
+          },
+          "token": {
+            "type": "string",
+            "description": "The token itself, this once.",
+            "example": "cmt_1f3c..."
+          }
+        }
+      },
       "LoginBody": {
         "type": "object",
         "description": "What `POST /auth/login` takes.",
@@ -6141,6 +7988,37 @@
           }
         }
       },
+      "McpTokenInfo": {
+        "type": "object",
+        "description": "One row of an account's MCP token list, for a management UI or CLI. Never\ncarries the token itself - only the hash is stored, so there is nothing to\nshow back after issuance.",
+        "required": [
+          "id",
+          "label",
+          "created_at"
+        ],
+        "properties": {
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339, when this token was issued."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The row id, used to revoke or rotate this token."
+          },
+          "label": {
+            "type": "string",
+            "description": "The caller-chosen label."
+          },
+          "last_used": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339, when this token last resolved a request. `None` if it has\nnever been used."
+          }
+        }
+      },
       "MeResponse": {
         "type": "object",
         "description": "What `GET /auth/me` answers with: everything a client needs before it draws\nanything.",
@@ -6149,6 +8027,7 @@
           "read_only",
           "needs_setup",
           "can_share",
+          "oauth",
           "version"
         ],
         "properties": {
@@ -6165,12 +8044,16 @@
               "string",
               "null"
             ],
-            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; a trusted-header identity is given a session here on the first\ncall and handed that same session's token on every later one, so every\nidentity that can mutate anything carries a token. See the `check_csrf`\nrule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
+            "description": "The CSRF token of the session this request arrived on, or null when it\narrived on no session.\n\nReissued here, not only by login, because the session cookie is\n`HttpOnly` and the token is not stored anywhere a reload survives: a\nbrowser that refreshes holds a live session whose token it can no longer\nproduce, and would be unable to log out or to write until it logged in\nagain. This probe is what a client opens on, so it is where the token\nbelongs.\n\nNull only for the anonymous viewer, which has no account and can never\nwrite; an identity a proxy asserts (`auth.trusted_header` or\n`auth.proxy_headers`) is given a session here on the first call and\nhanded that same session's token on every later one, so every identity\nthat can mutate anything carries a token. See the `check_csrf` rule.\n\nHanding the token back on a `GET` is safe for the same reason handing it\nback from login is: no CORS layer exists on this surface, so another\norigin can send the request but cannot read the answer. **That is load\nbearing - a CORS layer must not be added without revisiting this.**",
             "example": "9f2c1d7e4b6a8035"
           },
           "needs_setup": {
             "type": "boolean",
             "description": "Whether no account exists yet, so the first-run setup path is open.\n\nRead fresh on every probe rather than cached: it is one indexed count\nover a table with a handful of rows, and a stale `true` would draw a\nwizard whose POST then answers 410 - correct, but baffling. That it\ntells an unauthenticated caller \"this instance has no accounts yet\" is\ndeliberate: the login page needs to know before any identity exists, and\nthe state itself is what makes `POST /auth/setup` answer at all."
+          },
+          "oauth": {
+            "type": "boolean",
+            "description": "Whether this instance serves OAuth for MCP clients, from the effective\n`auth.oauth` setting.\n\nA rendering signal for the profile's connected-clients card, the same\nrole `can_share` plays for the share surfaces above: an instance that\nnever turned OAuth on draws no card asking somebody to manage clients\nthat can never exist. It is not a gate: every `/oauth/*` route refuses\non its own, off `auth.oauth` itself, regardless of what this probe\nsays, so a stale or forged `true` costs a 404 rather than access.\n\n`/me/oauth-grants` deliberately does not refuse on the setting. A grant\nis the caller's own account state, served like the personal MCP token\nsurface beside it, so an operator who turns OAuth off leaves every\naccount still able to see and revoke what it granted - and the grants\nare inert at the gate meanwhile. Forging this flag reaches nothing\nthere either: the route answers the caller's own rows and no others."
           },
           "read_only": {
             "type": "boolean",
@@ -6191,6 +8074,58 @@
             "type": "string",
             "description": "The server version, so a mismatched UI can say so.",
             "example": "0.12.0"
+          }
+        }
+      },
+      "MemberBody": {
+        "type": "object",
+        "description": "The level to invite this account at, or to move it to: `viewer` reads, `editor` writes, `manager` also administers the membership.",
+        "required": [
+          "level"
+        ],
+        "properties": {
+          "level": {
+            "$ref": "#/components/schemas/MemberLevel",
+            "description": "viewer | editor | manager"
+          }
+        }
+      },
+      "MemberLevel": {
+        "type": "string",
+        "description": "What a member may do on one private domain. Ordered least to most\nprivileged, exactly as [`Role`] is, and deliberately a separate ladder: an\naccount's instance role says what it may do on the installation, this says\nwhat it may do on one domain somebody invited it to.\n\n`Manager` is the level that may invite and change other members' levels. It\nmay not flip the domain back to shared, and it may not hand the domain to\nsomeone else: those two stay with the owner (and with an admin), which is\nwhat keeps \"who can see this at all\" a decision the owner made.",
+        "enum": [
+          "viewer",
+          "editor",
+          "manager"
+        ]
+      },
+      "MembersResponse": {
+        "type": "object",
+        "description": "Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private.",
+        "required": [
+          "visibility",
+          "members"
+        ],
+        "properties": {
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DomainMember"
+            },
+            "description": "Everyone invited, by name. Empty for a shared domain."
+          },
+          "owner": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The account that owns this domain, or `null`: a shared domain has no\nowner, and a private one whose owner's account was removed has none\neither.",
+            "example": "ada"
+          },
+          "visibility": {
+            "type": "string",
+            "description": "`private` or `shared`.",
+            "example": "private"
           }
         }
       },
@@ -6218,6 +8153,108 @@
             "type": "string",
             "description": "The engram to move, by permalink.",
             "example": "notes/beta"
+          }
+        }
+      },
+      "OauthErrorBody": {
+        "type": "object",
+        "description": "An OAuth error, sent as `application/json`. The only failures on this surface that are not RFC 9457 problem details: the client reading them speaks OAuth and branches on `error`.",
+        "required": [
+          "error",
+          "error_description"
+        ],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "The registered error code.",
+            "example": "invalid_redirect_uri"
+          },
+          "error_description": {
+            "type": "string",
+            "description": "What is wrong, in words.",
+            "example": "a redirect uri must be an https url, or an http url on a loopback address"
+          }
+        }
+      },
+      "OauthGrantInfo": {
+        "type": "object",
+        "description": "One row of an account's OAuth grant list: which client is connected, since\nwhen, and until when it may keep refreshing. Never carries a token - only\nhashes are stored, so there is nothing to show back.",
+        "required": [
+          "id",
+          "client_id",
+          "client_name",
+          "redirect_host",
+          "created_at",
+          "refresh_expires_at"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The registration this grant belongs to."
+          },
+          "client_name": {
+            "type": "string",
+            "description": "The name that registration gave for itself, or a stand-in when the\nregistration is gone."
+          },
+          "created_at": {
+            "type": "string",
+            "description": "RFC 3339, when the grant was created."
+          },
+          "id": {
+            "type": "integer",
+            "format": "int64",
+            "description": "The grant's id, which is what revokes it."
+          },
+          "last_used": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "RFC 3339, when one of its access tokens last resolved a request."
+          },
+          "redirect_host": {
+            "type": "string",
+            "description": "The host the client is redirected back to, for a person deciding\nwhether they recognize this connection."
+          },
+          "refresh_expires_at": {
+            "type": "string",
+            "description": "RFC 3339, when the refresh token stops working unless it is rotated\nbefore then."
+          }
+        }
+      },
+      "OidcProviderView": {
+        "type": "object",
+        "description": "The configured single sign-on provider as the sign-in screen needs it: whether to draw the button and what to write on it. Never the issuer, the client id or the secret.",
+        "required": [
+          "enabled"
+        ],
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Whether a provider is configured and usable.",
+            "example": true
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The label for the button, when enabled.",
+            "example": "Contoso"
+          }
+        }
+      },
+      "OwnerBody": {
+        "type": "object",
+        "description": "The account to hand this private domain to. It must be an existing, enabled account; its own membership row, if it had one, is dropped, since an owner holds every level already.",
+        "required": [
+          "owner"
+        ],
+        "properties": {
+          "owner": {
+            "type": "string",
+            "description": "The new owner's login name.",
+            "example": "ada"
           }
         }
       },
@@ -6305,6 +8342,150 @@
             "type": "string",
             "description": "The problem type URI. Always `about:blank`: `status` and `title` carry\nthe classification, and this surface publishes no per-problem pages to\npoint at.",
             "example": "about:blank"
+          }
+        }
+      },
+      "ProvidersResponse": {
+        "type": "object",
+        "description": "Which ways into this instance exist, for the sign-in screen to draw. Public: it is read before anyone is signed in, and it carries no configuration beyond the button's label.",
+        "required": [
+          "local",
+          "oidc"
+        ],
+        "properties": {
+          "local": {
+            "type": "boolean",
+            "description": "Whether local name-and-password accounts are offered. Always true: they\nare the accounts single sign-on is layered on top of.",
+            "example": true
+          },
+          "oidc": {
+            "$ref": "#/components/schemas/OidcProviderView",
+            "description": "The single sign-on provider, if one is configured."
+          }
+        }
+      },
+      "RegisterBody": {
+        "type": "object",
+        "description": "RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored.",
+        "properties": {
+          "client_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "What to call this client on the consent screen. Trimmed, at most 100\ncharacters, and defaulted when it is absent or blank.",
+            "example": "Claude"
+          },
+          "client_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The client's own home page, shown beside the name. Absolute https.",
+            "example": "https://claude.ai"
+          },
+          "grant_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The grants this client will use, within `authorization_code` and\n`refresh_token`."
+          },
+          "redirect_uris": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Where this client may be redirected back to. At least one, at most ten,\neach an https url or an http url on a loopback address, carrying no\nfragment and no user information, and sent in the form a url parser\nleaves it in (a lowercase scheme and host, no default port, no dot\nsegments, and a path of at least `/`), because what is registered is\nmatched exactly.",
+            "example": [
+              "https://claude.ai/api/mcp/auth_callback"
+            ]
+          },
+          "response_types": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The response types this client will ask for, within `code`."
+          },
+          "token_endpoint_auth_method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "How the client authenticates at the token endpoint. Absent or `none`:\nthis server registers public clients only.",
+            "example": "none"
+          }
+        }
+      },
+      "RegisteredClient": {
+        "type": "object",
+        "description": "What a registration answers with: the identifier, and the metadata as\nstored.\n\nNo `client_secret` and no `registration_access_token`. Both would be\ncredentials handed to a caller that proved nothing, and this server has no\nuse for either: every client is public, and a registration is managed by\nbeing left to expire rather than by a management API. `Debug` is derived\nbecause there is nothing here to redact - a client id authorizes nothing on\nits own.",
+        "required": [
+          "client_id",
+          "client_id_issued_at",
+          "client_name",
+          "redirect_uris",
+          "token_endpoint_auth_method",
+          "grant_types",
+          "response_types"
+        ],
+        "properties": {
+          "client_id": {
+            "type": "string",
+            "description": "The identifier this client names itself with from now on: `coc_` plus\n32 hex characters.",
+            "example": "coc_9f2c1d7e4b6a80351c8e0d2f4a6b8c1e"
+          },
+          "client_id_issued_at": {
+            "type": "integer",
+            "format": "int64",
+            "description": "When the registration was made, in seconds since the epoch.",
+            "example": 1767225600
+          },
+          "client_name": {
+            "type": "string",
+            "description": "The name as stored, which is what a consent screen shows.",
+            "example": "Claude"
+          },
+          "client_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The home page as stored, absent when the registration named none.",
+            "example": "https://claude.ai"
+          },
+          "grant_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Always `authorization_code` and `refresh_token`."
+          },
+          "redirect_uris": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The redirect uris as stored, in the order they were sent."
+          },
+          "response_types": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Always `code`."
+          },
+          "token_endpoint_auth_method": {
+            "type": "string",
+            "description": "Always `none`: a public client presents no secret.",
+            "example": "none"
           }
         }
       },
@@ -6474,6 +8655,20 @@
           }
         }
       },
+      "StartLinkResponse": {
+        "type": "object",
+        "description": "Where to send the browser to link a provider identity to the caller's account. Navigate the whole page to it: what follows is a redirect to the provider and a redirect back, so a background fetch would land nowhere anybody can authenticate.",
+        "required": [
+          "location"
+        ],
+        "properties": {
+          "location": {
+            "type": "string",
+            "description": "The provider's authorization endpoint, with PKCE, state and nonce.",
+            "example": "https://idp.example/authorize?client_id=..."
+          }
+        }
+      },
       "TokenBody": {
         "type": "object",
         "description": "A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is.",
@@ -6486,6 +8681,98 @@
             "description": "A GitHub personal access token. Write-only: no response ever echoes it.",
             "example": "ghp_xxxxxxxxxxxxxxxxxxxx",
             "writeOnly": true
+          }
+        }
+      },
+      "TokenForm": {
+        "type": "object",
+        "description": "A token request, sent as `application/x-www-form-urlencoded`. Which members are required depends on `grant_type`: `authorization_code` takes `code`, `redirect_uri`, `code_verifier` and `client_id`, `refresh_token` takes `refresh_token` and `client_id`. `resource` is optional on both.",
+        "properties": {
+          "client_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The registration this request is made under. Required by both grant\ntypes.",
+            "example": "coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0"
+          },
+          "code": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The single-use code the consent screen issued, for\n`grant_type=authorization_code`."
+          },
+          "code_verifier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The PKCE verifier: 43 to 128 unreserved characters whose `S256` is the\nchallenge the authorization was started with."
+          },
+          "grant_type": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`authorization_code` or `refresh_token`. Anything else is\n`unsupported_grant_type`.",
+            "example": "authorization_code"
+          },
+          "redirect_uri": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The redirect uri the code was issued for, compared exactly. For a\nnative client that is the address it PRESENTED at the authorize leg -\nthe port it managed to bind - and not necessarily the one it\nregistered."
+          },
+          "refresh_token": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The refresh token to rotate, for `grant_type=refresh_token`."
+          },
+          "resource": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Which resource the token is for (RFC 8707): absent, or this instance's\nown identifier, a trailing slash tolerated.",
+            "example": "https://kb.example"
+          }
+        }
+      },
+      "TokenResponse": {
+        "type": "object",
+        "description": "What a successful token request answers: RFC 6749 section 5.1, with the two\nmembers this server always sends and none of the ones it has no use for.\n\nNo `scope`, because a grant here is the whole account's rights until it is\nrevoked and there was never anything to narrow; no `id_token`, because this\nis not OpenID Connect and the account a token acts for is a fact of this\ninstance rather than a claim about a person.\n\n`Debug` is written rather than derived: both tokens are live credentials the\nmoment this struct exists, and a derived one is a single `tracing` call away\nfrom putting them in a file.",
+        "required": [
+          "access_token",
+          "token_type",
+          "expires_in",
+          "refresh_token"
+        ],
+        "properties": {
+          "access_token": {
+            "type": "string",
+            "description": "The bearer token an MCP request presents. `coa_` plus 64 hex, and the\nonly copy: the server keeps its sha256.",
+            "example": "coa_..."
+          },
+          "expires_in": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds the access token lives, which is an hour.",
+            "example": 3600,
+            "minimum": 0
+          },
+          "refresh_token": {
+            "type": "string",
+            "description": "The token that mints the next pair. `cor_` plus 64 hex, good for thirty\ndays, and rotated by every use: the one presented is dead the moment\nthis one exists, and presenting it again revokes the whole grant.",
+            "example": "cor_..."
+          },
+          "token_type": {
+            "type": "string",
+            "description": "Always `Bearer`.",
+            "example": "Bearer"
           }
         }
       },
@@ -6690,6 +8977,20 @@
           }
         }
       },
+      "VisibilityBody": {
+        "type": "object",
+        "description": "Whether the domain is private. `true` closes it to its owner and the people invited into it; `false` opens it to every account again and forgets the membership list.",
+        "required": [
+          "private"
+        ],
+        "properties": {
+          "private": {
+            "type": "boolean",
+            "description": "`true` makes the domain private, `false` makes it shared again.",
+            "example": true
+          }
+        }
+      },
       "WithdrawBody": {
         "type": "object",
         "description": "Whether withdrawing also puts the shared files back the way the team has them. Absent means false: the proposal closes and the working tree is left alone.",
@@ -6746,6 +9047,10 @@
     {
       "name": "settings",
       "description": "Instance settings. Admin only."
+    },
+    {
+      "name": "oauth",
+      "description": "OAuth 2.1 for MCP clients: dynamic registration, and the authorization code flow the metadata documents advertise."
     }
   ]
 }

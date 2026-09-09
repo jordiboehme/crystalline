@@ -62,7 +62,7 @@ describe("MermaidDiagram", () => {
   it("draws in the app's own palette rather than mermaid's", async () => {
     // `base` is the theme that takes variables; the built-in `default` and
     // `dark` themes ignore them and a diagram would arrive in mermaid's own
-    // purple, beside an app that is teal everywhere else.
+    // purple, a different shade than the app's own accent.
     draw("graph TD; A-->B;");
     await waitFor(() => {
       expect(initialize).toHaveBeenCalled();
@@ -70,9 +70,9 @@ describe("MermaidDiagram", () => {
     const config = initialize.mock.calls.at(-1)?.[0];
     expect(config).toMatchObject({ theme: "base" });
     expect(config?.themeVariables).toMatchObject({
-      primaryColor: "#ccfbf1",
+      primaryColor: "#ece8f9",
       primaryTextColor: "#0f172a",
-      primaryBorderColor: "#0f766e",
+      primaryBorderColor: "#45388c",
       // Named rather than left to `base`, which would otherwise derive a
       // highlighter-yellow note and an inverted title color.
       noteBkgColor: "#f1f5f9",
@@ -89,9 +89,9 @@ describe("MermaidDiagram", () => {
     });
     expect(initialize.mock.calls.at(-1)?.[0]?.themeVariables).toMatchObject({
       darkMode: true,
-      primaryColor: "#134e4a",
+      primaryColor: "#2a1f5f",
       primaryTextColor: "#e2e8f0",
-      primaryBorderColor: "#2dd4bf",
+      primaryBorderColor: "#978bd3",
       noteBkgColor: "#1e293b",
       noteTextColor: "#e2e8f0",
       titleColor: "#e2e8f0",

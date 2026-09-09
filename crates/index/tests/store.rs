@@ -733,6 +733,23 @@ async fn inbound_refs_kinds(store: &dyn Store) {
         EdgeKind::Link,
         "the prose wikilink is a link-kind inbound ref: {refs:?}"
     );
+    // Whether the reference named a domain in its brackets rides along, because
+    // the caller that rewrites bracket text has to tell `[[Hub]]` from
+    // `[[d:Hub]]`: the text on disk differs, and the target text alone is the
+    // same string in both.
+    assert_eq!(
+        refs.iter()
+            .find(|r| r.src_path == "cross.md")
+            .and_then(|r| r.to_domain.clone()),
+        Some("d".to_string()),
+        "a prefixed reference reports the domain it named: {refs:?}"
+    );
+    assert!(
+        refs.iter()
+            .filter(|r| r.src_domain == "d")
+            .all(|r| r.to_domain.is_none()),
+        "and a bare one reports none: {refs:?}"
+    );
 }
 parity!(inbound_refs_report_ref_kinds, inbound_refs_kinds);
 
@@ -800,6 +817,7 @@ fn hub_query(hub: EngramId, domain: DomainId) -> InboundQuery<'static> {
         title: "Hub",
         q: None,
         rel: None,
+        exclude_domains: &[],
         page: 1,
         limit: 10,
     }
@@ -1145,6 +1163,75 @@ async fn inbound_page_empty(store: &dyn Store) {
 parity!(
     inbound_page_reports_nothing_pointing_here,
     inbound_page_empty
+);
+
+/// `exclude_domains` takes a domain out of all three answers at once: the page,
+/// the total and the per-relation summary. A reader who may not see `Zed`
+/// learns nothing about it - not the row, and not a count that would only make
+/// sense if the row existed.
+async fn inbound_page_excludes_domains(store: &dyn Store) {
+    let (hub, domain) = hub_fixture(store).await;
+    let hidden = vec!["Zed".to_string()];
+
+    let page = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        !page.hits.iter().any(|h| h.domain == "Zed"),
+        "the hidden domain's referrer is off the page: {page:?}"
+    );
+    assert!(
+        !hit_titles(&page).contains(&"Cross"),
+        "and it is the cross-domain one that went: {page:?}"
+    );
+    assert_eq!(page.total, 6, "the total counts what it showed: {page:?}");
+    assert_eq!(
+        page.types
+            .iter()
+            .map(|t| (t.name.as_str(), t.count))
+            .collect::<Vec<_>>(),
+        vec![("cites", 3), ("part_of", 2), ("links_to", 1)],
+        "the summary drops the hidden reference too: {page:?}"
+    );
+
+    // The exclusion narrows and nothing else: a reader-chosen filter still
+    // applies on top of it, over the same reduced set.
+    let filtered = store
+        .inbound_page(&InboundQuery {
+            rel: Some("cites"),
+            exclude_domains: &hidden,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    assert_eq!(filtered.total, 3, "{filtered:?}");
+    assert!(
+        !filtered.hits.iter().any(|h| h.domain == "Zed"),
+        "{filtered:?}"
+    );
+
+    // A name nobody registered excludes nothing, so the unfiltered answer is
+    // the one the empty exclusion gives.
+    let unrelated = vec!["ghost".to_string()];
+    let same = store
+        .inbound_page(&InboundQuery {
+            exclude_domains: &unrelated,
+            ..hub_query(hub, domain)
+        })
+        .await
+        .unwrap();
+    let all = store.inbound_page(&hub_query(hub, domain)).await.unwrap();
+    assert_eq!(same.total, all.total, "{same:?}");
+    assert_eq!(hit_titles(&same), hit_titles(&all), "{same:?}");
+}
+parity!(
+    inbound_page_hides_the_domains_it_is_told_to,
+    inbound_page_excludes_domains
 );
 
 /// `unresolved_refs` reports every dangling relation and prose link in a domain,
@@ -2646,6 +2733,17 @@ async fn vocabulary_counts(store: &dyn Store) {
         eng_vocab.relation_types
     );
 
+    // Merging every domain's own sweep is the all-domain sweep, name for name
+    // and count for count. That is what a caller who may not read every domain
+    // assembles, and it must not be able to order or count itself differently
+    // from the single query.
+    let ops_vocab = store.vocabulary(Some("ops")).await.unwrap();
+    assert_eq!(
+        crystalline_index::merge_vocabularies(vec![eng_vocab.clone(), ops_vocab]),
+        all,
+        "the merge of the per-domain sweeps is the all-domain sweep"
+    );
+
     // An unknown domain yields empty vectors rather than an error.
     let missing = store.vocabulary(Some("nope")).await.unwrap();
     assert!(
@@ -2981,6 +3079,49 @@ async fn descriptor_lookups_order_by_bytes(store: &dyn Store) {
 parity!(
     descriptor_lookups_order_by_byte_value,
     descriptor_lookups_order_by_bytes
+);
+
+/// The name list and the counted stats describe the same set of domains, in the
+/// same byte order.
+///
+/// `domain_names` exists so the serving screen - which asks on every read which
+/// domains the index holds - does not pay for `domain_stats`' six correlated
+/// counting scans per domain to learn a name. Two answers for one question is
+/// how they drift, so this pins them together; the mixed case is here because a
+/// Postgres locale collation would order the two differently without the
+/// explicit `COLLATE "C"`.
+async fn names_and_stats_describe_the_same_domains(store: &dyn Store) {
+    assert!(
+        store.domain_names().await.unwrap().is_empty(),
+        "an empty index holds no domain names"
+    );
+    for name in ["Zed", "eng", "alpha"] {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.md", &engram("A", "a", "engram", "", "b\n"));
+        sync_domain(store, name, dir.path()).await.unwrap();
+    }
+    assert_eq!(
+        store.domain_names().await.unwrap(),
+        vec!["Zed".to_string(), "alpha".to_string(), "eng".to_string()],
+        "sorted in byte order, so a capitalized name comes first"
+    );
+    let mut counted: Vec<String> = store
+        .domain_stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    counted.sort();
+    assert_eq!(
+        counted,
+        store.domain_names().await.unwrap(),
+        "the cheap answer names exactly the domains the counted one does"
+    );
+}
+parity!(
+    domain_names_matches_domain_stats,
+    names_and_stats_describe_the_same_domains
 );
 
 async fn wipe_clears(store: &dyn Store) {
@@ -4774,4 +4915,184 @@ async fn clear_domain_clears_attachments(store: &dyn Store) {
 parity!(
     clear_domain_takes_attachments_with_it,
     clear_domain_clears_attachments
+);
+
+/// Issue #65 at the index: an engram whose own title's first word ends in a
+/// colon.
+///
+/// `[[Log: Weekly Garden Notes]]` splits like `[[domain:Target]]`, because the
+/// parser is domain-agnostic and nothing inside the brackets says which it is.
+/// Resolution is where the registry can settle it: a prefix no domain answers
+/// to means the whole bracket text is a title at home. A prefix that does name
+/// a domain is untouched, and an unregistered prefix matching nothing at home
+/// stays unresolved rather than being softened into a hit.
+async fn colon_title_resolution(store: &dyn Store) {
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path();
+    write(
+        other,
+        "runbook.md",
+        &engram("Runbook", "runbook", "engram", "", "how to restart\n"),
+    );
+    sync_domain(store, "ops", other).await.unwrap();
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path();
+    // The title is quoted, because a bare `title: Log: Weekly Garden Notes` is
+    // not YAML at all - which is a small reminder of why the colon is a
+    // problem worth solving rather than forbidding.
+    write(
+        root,
+        "log-weekly.md",
+        "---\ntype: engram\ntitle: 'Log: Weekly Garden Notes'\npermalink: log-weekly\ntags:\n  - t\nstatus: current\nrecorded_at: 2026-01-01\n---\n\n# Log: Weekly Garden Notes\n\nWhat the garden did this week.\n",
+    );
+    write(
+        root,
+        "alpha.md",
+        &engram(
+            "Alpha",
+            "alpha",
+            "engram",
+            "",
+            "- superseded_by [[Log: Weekly Garden Notes]]\n- cites [[ops:Runbook]]\n- blocks [[Ledger: Nobody Wrote This]]\n\nProse about [[Log: Weekly Garden Notes]] here.\n",
+        ),
+    );
+    sync_domain(store, "d", root).await.unwrap();
+
+    let alpha = store.lookup_id("d", "alpha").await.unwrap().unwrap();
+    let refs = store.outbound_refs(alpha).await.unwrap();
+    let shape: Vec<_> = refs
+        .iter()
+        .map(|r| (r.to_domain.as_deref(), r.to_target.as_str(), r.resolved))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            // Nothing is registered as `Log`, so the whole bracket text is the
+            // title of the engram beside it.
+            (Some("Log"), "Weekly Garden Notes", true),
+            // `ops` is a domain, so the prefix keeps its meaning.
+            (Some("ops"), "Runbook", true),
+            // `Ledger` is no domain either, and no engram here is titled
+            // `Ledger: Nobody Wrote This`. A second reading is a second
+            // question, not a softer answer.
+            (Some("Ledger"), "Nobody Wrote This", false),
+            // The prose wikilink is the same target through the other table.
+            (Some("Log"), "Weekly Garden Notes", true),
+        ]
+    );
+}
+parity!(
+    a_colon_in_a_title_resolves_at_home_on_both_backends,
+    colon_title_resolution
+);
+
+// --- the registration stamp --------------------------------------------------
+
+/// The `last_registered` stamp: a domain the configuration still names is
+/// marked as seen, restamping moves the mark forward, a domain nobody stamped
+/// reads as `None`, and the value travels on `domain_stats`.
+///
+/// `None` is the load-bearing case. It means "never stamped", not "stamped
+/// long ago": a domain row written before the column existed, or one written
+/// by a sync that ran before the first stamping sweep, carries no evidence
+/// about its age at all. A caller that ages the stamp must leave such a row
+/// alone rather than treat it as infinitely old.
+async fn registration_stamp(store: &dyn Store) {
+    let _ = store
+        .upsert_domain("alpha", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("beta", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+    let _ = store
+        .upsert_domain("gamma", None, DomainKind::Virtual)
+        .await
+        .unwrap();
+
+    // Fresh rows are unstamped: nobody has said they were registered yet.
+    let stamp = |stats: &Vec<crystalline_index::DomainStats>, name: &str| {
+        stats
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("{name} is in domain_stats"))
+            .last_registered
+            .clone()
+    };
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stamp(&stats, "alpha"), None, "a fresh row is unstamped");
+    assert_eq!(stamp(&stats, "beta"), None);
+    assert_eq!(stamp(&stats, "gamma"), None);
+
+    // Stamping names two of the three. Times are fixed-width RFC 3339 strings,
+    // the same convention `last_sync` uses, so they compare lexically.
+    store
+        .stamp_registered(&["alpha", "beta"], "2026-09-01T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "the stamp travels on domain_stats"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z")
+    );
+    assert_eq!(
+        stamp(&stats, "gamma"),
+        None,
+        "a domain nobody stamped stays unstamped: never seen, not seen long ago"
+    );
+
+    // Stamping again moves the mark forward for the named domains only.
+    store
+        .stamp_registered(&["alpha"], "2026-09-08T12:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "restamping moves the mark forward"
+    );
+    assert_eq!(
+        stamp(&stats, "beta").as_deref(),
+        Some("2026-09-01T00:00:00Z"),
+        "a domain the second call did not name keeps its earlier stamp"
+    );
+
+    // An empty set is a no-op, not a syntax error: a configuration that
+    // registers nothing is a configuration, and the sweep still runs.
+    store
+        .stamp_registered(&[], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(
+        stamp(&stats, "alpha").as_deref(),
+        Some("2026-09-08T12:00:00Z"),
+        "an empty stamp set changes nothing"
+    );
+
+    // A name with no row is a silent no-op: the configuration may register a
+    // domain that has never been synced, and stamping must not invent a row.
+    store
+        .stamp_registered(&["never-synced", "gamma"], "2026-09-09T00:00:00Z")
+        .await
+        .unwrap();
+    let stats = store.domain_stats().await.unwrap();
+    assert_eq!(stats.len(), 3, "stamping an unknown name creates no row");
+    assert_eq!(
+        stamp(&stats, "gamma").as_deref(),
+        Some("2026-09-09T00:00:00Z"),
+        "the known name beside it was still stamped"
+    );
+}
+parity!(
+    registration_stamp_records_when_a_domain_was_last_seen,
+    registration_stamp
 );

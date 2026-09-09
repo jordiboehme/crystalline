@@ -38,8 +38,9 @@ async fn store_info_reports_turso_schema_version() {
     assert_eq!(info.fts_mode, crystalline_index::FtsMode::CandidateScan);
     // v1 initial, v2 vector chunk storage, v3 domain kind, v4 domain host lock,
     // v5 title-lower expression index, v6 link unresolved partial index,
-    // v7 case-folded tag identity, v8 tag alias map, v9 engram attachments.
-    assert_eq!(info.schema_version, 9);
+    // v7 case-folded tag identity, v8 tag alias map, v9 engram attachments,
+    // v10 raw reference text, v11 domain registration stamp.
+    assert_eq!(info.schema_version, 11);
 }
 
 #[tokio::test]

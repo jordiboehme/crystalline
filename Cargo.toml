@@ -9,8 +9,8 @@ members = [
 ]
 
 [workspace.package]
-version = "0.17.0"
-authors = ["Jordi Boehme <jordi@boehme-lopez.de>"]
+version = "0.18.0"
+authors = ["Jordi Böhme <jordi@boehme-lopez.de>"]
 edition = "2024"
 license = "AGPL-3.0-or-later"
 rust-version = "1.96"
@@ -27,7 +27,7 @@ crystalline-service = { path = "crates/service" }
 
 clap = { version = "4.6.6", features = ["derive"] }
 tokio = { version = "1.53.1", features = ["full"] }
-rmcp = "3.1.2"
+rmcp = "3.2.0"
 turso = "0.7.2"
 candle-core = "0.11.0"
 candle-nn = "0.11.0"
@@ -58,16 +58,16 @@ sha2 = "0.11.0"
 chrono = "0.4.45"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-indexmap = "2.14.0"
+indexmap = "2.14.1"
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "json"] }
 fs4 = "1.1.0"
 axum = { version = "0.8.9", features = ["ws"] }
 # The yrs `sync` feature makes observer callbacks Send + Sync for the
 # multi-threaded server; the `yrs::sync` protocol module itself is
 # unconditional. Wire format pinned in crates/service/tests/collab_wire.rs.
-yrs = { version = "0.27.3", features = ["sync"] }
+yrs = { version = "0.27.4", features = ["sync"] }
 # Text diffing for collaborative merge conflict surfacing (crates/service).
-similar = "3.1.2"
+similar = "3.2.0"
 # Cheaply cloned byte buffers for the collab broadcast fan-out; also the shape
 # axum's WebSocket binary frames take, so a frame crosses the seam without a
 # copy. Already in the graph through axum and tokio.
@@ -82,15 +82,27 @@ axum-extra = { version = "0.12.6", default-features = false, features = ["cookie
 # axum-extra builds on takes its durations from here and re-exports no
 # constructor of its own. Already in the graph through that edge.
 time = { version = "0.3.55", default-features = false }
+# The `tower_service::Service` trait alone, which is what the MCP gate
+# implements and what axum's `any_service`/`fallback_service` bound on. rmcp
+# implements the same trait from the same crate; `tower::Service` is a
+# re-export of it, and pulling the trait crate keeps the middleware stack out
+# of the graph.
+tower-service = "0.3.3"
 libc = "0.2.189"
 serde_yaml_ng = "0.10.0"
 toml = "1.1.4"
 async-trait = "0.1.92"
-uuid = { version = "1.24.0", features = ["v4"] }
+uuid = { version = "1.26.0", features = ["v4"] }
 thiserror = "2.0.20"
 anyhow = "1.0.104"
 etcetera = "0.11.0"
 walkdir = "2.5.0"
+# Canonicalizes without adding (and, on Windows, while stripping) a `\\?\`
+# verbatim prefix, so two paths naming the same file converge on one shape
+# instead of a plain `std::fs::canonicalize` call introducing a new mismatch
+# of its own (crates/cli's doctor, matching a verify finding back to a file
+# a separate walk of "the same" root already found).
+dunce = "1.0.5"
 globset = "0.4.20"
 schemars = "1.2.2"
 futures = "0.3.34"
@@ -100,14 +112,14 @@ windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Syste
 
 # GitHub collaboration (crates/remote): plain-text three-way merge, the
 # GitHub-issued token in the OS keychain and repository tarball extraction.
-diffy = "0.5.1"
+diffy = "0.5.2"
 # `v1` pulls in exactly the apple-native (Keychain), windows-native and
 # zbus-secret-service (pure-Rust, no libdbus) backends; the 0600 file fallback
 # in crates/remote covers everything else (headless Linux without a session
 # bus, CI).
-keyring = { version = "4.1.6", default-features = false, features = ["v1"] }
+keyring = { version = "4.2.0", default-features = false, features = ["v1"] }
 tar = "0.4.46"
-flate2 = "1.1.9"
+flate2 = "1.1.10"
 base64 = "0.23.1"
 # Percent-decoding for the MCP `resources/read` uri (crates/service). Already
 # in the graph through axum and url; named directly because the MCP surface
@@ -146,8 +158,38 @@ rust-embed = { version = "8.12", features = [
 # switch serde_json's map type on the whole workspace.
 utoipa = "5.5.0"
 
+# The OpenID Connect relying party (crates/service). `default-features = false`
+# is load bearing: the defaults are `reqwest` + `rustls-tls`, which reach
+# reqwest through oauth2's `^0.12` requirement and would put a SECOND reqwest
+# and a second TLS stack in the graph beside the workspace's 0.13. The crate
+# has an `AsyncHttpClient` trait for exactly this, so `rest::oidc` implements
+# it over the one reqwest this workspace already builds.
+#
+# `accept-string-booleans` and `accept-rfc3339-timestamps` are tolerance for
+# providers that spell a claim the way the specification does not: Entra, the
+# provider the settings layer names, sends `email_verified` as the string
+# "true", and RFC 3339 timestamps turn up in the wild where the spec asks for
+# seconds since the epoch. Both only widen what parses; neither loosens a
+# signature, an issuer or an audience check.
+openidconnect = { version = "4.0.1", default-features = false, features = [
+    "accept-string-booleans",
+    "accept-rfc3339-timestamps",
+] }
+
 insta = { version = "1.48.0", features = ["yaml"] }
 assert_cmd = "2.2.2"
+# Dev-only, for the fake OpenID Connect provider the relying-party tests run
+# against (crates/service). `rust_crypto` rather than `aws_lc_rs`: every crate
+# it names - rsa, sha2 0.10, p256, p384, ed25519-dalek - is already in the
+# graph through openidconnect, so the backend adds no new C or assembly build.
+jsonwebtoken = { version = "11.0.0", default-features = false, features = [
+    "use_pem",
+    "rust_crypto",
+] }
+# Dev-only beside it: reads a PKCS#8 test key back out of its PEM so the fake
+# provider can publish the matching JWKS. Already in the graph through
+# openidconnect.
+rsa = { version = "0.9.10", features = ["pem"] }
 tempfile = "3.27.0"
 # o200k_base tokenizer for the TOON vs JSON payload measurement test; pulls no
 # serde_json (verified against its crates.io dependency list), so it cannot

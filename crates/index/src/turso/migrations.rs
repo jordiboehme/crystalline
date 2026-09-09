@@ -67,6 +67,16 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram attachments",
         sql: SCHEMA_V9,
     },
+    Migration {
+        version: 10,
+        label: "raw reference text",
+        sql: SCHEMA_V10,
+    },
+    Migration {
+        version: 11,
+        label: "domain registration stamp",
+        sql: SCHEMA_V11,
+    },
 ];
 
 const SCHEMA_V1: &str = r#"
@@ -302,6 +312,38 @@ CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
 // in `attachment_blob`, split off into its own table so the metadata listing
 // never drags a blob through the row cache. `size` is the byte length and
 // `modified` an RFC 3339 instant, matching the temporal columns' text form.
+// The bracket text a reference was written with, kept beside the split of it.
+//
+// `LinkTarget::parse` is domain-agnostic: it splits `[[Log: Weekly Garden
+// Notes]]` into a domain and a target exactly as it splits `[[ops:Runbook]]`,
+// because nothing inside the brackets says which is which. Only the registry
+// can tell them apart, and telling them apart means looking the whole original
+// string up as a title - which `to_target` and `to_domain` have by then lost
+// the whitespace of. So it is stored.
+//
+// Nullable, and deliberately not backfilled: a row written before this
+// migration has no bracket text to recover, and there is no expression over
+// `to_domain || to_target` that reconstructs it (the colon was trimmed around).
+// Such a row resolves exactly as it does today - the fallback compares against
+// NULL, which is never true - until the next reindex of its engram rewrites it.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE relation ADD COLUMN to_raw TEXT;
+ALTER TABLE link ADD COLUMN to_raw TEXT;
+"#;
+
+// When this domain was last seen in the configuration, RFC 3339, the same text
+// convention `last_sync` uses so the two compare lexically.
+//
+// Nullable with no default and no backfill, and that is the point: every row
+// that predates this migration reads NULL, and NULL means "never stamped", not
+// "stamped infinitely long ago". A caller that ages the stamp to decide whether
+// a domain has been gone long enough to collect must read NULL as no evidence
+// at all and leave the row alone, so the first sweep after an upgrade collects
+// nothing. Rows earn a stamp only by being seen registered.
+const SCHEMA_V11: &str = r#"
+ALTER TABLE domain ADD COLUMN last_registered TEXT;
+"#;
+
 const SCHEMA_V9: &str = r#"
 CREATE TABLE attachment (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -415,6 +457,136 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The v11 column against a domain row that predates it.
+    ///
+    /// The whole grace-period design rests on this reading: a row written
+    /// before the stamp existed comes out of the migration with
+    /// `last_registered` NULL, and NULL is "never stamped", not "stamped
+    /// infinitely long ago". Nothing backfills it, so on the first sweep after
+    /// an upgrade every domain in the index is unstamped and none of them is
+    /// old enough to collect. The row stamped afterwards is the control that
+    /// proves the column accepts a value at all.
+    #[tokio::test]
+    async fn v11_leaves_a_domain_row_written_before_it_unstamped() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for m in &MIGRATIONS[..10] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[10].version, 11, "the eleventh migration is v11");
+
+        conn.execute_batch(
+            "INSERT INTO domain(id, name, path) VALUES (1,'old','/tmp/old'),(2,'seen','/tmp/seen');",
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[10].sql).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE last_registered IS NULL"
+            )
+            .await,
+            2,
+            "no backfill: both pre-existing rows read NULL, meaning never stamped"
+        );
+
+        // Only the domain seen in the configuration is stamped, and the row
+        // beside it stays NULL rather than aging into a date.
+        conn.execute(
+            "UPDATE domain SET last_registered='2026-09-09T00:00:00Z' WHERE name='seen'",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE last_registered IS NOT NULL"
+            )
+            .await,
+            1,
+            "the stamped row carries a value and the unstamped one still does not"
+        );
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM domain WHERE name='old' AND last_registered IS NULL"
+            )
+            .await,
+            1,
+        );
+    }
+
+    /// The v10 column against a row that predates it.
+    ///
+    /// A reference written before `to_raw` existed has no bracket text to
+    /// recover and none can be reconstructed, so the fallback reading must not
+    /// fire for it: `to_raw` is NULL, every comparison against NULL is NULL,
+    /// and the row resolves exactly as it did before until its engram is
+    /// reindexed. The row beside it, written with the text, is the control that
+    /// proves the guard is doing the work rather than the expression failing
+    /// everywhere.
+    #[tokio::test]
+    async fn v10_leaves_a_reference_written_before_it_resolving_as_it_did() {
+        let db = Builder::new_local(":memory:").build().await.unwrap();
+        let conn = db.connect().unwrap();
+        for m in &MIGRATIONS[..9] {
+            conn.execute_batch(m.sql).await.unwrap();
+        }
+        assert_eq!(MIGRATIONS[9].version, 10, "the tenth migration is v10");
+
+        // One domain, the engram somebody links to by its colon-bearing title,
+        // and two links to it: one written before the column, one after.
+        conn.execute_batch(
+            r#"
+            INSERT INTO domain(id, name, path) VALUES (1,'d','/tmp/d');
+            INSERT INTO engram(id, domain_id, path, permalink, title)
+                VALUES (1,1,'log.md','log-weekly','Log: Weekly Garden Notes'),
+                       (2,1,'old.md','old','Old'),
+                       (3,1,'new.md','new','New');
+            INSERT INTO relation(id, engram_id, domain_id, line, rel_type, to_target, to_domain)
+                VALUES (1,2,1,3,'superseded_by','Weekly Garden Notes','Log'),
+                       (2,3,1,3,'superseded_by','Weekly Garden Notes','Log');
+            "#,
+        )
+        .await
+        .unwrap();
+
+        conn.execute_batch(MIGRATIONS[9].sql).await.unwrap();
+        // Only the second row is reindexed, which is what a reindex does: it
+        // rewrites the reference rows of the engram it read.
+        conn.execute(
+            "UPDATE relation SET to_raw = 'Log: Weekly Garden Notes' WHERE id = 2",
+            (),
+        )
+        .await
+        .unwrap();
+
+        let sql = format!(
+            "UPDATE relation SET to_id = {resolved} WHERE relation.to_id IS NULL AND {resolved} IS NOT NULL",
+            resolved = crate::store::reference_match("relation")
+        );
+        conn.execute(&sql, ()).await.unwrap();
+
+        assert_eq!(
+            scalar(
+                &conn,
+                "SELECT COUNT(*) FROM relation WHERE id=1 AND to_id IS NULL"
+            )
+            .await,
+            1,
+            "the row written before the column resolves exactly as it did"
+        );
+        assert_eq!(
+            scalar(&conn, "SELECT COALESCE(to_id, 0) FROM relation WHERE id=2").await,
+            1,
+            "the reindexed row reaches the engram whose title carries the colon"
+        );
     }
 
     /// Proves the v7 case-fold migration against a real turso connection: apply

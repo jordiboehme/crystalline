@@ -22,6 +22,7 @@ mod mock;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use crystalline_remote::merge::ConflictKind;
 use crystalline_remote::ops::{
     OriginStatusReport, PlannedAction, ProposeOutcome, PullReport, Resolution, ShareOptions,
     SubscribeReport, propose, propose_preview, pull, resolve, status, subscribe, withdraw,
@@ -801,6 +802,64 @@ async fn scenario_10_declined_proposal_without_movement() {
 // Scenario 11: the base commit is gone upstream (history rewritten). The pull
 // re-baselines onto head: upstream-only files materialize, a locally differing
 // file is left untouched and later shows as a local change.
+
+/// A re-baseline does not materialize a second copy of a file the domain
+/// already holds under another spelling of the same name.
+///
+/// The head tree's paths are the origin's spellings; the working tree's are
+/// this machine's. On a case-sensitive filesystem a re-cased file is invisible
+/// to an existence test at the origin's spelling, so the head's copy lands
+/// beside it. The outgoing base snapshot is what maps one spelling to the
+/// other, and it is still in hand at that moment.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; demonstrated on a case-sensitive APFS image.
+#[tokio::test]
+async fn a_re_baseline_writes_no_duplicate_at_a_recased_path() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"a v1\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    // The one local change is a re-case, which the folding detector treats as
+    // the same file rather than a delete and an add.
+    std::fs::remove_file(sub.domain_root.join("notes/a.md")).unwrap();
+    write(&sub.domain_root.join("notes/A.md"), b"a v1\n");
+
+    // Head moves, still carrying the origin's spelling, and the recorded base
+    // commit is gone so the pull re-baselines.
+    let c2 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/a.md", b"a v2\n")]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    set_base_commit(&sub.state_dir, "ghost-commit");
+    mock.gc_commit("ghost-commit");
+
+    let report = pull(&mock, &spec(), &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+    assert!(report.re_baselined);
+    assert!(
+        !report.applied.contains(&"notes/a.md".to_string()),
+        "the file is already here under the other spelling: {:?}",
+        report.applied
+    );
+
+    let names: Vec<String> = std::fs::read_dir(sub.domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("a.md"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["A.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(read(&sub.domain_root.join("notes/A.md")), b"a v1\n");
+}
 
 #[tokio::test]
 async fn scenario_11_missing_base_commit_re_baselines() {
@@ -1616,6 +1675,87 @@ async fn scenario_20_withdraw_revert_restores_undiverged_files() {
     );
 }
 
+/// A revert never writes a second copy of a file that is already there under
+/// another spelling of the same name.
+///
+/// The withdrawal's reads are keyed on the proposal's recorded path, which is
+/// the base snapshot's spelling. On a case-sensitive filesystem that spelling
+/// opens nothing when the file has been re-cased, so the `Deleted` arm sees an
+/// absent file, calls it undiverged and writes the base content back - landing
+/// a duplicate engram inside a tracked domain beside the real one. Routing the
+/// read through the detector's disk spelling is what makes the arm see the
+/// file that is really there and report it as diverged instead.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; the volume this was demonstrated on was a case-sensitive APFS
+/// image.
+#[tokio::test]
+async fn scenario_20_withdraw_revert_writes_no_duplicate_at_a_recased_path() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[("MANIFEST.md", b"# Manifest"), ("notes/gone.md", b"bye\n")]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+    std::fs::remove_file(sub.domain_root.join("notes/gone.md")).unwrap();
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .unwrap();
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("{other:?}"),
+    };
+
+    // The file comes back after the share, under a different spelling of the
+    // same name - the shape a re-case makes, and the one the folding detector
+    // now treats as the same file.
+    write(&sub.domain_root.join("notes/Gone.md"), b"back, renamed\n");
+
+    let w = withdraw(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        &sub.state_dir,
+        Some(report.number),
+        true,
+        false,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        w.skipped_diverged,
+        vec!["notes/gone.md".to_string()],
+        "the file is there under the other spelling, so it is newer work"
+    );
+    assert!(
+        w.restored.is_empty(),
+        "and nothing was put back over it: {:?}",
+        w.restored
+    );
+    let names: Vec<String> = std::fs::read_dir(sub.domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("gone.md"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Gone.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/Gone.md")),
+        b"back, renamed\n"
+    );
+}
+
 #[tokio::test]
 async fn scenario_20_withdraw_declined_skips_the_close() {
     let mock = MockProvider::new();
@@ -2004,6 +2144,148 @@ async fn scenario_22_resolve_merged_writes_the_supplied_content() {
     .unwrap();
     assert_eq!(report.remaining, 0);
     assert_eq!(read(&sub.domain_root.join("notes/a.md")), merged);
+}
+
+/// Seeds a re-cased engram that upstream also edited, so the conflict is
+/// recorded at a spelling nothing on disk answers to.
+///
+/// The engram is re-cased locally and edited under its new spelling, so at the
+/// recorded spelling the working tree has nothing: the merge sees a base, no
+/// local and an upstream edit, which is the one conflict shape reachable with
+/// the local file absent. The base snapshot is what still maps `notes/a.md` to
+/// the `notes/A.md` the person can see.
+async fn seeded_recased_delete_edit_conflict(mock: &MockProvider, spec: &OriginSpec) -> Subscribed {
+    let c1 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one\n"),
+        ]),
+        None,
+    );
+    let sub = subscribe_named(mock, spec, &c1, "brand").await;
+    std::fs::remove_file(sub.domain_root.join("notes/a.md")).unwrap();
+    write(&sub.domain_root.join("notes/A.md"), b"line one LOCAL\n");
+    // The whole point of the scenario only exists where the two spellings are
+    // two files; on a case-insensitive filesystem this asserts the same
+    // outcome over one file, which is why it passes there either way.
+    let case_sensitive = !sub.domain_root.join("notes/a.md").exists();
+
+    let c2 = mock.add_commit(
+        sub_commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            ("notes/a.md", b"line one UPSTREAM\n"),
+        ]),
+        Some(&c1),
+    );
+    mock.set_branch("main", &c2);
+    pull(mock, spec, &sub.domain_root, &sub.state_dir)
+        .await
+        .unwrap();
+
+    let st = load_state(&sub.state_dir);
+    assert_eq!(st.conflicts.len(), 1);
+    assert_eq!(st.conflicts[0].path, "notes/a.md");
+    // Both filesystems reach a conflict here, by different routes, and the
+    // kind says which machine this is running on. Where the two spellings are
+    // one file the merge sees a local edit and calls it `EditEdit`; where they
+    // are two the recorded spelling opens nothing, which is the one conflict
+    // shape reachable with the local file absent.
+    assert_eq!(
+        st.conflicts[0].kind,
+        if case_sensitive {
+            ConflictKind::DeleteEdit
+        } else {
+            ConflictKind::EditEdit
+        }
+    );
+    sub
+}
+
+/// The names under `notes/` that differ from `a.md` by case alone.
+fn a_md_spellings(domain_root: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("a.md"))
+        .collect();
+    names.sort();
+    names
+}
+
+/// A hand-merged body lands on the file the domain actually holds, not at the
+/// spelling the conflict was recorded under.
+///
+/// This is the worst member of the recorded-spelling family: written at the
+/// recorded spelling the merge goes to a path nothing reads, the live file
+/// keeps its pre-merge content and the conflict is cleared anyway, so somebody
+/// is told their resolution worked while it silently is not there.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; demonstrated on a case-sensitive APFS image.
+#[tokio::test]
+async fn a_resolved_merge_lands_on_the_recased_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_recased_delete_edit_conflict(&mock, &spec).await;
+
+    let merged: &[u8] = b"merged by hand\n";
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Merged(merged),
+    )
+    .unwrap();
+    assert_eq!(
+        report.resolved, "notes/a.md",
+        "the reported channel stays at the recorded spelling"
+    );
+    assert_eq!(report.remaining, 0);
+
+    assert_eq!(
+        read(&sub.domain_root.join("notes/A.md")),
+        merged,
+        "the merge has to be in the file the person can open"
+    );
+    assert_eq!(
+        a_md_spellings(&sub.domain_root),
+        vec!["A.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
+}
+
+/// Taking the origin's copy of a re-cased file replaces it rather than landing
+/// a second copy beside it. The same line as the merge above, the milder
+/// outcome.
+///
+/// Passes either way on a case-insensitive filesystem, where the two spellings
+/// are one file; demonstrated on a case-sensitive APFS image.
+#[tokio::test]
+async fn a_resolved_theirs_replaces_the_recased_file() {
+    let mock = MockProvider::new();
+    let spec = share_spec();
+    let sub = seeded_recased_delete_edit_conflict(&mock, &spec).await;
+
+    let report = resolve(
+        &sub.domain_root,
+        &sub.state_dir,
+        "notes/a.md",
+        Resolution::Theirs,
+    )
+    .unwrap();
+    assert_eq!(report.remaining, 0);
+
+    assert_eq!(
+        a_md_spellings(&sub.domain_root),
+        vec!["A.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/A.md")),
+        b"line one UPSTREAM\n"
+    );
+    assert!(load_state(&sub.state_dir).conflicts.is_empty());
 }
 
 #[tokio::test]
@@ -5525,6 +5807,61 @@ async fn an_interrupted_repair_resumes_on_the_next_withdraw() {
     );
 }
 
+/// The other write arm of a revert - the one that restores from a layer below
+/// rather than from the trunk - is protected the same way.
+///
+/// A path only a lower layer ever carried is not in the base snapshot, so a
+/// trunk-only detection cannot say where it lives on disk and the recorded
+/// spelling comes back unchanged. On a case-sensitive filesystem the arm then
+/// writes the lower layer's blob beside the re-cased file. Resolving against
+/// the trunk with the layers below laid over it is what reaches this arm.
+///
+/// Passes either way on a case-insensitive filesystem; demonstrated on a
+/// case-sensitive APFS image.
+#[tokio::test]
+async fn a_stacked_revert_writes_no_duplicate_at_a_recased_lower_layer_path() {
+    let mock = MockProvider::new();
+    mock.enable_stacks();
+    let (sub, _first) = stacked_bottom_layer(&mock).await;
+
+    // A path the trunk never carried: added by the middle layer, retired by
+    // the top one, so its pre-share content lives only in the middle layer's
+    // recorded blob.
+    write(&sub.domain_root.join("notes/b.md"), b"beta\n");
+    let _second = proposed(stacked_share(&mock, &sub).await);
+    std::fs::remove_file(sub.domain_root.join("notes/b.md")).unwrap();
+    let third = proposed(stacked_share(&mock, &sub).await);
+
+    // It comes back under the other spelling of the same name.
+    write(&sub.domain_root.join("notes/B.md"), b"back, renamed\n");
+
+    let report = stacked_withdraw(&mock, &sub, Some(third.number), true).await;
+    assert_eq!(
+        report.skipped_diverged,
+        vec!["notes/b.md".to_string()],
+        "the file is there under the other spelling, so it is newer work"
+    );
+    assert!(
+        report.restored.is_empty(),
+        "nothing was put back over it: {:?}",
+        report.restored
+    );
+    let names: Vec<String> = std::fs::read_dir(sub.domain_root.join("notes"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.eq_ignore_ascii_case("b.md"))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["B.md".to_string()],
+        "exactly one copy of the engram, at the spelling on disk"
+    );
+    assert_eq!(
+        read(&sub.domain_root.join("notes/B.md")),
+        b"back, renamed\n"
+    );
+}
+
 #[tokio::test]
 async fn stacked_withdraw_with_no_number_takes_the_top() {
     let mock = MockProvider::new();
@@ -8389,5 +8726,141 @@ async fn a_preview_plans_the_selection_rather_than_the_whole_delta() {
         matches!(nothing.action, PlannedAction::NothingToShare),
         "{:?}",
         nothing.action
+    );
+}
+
+// A directory whose case was tidied up locally, with an edit inside it. The
+// base snapshot still holds the old spelling, so the change is reported at
+// that spelling - a path this working tree does not contain. On a
+// case-sensitive filesystem the share has to read the file that IS there, or
+// it dies with a bare "No such file or directory" naming a path the user
+// cannot see; on a case-insensitive one the reported path happens to open the
+// file, which is why this needs a case-sensitive volume (or a Linux CI leg) to
+// mean anything. Either way the proposal must carry the spelling the
+// repository already knows, never a rename no teammate's checkout can hold.
+#[tokio::test]
+async fn a_case_only_directory_rename_shares_at_the_recorded_spelling() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            (
+                "Platform.Components.Common/CustomHeaderModule.md",
+                b"header module\n",
+            ),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    std::fs::remove_dir_all(sub.domain_root.join("Platform.Components.Common")).unwrap();
+    write(
+        &sub.domain_root
+            .join("platform.components.common/CustomHeaderModule.md"),
+        b"header module, revised\n",
+    );
+
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions::default(),
+    )
+    .await
+    .expect("a case-only rename must not break the read behind the share");
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+
+    assert_eq!(
+        report.updated,
+        vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()]
+    );
+    assert!(report.added.is_empty(), "{:?}", report.added);
+    assert!(report.deleted.is_empty(), "{:?}", report.deleted);
+
+    let record = load_state(&sub.state_dir)
+        .proposals
+        .into_iter()
+        .find(|p| p.number == report.number)
+        .expect("the proposal is recorded");
+    let paths: Vec<String> = record.files.iter().map(|f| f.path.clone()).collect();
+    assert_eq!(
+        paths,
+        vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()],
+        "the edited bytes travel upstream under the name the repository knows"
+    );
+}
+
+// The same rename, shared by name. A selection is checked against the delta,
+// which is reported at the base snapshot's spelling - so a person typing what
+// `ls` shows them would have their own file refused. Both spellings select it,
+// and both resolve to the one the repository knows; a path that is neither is
+// still refused by name.
+#[tokio::test]
+async fn a_case_folded_change_can_be_selected_by_either_spelling() {
+    let mock = MockProvider::new();
+    let c1 = mock.add_commit(
+        commit_files(&[
+            ("MANIFEST.md", b"# Manifest"),
+            (
+                "Platform.Components.Common/CustomHeaderModule.md",
+                b"header module\n",
+            ),
+        ]),
+        None,
+    );
+    let (sub, _) = subscribe_at(&mock, &c1).await;
+
+    std::fs::remove_dir_all(sub.domain_root.join("Platform.Components.Common")).unwrap();
+    write(
+        &sub.domain_root
+            .join("platform.components.common/CustomHeaderModule.md"),
+        b"header module, revised\n",
+    );
+
+    let typo = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            files: Some(&["platform.components.common/Nothing.md".to_string()]),
+            ..ShareOptions::default()
+        },
+    )
+    .await;
+    assert!(
+        matches!(&typo, Err(e) if e.to_string().contains("platform.components.common/Nothing.md")),
+        "a path that is neither spelling is still refused by name: {typo:?}"
+    );
+
+    let outcome = propose(
+        &mock,
+        &spec(),
+        &sub.domain_root,
+        "eng",
+        &sub.state_dir,
+        ShareOptions {
+            // The spelling on disk, which is the only one this working tree
+            // can show a person.
+            files: Some(&["platform.components.common/CustomHeaderModule.md".to_string()]),
+            ..ShareOptions::default()
+        },
+    )
+    .await
+    .expect("the spelling the user can see selects the change");
+    let report = match outcome {
+        ProposeOutcome::Proposed(r) => r,
+        other => panic!("expected Proposed, got {other:?}"),
+    };
+    assert_eq!(
+        report.updated,
+        vec!["Platform.Components.Common/CustomHeaderModule.md".to_string()],
+        "and it travels upstream under the name the repository knows"
     );
 }

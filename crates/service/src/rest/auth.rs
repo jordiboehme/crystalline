@@ -1,6 +1,6 @@
 //! Who a REST request is, and what that lets it do.
 //!
-//! Three ways in, tried in this order and never blended:
+//! Four ways in, tried in this order and never blended:
 //!
 //! 1. **The trusted header.** An upstream proxy has already authenticated the
 //!    caller and names them in the header `auth.trusted_header` configures. The
@@ -8,15 +8,24 @@
 //!    needs no separate user creation step. Believed only when configured: an
 //!    instance that has not been told to trust a proxy ignores the header
 //!    whatever a client sends.
-//! 2. **The session cookie.** [`SESSION_COOKIE`] carries a token issued by
+//! 2. **The forward-auth headers.** With `auth.proxy_headers` on, a proxy that
+//!    speaks the standard `Remote-*` quartet is believed the same way, and the
+//!    identity it asserts is keyed as `(proxy, <the forwarded user>)` in the
+//!    identity-link table - the same durable key single sign-on uses, so a
+//!    header identity and a provider identity are two people until somebody
+//!    links them. Off by default and trust-the-proxy by construction: safe
+//!    only where this instance is unreachable except through that proxy and
+//!    the proxy strips client-supplied copies of the headers. The two header
+//!    modes are mutually exclusive and refused together at startup.
+//! 3. **The session cookie.** [`SESSION_COOKIE`] carries a token issued by
 //!    `POST /auth/login`; the store resolves it to an account and the session's
 //!    CSRF token.
-//! 3. **Anonymous.** With `auth.anonymous` on, a request that carries neither
-//!    is still served, at viewer level and with no account behind it.
+//! 4. **Anonymous.** With `auth.anonymous` on, a request that carries none of
+//!    them is still served, at viewer level and with no account behind it.
 //!
-//! Both settings are resolved once, when the HTTP surface is built (see
-//! [`AuthCfg`]), matching `service.read_only`: a flip takes effect at the next
-//! start, never halfway through a served request.
+//! Every one of those settings is resolved once, when the HTTP surface is
+//! built (see [`AuthCfg`]), matching `service.read_only`: a flip takes effect
+//! at the next start, never halfway through a served request.
 //!
 //! Everything below the auth endpoints is closed by default. [`guard`] runs
 //! ahead of routing for every `/api/v1` path, so a caller with no identity is
@@ -38,8 +47,13 @@ use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite};
 use crystalline_core::config::{GlobalConfig, ShareIdentityMode};
 use tokio::sync::Semaphore;
 
-use super::auth_store::{AuthStore, PasswordCheck, Role, SessionMint, User, dummy_verify};
+use super::auth_store::{
+    AuthStore, DEFAULT_OIDC_ROLE, PasswordCheck, RefusalKind, Role, SessionMint, StoreRefusal,
+    User, dummy_verify, normalize_account_name,
+};
+use super::oidc::sanitize_account_name;
 use super::{ApiError, ApiJson, ProblemDetail, RestState};
+use crate::scope::Scope;
 
 /// The session cookie. Named for the UI it serves so it never collides with a
 /// cookie another app sets on a shared host.
@@ -61,6 +75,32 @@ pub const SESSION_TTL_SECS: i64 = 30 * 24 * 60 * 60;
 /// enough that the worst case is a rounding error.
 pub const LOGIN_SLOTS: usize = 4;
 
+/// The header a forward-auth proxy names the authenticated person in, and the
+/// three beside it that say how to show them and what they belong to.
+///
+/// A fixed set rather than four configurable names: `Remote-User` and its
+/// siblings are what a forward-auth proxy already sends, and a deployment
+/// whose proxy sends something else has `auth.trusted_header` for the name it
+/// does send. Lowercase, which is how a header map compares.
+const REMOTE_USER_HEADER: &str = "remote-user";
+const REMOTE_NAME_HEADER: &str = "remote-name";
+const REMOTE_EMAIL_HEADER: &str = "remote-email";
+const REMOTE_GROUPS_HEADER: &str = "remote-groups";
+
+/// The issuer half of a forward-auth identity's durable key.
+///
+/// There is no issuer url in this mode - a proxy is not an OpenID Connect
+/// provider - so every header identity is namespaced under this one value and
+/// keyed as `(proxy, <the forwarded user>)` in the identity-link table. That
+/// makes a header-provisioned account and a provider-provisioned account for
+/// the same person two accounts until an admin links them, which is the
+/// no-silent-linking rule applied to a mode that asserts nothing but a name.
+///
+/// A constant rather than a setting: one instance sits behind one proxy, and
+/// an operator who ever needs to tell two apart has an additive key to ask
+/// for rather than a stored value to keep in step with their proxy.
+pub const PROXY_ISSUER: &str = "proxy";
+
 /// The one path the CSRF check cannot apply to: there is no session yet, so
 /// there is no token to echo.
 const LOGIN_PATH: &str = "/auth/login";
@@ -76,7 +116,44 @@ pub const SETUP_PATH: &str = "/auth/setup";
 /// `/auth/setup` runs when no account exists at all, so there is no identity
 /// for the guard to find and it would otherwise 401 the one route the wizard
 /// has.
-const PUBLIC_PATHS: [&str; 4] = [LOGIN_PATH, "/auth/logout", "/auth/me", SETUP_PATH];
+/// The three single sign-on paths are public for the same reason login is:
+/// the browser reaching them has no session yet. The callback is not
+/// unprotected for it - it authenticates on a single-use state this process
+/// generated, matched against a cookie only the browser that started the
+/// sign-in holds. See [`super::oidc`].
+///
+/// One of the three is public by PATH and not by method: `oidc::LOGIN_PATH`
+/// serves the `GET` that starts a sign-in with no session, and also the `POST`
+/// that starts LINKING an identity to the account already signed in, which
+/// calls `require_account` inside the handler and is under the CSRF check like
+/// every other `POST`. This list is a path list, so it exempts both; the guard
+/// that matters for the second one lives in the handler rather than here, and
+/// that is the first thing to check when reading this exemption.
+const PUBLIC_PATHS: [&str; 10] = [
+    LOGIN_PATH,
+    "/auth/logout",
+    "/auth/me",
+    SETUP_PATH,
+    super::oidc::LOGIN_PATH,
+    super::oidc::CALLBACK_PATH,
+    super::oidc::PROVIDERS_PATH,
+    // A client registers itself before anybody has signed in anywhere, so
+    // there is no identity it could carry here. What bounds it instead is a
+    // body limit of its own, a burst limit, a ceiling and a prune, none of
+    // which need a caller to be anybody. See `super::oauth::register`.
+    super::oauth::REGISTER_PATH,
+    // And a client sends a browser here before that browser has signed in
+    // anywhere either - the consent screen it redirects to is what needs an
+    // account, and it is guarded. Nothing is granted by this route. See
+    // `super::oauth::authorize`.
+    super::oauth::AUTHORIZE_PATH,
+    // Where the client comes back with the code a person just granted it. It
+    // has no session and never will: what it takes away from this route is the
+    // credential it authenticates with from then on, checked at the MCP gate.
+    // What proves it may have one is the PKCE verifier behind the challenge the
+    // authorization was started with. See `super::oauth::token`.
+    super::oauth::TOKEN_PATH,
+];
 
 /// The three auth settings, resolved once when the HTTP surface is built.
 ///
@@ -89,12 +166,33 @@ pub struct AuthCfg {
     /// The header a trusted proxy names the authenticated user in, from
     /// `auth.trusted_header`. `None` means the path is off.
     pub trusted_header: Option<HeaderName>,
+    /// Whether the standard forward-auth quartet names the signed-in user,
+    /// from `auth.proxy_headers`. `false` means no `Remote-*` header is
+    /// believed, whatever a client sends.
+    pub proxy_headers: bool,
+    /// The role a forward-auth identity is provisioned at, from
+    /// `auth.oidc.default_role`.
+    ///
+    /// The single sign-on key rather than one of its own: both modes are an
+    /// external authenticator asserting a person this instance has never seen,
+    /// and one answer to "what may a newcomer do here" is easier to reason
+    /// about than two. Unset means [`DEFAULT_OIDC_ROLE`], the least privileged
+    /// one.
+    pub proxy_role: Role,
     /// Whether a request carrying no identity is served anyway, from
     /// `auth.anonymous`.
     pub anonymous: bool,
-    /// How many accounts trusted-header provisioning may mint in total, from
-    /// `auth.max_users`. Only minting a *new* account is capped; an existing
-    /// one always resolves, and the `crystalline users` CLI is never capped.
+    /// Whether every MCP connection over HTTP requires authentication with a
+    /// personal MCP token, from `auth.mcp`.
+    pub mcp: bool,
+    /// Whether OAuth is served for MCP clients, from `auth.oauth`. Requires
+    /// `mcp`, since the tokens it issues are checked at that gate.
+    pub oauth: bool,
+    /// How many accounts external provisioning may mint in total, from
+    /// `auth.max_users`: the trusted header, the forward-auth headers and
+    /// single sign-on all count against the one cap. Only minting a *new*
+    /// account is capped; an existing one always resolves, and the
+    /// `crystalline users` CLI is never capped.
     pub max_users: usize,
 }
 
@@ -102,20 +200,30 @@ impl Default for AuthCfg {
     fn default() -> AuthCfg {
         AuthCfg {
             trusted_header: None,
+            proxy_headers: false,
+            proxy_role: DEFAULT_OIDC_ROLE,
             anonymous: false,
+            mcp: false,
+            oauth: false,
             max_users: crystalline_core::config::DEFAULT_MAX_USERS,
         }
     }
 }
 
 impl AuthCfg {
-    /// Read all three settings out of `config`, validating the header name.
+    /// Read the auth settings out of `config`, validating the header name and
+    /// refusing the one combination that has no meaning.
     ///
     /// The settings layer only checks that the value is non-empty and has no
     /// whitespace (see `settings::set_trusted_header`), which still admits
     /// names HTTP does not allow. Rejecting those here means an operator who
     /// mistypes learns at startup instead of wondering why their proxy's header
     /// is ignored.
+    ///
+    /// The two header modes together are refused rather than ordered: they are
+    /// two answers to one question, an instance that carried both would believe
+    /// whichever header arrived first, and an operator who set both meant one
+    /// of them. Refusing at startup is the one moment they are still watching.
     pub fn resolve(config: &GlobalConfig) -> anyhow::Result<AuthCfg> {
         let trusted_header = match config.auth_trusted_header() {
             Some(raw) => Some(HeaderName::try_from(raw.to_ascii_lowercase()).with_context(
@@ -123,9 +231,36 @@ impl AuthCfg {
             )?),
             None => None,
         };
+        let proxy_headers = config.auth_proxy_headers();
+        if proxy_headers && trusted_header.is_some() {
+            anyhow::bail!(
+                "pick one: auth.trusted_header names a custom header, auth.proxy_headers \
+                 trusts the standard Remote-* set"
+            );
+        }
+        // Guaranteed parseable by the settings layer, which stores a role it
+        // already parsed; an environment variable can still carry anything, so
+        // an unreadable value falls back rather than refusing to serve.
+        let proxy_role = config
+            .auth_oidc()
+            .and_then(|oidc| oidc.default_role.as_deref())
+            .and_then(|raw| raw.parse::<Role>().ok())
+            .unwrap_or(DEFAULT_OIDC_ROLE);
+        let mcp = config.auth_mcp();
+        let oauth = config.auth_oauth();
+        if oauth && !mcp {
+            anyhow::bail!(
+                "auth.oauth needs auth.mcp: OAuth issues the credential the MCP gate \
+                 checks, and with the gate off nothing would check it"
+            );
+        }
         Ok(AuthCfg {
             trusted_header,
+            proxy_headers,
+            proxy_role,
             anonymous: config.auth_anonymous(),
+            mcp,
+            oauth,
             max_users: config.auth_max_users(),
         })
     }
@@ -188,10 +323,62 @@ fn rank(role: Role) -> u8 {
 }
 
 impl Identity {
+    /// What this request may see, as the one value every read below this layer
+    /// is threaded with.
+    ///
+    /// Resolved here and nowhere else on this surface: [`guard`] already did
+    /// the store lookups, so a handler that re-derived who somebody is would be
+    /// a second answer to a question that has one. An account maps to
+    /// [`Scope::User`] carrying the store's own spelling of the login name -
+    /// the acl and membership rows are keyed on the folded name, so a raw
+    /// header or cookie value would miss them - and everything else, the
+    /// anonymous viewer tier included, maps to [`Scope::Anonymous`], which sees
+    /// what is shared and no private domain.
+    ///
+    /// `admin` rides along rather than being read back a table deeper, because
+    /// this layer is the authority on it (see [`Scope::User::admin`]).
+    /// [`Scope::Unrestricted`] is deliberately unreachable from here: nothing
+    /// arriving over HTTP is the machine owner.
+    pub fn scope(&self) -> Scope {
+        match &self.user {
+            Some(user) => Scope::User {
+                account: user.name.clone(),
+                admin: user.role == Role::Admin,
+            },
+            None => Scope::Anonymous,
+        }
+    }
+
     /// The caller, when the request may be served at viewer level or above.
     /// 401 when the request carries no identity at all.
     pub fn require_viewer(&self) -> Result<Caller, ApiError> {
         self.require(Role::Viewer)
+    }
+
+    /// The account behind the request, when what follows is decided by
+    /// something other than the instance role: a private domain's membership,
+    /// or a surface that acts only on the caller's own account (its MCP tokens,
+    /// its single sign-on identities).
+    ///
+    /// [`Identity::require_viewer`] is the whole role check (a domain
+    /// invitation is what grants the rest), but its [`Caller::Anonymous`]
+    /// variant is not an account: the membership records are keyed on login
+    /// names, so an identity with none can only ever resolve to
+    /// [`crate::scope::DomainRight::None`] on a private domain. That case is
+    /// 401 rather than 403, for the reason [`Identity::require_admin`] answers
+    /// 401 to it too - logging in is exactly what fixes it - and answering it
+    /// here rather than one check later is what keeps the anonymous tier's
+    /// answer on these routes the same 401 every other write on this surface
+    /// gives it.
+    pub fn require_account(&self) -> Result<User, ApiError> {
+        match self.require_viewer()? {
+            Caller::Account(user) => Ok(user),
+            Caller::Anonymous => Err(ApiError::unauthorized(
+                "this request is served as the anonymous viewer, which has no \
+                 account of its own - nothing to be a member of anything, and \
+                 nothing to hold tokens or identities: log in first",
+            )),
+        }
     }
 
     /// The caller, when the request may mutate content. 403 for a viewer
@@ -288,7 +475,7 @@ pub async fn guard(
     Ok(next.run(req).await)
 }
 
-/// The trusted header, then the session cookie, then anonymous, then nothing.
+/// A header mode, then the session cookie, then anonymous, then nothing.
 async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, ApiError> {
     if let Some(name) = &state.auth_cfg.trusted_header
         && let Some(raw) = headers.get(name)
@@ -303,44 +490,38 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
             .ensure_user(value, Role::Viewer, state.auth_cfg.max_users)
             .await
             .map_err(|e| {
-                let msg = format!("{e:#}");
-                if msg.contains("auth.max_users") || msg.contains("login name") {
-                    // The header named an identity this instance will not
-                    // provision: the caller cannot fix it, the operator can.
-                    ApiError::forbidden(msg)
-                } else {
-                    ApiError::internal(msg)
+                // The header named an identity this instance will not
+                // provision: the caller cannot fix it, the operator can. Told
+                // apart by kind rather than by substring, so rewording the
+                // store's sentence cannot turn this into a 500.
+                match StoreRefusal::kind_of(&e) {
+                    Some(RefusalKind::CapReached | RefusalKind::InvalidName) => {
+                        ApiError::forbidden(format!("{e:#}"))
+                    }
+                    _ => ApiError::internal(format!("{e:#}")),
                 }
             })?;
         if user.disabled {
             return Err(ApiError::forbidden("this account is disabled"));
         }
-        // The settlement gives trusted-header identities a real session too:
-        // /auth/me mints it and this adopts its CSRF token. The cookie is
-        // preferred when it names the same account the header does, so a
-        // browser echoes the token of the session it actually holds. A cookie
-        // for anyone else (the proxy re-mapped the identity) is ignored: the
-        // header is the authority in this mode.
-        let from_cookie = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
-            Some(cookie) => match state.auth.session_user(cookie.value()).await? {
-                Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
-                _ => None,
-            },
-            None => None,
-        };
-        // With no usable cookie, fall back to the account's own live session.
-        // In this mode the cookie carries nothing the header has not already
-        // said, so binding the token to it would lock out exactly the callers
-        // that have none: a client that keeps no cookie jar, a device whose
-        // cookie went stale, and the second of two tabs opened at once, which
-        // is handed a reused session precisely because it has no token of its
-        // own to be given. What the token proves is unchanged either way - that
-        // whoever sent this read an /auth/me answer for this identity, which no
-        // other origin can do while no CORS layer exists.
-        let csrf = match from_cookie {
-            Some(csrf) => Some(csrf),
-            None => state.auth.newest_session_csrf(&user.name).await?,
-        };
+        let csrf = header_mode_csrf(state, headers, &user).await?;
+        return Ok(Identity {
+            user: Some(user),
+            csrf,
+            anonymous: false,
+        });
+    }
+    // The forward-auth quartet. Nothing here is read at all while the mode is
+    // off, which is the property that makes a spoofed `Remote-User` worth
+    // exactly nothing on a default install; and a request that carries no
+    // `Remote-User` while the mode IS on falls through to the session path
+    // below rather than becoming anybody, so turning the mode on escalates
+    // nobody.
+    if state.auth_cfg.proxy_headers
+        && let Some(subject) = forwarded_subject(headers)?
+    {
+        let user = proxy_header_user(state, &subject, headers).await?;
+        let csrf = header_mode_csrf(state, headers, &user).await?;
         return Ok(Identity {
             user: Some(user),
             csrf,
@@ -361,6 +542,289 @@ async fn resolve(state: &RestState, headers: &HeaderMap) -> Result<Identity, Api
         csrf: None,
         anonymous: state.auth_cfg.anonymous,
     })
+}
+
+/// The CSRF token a header-mode identity's mutating requests must echo.
+///
+/// The settlement gives a header identity a real session too: `/auth/me` mints
+/// it and this adopts its token. The cookie is preferred when it names the same
+/// account the header does, so a browser echoes the token of the session it
+/// actually holds. A cookie for anyone else (the proxy re-mapped the identity)
+/// is ignored: the header is the authority in this mode.
+///
+/// With no usable cookie, fall back to the account's own live session. In these
+/// modes the cookie carries nothing the header has not already said, so binding
+/// the token to it would lock out exactly the callers that have none: a client
+/// that keeps no cookie jar, a device whose cookie went stale, and the second of
+/// two tabs opened at once, which is handed a reused session precisely because
+/// it has no token of its own to be given. What the token proves is unchanged
+/// either way - that whoever sent this read an `/auth/me` answer for this
+/// identity, which no other origin can do while no CORS layer exists.
+async fn header_mode_csrf(
+    state: &RestState,
+    headers: &HeaderMap,
+    user: &User,
+) -> Result<Option<String>, ApiError> {
+    let from_cookie = match CookieJar::from_headers(headers).get(SESSION_COOKIE) {
+        Some(cookie) => match state.auth.session_user(cookie.value()).await? {
+            Some((session_user, csrf)) if session_user.name == user.name => Some(csrf),
+            _ => None,
+        },
+        None => None,
+    };
+    match from_cookie {
+        Some(csrf) => Ok(Some(csrf)),
+        None => Ok(state.auth.newest_session_csrf(&user.name).await?),
+    }
+}
+
+/// The person a forward-auth proxy is asserting, folded into the form the
+/// identity key is stored in, or `None` when it is asserting nobody.
+///
+/// Folded because the proxy is naming a person, not quoting a provider's opaque
+/// subject: one that sends `Ada` today and `ada` tomorrow means the same person
+/// both times, and two accounts would be the wrong answer. An absent or blank
+/// header is not an identity and not an error - the request simply falls
+/// through to the session path. A value that cannot be a login name is refused
+/// `403`, the same answer the trusted-header mode gives it: the caller cannot
+/// fix their proxy's header, and the operator can.
+fn forwarded_subject(headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+    let Some(raw) = forwarded_header(headers, REMOTE_USER_HEADER)? else {
+        // A header that arrived but is not readable as text says something,
+        // even though nothing in it can be believed: a proxy forwarding a name
+        // with a non-ASCII byte in it would otherwise get exactly the silence
+        // an absent header gets, while an unusable ASCII name gets a loud 403.
+        // The value is never logged; that it was unreadable is the whole point.
+        if headers
+            .get(REMOTE_USER_HEADER)
+            .is_some_and(|value| value.to_str().is_err())
+        {
+            tracing::warn!(
+                "{REMOTE_USER_HEADER} arrived with a value that is not ASCII text, so it names \
+                 nobody and this request falls through to the ordinary session path"
+            );
+        }
+        return Ok(None);
+    };
+    normalize_account_name(raw)
+        .map(Some)
+        .map_err(|err| ApiError::forbidden(format!("{err:#}")))
+}
+
+/// One forward-auth header's trimmed value, refusing a name that arrived more
+/// than once.
+///
+/// `HeaderMap::get` picks one of however many values came under a name, and
+/// which one is arrival order. In this mode that would decide who the caller
+/// is: a proxy that appends its own `Remote-User` rather than replacing the
+/// client's copy - the half-satisfied version of the trust boundary this mode
+/// documents - would serve whichever won, with nothing anywhere saying so.
+/// Refusing costs nothing and turns a silent compromise into a visible
+/// failure, so the three single-valued headers are refused on a duplicate, not
+/// only the one that names the person: a duplicate anywhere among them is the
+/// same tell about the proxy in front. The refusal names which header it was,
+/// because "the proxy sends this one twice" is the fact an operator has to act
+/// on and the message otherwise describes a fault they cannot locate.
+///
+/// `Remote-Groups` is NOT one of them and does not come through here: a list
+/// header is legitimately repeated once per element, and refusing a proxy for
+/// spelling one group per line would be refusing correct behaviour. See
+/// [`forwarded_group_list`].
+fn forwarded_header<'h>(headers: &'h HeaderMap, name: &str) -> Result<Option<&'h str>, ApiError> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(ApiError::forbidden(format!(
+            "the forward-auth header '{name}' arrived more than once: the proxy must strip \
+             client-supplied copies and set them itself"
+        )));
+    }
+    Ok(value
+        .to_str()
+        .ok()
+        .map(str::trim)
+        .filter(|value| !value.is_empty()))
+}
+
+/// The groups a proxy forwards, parsed and nothing more.
+///
+/// Claim mapping is not built: no group decides a role, a membership or a
+/// visibility here, and until it does, reading this header changes nothing
+/// about what the caller may do. The parse exists so the layer that will map
+/// them slots in where the values already are, rather than starting from the
+/// header again.
+fn forwarded_groups(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|group| !group.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Every group the proxy forwarded, however it chose to spell the list.
+///
+/// A list-valued header may arrive as one comma-separated value or as one
+/// header line per element, and both are correct: RFC 9110 says a recipient may
+/// join repeated field lines of a list-valued field with commas without
+/// changing the meaning. So this joins rather than refuses, which is the whole
+/// difference between this reader and [`forwarded_header`] - the other three
+/// headers name one thing each, and a second copy of one of those is a fault.
+///
+/// A value that is not readable as text is skipped rather than refused: no
+/// group decides anything yet, so an unusable one costs nothing, while
+/// refusing the request over it would turn a cosmetic header into an outage.
+fn forwarded_group_list(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all(REMOTE_GROUPS_HEADER)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(forwarded_groups)
+        .collect()
+}
+
+/// What the proxy's presentation headers change about `user`, or `None` when
+/// they change nothing.
+///
+/// Every request in this mode carries the headers, so a resolver that wrote
+/// them back each time would put a database write, under the store's own guard,
+/// in front of every authenticated read on the instance. Comparing first makes
+/// the write what it should be: something that happens when the person's name
+/// or address actually changed at the provider.
+///
+/// An absent header asks for nothing rather than asking for a clear: a proxy
+/// that stopped sending `Remote-Email` has said nothing about whether the
+/// person still has an address, which is the same rule the single sign-on path
+/// applies to an absent claim.
+fn presentation_update<'h>(
+    user: &User,
+    display: Option<&'h str>,
+    email: Option<&'h str>,
+) -> Option<(Option<&'h str>, Option<&'h str>)> {
+    let display = display
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != user.display);
+    let email = email
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && Some(*value) != user.email.as_deref());
+    (display.is_some() || email.is_some()).then_some((display, email))
+}
+
+/// The account a forward-auth request is served as: the one linked to
+/// `(proxy, subject)`, or a fresh one provisioned on first sight.
+///
+/// The lookup is by identity link and never by account name, which is what
+/// keeps this mode from being a silent takeover: a local `ada` who signs in
+/// with a password is a different person from whoever the proxy calls `ada`
+/// until an admin says otherwise, and the store's uniquifier gives the newcomer
+/// a name of their own. The subject is the durable key through every rename the
+/// proxy ever performs.
+async fn proxy_header_user(
+    state: &RestState,
+    subject: &str,
+    headers: &HeaderMap,
+) -> Result<User, ApiError> {
+    let display = forwarded_header(headers, REMOTE_NAME_HEADER)?;
+    let email = forwarded_header(headers, REMOTE_EMAIL_HEADER)?;
+    let groups = forwarded_group_list(headers);
+    if !groups.is_empty() {
+        tracing::debug!(
+            groups = groups.join(","),
+            "groups seen but claim mapping is not built"
+        );
+    }
+    let user = match state.auth.linked_user(PROXY_ISSUER, subject).await? {
+        Some(user) => user,
+        None => provision_forwarded_user(state, subject, display, email).await?,
+    };
+    // Refused before anything is written back: a disabled account is not a
+    // person whose display name we go on maintaining.
+    if user.disabled {
+        return Err(ApiError::forbidden("this account is disabled"));
+    }
+    // The sighting. `ensure_user` stamps one for the trusted-header mode and
+    // `session_user` for the cookie mode; this path resolves through the
+    // identity link and would otherwise leave every forward-auth account
+    // reading as never seen. The returned row is the one read a moment ago, so
+    // what a caller sees is the previous sighting rather than this one, which
+    // is what "last seen" means anyway.
+    state.auth.mark_seen(&user.name).await?;
+    match presentation_update(&user, display, email) {
+        Some((display, email)) => Ok(state
+            .auth
+            .refresh_presentation(&user.name, display, email)
+            .await?),
+        None => Ok(user),
+    }
+}
+
+/// The login name a forwarded identity's account is created under.
+///
+/// The same derivation a first sign-on uses, for the same reason: the subject
+/// is whatever the proxy chose to call somebody, and the store's own guard
+/// ([`normalize_account_name`]) only trims, folds and refuses whitespace - it
+/// bounds no length and admits any character, so `ada/../bob` would become an
+/// account name no `/api/v1/users/{name}` route can address and a multi-kilobyte
+/// header value would become a multi-kilobyte name. Sanitizing here changes
+/// nothing about identity: the link keeps the proxy's spelling as the subject,
+/// which is the key the next request arrives with. Only the human-facing name
+/// is derived, and the store uniquifies it from there.
+fn desired_account_name(subject: &str) -> String {
+    sanitize_account_name(subject).unwrap_or_else(|| PROXY_FALLBACK_ACCOUNT_NAME.to_string())
+}
+
+/// The login name a forwarded identity falls back to when its subject carries
+/// nothing name-shaped at all.
+///
+/// Not the sign-on path's `sso-user`: this account never met a sign-on
+/// provider, and the name is what an operator reads in the user list when they
+/// go looking for whoever this is. Uniquified like any other derived name, so a
+/// second such identity becomes `proxy-user-2`.
+pub(super) const PROXY_FALLBACK_ACCOUNT_NAME: &str = "proxy-user";
+
+/// Mint the account behind a forwarded identity, linking it to
+/// `(proxy, subject)` in the same transaction.
+///
+/// One store call rather than an account insert followed by a link: two
+/// requests for one newcomer can arrive at once, and the loser of that race
+/// must leave no half-made account behind. The loser instead re-reads the
+/// winner's link, because a sign-in that did work should not answer an error.
+async fn provision_forwarded_user(
+    state: &RestState,
+    subject: &str,
+    display: Option<&str>,
+    email: Option<&str>,
+) -> Result<User, ApiError> {
+    let provisioned = state
+        .auth
+        .provision_linked_user(
+            PROXY_ISSUER,
+            subject,
+            &desired_account_name(subject),
+            display,
+            email,
+            state.auth_cfg.proxy_role,
+            state.auth_cfg.max_users,
+        )
+        .await;
+    match provisioned {
+        Ok(user) => Ok(user),
+        Err(err) => {
+            if let Some(user) = state.auth.linked_user(PROXY_ISSUER, subject).await? {
+                return Ok(user);
+            }
+            // The one refusal a caller cannot act on and an operator can.
+            // Unlike the trusted-header path there is no name refusal to
+            // classify here: the subject was normalized before this ran and
+            // the desired name is derived, so both are names by the time the
+            // store sees them.
+            match StoreRefusal::kind_of(&err) {
+                Some(RefusalKind::CapReached) => Err(ApiError::forbidden(format!("{err:#}"))),
+                _ => Err(ApiError::internal(format!("{err:#}"))),
+            }
+        }
+    }
 }
 
 /// Refuse a mutating request that does not echo its session's CSRF token.
@@ -444,7 +908,7 @@ fn check_csrf(identity: &Identity, req: &Request) -> Result<(), ApiError> {
 /// Compare without an early exit, so the time taken does not narrow down how
 /// much of the token an attacker has guessed. Lengths are allowed to leak: both
 /// sides are fixed-width hex.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+pub(super) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -510,10 +974,10 @@ pub struct MeResponse {
     /// belongs.
     ///
     /// Null only for the anonymous viewer, which has no account and can never
-    /// write; a trusted-header identity is given a session here on the first
-    /// call and handed that same session's token on every later one, so every
-    /// identity that can mutate anything carries a token. See the `check_csrf`
-    /// rule.
+    /// write; an identity a proxy asserts (`auth.trusted_header` or
+    /// `auth.proxy_headers`) is given a session here on the first call and
+    /// handed that same session's token on every later one, so every identity
+    /// that can mutate anything carries a token. See the `check_csrf` rule.
     ///
     /// Handing the token back on a `GET` is safe for the same reason handing it
     /// back from login is: no CORS layer exists on this surface, so another
@@ -551,6 +1015,23 @@ pub struct MeResponse {
     /// is allowed to ask: an editor on an instance-mode install draws no share
     /// card and issues no request behind it.
     can_share: bool,
+    /// Whether this instance serves OAuth for MCP clients, from the effective
+    /// `auth.oauth` setting.
+    ///
+    /// A rendering signal for the profile's connected-clients card, the same
+    /// role `can_share` plays for the share surfaces above: an instance that
+    /// never turned OAuth on draws no card asking somebody to manage clients
+    /// that can never exist. It is not a gate: every `/oauth/*` route refuses
+    /// on its own, off `auth.oauth` itself, regardless of what this probe
+    /// says, so a stale or forged `true` costs a 404 rather than access.
+    ///
+    /// `/me/oauth-grants` deliberately does not refuse on the setting. A grant
+    /// is the caller's own account state, served like the personal MCP token
+    /// surface beside it, so an operator who turns OAuth off leaves every
+    /// account still able to see and revoke what it granted - and the grants
+    /// are inert at the gate meanwhile. Forging this flag reaches nothing
+    /// there either: the route answers the caller's own rows and no others.
+    oauth: bool,
     /// The server version, so a mismatched UI can say so.
     #[schema(example = "0.12.0")]
     version: &'static str,
@@ -607,7 +1088,7 @@ pub struct MeResponse {
         ),
         (
             status = 403,
-            description = "The trusted-header identity names a disabled account.",
+            description = "The identity a proxy asserted names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -654,6 +1135,25 @@ async fn sign_in(
     headers: &HeaderMap,
     user: User,
 ) -> Result<(CookieJar, NoStore, axum::Json<LoginResponse>), ApiError> {
+    let (jar, csrf) = issue_session_with_csrf(state, jar, headers, &user).await?;
+    Ok((jar, no_store(), axum::Json(LoginResponse { user, csrf })))
+}
+
+/// Retire the session the caller arrived holding, issue a fresh one for
+/// `user` and return the jar carrying its cookie.
+///
+/// The single definition of what signing in DOES, shared by the password
+/// login, the first-run setup and the single sign-on callback: the fixation
+/// defense, the cookie attributes and the TTL are one piece of code with three
+/// callers rather than three copies that could drift. The CSRF token comes
+/// back beside the jar because the two body-answering callers put it in their
+/// response; the redirecting one has nowhere to put it and does not ask.
+pub(super) async fn issue_session_with_csrf(
+    state: &RestState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    user: &User,
+) -> Result<(CookieJar, String), ApiError> {
     // Whatever session the caller arrived holding is retired rather than left
     // live beside the new one. A session fixation attack works by planting a
     // token the victim then logs in under, so the token that was presented is
@@ -672,14 +1172,21 @@ async fn sign_in(
         .secure(cookie_needs_secure(headers))
         .max_age(time::Duration::seconds(SESSION_TTL_SECS))
         .build();
-    Ok((
-        jar.add(cookie),
-        no_store(),
-        axum::Json(LoginResponse {
-            user,
-            csrf: session.csrf,
-        }),
-    ))
+    Ok((jar.add(cookie), session.csrf))
+}
+
+/// [`issue_session_with_csrf`] for a caller that redirects rather than
+/// answering a body: the browser lands on the app and asks `GET /auth/me` for
+/// its CSRF token, which is the only channel that route has ever handed one
+/// back through.
+pub(super) async fn issue_session(
+    state: &RestState,
+    jar: CookieJar,
+    headers: &HeaderMap,
+    user: &User,
+) -> Result<CookieJar, ApiError> {
+    let (jar, _csrf) = issue_session_with_csrf(state, jar, headers, user).await?;
+    Ok(jar)
 }
 
 /// Check a password at a cost that does not depend on which account it names.
@@ -1112,7 +1619,7 @@ fn setup_store_error(e: anyhow::Error) -> ApiError {
             status = 403,
             description = "The identity did not echo its CSRF token, or carries \
                            none yet and must call `/auth/me` first, or the \
-                           trusted-header identity names a disabled account.",
+                           identity a proxy asserted names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1147,8 +1654,8 @@ pub async fn logout(
 /// over the login form instead (see [`setup`]).
 ///
 /// It also issues and reissues the session's CSRF token, which is the only way
-/// a reloaded browser gets it back and the only way a trusted-header identity
-/// ever gets one: see `MeResponse::csrf`.
+/// a reloaded browser gets it back and the only way a header-mode identity -
+/// trusted-header or forward-auth - ever gets one: see `MeResponse::csrf`.
 #[utoipa::path(
     get,
     path = "/api/v1/auth/me",
@@ -1163,9 +1670,10 @@ pub async fn logout(
                    `github.share_identity` is `personal`), and \
                    which server version it is talking to. Also issues the CSRF token \
                    every later mutating request must echo in `x-csrf-token`: a \
-                   cookie session has its token reissued here, and a \
-                   trusted-header identity is minted a session on the first \
-                   call, which is the only way that mode obtains a token.",
+                   cookie session has its token reissued here, and an \
+                   identity a proxy asserts (`auth.trusted_header` or \
+                   `auth.proxy_headers`) is minted a session on the first \
+                   call, which is the only way those modes obtain a token.",
     responses(
         (
             status = 200,
@@ -1176,8 +1684,9 @@ pub async fn logout(
             headers(
                 ("set-cookie" = String, description = "The `fluid_session` \
                  session cookie, HttpOnly and SameSite=Lax. Set only when this \
-                 call issues a session, which is the first call from a \
-                 trusted-header identity whose account holds none; a later \
+                 call issues a session, which is the first call from an \
+                 identity a proxy asserted (`auth.trusted_header` or \
+                 `auth.proxy_headers`) whose account holds none; a later \
                  probe reuses that session and sets no cookie."),
                 ("cache-control" = String, description = "`no-store`. Always \
                  set: this answer names the caller and carries their CSRF \
@@ -1188,10 +1697,11 @@ pub async fn logout(
         ),
         (
             status = 403,
-            description = "The trusted-header identity names a disabled account. \
-                           The guard resolves identity ahead of routing, so this \
-                           answer reaches even the paths that are served without \
-                           one.",
+            description = "The identity a proxy asserted names a disabled \
+                           account, or its headers arrived in a shape this \
+                           instance will not believe. The guard resolves \
+                           identity ahead of routing, so this answer reaches \
+                           even the paths that are served without one.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -1270,6 +1780,12 @@ pub async fn me(
             // one rule decides what they serve and what a client draws.
             // Resolved off `identity` before it is moved into `user` above.
             can_share,
+            // Whether the OAuth surface actually came up at startup, read off
+            // the same `Option` the routes themselves are gated on rather than
+            // re-reading `auth.oauth` from live config: this is the setting as
+            // it stood when this daemon started, not what a config file says
+            // right now, which is what "serves OAuth" has to mean here.
+            oauth: state.oauth.is_some(),
             version: crystalline_core::VERSION,
         }),
     ))
@@ -1291,7 +1807,7 @@ pub async fn me(
 ///
 /// A request with no `Host` is treated as remote: HTTP/1.1 requires the header,
 /// so its absence is not a local browser.
-fn cookie_needs_secure(headers: &HeaderMap) -> bool {
+pub(super) fn cookie_needs_secure(headers: &HeaderMap) -> bool {
     forwarded_https(headers) || !is_loopback_request(headers)
 }
 
@@ -1301,7 +1817,7 @@ fn cookie_needs_secure(headers: &HeaderMap) -> bool {
 /// Any `proto=https` anywhere in the chain counts. The error that matters here
 /// is dropping `Secure` from a cookie that travels over the internet, so an
 /// ambiguous header resolves towards setting the flag.
-fn forwarded_https(headers: &HeaderMap) -> bool {
+pub(super) fn forwarded_https(headers: &HeaderMap) -> bool {
     let x_forwarded = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
@@ -1323,8 +1839,57 @@ fn forwarded_https(headers: &HeaderMap) -> bool {
             })
 }
 
+/// The origin this request says it arrived at: scheme, host and port, no path
+/// and no trailing slash.
+///
+/// Not a fact about the process - a fact about how the caller got here. Two
+/// surfaces rest on it and both need the same answer. The single sign-on
+/// callback address is built from it ([`super::oidc`]'s `absolute_url`), and it
+/// has to be registered with the provider in exactly the spelling the token
+/// exchange later repeats. And it is the OAuth resource identifier
+/// ([`super::OriginRule`]): the audience an access token is minted for and
+/// checked against, so a token minted for another deployment of this server
+/// cannot be replayed at this one.
+///
+/// The `Host` is untrusted input that ends up inside a url, so it is refused
+/// unless it is a bare host with an optional port. A browser sends the real
+/// host, so this only ever refuses a hand-made request - but a value that could
+/// open a path, a query or a userinfo component is not one to interpolate.
+///
+/// The scheme follows the same rule the session cookie's `Secure` flag does
+/// ([`cookie_needs_secure`]): a forwarded `https` anywhere in the chain, or any
+/// `Host` that is not loopback, means this instance is reached over TLS. The
+/// two agreeing is deliberate - an instance that thought itself public enough
+/// to protect a cookie and private enough to publish an `http` address would be
+/// wrong about one of them.
+pub(crate) fn request_origin(headers: &HeaderMap) -> Result<String, ApiError> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "this request carries no Host header, so the address this instance was reached \
+                 at cannot be worked out",
+            )
+        })?;
+    if !super::oidc::host_is_well_formed(host) {
+        return Err(ApiError::bad_request(
+            "this request's Host header is not a host name or address with an optional port, so \
+             the address this instance was reached at cannot be worked out",
+        ));
+    }
+    let scheme = if forwarded_https(headers) || !is_loopback_request(headers) {
+        "https"
+    } else {
+        "http"
+    };
+    Ok(format!("{scheme}://{host}"))
+}
+
 /// Whether the `Host` the client asked for names this machine.
-fn is_loopback_request(headers: &HeaderMap) -> bool {
+pub(super) fn is_loopback_request(headers: &HeaderMap) -> bool {
     headers
         .get(header::HOST)
         .and_then(|v| v.to_str().ok())
@@ -1366,7 +1931,11 @@ pub type NoStore = [(HeaderName, &'static str); 1];
 /// is only cacheable with explicit freshness information, so it is defence in
 /// depth there rather than a hole being closed, but a reader should not have to
 /// work out which of the three was safe.
-fn no_store() -> NoStore {
+///
+/// `pub(super)` because one route outside this module answers with material of
+/// the same class: `POST /me/mcp-tokens` and its rotate sibling hand back a
+/// live bearer credential (see [`super::mcp_tokens`]).
+pub(super) fn no_store() -> NoStore {
     [(header::CACHE_CONTROL, "no-store")]
 }
 
@@ -1506,8 +2075,12 @@ mod tests {
 
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("Remote-User".to_string()),
+            proxy_headers: None,
             anonymous: Some(true),
+            mcp: None,
+            oauth: None,
             max_users: Some(5),
+            oidc: None,
         });
         let cfg = AuthCfg::resolve(&config).unwrap();
         assert_eq!(cfg.trusted_header.unwrap().as_str(), "remote-user");
@@ -1516,13 +2089,156 @@ mod tests {
 
         config.auth = Some(crystalline_core::config::AuthConfig {
             trusted_header: Some("not a header".to_string()),
+            proxy_headers: None,
             anonymous: None,
+            mcp: None,
+            oauth: None,
             max_users: None,
+            oidc: None,
         });
         let err = AuthCfg::resolve(&config).unwrap_err().to_string();
         assert!(
             err.contains("auth.trusted_header"),
             "the startup error must name the setting, got: {err}"
+        );
+    }
+
+    #[test]
+    fn the_proxy_header_mode_is_off_until_it_is_turned_on() {
+        let config = GlobalConfig::default();
+        let cfg = AuthCfg::resolve(&config).unwrap();
+        assert!(
+            !cfg.proxy_headers,
+            "trust-the-proxy is opt in: a fresh install believes no Remote-* header"
+        );
+        assert_eq!(
+            cfg.proxy_role,
+            crate::rest::DEFAULT_OIDC_ROLE,
+            "and provisions at the least privileged role"
+        );
+    }
+
+    #[test]
+    fn the_proxy_header_role_follows_the_configured_default() {
+        let mut config = GlobalConfig::default();
+        crate::settings::apply(&mut config, "auth.proxy_headers", "true").unwrap();
+        crate::settings::apply(&mut config, "auth.oidc.default_role", "editor").unwrap();
+        let cfg = AuthCfg::resolve(&config).unwrap();
+        assert!(cfg.proxy_headers);
+        assert_eq!(cfg.proxy_role, Role::Editor);
+    }
+
+    #[test]
+    fn both_header_modes_together_refuse_startup() {
+        let mut config = GlobalConfig::default();
+        crate::settings::apply(&mut config, "auth.trusted_header", "X-Auth-User").unwrap();
+        crate::settings::apply(&mut config, "auth.proxy_headers", "true").unwrap();
+        let err = AuthCfg::resolve(&config).unwrap_err().to_string();
+        assert!(err.contains("pick one"), "{err}");
+        assert!(
+            err.contains("auth.trusted_header") && err.contains("auth.proxy_headers"),
+            "the refusal names both settings so the operator knows what to drop: {err}"
+        );
+    }
+
+    /// A `User` as the store hands one back, for the pure helpers below.
+    fn stored_user(display: &str, email: Option<&str>) -> User {
+        User {
+            name: "ada".to_string(),
+            display: display.to_string(),
+            email: email.map(str::to_string),
+            role: Role::Viewer,
+            disabled: false,
+            last_seen: None,
+        }
+    }
+
+    #[test]
+    fn an_unchanged_presentation_asks_for_no_write() {
+        let user = stored_user("Ada Lovelace", Some("ada@example.test"));
+        assert!(
+            presentation_update(&user, Some("Ada Lovelace"), Some("ada@example.test")).is_none(),
+            "every request carries the headers, so an unchanged pair must not write"
+        );
+        assert!(
+            presentation_update(&user, None, None).is_none(),
+            "an absent header asks for nothing"
+        );
+        assert!(
+            presentation_update(&user, Some("  Ada Lovelace  "), None).is_none(),
+            "and neither does one that only differs by the whitespace around it"
+        );
+    }
+
+    #[test]
+    fn a_changed_presentation_asks_only_for_what_changed() {
+        let user = stored_user("Ada Lovelace", Some("ada@example.test"));
+        assert_eq!(
+            presentation_update(&user, Some("Countess Lovelace"), Some("ada@example.test")),
+            Some((Some("Countess Lovelace"), None)),
+            "the address is unchanged, so it is not rewritten"
+        );
+        assert_eq!(
+            presentation_update(&user, None, Some("ada@contoso.test")),
+            Some((None, Some("ada@contoso.test"))),
+        );
+        let unnamed = stored_user("ada", None);
+        assert_eq!(
+            presentation_update(&unnamed, None, Some("ada@example.test")),
+            Some((None, Some("ada@example.test"))),
+            "an account with no address stored takes the one the proxy sends"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_name_is_derived_the_way_a_sign_ons_is() {
+        use super::super::oidc::FALLBACK_ACCOUNT_NAME;
+        // Addressable: nothing a path or a query would read as structure.
+        assert_eq!(desired_account_name("ada/../bob"), "ada-..-bob");
+        assert_eq!(desired_account_name("ada"), "ada");
+        // Bounded: a header value is not a name budget.
+        assert_eq!(desired_account_name(&"l".repeat(200)).chars().count(), 60);
+        // A value with nothing name-shaped left in it still gets a name, and
+        // it is this path's own: an account that arrived through a proxy never
+        // met a sign-on provider, and the user list is read by a person.
+        assert_eq!(desired_account_name("!!!"), PROXY_FALLBACK_ACCOUNT_NAME);
+        assert_ne!(PROXY_FALLBACK_ACCOUNT_NAME, FALLBACK_ACCOUNT_NAME);
+    }
+
+    #[test]
+    fn forwarded_groups_are_parsed_and_go_no_further() {
+        assert_eq!(
+            forwarded_groups("eng, ops ,,admins"),
+            vec!["eng".to_string(), "ops".to_string(), "admins".to_string()],
+            "the parse exists so claim mapping can slot in later"
+        );
+        assert!(forwarded_groups("  ,, ").is_empty());
+    }
+
+    /// A list header may arrive as one line or as one line per element, and
+    /// both mean the same list. The duplicate refusal the other three headers
+    /// carry would refuse a proxy for spelling it the second way, which is not
+    /// a fault, so `Remote-Groups` is read as multi-valued instead.
+    #[test]
+    fn remote_groups_may_arrive_once_per_group() {
+        let mut headers = HeaderMap::new();
+        headers.append(REMOTE_GROUPS_HEADER, "eng".parse().unwrap());
+        headers.append(REMOTE_GROUPS_HEADER, "ops, admins".parse().unwrap());
+        assert_eq!(
+            forwarded_group_list(&headers),
+            vec!["eng".to_string(), "ops".to_string(), "admins".to_string()],
+            "repeated lines and a comma list are one list"
+        );
+        // The single-valued headers are unchanged, and the refusal now names
+        // which one arrived twice.
+        let mut headers = HeaderMap::new();
+        headers.append(REMOTE_USER_HEADER, "ada".parse().unwrap());
+        headers.append(REMOTE_USER_HEADER, "bob".parse().unwrap());
+        let err = forwarded_header(&headers, REMOTE_USER_HEADER).unwrap_err();
+        assert!(
+            err.detail.contains(REMOTE_USER_HEADER),
+            "the refusal names the header: {}",
+            err.detail
         );
     }
 

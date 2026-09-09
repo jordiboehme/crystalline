@@ -280,6 +280,8 @@ export type DomainMode = "local" | "virtual" | "github";
 /**
  * A domain to register. Every field but `mode` belongs to one of the modes:
  * a local or virtual domain is named, a team domain names a repository.
+ * `private` applies to every mode alike: it registers the domain private and
+ * owned by the creating account instead of shared with the whole instance.
  */
 export interface CreateDomainBody {
   mode: DomainMode;
@@ -287,6 +289,13 @@ export interface CreateDomainBody {
   repo?: string;
   branch?: string;
   path?: string;
+  // Indexed off the generated schema rather than hand-typed `boolean`: the
+  // `const wire: CreateDomainWireBody = body` check below already catches a
+  // required field going missing or changing shape, but not this one being
+  // dropped from the schema outright (an excess optional field on a
+  // variable, as opposed to an object literal, is not flagged). Indexing it
+  // is what turns that removal into a compile error here too.
+  private?: NonNullable<CreateDomainWireBody["private"]>;
 }
 
 /** What a registration reports back: the name it took, and where it landed. */
@@ -325,12 +334,23 @@ export interface UnregisterReceipt {
   roomsClosed: number;
 }
 
-/** Unregister a domain. Files on disk are never touched. */
+/**
+ * Unregister a domain. Files on disk are never touched.
+ *
+ * `purge` confirms the one case where something IS deleted: a virtual domain's
+ * engrams live in the database and go with it, and the server refuses that
+ * removal (409) unless the request says the loss was intended. The rule is the
+ * engine's rather than this client's - the same route now serves a private
+ * domain's owner, not only an admin - so this passes what the confirmation
+ * collected instead of deciding anything.
+ */
 export async function unregisterDomain(
   name: string,
+  purge = false,
 ): Promise<UnregisterReceipt> {
+  const query = purge ? "?purge=true" : "";
   const report = asObject(
-    await api<unknown>(`/domains/${encodeSegment(name)}`, {
+    await api<unknown>(`/domains/${encodeSegment(name)}${query}`, {
       method: "DELETE",
     }),
   );

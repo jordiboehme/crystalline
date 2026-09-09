@@ -572,6 +572,177 @@ async fn not_found_on_a_repo_scoped_endpoint_maps_to_repo_not_found() {
     }
 }
 
+/// The body GitHub sends when a SAML-enforced organization refuses a token
+/// that is not authorized for it, verbatim.
+const SAML_BODY: &str = "Resource protected by organization SAML enforcement. \
+     You must grant your OAuth token access to this organization.";
+
+/// The body GitHub sends when an organization with OAuth App access
+/// restrictions has not approved the app, verbatim apart from the org name.
+const OAUTH_RESTRICTION_BODY: &str = "Although you appear to have the correct authorization credentials, the `acme` \
+     organization has enabled OAuth App access restrictions, meaning that data access \
+     to third-parties is limited.";
+
+/// The head endpoint every error-mapping test below points at, so each one
+/// only has to supply its handler.
+fn ref_route(handler: axum::routing::MethodRouter) -> Router {
+    Router::new().route("/repos/acme/brand-knowledge/git/ref/heads/main", handler)
+}
+
+#[tokio::test]
+async fn saml_403_with_the_sso_header_maps_to_sso_authorization_required() {
+    async fn handler() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            [(
+                "x-github-sso",
+                "required; url=https://github.com/orgs/acme/sso?authorization_request=abc",
+            )],
+            Json(serde_json::json!({"message": SAML_BODY})),
+        )
+            .into_response()
+    }
+    let base = spawn(ref_route(get(handler))).await;
+    let provider = GitHubProvider::new(Some(base), Some("tok".to_string()));
+
+    let err = provider.branch_head(&origin(), None).await.unwrap_err();
+    match err {
+        RemoteError::SsoAuthorizationRequired { org, url } => {
+            assert_eq!(org, "acme");
+            assert_eq!(
+                url,
+                "https://github.com/orgs/acme/sso?authorization_request=abc"
+            );
+        }
+        other => panic!("expected SsoAuthorizationRequired, got {other:?}"),
+    }
+}
+
+/// The organization GitHub names in the SSO url is the authoritative one:
+/// an enterprise routinely enforces single sign-on under an org that is not
+/// the repository's owner, and sending the person to the wrong org's page
+/// would be the same class of wrong answer as the collaborator advice.
+#[tokio::test]
+async fn the_sso_header_org_wins_over_the_repository_owner() {
+    async fn handler() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            [(
+                "x-github-sso",
+                "required; url=https://github.com/orgs/acme-enterprise/sso?authorization_request=xyz",
+            )],
+            Json(serde_json::json!({"message": SAML_BODY})),
+        )
+            .into_response()
+    }
+    let base = spawn(ref_route(get(handler))).await;
+    let provider = GitHubProvider::new(Some(base), Some("tok".to_string()));
+
+    let err = provider.branch_head(&origin(), None).await.unwrap_err();
+    match err {
+        RemoteError::SsoAuthorizationRequired { org, .. } => assert_eq!(org, "acme-enterprise"),
+        other => panic!("expected SsoAuthorizationRequired, got {other:?}"),
+    }
+}
+
+/// GitHub does not always send the header. The message still has to name an
+/// organization and a page, so both fall back: the repository owner, and the
+/// authorized-apps page derived from this instance's host.
+#[tokio::test]
+async fn saml_403_without_the_header_falls_back_to_the_owner_and_the_apps_page() {
+    async fn handler() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"message": SAML_BODY})),
+        )
+            .into_response()
+    }
+    let base = spawn(ref_route(get(handler))).await;
+    let provider = GitHubProvider::new(Some(base.clone()), Some("tok".to_string()));
+
+    let err = provider.branch_head(&origin(), None).await.unwrap_err();
+    match err {
+        RemoteError::SsoAuthorizationRequired { org, url } => {
+            assert_eq!(org, "acme");
+            assert_eq!(url, format!("{base}/settings/connections/applications"));
+        }
+        other => panic!("expected SsoAuthorizationRequired, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn oauth_app_restriction_403_maps_to_oauth_app_restricted() {
+    async fn handler() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"message": OAUTH_RESTRICTION_BODY})),
+        )
+            .into_response()
+    }
+    let base = spawn(ref_route(get(handler))).await;
+    let provider = GitHubProvider::new(Some(base), Some("tok".to_string()));
+
+    let err = provider.branch_head(&origin(), None).await.unwrap_err();
+    match err {
+        RemoteError::OauthAppRestricted { org } => assert_eq!(org, "acme"),
+        other => panic!("expected OauthAppRestricted, got {other:?}"),
+    }
+}
+
+/// Only the two documented policy refusals are reworded. Every other 403 -
+/// a token that genuinely cannot write the repository, most of all - keeps
+/// GitHub's own message so the personal-mode teaching still fires.
+#[tokio::test]
+async fn an_unrelated_403_stays_a_plain_api_error() {
+    async fn handler() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            Json(
+                serde_json::json!({"message": "Resource not accessible by personal access token"}),
+            ),
+        )
+            .into_response()
+    }
+    let base = spawn(ref_route(get(handler))).await;
+    let provider = GitHubProvider::new(Some(base), Some("tok".to_string()));
+
+    let err = provider.branch_head(&origin(), None).await.unwrap_err();
+    match err {
+        RemoteError::Api { status, message } => {
+            assert_eq!(status, 403);
+            assert_eq!(message, "Resource not accessible by personal access token");
+        }
+        other => panic!("expected a plain Api error, got {other:?}"),
+    }
+}
+
+/// A rate limit is still a rate limit even when the body mentions SAML: the
+/// exhausted-quota check runs first and keeps its own answer.
+#[tokio::test]
+async fn a_rate_limited_403_stays_rate_limited_whatever_the_body_says() {
+    async fn handler() -> Response {
+        (
+            StatusCode::FORBIDDEN,
+            [
+                ("x-ratelimit-remaining", "0"),
+                ("x-ratelimit-reset", "1700000000"),
+            ],
+            Json(serde_json::json!({"message": SAML_BODY})),
+        )
+            .into_response()
+    }
+    let base = spawn(ref_route(get(handler))).await;
+    let provider = GitHubProvider::new(Some(base), Some("tok".to_string()));
+
+    let err = provider.branch_head(&origin(), None).await.unwrap_err();
+    match err {
+        RemoteError::RateLimited { reset } => {
+            assert_eq!(reset, chrono::DateTime::from_timestamp(1_700_000_000, 0));
+        }
+        other => panic!("expected RateLimited, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn connection_refused_maps_to_offline() {
     // Bind to grab a free port, then drop the listener: nothing answers

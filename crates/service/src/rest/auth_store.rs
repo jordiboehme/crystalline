@@ -115,6 +115,15 @@ impl std::str::FromStr for Role {
     }
 }
 
+/// The role an account provisioned from a single sign-on is created at when
+/// `auth.oidc.default_role` is unset.
+///
+/// One definition for the whole workspace: the settings registry renders it as
+/// the key's unset value, and the relying party provisions at it. A promise
+/// made in two places is a promise that can drift, and this is the promise the
+/// documentation makes to an operator who never sets the key.
+pub const DEFAULT_OIDC_ROLE: Role = Role::Viewer;
+
 /// Read a role back out of a database row. An unrecognized value can only come
 /// from a hand-edited or corrupted file, so it resolves to the least
 /// privileged role rather than failing the whole read: an unreadable row must
@@ -138,18 +147,38 @@ fn role_from_db(s: &str) -> Role {
 ///
 /// `to_lowercase` is full Unicode case folding, matching the convention
 /// `crates/index` already uses for domain and tag names.
-fn normalize_name(name: &str) -> Result<String> {
+pub fn normalize_account_name(name: &str) -> Result<String> {
     let trimmed = name.trim();
     if trimmed.is_empty() {
-        bail!("a user name cannot be empty");
+        return Err(refuse(
+            RefusalKind::InvalidName,
+            "a user name cannot be empty".to_string(),
+        ));
     }
     if trimmed.chars().any(char::is_whitespace) {
-        bail!(
+        return Err(refuse(
+            RefusalKind::InvalidName,
             "a login name cannot contain whitespace: pick a space-free name \
              and put the readable form in the display name"
-        );
+                .to_string(),
+        ));
     }
     Ok(trimmed.to_lowercase())
+}
+
+/// Fold one half of an identity key: trimmed, and never empty.
+///
+/// Deliberately NOT lowercased, unlike an account name. An issuer url and a
+/// provider's subject are opaque strings the provider chose, compared byte for
+/// byte by every OpenID Connect implementation there is; folding their case
+/// here would make two distinct subjects the same person on any provider whose
+/// identifiers are case sensitive.
+fn identity_value(value: &str, what: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        bail!("an identity {what} cannot be empty");
+    }
+    Ok(trimmed.to_string())
 }
 
 /// One account. Carries no password material, so it is safe to hand to a
@@ -176,6 +205,45 @@ pub struct User {
     #[schema(example = "2026-08-08T09:14:22Z")]
     pub last_seen: Option<String>,
 }
+
+/// One identity an external provider asserts, tied to one account.
+///
+/// `(issuer, subject)` is the durable key: a username, an address and a
+/// display name are all mutable presentation data, and none of them may move
+/// an account. An account may hold several links (one per issuer), and a link
+/// points at exactly one account.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct IdentityLink {
+    /// The provider that asserts this identity, as its ID tokens spell it.
+    #[schema(example = "https://login.microsoftonline.com/<tenant>/v2.0")]
+    pub issuer: String,
+    /// The provider's stable identifier for the person.
+    #[schema(example = "0f8fad5b-d9cb-469f-a165-70867728950e")]
+    pub subject: String,
+    /// When the link was made, RFC 3339.
+    #[schema(example = "2026-09-07T09:14:22Z")]
+    pub linked_at: String,
+    /// Who made it: the account that linked it, an admin's name, or `jit` for
+    /// a link a first sign-in created along with its account.
+    #[schema(example = "jit")]
+    pub linked_by: String,
+}
+
+/// What [`AuthStore::provision_linked_user`] records as the linker when a
+/// first sign-in creates the account it links.
+pub const LINKED_BY_JIT: &str = "jit";
+
+/// What `crystalline users link` records as the linker. The machine operator
+/// is not a signed-in account, so there is no name to write: what the row can
+/// honestly say is that somebody at the command line did it, which is exactly
+/// the distinction the profile card draws between a link a person made for
+/// themselves and one an administrator made for them.
+pub const LINKED_BY_CLI: &str = "cli";
+
+/// How many suffixed names a provisioning tries before it gives up. Reached
+/// only when a thousand accounts already hold every variant of one name, which
+/// is a configuration problem rather than a collision.
+const MAX_NAME_ATTEMPTS: usize = 1000;
 
 /// What checking a password found, kept apart by how much work each one costs.
 ///
@@ -231,6 +299,450 @@ impl SessionMint {
             SessionMint::Created(session) => &session.csrf,
         }
     }
+}
+
+/// A freshly issued (or rotated) MCP token. The `token` is the only copy in
+/// existence that is not hashed - it goes to the client once, in the issuance
+/// response, and is never written down here.
+#[derive(Clone)]
+pub struct IssuedMcpToken {
+    /// The row id, used to revoke or rotate this token later.
+    pub id: i64,
+    /// The token itself: [`MCP_TOKEN_PREFIX`] plus 64 hex characters.
+    pub token: String,
+    /// The caller-chosen label, echoed back so the response is self-describing.
+    pub label: String,
+}
+
+/// Hand-written rather than derived so `id` and `label` still print (a later
+/// task's `tracing::debug!(?issued)` or a failed `assert_eq!` needs those to
+/// be useful) while `token` - the only unhashed copy of a live credential -
+/// never reaches a log line.
+impl std::fmt::Debug for IssuedMcpToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedMcpToken")
+            .field("id", &self.id)
+            .field("token", &"cmt_[redacted]")
+            .field("label", &self.label)
+            .finish()
+    }
+}
+
+/// A registered OAuth client, as the authorization server stores it. Public
+/// clients are the only kind here (`token_endpoint_auth_method: "none"`), so
+/// there is no secret in this record and nothing in it needs redacting: a
+/// client id is an identifier, and PKCE is what proves the exchange belongs to
+/// the browser that started the flow.
+#[derive(Clone, Debug)]
+pub struct OauthClient {
+    /// [`OAUTH_CLIENT_PREFIX`] plus 32 hex characters, the primary key.
+    pub client_id: String,
+    /// The name the client called itself, shown on the consent screen.
+    pub client_name: String,
+    /// The client's own page, when it registered one.
+    pub client_uri: Option<String>,
+    /// Every redirect uri this registration may be sent back to, in the order
+    /// it registered them. Never empty.
+    pub redirect_uris: Vec<String>,
+    /// RFC 3339, when the registration was written.
+    pub created_at: String,
+    /// RFC 3339, when this registration last started an authorization.
+    /// `None` until one does, which is what makes it prunable.
+    pub last_used: Option<String>,
+}
+
+/// A freshly issued - or freshly rotated - OAuth grant. The two tokens are the
+/// only unhashed copies in existence: they go to the client once, in the token
+/// endpoint's answer, and only their sha256 is written here.
+#[derive(Clone)]
+pub struct IssuedOauthGrant {
+    /// The grant row's id, which is what revokes it later and what a rotation
+    /// keeps: a refresh moves one grant along rather than forking it.
+    pub id: i64,
+    /// [`OAUTH_ACCESS_PREFIX`] plus 64 hex characters.
+    pub access_token: String,
+    /// [`OAUTH_REFRESH_PREFIX`] plus 64 hex characters.
+    pub refresh_token: String,
+    /// Seconds the access token has left, [`OAUTH_ACCESS_TTL_SECS`], reported
+    /// to the client as RFC 6749's `expires_in`.
+    pub expires_in: u64,
+}
+
+/// Hand-written for the reason [`IssuedMcpToken`]'s is: the id still prints,
+/// so a `tracing::debug!` or a failed assertion says something useful, while
+/// neither live credential can reach a log line.
+impl std::fmt::Debug for IssuedOauthGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IssuedOauthGrant")
+            .field("id", &self.id)
+            .field("access_token", &"coa_[redacted]")
+            .field("refresh_token", &"cor_[redacted]")
+            .field("expires_in", &self.expires_in)
+            .finish()
+    }
+}
+
+/// What presenting a refresh token did.
+///
+/// Four outcomes rather than a `Result<Option<_>>`, because two of them are
+/// not a failure to find anything: a replay is a fact about the grant that the
+/// caller has to act on, and a wrong audience is a live grant that was
+/// deliberately left where it was.
+pub enum RefreshOutcome {
+    /// The grant moved along: both tokens are new, the predecessors are dead.
+    Rotated(IssuedOauthGrant),
+    /// Nothing matched - an invented token, one at the wrong registration, one
+    /// past its window, or one belonging to an account that can no longer sign
+    /// in. Deliberately one outcome for all four, the way
+    /// [`AuthStore::mcp_token_user`] answers `None` for all of its misses.
+    Unknown,
+    /// The token had already been rotated away, so a copy of it outlived the
+    /// rotation. The grant it belonged to is revoked by the time this is
+    /// returned; `grant` is the id it had, for the log line.
+    Replayed {
+        /// The id of the grant this replay revoked.
+        grant: i64,
+    },
+    /// The token is live and the grant is this client's, but the request asked
+    /// for a resource the grant does not hold. Nothing was rotated: handing
+    /// back a token whose audience is not the one asked for would tell the
+    /// client something untrue about the credential it is holding, and RFC 8707
+    /// section 2.2 has an error for exactly this.
+    ///
+    /// **This is the one outcome here that is not indistinguishable from a
+    /// miss, and deliberately so.** It is reachable only from inside the live
+    /// lookup, so a caller who gets it has learned that the token it presented
+    /// is a live one for that client - and it learned it without rotating
+    /// anything, so it can ask again. That is accepted rather than overlooked:
+    /// a refresh token is 32 random bytes, so this tells nothing to anybody who
+    /// does not already hold one, and the alternative is to answer a client
+    /// that made a protocol mistake with a refusal that sends it back through
+    /// the whole authorization flow it did not need to repeat. Every other
+    /// miss - invented, expired, wrong client, disabled account - stays one
+    /// [`RefreshOutcome::Unknown`], and a replay stays indistinguishable from
+    /// all of them at the route.
+    WrongTarget,
+}
+
+/// Hand-written rather than derived, so the rule that no type carrying a token
+/// derives `Debug` holds for the wrapper too. `Rotated` prints through
+/// [`IssuedOauthGrant`]'s redacting `Debug`, which is where the redaction is.
+impl std::fmt::Debug for RefreshOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshOutcome::Rotated(grant) => f.debug_tuple("Rotated").field(grant).finish(),
+            RefreshOutcome::Unknown => f.write_str("Unknown"),
+            RefreshOutcome::WrongTarget => f.write_str("WrongTarget"),
+            RefreshOutcome::Replayed { grant } => {
+                f.debug_struct("Replayed").field("grant", grant).finish()
+            }
+        }
+    }
+}
+
+/// One row of an account's OAuth grant list: which client is connected, since
+/// when, and until when it may keep refreshing. Never carries a token - only
+/// hashes are stored, so there is nothing to show back.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct OauthGrantInfo {
+    /// The grant's id, which is what revokes it.
+    pub id: i64,
+    /// The registration this grant belongs to.
+    pub client_id: String,
+    /// The name that registration gave for itself, or a stand-in when the
+    /// registration is gone.
+    pub client_name: String,
+    /// The host the client is redirected back to, for a person deciding
+    /// whether they recognize this connection.
+    pub redirect_host: String,
+    /// RFC 3339, when the grant was created.
+    pub created_at: String,
+    /// RFC 3339, when one of its access tokens last resolved a request.
+    pub last_used: Option<String>,
+    /// RFC 3339, when the refresh token stops working unless it is rotated
+    /// before then.
+    pub refresh_expires_at: String,
+}
+
+/// One row of an account's MCP token list, for a management UI or CLI. Never
+/// carries the token itself - only the hash is stored, so there is nothing to
+/// show back after issuance.
+#[derive(Clone, Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct McpTokenInfo {
+    /// The row id, used to revoke or rotate this token.
+    pub id: i64,
+    /// The caller-chosen label.
+    pub label: String,
+    /// RFC 3339, when this token was issued.
+    pub created_at: String,
+    /// RFC 3339, when this token last resolved a request. `None` if it has
+    /// never been used.
+    pub last_used: Option<String>,
+}
+
+/// What a member may do on one private domain. Ordered least to most
+/// privileged, exactly as [`Role`] is, and deliberately a separate ladder: an
+/// account's instance role says what it may do on the installation, this says
+/// what it may do on one domain somebody invited it to.
+///
+/// `Manager` is the level that may invite and change other members' levels. It
+/// may not flip the domain back to shared, and it may not hand the domain to
+/// someone else: those two stay with the owner (and with an admin), which is
+/// what keeps "who can see this at all" a decision the owner made.
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum MemberLevel {
+    /// Read only: this domain is visible and searchable, nothing more.
+    Viewer,
+    /// Everything a viewer may do, plus writing and editing its engrams.
+    Editor,
+    /// Everything an editor may do, plus managing this domain's membership.
+    Manager,
+}
+
+impl MemberLevel {
+    /// The wire and database spelling, which is also what [`serde`] emits.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MemberLevel::Viewer => "viewer",
+            MemberLevel::Editor => "editor",
+            MemberLevel::Manager => "manager",
+        }
+    }
+}
+
+impl std::fmt::Display for MemberLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for MemberLevel {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<MemberLevel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "viewer" => Ok(MemberLevel::Viewer),
+            "editor" => Ok(MemberLevel::Editor),
+            "manager" => Ok(MemberLevel::Manager),
+            other => Err(anyhow!(
+                "unknown membership level '{other}': expected viewer, editor or manager"
+            )),
+        }
+    }
+}
+
+/// Read a membership level back out of a database row. Same contract as
+/// [`role_from_db`]: an unrecognized value can only come from a hand-edited or
+/// corrupted file, so it resolves to the least privileged level rather than
+/// failing the read. An unreadable row must never fail open.
+fn member_level_from_db(s: &str) -> MemberLevel {
+    s.parse().unwrap_or(MemberLevel::Viewer)
+}
+
+/// The one value the `domain_acl.visibility` column is ever written with.
+///
+/// The column is an enum of one on purpose: a later release can add a second
+/// visibility without a migration. Until one exists, *any* row in `domain_acl`
+/// means the domain is private and an absent row means it is shared, so this
+/// build never has to guess what an unknown value would have meant - it treats
+/// every row as the strictest state it knows, which is the only safe direction
+/// for an authorization record.
+const VISIBILITY_PRIVATE: &str = "private";
+
+/// The one `domain_member.principal_kind` this release writes or reads.
+///
+/// Decision 4 of the identity plan keeps the column (and its place in the
+/// primary key) so a group principal can be added later without schema
+/// surgery. Every statement here filters on it, so the day a `group` row
+/// exists it is invisible to the user-principal paths rather than silently
+/// resolving as a user of the same name.
+const PRINCIPAL_USER: &str = "user";
+
+/// Why the store refused a change, as a value rather than as prose.
+///
+/// The refusals below are the caller's doing rather than the server's,
+/// and the surfaces above have to tell them apart in order to answer with the
+/// right status. They used to be told apart by matching substrings of the
+/// message, which meant any rewording here silently turned a 409 into a 500 -
+/// and, worse, invited a surface to forward the store's own words to somebody
+/// who should not have them (an account that does not exist and one that is
+/// disabled are the same answer to anybody who cannot read the user list).
+///
+/// So the classification travels as a type. [`StoreRefusal`] carries the
+/// message as its `Display`, unchanged, so `{e:#}` still renders exactly what
+/// it always did for a log line or an operator-facing surface, while
+/// [`StoreRefusal::kind_of`] gives a caller the decision without reading
+/// prose. What each surface then SAYS is its own business: the CLI is the
+/// machine operator and prints the detail, the REST membership routes collapse
+/// the account arm to one word-for-word answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RefusalKind {
+    /// The domain is shared, so it has no membership and no owner.
+    NotPrivate,
+    /// The principal named owns the domain, and an owner holds no membership
+    /// row: the row could only ever say less than the truth.
+    OwnerIsNotAMember,
+    /// The principal names no account, or names one that is disabled. ONE
+    /// variant for both on purpose: a surface that cannot read the user list
+    /// must not be handed a probe for which of the two it is. Also what the
+    /// token verbs raise when the account they are acting FOR is gone, which
+    /// the self-service surface answers 401 to: the caller's own account
+    /// disappeared between the session resolving and the statement running, and
+    /// logging in again is what says so.
+    NoSuchAccount,
+    /// The `(issuer, subject)` pair is already linked, to this account or to
+    /// another one. The message names the account that holds it, for the
+    /// operator surfaces; the web surface must answer without it, which is why
+    /// the classification is what travels.
+    IdentityAlreadyLinked,
+    /// The account already holds an identity at this issuer, and one per
+    /// issuer is the rule: the one it holds has to go first.
+    IssuerAlreadyHeld,
+    /// The identity being unlinked is the last way into its account: there is
+    /// no password to fall back on and no other identity linked, so removing
+    /// it would leave nobody able to sign in. See
+    /// [`AuthStore::unlink_identity`].
+    LastCredential,
+    /// No MCP token with that id belongs to the account that asked. One
+    /// variant for "never existed" and "not yours" together, so an id cannot be
+    /// probed for through the difference.
+    NoSuchToken,
+    /// `auth.max_users` is reached, so no further account is provisioned. The
+    /// caller cannot act on it and an operator can, which is why it is told
+    /// apart from a server fault.
+    CapReached,
+    /// The name given cannot be a login name at all - empty, or carrying
+    /// whitespace. A bad request rather than a fault, on the surfaces that can
+    /// be handed one.
+    InvalidName,
+}
+
+/// A refused membership change: [`RefusalKind`] plus the sentence the store
+/// would have printed.
+#[derive(Debug)]
+pub struct StoreRefusal {
+    kind: RefusalKind,
+    message: String,
+}
+
+impl StoreRefusal {
+    /// What kind of refusal this is.
+    pub fn kind(&self) -> RefusalKind {
+        self.kind
+    }
+
+    /// The kind of membership refusal inside `error`, if it is one.
+    ///
+    /// Walks the whole source chain rather than downcasting the outermost
+    /// error, so a caller that added its own context on the way up does not
+    /// hide the classification.
+    pub fn kind_of(error: &anyhow::Error) -> Option<RefusalKind> {
+        error
+            .chain()
+            .find_map(|e| e.downcast_ref::<StoreRefusal>())
+            .map(|refusal| refusal.kind)
+    }
+}
+
+impl std::fmt::Display for StoreRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StoreRefusal {}
+
+/// Build one, as the error type the store's refusing statements return.
+fn refuse(kind: RefusalKind, message: String) -> anyhow::Error {
+    anyhow::Error::new(StoreRefusal { kind, message })
+}
+
+/// What every surface says when an unlink would take away the last way into an
+/// account: what would happen, and the one command that gives the account a
+/// second way in first.
+///
+/// One sentence, written here, forwarded verbatim by the REST route and by the
+/// CLI. The account it names is always the caller's own on the web surface and
+/// the one an operator typed on the command line, so naming it is not a probe
+/// for anybody.
+fn last_credential_message(user: &str) -> String {
+    format!(
+        "this is the only way into account '{user}': it has no password, so unlinking its last \
+         identity would leave nobody able to sign in - give it a password first with \
+         `crystalline users passwd {user}`"
+    )
+}
+
+/// The visibility record of one private domain. A row exists only for a domain
+/// somebody made private; an absent row is the default, shared visibility,
+/// which is why turning privacy off deletes the row rather than rewriting it.
+///
+/// There is no `visibility` field: see [`VISIBILITY_PRIVATE`] for why the
+/// column exists anyway.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DomainAcl {
+    /// The domain name, stored exactly as the caller registered it (trimmed,
+    /// never case folded: the engine keys its domain map on the literal name,
+    /// so folding here would conflate two distinct registrations).
+    pub domain: String,
+    /// The account that owns this domain: the login name, folded by
+    /// [`normalize_account_name`] like every other account reference.
+    pub owner: String,
+}
+
+/// What [`AuthStore::set_domain_visibility`] did, for a caller that has to say
+/// so.
+///
+/// Two answers rather than a bare `()`, because "it was already private" and
+/// "it is private now" are the same end state reached from different places and
+/// a person deserves to be told which one they are looking at - especially
+/// since the second one names an owner the caller chose and the first one names
+/// the owner it already had.
+#[derive(Clone, Debug, PartialEq)]
+pub enum VisibilityWrite {
+    /// The visibility record was written: the domain is now what was asked for.
+    Written,
+    /// The domain was already private and was left exactly as it stood, with
+    /// the owner named here and every membership row intact.
+    AlreadyPrivate {
+        /// The owner it already has, which is not necessarily the account the
+        /// caller named.
+        owner: String,
+    },
+}
+
+/// One membership row: who was invited to a private domain, at what level, by
+/// whom and when.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, utoipa::ToSchema)]
+pub struct DomainMember {
+    /// The member's login name, folded by [`normalize_account_name`].
+    pub principal: String,
+    /// What this member may do here.
+    pub level: MemberLevel,
+    /// Who added or last changed this row. An audit field, stored as given:
+    /// it is usually a login name but may name a non-account actor, the same
+    /// latitude the identity-link plan gives `linked_by`.
+    pub added_by: String,
+    /// RFC 3339, when this row was last written.
+    pub added_at: String,
+}
+
+/// Fold a supplied domain name to the form this store keys on: trimmed, and
+/// otherwise left exactly as given.
+///
+/// Deliberately *not* lowercased, which is where this parts company with
+/// [`normalize_account_name`]. A domain name is a key in the engine's own domain map
+/// (`Engine::domain_entry` does an exact `HashMap` lookup), so `Lab` and `lab`
+/// are two different registrations there; folding them together here would let
+/// a privacy record written for one hide the other, or - worse - let a lookup
+/// for one miss the record protecting it.
+fn normalize_domain(domain: &str) -> Result<String> {
+    let trimmed = domain.trim();
+    if trimmed.is_empty() {
+        bail!("a domain name cannot be empty");
+    }
+    Ok(trimmed.to_string())
 }
 
 /// The users and sessions database. Open one per process that needs it: the
@@ -292,7 +804,145 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 CREATE INDEX IF NOT EXISTS sessions_user_name ON sessions (user_name);
 CREATE INDEX IF NOT EXISTS sessions_expires_at ON sessions (expires_at);
+CREATE TABLE IF NOT EXISTS mcp_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user TEXT NOT NULL,
+    token_hash TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used TEXT
+);
+CREATE INDEX IF NOT EXISTS mcp_tokens_user ON mcp_tokens (user);
+CREATE TABLE IF NOT EXISTS domain_acl (
+    domain TEXT PRIMARY KEY NOT NULL,
+    visibility TEXT NOT NULL,
+    owner TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS domain_member (
+    domain TEXT NOT NULL,
+    principal_kind TEXT NOT NULL DEFAULT 'user',
+    principal TEXT NOT NULL,
+    level TEXT NOT NULL,
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (domain, principal_kind, principal)
+);
+CREATE INDEX IF NOT EXISTS domain_member_principal
+    ON domain_member (principal_kind, principal);
+CREATE TABLE IF NOT EXISTS identity_link (
+    issuer TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    user TEXT NOT NULL,
+    linked_at TEXT NOT NULL,
+    linked_by TEXT NOT NULL,
+    PRIMARY KEY (issuer, subject)
+);
+CREATE INDEX IF NOT EXISTS identity_link_user ON identity_link (user);
+CREATE UNIQUE INDEX IF NOT EXISTS identity_link_issuer_user
+    ON identity_link (issuer, user);
+CREATE TABLE IF NOT EXISTS oauth_clients (
+    client_id TEXT PRIMARY KEY,
+    client_name TEXT NOT NULL,
+    client_uri TEXT,
+    redirect_uris TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used TEXT
+);
+CREATE TABLE IF NOT EXISTS oauth_grants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user TEXT NOT NULL,
+    client_id TEXT NOT NULL,
+    resource TEXT NOT NULL,
+    access_hash TEXT NOT NULL UNIQUE,
+    access_expires_at INTEGER NOT NULL,
+    refresh_hash TEXT NOT NULL UNIQUE,
+    previous_refresh_hash TEXT,
+    refresh_expires_at INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    last_used TEXT
+);
+CREATE INDEX IF NOT EXISTS oauth_grants_user ON oauth_grants (user);
+CREATE INDEX IF NOT EXISTS oauth_grants_client ON oauth_grants (client_id);
+CREATE INDEX IF NOT EXISTS oauth_grants_previous_refresh
+    ON oauth_grants (previous_refresh_hash);
 ";
+
+/// Prefix every MCP token is minted with, so a token is recognizable at a
+/// glance and distinct from a session cookie or a CSRF value. The remainder is
+/// 64 lowercase hex characters, 32 bytes from the OS CSPRNG.
+pub const MCP_TOKEN_PREFIX: &str = "cmt_";
+
+/// Prefix on every OAuth access token, so the MCP gate can tell one from an
+/// MCP token by looking at it and route it to the right lookup. The remainder
+/// is 64 lowercase hex characters, 32 bytes from the OS CSPRNG, exactly as an
+/// MCP token's is.
+pub const OAUTH_ACCESS_PREFIX: &str = "coa_";
+
+/// Prefix on every OAuth refresh token. A separate prefix from the access
+/// token's on purpose: the two are presented at different endpoints, and a
+/// client that sends the wrong one gets a refusal rather than a lookup that
+/// happens to miss.
+pub const OAUTH_REFRESH_PREFIX: &str = "cor_";
+
+/// Prefix on every registered client id. Not a credential - a public client
+/// authorizes with nothing but this id and PKCE - so its random half is 32 hex
+/// characters rather than 64.
+pub const OAUTH_CLIENT_PREFIX: &str = "coc_";
+
+/// How long an OAuth access token lives, in seconds. One hour: long enough
+/// that a session is not a stream of refreshes, short enough that a leaked
+/// token stops working on its own, and the number the token endpoint reports
+/// as `expires_in`.
+pub const OAUTH_ACCESS_TTL_SECS: i64 = 3600;
+
+/// How long an OAuth refresh token lives, in seconds. Thirty days, restarted
+/// at every rotation, so a client used at all keeps working and one abandoned
+/// for a month has to ask its person again.
+pub const OAUTH_REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a registration that HAS been authorized is kept once it stops
+/// being used, in seconds. Thirty days from the last authorization a person
+/// allowed, so somebody's client between connections keeps its identity while
+/// one nobody has used in a month is swept by
+/// [`AuthStore::prune_oauth_clients`]. A registration that holds a grant is
+/// never pruned, however old it is.
+pub const OAUTH_CLIENT_UNUSED_SECS: i64 = 30 * 24 * 3600;
+
+/// How long a registration nobody has authorized is kept, in seconds. One
+/// hour, and the short clock is the point.
+///
+/// The two ages measure different things. A row nobody has authorized is the
+/// residue of a client that registered and walked away - or of an anonymous
+/// caller filling the table, which is the only way
+/// [`crate::rest::MAX_OAUTH_CLIENTS`] is ever reached, since registration is
+/// the one write nobody has to authenticate for. Keeping such a row for thirty
+/// days is exactly what would make that filling stick: the table would stay
+/// full for a month and every real client would be refused for as long. An
+/// hour is far longer than any client needs between registering and sending
+/// its person to consent, and short enough that a filled table drains by
+/// itself.
+///
+/// **"Authorized" means a person allowed it, not that a request arrived.** The
+/// authorize leg carries no identity and passes by construction for whoever
+/// owns the registration, so a clock that started on a request rather than on
+/// a decision would cost an attacker one extra call per row and buy back the
+/// whole thirty days. [`AuthStore::touch_oauth_client`] is where that line is
+/// drawn.
+pub const OAUTH_CLIENT_UNAUTHORIZED_SECS: i64 = 3600;
+
+/// What [`AuthStore::list_oauth_grants`] shows where a client name should be,
+/// for a grant whose registration is gone. The grant stays listed - and
+/// therefore revocable - rather than disappearing from the one screen that can
+/// stop it.
+const GONE_OAUTH_CLIENT: &str = "a client that is no longer registered";
+
+/// What [`redirect_host`] shows for a redirect uri that names no host at all.
+/// A `javascript:` or `data:` uri parses, carries no host and is entirely
+/// attacker-chosen text; the consent screen and the grant card label that
+/// field as the address a person is asked to recognize, so a uri with no host
+/// says so rather than being allowed to write the line itself.
+const NO_REDIRECT_HOST: &str = "an address with no host";
 
 /// The columns every user read selects, in the order [`user_from_row`] decodes.
 const USER_COLUMNS: &str = "name, display, email, role, disabled, last_seen_at";
@@ -491,7 +1141,7 @@ impl AuthStore {
     }
 
     /// Add an account with a password. The name is folded by
-    /// [`normalize_name`], so `Ada` and `ada` are the same account. Errors if
+    /// [`normalize_account_name`], so `Ada` and `ada` are the same account. Errors if
     /// the name is already taken; the primary key is the guard, so two racing
     /// writers cannot both win.
     pub async fn add_user(
@@ -502,7 +1152,7 @@ impl AuthStore {
         role: Role,
         password: &str,
     ) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -556,12 +1206,12 @@ impl AuthStore {
     /// the statement, the `WHERE NOT EXISTS` is decided by whichever writer
     /// holds the write lock, exactly like [`NOT_LAST_ADMIN`].
     ///
-    /// The name is folded by [`normalize_name`] like every other path, and a
+    /// The name is folded by [`normalize_account_name`] like every other path, and a
     /// name that will not fold is refused before anything is written, so a typo
     /// does not consume the one slot there is. The password is hashed outside
     /// the lock, as in [`AuthStore::add_user`]: argon2 is CPU, not database.
     pub async fn add_first_admin(&self, name: &str, display: &str, password: &str) -> Result<bool> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -611,7 +1261,7 @@ impl AuthStore {
     ///
     /// [`NoHash`]: PasswordCheck::NoHash
     pub async fn check_password(&self, name: &str, password: &str) -> Result<PasswordCheck> {
-        let Ok(name) = normalize_name(name) else {
+        let Ok(name) = normalize_account_name(name) else {
             return Ok(PasswordCheck::NoHash);
         };
         // Scoped so the lock is released before the argon2 verify below.
@@ -653,7 +1303,7 @@ impl AuthStore {
     /// before the change can survive it, and a refused change (an account that
     /// is not there) revokes nothing.
     pub async fn set_password(&self, name: &str, password: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         // Hash before taking the lock: argon2 is CPU, not database.
         let hash = hash_password(password).await?;
         let _guard = self.guard.lock().await;
@@ -698,7 +1348,7 @@ impl AuthStore {
     /// installation cannot be locked out over the network - only deliberately,
     /// on the machine that holds this file.
     pub async fn set_role_force(&self, name: &str, role: Role) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         let changed = self
             .conn
@@ -723,7 +1373,7 @@ impl AuthStore {
     /// print. No last-admin guard applies - a display name changes nothing
     /// about what the account may do.
     pub async fn set_display(&self, name: &str, display: Option<&str>) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let display = display
             .map(str::trim)
             .filter(|d| !d.is_empty())
@@ -760,7 +1410,7 @@ impl AuthStore {
     /// re-enabling never is, so the `?2 = 0` arm short-circuits the guard. A
     /// refused disabling rolls back, sessions included.
     pub async fn set_disabled(&self, name: &str, disabled: bool) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         self.begin_immediate()
             .await
@@ -804,10 +1454,11 @@ impl AuthStore {
         self.finish(result).await
     }
 
-    /// Delete an account and every session it holds. Errors if there is no
+    /// Delete an account and everything keyed on its name: its sessions, its
+    /// MCP tokens and its private-domain memberships. Errors if there is no
     /// such account.
     ///
-    /// The two deletes are one `BEGIN IMMEDIATE` transaction, sessions first.
+    /// The deletes are one `BEGIN IMMEDIATE` transaction, sessions first.
     /// Both details are load-bearing, because a session row that outlives its
     /// account is not merely garbage: `session_user` resolves a token by
     /// joining `sessions` to `users`, so once a new account claims the freed
@@ -827,7 +1478,7 @@ impl AuthStore {
     /// two concurrent removals cannot both observe the other admin and both
     /// succeed. A refusal rolls the session delete back with everything else.
     pub async fn remove_user(&self, name: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -835,6 +1486,11 @@ impl AuthStore {
             .with_context(|| format!("removing user '{name}'"))?;
         let result = async {
             self.delete_sessions_of(&name).await?;
+            self.delete_mcp_tokens_of(&name).await?;
+            self.delete_memberships_of(&name).await?;
+            self.delete_identity_links_of(&name).await?;
+            self.delete_oauth_grants_of(&name).await?;
+            self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
                 .execute(
@@ -862,11 +1518,11 @@ impl AuthStore {
     }
 
     /// [`AuthStore::remove_user`] without the last-admin guard, for
-    /// `users remove --force`. Sessions still go first, in the same
-    /// `BEGIN IMMEDIATE` transaction, for the resurrection reasons the guarded
-    /// remove documents.
+    /// `users remove --force`. Sessions, tokens and memberships still go
+    /// first, in the same `BEGIN IMMEDIATE` transaction, for the resurrection
+    /// reasons the guarded remove documents.
     pub async fn remove_user_force(&self, name: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let key = vec![Value::Text(name.clone())];
         let _guard = self.guard.lock().await;
         self.begin_immediate()
@@ -874,6 +1530,11 @@ impl AuthStore {
             .with_context(|| format!("removing user '{name}'"))?;
         let result = async {
             self.delete_sessions_of(&name).await?;
+            self.delete_mcp_tokens_of(&name).await?;
+            self.delete_memberships_of(&name).await?;
+            self.delete_identity_links_of(&name).await?;
+            self.delete_oauth_grants_of(&name).await?;
+            self.disown_domains_of(&name).await?;
             let changed = self
                 .conn
                 .execute("DELETE FROM users WHERE name = ?1", key)
@@ -886,6 +1547,27 @@ impl AuthStore {
         }
         .await;
         self.finish(result).await
+    }
+
+    /// One account by name, or `None` when there is none. The name is folded
+    /// by [`normalize_account_name`] like every other lookup, so `Ada` finds `ada`.
+    ///
+    /// A pure existence-and-details read, with none of
+    /// [`AuthStore::session_user`]'s stamping: the caller is asking whether a
+    /// name is an account, not resolving a credential, so nothing about the
+    /// account changes. What it exists for is telling a mistyped name apart
+    /// from a real account with nothing in it - `crystalline users mcp-token
+    /// ghsot --list` must say "no such user" rather than "holds no tokens".
+    pub async fn user(&self, name: &str) -> Result<Option<User>> {
+        let name = normalize_account_name(name)?;
+        let _guard = self.guard.lock().await;
+        Ok(self
+            .query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name)],
+            )
+            .await?
+            .map(|row| user_from_row(&row)))
     }
 
     /// Every account, by name. Names sort byte-wise, which is the ordering
@@ -915,7 +1597,7 @@ impl AuthStore {
     /// `role` applies at creation only. A later [`AuthStore::set_role`] by an
     /// admin sticks instead of being reverted on the account's next request.
     ///
-    /// The name is folded by [`normalize_name`], which matters most here: a
+    /// The name is folded by [`normalize_account_name`], which matters most here: a
     /// header value of `Ada` must resolve to the existing `ada` rather than
     /// mint a second account at the default role, which would silently undo a
     /// disable or a demotion. The display name keeps the casing as sent.
@@ -933,7 +1615,7 @@ impl AuthStore {
     /// stopping *unbounded* minting, not enforcing an exact ceiling.
     pub async fn ensure_user(&self, name: &str, role: Role, cap: usize) -> Result<User> {
         let display = name.trim().to_string();
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         let exists = self
             .query_first(
@@ -952,10 +1634,13 @@ impl AuthStore {
                 _ => 0,
             };
             if count >= cap {
-                bail!(
-                    "refusing to provision '{name}': the account cap is reached \
-                     (auth.max_users = {cap}). Remove unused accounts or raise the cap"
-                );
+                return Err(refuse(
+                    RefusalKind::CapReached,
+                    format!(
+                        "refusing to provision '{name}': the account cap is reached \
+                         (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                    ),
+                ));
             }
         }
         self.conn
@@ -991,6 +1676,320 @@ impl AuthStore {
         .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
     }
 
+    /// The account an external provider's `(issuer, subject)` pair names, or
+    /// `None` when this instance has never seen that pair.
+    ///
+    /// The one lookup a sign-on does. It deliberately cannot be asked to find
+    /// an account by address or by username: matching either of those would be
+    /// the silent takeover this design refuses, and an API that cannot express
+    /// it cannot grow it by accident.
+    ///
+    /// The read drops any link whose account no longer exists, the same sweep
+    /// [`AuthStore::session_user`] and [`AuthStore::mcp_token_user`] apply to
+    /// their own tables. `identity_link` carries no foreign key, and both
+    /// removal paths delete the links inside the transaction that deletes the
+    /// account, so nothing here is supposed to write one; but a link is a
+    /// credential, and an orphaned one is exactly what would be inherited by
+    /// the next account to take that login name - a stranger's provider
+    /// identity signing into somebody else's account. Clearing it on sight
+    /// makes that unrecoverable rather than dormant.
+    pub async fn linked_user(&self, issuer: &str, subject: &str) -> Result<Option<User>> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let subject = identity_value(subject, "subject")?;
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM identity_link
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = identity_link.user)",
+                (),
+            )
+            .await
+            .context("pruning orphaned identity links")?;
+        Ok(self
+            .query_first(
+                &format!(
+                    "SELECT {USER_COLUMNS_JOINED} FROM identity_link l
+                     JOIN users u ON u.name = l.user
+                     WHERE l.issuer = ?1 AND l.subject = ?2"
+                ),
+                vec![Value::Text(issuer), Value::Text(subject)],
+            )
+            .await?
+            .map(|row| user_from_row(&row)))
+    }
+
+    /// Tie an external identity to an existing account. An explicit act, which
+    /// is the whole policy: a sign-on never lands in an account it was not
+    /// linked to, and linking is done by the person who is signed in or by an
+    /// admin.
+    ///
+    /// Refused when the pair is already linked (to any account, this one
+    /// included), when the account already holds an identity at this issuer,
+    /// and when the name is nobody or a disabled account. All three checks run
+    /// inside the same `BEGIN IMMEDIATE` transaction as the insert, so what
+    /// they saw is what the insert sees.
+    pub async fn link_identity(
+        &self,
+        issuer: &str,
+        subject: &str,
+        user: &str,
+        linked_by: &str,
+    ) -> Result<()> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let subject = identity_value(subject, "subject")?;
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("linking an identity to user '{user}'"))?;
+        let result = async {
+            self.require_live_user(&user).await?;
+            self.insert_link(&issuer, &subject, &user, linked_by).await
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Drop the identity `user` holds at `issuer`. `true` when there was one.
+    ///
+    /// Keyed on `(issuer, user)` rather than on the subject: the person
+    /// unlinking knows which provider they want gone, and by construction they
+    /// hold at most one identity there.
+    ///
+    /// Refused with [`RefusalKind::LastCredential`] when the link being removed
+    /// is the account's last way in - no password hash and no other identity -
+    /// because an account provisioned by a first sign-on has no password by
+    /// construction, so unlinking it would leave a live account nobody can
+    /// reach. The rule lives here rather than in each surface, so the profile
+    /// card, the REST route and the CLI cannot disagree about it. The one way
+    /// past it is [`AuthStore::unlink_identity_force`].
+    pub async fn unlink_identity(&self, issuer: &str, user: &str) -> Result<bool> {
+        self.unlink(issuer, user, false).await
+    }
+
+    /// [`AuthStore::unlink_identity`] with the last-way-in guard bypassed, for
+    /// the operator repairing an account whose provider re-issued its subject:
+    /// the stale identity has to go before the new one can be linked, and the
+    /// account is genuinely unreachable in between. Never reachable from the
+    /// web surface, where the person doing it would be stranding themselves.
+    pub async fn unlink_identity_force(&self, issuer: &str, user: &str) -> Result<bool> {
+        self.unlink(issuer, user, true).await
+    }
+
+    /// The two above. The read of what else the account has to sign in with
+    /// and the delete share one `BEGIN IMMEDIATE`: two concurrent unlinks of
+    /// an account's two identities would otherwise both see a second way in
+    /// and leave none.
+    async fn unlink(&self, issuer: &str, user: &str, force: bool) -> Result<bool> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("unlinking an identity from user '{user}'"))?;
+        let result = async {
+            if !force
+                && self.link_at(&issuer, &user).await?
+                && self.link_count(&user).await? <= 1
+                && !self.password_present(&user).await?
+            {
+                return Err(refuse(
+                    RefusalKind::LastCredential,
+                    last_credential_message(&user),
+                ));
+            }
+            let changed = self
+                .conn
+                .execute(
+                    "DELETE FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                    vec![Value::Text(issuer.clone()), Value::Text(user.to_string())],
+                )
+                .await
+                .with_context(|| format!("unlinking an identity from user '{user}'"))?;
+            Ok(changed > 0)
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Whether `user` has a local password to sign in with.
+    ///
+    /// A read of its own rather than a byproduct of
+    /// [`AuthStore::check_password`], whose [`PasswordCheck::NoHash`]
+    /// deliberately collapses "no hash" with "no such account": here the two
+    /// have to be one answer for a different reason - a name that is nobody
+    /// has no password either - but the caller is asking about an account it
+    /// already holds, and about whether unlinking would strand it.
+    pub async fn has_password(&self, name: &str) -> Result<bool> {
+        let name = normalize_account_name(name)?;
+        let _guard = self.guard.lock().await;
+        self.password_present(&name).await
+    }
+
+    /// Every identity linked to one account, by issuer.
+    pub async fn identity_links(&self, user: &str) -> Result<Vec<IdentityLink>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT issuer, subject, linked_at, linked_by FROM identity_link
+                 WHERE user = ?1 ORDER BY issuer",
+                vec![Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("reading the identity links of user '{user}'"))?;
+        let mut links = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("reading the identity links of user '{user}'"))?
+        {
+            links.push(IdentityLink {
+                issuer: cell_text(&row, 0).unwrap_or_default(),
+                subject: cell_text(&row, 1).unwrap_or_default(),
+                linked_at: cell_text(&row, 2).unwrap_or_default(),
+                linked_by: cell_text(&row, 3).unwrap_or_default(),
+            });
+        }
+        Ok(links)
+    }
+
+    /// Create an account for an identity nobody has seen before, and link it,
+    /// as one transaction.
+    ///
+    /// `desired_name` is a *hint*: it is folded, and a name already taken is
+    /// uniquified with `-2`, `-3` and so on rather than joined. Joining would
+    /// hand a stranger whose provider happens to call them `ada` whatever the
+    /// local `ada` may do, which is exactly the takeover the `(issuer,
+    /// subject)` rule exists to prevent.
+    ///
+    /// The account is created with no password hash: it signs in through its
+    /// provider, and there is no local credential to guess.
+    ///
+    /// One `BEGIN IMMEDIATE` for the cap check, the name search, the insert
+    /// and the link. Two first sign-ins racing therefore produce one account
+    /// and one link, rather than an orphan account whose link lost.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn provision_linked_user(
+        &self,
+        issuer: &str,
+        subject: &str,
+        desired_name: &str,
+        display: Option<&str>,
+        email: Option<&str>,
+        role: Role,
+        cap: usize,
+    ) -> Result<User> {
+        let issuer = identity_value(issuer, "issuer")?;
+        let subject = identity_value(subject, "subject")?;
+        let base = normalize_account_name(desired_name)?;
+        let display = display
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let email = email
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("provisioning an account for a single sign-on")?;
+        let result = async {
+            let count = match self
+                .query_first("SELECT COUNT(*) FROM users", vec![])
+                .await?
+                .map(|row| row.get_value(0))
+            {
+                Some(Ok(Value::Integer(n))) => n as usize,
+                _ => 0,
+            };
+            if count >= cap {
+                return Err(refuse(
+                    RefusalKind::CapReached,
+                    format!(
+                        "refusing to provision an account for this sign-in: the account cap is \
+                         reached (auth.max_users = {cap}). Remove unused accounts or raise the cap"
+                    ),
+                ));
+            }
+            let name = self.free_account_name(&base).await?;
+            self.conn
+                .execute(
+                    "INSERT INTO users
+                         (name, display, email, role, pass_hash, disabled, created_at)
+                     VALUES (?1, ?2, ?3, ?4, NULL, 0, ?5)",
+                    vec![
+                        Value::Text(name.clone()),
+                        Value::Text(display.clone().unwrap_or_else(|| name.clone())),
+                        match &email {
+                            Some(value) => Value::Text(value.clone()),
+                            None => Value::Null,
+                        },
+                        Value::Text(role.as_str().to_string()),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("provisioning user '{name}'"))?;
+            self.insert_link(&issuer, &subject, &name, LINKED_BY_JIT)
+                .await?;
+            self.query_first(
+                &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+                vec![Value::Text(name.clone())],
+            )
+            .await?
+            .map(|row| user_from_row(&row))
+            .ok_or_else(|| anyhow!("user '{name}' vanished right after being provisioned"))
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Refresh what an account shows: its display name and its address, and
+    /// nothing else. Returns the account as it now stands, read back in the
+    /// same call so a caller never has to guess what it wrote.
+    ///
+    /// A `None` leaves the stored value alone: an ID token that carries no
+    /// `name` this time says nothing about the person's name, and must never
+    /// be read as "they no longer have one". Role, disabled state and login
+    /// name are untouched by construction - they are not presentation data,
+    /// and a provider does not get to move them.
+    pub async fn refresh_presentation(
+        &self,
+        name: &str,
+        display: Option<&str>,
+        email: Option<&str>,
+    ) -> Result<User> {
+        let name = normalize_account_name(name)?;
+        let text = |value: Option<&str>| match value.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(value) => Value::Text(value.to_string()),
+            None => Value::Null,
+        };
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "UPDATE users
+                 SET display = COALESCE(?2, display), email = COALESCE(?3, email)
+                 WHERE name = ?1",
+                vec![Value::Text(name.clone()), text(display), text(email)],
+            )
+            .await
+            .with_context(|| format!("updating user '{name}'"))?;
+        if changed == 0 {
+            bail!("no such user: '{name}'");
+        }
+        self.query_first(
+            &format!("SELECT {USER_COLUMNS} FROM users WHERE name = ?1"),
+            vec![Value::Text(name.clone())],
+        )
+        .await?
+        .map(|row| user_from_row(&row))
+        .ok_or_else(|| anyhow!("no such user: '{name}'"))
+    }
+
     /// Issue a session for an existing account, valid for `ttl_secs` from now.
     /// The returned token is the only unhashed copy; only its sha256 is
     /// written. A non-positive `ttl_secs` produces an already-expired session,
@@ -1001,7 +2000,7 @@ impl AuthStore {
     /// CLI could delete the account between the two and leave this session
     /// stranded, to be inherited by the next account to claim the name.
     pub async fn create_session(&self, name: &str, ttl_secs: i64) -> Result<Session> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let token = random_hex();
         let csrf = random_hex();
         let expires_at = chrono::Utc::now().timestamp().saturating_add(ttl_secs);
@@ -1061,7 +2060,7 @@ impl AuthStore {
     /// a cookie - which is why [`AuthStore::newest_session_csrf`] exists: the
     /// trusted-header path resolves the token by identity, not by cookie.
     pub async fn ensure_session(&self, name: &str, ttl_secs: i64) -> Result<SessionMint> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let now = chrono::Utc::now().timestamp();
         let token = random_hex();
         let csrf = random_hex();
@@ -1135,7 +2134,7 @@ impl AuthStore {
     /// where the cookie is the identity and its own session's token is the one
     /// that must match.
     pub async fn newest_session_csrf(&self, name: &str) -> Result<Option<String>> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let now = chrono::Utc::now().timestamp();
         let _guard = self.guard.lock().await;
         self.live_csrf(&name, now).await
@@ -1256,6 +2255,32 @@ impl AuthStore {
         Ok(Some((user, csrf)))
     }
 
+    /// Stamp `name` as seen just now.
+    ///
+    /// The sighting a forward-auth request is. That path resolves an account
+    /// through its identity link rather than through a session or a
+    /// provisioning call, so nothing else on it would move `last_seen_at` and
+    /// an admin's user list would show every such account as never seen.
+    /// [`AuthStore::ensure_user`] and [`AuthStore::session_user`] do the same
+    /// write for the two paths they own; this is the third.
+    ///
+    /// `name` is an account name a row already carries, so it is stamped as
+    /// given: a name that is nobody stamps nothing, which is not an error.
+    pub async fn mark_seen(&self, name: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "UPDATE users SET last_seen_at = ?2 WHERE name = ?1",
+                vec![
+                    Value::Text(name.to_string()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping last_seen_at")?;
+        Ok(())
+    }
+
     /// Revoke one session. Deleting an unknown token is not an error: logging
     /// out twice, or with a stale cookie, is a normal thing for a browser to
     /// do.
@@ -1288,6 +2313,1625 @@ impl AuthStore {
         Ok(())
     }
 
+    /// Delete every MCP token `name` holds. `name` must already be normalized.
+    ///
+    /// Called by [`AuthStore::remove_user`] and [`AuthStore::remove_user_force`]
+    /// alongside [`AuthStore::delete_sessions_of`], inside the same transaction,
+    /// so an account's tokens do not outlive it - the same resurrection risk
+    /// [`AuthStore::remove_user`]'s doc comment describes for sessions applies
+    /// here: a token row that outlives its account would be inherited by the
+    /// next account to claim the freed name.
+    ///
+    /// Deliberately not called by [`AuthStore::set_disabled`]: disabling is
+    /// reversible, and [`AuthStore::mcp_token_user`] already refuses a disabled
+    /// account's tokens at read time, so re-enabling must hand every token back
+    /// rather than force every integration to be re-issued.
+    async fn delete_mcp_tokens_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM mcp_tokens WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing mcp tokens for user '{name}'"))?;
+        Ok(())
+    }
+
+    /// Issue a new MCP token for an existing account. The returned token is the
+    /// only unhashed copy; only its sha256 is written, via the same
+    /// [`token_hash`] helper a session token uses.
+    ///
+    /// Errors if the account does not exist, so a mistyped name is reported
+    /// rather than silently minting an orphaned row.
+    ///
+    /// The existence check and the insert are one `BEGIN IMMEDIATE`
+    /// transaction, exactly as [`AuthStore::create_session`] does it and for
+    /// the same reason: without it, a `remove_user` running in the CLI could
+    /// delete the account between the two and leave this token stranded, to be
+    /// inherited by the next account to claim the name (`mcp_tokens` carries no
+    /// foreign key, so nothing else would stop the insert from landing).
+    pub async fn issue_mcp_token(&self, user: &str, label: &str) -> Result<IssuedMcpToken> {
+        let user = normalize_account_name(user)?;
+        let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
+        let hash = token_hash(&token);
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
+        let result = async {
+            let exists = self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(user.clone())],
+                )
+                .await?;
+            if exists.is_none() {
+                return Err(refuse(
+                    RefusalKind::NoSuchAccount,
+                    format!("no such user: '{user}'"),
+                ));
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(user.clone()),
+                        Value::Text(hash),
+                        Value::Text(label.to_string()),
+                        Value::Text(created_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("issuing an mcp token for user '{user}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        // Read after commit, still under `self.guard` and on this connection,
+        // so nothing else on this connection can insert between the commit
+        // above and this read - same reasoning `rotate_mcp_token` relies on.
+        let id = self.conn.last_insert_rowid();
+        Ok(IssuedMcpToken {
+            id,
+            token,
+            label: label.to_string(),
+        })
+    }
+
+    /// Resolve an MCP token to its account. `None` for an unknown, revoked (the
+    /// row is gone, whether by an explicit revoke or by the account's removal),
+    /// or disabled-account token - the three are deliberately indistinguishable,
+    /// same as [`AuthStore::verify_password`]. Stamps `last_used` on a hit, so
+    /// [`AuthStore::list_mcp_tokens`] can show when a token was last presented.
+    ///
+    /// Also prunes any orphaned `mcp_tokens` row - one whose account no longer
+    /// exists - on every call, the same defense in depth
+    /// [`AuthStore::session_user`] applies to sessions. `mcp_tokens` carries no
+    /// foreign key, and [`AuthStore::issue_mcp_token`]'s transaction is what is
+    /// supposed to stop a stranded row from ever being written; this is the
+    /// belt to that transaction's suspenders, for a row written before this
+    /// existed or reached by any other path.
+    pub async fn mcp_token_user(&self, token: &str) -> Result<Option<User>> {
+        let hash = token_hash(token);
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM mcp_tokens
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = mcp_tokens.user)",
+                (),
+            )
+            .await
+            .context("pruning orphaned mcp tokens")?;
+        let Some(row) = self
+            .query_first(
+                &format!(
+                    "SELECT {USER_COLUMNS_JOINED}, m.id
+                     FROM mcp_tokens m JOIN users u ON u.name = m.user
+                     WHERE m.token_hash = ?1"
+                ),
+                vec![Value::Text(hash)],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let user = user_from_row(&row);
+        if user.disabled {
+            return Ok(None);
+        }
+        if let Ok(Value::Integer(id)) = row.get_value(6) {
+            self.conn
+                .execute(
+                    "UPDATE mcp_tokens SET last_used = ?2 WHERE id = ?1",
+                    vec![
+                        Value::Integer(id),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .context("stamping an mcp token's last_used")?;
+        }
+        Ok(Some(user))
+    }
+
+    /// Every MCP token `user` holds, newest first, never carrying the token
+    /// itself. `user` is folded by [`normalize_account_name`] like every other lookup
+    /// keyed on a login name.
+    pub async fn list_mcp_tokens(&self, user: &str) -> Result<Vec<McpTokenInfo>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, label, created_at, last_used FROM mcp_tokens
+                 WHERE user = ?1 ORDER BY created_at DESC, id DESC",
+                vec![Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("listing mcp tokens for user '{user}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing mcp tokens for user '{user}'"))?
+        {
+            let Ok(Value::Integer(id)) = row.get_value(0) else {
+                continue;
+            };
+            out.push(McpTokenInfo {
+                id,
+                label: cell_text(&row, 1).unwrap_or_default(),
+                created_at: cell_text(&row, 2).unwrap_or_default(),
+                last_used: cell_text(&row, 3),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Revoke one of `user`'s MCP tokens by id. Returns whether a row was
+    /// deleted - `false` covers both an unknown id and one owned by a different
+    /// account, deliberately indistinguishable so a caller cannot probe another
+    /// account's token ids.
+    pub async fn revoke_mcp_token(&self, user: &str, id: i64) -> Result<bool> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM mcp_tokens WHERE id = ?1 AND user = ?2",
+                vec![Value::Integer(id), Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("revoking an mcp token for user '{user}'"))?;
+        Ok(changed > 0)
+    }
+
+    /// Replace one of `user`'s MCP tokens with a freshly issued one carrying
+    /// the same label, in one transaction: the old row is gone and the new one
+    /// exists, or neither change happened. Errors if `id` does not name a token
+    /// owned by `user`.
+    pub async fn rotate_mcp_token(&self, user: &str, id: i64) -> Result<IssuedMcpToken> {
+        let user = normalize_account_name(user)?;
+        let token = format!("{MCP_TOKEN_PREFIX}{}", random_hex());
+        let hash = token_hash(&token);
+        let created_at = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
+        // Captured by the closure below and read after `finish` commits, the
+        // same `ensure_session` shape this file already uses for a
+        // transaction whose caller needs more out of it than `Result<()>`.
+        let mut label = String::new();
+        let result = async {
+            let row = self
+                .query_first(
+                    "SELECT label FROM mcp_tokens WHERE id = ?1 AND user = ?2",
+                    vec![Value::Integer(id), Value::Text(user.clone())],
+                )
+                .await?;
+            let Some(row) = row else {
+                return Err(refuse(
+                    RefusalKind::NoSuchToken,
+                    format!("no such mcp token '{id}' for user '{user}'"),
+                ));
+            };
+            label = cell_text(&row, 0).unwrap_or_default();
+            self.conn
+                .execute(
+                    "DELETE FROM mcp_tokens WHERE id = ?1",
+                    vec![Value::Integer(id)],
+                )
+                .await
+                .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO mcp_tokens (user, token_hash, label, created_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(user.clone()),
+                        Value::Text(hash.clone()),
+                        Value::Text(label.clone()),
+                        Value::Text(created_at.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("rotating an mcp token for user '{user}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        // Read after commit, still under `self.guard` and on this connection:
+        // see `issue_mcp_token`'s matching comment.
+        let id = self.conn.last_insert_rowid();
+        Ok(IssuedMcpToken { id, token, label })
+    }
+
+    /// Register a public OAuth client and hand the record back, `client_id`
+    /// and all. RFC 7591 dynamic registration is what calls this: a client
+    /// nobody configured says what it is called and where it may be redirected
+    /// to, and gets an id and no secret.
+    ///
+    /// What a redirect uri is allowed to be, how long a name may be and which
+    /// authentication methods are refused belong to the endpoint that speaks
+    /// RFC 7591's error codes. The one thing insisted on here is the one a
+    /// stored row would be useless without: somewhere to redirect. A
+    /// registration with no uri could never finish a flow, and
+    /// [`AuthStore::list_oauth_grants`] reads the first one to tell a person
+    /// which client a grant belongs to.
+    pub async fn register_oauth_client(
+        &self,
+        name: &str,
+        client_uri: Option<&str>,
+        redirect_uris: &[String],
+    ) -> Result<OauthClient> {
+        if redirect_uris.is_empty() {
+            bail!("an oauth client registration needs at least one redirect uri");
+        }
+        let client = OauthClient {
+            client_id: format!("{OAUTH_CLIENT_PREFIX}{}", random_id_hex()),
+            client_name: name.to_string(),
+            client_uri: client_uri.map(str::to_string),
+            redirect_uris: redirect_uris.to_vec(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            last_used: None,
+        };
+        let encoded = serde_json::to_string(&client.redirect_uris)
+            .context("encoding an oauth client's redirect uris")?;
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "INSERT INTO oauth_clients
+                     (client_id, client_name, client_uri, redirect_uris, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    Value::Text(client.client_id.clone()),
+                    Value::Text(client.client_name.clone()),
+                    match &client.client_uri {
+                        Some(uri) => Value::Text(uri.clone()),
+                        None => Value::Null,
+                    },
+                    Value::Text(encoded),
+                    Value::Text(client.created_at.clone()),
+                ],
+            )
+            .await
+            .context("registering an oauth client")?;
+        Ok(client)
+    }
+
+    /// One registration by id, or `None` when there is none - which is what an
+    /// unknown `client_id` at the authorize or token endpoint looks like.
+    pub async fn oauth_client(&self, client_id: &str) -> Result<Option<OauthClient>> {
+        let _guard = self.guard.lock().await;
+        self.oauth_client_row(client_id).await
+    }
+
+    /// [`AuthStore::oauth_client`] without the lock, for the methods that
+    /// already hold it.
+    async fn oauth_client_row(&self, client_id: &str) -> Result<Option<OauthClient>> {
+        let Some(row) = self
+            .query_first(
+                "SELECT client_id, client_name, client_uri, redirect_uris, created_at, last_used
+                 FROM oauth_clients WHERE client_id = ?1",
+                vec![Value::Text(client_id.to_string())],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(OauthClient {
+            client_id: cell_text(&row, 0).unwrap_or_default(),
+            client_name: cell_text(&row, 1).unwrap_or_default(),
+            client_uri: cell_text(&row, 2),
+            redirect_uris: decode_redirect_uris(cell_text(&row, 3).as_deref()),
+            created_at: cell_text(&row, 4).unwrap_or_default(),
+            last_used: cell_text(&row, 5),
+        }))
+    }
+
+    /// Record that a person AUTHORIZED this registration, which is the only
+    /// thing `last_used` means and the whole input to the long clock in
+    /// [`AuthStore::prune_oauth_clients`].
+    ///
+    /// **Call this when consent is allowed, and when a grant is issued or
+    /// refreshed for the client. Never on an authorization request.** The
+    /// authorize leg runs before anybody has signed in, and a caller that
+    /// registered a client is authorizing against its own row, so every check
+    /// there passes by construction: stamping on that request would let one
+    /// extra unauthenticated call per row move it onto the thirty-day branch,
+    /// which is exactly the fill-and-hold the one-hour clock exists to prevent
+    /// (see [`OAUTH_CLIENT_UNAUTHORIZED_SECS`]). Reading a registration is not
+    /// using it. The call sites are the consent endpoint's allow decision and
+    /// the token endpoint; nothing else in this file writes the column, and
+    /// `only_an_allowed_authorization_stamps_a_registration_as_used` is that
+    /// contract in executable form.
+    ///
+    /// A `client_id` that names no registration is a no-op rather than an
+    /// error: the caller has already refused the request it was stamping for,
+    /// and a second failure mode here would tell it nothing new.
+    pub async fn touch_oauth_client(&self, client_id: &str) -> Result<()> {
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(client_id.to_string()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                ],
+            )
+            .await
+            .context("stamping an oauth client registration")?;
+        Ok(())
+    }
+
+    /// Delete every grant whose refresh window has closed, and report how
+    /// many went. Runs at every registration and at daemon start, immediately
+    /// **before** [`AuthStore::prune_oauth_clients`].
+    ///
+    /// A grant past `refresh_expires_at` can never work again: the rotation
+    /// lookup excludes it, its access token died an hour into those thirty
+    /// days, and a token that was never rotated cannot match the replay
+    /// lookup. Nothing else would ever delete it, so without this the table
+    /// grows with every re-authorization, the account's grant card lists
+    /// connections that cannot work, and - the reason the order matters - each
+    /// dead row holds its registration against the client prune's
+    /// `NOT EXISTS`, which is exactly the abandoned registration that prune
+    /// exists to collect.
+    ///
+    /// Expiry is the statement's comparison, like every other one here.
+    pub async fn prune_oauth_grants(&self) -> Result<usize> {
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE refresh_expires_at <= ?1",
+                vec![Value::Integer(now)],
+            )
+            .await
+            .context("pruning expired oauth grants")?;
+        Ok(removed as usize)
+    }
+
+    /// Delete every registration that holds no grant and has aged out, and
+    /// report how many went. Runs at every registration and at daemon start,
+    /// immediately **after** [`AuthStore::prune_oauth_grants`] - a registration
+    /// whose only grant is dead is only collectable once that grant is gone, so
+    /// the two prunes in that order collect an abandoned client in one pass.
+    ///
+    /// The `NOT EXISTS` is the load-bearing half: a registration somebody is
+    /// connected through is kept however old it is, because deleting it would
+    /// leave live grants pointing at nothing.
+    ///
+    /// **Two ages, decided by whether a person ever authorized the client.** A
+    /// row with `last_used IS NULL` - nobody has allowed it anything, whatever
+    /// requests it has made - is collected [`OAUTH_CLIENT_UNAUTHORIZED_SECS`]
+    /// after it was made; one that has been authorized at least once is
+    /// collected [`OAUTH_CLIENT_UNUSED_SECS`] after that last authorization.
+    /// See the two constants for why they differ by that much, and
+    /// [`AuthStore::touch_oauth_client`] for why the stamp follows a person's
+    /// decision rather than the arrival of a request: the short clock is what
+    /// keeps a table filled by an anonymous caller from staying full for a
+    /// month, and a clock keyed on requests would hand that month back for one
+    /// extra call per row.
+    ///
+    /// Every date compared here is RFC 3339 UTC written by this file, so byte
+    /// order is time order - the same property
+    /// [`AuthStore::list_mcp_tokens`] already orders on.
+    pub async fn prune_oauth_clients(&self) -> Result<usize> {
+        let now = chrono::Utc::now();
+        let idle_cutoff = (now - chrono::Duration::seconds(OAUTH_CLIENT_UNUSED_SECS)).to_rfc3339();
+        let unauthorized_cutoff =
+            (now - chrono::Duration::seconds(OAUTH_CLIENT_UNAUTHORIZED_SECS)).to_rfc3339();
+        let _guard = self.guard.lock().await;
+        let removed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_clients
+                 WHERE NOT EXISTS (
+                           SELECT 1 FROM oauth_grants g
+                           WHERE g.client_id = oauth_clients.client_id
+                       )
+                   AND CASE
+                           WHEN last_used IS NULL THEN created_at < ?2
+                           ELSE last_used < ?1
+                       END",
+                vec![Value::Text(idle_cutoff), Value::Text(unauthorized_cutoff)],
+            )
+            .await
+            .context("pruning unused oauth client registrations")?;
+        Ok(removed as usize)
+    }
+
+    /// How many registrations are stored, for the cap the registration
+    /// endpoint enforces. That one caller is the whole of it; nothing reports
+    /// this number on a settings surface.
+    pub async fn count_oauth_clients(&self) -> Result<usize> {
+        let _guard = self.guard.lock().await;
+        // A count this method cannot read fails the call rather than reading
+        // as an empty table: the one caller is the ceiling on registration,
+        // the only unauthenticated write here, and a zero there would admit
+        // the very row the ceiling exists to refuse.
+        match self
+            .query_first("SELECT COUNT(*) FROM oauth_clients", vec![])
+            .await?
+            .map(|row| row.get_value(0))
+        {
+            Some(Ok(Value::Integer(n))) => Ok(n as usize),
+            _ => bail!("the oauth client registrations could not be counted"),
+        }
+    }
+
+    /// Issue a grant: one row carrying an access token good for an hour and a
+    /// refresh token good for thirty days, both hashed, both bound to `user`,
+    /// `client_id` and `resource`. The returned tokens are the only unhashed
+    /// copies.
+    ///
+    /// The account check and the registration check share one `BEGIN
+    /// IMMEDIATE` with the insert, for the reason
+    /// [`AuthStore::issue_mcp_token`] documents: neither table carries a
+    /// foreign key, so without the transaction a concurrent `remove_user` or
+    /// prune could leave this grant pointing at nothing.
+    ///
+    /// `resource` is stored as [`normalize_resource`] spells it, so the
+    /// audience comparison at read time is an equality test on one spelling
+    /// rather than a family of them.
+    pub async fn issue_oauth_grant(
+        &self,
+        user: &str,
+        client_id: &str,
+        resource: &str,
+    ) -> Result<IssuedOauthGrant> {
+        let user = normalize_account_name(user)?;
+        let resource = normalize_resource(resource);
+        // The empty string is not an audience. Refused here and refused again
+        // at the read, so the two halves of the check can never agree on
+        // nothing - not even if an origin derivation upstream produced one.
+        if resource.is_empty() {
+            bail!("an oauth grant needs a resource to be issued for");
+        }
+        let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
+        let refresh_token = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let now = chrono::Utc::now();
+        let issued_at = now.timestamp();
+        let created_at = now.to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
+        let result = async {
+            self.require_live_user(&user).await?;
+            if self
+                .query_first(
+                    "SELECT 1 FROM oauth_clients WHERE client_id = ?1",
+                    vec![Value::Text(client_id.to_string())],
+                )
+                .await?
+                .is_none()
+            {
+                bail!("no such oauth client: '{client_id}'");
+            }
+            self.conn
+                .execute(
+                    "INSERT INTO oauth_grants
+                         (user, client_id, resource, access_hash, access_expires_at,
+                          refresh_hash, refresh_expires_at, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    vec![
+                        Value::Text(user.clone()),
+                        Value::Text(client_id.to_string()),
+                        Value::Text(resource.clone()),
+                        Value::Text(token_hash(&access_token)),
+                        Value::Integer(issued_at + OAUTH_ACCESS_TTL_SECS),
+                        Value::Text(token_hash(&refresh_token)),
+                        Value::Integer(issued_at + OAUTH_REFRESH_TTL_SECS),
+                        Value::Text(created_at),
+                    ],
+                )
+                .await
+                .with_context(|| format!("issuing an oauth grant for user '{user}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        // Read after commit, still under `self.guard` and on this connection:
+        // see `issue_mcp_token`'s matching comment.
+        let id = self.conn.last_insert_rowid();
+        Ok(IssuedOauthGrant {
+            id,
+            access_token,
+            refresh_token,
+            expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
+        })
+    }
+
+    /// Present a refresh token. Either it rotates the grant, or it is a replay
+    /// that revokes it, or it matches nothing.
+    ///
+    /// Both lookups and the write they lead to are one `BEGIN IMMEDIATE`, so
+    /// two clients racing the same refresh token cannot both rotate it: the
+    /// loser arrives after the winner's update and finds its token in
+    /// `previous_refresh_hash`, which is a replay by definition and revokes
+    /// the grant. That is the intended answer, not a false positive - two
+    /// holders of one refresh token is exactly what the replay rule is for.
+    ///
+    /// The rotation keys on the token, its client and its window, and joins
+    /// `users` so a disabled account rotates nothing (`Unknown`, indistinguishable
+    /// from a miss, and reversible: re-enabling the account hands its grants
+    /// back the way it hands MCP tokens back). Expiry is a comparison inside
+    /// the statement, never a check in Rust after the read.
+    ///
+    /// The replay lookup deliberately keys on the token hash *alone*: a
+    /// rotated token coming back is evidence a copy of it leaked, whoever
+    /// presents it and however long ago the window closed. Only the immediate
+    /// predecessor is detectable - a second rotation overwrites
+    /// `previous_refresh_hash` - which is enough, because a client that keeps
+    /// rotating is the one that holds the live token.
+    ///
+    /// `resource` is what the client asked its next token to be minted for
+    /// (RFC 8707 section 2.2), or `None` when it asked for nothing. It is
+    /// compared against the audience the grant actually holds - never against
+    /// the address this request arrived at, which says nothing about what the
+    /// token in the caller's hand is good for - and a mismatch is
+    /// [`RefreshOutcome::WrongTarget`] with the row untouched.
+    ///
+    /// **The comparison is here rather than in the caller, and inside this
+    /// transaction, because ordering is a security property.** A replayed
+    /// token has no row under `refresh_hash` at all, so a caller that read the
+    /// grant first and refused on `resource` would refuse before the replay
+    /// was ever looked for, and one extra form field would turn the tripwire
+    /// off. The replay branch below therefore runs whatever resource was
+    /// named, and only a token that matched a live row can be refused for its
+    /// audience.
+    pub async fn refresh_oauth_grant(
+        &self,
+        refresh_token: &str,
+        client_id: &str,
+        resource: Option<&str>,
+    ) -> Result<RefreshOutcome> {
+        let presented = token_hash(refresh_token);
+        let access_token = format!("{OAUTH_ACCESS_PREFIX}{}", random_hex());
+        let next_refresh = format!("{OAUTH_REFRESH_PREFIX}{}", random_hex());
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .context("refreshing an oauth grant")?;
+        // Captured by the block below and read after `finish` commits, the
+        // shape `rotate_mcp_token` already uses for a transaction whose caller
+        // needs more out of it than `Result<()>`.
+        let mut outcome = RefreshOutcome::Unknown;
+        let result = async {
+            let live = self
+                .query_first(
+                    "SELECT g.id, g.resource FROM oauth_grants g JOIN users u ON u.name = g.user
+                     WHERE g.refresh_hash = ?1 AND g.client_id = ?2
+                       AND g.refresh_expires_at > ?3 AND u.disabled = 0",
+                    vec![
+                        Value::Text(presented.clone()),
+                        Value::Text(client_id.to_string()),
+                        Value::Integer(now),
+                    ],
+                )
+                .await?;
+            if let Some(row) = live {
+                let Ok(Value::Integer(id)) = row.get_value(0) else {
+                    return Ok(());
+                };
+                // Only read when there is something to compare it to, and then
+                // fail closed the way the replay branch does: a grant whose
+                // audience cannot be read is one whose audience cannot be
+                // checked, and rotating it would answer a question this store
+                // does not know the answer to.
+                if let Some(asked) = resource {
+                    let Ok(Value::Text(held)) = row.get_value(1) else {
+                        bail!("an oauth grant row has an unreadable resource");
+                    };
+                    if normalize_resource(asked) != normalize_resource(&held) {
+                        outcome = RefreshOutcome::WrongTarget;
+                        return Ok(());
+                    }
+                }
+                self.conn
+                    .execute(
+                        "UPDATE oauth_grants
+                         SET access_hash = ?2,
+                             access_expires_at = ?3,
+                             previous_refresh_hash = refresh_hash,
+                             refresh_hash = ?4,
+                             refresh_expires_at = ?5
+                         WHERE id = ?1",
+                        vec![
+                            Value::Integer(id),
+                            Value::Text(token_hash(&access_token)),
+                            Value::Integer(now + OAUTH_ACCESS_TTL_SECS),
+                            Value::Text(token_hash(&next_refresh)),
+                            Value::Integer(now + OAUTH_REFRESH_TTL_SECS),
+                        ],
+                    )
+                    .await
+                    .context("rotating an oauth grant")?;
+                outcome = RefreshOutcome::Rotated(IssuedOauthGrant {
+                    id,
+                    access_token: access_token.clone(),
+                    refresh_token: next_refresh.clone(),
+                    expires_in: OAUTH_ACCESS_TTL_SECS.unsigned_abs(),
+                });
+                return Ok(());
+            }
+            let replayed = self
+                .query_first(
+                    "SELECT id FROM oauth_grants WHERE previous_refresh_hash = ?1",
+                    vec![Value::Text(presented.clone())],
+                )
+                .await?;
+            if let Some(row) = replayed {
+                // Fails closed, unlike the rotate branch's matching decode: a
+                // grant this store has just proven compromised must not be
+                // left alive by a row it could not read. The whole transaction
+                // rolls back and the caller sees the error.
+                let Ok(Value::Integer(id)) = row.get_value(0) else {
+                    bail!("an oauth grant row has an unreadable id");
+                };
+                self.conn
+                    .execute(
+                        "DELETE FROM oauth_grants WHERE id = ?1",
+                        vec![Value::Integer(id)],
+                    )
+                    .await
+                    .context("revoking a replayed oauth grant")?;
+                outcome = RefreshOutcome::Replayed { grant: id };
+            }
+            Ok(())
+        }
+        .await;
+        self.finish(result).await?;
+        // Both lines are emitted after the commit, never inside the
+        // transaction body. A rollback - a disk error, a busy timeout against
+        // the CLI holding the write lock - must not leave an audit record
+        // claiming a revocation that did not happen, and a revocation is the
+        // one thing here worth an audit record at all.
+        match &outcome {
+            RefreshOutcome::Rotated(grant) => {
+                tracing::debug!(grant = grant.id, client = %client_id, "rotated an oauth grant");
+            }
+            RefreshOutcome::Replayed { grant } => tracing::info!(
+                grant = *grant,
+                client = %client_id,
+                "a replayed refresh token revoked an oauth grant"
+            ),
+            // Neither is worth an audit line: a miss is a miss, and a wrong
+            // audience is a protocol mistake the route already logs one WARN
+            // for, with the client id beside it.
+            RefreshOutcome::Unknown | RefreshOutcome::WrongTarget => {}
+        }
+        Ok(outcome)
+    }
+
+    /// Resolve an OAuth access token to its account, for one resource. `None`
+    /// for an unknown, expired, revoked or wrong-audience token and for a
+    /// disabled account - deliberately indistinguishable, the way
+    /// [`AuthStore::mcp_token_user`] answers, because the gate sends one
+    /// refusal for all of them.
+    ///
+    /// `resource` is the origin this request arrived at. It is compared to the
+    /// one the grant was issued for after [`normalize_resource`] has taken one
+    /// trailing slash off each side, and the comparison happens *in the
+    /// statement*: a token minted for another deployment of this server cannot
+    /// be replayed here, and no branch in Rust can forget to check.
+    ///
+    /// Stamps `last_used` on a hit, and prunes any grant whose account is gone
+    /// on every call that reaches the statement - the same defense in depth
+    /// `mcp_token_user` applies to tokens, for a row reached by some path the
+    /// issuing transaction does not cover. A call naming an empty resource
+    /// returns before it, since such a call could never have matched a grant
+    /// anyway.
+    pub async fn oauth_access_user(&self, token: &str, resource: &str) -> Result<Option<User>> {
+        let hash = token_hash(token);
+        let resource = normalize_resource(resource);
+        // See `issue_oauth_grant`: nothing opens the empty resource, whatever
+        // a row happens to hold.
+        if resource.is_empty() {
+            return Ok(None);
+        }
+        let now = chrono::Utc::now().timestamp();
+        let _guard = self.guard.lock().await;
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grants
+                 WHERE NOT EXISTS (SELECT 1 FROM users u WHERE u.name = oauth_grants.user)",
+                (),
+            )
+            .await
+            .context("pruning orphaned oauth grants")?;
+        let Some(row) = self
+            .query_first(
+                &format!(
+                    "SELECT {USER_COLUMNS_JOINED}, g.id
+                     FROM oauth_grants g JOIN users u ON u.name = g.user
+                     WHERE g.access_hash = ?1 AND g.access_expires_at > ?2 AND g.resource = ?3"
+                ),
+                vec![
+                    Value::Text(hash),
+                    Value::Integer(now),
+                    Value::Text(resource),
+                ],
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        let user = user_from_row(&row);
+        if user.disabled {
+            return Ok(None);
+        }
+        if let Ok(Value::Integer(id)) = row.get_value(6) {
+            self.conn
+                .execute(
+                    "UPDATE oauth_grants SET last_used = ?2 WHERE id = ?1",
+                    vec![
+                        Value::Integer(id),
+                        Value::Text(chrono::Utc::now().to_rfc3339()),
+                    ],
+                )
+                .await
+                .context("stamping an oauth grant's last_used")?;
+        }
+        Ok(Some(user))
+    }
+
+    /// Every OAuth grant `user` holds, newest first, never carrying a token.
+    ///
+    /// A `LEFT JOIN` on purpose: a grant whose registration vanished still
+    /// resolves its tokens, so it has to stay listed to stay revocable. It
+    /// shows [`GONE_OAUTH_CLIENT`] where the name would be rather than
+    /// dropping out of the one screen that can stop it.
+    ///
+    /// A grant past its refresh window is left out, in the statement: it can
+    /// no longer work by any path, so listing it would show a person a
+    /// connection they cannot act on and cannot tell from a live one.
+    /// [`AuthStore::prune_oauth_grants`] removes the rows; this is what keeps
+    /// the card honest in between.
+    pub async fn list_oauth_grants(&self, user: &str) -> Result<Vec<OauthGrantInfo>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT g.id, g.client_id, c.client_name, c.redirect_uris,
+                        g.created_at, g.last_used, g.refresh_expires_at
+                 FROM oauth_grants g
+                 LEFT JOIN oauth_clients c ON c.client_id = g.client_id
+                 WHERE g.user = ?1 AND g.refresh_expires_at > ?2
+                 ORDER BY g.created_at DESC, g.id DESC",
+                vec![
+                    Value::Text(user.clone()),
+                    Value::Integer(chrono::Utc::now().timestamp()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing oauth grants for user '{user}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing oauth grants for user '{user}'"))?
+        {
+            let Ok(Value::Integer(id)) = row.get_value(0) else {
+                continue;
+            };
+            let refresh_expires_at = match row.get_value(6) {
+                Ok(Value::Integer(secs)) => rfc3339_from_unix(secs),
+                _ => String::new(),
+            };
+            out.push(OauthGrantInfo {
+                id,
+                client_id: cell_text(&row, 1).unwrap_or_default(),
+                client_name: cell_text(&row, 2).unwrap_or_else(|| GONE_OAUTH_CLIENT.to_string()),
+                redirect_host: decode_redirect_uris(cell_text(&row, 3).as_deref())
+                    .first()
+                    .map(|uri| redirect_host(uri))
+                    .unwrap_or_default(),
+                created_at: cell_text(&row, 4).unwrap_or_default(),
+                last_used: cell_text(&row, 5),
+                refresh_expires_at,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Revoke one of `user`'s grants by id, reporting whether a row went.
+    /// `false` covers both an unknown id and one belonging to another account,
+    /// deliberately indistinguishable so a caller cannot probe for ids.
+    ///
+    /// One delete stops both of the grant's tokens at once, which is the whole
+    /// reason a grant is one row rather than a token table plus a refresh
+    /// table.
+    pub async fn revoke_oauth_grant(&self, user: &str, id: i64) -> Result<bool> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE id = ?1 AND user = ?2",
+                vec![Value::Integer(id), Value::Text(user.clone())],
+            )
+            .await
+            .with_context(|| format!("revoking an oauth grant for user '{user}'"))?;
+        if changed > 0 {
+            tracing::info!(grant = id, user = %user, "revoked an oauth grant");
+        }
+        Ok(changed > 0)
+    }
+
+    /// Drop every OAuth grant of one account. Called by both removal paths
+    /// inside their transaction, for the reason [`AuthStore::delete_mcp_tokens_of`]
+    /// documents one table over: `oauth_grants` carries no foreign key, so a
+    /// row that outlived its account would resolve for whoever next claims the
+    /// freed name.
+    ///
+    /// Deliberately not called by [`AuthStore::set_disabled`]: disabling is
+    /// reversible, and both OAuth lookups refuse a disabled account at read
+    /// time, so re-enabling hands the connections back rather than making
+    /// every client authorize again.
+    ///
+    /// The registrations themselves are left alone: they are shared, and the
+    /// ones nobody is connected through go on their own schedule, through
+    /// [`AuthStore::prune_oauth_clients`].
+    async fn delete_oauth_grants_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM oauth_grants WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing oauth grants for user '{name}'"))?;
+        Ok(())
+    }
+
+    /// The visibility record of one domain: `Some` when it is private, `None`
+    /// when it is shared, which is every domain nobody ever made private.
+    ///
+    /// The lookup is exact on the trimmed name ([`normalize_domain`]), so it
+    /// answers for the same string the engine keys its domain map on.
+    pub async fn domain_visibility(&self, domain: &str) -> Result<Option<DomainAcl>> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        self.acl_of(&domain).await
+    }
+
+    /// [`AuthStore::domain_visibility`] without the lock or the folding, for
+    /// the methods that already hold both.
+    async fn acl_of(&self, domain: &str) -> Result<Option<DomainAcl>> {
+        let row = self
+            .query_first(
+                "SELECT domain, owner FROM domain_acl WHERE domain = ?1",
+                vec![Value::Text(domain.to_string())],
+            )
+            .await
+            .with_context(|| format!("reading the visibility of domain '{domain}'"))?;
+        // The name comes from the caller rather than from the row: this is a
+        // lookup by exact name, so the row's own copy can only agree, and
+        // defaulting an unreadable cell to `""` here would hand back an acl
+        // that names a domain nobody asked about. The owner keeps its default
+        // because `""` is the one value no live account can match, so an
+        // unreadable owner cell reads as owned by nobody - closed, not open.
+        Ok(row.map(|row| DomainAcl {
+            domain: domain.to_string(),
+            owner: cell_text(&row, 1).unwrap_or_default(),
+        }))
+    }
+
+    /// Make `domain` private, owned by `owner`, or make it shared again.
+    ///
+    /// `private = true` on a SHARED domain writes the acl row naming `owner`
+    /// and leaves the (nonexistent) membership alone. The one row it drops is
+    /// the new owner's own membership, if some earlier private spell left one:
+    /// an owner holds every level, so the row could only say less than the
+    /// truth, and it would come back to life the moment the domain is handed
+    /// on again. This is the same step [`AuthStore::transfer_domain`] takes,
+    /// for the same reason - the two paths that change an owner must agree.
+    /// On a domain that is already private this writes nothing at all; see the
+    /// paragraph below. `private = false` deletes the acl row *and*
+    /// every membership row for the domain: membership only means anything
+    /// while a domain is private, and leaving the rows behind would silently
+    /// restore them if the domain were ever made private again by somebody
+    /// else.
+    ///
+    /// `owner` must name an existing, enabled account. An acl row pointing at
+    /// nobody would be a domain only an admin could ever reach, with no way to
+    /// invite anyone into it, which is a state no caller can have meant.
+    ///
+    /// Both halves run in one `BEGIN IMMEDIATE` transaction, for the reason
+    /// [`AuthStore::issue_mcp_token`] documents: the owner check and the write
+    /// must see the same users table, and the two deletes must not be
+    /// separable by another writer.
+    ///
+    /// Turning privacy off on a domain that was never private is a no-op
+    /// rather than an error - the caller asked for a state that already holds.
+    ///
+    /// **Privatizing an already-private domain is a no-op too, and that is the
+    /// half that matters.** Writing the row again would delete the acl row and
+    /// insert one naming the CALLER, so a retried request, a stale client or a
+    /// script would hand the domain to whoever asked last and drop its previous
+    /// owner - who holds no membership row by construction - to no access at
+    /// all, with nothing said to either of them. A `PUT` states a visibility;
+    /// changing an owner is [`AuthStore::transfer_domain`]'s job, and it is a
+    /// verb of its own for exactly this reason. So the record is read first and
+    /// left exactly as it stands, owner and members included, and the answer
+    /// says it was already private so a caller can say so too.
+    pub async fn set_domain_visibility(
+        &self,
+        domain: &str,
+        private: bool,
+        owner: &str,
+    ) -> Result<VisibilityWrite> {
+        let domain = normalize_domain(domain)?;
+        let owner = normalize_account_name(owner)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("setting the visibility of domain '{domain}'"))?;
+        let result = async {
+            if !private {
+                self.delete_members_of_domain(&domain).await?;
+                self.conn
+                    .execute(
+                        "DELETE FROM domain_acl WHERE domain = ?1",
+                        vec![Value::Text(domain.clone())],
+                    )
+                    .await
+                    .with_context(|| format!("making domain '{domain}' shared"))?;
+                return Ok(VisibilityWrite::Written);
+            }
+            if let Some(acl) = self.acl_of(&domain).await? {
+                return Ok(VisibilityWrite::AlreadyPrivate { owner: acl.owner });
+            }
+            self.require_live_user(&owner).await?;
+            // Delete then insert rather than an upsert clause: two plain
+            // statements inside the transaction that already serializes them,
+            // with no dependence on which conflict syntax the embedded
+            // database supports.
+            self.conn
+                .execute(
+                    "DELETE FROM domain_acl WHERE domain = ?1",
+                    vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("making domain '{domain}' private"))?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(owner.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("making domain '{domain}' private"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO domain_acl (domain, visibility, owner, updated_at)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(VISIBILITY_PRIVATE.to_string()),
+                        Value::Text(owner.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("making domain '{domain}' private"))?;
+            Ok(VisibilityWrite::Written)
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Retire every visibility and membership record of one domain, for a
+    /// domain that has just been unregistered.
+    ///
+    /// Deliberately not [`AuthStore::set_domain_visibility`] with `private =
+    /// false`: that means "this domain is shared now", takes an owner it has no
+    /// use for here, and leaves a domain standing. This means "there is no such
+    /// domain any more", and it is the only caller that is allowed to drop an
+    /// acl row without somebody deciding the domain should be public.
+    ///
+    /// Both tables go in one transaction, so a domain can never be left
+    /// half-forgotten: an acl row with no members would still hide the name
+    /// from everyone but an admin. Answers whether there was an acl row at all,
+    /// which is how a caller can tell a private domain's records from a shared
+    /// domain's absence of them.
+    pub async fn forget_domain(&self, domain: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
+        let result = async {
+            let was_private = self.acl_of(&domain).await?.is_some();
+            self.delete_members_of_domain(&domain).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_acl WHERE domain = ?1",
+                    vec![Value::Text(domain.clone())],
+                )
+                .await
+                .with_context(|| format!("forgetting the records of domain '{domain}'"))?;
+            Ok(was_private)
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Hand a private domain to a different owner.
+    ///
+    /// The new owner must be an existing, enabled account, and the domain must
+    /// already be private: there is no owner to transfer on a shared domain,
+    /// and inventing one here would make a domain private as a side effect of
+    /// a transfer.
+    ///
+    /// A membership row for the new owner is dropped in the same transaction.
+    /// The owner already holds every level (see [`DomainRight`] in
+    /// `crate::scope`), so leaving one behind would be a row that says less
+    /// than the truth and would come back to life the moment the domain is
+    /// transferred away again.
+    ///
+    /// [`DomainRight`]: crate::scope::DomainRight
+    pub async fn transfer_domain(&self, domain: &str, new_owner: &str) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let new_owner = normalize_account_name(new_owner)?;
+        let now = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("transferring domain '{domain}'"))?;
+        let result = async {
+            if self.acl_of(&domain).await?.is_none() {
+                return Err(refuse(
+                    RefusalKind::NotPrivate,
+                    format!("domain '{domain}' is not private, so it has no owner to transfer"),
+                ));
+            }
+            self.require_live_user(&new_owner).await?;
+            self.conn
+                .execute(
+                    "UPDATE domain_acl SET owner = ?2, updated_at = ?3 WHERE domain = ?1",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(new_owner.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("transferring domain '{domain}'"))?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(new_owner.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("transferring domain '{domain}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Everyone invited to `domain`, by name. The owner is deliberately absent:
+    /// it is a property of the domain, not a membership row, and it is read
+    /// from [`AuthStore::domain_visibility`].
+    pub async fn domain_members(&self, domain: &str) -> Result<Vec<DomainMember>> {
+        let domain = normalize_domain(domain)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT principal, level, added_by, added_at FROM domain_member
+                 WHERE domain = ?1 AND principal_kind = ?2 ORDER BY principal",
+                vec![
+                    Value::Text(domain.clone()),
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing the members of domain '{domain}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing the members of domain '{domain}'"))?
+        {
+            out.push(DomainMember {
+                principal: cell_text(&row, 0).unwrap_or_default(),
+                level: member_level_from_db(&cell_text(&row, 1).unwrap_or_default()),
+                added_by: cell_text(&row, 2).unwrap_or_default(),
+                added_at: cell_text(&row, 3).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Invite `principal` to `domain` at `level`, or change the level it is
+    /// already there at. `added_by` is recorded as given (trimmed): it is an
+    /// audit field, usually the acting account's name, and it is not resolved
+    /// against the users table because a non-account actor may legitimately
+    /// grant membership. It may not be empty, though - a blank "invited by" is
+    /// not an audit trail, and it is what a caller that forgot to pass one
+    /// would write.
+    ///
+    /// Three things are refused, all inside the one transaction that also does
+    /// the write so none of them can be raced past:
+    ///
+    /// * a domain that is not private, because a membership row there would
+    ///   grant nothing and mean nothing (see `crate::scope`, where every
+    ///   caller's right on a shared domain comes from its instance role);
+    /// * a principal that is not an existing, enabled account, so a typo is
+    ///   reported instead of leaving a row waiting for someone to claim that
+    ///   name later;
+    /// * the domain's own owner, which is the one row that could only ever
+    ///   *reduce* what its holder may do.
+    pub async fn upsert_domain_member(
+        &self,
+        domain: &str,
+        principal: &str,
+        level: MemberLevel,
+        added_by: &str,
+    ) -> Result<()> {
+        let domain = normalize_domain(domain)?;
+        let principal = normalize_account_name(principal)?;
+        let added_by = added_by.trim().to_string();
+        if added_by.is_empty() {
+            bail!("recording a membership needs an actor to record it as");
+        }
+        let now = chrono::Utc::now().to_rfc3339();
+        let _guard = self.guard.lock().await;
+        self.begin_immediate()
+            .await
+            .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
+        let result = async {
+            let Some(acl) = self.acl_of(&domain).await? else {
+                return Err(refuse(
+                    RefusalKind::NotPrivate,
+                    format!(
+                        "domain '{domain}' is not private, so it has no membership: \
+                         make it private first"
+                    ),
+                ));
+            };
+            if acl.owner == principal {
+                return Err(refuse(
+                    RefusalKind::OwnerIsNotAMember,
+                    format!(
+                        "'{principal}' owns domain '{domain}': \
+                         the owner already holds every level"
+                    ),
+                ));
+            }
+            self.require_live_user(&principal).await?;
+            self.conn
+                .execute(
+                    "DELETE FROM domain_member
+                     WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(principal.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
+            self.conn
+                .execute(
+                    "INSERT INTO domain_member
+                         (domain, principal_kind, principal, level, added_by, added_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    vec![
+                        Value::Text(domain.clone()),
+                        Value::Text(PRINCIPAL_USER.to_string()),
+                        Value::Text(principal.clone()),
+                        Value::Text(level.as_str().to_string()),
+                        Value::Text(added_by.clone()),
+                        Value::Text(now.clone()),
+                    ],
+                )
+                .await
+                .with_context(|| format!("adding '{principal}' to domain '{domain}'"))?;
+            Ok(())
+        }
+        .await;
+        self.finish(result).await
+    }
+
+    /// Remove one membership. Returns whether a row was deleted, so a caller
+    /// can tell "removed" from "was never a member" without a second read.
+    pub async fn remove_domain_member(&self, domain: &str, principal: &str) -> Result<bool> {
+        let domain = normalize_domain(domain)?;
+        let principal = normalize_account_name(principal)?;
+        let _guard = self.guard.lock().await;
+        let changed = self
+            .conn
+            .execute(
+                "DELETE FROM domain_member
+                 WHERE domain = ?1 AND principal_kind = ?2 AND principal = ?3",
+                vec![
+                    Value::Text(domain.clone()),
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(principal.clone()),
+                ],
+            )
+            .await
+            .with_context(|| format!("removing '{principal}' from domain '{domain}'"))?;
+        Ok(changed > 0)
+    }
+
+    /// Every private domain, by name. This is the whole input to the
+    /// visibility filter: a domain absent from this list is visible to
+    /// everyone who may reach the instance at all.
+    pub async fn private_domains(&self) -> Result<Vec<DomainAcl>> {
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query("SELECT domain, owner FROM domain_acl ORDER BY domain", ())
+            .await
+            .context("listing the private domains")?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.context("listing the private domains")? {
+            // A row whose name cannot be read fails the whole call rather than
+            // being skipped or defaulted. This list is the *input* to the
+            // visibility filter, so dropping an entry (or defaulting it to
+            // `""`, which is what it used to do) would leave a private domain
+            // hidden from nobody. Skipping is the right answer one table over
+            // in `memberships_of`, where a lost row only ever narrows what its
+            // holder may reach; here it widens, so it must not be silent. The
+            // column is `NOT NULL`, so this is a corrupt file, not a state the
+            // schema permits.
+            let Some(domain) = cell_text(&row, 0) else {
+                bail!(
+                    "the visibility record of a private domain is unreadable: \
+                     refusing to answer rather than serving it to everyone"
+                );
+            };
+            out.push(DomainAcl {
+                domain,
+                owner: cell_text(&row, 1).unwrap_or_default(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Every private domain `user` is a member of, with the level. Owned
+    /// domains are not in here (an owner holds no membership row); the caller
+    /// reads ownership from the acl rows it already has.
+    pub async fn memberships_of(&self, user: &str) -> Result<Vec<(String, MemberLevel)>> {
+        let user = normalize_account_name(user)?;
+        let _guard = self.guard.lock().await;
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT domain, level FROM domain_member
+                 WHERE principal_kind = ?1 AND principal = ?2 ORDER BY domain",
+                vec![
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(user.clone()),
+                ],
+            )
+            .await
+            .with_context(|| format!("listing the memberships of '{user}'"))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows
+            .next()
+            .await
+            .with_context(|| format!("listing the memberships of '{user}'"))?
+        {
+            let Some(domain) = cell_text(&row, 0) else {
+                continue;
+            };
+            out.push((
+                domain,
+                member_level_from_db(&cell_text(&row, 1).unwrap_or_default()),
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Un-name `name` as the owner of every private domain it owns, leaving
+    /// each row owned by nobody.
+    ///
+    /// The other half of the removal sweep, and the half that closes the
+    /// resurrection hazard on this table: `domain_acl` carries no foreign key,
+    /// so an owner row that kept a freed login name would hand ownership - read,
+    /// write, membership management and the power to make the domain shared
+    /// again - to whoever is next added under that name. That is the same
+    /// hazard `a_readded_name_does_not_inherit_the_old_holders_session` pins for
+    /// sessions and [`AuthStore::mcp_token_user`] for tokens, one table over,
+    /// and here it would hand a private domain to a stranger.
+    ///
+    /// The empty string is the "owned by nobody" marker because
+    /// [`normalize_account_name`] can never produce it, so no live account can ever
+    /// match it. The domain stays private and its members keep their levels;
+    /// what it loses is an owner, which leaves it administered by instance
+    /// admins alone until one runs [`AuthStore::transfer_domain`]. Choosing a
+    /// successor is deliberately not done here - that is a product decision,
+    /// and every automatic answer (the removing admin, the senior manager)
+    /// hands somebody a domain nobody gave them.
+    async fn disown_domains_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE domain_acl SET owner = '' WHERE owner = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("releasing the domains owned by user '{name}'"))?;
+        Ok(())
+    }
+
+    /// Fail unless `name` is an existing account that is not disabled. Called
+    /// inside a transaction, so what it checked is what the write beside it
+    /// sees.
+    ///
+    /// A disabled account is refused rather than accepted: it cannot sign in,
+    /// so granting it access would be a row nobody can use today and a
+    /// surprise the day the account is re-enabled.
+    async fn require_live_user(&self, name: &str) -> Result<()> {
+        let row = self
+            .query_first(
+                "SELECT disabled FROM users WHERE name = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?;
+        // Both arms carry the SAME kind. The two states are told apart in the
+        // message, for the operator-facing surfaces that may see it, and never
+        // by the type - so a surface that collapses them cannot accidentally
+        // grow a branch that does not.
+        match row {
+            None => Err(refuse(
+                RefusalKind::NoSuchAccount,
+                format!("no such user: '{name}'"),
+            )),
+            Some(row) if matches!(row.get_value(0), Ok(Value::Integer(i)) if i != 0) => {
+                Err(refuse(
+                    RefusalKind::NoSuchAccount,
+                    format!("user '{name}' is disabled: enable the account first"),
+                ))
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Drop every membership row of one domain. Callers hold the lock and are
+    /// inside a transaction.
+    ///
+    /// The one statement here that deliberately carries no `principal_kind`
+    /// filter, where every sibling has one: a domain that is no longer private
+    /// has no membership of any kind, so this must sweep a future group row
+    /// too. Not an omission - do not "fix" it.
+    async fn delete_members_of_domain(&self, domain: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_member WHERE domain = ?1",
+                vec![Value::Text(domain.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the members of domain '{domain}'"))?;
+        Ok(())
+    }
+
+    /// Drop every membership row `name` holds, wherever it holds one.
+    ///
+    /// Called from both removal paths for the reason
+    /// `a_readded_name_does_not_inherit_the_old_holders_session` pins for
+    /// sessions: `domain_member` carries no foreign key, so a row left behind
+    /// would be inherited by the next account to claim the same login name -
+    /// here that would hand a stranger read access to a private domain. The
+    /// belt to [`AuthStore::mcp_token_user`]'s suspenders, one table over.
+    ///
+    /// Deliberately not called by [`AuthStore::set_disabled`]: disabling is
+    /// reversible and `crate::scope` already refuses a disabled account at
+    /// resolve time, so re-enabling must hand the memberships back rather than
+    /// force every invitation to be issued again.
+    ///
+    /// Ownership is handled beside this, by [`AuthStore::disown_domains_of`].
+    async fn delete_memberships_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM domain_member WHERE principal_kind = ?1 AND principal = ?2",
+                vec![
+                    Value::Text(PRINCIPAL_USER.to_string()),
+                    Value::Text(name.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("removing the memberships of user '{name}'"))?;
+        Ok(())
+    }
+
+    /// The two conflict checks and the insert that make one link, with no
+    /// lock taken and no transaction opened.
+    ///
+    /// Both public linking paths call this after taking the guard and opening
+    /// their own transaction, because neither the guard (a `tokio` mutex) nor
+    /// a turso transaction is reentrant: a method calling the other public
+    /// method would deadlock on the first and be refused on the second.
+    async fn insert_link(
+        &self,
+        issuer: &str,
+        subject: &str,
+        user: &str,
+        linked_by: &str,
+    ) -> Result<()> {
+        let pair = vec![
+            Value::Text(issuer.to_string()),
+            Value::Text(subject.to_string()),
+        ];
+        if let Some(row) = self
+            .query_first(
+                "SELECT user FROM identity_link WHERE issuer = ?1 AND subject = ?2",
+                pair.clone(),
+            )
+            .await?
+        {
+            let holder = cell_text(&row, 0).unwrap_or_default();
+            return Err(refuse(
+                RefusalKind::IdentityAlreadyLinked,
+                format!(
+                    "this identity is already linked to account '{holder}': an admin can move it"
+                ),
+            ));
+        }
+        if self
+            .query_first(
+                "SELECT subject FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                vec![
+                    Value::Text(issuer.to_string()),
+                    Value::Text(user.to_string()),
+                ],
+            )
+            .await?
+            .is_some()
+        {
+            return Err(refuse(
+                RefusalKind::IssuerAlreadyHeld,
+                format!(
+                    "account '{user}' already holds an identity at this provider: unlink that \
+                     one first"
+                ),
+            ));
+        }
+        self.conn
+            .execute(
+                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    Value::Text(issuer.to_string()),
+                    Value::Text(subject.to_string()),
+                    Value::Text(user.to_string()),
+                    Value::Text(chrono::Utc::now().to_rfc3339()),
+                    Value::Text(linked_by.to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("linking an identity to user '{user}'"))?;
+        Ok(())
+    }
+
+    /// The first free account name from `base`, `base-2`, `base-3` and so on.
+    /// Called inside a transaction, so the name it found is still free when
+    /// the insert beside it runs.
+    async fn free_account_name(&self, base: &str) -> Result<String> {
+        for attempt in 1..=MAX_NAME_ATTEMPTS {
+            let candidate = if attempt == 1 {
+                base.to_string()
+            } else {
+                format!("{base}-{attempt}")
+            };
+            if self
+                .query_first(
+                    "SELECT 1 FROM users WHERE name = ?1",
+                    vec![Value::Text(candidate.clone())],
+                )
+                .await?
+                .is_none()
+            {
+                return Ok(candidate);
+            }
+        }
+        bail!("refusing to provision an account: every name from '{base}' on is taken")
+    }
+
+    /// Whether `user` holds a link at `issuer`. Callers hold the lock and are
+    /// inside a transaction.
+    async fn link_at(&self, issuer: &str, user: &str) -> Result<bool> {
+        Ok(self
+            .query_first(
+                "SELECT 1 FROM identity_link WHERE issuer = ?1 AND user = ?2",
+                vec![
+                    Value::Text(issuer.to_string()),
+                    Value::Text(user.to_string()),
+                ],
+            )
+            .await?
+            .is_some())
+    }
+
+    /// How many identities `user` holds, across every issuer. Callers hold the
+    /// lock and are inside a transaction.
+    async fn link_count(&self, user: &str) -> Result<i64> {
+        let row = self
+            .query_first(
+                "SELECT COUNT(*) FROM identity_link WHERE user = ?1",
+                vec![Value::Text(user.to_string())],
+            )
+            .await?;
+        Ok(match row.as_ref().map(|row| row.get_value(0)) {
+            Some(Ok(Value::Integer(count))) => count,
+            _ => 0,
+        })
+    }
+
+    /// Whether the account row for `name` carries a password hash. Callers
+    /// hold the lock; the two transactional callers are inside one.
+    ///
+    /// The hash itself is never read out: what comes back is the one bit the
+    /// question needs, so no caller can grow a habit of holding one.
+    async fn password_present(&self, name: &str) -> Result<bool> {
+        let row = self
+            .query_first(
+                "SELECT pass_hash IS NOT NULL AND pass_hash <> '' FROM users WHERE name = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await?;
+        Ok(matches!(
+            row.as_ref().map(|row| row.get_value(0)),
+            Some(Ok(Value::Integer(present))) if present != 0
+        ))
+    }
+
+    /// Drop every identity linked to one account. Called inside the removal
+    /// transaction: a link that outlived its account would hand the next
+    /// account to claim the name somebody else's sign-on.
+    async fn delete_identity_links_of(&self, name: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM identity_link WHERE user = ?1",
+                vec![Value::Text(name.to_string())],
+            )
+            .await
+            .with_context(|| format!("removing the identity links of user '{name}'"))?;
+        Ok(())
+    }
+
     /// Run a single-column update against one account, failing when the account
     /// does not exist, for a statement carrying the [`NOT_LAST_ADMIN`] guard:
     /// zero rows changed then has a second possible meaning, that the edit was
@@ -1298,7 +3942,7 @@ impl AuthStore {
     /// nothing was written either way - so it does not need to share the
     /// statement's transaction.
     async fn update_guarded(&self, sql: &str, name: &str, value: Value, verb: &str) -> Result<()> {
-        let name = normalize_name(name)?;
+        let name = normalize_account_name(name)?;
         let _guard = self.guard.lock().await;
         let changed = self
             .conn
@@ -1336,14 +3980,14 @@ impl AuthStore {
     /// Commit when the body succeeded, roll back when it did not. The rollback
     /// is best-effort: the body's error is what the caller needs to see, and
     /// an abandoned transaction is released when the connection drops anyway.
-    async fn finish(&self, result: Result<()>) -> Result<()> {
+    async fn finish<T>(&self, result: Result<T>) -> Result<T> {
         match result {
-            Ok(()) => {
+            Ok(value) => {
                 self.conn
                     .execute("COMMIT", ())
                     .await
                     .context("committing an auth database transaction")?;
-                Ok(())
+                Ok(value)
             }
             Err(e) => {
                 let _ = self.conn.execute("ROLLBACK", ()).await;
@@ -1411,12 +4055,89 @@ fn cell_text(row: &Row, idx: usize) -> Option<String> {
     }
 }
 
-/// 32 bytes from the OS CSPRNG, lowercase hex. Used for both the session token
-/// and the CSRF token.
-fn random_hex() -> String {
-    let mut bytes = [0u8; 32];
+/// `N` bytes from the OS CSPRNG, lowercase hex. The single entropy source
+/// behind every random value this file mints, so an audit of "where does the
+/// randomness come from" reads one function rather than one per family.
+fn random_hex_bytes<const N: usize>() -> String {
+    let mut bytes = [0u8; N];
     OsRng.fill_bytes(&mut bytes);
     crystalline_index::hex_lower(&bytes)
+}
+
+/// 32 bytes, 64 hex characters: the random half of every credential here - a
+/// session token, its CSRF token, an MCP token, and an OAuth access and
+/// refresh token.
+fn random_hex() -> String {
+    random_hex_bytes::<32>()
+}
+
+/// 16 bytes, 32 hex characters: the random half of an OAuth client id. Half
+/// the width of [`random_hex`] on purpose - a client id is a public identifier
+/// that authorizes nothing by itself, and 128 random bits is already far past
+/// guessing.
+fn random_id_hex() -> String {
+    random_hex_bytes::<16>()
+}
+
+/// A resource identifier as the audience check compares it: trimmed, with at
+/// most one trailing slash taken off.
+///
+/// Exactly that tolerance and nothing more. Nothing is lowercased and no other
+/// canonicalization happens, because an origin that differs in any other way
+/// is a different origin, and an audience check that "helpfully" folded
+/// spellings together would be the hole it exists to close. The trailing slash
+/// is the one difference clients actually produce, since a person typing the
+/// server address into a client adds or omits it without meaning anything by
+/// it.
+///
+/// `pub(crate)` so the request-origin side compares the same spelling this one
+/// stores; a second implementation of this rule is a bug waiting to happen.
+pub(crate) fn normalize_resource(resource: &str) -> String {
+    let trimmed = resource.trim();
+    trimmed.strip_suffix('/').unwrap_or(trimmed).to_string()
+}
+
+/// The host (with its port, when the uri names one) a client is redirected
+/// back to, for the consent screen and the grant list.
+///
+/// Display only. Whether a redirect uri is acceptable, and whether the one
+/// presented at the token endpoint matches the registration, are decisions
+/// made against the registered uris themselves - never against this string.
+///
+/// A uri that names no host - one that does not parse, or a `javascript:` or
+/// `data:` uri, which parse and carry none - reads as [`NO_REDIRECT_HOST`]
+/// rather than being echoed. Registration validation should make both
+/// unreachable; this is the last line before attacker-chosen text lands in a
+/// field a person reads as the address they are being asked to recognize.
+pub(crate) fn redirect_host(uri: &str) -> String {
+    let Ok(parsed) = openidconnect::url::Url::parse(uri) else {
+        return NO_REDIRECT_HOST.to_string();
+    };
+    match (parsed.host_str(), parsed.port()) {
+        (Some(host), Some(port)) => format!("{host}:{port}"),
+        (Some(host), None) => host.to_string(),
+        (None, _) => NO_REDIRECT_HOST.to_string(),
+    }
+}
+
+/// Decode the JSON array a registration's redirect uris are stored as.
+///
+/// A missing or unreadable value reads as no uris at all, which fails closed:
+/// a registration with nothing to match against can complete no flow, where a
+/// tolerant fallback would have to invent a uri to redirect to.
+fn decode_redirect_uris(encoded: Option<&str>) -> Vec<String> {
+    encoded
+        .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        .unwrap_or_default()
+}
+
+/// A unix timestamp column as the RFC 3339 string a person reads. The expiry
+/// columns are integers so every comparison happens in SQL; this is the one
+/// place that turns one back into text, on the way out to a management screen.
+fn rfc3339_from_unix(secs: i64) -> String {
+    chrono::DateTime::from_timestamp(secs, 0)
+        .map(|when| when.to_rfc3339())
+        .unwrap_or_default()
 }
 
 /// What is stored for a session token. The token itself is never written, so a
@@ -2454,7 +5175,7 @@ mod tests {
     }
 
     /// Login names are space-free: the readable form belongs in the display name.
-    /// Enforced in normalize_name so every path - add, ensure, verify, edit -
+    /// Enforced in normalize_account_name so every path - add, ensure, verify, edit -
     /// refuses the same way.
     #[tokio::test]
     async fn a_name_with_internal_whitespace_is_rejected_on_every_path() {
@@ -2487,12 +5208,12 @@ mod tests {
     }
 
     #[test]
-    fn normalize_name_trims_folds_and_rejects_empty() {
-        assert_eq!(normalize_name("  AdA  ").unwrap(), "ada");
-        assert_eq!(normalize_name("Ada").unwrap(), "ada");
-        assert!(normalize_name("").is_err());
-        assert!(normalize_name("   ").is_err());
-        assert!(normalize_name("ada lovelace").is_err());
+    fn normalize_account_name_trims_folds_and_rejects_empty() {
+        assert_eq!(normalize_account_name("  AdA  ").unwrap(), "ada");
+        assert_eq!(normalize_account_name("Ada").unwrap(), "ada");
+        assert!(normalize_account_name("").is_err());
+        assert!(normalize_account_name("   ").is_err());
+        assert!(normalize_account_name("ada lovelace").is_err());
     }
 
     #[tokio::test]
@@ -3017,6 +5738,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn marking_a_sighting_moves_last_seen() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Viewer, "pw")
+            .await
+            .unwrap();
+        let before = store.user("ada").await.unwrap().unwrap().last_seen;
+        assert!(before.is_none(), "an account nobody has used yet");
+        store.mark_seen("ada").await.unwrap();
+        let after = store.user("ada").await.unwrap().unwrap().last_seen;
+        assert!(after.is_some(), "and one that just arrived");
+        // A name nobody holds is not an error: the caller stamps a row it read,
+        // and a row removed in between is somebody else's problem to report.
+        store.mark_seen("nobody").await.unwrap();
+    }
+
     /// The operator escape hatch: --force bypasses the last-admin guard. It still
     /// reports a missing account, and a forced removal still takes the sessions
     /// with it in the same transaction.
@@ -3045,5 +5783,2617 @@ mod tests {
 
         assert!(store.set_role_force("ghost", Role::Viewer).await.is_err());
         assert!(store.remove_user_force("ghost").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn mcp_token_round_trip_and_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "laptop-agent").await.unwrap();
+        assert!(issued.token.starts_with("cmt_"));
+        assert_eq!(issued.token.len(), 4 + 64);
+        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
+        assert_eq!(user.name, "ada");
+        let listed = store.list_mcp_tokens("ada").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].last_used.is_some());
+
+        // The store never keeps the plaintext - proved, not just commented.
+        // Read the raw column via the store's own connection (tests are a
+        // descendant module, so the private field and helper are reachable)
+        // and check it against an independently computed sha256, the same
+        // property `token_hash` is supposed to have.
+        let row = store
+            .query_first(
+                "SELECT token_hash FROM mcp_tokens WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let stored_hash = cell_text(&row, 0).unwrap();
+        assert_eq!(stored_hash.len(), 64, "a sha256 hex digest is 64 chars");
+        assert!(
+            stored_hash.chars().all(|c| c.is_ascii_hexdigit()),
+            "the stored value must be hex, not the token itself"
+        );
+        assert_ne!(stored_hash, issued.token);
+        assert!(!stored_hash.contains(issued.token.as_str()));
+        assert!(!issued.token.contains(stored_hash.as_str()));
+        let mut hasher = Sha256::new();
+        hasher.update(issued.token.as_bytes());
+        let expected = crystalline_index::hex_lower(&hasher.finalize());
+        assert_eq!(
+            stored_hash, expected,
+            "the column holds sha256 of the whole token, prefix included"
+        );
+
+        assert!(store.revoke_mcp_token("ada", issued.id).await.unwrap());
+        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn mcp_token_of_a_disabled_account_stops_resolving() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "t").await.unwrap();
+        store.set_disabled("ada", true).await.unwrap();
+        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+
+        // Disabled without deletion: the row must still be there, and
+        // re-enabling must hand the very same token back rather than force a
+        // re-issue.
+        let listed = store.list_mcp_tokens("ada").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "disabling an account must not delete its mcp tokens"
+        );
+        store.set_disabled("ada", false).await.unwrap();
+        let user = store.mcp_token_user(&issued.token).await.unwrap().unwrap();
+        assert_eq!(user.name, "ada");
+    }
+
+    #[tokio::test]
+    async fn an_orphaned_mcp_token_row_cannot_resolve_and_gets_pruned() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
+
+        // Simulate the stranded-row scenario `issue_mcp_token`'s own
+        // transaction now prevents live: an account vanishing by a path other
+        // than `remove_user`'s sweep, leaving an `mcp_tokens` row with no
+        // matching account (the table carries no foreign key). A row written
+        // before this defense existed, or reached some other way, must still
+        // fail closed rather than resolve for whoever next claims the name.
+        store
+            .conn
+            .execute("DELETE FROM users WHERE name = 'ada'", ())
+            .await
+            .unwrap();
+
+        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+
+        let remaining = store
+            .query_first("SELECT COUNT(*) FROM mcp_tokens", vec![])
+            .await
+            .unwrap()
+            .unwrap();
+        let count = match remaining.get_value(0) {
+            Ok(Value::Integer(n)) => n,
+            other => panic!("unexpected COUNT(*) result: {other:?}"),
+        };
+        assert_eq!(
+            count, 0,
+            "mcp_token_user must prune the orphaned row, not just refuse it"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_token_rotation_replaces_in_one_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = AuthStore::open(&dir.path().join("web-auth.db"))
+            .await
+            .unwrap();
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let first = store.issue_mcp_token("ada", "agent").await.unwrap();
+        let second = store.rotate_mcp_token("ada", first.id).await.unwrap();
+        assert_eq!(second.label, "agent");
+        assert!(store.mcp_token_user(&first.token).await.unwrap().is_none());
+        assert!(store.mcp_token_user(&second.token).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_revokes_its_mcp_tokens() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "agent").await.unwrap();
+        store.remove_user("ada").await.unwrap();
+        assert!(store.mcp_token_user(&issued.token).await.unwrap().is_none());
+        assert!(store.list_mcp_tokens("ada").await.unwrap().is_empty());
+    }
+
+    /// A name that is not an account reads as `None`, and a folded spelling of
+    /// one that is finds it: the difference between "no such user" and "an
+    /// account with no tokens" rests on this.
+    #[tokio::test]
+    async fn one_account_is_read_back_by_any_spelling_of_its_name() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        for spelling in ["ada", "ADA", "  Ada  "] {
+            let found = store.user(spelling).await.unwrap();
+            assert_eq!(found.expect("'{spelling}' is ada").name, "ada");
+        }
+        assert!(store.user("ghost").await.unwrap().is_none());
+    }
+
+    /// The one unhashed copy of a live credential must never be one
+    /// `tracing::debug!` or one failed assertion away from a log file, while
+    /// the id and the label - the parts that make such a line useful - still
+    /// print. Asserted on the random half rather than on the whole token: the
+    /// redaction keeps the [`MCP_TOKEN_PREFIX`], so `!contains(&issued.token)`
+    /// would pass even if the secret leaked in pieces.
+    #[tokio::test]
+    async fn an_issued_token_never_prints_its_secret() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let issued = store.issue_mcp_token("ada", "laptop").await.unwrap();
+        let secret = issued
+            .token
+            .strip_prefix(MCP_TOKEN_PREFIX)
+            .expect("a token carries the prefix");
+        let text = format!("{issued:?}");
+        assert!(!text.contains(secret), "the secret is redacted: {text}");
+        assert!(text.contains("redacted"), "and says so: {text}");
+        assert!(
+            text.contains("laptop") && text.contains(&issued.id.to_string()),
+            "while the id and label still print: {text}"
+        );
+    }
+
+    /// The membership cast every test below shares: two accounts that own or
+    /// join things and one that never does.
+    async fn members_cast(store: &AuthStore) {
+        for (name, role) in [
+            ("owner", Role::Editor),
+            ("mem", Role::Viewer),
+            ("out", Role::Editor),
+        ] {
+            store
+                .add_user(name, name, None, role, "pw12345678")
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_domain_is_shared_until_somebody_makes_it_private() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        assert!(store.domain_visibility("lab").await.unwrap().is_none());
+        assert!(store.private_domains().await.unwrap().is_empty());
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let acl = store.domain_visibility("lab").await.unwrap().unwrap();
+        assert_eq!(acl.domain, "lab");
+        assert_eq!(acl.owner, "owner");
+        assert_eq!(
+            store.private_domains().await.unwrap(),
+            vec![DomainAcl {
+                domain: "lab".into(),
+                owner: "owner".into()
+            }]
+        );
+        // The name is trimmed but never folded: the engine keys its domain map
+        // on the literal name.
+        assert!(store.domain_visibility("  lab  ").await.unwrap().is_some());
+        assert!(store.domain_visibility("Lab").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_domain_acl_needs_a_live_owner() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        let err = store
+            .set_domain_visibility("lab", true, "ghost")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such user"), "{err}");
+        store.set_disabled("mem", true).await.unwrap();
+        let err = store
+            .set_domain_visibility("lab", true, "mem")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("disabled"), "{err}");
+        assert!(
+            store.domain_visibility("lab").await.unwrap().is_none(),
+            "a refused call writes nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn making_a_domain_shared_again_takes_its_members_with_it() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        assert_eq!(store.domain_members("lab").await.unwrap().len(), 1);
+        store
+            .set_domain_visibility("lab", false, "owner")
+            .await
+            .unwrap();
+        assert!(store.domain_visibility("lab").await.unwrap().is_none());
+        assert!(
+            store.domain_members("lab").await.unwrap().is_empty(),
+            "the members go with the acl, so making it private again does not \
+             restore somebody else's invitations"
+        );
+        assert!(store.memberships_of("mem").await.unwrap().is_empty());
+        // Asking for a state that already holds is not an error.
+        store
+            .set_domain_visibility("lab", false, "owner")
+            .await
+            .unwrap();
+    }
+
+    /// Privatizing a domain that is already private writes nothing: not the
+    /// owner, not the membership rows. It used to hand the domain to whoever
+    /// asked last, which made a retried request an ownership transfer nobody
+    /// asked for and dropped the previous owner - who holds no membership row
+    /// by construction - to no access at all.
+    #[tokio::test]
+    async fn privatizing_an_already_private_domain_writes_nothing() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap();
+
+        let again = store
+            .set_domain_visibility("lab", true, "out")
+            .await
+            .unwrap();
+        assert_eq!(
+            again,
+            VisibilityWrite::AlreadyPrivate {
+                owner: "owner".to_string()
+            },
+            "the answer says it was already private, and names the owner it kept"
+        );
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "owner",
+            "a visibility statement is not an ownership transfer"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "and nobody was evicted"
+        );
+
+        // The verb that DOES change an owner still does, and still keeps the
+        // members: the two paths that change an owner must agree, and one of
+        // them is no longer this one.
+        store.transfer_domain("lab", "out").await.unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "out"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "an owner change is not an eviction"
+        );
+    }
+
+    // `promoting_a_member_to_owner_drops_the_row_that_now_says_less` used to sit
+    // here, promoting a member by privatizing an already-private domain with a
+    // new owner. That is not a thing this method does any more - privatizing
+    // one that is already private writes nothing at all - and the step it was
+    // really about is `transfer_domain`'s, which the test below pins on the one
+    // path that still takes it.
+
+    #[tokio::test]
+    async fn transfer_domain_swaps_the_owner_and_drops_its_member_row() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "out", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.transfer_domain("lab", "mem").await.unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "mem"
+        );
+        let members = store.domain_members("lab").await.unwrap();
+        assert_eq!(
+            members
+                .iter()
+                .map(|m| m.principal.as_str())
+                .collect::<Vec<_>>(),
+            vec!["out"],
+            "the new owner's membership row is gone: it could only say less"
+        );
+        assert!(store.memberships_of("mem").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_domain_refuses_a_shared_domain_and_a_dead_owner() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        let err = store
+            .transfer_domain("lab", "mem")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not private"), "{err}");
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let err = store
+            .transfer_domain("lab", "ghost")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such user"), "{err}");
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "owner",
+            "a refused transfer leaves the owner alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn membership_is_upserted_and_removed_by_name() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "MEM", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+            .await
+            .unwrap();
+        let members = store.domain_members("lab").await.unwrap();
+        assert_eq!(
+            members.len(),
+            1,
+            "an upsert replaces rather than duplicates"
+        );
+        assert_eq!(members[0].principal, "mem", "the name is folded");
+        assert_eq!(members[0].level, MemberLevel::Manager);
+        assert_eq!(members[0].added_by, "owner");
+        assert!(!members[0].added_at.is_empty());
+        assert_eq!(
+            store.memberships_of("Mem").await.unwrap(),
+            vec![("lab".to_string(), MemberLevel::Manager)]
+        );
+        assert!(store.remove_domain_member("lab", "mem").await.unwrap());
+        assert!(
+            !store.remove_domain_member("lab", "mem").await.unwrap(),
+            "removing what is not there reports itself rather than erroring"
+        );
+        assert!(store.domain_members("lab").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn membership_refuses_a_shared_domain_a_stranger_and_the_owner() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        let err = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not private"), "{err}");
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let err = store
+            .upsert_domain_member("lab", "ghost", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no such user"), "{err}");
+        let err = store
+            .upsert_domain_member("lab", "owner", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already holds every level"), "{err}");
+        store.set_disabled("mem", true).await.unwrap();
+        let err = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Viewer, "owner")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("disabled"), "{err}");
+        let err = store
+            .upsert_domain_member("lab", "out", MemberLevel::Viewer, "  ")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("an actor to record it as"), "{err}");
+        assert!(store.domain_members("lab").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_takes_its_memberships_with_it() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .add_user("boss", "boss", None, Role::Admin, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "out", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.remove_user("mem").await.unwrap();
+        store.remove_user_force("out").await.unwrap();
+        assert!(
+            store.domain_members("lab").await.unwrap().is_empty(),
+            "a re-added name must not inherit the old holder's access"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_user_leaves_the_domains_it_owned_owned_by_nobody() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.remove_user("owner").await.unwrap();
+        let acl = store
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .expect("the domain stays private when its owner goes");
+        assert_eq!(
+            acl.owner, "",
+            "owned by nobody: a name no live account can ever hold"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "and the people invited into it keep their levels"
+        );
+        // Re-adding the freed name mints a different person. The resolver half
+        // of this is `a_re_added_owner_name_does_not_inherit_the_domain` in
+        // `crate::scope`; here the record itself must not name them.
+        store
+            .add_user("owner", "owner", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            ""
+        );
+        assert!(store.memberships_of("owner").await.unwrap().is_empty());
+    }
+
+    /// The forced removal takes the same step. `remove_user_force` runs the
+    /// same four cleanups the guarded remove does, and this is the one of them
+    /// that widens rather than narrows if it is ever dropped: a private domain
+    /// left naming a departed account would hand it to whoever next signs up
+    /// under that login name. The guarded path is pinned above; a `--force`
+    /// removal is exactly the path an operator reaches for when the account
+    /// being removed is the last admin, so it must not be the one that leaks.
+    #[tokio::test]
+    async fn force_removing_a_user_also_leaves_its_domains_owned_by_nobody() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap();
+        store.remove_user_force("owner").await.unwrap();
+        let acl = store
+            .domain_visibility("lab")
+            .await
+            .unwrap()
+            .expect("the domain stays private when its owner is forced out");
+        assert_eq!(
+            acl.owner, "",
+            "owned by nobody, exactly as the guarded removal leaves it"
+        );
+        assert_eq!(
+            store.domain_members("lab").await.unwrap().len(),
+            1,
+            "and the people invited into it keep their levels"
+        );
+    }
+
+    /// Every membership refusal carries its kind as a TYPE, and its own
+    /// sentence as the message.
+    ///
+    /// The pin that lets `rest::members` classify by value: matching prose
+    /// meant a rewording here silently turned a 409 into a 500. Both halves
+    /// are asserted - the kind, which the surface decides on, and the
+    /// message, which the operator-facing surfaces still print - so neither
+    /// can be dropped in favour of the other.
+    #[tokio::test]
+    async fn every_membership_refusal_carries_its_kind_and_its_words() {
+        let (_dir, store) = store().await;
+        members_cast(&store).await;
+
+        let shared = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&shared),
+            Some(RefusalKind::NotPrivate)
+        );
+        assert!(
+            format!("{shared:#}").contains("is not private"),
+            "{shared:#}"
+        );
+
+        let no_owner = store.transfer_domain("lab", "mem").await.unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&no_owner),
+            Some(RefusalKind::NotPrivate)
+        );
+
+        store
+            .set_domain_visibility("lab", true, "owner")
+            .await
+            .unwrap();
+        let owner = store
+            .upsert_domain_member("lab", "owner", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&owner),
+            Some(RefusalKind::OwnerIsNotAMember)
+        );
+        assert!(format!("{owner:#}").contains("owns domain"), "{owner:#}");
+
+        let ghost = store
+            .upsert_domain_member("lab", "ghost", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&ghost),
+            Some(RefusalKind::NoSuchAccount)
+        );
+
+        // A disabled account is the SAME kind as one that does not exist. The
+        // two are told apart only in the message, which is what lets a surface
+        // that must not distinguish them answer with one word-for-word reply
+        // and be sure it has no second branch.
+        store.set_disabled("mem", true).await.unwrap();
+        let disabled = store
+            .upsert_domain_member("lab", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&disabled),
+            Some(RefusalKind::NoSuchAccount),
+            "an existing-but-disabled account is not a kind of its own"
+        );
+        assert!(
+            format!("{disabled:#}").contains("is disabled"),
+            "{disabled:#}"
+        );
+
+        // A principal that cannot be a login name at all carries its own kind,
+        // which is what lets the one route taking a principal in the BODY
+        // answer the 422 its documentation promises rather than a 500.
+        let malformed = store
+            .upsert_domain_member("lab", "  ", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&malformed),
+            Some(RefusalKind::InvalidName)
+        );
+
+        // And a failure that is nobody's doing carries no kind at all, so the
+        // surfaces keep answering 500 for what is genuinely theirs.
+        let unregistered = store
+            .upsert_domain_member("nosuchdomain", "mem", MemberLevel::Editor, "owner")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&unregistered),
+            Some(RefusalKind::NotPrivate),
+            "a domain with no acl row is shared as far as this table knows"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_membership_tables_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("web-auth.db");
+        {
+            let store = AuthStore::open(&path).await.unwrap();
+            members_cast(&store).await;
+            store
+                .set_domain_visibility("lab", true, "owner")
+                .await
+                .unwrap();
+            store
+                .upsert_domain_member("lab", "mem", MemberLevel::Manager, "owner")
+                .await
+                .unwrap();
+        }
+        // The schema is idempotent DDL, so opening the same file again applies
+        // it a second time and must change nothing.
+        let store = AuthStore::open(&path).await.unwrap();
+        assert_eq!(
+            store.domain_visibility("lab").await.unwrap().unwrap().owner,
+            "owner"
+        );
+        assert_eq!(
+            store.memberships_of("mem").await.unwrap(),
+            vec![("lab".to_string(), MemberLevel::Manager)]
+        );
+    }
+
+    #[test]
+    fn member_levels_round_trip_through_text_and_json() {
+        for level in [
+            MemberLevel::Viewer,
+            MemberLevel::Editor,
+            MemberLevel::Manager,
+        ] {
+            assert_eq!(level.to_string().parse::<MemberLevel>().unwrap(), level);
+            assert_eq!(
+                serde_json::to_string(&level).unwrap(),
+                format!("\"{}\"", level.as_str())
+            );
+        }
+        assert_eq!(
+            " Manager ".parse::<MemberLevel>().unwrap(),
+            MemberLevel::Manager
+        );
+        assert!("owner".parse::<MemberLevel>().is_err());
+        assert_eq!(
+            member_level_from_db("nonsense"),
+            MemberLevel::Viewer,
+            "an unreadable row never fails open"
+        );
+    }
+
+    #[test]
+    fn a_domain_name_is_trimmed_and_never_empty() {
+        assert_eq!(normalize_domain("  lab ").unwrap(), "lab");
+        assert_eq!(normalize_domain("My Domain").unwrap(), "My Domain");
+        assert!(normalize_domain("   ").is_err());
+    }
+
+    // --- identity links ---------------------------------------------------
+
+    /// An account provisioned from an identity is found back by that
+    /// identity, and by nothing else.
+    #[tokio::test]
+    async fn a_provisioned_identity_is_found_back_by_its_pair() {
+        let (_dir, store) = store().await;
+        let user = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                Some("Ada Lovelace"),
+                Some("ada@example.test"),
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(user.name, "ada");
+        assert_eq!(user.display, "Ada Lovelace");
+        assert_eq!(user.email.as_deref(), Some("ada@example.test"));
+        assert_eq!(user.role, Role::Viewer);
+
+        let found = store
+            .linked_user("https://idp.example", "sub-1")
+            .await
+            .unwrap()
+            .expect("the pair names the account");
+        assert_eq!(found.name, "ada");
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-2")
+                .await
+                .unwrap()
+                .is_none(),
+            "another subject at the same issuer is another person"
+        );
+        assert!(
+            store
+                .linked_user("https://other.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the same subject at another issuer is another person"
+        );
+        let links = store.identity_links("ada").await.unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].issuer, "https://idp.example");
+        assert_eq!(links[0].subject, "sub-1");
+        assert_eq!(links[0].linked_by, "jit");
+        assert!(!links[0].linked_at.is_empty());
+    }
+
+    /// A link whose account is gone is swept the moment it is looked up,
+    /// rather than left dormant for the next account to take the name.
+    ///
+    /// The direct analogue of
+    /// `an_orphaned_session_row_is_swept_rather_than_inherited`, and for the
+    /// same reason: an identity link is a credential, and a dormant one signs
+    /// a stranger into whoever next holds that login name.
+    #[tokio::test]
+    async fn an_orphaned_identity_link_is_swept_rather_than_inherited() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                Some("Ada"),
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        // Delete only the account row. Both removal paths are transactional
+        // and sweep the links themselves, so this is the state a differently
+        // built binary writing the same file, a hand edit, or a future
+        // deletion path that forgets the sweep would leave behind.
+        store
+            .conn
+            .execute(
+                "DELETE FROM users WHERE name = ?1",
+                vec![Value::Text("ada".to_string())],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store
+            .add_user("ada", "Ada The Second", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "the orphan must have been swept, not left dormant"
+        );
+        assert!(
+            store.identity_links("ada").await.unwrap().is_empty(),
+            "and the account that took the name inherits nothing"
+        );
+    }
+
+    /// The engine enforces both constraints, not only `insert_link`'s checks:
+    /// a raw duplicate pair and a second identity for one account at one
+    /// issuer are both refused by the database itself.
+    #[tokio::test]
+    async fn the_database_itself_refuses_a_duplicate_pair_and_a_second_identity() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "pw")
+            .await
+            .unwrap();
+        let insert = |subject: &str, user: &str| {
+            store.conn.execute(
+                "INSERT INTO identity_link (issuer, subject, user, linked_at, linked_by)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                vec![
+                    Value::Text("https://idp.example".to_string()),
+                    Value::Text(subject.to_string()),
+                    Value::Text(user.to_string()),
+                    Value::Text("2026-09-07T00:00:00Z".to_string()),
+                    Value::Text("test".to_string()),
+                ],
+            )
+        };
+        insert("sub-1", "ada").await.unwrap();
+        assert!(
+            insert("sub-1", "ada").await.is_err(),
+            "the primary key on (issuer, subject) is the engine's, not ours"
+        );
+        assert!(
+            insert("sub-2", "ada").await.is_err(),
+            "and one account holds one identity per issuer, by unique index"
+        );
+    }
+
+    /// A name already taken is uniquified rather than joined, and the
+    /// suffixes keep counting.
+    #[tokio::test]
+    async fn provisioning_uniquifies_a_taken_name() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        let second = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "Ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.name, "ada-2");
+        let third = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-2",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert_eq!(third.name, "ada-3");
+        assert_eq!(
+            store.user("ada").await.unwrap().unwrap().role,
+            Role::Admin,
+            "the account that held the name is untouched"
+        );
+    }
+
+    /// Provisioning honours the account cap, and refuses in words that name
+    /// the setting.
+    #[tokio::test]
+    async fn provisioning_refuses_past_the_account_cap() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        let err = store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "grace",
+                None,
+                None,
+                Role::Viewer,
+                1,
+            )
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("auth.max_users"), "{message}");
+        assert!(store.user("grace").await.unwrap().is_none());
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none(),
+            "a refused provisioning leaves no link behind"
+        );
+    }
+
+    /// A pair belongs to one account, and an account holds one identity per
+    /// issuer. Both refusals name what is in the way.
+    #[tokio::test]
+    async fn a_pair_links_once_and_an_account_holds_one_identity_per_issuer() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .add_user("grace", "Grace", None, Role::Editor, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+
+        let err = store
+            .link_identity("https://idp.example", "sub-1", "grace", "grace")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already linked"), "{err:#}");
+
+        let err = store
+            .link_identity("https://idp.example", "sub-2", "ada", "ada")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("already holds"), "{err:#}");
+
+        // A second issuer is a second identity, and that is allowed.
+        store
+            .link_identity("https://other.example", "sub-2", "ada", "ada")
+            .await
+            .unwrap();
+        assert_eq!(store.identity_links("ada").await.unwrap().len(), 2);
+        assert!(store.identity_links("grace").await.unwrap().is_empty());
+    }
+
+    /// Linking refuses a name that is nobody, so a link can never point at an
+    /// account that does not exist.
+    #[tokio::test]
+    async fn an_identity_cannot_be_linked_to_a_name_that_is_nobody() {
+        let (_dir, store) = store().await;
+        let err = store
+            .link_identity("https://idp.example", "sub-1", "ghost", "admin")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("no such user"), "{err:#}");
+    }
+
+    /// Unlinking removes the link and says whether there was one.
+    #[tokio::test]
+    async fn unlinking_reports_whether_it_removed_anything() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity("https://idp.example", "ada")
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .unlink_identity("https://idp.example", "ada")
+                .await
+                .unwrap(),
+            "the second unlink had nothing to remove"
+        );
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// An account provisioned by a sign-on has no password, so its identity
+    /// link is the only way into it: unlinking the last one is refused, in
+    /// words that name the command which gives it a second way in.
+    #[tokio::test]
+    async fn unlinking_the_last_way_into_an_account_is_refused() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        let err = store
+            .unlink_identity("https://idp.example", "ada")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("crystalline users passwd"),
+            "the refusal teaches the way out: {message}"
+        );
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::LastCredential),
+            "the refusal travels as a type, not as prose"
+        );
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_some(),
+            "a refused unlink removes nothing"
+        );
+    }
+
+    /// The rule is about the last way IN, not about the last link: an account
+    /// with a password may unlink everything, and an account with two
+    /// identities may unlink one of them.
+    #[tokio::test]
+    async fn a_second_way_in_is_what_makes_an_unlink_allowed() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity("https://idp.example", "ada")
+                .await
+                .unwrap(),
+            "a password is the other way in"
+        );
+
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-2",
+                "grace",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        store
+            .link_identity("https://other.example", "sub-9", "grace", "grace")
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity("https://idp.example", "grace")
+                .await
+                .unwrap(),
+            "the other identity is the other way in"
+        );
+        let err = store
+            .unlink_identity("https://other.example", "grace")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            StoreRefusal::kind_of(&err),
+            Some(RefusalKind::LastCredential),
+            "the one that is left is the last way in"
+        );
+    }
+
+    /// An unlink that removes nothing is not a refusal: the account keeps
+    /// whatever it had, so there is nothing to protect it from.
+    #[tokio::test]
+    async fn an_unlink_at_an_issuer_holding_no_link_is_a_no_op() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .unlink_identity("https://elsewhere.example", "ada")
+                .await
+                .unwrap(),
+            "there was no link at that issuer to remove"
+        );
+    }
+
+    /// The admin repair: an operator whose provider re-issued its subjects
+    /// unlinks the stale identity and links the new one, which needs a way
+    /// past the guard. Forcing it is the only way, and it does strand the
+    /// account until the link is remade.
+    #[tokio::test]
+    async fn a_forced_unlink_is_the_admin_repair() {
+        let (_dir, store) = store().await;
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "old-sub",
+                "ada",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .unlink_identity_force("https://idp.example", "ada")
+                .await
+                .unwrap()
+        );
+        assert!(store.identity_links("ada").await.unwrap().is_empty());
+        store
+            .link_identity("https://idp.example", "new-sub", "ada", LINKED_BY_CLI)
+            .await
+            .unwrap();
+        let found = store
+            .linked_user("https://idp.example", "new-sub")
+            .await
+            .unwrap()
+            .expect("the repaired pair names the account");
+        assert_eq!(found.name, "ada");
+        assert_eq!(
+            store.identity_links("ada").await.unwrap()[0].linked_by,
+            LINKED_BY_CLI
+        );
+    }
+
+    /// Whether an account has a local password, which is what the unlink rule
+    /// and the profile card both turn on. A name that is nobody has none.
+    #[tokio::test]
+    async fn a_password_is_reported_without_being_read_back() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "grace",
+                None,
+                None,
+                Role::Viewer,
+                100,
+            )
+            .await
+            .unwrap();
+        assert!(store.has_password("ada").await.unwrap());
+        assert!(!store.has_password("grace").await.unwrap());
+        assert!(!store.has_password("nobody").await.unwrap());
+        store.set_password("grace", "correct horse").await.unwrap();
+        assert!(
+            store.has_password("grace").await.unwrap(),
+            "`users passwd` is what gives a provisioned account a second way in"
+        );
+    }
+
+    /// Removing an account takes its identity links with it, so the pair
+    /// cannot resurrect a deleted account on the next sign-in.
+    #[tokio::test]
+    async fn removing_an_account_takes_its_identity_links() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .add_user("grace", "Grace", None, Role::Admin, "correct horse")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-1", "ada", "ada")
+            .await
+            .unwrap();
+        store
+            .link_identity("https://idp.example", "sub-2", "grace", "grace")
+            .await
+            .unwrap();
+
+        store.remove_user("ada").await.unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        store.remove_user_force("grace").await.unwrap();
+        assert!(
+            store
+                .linked_user("https://idp.example", "sub-2")
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Presentation data refreshes, and an absent claim clears nothing.
+    #[tokio::test]
+    async fn refreshing_presentation_never_clears_what_was_not_sent() {
+        let (_dir, store) = store().await;
+        store
+            .add_user(
+                "ada",
+                "Ada",
+                Some("ada@example.test"),
+                Role::Editor,
+                "correct horse",
+            )
+            .await
+            .unwrap();
+        let refreshed = store
+            .refresh_presentation("ada", Some("Ada L"), Some("new@example.test"))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.display, "Ada L");
+        assert_eq!(refreshed.email.as_deref(), Some("new@example.test"));
+        assert_eq!(refreshed.role, Role::Editor, "presentation moves no role");
+
+        let untouched = store.refresh_presentation("ada", None, None).await.unwrap();
+        assert_eq!(untouched.display, "Ada L");
+        assert_eq!(untouched.email.as_deref(), Some("new@example.test"));
+    }
+
+    /// Two first sign-ins for one subject leave one account and one link.
+    ///
+    /// The property the single transaction buys: the loser's account insert
+    /// rolls back with its refused link, rather than staying behind as an
+    /// orphan nobody can sign into. An implementation that created the account
+    /// and linked it in two calls would pass every other test here and leave
+    /// `ada-2` behind on this one.
+    #[tokio::test]
+    async fn two_first_sign_ins_for_one_subject_leave_one_account_and_one_link() {
+        let (_dir, store) = store().await;
+        let provision = || {
+            store.provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "ada",
+                Some("Ada"),
+                None,
+                Role::Viewer,
+                100,
+            )
+        };
+        let outcomes = {
+            let (first, second) = tokio::join!(provision(), provision());
+            [first, second]
+        };
+        assert_eq!(
+            outcomes.iter().filter(|outcome| outcome.is_ok()).count(),
+            1,
+            "exactly one of the two races provisions"
+        );
+        let refusal = outcomes
+            .iter()
+            .find_map(|outcome| outcome.as_ref().err())
+            .expect("the loser is refused");
+        assert!(
+            format!("{refusal:#}").contains("already linked"),
+            "{refusal:#}"
+        );
+        assert_eq!(
+            store.list_users().await.unwrap().len(),
+            1,
+            "the loser left no orphan account behind"
+        );
+        assert_eq!(store.identity_links("ada").await.unwrap().len(), 1);
+    }
+
+    /// The resource every grant below is issued for: the origin the MCP
+    /// transport is served from, no trailing slash, which is the spelling
+    /// [`normalize_resource`] settles on.
+    const OAUTH_RESOURCE: &str = "https://crystal.example";
+
+    /// The OAuth cast every grant test starts from: one account and one
+    /// registered client.
+    async fn oauth_cast(store: &AuthStore) -> OauthClient {
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        store
+            .register_oauth_client(
+                "Some Client",
+                Some("https://client.example"),
+                &["https://client.example/callback".to_string()],
+            )
+            .await
+            .unwrap()
+    }
+
+    /// One integer column of one grant row, for the assertions that are about
+    /// what the database holds rather than about what a method answered.
+    async fn grant_int(store: &AuthStore, id: i64, column: &str) -> i64 {
+        let row = store
+            .query_first(
+                &format!("SELECT {column} FROM oauth_grants WHERE id = ?1"),
+                vec![Value::Integer(id)],
+            )
+            .await
+            .unwrap()
+            .expect("the grant row is there");
+        match row.get_value(0) {
+            Ok(Value::Integer(n)) => n,
+            other => panic!("unexpected {column}: {other:?}"),
+        }
+    }
+
+    /// The same for a text column.
+    async fn grant_text(store: &AuthStore, id: i64, column: &str) -> String {
+        let row = store
+            .query_first(
+                &format!("SELECT {column} FROM oauth_grants WHERE id = ?1"),
+                vec![Value::Integer(id)],
+            )
+            .await
+            .unwrap()
+            .expect("the grant row is there");
+        cell_text(&row, 0).unwrap_or_default()
+    }
+
+    async fn count_rows(store: &AuthStore, table: &str) -> i64 {
+        let row = store
+            .query_first(&format!("SELECT COUNT(*) FROM {table}"), vec![])
+            .await
+            .unwrap()
+            .expect("COUNT(*) always answers");
+        match row.get_value(0) {
+            Ok(Value::Integer(n)) => n,
+            other => panic!("unexpected COUNT(*) result: {other:?}"),
+        }
+    }
+
+    /// The audience rule and the expiry, the two properties an access token
+    /// carries beyond "this is ada". The expiry is reached by winding the
+    /// column back through the connection, because `issue_oauth_grant` takes
+    /// no TTL: the thirty days and the hour are the store's, not a caller's.
+    #[tokio::test]
+    async fn an_oauth_grant_resolves_only_for_its_resource_and_until_it_expires() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        assert!(issued.access_token.starts_with(OAUTH_ACCESS_PREFIX));
+        assert!(issued.refresh_token.starts_with(OAUTH_REFRESH_PREFIX));
+        assert_eq!(issued.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
+        assert_eq!(
+            grant_text(&store, issued.id, "access_hash").await,
+            token_hash(&issued.access_token),
+            "only the hash is written, the same way an MCP token is stored"
+        );
+
+        let user = store
+            .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+            .await
+            .unwrap()
+            .expect("the token resolves for the resource it was issued for");
+        assert_eq!(user.name, "ada");
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, "https://crystal.example/")
+                .await
+                .unwrap()
+                .is_some(),
+            "one trailing slash is the same resource"
+        );
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, "https://other.example")
+                .await
+                .unwrap()
+                .is_none(),
+            "a token issued for one resource never opens another"
+        );
+        assert!(
+            store
+                .oauth_access_user("coa_not-a-token", OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(
+            listed[0].last_used.is_some(),
+            "resolving stamped the grant, which is what the management list shows"
+        );
+
+        store.set_disabled("ada", true).await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "a disabled account's grant resolves for nobody"
+        );
+        store.set_disabled("ada", false).await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "and re-enabling hands it back, the way a disabled account's MCP tokens come back"
+        );
+
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET access_expires_at = 1 WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "an expired access token resolves for nobody"
+        );
+    }
+
+    /// A grant is a row about an account and a registration, so neither may be
+    /// invented by the write. The transaction is what makes the two checks
+    /// mean anything at the moment of the insert.
+    #[tokio::test]
+    async fn a_grant_needs_a_live_account_and_a_registered_client() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let ghost = store
+            .issue_oauth_grant("ghost", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .expect_err("an account that is nobody gets no grant");
+        assert!(format!("{ghost:#}").contains("no such user"), "{ghost:#}");
+
+        let stranger = store
+            .issue_oauth_grant("ada", "coc_nobody", OAUTH_RESOURCE)
+            .await
+            .expect_err("a registration that does not exist gets no grant");
+        assert!(
+            format!("{stranger:#}").contains("no such oauth client"),
+            "{stranger:#}"
+        );
+
+        store.set_disabled("ada", true).await.unwrap();
+        let disabled = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .expect_err("a disabled account gets no new grant");
+        assert!(format!("{disabled:#}").contains("disabled"), "{disabled:#}");
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// What a rotation is: one grant row moved along, both tokens replaced,
+    /// the predecessor's access token dead on the spot and the refresh window
+    /// restarted. Presenting the predecessor's *refresh* token is a replay
+    /// rather than a miss, so that half is
+    /// [`a_replayed_refresh_token_revokes_the_whole_grant`]'s.
+    #[tokio::test]
+    async fn a_refresh_rotates_both_tokens_and_the_predecessor_stops_working() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let first = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        // Bring the refresh window in close, so "the thirty days start at
+        // rotation" cannot pass by accident on the window the issue opened.
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = ?2 WHERE id = ?1",
+                vec![
+                    Value::Integer(first.id),
+                    Value::Integer(chrono::Utc::now().timestamp() + 60),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let outcome = store
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+        assert_eq!(
+            second.id, first.id,
+            "a rotation moves one grant along rather than forking it"
+        );
+        assert_ne!(second.access_token, first.access_token);
+        assert_ne!(second.refresh_token, first.refresh_token);
+        assert_eq!(second.expires_in, OAUTH_ACCESS_TTL_SECS as u64);
+        assert!(
+            store
+                .oauth_access_user(&first.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the predecessor's access token stops the moment its successor exists"
+        );
+        assert!(
+            store
+                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            grant_int(&store, first.id, "refresh_expires_at").await
+                > chrono::Utc::now().timestamp() + OAUTH_REFRESH_TTL_SECS - 60,
+            "the new refresh token's thirty days start at the rotation"
+        );
+        assert_eq!(
+            grant_text(&store, first.id, "previous_refresh_hash").await,
+            token_hash(&first.refresh_token),
+            "the predecessor's hash is kept, which is what makes a replay detectable"
+        );
+        assert_eq!(store.list_oauth_grants("ada").await.unwrap().len(), 1);
+    }
+
+    /// A rotated refresh token coming back is evidence that a copy of it
+    /// leaked, so the grant it belonged to is revoked rather than refreshed -
+    /// and it is evidence whoever presents it, which is why the rule keys on
+    /// the token alone while a rotation keys on the token and its client.
+    #[tokio::test]
+    async fn a_replayed_refresh_token_revokes_the_whole_grant() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let stranger = store
+            .register_oauth_client(
+                "Another Client",
+                None,
+                &["https://x.example/cb".to_string()],
+            )
+            .await
+            .unwrap();
+        let first = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let outcome = store
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+
+        let replay = store
+            .refresh_oauth_grant(&first.refresh_token, &stranger.client_id, None)
+            .await
+            .unwrap();
+        match replay {
+            RefreshOutcome::Replayed { grant } => assert_eq!(grant, first.id),
+            other => panic!("a rotated refresh token is a replay, got {other:?}"),
+        }
+        assert!(
+            store
+                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none(),
+            "the revocation took the successor's access token with it"
+        );
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "and its refresh token, because the whole row is gone"
+        );
+        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// Only the token a rotation just replaced is a replay. A second rotation
+    /// overwrites `previous_refresh_hash`, so the one before it matches
+    /// nothing at all - which is the behaviour the column can support, and
+    /// enough, because the client that keeps rotating is the one holding the
+    /// live token.
+    #[tokio::test]
+    async fn only_the_immediate_predecessor_of_a_refresh_token_is_a_replay() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let first = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let outcome = store
+            .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(second) = outcome else {
+            panic!("a live refresh token rotates, got {outcome:?}");
+        };
+        let outcome = store
+            .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
+            .await
+            .unwrap();
+        let RefreshOutcome::Rotated(third) = outcome else {
+            panic!("the successor rotates in its turn, got {outcome:?}");
+        };
+
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&first.refresh_token, &client.client_id, None)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "the token two rotations back is forgotten, not a replay"
+        );
+        assert!(
+            store
+                .oauth_access_user(&third.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "so the grant is still live"
+        );
+        match store
+            .refresh_oauth_grant(&second.refresh_token, &client.client_id, None)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { grant } => assert_eq!(grant, first.id),
+            other => panic!("the immediate predecessor is the replay, got {other:?}"),
+        }
+    }
+
+    /// The three ways a refresh misses without being a replay. None of them
+    /// may touch the grant: an unknown token is a stranger, a live token at
+    /// the wrong registration is a client mixing up its credentials, and an
+    /// expired one is a client that waited too long. Only a token that was
+    /// actually rotated revokes anything.
+    #[tokio::test]
+    async fn an_unknown_refresh_token_is_neither_rotated_nor_a_replay() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let stranger = store
+            .register_oauth_client(
+                "Another Client",
+                None,
+                &["https://x.example/cb".to_string()],
+            )
+            .await
+            .unwrap();
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        for (token, client_id, why) in [
+            (
+                "cor_nothing".to_string(),
+                client.client_id.clone(),
+                "a token nobody issued",
+            ),
+            (
+                issued.refresh_token.clone(),
+                stranger.client_id.clone(),
+                "a live token at the wrong registration",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    store
+                        .refresh_oauth_grant(&token, &client_id, None)
+                        .await
+                        .unwrap(),
+                    RefreshOutcome::Unknown
+                ),
+                "{why} rotates nothing"
+            );
+        }
+
+        store.set_disabled("ada", true).await.unwrap();
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "a disabled account refreshes nothing"
+        );
+        store.set_disabled("ada", false).await.unwrap();
+
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = 1 WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "an expired refresh token rotates nothing"
+        );
+        assert_eq!(
+            count_rows(&store, "oauth_grants").await,
+            1,
+            "and none of the four refusals deleted the grant"
+        );
+    }
+
+    /// Revoking is one delete, so both of a grant's tokens stop together, and
+    /// removing the account sweeps what is left - the resurrection hazard
+    /// `mcp_tokens` documents, one table over: a grant row that outlived its
+    /// account would be inherited by the next holder of the freed name.
+    #[tokio::test]
+    async fn revoking_a_grant_stops_both_tokens_and_removing_the_account_sweeps_them() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, issued.id);
+        assert_eq!(listed[0].client_id, client.client_id);
+        assert_eq!(listed[0].client_name, "Some Client");
+        assert_eq!(
+            listed[0].redirect_host, "client.example",
+            "the card names the host the client redirects to"
+        );
+        assert!(listed[0].last_used.is_none());
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&listed[0].refresh_expires_at).is_ok(),
+            "the expiry a person reads is RFC 3339: {}",
+            listed[0].refresh_expires_at
+        );
+
+        store
+            .add_user("bob", "Bob", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        assert!(
+            !store.revoke_oauth_grant("bob", issued.id).await.unwrap(),
+            "another account's revoke never reaches this grant"
+        );
+        assert!(store.revoke_oauth_grant("ada", issued.id).await.unwrap());
+        assert!(
+            !store.revoke_oauth_grant("ada", issued.id).await.unwrap(),
+            "a second revoke removes nothing"
+        );
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(
+                store
+                    .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+                    .await
+                    .unwrap(),
+                RefreshOutcome::Unknown
+            ),
+            "one deleted row stops both tokens at once"
+        );
+
+        let second = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store.remove_user("ada").await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&second.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            count_rows(&store, "oauth_grants").await,
+            0,
+            "the removal swept the row rather than leaving it for the next holder of the name"
+        );
+        assert!(store.list_oauth_grants("ada").await.unwrap().is_empty());
+    }
+
+    /// The forced removal path sweeps the same rows the guarded one does. The
+    /// two are separate statements that have to be kept in step, which is why
+    /// every sweep on this file carries a test on both.
+    #[tokio::test]
+    async fn force_removing_an_account_sweeps_its_oauth_grants_too() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store.remove_user_force("ada").await.unwrap();
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// A registration is what a client gets instead of a secret, so it has to
+    /// come back exactly as it was written, including the order of its
+    /// redirect uris - the token endpoint compares against them.
+    #[tokio::test]
+    async fn a_registration_is_read_back_by_its_client_id_and_touched() {
+        let (_dir, store) = store().await;
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 0);
+        let uris = vec![
+            "http://127.0.0.1:33418/callback".to_string(),
+            "https://client.example/cb".to_string(),
+        ];
+        let client = store
+            .register_oauth_client("Some Client", Some("https://client.example"), &uris)
+            .await
+            .unwrap();
+        assert!(client.client_id.starts_with(OAUTH_CLIENT_PREFIX));
+        assert_eq!(
+            client.client_id.len(),
+            OAUTH_CLIENT_PREFIX.len() + 32,
+            "a client id is the prefix plus 32 hex characters"
+        );
+        assert!(client.last_used.is_none());
+
+        let read = store
+            .oauth_client(&client.client_id)
+            .await
+            .unwrap()
+            .expect("the registration reads back by its id");
+        assert_eq!(read.client_name, "Some Client");
+        assert_eq!(read.client_uri.as_deref(), Some("https://client.example"));
+        assert_eq!(read.redirect_uris, uris);
+        assert_eq!(read.created_at, client.created_at);
+        assert!(store.oauth_client("coc_nobody").await.unwrap().is_none());
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 1);
+
+        store.touch_oauth_client(&client.client_id).await.unwrap();
+        let touched = store
+            .oauth_client(&client.client_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            touched.last_used.is_some(),
+            "an authorization a person allowed stamps the registration"
+        );
+        store
+            .touch_oauth_client("coc_nobody")
+            .await
+            .expect("touching a registration that is gone is a no-op, not an error");
+
+        assert!(
+            store
+                .register_oauth_client("Some Client", None, &[])
+                .await
+                .is_err(),
+            "a registration with nowhere to redirect is refused"
+        );
+        let second = store
+            .register_oauth_client("Another", None, &["https://a.example/cb".to_string()])
+            .await
+            .unwrap();
+        assert_ne!(second.client_id, client.client_id);
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
+    }
+
+    /// Registrations arrive one per fresh connection and nobody deletes them,
+    /// so the store prunes the ones that never became a connection. A
+    /// registration somebody is still connected through is never pruned, and
+    /// an authorization a person allowed buys another thirty days.
+    #[tokio::test]
+    async fn an_unused_registration_is_pruned_after_thirty_days() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let fresh = store
+            .register_oauth_client("Fresh", None, &["https://fresh.example/cb".to_string()])
+            .await
+            .unwrap();
+        let stale = store
+            .register_oauth_client("Stale", None, &["https://stale.example/cb".to_string()])
+            .await
+            .unwrap();
+        let used = store
+            .register_oauth_client("Used", None, &["https://used.example/cb".to_string()])
+            .await
+            .unwrap();
+        let issued = store
+            .issue_oauth_grant("ada", &used.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+
+        // Age two of the three through the connection: the thirty days are the
+        // store's, and no method winds the clock back.
+        let long_ago = "2020-01-01T00:00:00+00:00";
+        for id in [&stale.client_id, &used.client_id] {
+            store
+                .conn
+                .execute(
+                    "UPDATE oauth_clients SET created_at = ?2, last_used = NULL
+                     WHERE client_id = ?1",
+                    vec![Value::Text(id.clone()), Value::Text(long_ago.to_string())],
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 3);
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "only the old registration that never produced a grant goes"
+        );
+        assert!(
+            store
+                .oauth_client(&stale.client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .oauth_client(&fresh.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a registration inside the window stays"
+        );
+        assert!(
+            store.oauth_client(&used.client_id).await.unwrap().is_some(),
+            "and so does an old one somebody is still connected through"
+        );
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "the prune left the live connection alone"
+        );
+
+        // An authorization somebody allowed stamps `last_used`, and that is
+        // what keeps an old registration alive for another thirty days. Nothing
+        // an unauthenticated request does reaches this column: see
+        // `only_an_allowed_authorization_stamps_a_registration_as_used`.
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(fresh.client_id.clone()),
+                    Value::Text(long_ago.to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        store.touch_oauth_client(&fresh.client_id).await.unwrap();
+        assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
+        assert_eq!(store.count_oauth_clients().await.unwrap(), 2);
+    }
+
+    /// **Reading a registration is not using it**: only an authorization that
+    /// a person actually allowed moves a row off the one-hour clock.
+    ///
+    /// The distinction is the whole of why the short clock works. Everything an
+    /// authorization *request* does to a registration is read it - look it up
+    /// by the id the caller named, compare the redirect uri it presented - and
+    /// that request carries no identity: the person has not signed in yet, and
+    /// a caller that registered the client is authorizing against its own row,
+    /// so every check on that leg passes by construction. If reading stamped
+    /// `last_used`, one extra unauthenticated request per row would move it to
+    /// the thirty-day branch, and the fill-and-hold the short clock exists to
+    /// prevent would be back at the cost of one GET.
+    ///
+    /// So [`AuthStore::touch_oauth_client`] is called when consent is ALLOWED
+    /// and when a grant is issued or refreshed, never on the authorize request,
+    /// and nothing else in this file writes that column. This test is the
+    /// contract in executable form for the two tasks that hold those call
+    /// sites.
+    #[tokio::test]
+    async fn only_an_allowed_authorization_stamps_a_registration_as_used() {
+        let (_dir, store) = store().await;
+        let client = store
+            .register_oauth_client("Asker", None, &["https://asker.example/cb".to_string()])
+            .await
+            .unwrap();
+        assert!(client.last_used.is_none());
+
+        // Everything the authorize leg does to the row before a person has
+        // decided anything, twice over.
+        for _ in 0..2 {
+            let read = store
+                .oauth_client(&client.client_id)
+                .await
+                .unwrap()
+                .expect("the registration reads back");
+            assert!(
+                read.last_used.is_none(),
+                "reading a registration never stamps it"
+            );
+        }
+
+        // Two hours later that row is still on the short clock, because
+        // nothing it has been through counts as an authorization.
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(client.client_id.clone()),
+                    Value::Text(two_hours_ago.clone()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "an hour of being asked about is not an hour of being used"
+        );
+
+        // The same row, with the one thing that does count: a person allowed
+        // it, which is what the consent endpoint stamps.
+        let allowed = store
+            .register_oauth_client("Allowed", None, &["https://allowed.example/cb".to_string()])
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(allowed.client_id.clone()),
+                    Value::Text(two_hours_ago),
+                ],
+            )
+            .await
+            .unwrap();
+        store.touch_oauth_client(&allowed.client_id).await.unwrap();
+        assert_eq!(store.prune_oauth_clients().await.unwrap(), 0);
+        assert!(
+            store
+                .oauth_client(&allowed.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "an allowed authorization buys the thirty days"
+        );
+    }
+
+    /// **A registration nobody ever authorized expires within the hour**, and
+    /// only one somebody did gets the thirty days.
+    ///
+    /// The two clocks exist because the two rows mean different things. A row
+    /// that never reached the authorize endpoint is the residue of a client
+    /// that registered and walked away - or of an anonymous caller filling the
+    /// table, which is the only way the cap is ever reached - and keeping it
+    /// for thirty days is what would make that filling stick. A row that HAS
+    /// authorized is somebody's client between connections, and thirty idle
+    /// days is the right patience for it.
+    #[tokio::test]
+    async fn a_registration_that_never_authorized_expires_within_the_hour() {
+        let (_dir, store) = store().await;
+        store
+            .add_user("ada", "Ada", None, Role::Editor, "pw12345678")
+            .await
+            .unwrap();
+        let never = store
+            .register_oauth_client("Never", None, &["https://never.example/cb".to_string()])
+            .await
+            .unwrap();
+        let authorized = store
+            .register_oauth_client("Asked", None, &["https://asked.example/cb".to_string()])
+            .await
+            .unwrap();
+        let connected = store
+            .register_oauth_client("Live", None, &["https://live.example/cb".to_string()])
+            .await
+            .unwrap();
+        store
+            .issue_oauth_grant("ada", &connected.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let just_now = store
+            .register_oauth_client("Fresh", None, &["https://fresh.example/cb".to_string()])
+            .await
+            .unwrap();
+
+        // Two hours ago for all three of the old ones, and the one that
+        // authorized did so half an hour ago: well past the hour, nowhere near
+        // the thirty days.
+        let two_hours_ago = (chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339();
+        let half_hour_ago = (chrono::Utc::now() - chrono::Duration::minutes(30)).to_rfc3339();
+        for id in [
+            &never.client_id,
+            &authorized.client_id,
+            &connected.client_id,
+        ] {
+            store
+                .conn
+                .execute(
+                    "UPDATE oauth_clients SET created_at = ?2 WHERE client_id = ?1",
+                    vec![Value::Text(id.clone()), Value::Text(two_hours_ago.clone())],
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(authorized.client_id.clone()),
+                    Value::Text(half_hour_ago),
+                ],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "only the registration nobody authorized, holding nothing, goes"
+        );
+        assert!(
+            store
+                .oauth_client(&never.client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .oauth_client(&authorized.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a registration somebody authorized gets the thirty days"
+        );
+        assert!(
+            store
+                .oauth_client(&connected.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "and one somebody is connected through is never collected at all"
+        );
+        assert!(
+            store
+                .oauth_client(&just_now.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "a registration made a moment ago has its hour"
+        );
+
+        // The same row, thirty idle days later.
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_clients SET last_used = ?2 WHERE client_id = ?1",
+                vec![
+                    Value::Text(authorized.client_id.clone()),
+                    Value::Text("2020-01-01T00:00:00+00:00".to_string()),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.prune_oauth_clients().await.unwrap(), 1);
+        assert!(
+            store
+                .oauth_client(&authorized.client_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The two unhashed copies of a live credential must never be one
+    /// `tracing::debug!` or one failed assertion away from a log file, and the
+    /// enum that carries a rotation's answer must not undo that.
+    #[tokio::test]
+    async fn an_issued_oauth_grant_never_prints_its_secrets() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let text = format!("{issued:?}");
+        for (prefix, token) in [
+            (OAUTH_ACCESS_PREFIX, &issued.access_token),
+            (OAUTH_REFRESH_PREFIX, &issued.refresh_token),
+        ] {
+            let secret = token
+                .strip_prefix(prefix)
+                .expect("a token carries its prefix");
+            assert!(!text.contains(secret), "the secret is redacted: {text}");
+        }
+        assert!(text.contains("redacted"), "and says so: {text}");
+        assert!(
+            text.contains(&issued.id.to_string()),
+            "while the id still prints: {text}"
+        );
+
+        let rotated = store
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+            .await
+            .unwrap();
+        let printed = format!("{rotated:?}");
+        let RefreshOutcome::Rotated(next) = &rotated else {
+            panic!("a live refresh token rotates, got {printed}");
+        };
+        let secret = next
+            .access_token
+            .strip_prefix(OAUTH_ACCESS_PREFIX)
+            .expect("a token carries its prefix");
+        assert!(
+            !printed.contains(secret),
+            "the outcome redacts what it wraps: {printed}"
+        );
+    }
+
+    /// A grant past its refresh window can never work again: no rotation, no
+    /// replay, and its access token died an hour into the thirty days. So it
+    /// is neither a connection to show a person nor a row to keep - and while
+    /// it is kept, it pins its registration against the client prune, which is
+    /// what makes the ordering of the two prunes load bearing.
+    #[tokio::test]
+    async fn an_expired_grant_is_pruned_and_never_listed_as_a_connection() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let live = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let dead = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        close_refresh_window(&store, dead.id).await;
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(
+            listed.len(),
+            1,
+            "a grant that cannot work again is not a connection anybody can act on"
+        );
+        assert_eq!(listed[0].id, live.id);
+        assert_eq!(store.prune_oauth_grants().await.unwrap(), 1);
+        assert_eq!(count_rows(&store, "oauth_grants").await, 1);
+        assert!(
+            store
+                .oauth_access_user(&live.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_some(),
+            "the prune left the live grant alone"
+        );
+
+        // A registration abandoned after one connection: its dead grant holds
+        // it against the client prune until the grant prune runs first.
+        let abandoned = store
+            .register_oauth_client("Abandoned", None, &["https://gone.example/cb".to_string()])
+            .await
+            .unwrap();
+        let stranded = store
+            .issue_oauth_grant("ada", &abandoned.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        close_refresh_window(&store, stranded.id).await;
+        // Age *both* registrations past the window, so what keeps the first
+        // one is its live grant rather than its freshness - which is the
+        // property the last assertion is about.
+        for id in [&abandoned.client_id, &client.client_id] {
+            store
+                .conn
+                .execute(
+                    "UPDATE oauth_clients SET created_at = '2020-01-01T00:00:00+00:00'
+                     WHERE client_id = ?1",
+                    vec![Value::Text(id.clone())],
+                )
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            0,
+            "while the dead grant is there it pins the registration"
+        );
+        assert_eq!(store.prune_oauth_grants().await.unwrap(), 1);
+        assert_eq!(
+            store.prune_oauth_clients().await.unwrap(),
+            1,
+            "and the registration goes in the same pass, once its grant has"
+        );
+        assert!(
+            store
+                .oauth_client(&client.client_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "the registration somebody is still connected through stays, \
+             old as it is, because its live grant is what holds it"
+        );
+    }
+
+    /// Close a grant's refresh window through the connection, the only way to
+    /// reach an expiry the store owns.
+    async fn close_refresh_window(store: &AuthStore, id: i64) {
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET refresh_expires_at = 1 WHERE id = ?1",
+                vec![Value::Integer(id)],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The observable consequence of taking the write lock before the lookup:
+    /// one refresh token presented twice rotates once and then replays, at the
+    /// same registration. Two clients racing one token reach the same two
+    /// answers in the same order, because the second only ever sees
+    /// post-commit state.
+    #[tokio::test]
+    async fn presenting_one_refresh_token_twice_rotates_then_replays() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        let first = store
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(first, RefreshOutcome::Rotated(_)),
+            "the first presentation rotates, got {first:?}"
+        );
+        match store
+            .refresh_oauth_grant(&issued.refresh_token, &client.client_id, None)
+            .await
+            .unwrap()
+        {
+            RefreshOutcome::Replayed { grant } => assert_eq!(grant, issued.id),
+            other => panic!("the second presentation is a replay, got {other:?}"),
+        }
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+    }
+
+    /// The host on the consent screen and the grant card is a fact a person is
+    /// asked to recognize, so a uri that names no host must not get to write
+    /// that line itself.
+    #[test]
+    fn a_redirect_uri_with_no_host_never_shows_its_own_text() {
+        assert_eq!(redirect_host("https://client.example/cb"), "client.example");
+        assert_eq!(
+            redirect_host("http://127.0.0.1:33418/callback"),
+            "127.0.0.1:33418"
+        );
+        for uri in [
+            "javascript:alert(1)",
+            "data:text/html,<b>your bank</b>",
+            "not a url at all",
+        ] {
+            assert_eq!(
+                redirect_host(uri),
+                NO_REDIRECT_HOST,
+                "a uri with no host says so rather than speaking for itself: {uri}"
+            );
+        }
+    }
+
+    /// The empty string is not an audience. Refusing it at both ends means the
+    /// two halves of the check cannot agree on nothing and let a token
+    /// through, even if an origin derivation upstream ever produced one.
+    #[tokio::test]
+    async fn an_empty_resource_is_refused_on_both_sides() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        for resource in ["", "/", "   "] {
+            assert!(
+                store
+                    .issue_oauth_grant("ada", &client.client_id, resource)
+                    .await
+                    .is_err(),
+                "a grant with no audience is refused: {resource:?}"
+            );
+        }
+        assert_eq!(count_rows(&store, "oauth_grants").await, 0);
+
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE oauth_grants SET resource = '' WHERE id = ?1",
+                vec![Value::Integer(issued.id)],
+            )
+            .await
+            .unwrap();
+        for resource in ["", "/"] {
+            assert!(
+                store
+                    .oauth_access_user(&issued.access_token, resource)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "an empty origin opens nothing, whatever a row holds: {resource:?}"
+            );
+        }
+    }
+
+    /// A grant whose registration vanished stays listable, so it stays
+    /// revocable: its tokens still resolve, and a list that dropped the row
+    /// would leave the account no way to stop them.
+    #[tokio::test]
+    async fn a_grant_outlives_a_vanished_registration_rather_than_hiding() {
+        let (_dir, store) = store().await;
+        let client = oauth_cast(&store).await;
+        let issued = store
+            .issue_oauth_grant("ada", &client.client_id, OAUTH_RESOURCE)
+            .await
+            .unwrap();
+        store
+            .conn
+            .execute("DELETE FROM oauth_clients", ())
+            .await
+            .unwrap();
+
+        let listed = store.list_oauth_grants("ada").await.unwrap();
+        assert_eq!(listed.len(), 1, "the grant is still listed");
+        assert_eq!(listed[0].id, issued.id);
+        assert!(
+            !listed[0].client_name.is_empty(),
+            "with something a person can read where the registration was"
+        );
+        assert!(store.revoke_oauth_grant("ada", issued.id).await.unwrap());
+        assert!(
+            store
+                .oauth_access_user(&issued.access_token, OAUTH_RESOURCE)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// The resource comparison is the audience check, so its tolerance is
+    /// exactly one trailing slash: nothing is lowercased and no other
+    /// canonicalization happens, because an origin that differs in any other
+    /// way is a different origin.
+    #[test]
+    fn a_resource_tolerates_one_trailing_slash_and_nothing_else() {
+        assert_eq!(
+            normalize_resource("https://crystal.example/"),
+            "https://crystal.example"
+        );
+        assert_eq!(
+            normalize_resource("  https://crystal.example  "),
+            "https://crystal.example"
+        );
+        assert_eq!(
+            normalize_resource("https://crystal.example//"),
+            "https://crystal.example/",
+            "one slash, not every slash"
+        );
+        assert_eq!(
+            normalize_resource("https://Crystal.Example"),
+            "https://Crystal.Example",
+            "case is the caller's business, not the store's"
+        );
+        assert_eq!(normalize_resource("/"), "");
     }
 }

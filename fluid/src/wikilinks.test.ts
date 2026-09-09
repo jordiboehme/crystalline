@@ -30,8 +30,25 @@ function detail() {
           resolved: true,
           target: { domain: "ops", target: "Runbook" },
         },
+        // An engram whose own title starts with a word and a colon. The server
+        // parsed it as a prefix, because that is all the bracket text says, and
+        // resolved it at home.
+        {
+          line: 3,
+          resolved: true,
+          target: { domain: "Log", target: "Weekly Garden Notes" },
+        },
       ],
-      relations: [],
+      relations: [
+        // The shape the engine writes for itself: the successor named by its
+        // permalink, because a permalink cannot be misread as a domain prefix.
+        {
+          line: 4,
+          relType: "superseded_by",
+          resolved: true,
+          target: { domain: null, target: "notes/beta" },
+        },
+      ],
     },
     "eng",
     "alpha",
@@ -65,11 +82,22 @@ function graph() {
         status: "stable",
         type: "runbook",
       },
+      {
+        id: 4,
+        domain: "eng",
+        permalink: "log-weekly",
+        title: "Log: Weekly Garden Notes",
+        status: "stable",
+        type: "engram",
+      },
     ],
     edges: [],
     truncated: false,
   });
 }
+
+/** The domain listing the app already holds, as the resolver takes it. */
+const DOMAINS = ["eng", "ops"];
 
 describe("parsing what is inside the brackets", () => {
   it("reads a leading domain prefix", () => {
@@ -85,6 +113,18 @@ describe("parsing what is inside the brackets", () => {
     expect(parseWikiTarget("Note on things: the sequel")).toEqual({
       domain: null,
       target: "Note on things: the sequel",
+    });
+  });
+
+  it("cannot tell a one-word title prefix from a domain, and does not try", () => {
+    // The half of the same case that does have whitespace-free text before the
+    // colon. This split is wrong for `Log: Weekly Garden Notes` and right for
+    // `ops:Runbook`, and nothing inside the brackets says which is which - so
+    // the parser stays the server's mirror and the resolver settles it against
+    // the domain list.
+    expect(parseWikiTarget("Log: Weekly Garden Notes")).toEqual({
+      domain: "Log",
+      target: "Weekly Garden Notes",
     });
   });
 });
@@ -125,9 +165,53 @@ describe("the wikilink resolver", () => {
     expect(resolve("Ghost")).toEqual({ kind: "unresolved" });
   });
 
+  it("labels a link written by permalink with the engram's title", () => {
+    const resolve = buildWikilinkResolver(detail(), graph(), DOMAINS);
+
+    // The file carries the address and a reader keeps seeing the name. This is
+    // what lets the engine write the stable identity into a relation without
+    // costing anybody the title.
+    expect(resolve("notes/beta")).toEqual({
+      kind: "resolved",
+      href: "/d/eng/e/notes/beta",
+      label: "Beta",
+    });
+  });
+
   it("says nothing about bracket text the server never parsed as a reference", () => {
     const resolve = buildWikilinkResolver(detail(), graph());
 
     expect(resolve("Nowhere At All")).toBeNull();
+  });
+
+  it("reads a prefix no domain answers to as part of the title", () => {
+    // Nothing is registered under `Log`, so the whole bracket text is a title
+    // in this engram's own domain - which is where the graph put the engram
+    // and the only key it can be found under.
+    const resolve = buildWikilinkResolver(detail(), graph(), DOMAINS);
+
+    expect(resolve("Log: Weekly Garden Notes")).toEqual({
+      kind: "resolved",
+      href: "/d/eng/e/log-weekly",
+      label: "Log: Weekly Garden Notes",
+    });
+  });
+
+  it("keeps a prefix that names a real domain a prefix", () => {
+    const resolve = buildWikilinkResolver(detail(), graph(), DOMAINS);
+
+    expect(resolve("ops:Runbook")).toEqual({
+      kind: "resolved",
+      href: "/d/ops/e/runbooks/restart",
+      label: "Runbook",
+    });
+  });
+
+  it("asks nothing of a caller that has no domain listing to give", () => {
+    // No list is not an empty list: a caller that cannot tell gets the reading
+    // the parser gave and no second guess, which leaves this one pending.
+    const resolve = buildWikilinkResolver(detail(), graph());
+
+    expect(resolve("Log: Weekly Garden Notes")).toBeNull();
   });
 });

@@ -66,6 +66,16 @@ pub const MIGRATIONS: &[Migration] = &[
         label: "engram attachments",
         sql: SCHEMA_V8,
     },
+    Migration {
+        version: 9,
+        label: "raw reference text",
+        sql: SCHEMA_V9,
+    },
+    Migration {
+        version: 10,
+        label: "domain registration stamp",
+        sql: SCHEMA_V10,
+    },
 ];
 
 // The whole current schema in one step. The temporal columns stay TEXT ISO
@@ -288,6 +298,39 @@ CREATE INDEX idx_tag_alias_canonical ON tag_alias(domain_id, canonical);
 // its own table so the metadata listing never drags a blob through the row
 // cache. `size` is the byte length and `modified` an RFC 3339 instant, matching
 // the temporal columns' text form.
+// The bracket text a reference was written with, kept beside the split of it.
+//
+// `LinkTarget::parse` is domain-agnostic: it splits `[[Log: Weekly Garden
+// Notes]]` into a domain and a target exactly as it splits `[[ops:Runbook]]`,
+// because nothing inside the brackets says which is which. Only the registry
+// can tell them apart, and telling them apart means looking the whole original
+// string up as a title - which `to_target` and `to_domain` have by then lost
+// the whitespace of. So it is stored.
+//
+// Nullable, and deliberately not backfilled: a row written before this
+// migration has no bracket text to recover, and there is no expression over
+// `to_domain || to_target` that reconstructs it (the colon was trimmed around).
+// Such a row resolves exactly as it does today - the fallback compares against
+// NULL, which is never true - until the next reindex of its engram rewrites it.
+const SCHEMA_V9: &str = r#"
+ALTER TABLE relation ADD COLUMN IF NOT EXISTS to_raw TEXT;
+ALTER TABLE link ADD COLUMN IF NOT EXISTS to_raw TEXT;
+"#;
+
+// When this domain was last seen in the configuration. TEXT RFC 3339 rather
+// than `timestamptz`, matching `last_sync` and the Turso twin so the column
+// compares lexically and identically on both backends.
+//
+// Nullable with no default and no backfill, and that is the point: every row
+// that predates this migration reads NULL, and NULL means "never stamped", not
+// "stamped infinitely long ago". A caller that ages the stamp to decide whether
+// a domain has been gone long enough to collect must read NULL as no evidence
+// at all and leave the row alone, so the first sweep after an upgrade collects
+// nothing. Rows earn a stamp only by being seen registered.
+const SCHEMA_V10: &str = r#"
+ALTER TABLE domain ADD COLUMN IF NOT EXISTS last_registered TEXT;
+"#;
+
 const SCHEMA_V8: &str = r#"
 CREATE TABLE attachment (
     id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

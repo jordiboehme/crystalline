@@ -39,14 +39,16 @@ pub use store::{
     DEFAULT_SALIENCE_WEIGHT, DomainHost, DomainId, DomainKind, DomainStats, EdgeKind,
     EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId, EngramRecord, EngramSummary,
     FileStamp, FilterOp, FtsMode, GraphEdge, GraphNode, GraphSlice, HitKind, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, MetadataFilter,
-    NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter, SearchHit, SearchMode,
-    SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount, Vocabulary, is_current_status,
-    is_retired_status, parse_metadata_filters, retired_factor, salience_prior,
+    InboundPage, InboundQuery, InboundRef, LEXICAL_CANDIDATE_CAP, LINKS_TO, LeadVector,
+    MetadataFilter, NamedCount, NewChunk, OutboundRef, Page, RETIRED_STATUSES, RecentFilter,
+    SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, TagAlias, TagCount,
+    Vocabulary, is_current_status, is_retired_status, merge_vocabularies, parse_metadata_filters,
+    retired_factor, salience_prior,
 };
 pub use sweep::{
-    AckCounts, AckEntry, Class, EngramFacts, Family, Finding, RULES, RuleInfo, SHARE_STALE_DAYS,
-    ShareFacts, SweepInput, SweepOptions, SweepReport, UnresolvedRef, detect, rank, rule_info,
+    AckCounts, AckEntry, Class, EngramFacts, FactObservation, Family, Finding, MIN_CONTENT_LINES,
+    RULES, RuleInfo, SHARE_STALE_DAYS, ShareFacts, SweepInput, SweepOptions, SweepReport,
+    UnresolvedRef, content_line_count, detect, is_pair_scoped, rank, rule_info,
 };
 pub use sync::{
     DomainScan, SyncReport, apply_scan, apply_scan_with_slab, refresh_tag_aliases, scan_domain,

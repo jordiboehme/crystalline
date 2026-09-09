@@ -55,7 +55,7 @@ import { domainRoute, engramRoute, folderRoute, manifestRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
 import { CreateEngramDialog } from "./CreateEngramDialog";
 import { ITEM_CLASSES, MENU_CLASSES } from "./menu";
-import { FOCUS_RING } from "./primitives";
+import { Chip, FOCUS_RING } from "./primitives";
 
 export interface DomainNavProps {
   /** The domain the route is inside. */
@@ -231,6 +231,13 @@ function DomainSwitcher({
                   <span aria-hidden="true">*</span>
                 </DropdownMenu.ItemIndicator>
                 <span className="truncate">{entry.name}</span>
+                {/*
+                  The same badge the flat sidebar list gives a private domain,
+                  in the sidebar's other form: a reader inside a domain picks
+                  the next one from here, and a domain that reads as private
+                  in one list must not read as ordinary in the other.
+                */}
+                {entry.private && <Chip variant="accent">private</Chip>}
                 {entry.engrams !== null && (
                   <span className="ml-auto text-xs text-slate-500 tabular-nums dark:text-slate-400">
                     {entry.engrams}

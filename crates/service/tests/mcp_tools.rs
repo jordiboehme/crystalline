@@ -5,6 +5,8 @@
 //! engine shares an in-memory store; domains are real temp directories because
 //! files are the source of truth.
 
+mod support;
+
 use std::sync::Arc;
 
 use crystalline_core::config::{
@@ -103,6 +105,26 @@ impl Harness {
             tokio::spawn(
                 async move { rmcp::serve_server(McpServer::new(engine), server_io).await },
             );
+        let client = rmcp::serve_client((), client_io).await.unwrap();
+        let server = server_task.await.unwrap().unwrap();
+        (client, server)
+    }
+
+    /// [`Harness::connect`] over the HTTP transport, which with no identity
+    /// extension inserted is [`crystalline_service::Scope::Anonymous`] - the
+    /// legacy open tier, the one scope reachable in-process that is narrower
+    /// than the machine owner's.
+    async fn connect_http(
+        &self,
+    ) -> (
+        RunningService<RoleClient, ()>,
+        RunningService<rmcp::RoleServer, McpServer>,
+    ) {
+        let (client_io, server_io) = tokio::io::duplex(1 << 16);
+        let engine = self.engine.clone();
+        let server_task = tokio::spawn(async move {
+            rmcp::serve_server(McpServer::new_http(engine), server_io).await
+        });
         let client = rmcp::serve_client((), client_io).await.unwrap();
         let server = server_task.await.unwrap().unwrap();
         (client, server)
@@ -277,8 +299,10 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
         "provision",
         "read_engram",
         "recent_activity",
+        "remove_domain",
         "search_engrams",
         "skills",
+        "split_engram",
         "validate_engrams",
         "vocabulary",
         "write_engram",
@@ -302,7 +326,7 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
             "{hidden} must be withheld while github.enabled is off: {names:?}"
         );
     }
-    assert_eq!(names.len(), 18, "every tool, exactly once: {names:?}");
+    assert_eq!(names.len(), 20, "every tool, exactly once: {names:?}");
 
     // The deterministic-ordering SHOULD on `/server/tools`, satisfied by
     // rmcp's `ToolRouter::list_all` (3.1.2 `handler/server/router/tool.rs:588`
@@ -310,6 +334,44 @@ async fn a_writable_default_install_lists_everything_but_the_collaboration_surfa
     let mut sorted = names.clone();
     sorted.sort_unstable();
     assert_eq!(names, sorted, "tools/list is ordered by name");
+}
+
+/// No agent administers a private domain.
+///
+/// The identity plan's own line: agents INHERIT visibility - an MCP session
+/// acts as the account whose token it carries, and every read and write it
+/// makes is already filtered by that account's memberships - and they do not
+/// hand it out. Inviting somebody into a domain, changing a level, handing a
+/// domain on and deciding whether a domain is private at all are decisions a
+/// person makes, over REST or at the `crystalline` CLI.
+///
+/// Pinned as a property of the whole list rather than as five absent names,
+/// because the failure mode is a LATER task adding a membership verb because
+/// it was convenient, not somebody re-adding one of today's names. Both the
+/// default install and the collaboration-enabled list are checked: the gated
+/// surface is where such a tool would most plausibly land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn no_tool_administers_a_domains_membership() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    call(
+        client.peer(),
+        "configure",
+        json!({"set": {"github.enabled": "true"}}),
+    )
+    .await
+    .unwrap();
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+    for tool in &tools.tools {
+        let name = tool.name.to_string();
+        for word in ["member", "invite", "visibility", "private"] {
+            assert!(
+                !name.contains(word),
+                "'{name}' looks like a membership verb: agents inherit what \
+                 they may see and never administer it"
+            );
+        }
+    }
 }
 
 /// Turning collaboration on adds exactly the five tools it enables, and takes
@@ -581,6 +643,44 @@ async fn tool_descriptions_teach_salience() {
     );
 }
 
+/// How often an acknowledgment stacks is a rule-by-rule fact, and `edit_engram`
+/// is where an agent learns it. The stacking clause has to name `V301`: it is
+/// the only rule whose entries are kept per pair. Stated generally it is false
+/// of `V103`, which fires once per reciprocal pair and so can raise several
+/// findings on one engram whose acknowledgments replace one another - an agent
+/// reading the general form would expect a second note to sit beside the first
+/// and find it had overwritten it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tool_descriptions_teach_which_rule_acknowledges_per_pair() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let tools = client.peer().list_tools(Default::default()).await.unwrap();
+
+    let edit = tools
+        .tools
+        .iter()
+        .find(|t| t.name == "edit_engram")
+        .expect("edit_engram tool present");
+    let text = edit.description.as_deref().unwrap_or("");
+    // Clause by clause rather than as one string, so the check is about which
+    // claim names the rule and not about how the rest of the copy is worded.
+    let stacking: Vec<&str> = text
+        .split(['.', ';'])
+        .filter(|clause| clause.contains("beside the first"))
+        .collect();
+    assert_eq!(
+        stacking.len(),
+        1,
+        "edit_engram teaches stacking exactly once: {text}"
+    );
+    assert!(
+        stacking[0].contains("V301"),
+        "the clause that says a second acknowledgment is kept has to name the \
+         one rule that keeps it: {}",
+        stacking[0]
+    );
+}
+
 /// Folder hierarchy inside a domain is invisible to an agent unless the tool
 /// copy teaches it: `write_engram` documents the `folder` argument and the
 /// `build_context` glob it unlocks, and `move_engram` says a destination
@@ -703,14 +803,17 @@ async fn read_only_hides_the_write_gated_tools() {
     let tools = client.peer().list_tools(Default::default()).await.unwrap();
     let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
 
-    // The five write-gated tools (four content-mutating plus add_domain, which
-    // creates domains) are absent from the surface.
+    // The seven write-gated tools (five content-mutating plus add_domain and
+    // remove_domain, which create and unregister domains) are absent from the
+    // surface.
     for hidden in [
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "add_domain",
+        "remove_domain",
     ] {
         assert!(
             !names.contains(&hidden.to_string()),
@@ -1511,6 +1614,133 @@ async fn move_same_domain_and_cross_domain_link_rewrite() {
         "link rewritten: {linker}"
     );
     assert!(h.root.join("ops/target.md").exists());
+}
+
+/// **The write gate reads the destination domain exactly as the verb does.**
+///
+/// The gate used to trim `destination_domain` before checking it while the
+/// engine read the field as sent. Trimming could only make the gate check a
+/// name at least as restrictive as the one written to, so it was not a hole -
+/// but the argument that says so has to be re-derived by whoever reads the two
+/// lines next, and the day both sides trim, a padded destination silently moves
+/// an engram into the trimmed domain. So the property is pinned instead: a
+/// padded name is not a registered domain, the move is refused, and nothing
+/// lands anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_padded_destination_domain_names_no_domain_at_all() {
+    let h = Harness::new(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Target", "content": "the target" }),
+    )
+    .await
+    .unwrap();
+
+    let refused = call(
+        peer,
+        "move_engram",
+        json!({
+            "identifier": "target",
+            "domain": "eng",
+            "destination": "target.md",
+            "destination_domain": " ops",
+        }),
+    )
+    .await
+    .expect_err("' ops' is not a registered domain");
+    assert!(
+        refused.to_string().contains("' ops' not registered"),
+        "and the refusal names the string as sent: {refused}"
+    );
+    assert!(
+        h.root.join("eng/target.md").exists(),
+        "the engram stayed where it was"
+    );
+    assert!(
+        !h.root.join("ops/target.md").exists(),
+        "and nothing was written into the domain the padded name resembles"
+    );
+}
+
+/// **A cross-domain move rewrites bare links and nothing else.**
+///
+/// A reference written with a prefix in its brackets - `[[open:Thing]]`, or a
+/// colon title like `[[Log: Weekly Garden Notes]]`, which parses the same way
+/// and resolves by title - carries a `to_target` that is only the text after
+/// the colon. The needle the rewrite builds from it is therefore not what the
+/// file holds, and when the same file also holds a genuinely bare link with
+/// exactly that text, the replace is global: the wrong link gets prefixed and
+/// the receipt counts it as a repair.
+///
+/// So the rewrite skips a reference that named a domain. The colon-titled link
+/// dangles after the move, which is what a link the mover cannot rewrite
+/// honestly does, and the bare link pointing somewhere else is left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cross_domain_move_never_rewrites_a_link_it_did_not_match() {
+    let h = Harness::new(&["eng", "ops"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    // The engram that moves, whose title's first word ends in a colon.
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Log: Weekly Garden Notes", "content": "what the garden did" }),
+    )
+    .await
+    .unwrap();
+    // One file linking twice: to the colon title, and to a bare `[[Weekly
+    // Garden Notes]]` - an engram nobody has written yet, which is an ordinary
+    // state and the sweep's business, not the mover's. No engram may carry that
+    // exact title here: one would take the colon-titled link's resolution for
+    // itself, which is a different case from the one this test is about.
+    call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Linker",
+            "content": "see [[Log: Weekly Garden Notes]] and also [[Weekly Garden Notes]]",
+        }),
+    )
+    .await
+    .unwrap();
+
+    let out = call(
+        peer,
+        "move_engram",
+        json!({
+            "identifier": "log-weekly-garden-notes",
+            "domain": "eng",
+            "destination": "log-weekly-garden-notes.md",
+            "destination_domain": "ops",
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(out["cross_domain"], json!(true));
+    assert_eq!(
+        out["links_rewritten"],
+        json!(0),
+        "no bare link pointed at the moved engram, so nothing was repaired: {out}"
+    );
+
+    let linker = std::fs::read_to_string(h.root.join("eng/linker.md")).unwrap();
+    assert!(
+        linker.contains("[[Weekly Garden Notes]]"),
+        "the bare link to somebody else is untouched: {linker}"
+    );
+    assert!(
+        !linker.contains("[[ops:Weekly Garden Notes]]"),
+        "and was never rewritten in the moved engram's name: {linker}"
+    );
+    assert!(
+        linker.contains("[[Log: Weekly Garden Notes]]"),
+        "the colon-titled link is left as written: {linker}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3316,7 +3546,7 @@ type AnnotationRow = (
     Option<bool>,
 );
 
-const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
+const EXPECTED_ANNOTATIONS: [AnnotationRow; 22] = [
     (
         "write_engram",
         "Capture engram",
@@ -3344,6 +3574,14 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
     (
         "move_engram",
         "Move engram",
+        Some(false),
+        Some(true),
+        Some(false),
+        Some(false),
+    ),
+    (
+        "split_engram",
+        "Split engram",
         Some(false),
         Some(true),
         Some(false),
@@ -3448,6 +3686,18 @@ const EXPECTED_ANNOTATIONS: [AnnotationRow; 20] = [
         Some(false),
         Some(true),
     ),
+    // Destructive where `add_domain` is not: this ends a domain rather than
+    // creating one. Idempotent, because a second call on a name that is already
+    // gone is the ordinary unregistered-domain answer and changes nothing.
+    // Closed-world: unregistering a team domain never touches its repository.
+    (
+        "remove_domain",
+        "Remove domain",
+        Some(false),
+        Some(true),
+        Some(true),
+        Some(false),
+    ),
     (
         "share_changes",
         "Share changes",
@@ -3536,7 +3786,7 @@ async fn tool_annotations_match_the_locked_table() {
 async fn annotation_hints_line_up_with_the_gating() {
     use rmcp::ServerHandler;
 
-    // The eight write-gated tools (the five WRITE_TOOLS plus the three
+    // The write-gated tools (the WRITE_TOOLS carrying a row here, plus the three
     // collaboration tools hidden in read-only mode) must each disclaim
     // read-only.
     let rw = annotation_server(false).await;
@@ -3544,8 +3794,10 @@ async fn annotation_hints_line_up_with_the_gating() {
         "write_engram",
         "edit_engram",
         "move_engram",
+        "split_engram",
         "delete_engram",
         "add_domain",
+        "remove_domain",
         "configure",
         "share_changes",
         "resolve_conflict",
@@ -3627,6 +3879,13 @@ async fn provision_is_listed_when_no_domain_declares_and_refuses_the_mutations()
         assert!(
             text.contains("## Provisioning"),
             "provision {action}'s refusal must name what is missing: {text}"
+        );
+        // A stdio session is the machine owner, so the instance-admin gate the
+        // three mutating actions carry over HTTP never fires here: whoever runs
+        // this process already has the config file and the harnesses on disk.
+        assert!(
+            !text.contains("instance admin"),
+            "provision {action} is never role gated over stdio: {text}"
         );
     }
 }
@@ -4151,9 +4410,9 @@ fn assert_conservative(schema: &Value, context: &str) {
     }
 }
 
-/// Every one of the 20 tools in `EXPECTED_ANNOTATIONS` advertises an input
+/// Every one of the 22 tools in `EXPECTED_ANNOTATIONS` advertises an input
 /// schema that passes the naive conservative-shape sweep, both on the
-/// read-write server where all 20 are visible and on the read-only one where
+/// read-write server where all 22 are visible and on the read-only one where
 /// only a subset resolves through `get_tool`. Also locks down the two
 /// type-less `serde_json::Value` params in this codebase to their documented
 /// object shape.
@@ -4560,4 +4819,328 @@ async fn evolve_engrams_renders_the_queue_as_one_toon_table() {
     // The legend and the guidance ride the same response.
     assert!(text.contains("actions["), "{text}");
     assert!(text.contains("guidance:"), "{text}");
+}
+
+// --- remove_domain ----------------------------------------------------------
+
+/// **A local domain is unregistered and its files stay on disk**, and a stdio
+/// session may do it at all: the machine owner is `Scope::Unrestricted`, so the
+/// removal gate that an HTTP caller meets resolves to `Own` here and never
+/// stands between somebody and the files they already have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_unregisters_a_local_domain_and_keeps_its_files() {
+    let h = Harness::new(&["eng", "keep"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Alpha", "content": "Alpha knowledge" }),
+    )
+    .await
+    .unwrap();
+
+    let report = call(peer, "remove_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap();
+    assert_eq!(report["domain"], json!("eng"), "{report}");
+    assert_eq!(report["unregistered"], json!(true), "{report}");
+    assert_eq!(
+        report["files_kept"],
+        json!(true),
+        "a file domain's files stay on disk: {report}"
+    );
+
+    assert!(
+        h.root.join("eng").join("alpha.md").exists(),
+        "the engram file was left exactly where it was"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        !listed.to_string().contains("\"eng\""),
+        "the domain is gone from the listing: {listed}"
+    );
+    assert!(
+        listed.to_string().contains("keep"),
+        "and the other domain is untouched: {listed}"
+    );
+}
+
+/// **A virtual domain's rows ARE its knowledge**, so the removal refuses until
+/// the caller says `purge: true` - and the refusal is the tool's own text a
+/// model can read, not an opaque protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_refuses_a_virtual_domain_without_purge() {
+    let h = Harness::new(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mind", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    call(
+        peer,
+        "write_engram",
+        json!({ "domain": "mind", "title": "Only Copy", "content": "Nowhere else" }),
+    )
+    .await
+    .unwrap();
+
+    let refused = call_result(peer, "remove_domain", json!({ "domain": "mind" })).await;
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "the refusal is a tool error the model reads: {refused:?}"
+    );
+    let text = result_text(&refused);
+    assert!(
+        text.contains("purge"),
+        "the refusal names the way through: {text}"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        listed.to_string().contains("mind"),
+        "and nothing was removed: {listed}"
+    );
+
+    let report = call(
+        peer,
+        "remove_domain",
+        json!({ "domain": "mind", "purge": true }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(report["unregistered"], json!(true), "{report}");
+    assert_eq!(
+        report["files_kept"],
+        json!(false),
+        "a virtual domain has no files to keep: {report}"
+    );
+
+    // The whole justification for requiring `purge` is that the rows ARE the
+    // knowledge, so the loss has to be a pinned fact rather than a claim the
+    // refusal text makes. Re-registered under the same name, the domain is
+    // empty: nothing survived the removal to be re-adopted, which is exactly
+    // what a file domain would have done.
+    call(
+        peer,
+        "add_domain",
+        json!({ "domain": "mind", "virtual": true }),
+    )
+    .await
+    .unwrap();
+    let found = call(peer, "search_engrams", json!({ "query": "Nowhere else" }))
+        .await
+        .unwrap();
+    assert!(
+        !found.to_string().contains("Only Copy"),
+        "the purged engrams are gone: {found}"
+    );
+}
+
+/// A read-only instance hides `remove_domain` with the rest of the write-gated
+/// tools, and a call by name still reaches the engine guard rather than a bare
+/// "no such tool".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remove_domain_is_hidden_and_refused_on_a_read_only_instance() {
+    let h = Harness::new_read_only(&["eng"]).await;
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+
+    let tools = peer.list_tools(Default::default()).await.unwrap();
+    let names: Vec<String> = tools.tools.iter().map(|t| t.name.to_string()).collect();
+    assert!(
+        !names.contains(&"remove_domain".to_string()),
+        "remove_domain is hidden read-only: {names:?}"
+    );
+
+    let refused = call(peer, "remove_domain", json!({ "domain": "eng" }))
+        .await
+        .unwrap_err();
+    assert!(
+        refused.contains("read-only"),
+        "the route stays registered and answers the read-only refusal: {refused}"
+    );
+    let listed = call(peer, "list_domains", json!({})).await.unwrap();
+    assert!(
+        listed.to_string().contains("eng"),
+        "and nothing was unregistered: {listed}"
+    );
+}
+
+// --- the neighbours advisory on a write receipt ------------------------------
+
+const RETRY: &str = "The retry queue doubles its backoff on every failure.\nA dead-letter ttl bounds how long a retry waits.\nRaising the ttl fixed the stuck retries last time.";
+const RETRY_AGAIN: &str = "Retries wait on a backoff that doubles each time.\nThe dead-letter ttl is the bound on a stuck retry.\nWe raised the ttl and the queue drained.";
+
+#[tokio::test]
+async fn write_and_content_edit_receipts_name_their_neighbours() {
+    let h = Harness::new(&["eng"]).await;
+    h.engine.set_provider(Arc::new(support::TopicEmbedder));
+    let (client, _server) = h.connect().await;
+    let peer = client.peer();
+    let first = call(
+        peer,
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry queue gotcha", "content": RETRY, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    assert!(
+        first.get("similar").is_none(),
+        "nothing near the first capture: {first}"
+    );
+    h.engine.embed_pending().await.unwrap();
+
+    let second = call(
+        peer,
+        "write_engram",
+        json!({
+            "domain": "eng",
+            "title": "Retry backoff lesson",
+            "content": RETRY_AGAIN,
+            "tags": ["t"]
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        second["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{second}"
+    );
+    assert_eq!(second["similar"][0]["type"], "engram");
+    assert_eq!(second["similar"][0]["status"], "stable");
+    assert_eq!(second["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+    assert!(second["similar"].as_array().unwrap().len() <= 3);
+
+    let appended = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "retry-backoff-lesson", "domain": "eng", "operation": "append",
+            "content": "- [lesson] a retry storm needs a longer dead-letter ttl and a wider backoff on the queue #retry"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        appended["similar"][0]["permalink"], "retry-queue-gotcha",
+        "{appended}"
+    );
+    assert_eq!(appended["guidance"], crystalline_service::SIMILAR_GUIDANCE);
+
+    let flipped = call(
+        peer,
+        "edit_engram",
+        json!({
+            "identifier": "retry-backoff-lesson", "domain": "eng",
+            "operation": "set_frontmatter", "key": "salience", "value": "7"
+        }),
+    )
+    .await
+    .unwrap();
+    // `call` hands back a bare `Value::String` for a tool-level refusal, and
+    // `.get` on a string is always `None`, so the receipt is pinned before the
+    // absence is read: a refused edit must not read as a silent one.
+    assert_eq!(
+        flipped["operation"], "set_frontmatter",
+        "the flip landed: {flipped}"
+    );
+    assert!(
+        flipped.get("similar").is_none(),
+        "set_frontmatter never probes: {flipped}"
+    );
+}
+
+#[tokio::test]
+async fn a_hidden_domains_engram_is_a_neighbour_only_to_a_caller_who_may_see_it() {
+    // The one property this file can prove that the engine tests cannot: the
+    // handler passes the CALLER's scope rather than a hard-coded
+    // `Scope::Unrestricted`. `lab` is private, so it is a neighbour over stdio
+    // (the machine owner) and invisible over the open HTTP tier.
+    let h = Harness::new(&["eng", "lab"]).await;
+    h.engine.set_provider(Arc::new(support::TopicEmbedder));
+    h.engine
+        .write_engram(&crystalline_service::params::WriteParams {
+            domain: "lab".to_string(),
+            title: "Retry secrets".to_string(),
+            content: RETRY.to_string(),
+            folder: None,
+            engram_type: None,
+            tags: vec!["t".to_string()],
+            status: None,
+            metadata: None,
+            overwrite: false,
+        })
+        .await
+        .unwrap();
+    h.engine.embed_pending().await.unwrap();
+
+    let auth = Arc::new(
+        crystalline_service::rest::AuthStore::open(&h.root.join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    auth.add_user(
+        "owner",
+        "owner",
+        None,
+        crystalline_service::rest::Role::Editor,
+        "pw12345678",
+    )
+    .await
+    .unwrap();
+    auth.set_domain_visibility("lab", true, "owner")
+        .await
+        .unwrap();
+    h.engine
+        .set_domain_access(Arc::new(crystalline_service::DomainAccess::new(auth)));
+
+    // The open tier first, while `eng` still holds no retry engram of its own:
+    // an empty advisory here means "nothing visible", not "nothing near".
+    let (anon, _s1) = h.connect_http().await;
+    let stranger = call(
+        anon.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry backoff lesson", "content": RETRY_AGAIN, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    // Same guard as above, and it carries more here: without it a write the
+    // open tier REFUSED would read exactly like one that was scoped.
+    assert_eq!(
+        stranger["permalink"], "retry-backoff-lesson",
+        "the open tier's write landed: {stranger}"
+    );
+    assert!(
+        stranger.get("similar").is_none(),
+        "a private domain's engram never reaches the open tier: {stranger}"
+    );
+    h.engine.embed_pending().await.unwrap();
+
+    let (owner, _s2) = h.connect().await;
+    let machine = call(
+        owner.peer(),
+        "write_engram",
+        json!({ "domain": "eng", "title": "Retry ttl note", "content": RETRY_AGAIN, "tags": ["t"] }),
+    )
+    .await
+    .unwrap();
+    let names: Vec<&str> = machine["similar"]
+        .as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|row| row["permalink"].as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        names.contains(&"retry-secrets"),
+        "the machine owner sees the private domain's neighbour: {machine}"
+    );
 }

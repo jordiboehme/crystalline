@@ -45,10 +45,18 @@
  * the chip on a finding is shorthand for it and a shorthand needs its key on
  * the page exactly once.
  *
- * The domain filter is a lens over what already arrived rather than a second
- * sweep. Its choices come from the findings themselves, so it offers the
- * domains that actually have something waiting, and it keeps offering all of
- * them once one of them is chosen.
+ * The two filters are inputs to the sweep, not lenses over what it returned.
+ * That is the whole of what makes them honest: the engine ranks the entire
+ * result and answers with one capped page of it, so a page taken unfiltered is
+ * whatever family and domain rank highest, and narrowing it here would only
+ * ever show the part of a domain that already survived somebody else's
+ * ranking. A queue that says "Temporal 8" and can draw one of them is the
+ * shape of that bug. So both filters ride the query key and go to the server,
+ * which re-sweeps scoped and ranks that.
+ *
+ * The domain choices come from the domain listing rather than from the
+ * findings, for the same reason: a domain whose work never ranks into the page
+ * is exactly the domain somebody needs to be able to ask about.
  */
 
 import { useQuery, useQueryClient } from "@tanstack/react-query";
@@ -56,7 +64,13 @@ import { useId, useState } from "react";
 import { Link } from "react-router";
 
 import { problemDetail } from "../api/client";
-import type { EvolveAction, EvolveFinding, EvolveQueue } from "../api/evolve";
+import { DOMAINS_QUERY_KEY, fetchDomains } from "../api/domains";
+import type {
+  EvolveAction,
+  EvolveFamily,
+  EvolveFinding,
+  EvolveQueue,
+} from "../api/evolve";
 import {
   EVOLVE_FAMILIES,
   EVOLVE_FAMILY_BLURBS,
@@ -96,9 +110,21 @@ interface FindingGroup {
 
 export default function Maintenance() {
   const [domain, setDomain] = useState(EVERY_DOMAIN);
+  // Empty is every family, which is what the engine reads an empty filter as.
+  // Kept as the catalog's own values rather than a set of booleans, because it
+  // is a query parameter before it is a control.
+  const [families, setFamilies] = useState<EvolveFamily[]>([]);
   const [showAcknowledged, setShowAcknowledged] = useState(false);
   const { capabilities } = useAuth();
   const queryClient = useQueryClient();
+
+  // The listing the sidebar already read, under the same key: the domain
+  // filter offers every registered domain rather than only the ones with
+  // something on this page, and costs nothing on the wire to do it.
+  const listing = useQuery({
+    queryKey: DOMAINS_QUERY_KEY,
+    queryFn: fetchDomains,
+  });
   // Fetched on arrival, on the Refresh button, when the acknowledged rows are
   // asked for or given back, and after a write that changes what the queue
   // holds. Never on anything else: the app's default is to refetch a stale
@@ -109,9 +135,20 @@ export default function Maintenance() {
   // doors - the flag stops a focus from re-sweeping a page that is already
   // open, and the freshness window stops the remount that following a finding
   // to its engram and coming back would otherwise cost.
+  // What the filters narrow, named once: the query key and the request are the
+  // same two values, so a cache entry can never stand for a different sweep
+  // than the one it holds.
+  const scopedDomains = domain === EVERY_DOMAIN ? [] : [domain];
+  // Whether either filter is set, which decides what the page claims was swept.
+  const scoped = scopedDomains.length > 0 || families.length > 0;
   const sweep = useQuery({
-    queryKey: evolveKey([], showAcknowledged),
-    queryFn: () => fetchEvolveQueue({ includeAcknowledged: showAcknowledged }),
+    queryKey: evolveKey(scopedDomains, showAcknowledged, families),
+    queryFn: () =>
+      fetchEvolveQueue({
+        domains: scopedDomains,
+        families,
+        includeAcknowledged: showAcknowledged,
+      }),
     staleTime: EVOLVE_STALE_MS,
     refetchOnWindowFocus: false,
     // Asking for the silenced rows is a new question with its own cache entry,
@@ -126,18 +163,21 @@ export default function Maintenance() {
     await queryClient.invalidateQueries({ queryKey: EVOLVE_KEY_ROOT });
   };
 
+  // The answer on screen is the previous scope's while a new one is on its
+  // way: `placeholderData` holds it across the key change, which keeps the
+  // controls under the reader's hand and would otherwise leave the rows
+  // reading as the answer to a filter that has not been asked yet.
+  const stale = sweep.isPlaceholderData && sweep.isFetching;
+
   const queue = sweep.data;
+  // Every row that came back, drawn as it came: the sweep was already scoped,
+  // so there is nothing left here to filter and nothing a filter here could
+  // reach.
   const findings = queue?.queue ?? [];
-  const shown =
-    domain === EVERY_DOMAIN
-      ? findings
-      : findings.filter((finding) => finding.domain === domain);
-  const groups = groupByFamily(shown);
-  // Fed from the whole sweep rather than from what is on screen, so choosing
-  // one domain does not take the others off the list that offered them.
-  const domains = [...new Set(findings.map((finding) => finding.domain))].sort(
-    (left, right) => left.localeCompare(right),
-  );
+  const groups = groupByFamily(findings);
+  // Every registered domain, in the order the listing gives them, which is
+  // alphabetical.
+  const domains = (listing.data?.domains ?? []).map((entry) => entry.name);
   // Keyed by rule and carried whole: a row wants the paragraph and the words
   // that head it, and splitting them into two lookups here would only put them
   // back together one component down.
@@ -154,9 +194,16 @@ export default function Maintenance() {
             Maintenance - what the knowledge needs next
           </h1>
           <p className="text-sm text-slate-500 dark:text-slate-400">
-            A sweep of every registered domain, ranked. Reading it changes
-            nothing: a finding names what to go and read, and the work mostly
-            happens there.
+            {/*
+              What was actually swept, since the filters below narrow the
+              request rather than the page: "every registered domain" is a
+              claim, and it stops being true the moment one of them is set.
+            */}
+            {scoped
+              ? "A sweep of what the filter names"
+              : "A sweep of every registered domain"}
+            , ranked. Reading it changes nothing: a finding names what to go and
+            read, and the work mostly happens there.
           </p>
         </div>
         {/*
@@ -205,7 +252,17 @@ export default function Maintenance() {
               ))}
             </select>
           </span>
-          <Tally queue={queue} shown={shown.length} scoped={domain} />
+          <FamilyFilter
+            selected={families}
+            onToggle={(family) => {
+              setFamilies((was) =>
+                was.includes(family)
+                  ? was.filter((entry) => entry !== family)
+                  : [...was, family],
+              );
+            }}
+          />
+          <Tally queue={queue} busy={stale} />
         </div>
       )}
 
@@ -232,19 +289,39 @@ export default function Maintenance() {
         </p>
       )}
 
-      {queue && shown.length === 0 && (
-        <Nothing scanned={queue.engramsScanned} scoped={domain} />
-      )}
+      {/*
+        Marked busy, and dimmed to say so without words, while a sweep started
+        by a filter is still running. `placeholderData` holds the previous
+        answer across a key change, which is right for the acknowledged toggle
+        - the same question, one subset wider - and wrong for a scope change,
+        where what is drawn is a different question's answer under a filter
+        that already reads as chosen. Left drawn rather than replaced by a
+        skeleton, because this is the heaviest read the API has and a reader
+        watching rows they can still see is better served than one watching an
+        empty page.
+      */}
+      <div
+        aria-busy={stale}
+        className={`flex flex-col gap-6 ${stale ? "opacity-50" : ""}`}
+      >
+        {queue && findings.length === 0 && (
+          <Nothing
+            scanned={queue.engramsScanned}
+            scoped={domain}
+            families={families}
+          />
+        )}
 
-      {groups.map((group) => (
-        <FamilySection
-          key={group.key}
-          group={group}
-          actions={actions}
-          canWrite={capabilities.canWrite}
-          onChanged={resweep}
-        />
-      ))}
+        {groups.map((group) => (
+          <FamilySection
+            key={group.key}
+            group={group}
+            actions={actions}
+            canWrite={capabilities.canWrite}
+            onChanged={resweep}
+          />
+        ))}
+      </div>
 
       {queue && queue.acknowledged.total > 0 && (
         <Acknowledged
@@ -271,52 +348,73 @@ export default function Maintenance() {
 }
 
 /**
+ * Which families the sweep asks about.
+ *
+ * A filter rather than a legend, and pressing one narrows the request: the
+ * engine ranks the whole result and answers with a capped page of it, so a
+ * family that ranks low is not merely further down the page, it can be off it
+ * entirely. Nothing pressed is every family, which is what the engine reads an
+ * empty filter as and what a reader arriving at the page expects to see.
+ */
+function FamilyFilter({
+  selected,
+  onToggle,
+}: {
+  selected: EvolveFamily[];
+  onToggle: (family: EvolveFamily) => void;
+}) {
+  return (
+    <span className="flex flex-wrap items-center gap-2">
+      <span className="text-xs text-slate-500 dark:text-slate-400">
+        Families
+      </span>
+      {EVOLVE_FAMILIES.map((family) => {
+        const on = selected.includes(family);
+        return (
+          <button
+            key={family}
+            type="button"
+            aria-pressed={on}
+            className={on ? TOGGLE.on : TOGGLE.off}
+            onClick={() => {
+              onToggle(family);
+            }}
+          >
+            {EVOLVE_FAMILY_TITLES[family]}
+          </button>
+        );
+      })}
+    </span>
+  );
+}
+
+/**
  * What the sweep read and what it found, on one line.
  *
- * The family counts are the engine's own, over the whole result rather than
- * over the page, and the section headings count the rows actually drawn. Those
- * two numbers wear the same word and are both right, so whenever they can
- * differ - a cap that kept part of the result off the page, a domain filter
- * that narrowed what is drawn - the breakdown is named as the whole queue
- * rather than left to be read as a second count of the page. It is kept rather
- * than dropped in exactly those cases, because the shape of everything waiting
- * is most worth saying when the page is not all of it.
- *
- * The count of what is drawn names the base it counts against for the same
- * reason: "1 finding in ops" on its own is a true sentence that has lost the
- * only not-all-of-it signal on the screen.
+ * Everything here counts the same sweep, which is the scoped one: the filters
+ * above are inputs to it rather than a view of it, so there is no second,
+ * smaller number to reconcile against the engine's own. What can still differ
+ * is the page - the engine ranks the whole result and answers with a capped
+ * slice of it - so the counts are named as the whole queue exactly when the
+ * page is not all of it, which is when the shape of everything waiting is most
+ * worth saying.
  */
-function Tally({
-  queue,
-  shown,
-  scoped,
-}: {
-  queue: EvolveQueue;
-  shown: number;
-  scoped: string;
-}) {
-  // What arrived, which is the page rather than the result. A domain filter
-  // counts out of this, and it is said out loud whenever it is less than the
-  // whole: a count with no base is what makes "1 finding in ops" sound like
-  // the end of the matter.
+function Tally({ queue, busy }: { queue: EvolveQueue; busy: boolean }) {
+  // What arrived, which is the page rather than the result.
   const fetched = queue.queue.length;
   const breakdown = queue.families
     .map((count) => `${familyTitle(count.family)} ${String(count.findings)}`)
     .join(", ");
-  const page =
-    fetched < queue.total
-      ? `${String(fetched)} of ${plural(queue.total, "finding", "findings")}`
-      : plural(queue.total, "finding", "findings");
-  const narrowed =
-    scoped === EVERY_DOMAIN ? "" : `, ${String(shown)} of them in ${scoped}`;
-  // Whether what is drawn is less than the whole result, by a cap or a filter
-  // or both. That is exactly when the engine's counts and the headings above
-  // the rows can differ, and exactly when the breakdown has to say which it is.
-  const partial = shown < queue.total;
+  const partial = fetched < queue.total;
+  const page = partial
+    ? `${String(fetched)} of ${plural(queue.total, "finding", "findings")}`
+    : plural(queue.total, "finding", "findings");
   return (
-    <p className="text-caption text-slate-500 tabular-nums dark:text-slate-400">
+    <p
+      aria-busy={busy}
+      className={`text-caption text-slate-500 tabular-nums dark:text-slate-400 ${busy ? "opacity-50" : ""}`}
+    >
       {plural(queue.engramsScanned, "engram", "engrams")} swept, {page}
-      {narrowed}
       {breakdown === ""
         ? "."
         : partial
@@ -331,14 +429,34 @@ function Tally({
  *
  * Two different nothings, and only one of them is about the knowledge base: a
  * clean sweep is good news, while a filter that matches nothing is a fact about
- * the filter. Neither is a failure, and neither wears one.
+ * the filter. Neither is a failure, and neither wears one - and the second is
+ * never told in the words of the first, because "found nothing that needs
+ * attention" said under a filter is a claim about a base the sweep never read.
  */
-function Nothing({ scanned, scoped }: { scanned: number; scoped: string }) {
+function Nothing({
+  scanned,
+  scoped,
+  families,
+}: {
+  scanned: number;
+  scoped: string;
+  families: EvolveFamily[];
+}) {
+  const narrowed = [
+    scoped === EVERY_DOMAIN ? null : scoped,
+    families.length === 0
+      ? null
+      : families
+          .map((family) => EVOLVE_FAMILY_TITLES[family].toLowerCase())
+          .join(" and "),
+  ]
+    .filter((part): part is string => part !== null)
+    .join(", ");
   return (
     <p className="rounded border border-dashed border-slate-300 px-3 py-6 text-sm text-slate-600 dark:border-slate-700 dark:text-slate-300">
-      {scoped === EVERY_DOMAIN
+      {narrowed === ""
         ? `Nothing is waiting. The sweep read ${plural(scanned, "engram", "engrams")} and found nothing that needs attention.`
-        : `Nothing is waiting in ${scoped}. Other domains may still have something; choose every domain to see it.`}
+        : `Nothing is waiting in ${narrowed}. The rest of the sweep may still have something; widen the filter to see it.`}
     </p>
   );
 }
@@ -481,7 +599,7 @@ function FindingRow({
   // deleted and what gets shown are read from different fields on purpose, so
   // a future prettier title cannot aim the delete somewhere else.
   const attachmentPath = finding.attachmentPath;
-  // Re-acknowledging is the same write: the server recomputes the scope, so
+  // Re-acknowledging is the same write, given for what the row fires on now:
   // the entry it replaces is the one that stopped matching.
   const ackLabel = finding.ackStale ? "Re-acknowledge" : "Acknowledge";
 
@@ -616,6 +734,10 @@ function FindingRow({
                   finding.domain,
                   finding.permalink,
                   finding.rule,
+                  // The entry this row was silenced by, so a twin pair is
+                  // taken back on its own and the engram's other pairs stay
+                  // acknowledged.
+                  finding.ackScope,
                 ),
               );
             }}
@@ -690,6 +812,10 @@ function FindingRow({
                   finding.permalink,
                   finding.rule,
                   note,
+                  // The evidence this row fires on, so an engram raising two
+                  // twin findings silences the one that was read rather than
+                  // whichever the server would have picked.
+                  finding.scope,
                 ),
               );
             }}

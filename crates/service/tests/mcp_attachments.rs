@@ -586,7 +586,7 @@ async fn the_tool_list_is_unchanged_by_the_attachment_surface() {
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
     assert_eq!(
         names.len(),
-        18,
+        20,
         "a default install's list, unmoved by this surface: {names:?}"
     );
     assert!(

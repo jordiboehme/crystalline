@@ -24,6 +24,7 @@ use crystalline_remote::provider::{Feedback, ProposalState};
 use crystalline_remote::state::{
     FeedbackItem, FeedbackKind, OriginState, Proposal, ProposalStatus, ProposedChange, ProposedFile,
 };
+use crystalline_service::Scope;
 use crystalline_service::engine::{EngineError, PreviewCredential, ShareActor};
 use crystalline_service::params::{ReadParams, SearchParams};
 use crystalline_service::{Engine, EnvOverlay};
@@ -137,13 +138,19 @@ async fn github_disabled_refuses_all_three_origin_operations() {
         "{add_err}"
     );
 
-    let update_err = eng.origin_update(None).await.unwrap_err();
+    let update_err = eng
+        .origin_update(None, &Scope::Unrestricted)
+        .await
+        .unwrap_err();
     assert!(
         matches!(update_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{update_err}"
     );
 
-    let status_err = eng.origin_status(None).await.unwrap_err();
+    let status_err = eng
+        .origin_status(None, false, &Scope::Unrestricted)
+        .await
+        .unwrap_err();
     assert!(
         matches!(status_err, EngineError::Remote(RemoteError::NotEnabled)),
         "{status_err}"
@@ -179,11 +186,14 @@ async fn read_only_refuses_add_but_allows_update_and_status() {
 
     // No origin domains are registered in this test, but the calls
     // themselves must not be refused for being read-only.
-    let update = eng.origin_update(None).await.unwrap();
+    let update = eng.origin_update(None, &Scope::Unrestricted).await.unwrap();
     assert_eq!(update["domains"].as_array().unwrap().len(), 0);
     assert_eq!(update["errors"].as_array().unwrap().len(), 0);
 
-    let status = eng.origin_status(None).await.unwrap();
+    let status = eng
+        .origin_status(None, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(status["domains"].as_array().unwrap().len(), 0);
 }
 
@@ -351,10 +361,13 @@ async fn origin_add_creates_folder_registers_domain_and_indexes_engrams() {
 
     // Indexed: readable through the engine's own read path.
     let read = eng
-        .read_engram(&ReadParams {
-            identifier: "alpha".to_string(),
-            domain: Some("brand-knowledge".to_string()),
-        })
+        .read_engram(
+            &ReadParams {
+                identifier: "alpha".to_string(),
+                domain: Some("brand-knowledge".to_string()),
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(
@@ -893,7 +906,10 @@ async fn origin_update_applies_an_upstream_edit_and_the_index_reflects_it() {
     ]));
     mock.set_branch("main", &c2);
 
-    let result = eng.origin_update(Some("brand")).await.unwrap();
+    let result = eng
+        .origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = result["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], "brand");
@@ -907,10 +923,13 @@ async fn origin_update_applies_an_upstream_edit_and_the_index_reflects_it() {
 
     // The index reflects it too.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("revised upstream".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("revised upstream".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1);
@@ -955,7 +974,9 @@ async fn origin_update_schedules_embedding_on_the_worker_channel() {
     ]));
     mock.set_branch("main", &c2);
 
-    eng.origin_update(Some("brand")).await.unwrap();
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
     assert!(
         rx.try_recv().is_ok(),
         "origin_update must schedule a background embed instead of embedding inline"
@@ -975,7 +996,10 @@ async fn origin_update_named_domain_with_no_origin_errors() {
     )
     .await;
 
-    let err = eng.origin_update(Some("nope")).await.unwrap_err();
+    let err = eng
+        .origin_update(Some("nope"), &Scope::Unrestricted)
+        .await
+        .unwrap_err();
     // Unregistered entirely, since none was ever added.
     assert!(matches!(err, EngineError::UnknownDomain { .. }), "{err}");
 }
@@ -1010,7 +1034,10 @@ async fn origin_update_bootstraps_an_env_domain_then_plain_pulls() {
     .await;
 
     // First update bootstraps: the missing-state env domain subscribes.
-    let result = eng.origin_update(Some("team")).await.unwrap();
+    let result = eng
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = result["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], "team");
@@ -1031,17 +1058,23 @@ async fn origin_update_bootstraps_an_env_domain_then_plain_pulls() {
 
     // Indexed and searchable through the engine's own read path.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("turbines".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("turbines".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1);
 
     // Second update is a plain pull now that state is present: nothing new
     // upstream, so it is up to date and no longer marked bootstrapped.
-    let result = eng.origin_update(Some("team")).await.unwrap();
+    let result = eng
+        .origin_update(Some("team"), &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = result["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert!(
@@ -1133,7 +1166,7 @@ async fn origin_update_one_domain_failing_does_not_abort_the_others() {
     ]));
     mock.set_branch("good-branch", &good_commit_2);
 
-    let result = eng.origin_update(None).await.unwrap();
+    let result = eng.origin_update(None, &Scope::Unrestricted).await.unwrap();
     let domains = result["domains"].as_array().unwrap();
     let errors = result["errors"].as_array().unwrap();
     assert_eq!(domains.len(), 1, "{result}");
@@ -1204,7 +1237,10 @@ async fn origin_update_reports_a_proposal_transition_with_its_url_and_title() {
     ]));
     mock.set_branch("main", &c2);
 
-    let result = eng.origin_update(Some("brand")).await.unwrap();
+    let result = eng
+        .origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = result["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1, "{result}");
     let proposals = domains[0]["proposals"].as_array().unwrap();
@@ -1246,7 +1282,10 @@ async fn origin_status_reports_behind_and_connection() {
     .await
     .unwrap();
 
-    let status = eng.origin_status(Some("brand")).await.unwrap();
+    let status = eng
+        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(status["connection"]["connected"], true);
     assert_eq!(status["connection"]["user"], "mock-user");
     let domains = status["domains"].as_array().unwrap();
@@ -1263,7 +1302,10 @@ async fn origin_status_reports_behind_and_connection() {
         engram("Local", "local", "not shared yet"),
     )
     .unwrap();
-    let status_local = eng.origin_status(Some("brand")).await.unwrap();
+    let status_local = eng
+        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(status_local["domains"][0]["local_changes"], 1);
 
     let c2 = mock.add_commit(commit_files(&[
@@ -1272,9 +1314,178 @@ async fn origin_status_reports_behind_and_connection() {
     ]));
     mock.set_branch("main", &c2);
 
-    let status2 = eng.origin_status(Some("brand")).await.unwrap();
+    let status2 = eng
+        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains2 = status2["domains"].as_array().unwrap();
     assert_eq!(domains2[0]["behind"], true);
+}
+
+/// The keys one domain entry carries when nobody asked for detail. Pinned as a
+/// list rather than spot-checked so an accidental `detail: null` - a key that
+/// costs every reader something and says nothing - fails here.
+const STATUS_KEYS_WITHOUT_DETAIL: [&str; 17] = [
+    "base_commit",
+    "behind",
+    "branch",
+    "conflicts",
+    "declined_proposals",
+    "domain",
+    "last_checked",
+    "local_changes",
+    "merged_unconsumed",
+    "open_proposals",
+    "probe_error",
+    "repair_pending",
+    "repo",
+    "skipped_large",
+    "stack_link_pending",
+    "stack_number",
+    "stack_wedged",
+];
+
+/// A status asked for detail names the unshared work; a status not asked for it
+/// is the payload it always was.
+///
+/// The delta is the one that misled a reader: something added, something
+/// modified, something DELETED, and folder listings riding along. The deletion
+/// is the assertion that earns the test, because it is the change kind no scan
+/// of the filesystem can find - the file is not there to be found.
+#[tokio::test]
+async fn origin_status_detail_names_the_changes_and_the_default_still_only_counts_them() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/edit.md", engram("Edit", "edit", "the team's copy")),
+        ("notes/gone.md", engram("Gone", "gone", "the team's copy")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+
+    // One of each kind, plus two refreshed folder listings that ride along.
+    std::fs::write(
+        root.join("notes/added.md"),
+        engram("Added", "added", "written here, never shared"),
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("notes/edit.md"),
+        engram("Edit", "edit", "edited here since the pull"),
+    )
+    .unwrap();
+    std::fs::remove_file(root.join("notes/gone.md")).unwrap();
+    std::fs::write(root.join("index.md"), b"# listing\n").unwrap();
+    std::fs::write(root.join("notes/index.md"), b"# listing\n").unwrap();
+
+    let counted = eng
+        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let entry = &counted["domains"][0];
+    assert_eq!(entry["local_changes"], 3, "{counted}");
+    let mut keys: Vec<&str> = entry
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys, STATUS_KEYS_WITHOUT_DETAIL,
+        "a status nobody asked detail of is the payload it always was: {entry}"
+    );
+
+    let named = eng
+        .origin_status(Some("brand"), true, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let entry = &named["domains"][0];
+    assert_eq!(
+        entry["local_changes"], 3,
+        "the bare count is unchanged by asking: {entry}"
+    );
+    let detail = &entry["detail"];
+    assert_eq!(detail["added"], serde_json::json!(["notes/added.md"]));
+    assert_eq!(detail["modified"], serde_json::json!(["notes/edit.md"]));
+    assert_eq!(
+        detail["deleted"],
+        serde_json::json!(["notes/gone.md"]),
+        "the deleted file is on no filesystem: this is the only surface that can name it"
+    );
+    assert_eq!(
+        detail["generated_indexes"],
+        serde_json::json!(2),
+        "the listings ride along as one number and are named nowhere: {detail}"
+    );
+    let named_count: usize = ["added", "modified", "deleted"]
+        .iter()
+        .map(|key| detail[*key].as_array().unwrap().len())
+        .sum();
+    assert_eq!(
+        named_count,
+        entry["local_changes"].as_u64().unwrap() as usize,
+        "the three arrays sum to the count: {entry}"
+    );
+}
+
+/// Offline is exactly when a caller cannot look the change list up anywhere
+/// else, so the probe-free retry carries the detail too.
+#[tokio::test]
+async fn origin_status_detail_survives_an_offline_probe() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mock = Arc::new(MockProvider::new());
+    let commit = mock.add_commit(commit_files(&[
+        ("MANIFEST.md", manifest()),
+        ("notes/gone.md", engram("Gone", "gone", "the team's copy")),
+    ]));
+    mock.set_branch("main", &commit);
+
+    let config_path = tmp.path().join("config.yaml");
+    let origins_dir = tmp.path().join("origins");
+    let root = tmp.path().join("brand-knowledge");
+    let eng = engine_with(&config_path, &origins_dir, mock.clone(), true, false).await;
+    eng.origin_add(
+        "acme/brand-knowledge",
+        Some("brand"),
+        None,
+        None,
+        Some(root.to_str().unwrap()),
+    )
+    .await
+    .unwrap();
+    std::fs::remove_file(root.join("notes/gone.md")).unwrap();
+
+    mock.fail_branch_head_offline("main");
+
+    let status = eng
+        .origin_status(Some("brand"), true, &Scope::Unrestricted)
+        .await
+        .unwrap();
+    let entry = &status["domains"][0];
+    assert!(
+        entry["probe_error"].is_string(),
+        "this is the probe-free retry arm: {entry}"
+    );
+    assert_eq!(
+        entry["detail"]["deleted"],
+        serde_json::json!(["notes/gone.md"]),
+        "a status that degraded to local state still names what the tree owes: {entry}"
+    );
 }
 
 #[tokio::test]
@@ -1298,7 +1509,10 @@ async fn origin_status_with_no_domain_reports_every_origin_domain() {
     .await
     .unwrap();
 
-    let status = eng.origin_status(None).await.unwrap();
+    let status = eng
+        .origin_status(None, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = status["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], "brand");
@@ -1339,7 +1553,10 @@ async fn origin_status_survives_a_live_offline_probe_for_a_connected_domain() {
     // itself cannot reach GitHub.
     mock.fail_branch_head_offline("main");
 
-    let status = eng.origin_status(Some("brand")).await.unwrap();
+    let status = eng
+        .origin_status(Some("brand"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(
         status["errors"].as_array().unwrap().len(),
         0,
@@ -1395,7 +1612,10 @@ async fn origin_status_offline_probe_on_one_domain_still_reports_both_domains() 
 
     mock.fail_branch_head_offline("bad-branch");
 
-    let status = eng.origin_status(None).await.unwrap();
+    let status = eng
+        .origin_status(None, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     assert_eq!(status["errors"].as_array().unwrap().len(), 0, "{status}");
     let domains = status["domains"].as_array().unwrap();
     assert_eq!(
@@ -1457,7 +1677,10 @@ async fn origin_status_one_domain_genuinely_failing_does_not_abort_the_others() 
     // touching "good".
     std::fs::remove_file(origins_dir.join("bad").join("state.json")).unwrap();
 
-    let status = eng.origin_status(None).await.unwrap();
+    let status = eng
+        .origin_status(None, false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domains = status["domains"].as_array().unwrap();
     let errors = status["errors"].as_array().unwrap();
     assert_eq!(domains.len(), 1, "{status}");
@@ -1627,7 +1850,9 @@ async fn origin_share_with_pending_conflicts_reports_them_without_erroring() {
         ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
     ]));
     mock.set_branch("main", &c2);
-    eng.origin_update(Some("brand")).await.unwrap();
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
 
     let result = eng
         .origin_share("brand", None, None, None, None, ShareActor::Owner)
@@ -1669,10 +1894,13 @@ async fn a_preview_and_a_share_index_what_their_pull_applied() {
     let found = |needle: &'static str| {
         let eng = &eng;
         async move {
-            eng.search_engrams(&SearchParams {
-                query: Some(needle.to_string()),
-                ..SearchParams::default()
-            })
+            eng.search_engrams(
+                &SearchParams {
+                    query: Some(needle.to_string()),
+                    ..SearchParams::default()
+                },
+                &Scope::Unrestricted,
+            )
             .await
             .unwrap()["total"]
                 .as_u64()
@@ -1939,7 +2167,10 @@ async fn a_personal_mode_status_leaves_an_owed_stack_link_for_the_next_write() {
     .unwrap();
 
     let before = mock.calls().len();
-    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let status = eng
+        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let delta = mock.calls().split_off(before);
     assert!(
         stack_calls(&delta).is_empty(),
@@ -1997,7 +2228,10 @@ async fn an_instance_mode_status_still_settles_an_owed_stack_link() {
     let (eng, mock, _root, state_dir) = engine_owing_a_stack_link(&tmp).await;
 
     let before = mock.calls().len();
-    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let status = eng
+        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let delta = mock.calls().split_off(before);
     assert!(
         delta.iter().any(|c| c.starts_with("create_stack:")),
@@ -2225,7 +2459,10 @@ async fn origin_share_teaching_refusal_survives_the_engine_boundary() {
 async fn origin_status_json_names_wedge_and_pending_flags() {
     let tmp = tempfile::tempdir().unwrap();
     let (eng, _mock, _root, _number) = shared_team_engine(&tmp).await;
-    let v = eng.origin_status(Some("kb")).await.unwrap();
+    let v = eng
+        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let domain = &v["domains"][0];
     assert!(domain["stack_number"].is_null(), "{v}");
     assert_eq!(
@@ -2284,7 +2521,10 @@ async fn origin_update_response_carries_open_proposal_feedback() {
             }],
         },
     );
-    let v = eng.origin_update(Some("kb")).await.unwrap();
+    let v = eng
+        .origin_update(Some("kb"), &Scope::Unrestricted)
+        .await
+        .unwrap();
     let prop = &v["domains"][0]["open_proposals"][0];
     assert_eq!(prop["feedback"][0]["body"], "tighten the wording", "{v}");
     assert_eq!(prop["review_state"], "changes_requested");
@@ -2302,7 +2542,10 @@ async fn origin_status_flags_an_amended_open_proposal() {
     let amended = mock.add_commit(commit_files(&[("MANIFEST.md", manifest())]));
     mock.set_branch(&branch, &amended);
 
-    let v = eng.origin_status(Some("kb")).await.unwrap();
+    let v = eng
+        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let open = &v["domains"][0]["open_proposals"][0];
     assert_eq!(open["number"].as_u64(), Some(number), "{v}");
     assert_eq!(open["amended_upstream"], true, "{v}");
@@ -2329,9 +2572,14 @@ async fn conflicted_team_engine(tmp: &tempfile::TempDir) -> (Engine, std::path::
         ("notes/a.md", engram("Alpha", "notes/a", "theirs theirs")),
     ]));
     mock.set_branch("main", &c2);
-    eng.origin_update(Some("kb")).await.unwrap();
+    eng.origin_update(Some("kb"), &Scope::Unrestricted)
+        .await
+        .unwrap();
 
-    let status = eng.origin_status(Some("kb")).await.unwrap();
+    let status = eng
+        .origin_status(Some("kb"), false, &Scope::Unrestricted)
+        .await
+        .unwrap();
     let id = status["domains"][0]["conflicts"][0]["id"]
         .as_str()
         .expect("the pull recorded a conflict")
@@ -2474,10 +2722,13 @@ async fn origin_withdraw_restores_files_and_syncs_the_index() {
 
     // The index reflects the restored content: sync ran after the withdraw.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("base content".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("base content".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1, "{hits}");
@@ -2586,7 +2837,9 @@ async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
         ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
     ]));
     mock.set_branch("main", &c2);
-    eng.origin_update(Some("brand")).await.unwrap();
+    eng.origin_update(Some("brand"), &Scope::Unrestricted)
+        .await
+        .unwrap();
 
     let state_dir = origins_dir.join("brand");
     assert_eq!(
@@ -2622,10 +2875,13 @@ async fn origin_resolve_writes_the_resolution_and_syncs_the_index() {
 
     // The index reflects the resolved content: sync ran after resolve.
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("UPSTREAM".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("UPSTREAM".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 1, "{hits}");
@@ -2749,12 +3005,15 @@ async fn hybrid_search_returns_hits_and_embeds_the_query_once() {
     assert!(before >= 1, "the inline embed pass ran during domain add");
 
     let hits = eng
-        .search_engrams(&SearchParams {
-            query: Some("alpha".to_string()),
-            search_type: Some("hybrid".to_string()),
-            domains: vec!["local-notes".to_string()],
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("alpha".to_string()),
+                search_type: Some("hybrid".to_string()),
+                domains: vec!["local-notes".to_string()],
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
 

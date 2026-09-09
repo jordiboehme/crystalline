@@ -79,7 +79,7 @@ fn prompt_text_read_only_matches_snapshot() {
 
     let text = String::from_utf8(output).unwrap();
     // The read-only variant drops the write-tools line and names none of the
-    // four content-mutating tools.
+    // four content-mutating tools the block names.
     for tool in [
         "write_engram",
         "edit_engram",
@@ -387,5 +387,47 @@ fn prompt_system_scaffolded_30_domains_stays_under_500ms() {
     assert!(
         elapsed.as_millis() < 500,
         "prompt system took {elapsed:?} for 30 domains, expected well under the 500ms CI-safe bound"
+    );
+}
+
+/// `--harness` is accepted on the routing command because both managed hook
+/// commands now carry it, and it changes nothing about the routing block: a
+/// known id, an id this binary does not know (a hook a newer release wired up,
+/// run by an older binary) and no flag at all all print the same bytes. A
+/// lifecycle hook that started refusing arguments would take the session's
+/// routing block down with it.
+#[test]
+fn the_harness_flag_never_changes_the_routing_block() {
+    let run = |extra: &[&str]| {
+        let mut args = vec![
+            "prompt",
+            "system",
+            "--workspace",
+            "workspace",
+            "--config",
+            "config.yaml",
+        ];
+        args.extend_from_slice(extra);
+        Command::cargo_bin("crystalline")
+            .unwrap()
+            .current_dir(fixtures_dir().join("prompt-fixture"))
+            .args(&args)
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone()
+    };
+
+    let plain = run(&[]);
+    assert_eq!(
+        run(&["--harness", "claude-code"]),
+        plain,
+        "a known harness prints the same routing block"
+    );
+    assert_eq!(
+        run(&["--harness", "a-harness-from-a-future-release"]),
+        plain,
+        "an unknown harness is inert, never an error"
     );
 }

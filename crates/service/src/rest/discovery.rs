@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use utoipa::IntoParams;
 
+use super::auth::Identity;
 use super::{ApiError, ApiQuery, ProblemDetail, RestState, csv};
 use crate::params::{ContextParams, RecentParams, SearchParams, VocabularyParams};
 
@@ -149,23 +150,27 @@ pub struct SearchQuery {
 )]
 pub async fn search(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .search_engrams(&SearchParams {
-            query: query.q,
-            domains: csv(query.domains.as_deref()),
-            engram_type: query.engram_type,
-            tags: csv(query.tags.as_deref()),
-            status: query.status,
-            metadata_filters: None,
-            after: query.after,
-            search_type: query.search_type,
-            min_similarity: query.min_similarity,
-            limit: query.limit,
-            page: query.page,
-        })
+        .search_engrams(
+            &SearchParams {
+                query: query.q,
+                domains: csv(query.domains.as_deref()),
+                engram_type: query.engram_type,
+                tags: csv(query.tags.as_deref()),
+                status: query.status,
+                metadata_filters: None,
+                after: query.after,
+                search_type: query.search_type,
+                min_similarity: query.min_similarity,
+                limit: query.limit,
+                page: query.page,
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }
@@ -237,13 +242,17 @@ pub struct VocabularyQuery {
 )]
 pub async fn vocabulary(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<VocabularyQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .vocabulary(&VocabularyParams {
-            domain: query.domain,
-        })
+        .vocabulary(
+            &VocabularyParams {
+                domain: query.domain,
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }
@@ -358,17 +367,21 @@ pub struct ContextQuery {
 )]
 pub async fn context(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<ContextQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .build_context(&ContextParams {
-            anchor: query.anchor,
-            depth: query.depth,
-            domains: csv(query.domains.as_deref()),
-            timeframe: None,
-            max_related: query.max_related,
-        })
+        .build_context(
+            &ContextParams {
+                anchor: query.anchor,
+                depth: query.depth,
+                domains: csv(query.domains.as_deref()),
+                timeframe: None,
+                max_related: query.max_related,
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }
@@ -445,15 +458,19 @@ pub struct ActivityQuery {
 )]
 pub async fn activity(
     State(state): State<RestState>,
+    identity: Identity,
     ApiQuery(query): ApiQuery<ActivityQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let value = state
         .engine
-        .recent_activity(&RecentParams {
-            domains: csv(query.domains.as_deref()),
-            timeframe: query.timeframe,
-            types: csv(query.types.as_deref()),
-        })
+        .recent_activity(
+            &RecentParams {
+                domains: csv(query.domains.as_deref()),
+                timeframe: query.timeframe,
+                types: csv(query.types.as_deref()),
+            },
+            &identity.scope(),
+        )
         .await?;
     Ok(Json(value))
 }

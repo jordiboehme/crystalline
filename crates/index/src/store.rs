@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use chrono::NaiveDate;
 pub use crystalline_core::config::DomainKind;
 use crystalline_core::{Engram, slugify};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::sweep::UnresolvedRef;
@@ -35,7 +35,11 @@ pub struct EngramId(pub i64);
 
 /// The recorded file identity used by the sync prefilter: modification time and
 /// size are the cheap comparison, the SHA-256 is the authoritative one.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because the daemon serves a domain's stamps over the ctl
+/// `file_stamps` command, which is how `crystalline doctor` reads the index
+/// while the daemon holds it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileStamp {
     /// Modification time in whole seconds since the Unix epoch.
     pub mtime: i64,
@@ -60,6 +64,47 @@ pub struct ObservationRecord {
     pub context: Option<String>,
 }
 
+/// The SQL expression that resolves one reference row to an engram id, or to
+/// NULL when nothing answers to it.
+///
+/// One rule, shared by both backends and by both reference tables, because a
+/// second copy of it would be a second answer to "does this link resolve".
+/// `table` is `relation` or `link`; every construct here is spelled the same in
+/// both dialects, so only the caller's bind placeholder differs.
+///
+/// Three readings, in the order [`crystalline_core::address::resolve`] tries
+/// them: the target as a permalink in the target domain, the target as a title
+/// there, and - only when the row names a domain nobody registered - the whole
+/// bracket text as a permalink and then a title in the row's OWN domain.
+///
+/// That third reading is what makes an engram titled `Log: Weekly Garden Notes`
+/// reachable. The parser splits that into a domain and a target exactly as it
+/// splits `ops:Runbook`, because nothing inside the brackets says which it is,
+/// and only the registry can settle it. It stays a second question rather than
+/// a softer answer: a prefix that does name a domain never reaches it, and a
+/// row written before `to_raw` existed compares against NULL, which is never
+/// true, so it resolves exactly as it did before until its engram is reindexed.
+pub(crate) fn reference_match(table: &str) -> String {
+    let target_domain = format!(
+        "COALESCE((SELECT d.id FROM domain d WHERE d.name = {table}.to_domain), {table}.domain_id)"
+    );
+    let unregistered = format!(
+        "{table}.to_domain IS NOT NULL \
+         AND NOT EXISTS (SELECT 1 FROM domain d WHERE d.name = {table}.to_domain)"
+    );
+    format!(
+        "COALESCE(\
+         (SELECT e.id FROM engram e WHERE e.permalink = {table}.to_target \
+          AND e.domain_id = {target_domain} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE lower(e.title) = lower({table}.to_target) \
+          AND e.domain_id = {target_domain} LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {unregistered} AND e.permalink = {table}.to_raw \
+          AND e.domain_id = {table}.domain_id LIMIT 1), \
+         (SELECT e.id FROM engram e WHERE {unregistered} AND lower(e.title) = lower({table}.to_raw) \
+          AND e.domain_id = {table}.domain_id LIMIT 1))"
+    )
+}
+
 /// One relation bullet, ready to index. `to_id` is filled by
 /// [`Store::resolve_pending_relations`] once the target exists.
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +117,15 @@ pub struct RelationRecord {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The bracket text exactly as it was written, colon and all.
+    ///
+    /// Kept beside the split because the split is domain-agnostic and can be
+    /// wrong: `[[Log: Weekly Garden Notes]]` and `[[ops:Runbook]]` are the same
+    /// shape, and only the registry tells them apart. Resolution reads this
+    /// when the prefix names no registered domain, and it is the only thing
+    /// that can - `to_domain` and `to_target` have by then lost the whitespace
+    /// the colon was trimmed around.
+    pub to_raw: String,
 }
 
 /// One prose wikilink, treated as a direct link edge.
@@ -83,6 +137,15 @@ pub struct LinkRecord {
     pub to_target: String,
     /// An explicit cross-domain target domain, or `None` for same-domain.
     pub to_domain: Option<String>,
+    /// The bracket text exactly as it was written, colon and all.
+    ///
+    /// Kept beside the split because the split is domain-agnostic and can be
+    /// wrong: `[[Log: Weekly Garden Notes]]` and `[[ops:Runbook]]` are the same
+    /// shape, and only the registry tells them apart. Resolution reads this
+    /// when the prefix names no registered domain, and it is the only thing
+    /// that can - `to_domain` and `to_target` have by then lost the whitespace
+    /// the colon was trimmed around.
+    pub to_raw: String,
 }
 
 /// A fully prepared engram row plus its child rows and file stamp. Built from a
@@ -196,6 +259,7 @@ impl EngramRecord {
                 rel_type: r.rel_type.clone(),
                 to_target: r.target.target.clone(),
                 to_domain: r.target.domain.clone(),
+                to_raw: r.target.raw.clone(),
             })
             .collect();
         let links = engram
@@ -205,6 +269,7 @@ impl EngramRecord {
                 line: l.line,
                 to_target: l.target.target.clone(),
                 to_domain: l.target.domain.clone(),
+                to_raw: l.target.raw.clone(),
             })
             .collect();
 
@@ -752,6 +817,18 @@ pub struct InboundRef {
     pub src_path: String,
     /// The exact target text used in the link.
     pub to_target: String,
+    /// The domain the reference named, when it named one: `Some("open")` for
+    /// `[[open:Thing]]`, `None` for a bare `[[Thing]]`.
+    ///
+    /// Here because `to_target` alone cannot tell the two apart, and a caller
+    /// that rewrites the bracket text has to. The cross-domain move rewrites
+    /// bare links only: for a prefixed one the bracket text on disk is not
+    /// `[[{to_target}]]`, so a needle built from `to_target` either misses it -
+    /// or, when the same file also holds a bare link with that exact text,
+    /// matches the wrong one and reports the rewrite as a success. A colon
+    /// title (`[[Log: Weekly Notes]]`, which resolves by title) reaches that
+    /// loop the same way, since parsing splits it at the colon.
+    pub to_domain: Option<String>,
     /// Whether the reference came from a relation bullet or a prose link.
     pub kind: EdgeKind,
 }
@@ -811,6 +888,18 @@ pub struct InboundQuery<'a> {
     /// Keep only references carrying this relation type ([`LINKS_TO`] for prose
     /// wikilinks). `None` selects every relation.
     pub rel: Option<&'a str>,
+    /// Domain names whose references are left out entirely: the private
+    /// domains the caller asking may not see. Empty for a caller who may see
+    /// everything, which is the usual case.
+    ///
+    /// Subtracted inside the query rather than from its answer, and from all
+    /// three of the statements it runs - the page, the total and the
+    /// per-relation summary. A caller that filtered the returned page would
+    /// hand out short pages and a `total` that counts what it did not show,
+    /// and a count that disagrees with its rows says a reference exists
+    /// somewhere the reader may not look, which is exactly the fact being
+    /// kept.
+    pub exclude_domains: &'a [String],
     /// One-based page number.
     pub page: usize,
     /// Page size.
@@ -899,6 +988,19 @@ pub struct EmbeddingRow {
     pub embedding: Vec<f32>,
     /// The vector dimensionality.
     pub dims: usize,
+}
+
+/// One engram's lead vector: the embedding of its first chunk (`seq = 0`)
+/// for one model, as [`Store::lead_vectors`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeadVector {
+    /// The engram the lead chunk belongs to.
+    pub engram_id: EngramId,
+    /// The vector dimensionality, as the chunk row declares it. Carried so a
+    /// caller can skip a pair of mismatched widths rather than compare them.
+    pub dims: usize,
+    /// The lead chunk's embedding, exactly as the backend stored it.
+    pub vector: Vec<f32>,
 }
 
 /// A freshly computed chunk to store against an engram. Produced by the chunker
@@ -1018,6 +1120,16 @@ pub struct DomainStats {
     /// The host's last heartbeat, RFC 3339, when hosted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_heartbeat_at: Option<String>,
+    /// When this domain was last seen registered in the configuration, RFC
+    /// 3339, or `None` when it has never been stamped. Written by
+    /// [`Store::stamp_registered`].
+    ///
+    /// `None` means never stamped. It is emphatically not an old timestamp: a
+    /// caller comparing ages treats `None` as no evidence of staleness, never
+    /// as infinitely old. Every domain row written before the column existed
+    /// reads `None`, so a fresh upgrade must find nothing collectable on its
+    /// first sweep.
+    pub last_registered: Option<String>,
 }
 
 /// The instance currently holding a file domain's host lock in a shared
@@ -1196,6 +1308,60 @@ pub(crate) fn build_vocabulary(
         statuses: to_named(statuses),
         aliases,
     }
+}
+
+/// Sum several vocabularies into one, ordered exactly as a single sweep over
+/// the same domains would order it.
+///
+/// This exists for the one caller that cannot ask SQL for what it wants: a
+/// vocabulary sweep for a caller who may not read every domain. The store's own
+/// sweep is all-domains or one domain, so such a caller reads the domains it may
+/// see and merges here - and the merge is [`build_vocabulary`] itself, fed the
+/// summed per-name counts, so the result cannot order or shape itself
+/// differently from a sweep the store answered in one query.
+pub fn merge_vocabularies(parts: Vec<Vocabulary>) -> Vocabulary {
+    let mut engram_tags: HashMap<String, i64> = HashMap::new();
+    let mut observation_tags: HashMap<String, i64> = HashMap::new();
+    let mut categories: HashMap<String, i64> = HashMap::new();
+    let mut relation_types: HashMap<String, i64> = HashMap::new();
+    let mut types: HashMap<String, i64> = HashMap::new();
+    let mut statuses: HashMap<String, i64> = HashMap::new();
+    let mut aliases: Vec<(String, String)> = Vec::new();
+    fn sum(into: &mut HashMap<String, i64>, rows: Vec<NamedCount>) {
+        for row in rows {
+            *into.entry(row.name).or_default() += row.count;
+        }
+    }
+    for part in parts {
+        for tag in part.tags {
+            // A zero count is a name SQL would never have grouped, so it is not
+            // carried into the pair lists `build_vocabulary` expects.
+            if tag.engrams != 0 {
+                *engram_tags.entry(tag.name.clone()).or_default() += tag.engrams;
+            }
+            if tag.observations != 0 {
+                *observation_tags.entry(tag.name).or_default() += tag.observations;
+            }
+        }
+        sum(&mut categories, part.categories);
+        sum(&mut relation_types, part.relation_types);
+        sum(&mut types, part.types);
+        sum(&mut statuses, part.statuses);
+        aliases.extend(
+            part.aliases
+                .into_iter()
+                .map(|alias| (alias.alias, alias.canonical)),
+        );
+    }
+    build_vocabulary(
+        engram_tags.into_iter().collect(),
+        observation_tags.into_iter().collect(),
+        categories.into_iter().collect(),
+        relation_types.into_iter().collect(),
+        types.into_iter().collect(),
+        statuses.into_iter().collect(),
+        aliases,
+    )
 }
 
 /// The backend-agnostic storage interface. All methods are async so a network
@@ -1398,6 +1564,11 @@ pub trait Store: Send + Sync {
     /// inside it, and a summary that shrank as it was used would be a map that
     /// redraws itself while it is being read.
     ///
+    /// [`InboundQuery::exclude_domains`] is the one narrowing all three of
+    /// them honor, summary included: it is not a filter a reader chose but the
+    /// set of domains that reader may not see, and a count that named one
+    /// would be the disclosure the exclusion is for.
+    ///
     /// Ordered by title, then permalink, then domain, then relation, byte-wise
     /// on both backends, so paging is stable and a page boundary never drops or
     /// repeats a row.
@@ -1493,6 +1664,33 @@ pub trait Store: Send + Sync {
     /// default search mode.
     async fn embedding_coverage(&self) -> Result<EmbeddingCoverage>;
 
+    /// Every engram in `domain` whose first chunk carries an embedding by
+    /// `model`, with that vector, ordered by engram id. The maintenance
+    /// sweep's `V301` compares these pairwise, so the projection is exactly
+    /// the lead chunk - title, description and opening body - and nothing
+    /// wider: one row per engram, never one per chunk. A row whose stored
+    /// width disagrees with its `dims` column is skipped rather than
+    /// returned mis-sized.
+    ///
+    /// Unbounded on purpose, and the cost is the caller's to bound: every
+    /// matching engram in the domain comes back, so this materializes
+    /// `dims * 4` bytes of payload per engram plus per-vector heap overhead,
+    /// twice over at the peak (the database rows and the decoded output are
+    /// both live inside the call). At the default model's 384 dims that is
+    /// roughly 1.5 KB an engram, so a hundred thousand of them is hundreds of
+    /// megabytes.
+    ///
+    /// The one caller, the sweep's per-domain fact assembly, takes the whole
+    /// fetch knowingly: it already parses every engram in the domain and holds
+    /// each body, so the vectors add a fraction to a cost that was linear in
+    /// domain size anyway, and a domain over the sweep's `MAX_TWIN_VECTORS`
+    /// pays for vectors it then declines to compare. There is deliberately no
+    /// count method to skip on - adding one, or pushing the sweep's rule filter
+    /// down so a run that cannot emit `V301` never asks, is the named follow-up
+    /// in the backlog. Until it lands, a new caller with a ceiling should
+    /// assume this returns everything.
+    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>>;
+
     /// Delete all indexed data, keeping the schema. The corruption-recovery and
     /// full-reindex path.
     async fn wipe(&self) -> Result<()>;
@@ -1512,11 +1710,44 @@ pub trait Store: Send + Sync {
     /// Record that a domain finished syncing at the given RFC 3339 instant.
     async fn record_sync(&self, domain: DomainId, when: &str) -> Result<()>;
 
+    /// Record that every named domain was seen registered at the given RFC
+    /// 3339 instant, writing `last_registered` on each matching row.
+    ///
+    /// Domains are named rather than identified because the caller is the
+    /// configuration, which knows names. A name with no row in the index is a
+    /// silent no-op: this stamps rows, it never creates them. An empty set is
+    /// a no-op too, so a configuration that registers nothing is not an error.
+    ///
+    /// The caller must pass the configuration's own registrations, read the
+    /// way a named lookup resolves them (including a re-read of the config
+    /// file on disk), not a cached or narrower approximation of that set. A
+    /// domain that is genuinely registered but missing from the set handed in
+    /// here goes unstamped, ages, and is indistinguishable from one that was
+    /// removed - which, for a caller that collects on the stamp, is data loss.
+    ///
+    /// The stamp is how a later reader tells a domain removed a week ago from
+    /// one whose configuration was edited an hour ago. Absence of a stamp
+    /// (`DomainStats::last_registered` reading `None`) means *never stamped*,
+    /// not *stamped infinitely long ago*: a caller aging the stamp must treat
+    /// `None` as no evidence of staleness and leave the row alone, so the
+    /// first sweep after an upgrade, when every pre-existing row reads `None`,
+    /// collects nothing.
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()>;
+
     /// Diagnostics about the open store.
     async fn store_info(&self) -> Result<StoreInfo>;
 
     /// Per-domain counts, in registration order.
     async fn domain_stats(&self) -> Result<Vec<DomainStats>>;
+
+    /// Every domain name the index holds, sorted.
+    ///
+    /// The cheap half of [`Store::domain_stats`], for the caller that needs to
+    /// know *which* domains have rows rather than how many rows each has. One
+    /// column of a table with a row per domain, against six correlated counting
+    /// scans per domain - which matters because the serving screen asks this on
+    /// every read, and a domain name is all it wants.
+    async fn domain_names(&self) -> Result<Vec<String>>;
 
     /// The vocabulary in use: tag, observation-category, relation-type, engram
     /// `type` and engram `status` usage counts, for one domain or (when

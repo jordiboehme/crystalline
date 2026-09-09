@@ -5,9 +5,9 @@
 //! is expected at that root; its absence is rule `M001`, not a scan
 //! failure). All `.md` files found recursively under a root (skipping
 //! dotfiles and dot-directories) are parsed and checked against the full
-//! rule catalog: `E` (format), `T` (temporal), `M` (manifest and
-//! configurable required-file structure), `L` (links), `S` (schema
-//! conformance) and `Q` (quality).
+//! rule catalog: `E` (format, plus `E009` on the domain's paths themselves),
+//! `T` (temporal), `M` (manifest and configurable required-file structure),
+//! `L` (links), `S` (schema conformance) and `Q` (quality).
 //!
 //! Severities are `Error`, `Warning` and `Info`. A domain's
 //! `.crystalline.yaml` can override a rule's severity (including turning it
@@ -280,6 +280,7 @@ fn run_rules(domains: &[scanner::Domain], options: &VerifyOptions) -> VerifyRepo
         );
         manifest_rules::check(domain, &mut sink);
         schema_rules::check(domain, &mut sink);
+        format::check_domain(domain, &mut sink);
 
         // Tokenize each file's body once here, aligned by index with
         // `domain.files`, and share the slice with the L- and Q-family rules

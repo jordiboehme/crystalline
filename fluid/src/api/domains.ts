@@ -28,6 +28,16 @@ export interface DomainSummary {
   lastSync: string | null;
   /** The routing bullets from its MANIFEST: what this domain is for. */
   whenToUse: string[];
+  /**
+   * Whether the domain is private: visible only to its owner, the accounts
+   * invited into it and instance admins.
+   *
+   * False for a shared domain and false for a listing that does not say -
+   * an older server, or an installation with no accounts database, where no
+   * domain has ever been made private. A domain this session may not read is
+   * not in the listing at all, so a row is never withheld here, only marked.
+   */
+  private: boolean;
 }
 
 /** Everything `GET /domains` says. */
@@ -50,6 +60,7 @@ function readDomain(value: unknown): DomainSummary | null {
     engrams: typeof record?.engrams === "number" ? record.engrams : null,
     lastSync: typeof record?.last_sync === "string" ? record.last_sync : null,
     whenToUse: asStrings(record?.when_to_use),
+    private: record?.private === true,
   };
 }
 

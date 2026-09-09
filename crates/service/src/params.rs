@@ -139,6 +139,17 @@ pub struct EditParams {
     /// last-write-wins.
     #[serde(default)]
     pub expected_checksum: Option<String>,
+    /// The pair an `evolve_ack` assignment names, for the one rule that is
+    /// acknowledged per pair rather than per engram.
+    ///
+    /// Never on the wire - `serde(skip)` keeps it out of the deserialized body
+    /// and out of the tool schema alike. An agent setting frontmatter says
+    /// which rule it is ruling intentional and the server works out what that
+    /// rule is firing on; this is how the REST acknowledgment route passes on
+    /// the pair a person's client named, where the row they clicked is the one
+    /// they meant and nothing else can tell the server which of two it was.
+    #[serde(skip)]
+    pub ack_scope: Option<String>,
 }
 
 /// Parameters for `save_engram`, the full-document save behind the HTTP PUT.
@@ -179,6 +190,39 @@ pub struct RetireParams {
     /// date is unknown, never a sentinel.
     #[serde(default)]
     pub valid_to: Option<String>,
+}
+
+/// Parameters for `split_engram`, the atomic move of part of an engram into a
+/// new one.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct SplitParams {
+    /// The source engram's domain. The new engram lands in the same domain.
+    pub domain: String,
+    /// The source engram: a bare permalink, title or `crystalline://` URL,
+    /// domain-relative.
+    pub identifier: String,
+    /// The new engram's title. Slugified into its permalink, as write_engram
+    /// slugifies one.
+    pub title: String,
+    /// A domain-relative subfolder for the new engram. Defaults to the domain
+    /// root, whatever folder the source sits in.
+    #[serde(default)]
+    pub folder: Option<String>,
+    /// The observation bullets to move, by the one-based line numbers
+    /// read_engram reports. Every line must be an observation bullet on the
+    /// source.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub observations: Vec<usize>,
+    /// The sections to move, by heading path (`## API > ### Auth`), the same
+    /// form edit_engram accepts. A section moves with its heading and every
+    /// deeper subsection under it.
+    #[serde(default, deserialize_with = "null_as_default")]
+    pub sections: Vec<String>,
+    /// The checksum from a prior read of the source, guarding the split
+    /// against a change since that read: both writes are refused as a conflict
+    /// if the source changed. Omit for last-write-wins.
+    #[serde(default)]
+    pub expected_checksum: Option<String>,
 }
 
 /// Parameters for `move_engram`.
@@ -419,9 +463,11 @@ pub struct ConfigureParams {
     #[serde(default, deserialize_with = "null_as_default")]
     pub unset: Vec<String>,
     /// Pass "github" to link a GitHub account: starts a short code to
-    /// confirm at github.com/login/device, or reports an already-pending
-    /// one. Omit when `token` is supplied. Works whether or not
-    /// github.enabled is on yet; enabling is only needed for team domains.
+    /// confirm at github.com/login/device, then click Authorize on the page
+    /// that follows; the result carries next_steps to relay verbatim, and
+    /// calling configure again reports whether the sign-in landed. Omit
+    /// when `token` is supplied. Works whether or not github.enabled is on
+    /// yet; enabling is only needed for team domains.
     #[serde(default)]
     pub connect: Option<String>,
     /// A GitHub personal access token, connecting immediately instead of the
@@ -433,6 +479,10 @@ pub struct ConfigureParams {
     /// github.api_url`.
     #[serde(default)]
     pub host: Option<String>,
+    /// With connect: github, abandon a pending sign-in and start a fresh
+    /// code.
+    #[serde(default)]
+    pub restart: bool,
 }
 
 /// Parameters for `add_domain`. The mode follows the parameters: `repo` makes
@@ -473,6 +523,18 @@ pub struct AddDomainParams {
     pub branch: Option<String>,
 }
 
+/// Parameters for `remove_domain`.
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct RemoveDomainParams {
+    /// The registered domain to unregister.
+    pub domain: String,
+    /// Required to unregister a VIRTUAL domain, whose engrams live in the
+    /// database and are deleted with it. Ignored for a file domain, whose
+    /// files are never touched either way.
+    #[serde(default)]
+    pub purge: bool,
+}
+
 /// Parameters for `share_changes`.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
 pub struct ShareChangesParams {
@@ -509,6 +571,13 @@ pub struct OriginStatusParams {
     /// domain.
     #[serde(default)]
     pub domain: Option<String>,
+    /// Name the unshared files instead of only counting them: each domain
+    /// then carries a detail block listing the changed paths grouped as
+    /// added, modified and deleted, plus how many generated folder listings
+    /// ride along. Ask for it whenever you have to say WHAT is unshared;
+    /// leave it off when the count is all you need.
+    #[serde(default)]
+    pub detail: bool,
 }
 
 /// Parameters for `resolve_conflict`.

@@ -250,6 +250,36 @@ describe("the layout", () => {
     expect(screen.queryByRole("button", { name: /^Domain:/ })).toBeNull();
   });
 
+  it("badges a private domain in the sidebar and leaves a shared one plain", async () => {
+    serveSignedIn({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          {
+            name: "lab",
+            kind: "file",
+            engrams: 2,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/");
+
+    const domains = await screen.findByRole("navigation", { name: "Domains" });
+    const lab = await within(domains).findByRole("link", { name: /^lab/ });
+    expect(lab).toHaveTextContent("private");
+    // The badge rides on the listing's own field, so a row that does not say
+    // it is private wears nothing - the same as a row from a server that
+    // never heard of the field.
+    expect(
+      within(domains).getByRole("link", { name: /^eng/ }),
+    ).not.toHaveTextContent("private");
+  });
+
   it("says what went wrong instead of emptying the sidebar", async () => {
     serveSignedIn({
       "/domains": () => {
@@ -533,6 +563,39 @@ describe("the sidebar inside a domain", () => {
     expect(
       await screen.findByRole("button", { name: "Domain: ops" }),
     ).toBeVisible();
+  });
+
+  it("badges a private domain in the switcher", async () => {
+    // The sidebar has two forms and the same domain has to read the same way
+    // in both: the flat list outside a domain, and this switcher inside one.
+    serveInDomain({
+      "/domains": () => ({
+        behavior: [],
+        domains: [
+          { name: "eng", kind: "file", engrams: 4, when_to_use: [] },
+          {
+            name: "ops",
+            kind: "file",
+            engrams: 2,
+            private: true,
+            when_to_use: [],
+          },
+        ],
+      }),
+    });
+
+    renderApp("/d/eng");
+    const user = userEvent.setup();
+    await user.click(
+      await screen.findByRole("button", { name: "Domain: eng" }),
+    );
+
+    expect(
+      await screen.findByRole("menuitemradio", { name: /^ops/ }),
+    ).toHaveTextContent("private");
+    expect(
+      screen.getByRole("menuitemradio", { name: /^eng/ }),
+    ).not.toHaveTextContent("private");
   });
 
   it("splits a folder row: the name browses it, the icon opens it here", async () => {

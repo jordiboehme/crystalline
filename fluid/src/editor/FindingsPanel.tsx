@@ -76,6 +76,7 @@ export function FindingsPanel({
         // A clean report is a state, not a lesson: one green line under the
         // heading. The states that need explaining - checking is unavailable,
         // a run still going, the findings themselves - keep their full words.
+        // Emerald is the semantic "good" color here, not the accent.
         <p className="text-sm text-emerald-700 dark:text-emerald-300">
           No findings
         </p>

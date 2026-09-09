@@ -26,6 +26,7 @@ import Home from "./screens/Home";
 import Maintenance from "./screens/Maintenance";
 import ManifestPage from "./screens/ManifestPage";
 import NotFound from "./screens/NotFound";
+import OauthConsent from "./screens/OauthConsent";
 import Search from "./screens/Search";
 
 /**
@@ -152,6 +153,14 @@ export function AppRoutes() {
           />
           <Route path="/search" element={<Search />} />
           <Route path="/graph" element={<GraphView />} />
+          {/*
+            Where an OAuth client's `?request=<id>` redirect lands. Eager,
+            unlike the two editors and the reading screen above: it carries
+            no editor weight of its own, and it is the one address a person
+            arrives at mid-journey from somewhere else entirely, so it must
+            not add a chunk fetch on top of that wait.
+          */}
+          <Route path="/authorize" element={<OauthConsent />} />
           {/*
             Eager, unlike the two admin screens below it: this one is offered
             to every role from the frame, so nobody would be spared its weight

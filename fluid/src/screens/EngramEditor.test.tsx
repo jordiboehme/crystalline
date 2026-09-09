@@ -691,6 +691,70 @@ describe("the engram editor", () => {
     expect(await screen.findByText("Saved")).toBeInTheDocument();
   });
 
+  it("shows the save receipt's neighbours advisory, and dismisses it", async () => {
+    const put = vi.fn(() =>
+      detailResponse({
+        checksum: "next111",
+        similar: [
+          {
+            domain: "eng",
+            permalink: "retry-queue-gotcha",
+            title: "Retry queue gotcha",
+            status: "stable",
+            type: "engram",
+          },
+        ],
+        guidance: "read the one that fits",
+      }),
+    );
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+
+    const panel = await screen.findByRole("status", {
+      name: "Similar engrams",
+    });
+    expect(
+      within(panel).getByRole("link", { name: /Retry queue gotcha/ }),
+    ).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(
+      screen.queryByRole("status", { name: "Similar engrams" }),
+    ).not.toBeInTheDocument();
+    // Dismissing takes the Dismiss button itself out of the document, and
+    // a reader who reached it from the keyboard should land back in the
+    // buffer they were editing rather than at document.body, which would
+    // restart the next Tab from the top of the page.
+    expect(document.body).not.toHaveFocus();
+    expect(screen.getByLabelText("Engram source")).toHaveFocus();
+  });
+
+  it("carries no neighbours advisory when the save answers with none", async () => {
+    const put = vi.fn(() => detailResponse({ checksum: "next111" }));
+    serveEditor({
+      "/domains/eng/engrams/alpha": (_path, init) =>
+        init?.method === "PUT" ? put() : detailResponse(),
+    });
+    renderApp("/d/eng/edit/alpha");
+    await screen.findByLabelText("Engram source");
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Save" }));
+    await screen.findByText("Saved");
+    expect(
+      screen.queryByRole("status", { name: "Similar engrams" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("saves from inside the buffer, on the keyboard", async () => {
     const put = vi.fn(() => detailResponse({ checksum: "next111" }));
     serveEditor({

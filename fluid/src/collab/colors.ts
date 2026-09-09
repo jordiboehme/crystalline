@@ -8,7 +8,10 @@
 
 /** The palette y-codemirror.next paints cursors and selections with; the
  *  light variant is the selection background (the upstream 0x33 alpha
- *  convention). Chosen for contrast on both schemes. */
+ *  convention). Chosen for contrast on both schemes. Eight distinct hues for
+ *  telling people apart, not the app's accent - teal (`#14b8a6`) stays put
+ *  here even though the accent scale moved off teal, and none of the eight
+ *  is retuned to track it. */
 const PALETTE = [
   "#0ea5e9",
   "#f59e0b",

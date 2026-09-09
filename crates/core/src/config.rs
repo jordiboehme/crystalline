@@ -83,6 +83,10 @@ pub struct GlobalConfig {
     /// working untouched.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<IndexConfig>,
+    /// Capture-time advisory settings. Absent means the advisory is on, so
+    /// every existing config keeps working untouched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture: Option<CaptureConfig>,
     /// Write-provenance settings. Absent means the actor recorded on a write
     /// is derived from the connected client, so every existing config keeps
     /// working untouched.
@@ -238,6 +242,17 @@ impl GlobalConfig {
         self.index.as_ref().and_then(|i| i.files).unwrap_or(true)
     }
 
+    /// Whether a write or content edit receipt carries the `similar`
+    /// advisory, from `capture.similar`. Absent config or an absent key means
+    /// on (true): the advisory is the write telling the writer what it
+    /// already knew.
+    pub fn capture_similar(&self) -> bool {
+        self.capture
+            .as_ref()
+            .and_then(|c| c.similar)
+            .unwrap_or(true)
+    }
+
     /// The configured actor recorded as `generated.by` on every write, from
     /// `identity.actor`. Absent means no override: the writer is identified
     /// from the connected client instead.
@@ -260,6 +275,16 @@ impl GlobalConfig {
             .filter(|s| !s.is_empty())
     }
 
+    /// Whether the forward-auth `Remote-*` headers name the signed-in user,
+    /// from `auth.proxy_headers`. Absent config or an absent key means off:
+    /// a header is believed only where an operator has said a proxy sets it.
+    pub fn auth_proxy_headers(&self) -> bool {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.proxy_headers)
+            .unwrap_or(false)
+    }
+
     /// Whether a request that carries no identity is served anyway, from
     /// `auth.anonymous`. Absent config or an absent key means off (false).
     pub fn auth_anonymous(&self) -> bool {
@@ -269,6 +294,26 @@ impl GlobalConfig {
             .unwrap_or(false)
     }
 
+    /// Whether every MCP connection over HTTP requires authentication with a
+    /// personal MCP token, from `auth.mcp`. Absent config or an absent key
+    /// means off (false).
+    pub fn auth_mcp(&self) -> bool {
+        self.auth.as_ref().and_then(|a| a.mcp).unwrap_or(false)
+    }
+
+    /// Whether OAuth is served for MCP clients, from `auth.oauth`. Absent
+    /// config or an absent key follows `auth.mcp` where the UI is served: a
+    /// shared instance with agents authenticating and a consent page to show
+    /// them gets OAuth for free. An explicit `false` turns it off; an
+    /// explicit `true` insists and the two startup guards refuse to serve
+    /// where it cannot be met.
+    pub fn auth_oauth(&self) -> bool {
+        self.auth
+            .as_ref()
+            .and_then(|a| a.oauth)
+            .unwrap_or_else(|| self.auth_mcp() && self.ui_enabled())
+    }
+
     /// `auth.max_users`. Absent config or an absent key means the default cap.
     pub fn auth_max_users(&self) -> usize {
         self.auth
@@ -276,6 +321,16 @@ impl GlobalConfig {
             .and_then(|a| a.max_users)
             .map(|n| n as usize)
             .unwrap_or(DEFAULT_MAX_USERS)
+    }
+
+    /// The `auth.oidc` block, from `auth.oidc.*`. Absent config or an absent
+    /// block means single sign-on is off: SSO is opt-in on top of the local
+    /// accounts, never a replacement for them. A present block is not
+    /// necessarily a complete one - the relying party decides which fields it
+    /// needs and says so - so this hands the block over as configured rather
+    /// than pre-judging it.
+    pub fn auth_oidc(&self) -> Option<&OidcConfig> {
+        self.auth.as_ref().and_then(|a| a.oidc.as_ref())
     }
 }
 
@@ -409,7 +464,7 @@ pub enum DatabaseBackend {
 
 /// The `database` block: which backend backs the derived index and, for
 /// PostgreSQL, its connection URL.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     /// The storage backend. Absent means Turso.
     #[serde(default)]
@@ -419,6 +474,25 @@ pub struct DatabaseConfig {
     /// and the default `index.db` path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
+}
+
+/// Hand-written for the reason [`OidcConfig`]'s is: a Postgres URL carries the
+/// database password in it, in cleartext, and a derived `Debug` would put it
+/// in whatever log line or panic message printed the config. Nothing prints
+/// one today - the settings registry already masks `database.url` - and a
+/// `{:?}` away is exactly the distance this mask exists to close.
+///
+/// The backend renders as-is, so what a reader wants from a debug print (which
+/// store is behind this instance) survives; whether a URL is configured
+/// survives too, since a file path override reads as `(set)` and an absent one
+/// as `None`.
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseConfig")
+            .field("backend", &self.backend)
+            .field("url", &self.url.as_ref().map(|_| SECRET_DISPLAY))
+            .finish()
+    }
 }
 
 impl DatabaseConfig {
@@ -614,6 +688,15 @@ pub struct IndexConfig {
     pub files: Option<bool>,
 }
 
+/// Capture-time advisory configuration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct CaptureConfig {
+    /// Whether a write or content edit receipt carries the `similar` list of
+    /// the nearest existing engrams. Absent means on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub similar: Option<bool>,
+}
+
 /// The `identity` block: who Crystalline records as the writer of an engram.
 /// Reads like a settings-page section - see the `configure` tool, which
 /// exposes exactly these keys.
@@ -644,14 +727,114 @@ pub struct AuthConfig {
     /// strips the header from client requests and sets it itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_header: Option<String>,
+    /// Trust the forward-auth quartet a reverse proxy sets - `Remote-User`,
+    /// `Remote-Name`, `Remote-Email` and `Remote-Groups` - to name the
+    /// authenticated user. Absent means off, and no such header is believed.
+    /// Only safe where Crystalline is unreachable except through that proxy
+    /// and the proxy strips client-supplied copies of the headers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_headers: Option<bool>,
     /// Serve requests that carry no identity at all. Absent means off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anonymous: Option<bool>,
+    /// Require every MCP connection over HTTP to authenticate with a personal
+    /// MCP token. Absent means off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp: Option<bool>,
+    /// Serve OAuth for MCP clients: the well-known metadata, dynamic client
+    /// registration, authorization with a consent page and a token endpoint,
+    /// so a hosted client such as Claude.ai connects without a pasted token.
+    /// Requires `auth.mcp`, since the tokens it issues are checked at that
+    /// gate. Absent follows `auth.mcp` where the UI is served, so a shared
+    /// instance with agents authenticating and a consent page to show them
+    /// gets OAuth without asking; `false` turns it off and `true` insists,
+    /// and the startup guards refuse to serve where an explicit `true` cannot
+    /// be met. See [`GlobalConfig::auth_oauth`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<bool>,
     /// `auth.max_users`. How many accounts trusted-header provisioning may
     /// mint in total; absent means the default of 100. The CLI is never
     /// capped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_users: Option<u32>,
+    /// The single sign-on block. Absent means SSO is off and only the local
+    /// accounts sign in; present means an OpenID Connect provider is offered
+    /// beside them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<OidcConfig>,
+}
+
+/// The `auth.oidc` block: one OpenID Connect provider Crystalline signs people
+/// in against, on top of - never instead of - the local accounts. Every field
+/// is optional at this layer so a half-configured provider is a config a
+/// person can keep editing rather than a file that refuses to load; the
+/// relying party is what insists on a complete set before it offers the
+/// button.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct OidcConfig {
+    /// The provider's issuer url, the one discovery appends
+    /// `/.well-known/openid-configuration` to. Tenant-specific where the
+    /// provider is: `https://login.microsoftonline.com/<tenant-id>/v2.0`, not
+    /// the tenant-independent template.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// The client id (application id) the provider issued for this
+    /// Crystalline instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    /// The client secret that goes with the client id. A credential: it is
+    /// stored here but never rendered back, and `CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET`
+    /// supplies it instead where a deployment keeps secrets out of the config
+    /// file entirely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_secret: Option<String>,
+    /// The provider's display name, the label on the sign-in button. Absent
+    /// means the generic wording.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The scopes requested at authorization, space separated. Absent means
+    /// the standard set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scopes: Option<String>,
+    /// The role an account provisioned through this provider is created at:
+    /// `viewer`, `editor` or `admin`. Absent means the least privileged one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_role: Option<String>,
+    /// The address the provider sends the browser back to, used verbatim
+    /// instead of the one derived from a request's `Host` and forwarded
+    /// scheme. Absent means derive it, which is right wherever the browser
+    /// reaches this instance at the address the request says it did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redirect_uri: Option<String>,
+}
+
+/// What a credential renders as wherever a config is displayed instead of
+/// its value: whether one is configured, and nothing more. The settings
+/// registry, the environment overlay and this module's own `Debug` impls all
+/// share it, so a secret reads the same in `config show`, in `doctor` and in
+/// a log line.
+pub const SECRET_DISPLAY: &str = "(set)";
+
+/// Hand-written so the client secret cannot reach a log line or a panic
+/// message through a careless `{:?}`: the struct that holds the credential
+/// masks it unconditionally rather than trusting every future caller (a
+/// relying-party struct that derives `Debug`, say) to remember not to print
+/// it. Every other field renders as-is, so the render stays diagnosable.
+impl std::fmt::Debug for OidcConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OidcConfig")
+            .field("issuer", &self.issuer)
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_ref().map(|_| SECRET_DISPLAY),
+            )
+            .field("name", &self.name)
+            .field("scopes", &self.scopes)
+            .field("default_role", &self.default_role)
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 /// Service configuration.
@@ -660,7 +843,7 @@ pub struct ServiceConfig {
     /// The HTTP setting: a bool, or a `host:port` string.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub http: Option<HttpSetting>,
-    /// Serve the content API read-only: the four content-mutating tools are
+    /// Serve the content API read-only: the five content-mutating tools are
     /// hidden from the MCP surface and refused by the engine, while sync,
     /// reindex, watching and embedding still follow external file changes.
     /// Absent means read-write.
@@ -1100,6 +1283,55 @@ pub fn models_dir() -> Result<PathBuf, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The one place a config's own `Debug` is load bearing: the client
+    /// secret is masked, the rest of the block is not, and the whole config
+    /// inherits the mask because the derived impls above it delegate here.
+    #[test]
+    fn the_oidc_debug_render_masks_the_client_secret_and_nothing_else() {
+        let cfg = GlobalConfig {
+            auth: Some(AuthConfig {
+                oidc: Some(OidcConfig {
+                    issuer: Some("https://login.example.com/v2.0".into()),
+                    client_id: Some("app-1234".into()),
+                    client_secret: Some("hunter2".into()),
+                    ..OidcConfig::default()
+                }),
+                ..AuthConfig::default()
+            }),
+            ..GlobalConfig::default()
+        };
+
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains(SECRET_DISPLAY), "{rendered}");
+        assert!(rendered.contains("app-1234"), "{rendered}");
+        assert!(rendered.contains("login.example.com"), "{rendered}");
+
+        let unset = format!("{:?}", OidcConfig::default());
+        assert!(unset.contains("client_secret: None"), "{unset}");
+    }
+
+    /// The other credential a config carries in a field that is not called
+    /// one: a Postgres URL holds the database password inside it.
+    #[test]
+    fn the_database_debug_render_masks_the_url_and_keeps_the_backend() {
+        let cfg = GlobalConfig {
+            database: Some(DatabaseConfig {
+                backend: DatabaseBackend::Postgres,
+                url: Some("postgres://crystalline:hunter2@db.example.test/crystalline".into()),
+            }),
+            ..GlobalConfig::default()
+        };
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("db.example.test"), "{rendered}");
+        assert!(rendered.contains(SECRET_DISPLAY), "{rendered}");
+        assert!(rendered.contains("Postgres"), "{rendered}");
+
+        let unset = format!("{:?}", DatabaseConfig::default());
+        assert!(unset.contains("url: None"), "{unset}");
+    }
 
     #[test]
     fn github_stacks_defaults_true_and_reads_the_key() {

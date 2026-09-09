@@ -14,7 +14,6 @@
  * header's home link.
  */
 
-import { Gem } from "lucide-react";
 import type { PointerEvent, MouseEvent, ReactElement } from "react";
 import { useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
@@ -28,15 +27,34 @@ const SHATTER_MS = 550;
 
 type Phase = "idle" | "shattering" | "about";
 
-/** One gem drawing, shared by the mark and its shards. */
+/**
+ * One gem drawing, shared by the mark and its shards: the iso cell from the
+ * banner, a flat-top hexagon split into three rhombic faces. The lit face is
+ * the upper left, the side face the right, the far face the lower left, in
+ * three stops of the accent ramp so the cube reads on either theme.
+ */
 function GemGlyph(): ReactElement {
   return (
-    <Gem
+    <svg
       aria-hidden="true"
-      size={18}
-      strokeWidth={1.75}
-      className="text-accent-600 dark:text-accent-400"
-    />
+      width={18}
+      height={18}
+      viewBox="0 0 24 24"
+      className="shrink-0"
+    >
+      <polygon
+        points="12,12 1.5,12 6.75,2.91 17.25,2.91"
+        className="fill-accent-300 dark:fill-accent-200"
+      />
+      <polygon
+        points="12,12 17.25,2.91 22.5,12 17.25,21.09"
+        className="fill-accent-500 dark:fill-accent-400"
+      />
+      <polygon
+        points="12,12 17.25,21.09 6.75,21.09 1.5,12"
+        className="fill-accent-800 dark:fill-accent-700"
+      />
+    </svg>
   );
 }
 

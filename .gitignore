@@ -27,3 +27,4 @@ __pycache__/
 # Editor state
 .idea/
 .vscode/
+/.cargo/config.toml

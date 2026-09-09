@@ -19,7 +19,7 @@
 //!   reachable on an instance where sharing already exists.
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
@@ -74,6 +74,21 @@ fn view(c: crate::engine::GithubIdentity) -> GithubIdentityResponse {
         }),
         error: c.error,
     }
+}
+
+/// The query of `POST /me/github-identity/connect`: whether to abandon a
+/// sign-in of this account's already in flight and issue a fresh code.
+///
+/// A query parameter rather than a body so the route keeps taking none: the
+/// only thing to say here is a yes or no, and adding a body would drag
+/// content-type handling onto a request that has nothing to carry.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct ConnectQuery {
+    /// Abandon this account's pending sign-in and start a fresh code.
+    /// Defaults to false, which reports the outstanding code instead.
+    #[serde(default)]
+    pub restart: bool,
 }
 
 /// The caller, when they may manage a GitHub identity of their own: an editor
@@ -166,6 +181,11 @@ pub async fn status(
 /// in flight - another person's, or the machine's - is answered 409, because
 /// there is one flow slot and two sign-ins must never complete into each
 /// other's credential.
+///
+/// `?restart=true` is the way out of a code this account cannot use - one
+/// started in a terminal and never seen, or left to go stale: it abandons
+/// this account's pending flow and issues a fresh code. It abandons only this
+/// account's own; another identity's is still 409.
 #[utoipa::path(
     post,
     path = "/api/v1/me/github-identity/connect",
@@ -176,11 +196,13 @@ pub async fn status(
                    instance. Answers 202 with the short code to confirm in a \
                    browser; the flow runs in the background and its outcome is \
                    read from `GET /me/github-identity`. A second call from the \
-                   same account reports that same flow; one made while another \
-                   identity's sign-in is in flight is refused 409. Unlike the \
-                   instance connect, this does not turn `github.enabled` on: \
-                   enabling collaboration is an admin's instance-wide \
-                   decision.",
+                   same account reports that same flow, unless `restart=true` \
+                   is given, which abandons it and issues a fresh code; one \
+                   made while another identity's sign-in is in flight is \
+                   refused 409 either way. Unlike the instance connect, this \
+                   does not turn `github.enabled` on: enabling collaboration \
+                   is an admin's instance-wide decision.",
+    params(ConnectQuery),
     responses(
         (
             status = 202,
@@ -224,12 +246,13 @@ pub async fn status(
 pub async fn connect(
     State(state): State<RestState>,
     identity: Identity,
+    Query(query): Query<ConnectQuery>,
 ) -> Result<Response, ApiError> {
     let caller = require_own_identity(&identity)?;
     refuse_read_only(&state)?;
     let started = state
         .engine
-        .start_github_identity_device_flow(caller.name())
+        .start_github_identity_device_flow(caller.name(), query.restart)
         .await?;
     Ok((StatusCode::ACCEPTED, Json(view(started))).into_response())
 }

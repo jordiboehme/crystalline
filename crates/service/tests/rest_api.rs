@@ -24,9 +24,26 @@ struct AuthOptions {
     anonymous: bool,
     /// `auth.trusted_header`: the header a trusted proxy names the user in.
     trusted_header: Option<&'static str>,
+    /// `auth.proxy_headers`: believe the standard `Remote-*` set a forward-auth
+    /// proxy sets. Off by default, exactly as a fresh install has it.
+    proxy_headers: bool,
     /// `auth.max_users`: how many accounts trusted-header provisioning may
     /// mint in total. `None` leaves the default cap (100) in place.
     max_users: Option<u32>,
+    /// `auth.mcp`: require every MCP connection over HTTP to authenticate.
+    /// `None` leaves the key unset (off, the legacy open tier), which is also
+    /// what lets an unset `oauth` below follow it.
+    mcp: Option<bool>,
+    /// `auth.oauth`: serve OAuth for MCP clients. `None` leaves the key
+    /// unset, so it follows `auth.mcp` and `service.ui` the way the config
+    /// layer derives it; `Some` sets it explicitly either way.
+    oauth: Option<bool>,
+    /// `service.api`: serve the JSON API under `/api/v1`. `None` leaves the
+    /// default of on in place.
+    api: Option<bool>,
+    /// `service.ui`: serve the embedded web UI. `None` leaves the default of
+    /// on in place.
+    ui: Option<bool>,
 }
 
 /// Build the same kind of engine the other service integration tests use: a
@@ -49,8 +66,12 @@ async fn build_engine_with(
     let mut cfg = GlobalConfig {
         auth: Some(AuthConfig {
             trusted_header: opts.trusted_header.map(str::to_string),
+            proxy_headers: opts.proxy_headers.then_some(true),
             anonymous: Some(opts.anonymous),
+            mcp: opts.mcp,
+            oauth: opts.oauth,
             max_users: opts.max_users,
+            oidc: None,
         }),
         ..GlobalConfig::default()
     };
@@ -93,6 +114,8 @@ async fn build_engine_with(
         .insert("void".to_string(), DomainEntry::virtual_domain());
     cfg.service = Some(ServiceConfig {
         response_format: Some(ResponseFormat::Json),
+        api: opts.api,
+        ui: opts.ui,
         ..ServiceConfig::default()
     });
     let config_path = root.join("config.yaml");
@@ -481,6 +504,10 @@ async fn me_reports_capabilities_without_an_identity() {
     assert_eq!(body["anonymous"], false);
     assert_eq!(body["version"], crystalline_core::VERSION);
     assert!(body["read_only"].is_boolean());
+    assert_eq!(
+        body["oauth"], false,
+        "this fixture leaves auth.mcp unset, so the followed auth.oauth is off: {body}"
+    );
 }
 
 /// With `auth.anonymous` on, the same probe reports that the caller is being
@@ -861,7 +888,7 @@ async fn a_disabled_account_is_refused_on_the_trusted_header() {
 }
 
 /// A trusted-header value with internal whitespace cannot normalize into a
-/// login name (see `auth_store::normalize_name`). Before this task that
+/// login name (see `auth_store::normalize_account_name`). Before this task that
 /// refusal fell through the generic `anyhow` conversion and answered `500`;
 /// the caller cannot fix the proxy's header, so it must be a `403` naming the
 /// problem, not an opaque server error.
@@ -946,6 +973,584 @@ async fn trusted_header_provisioning_is_capped() {
         .map(|u| u.name)
         .collect();
     assert_eq!(names, vec!["ada".to_string()]);
+}
+
+// --- auth.proxy_headers: the forward-auth quartet -------------------------
+//
+// The mode a reverse proxy that has already authenticated the person turns on:
+// `Remote-User` names them, `Remote-Name` and `Remote-Email` say how to show
+// them, `Remote-Groups` is read and thrown away until claim mapping exists.
+// It is trust-the-proxy by construction, so the tests below pin both halves of
+// the boundary: nothing is believed while the mode is off, and while it is on
+// an identity is keyed on `(proxy, <forwarded user>)` in the identity-link
+// table rather than on whatever local account happens to share its name.
+
+/// The spoof pin. With the mode off, a request carrying the whole quartet is
+/// resolved exactly as one carrying none of it: no identity, no account, 401.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn remote_headers_are_ignored_until_the_mode_is_on() {
+    let fixture = serve_with_auth(AuthOptions::default()).await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/domains", fixture.addr))
+        .header("Remote-User", "mallory")
+        .header("Remote-Name", "Mallory")
+        .header("Remote-Email", "mallory@example.test")
+        .header("Remote-Groups", "admins")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        401,
+        "a spoofed header buys nothing while the mode is off"
+    );
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "and it provisions nothing"
+    );
+}
+
+/// The mode on: the first arrival provisions one account with the presentation
+/// the proxy sent and one `proxy` identity link, and the next request on the
+/// same forwarded user lands in that same account rather than minting another.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_headers_provision_once_and_return_on_the_same_subject() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let probe = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "Ada")
+        .header("Remote-Name", "Ada Lovelace")
+        .header("Remote-Email", "ada@example.test")
+        .header("Remote-Groups", "eng,ops")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+    let me: serde_json::Value = probe.json().await.unwrap();
+    assert_eq!(me["user"]["name"], "ada", "the name is folded");
+    assert_eq!(me["user"]["display"], "Ada Lovelace");
+    assert_eq!(me["user"]["email"], "ada@example.test");
+    assert_eq!(me["user"]["role"], "viewer", "the default role");
+    assert!(
+        me["csrf"].as_str().is_some_and(|tok| !tok.is_empty()),
+        "one CSRF rule for every identity mode: {me}"
+    );
+
+    let seen = fixture.auth.user("ada").await.unwrap().unwrap();
+    assert!(
+        seen.last_seen.is_some(),
+        "arriving through the proxy is a sighting, exactly as arriving through \
+         the trusted header is: an admin's user list must not show every \
+         forward-auth account as never seen"
+    );
+
+    let links = fixture.auth.identity_links("ada").await.unwrap();
+    assert_eq!(links.len(), 1, "one link: {links:?}");
+    assert_eq!(links[0].issuer, "proxy");
+    assert_eq!(links[0].subject, "ada");
+    assert_eq!(links[0].linked_by, "jit");
+
+    // The same person again, with the proxy sending a renamed display: one
+    // account still, and the presentation follows.
+    let again = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Name", "Countess Lovelace")
+        .header("Remote-Email", "ada@example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    let me: serde_json::Value = again.json().await.unwrap();
+    assert_eq!(me["user"]["display"], "Countess Lovelace");
+    assert_eq!(fixture.auth.list_users().await.unwrap().len(), 1);
+}
+
+/// The forwarded user is a subject, not a claim on a local account of the same
+/// name. An admin called `ada` who signs in with a password is a different
+/// person from whoever the proxy calls `ada` until somebody links them, which
+/// is the no-silent-linking rule applied to this mode.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_user_never_adopts_a_local_account_of_the_same_name() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    fixture
+        .auth
+        .add_user("ada", "Ada the admin", None, Role::Admin, "pw")
+        .await
+        .unwrap();
+
+    let probe = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Name", "Ada from the proxy")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), 200);
+    let me: serde_json::Value = probe.json().await.unwrap();
+    assert_eq!(me["user"]["name"], "ada-2", "a uniquified name of its own");
+    assert_eq!(me["user"]["role"], "viewer", "and never the admin's role");
+
+    let admin = fixture.auth.user("ada").await.unwrap().unwrap();
+    assert_eq!(
+        admin.display, "Ada the admin",
+        "the local account is intact"
+    );
+    assert_eq!(admin.role, Role::Admin);
+    assert!(
+        fixture.auth.identity_links("ada").await.unwrap().is_empty(),
+        "and holds no identity it never asked for"
+    );
+}
+
+/// With the mode on, a request that carries no `Remote-User` is resolved the
+/// ordinary way: a session cookie still signs in, and a request with neither
+/// is still nobody. Turning the mode on is not an anonymous escalation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_request_without_the_headers_falls_back_to_the_session_path() {
+    let fixture = serve_with_ada(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let nobody = get(fixture.addr, "/api/v1/domains").await;
+    assert_eq!(nobody.status(), 401, "no headers and no cookie is nobody");
+
+    let (token, _csrf) = login(fixture.addr, "ada", "s3cret").await;
+    let signed_in = client()
+        .get(format!("http://{}/api/v1/domains", fixture.addr))
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signed_in.status(), 200, "the cookie path still works");
+
+    // An empty header is not an identity either: it falls through to the same
+    // session path rather than provisioning a nameless account.
+    let blank = client()
+        .get(format!("http://{}/api/v1/domains", fixture.addr))
+        .header("Remote-User", "   ")
+        .header("cookie", format!("fluid_session={token}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(blank.status(), 200);
+    assert_eq!(
+        fixture.auth.list_users().await.unwrap().len(),
+        1,
+        "only ada, who was created by the fixture"
+    );
+}
+
+/// A disabled account is refused whoever vouches for it, in the same words the
+/// trusted-header and single sign-on paths use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_disabled_account_is_refused_in_proxy_header_mode() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let first = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200, "provisioned on first sight");
+    fixture.auth.set_disabled("ada", true).await.unwrap();
+
+    let refused = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(
+        refused.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert_eq!(body["detail"], "this account is disabled");
+}
+
+/// `auth.max_users` bounds this mode's provisioning too, and says so: the
+/// caller cannot act on the refusal, the operator can.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn proxy_header_provisioning_is_capped() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        max_users: Some(1),
+        ..AuthOptions::default()
+    })
+    .await;
+    let first = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200, "the first account is under the cap");
+
+    let refused = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "grace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 403);
+    let body: serde_json::Value = refused.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("auth.max_users"),
+        "the refusal names the setting: {body}"
+    );
+
+    let still = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(still.status(), 200, "the existing account keeps resolving");
+}
+
+/// A presentation header the proxy stops sending says nothing about the person,
+/// so it never clears what is stored - the same rule the single sign-on path
+/// applies to an absent claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_absent_presentation_header_never_clears_what_is_stored() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let first = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Name", "Ada Lovelace")
+        .header("Remote-Email", "ada@example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+
+    let bare = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bare.status(), 200);
+    let me: serde_json::Value = bare.json().await.unwrap();
+    assert_eq!(me["user"]["display"], "Ada Lovelace");
+    assert_eq!(me["user"]["email"], "ada@example.test");
+}
+
+/// A header that arrived more than once is refused rather than resolved by
+/// arrival order. This is the misconfiguration the trust boundary is most
+/// likely to be half-satisfied on: a proxy that appends its own `Remote-User`
+/// instead of replacing the client's copy would otherwise hand whoever won the
+/// ordering a session, with nothing anywhere saying so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forward_auth_header_that_arrived_twice_is_refused() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let doubled = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-User", "mallory")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doubled.status(), 403);
+    assert_eq!(
+        doubled.headers()["content-type"],
+        "application/problem+json"
+    );
+    let body: serde_json::Value = doubled.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("more than once"),
+        "the refusal must name what the proxy has to fix: {body}"
+    );
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "and neither name was provisioned"
+    );
+
+    // A presentation header is the same tell, even beside a single user header.
+    let doubled_email = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Email", "ada@example.test")
+        .header("Remote-Email", "mallory@example.test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(doubled_email.status(), 403);
+    assert!(
+        fixture.auth.list_users().await.unwrap().is_empty(),
+        "a refused request provisions nothing"
+    );
+
+    // Remote-Groups is the exception, and it is not an exception to the rule:
+    // a list header is legitimately one line per element, so a proxy that
+    // spells the list that way is correct and is served.
+    let listed = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada")
+        .header("Remote-Groups", "eng")
+        .header("Remote-Groups", "ops")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.status(),
+        200,
+        "a repeated list header is how a list is spelled: {:?}",
+        listed.text().await
+    );
+}
+
+/// A forwarded value that cannot be a login name is refused `403` naming why,
+/// rather than a `500` or an account nobody can address. The same answer the
+/// trusted-header mode gives it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_user_that_cannot_be_a_login_name_is_refused() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada lovelace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 403);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert!(
+        body["detail"].as_str().unwrap().contains("whitespace"),
+        "the message must be actionable, not opaque: {body}"
+    );
+    assert!(fixture.auth.list_users().await.unwrap().is_empty());
+}
+
+/// The quartet is matched the way HTTP names are compared, so a proxy that
+/// spells them `REMOTE-USER` is understood. The constants are lowercase and
+/// the header map folds; this is what says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_forward_auth_headers_are_matched_whatever_their_case() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+    let resp = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("REMOTE-USER", "ada")
+        .header("Remote-NAME", "Ada Lovelace")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    let me: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(me["user"]["name"], "ada");
+    assert_eq!(me["user"]["display"], "Ada Lovelace");
+}
+
+/// The login name a forwarded identity gets is derived the way a sign-on's is:
+/// sanitized down to something addressable and cut to a bounded length, while
+/// the identity link keeps the proxy's spelling, because that is the durable
+/// key and only the account name has to be a name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forwarded_name_is_derived_and_bounded_like_a_sign_ons() {
+    let fixture = serve_with_auth(AuthOptions {
+        proxy_headers: true,
+        ..AuthOptions::default()
+    })
+    .await;
+
+    let pathlike = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", "ada/../bob")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pathlike.status(), 200);
+    let me: serde_json::Value = pathlike.json().await.unwrap();
+    let name = me["user"]["name"].as_str().unwrap().to_string();
+    assert!(
+        !name.contains('/'),
+        "an account name has to be addressable through /api/v1/users/{{name}}: {name}"
+    );
+    let links = fixture.auth.identity_links(&name).await.unwrap();
+    assert_eq!(
+        links[0].subject, "ada/../bob",
+        "the link keeps the proxy's spelling: that is the key it will send again"
+    );
+
+    let long = "l".repeat(200);
+    let oversized = client()
+        .get(format!("http://{}/api/v1/auth/me", fixture.addr))
+        .header("Remote-User", long.as_str())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(oversized.status(), 200);
+    let me: serde_json::Value = oversized.json().await.unwrap();
+    let name = me["user"]["name"].as_str().unwrap().to_string();
+    assert!(
+        name.chars().count() <= 60,
+        "a header value is not a name budget: {name}"
+    );
+    let links = fixture.auth.identity_links(&name).await.unwrap();
+    assert_eq!(
+        links[0].subject, long,
+        "and the key is still the whole value"
+    );
+}
+
+/// Both header modes at once is a configuration nobody can mean, so the daemon
+/// refuses to start on it rather than picking one silently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn both_header_modes_together_refuse_to_serve() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            trusted_header: Some("x-auth-user"),
+            proxy_headers: true,
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built on a contradictory auth config");
+    let text = format!("{err:#}");
+    assert!(text.contains("pick one"), "{text}");
+}
+
+/// `auth.oauth` issues the credential `auth.mcp` checks, so serving OAuth
+/// without the gate it feeds would mint tokens nothing ever verifies. The
+/// combination is refused at startup, the same treatment the two header
+/// modes together get above.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_without_mcp_refuses_the_http_endpoint() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            oauth: Some(true),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built with auth.oauth on and auth.mcp off");
+    let text = format!("{err:#}");
+    assert!(text.contains("auth.mcp"), "{text}");
+}
+
+/// `auth.oauth`'s endpoints are REST routes under `/api/v1`; with the API
+/// off there is nowhere for them to live, so the combination is refused at
+/// startup before `RestState::new` (which never runs when `service.api` is
+/// off) ever gets a chance to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_without_api_refuses_the_http_endpoint() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            oauth: Some(true),
+            api: Some(false),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built with auth.oauth on and service.api off");
+    let text = format!("{err:#}");
+    assert!(text.contains("service.api"), "{text}");
+}
+
+/// `authorize` answers a redirect to the Fluid consent page at `/authorize`;
+/// with the embedded UI off, that address falls to the MCP transport instead
+/// and no consent can ever be given. Refused at startup, distinctly from the
+/// `service.api` case above: here the API is still on, only the UI is off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn oauth_without_ui_refuses_the_http_endpoint() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            oauth: Some(true),
+            ui: Some(false),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let err = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect_err("a router must not be built with auth.oauth on and service.ui off");
+    let text = format!("{err:#}");
+    assert!(text.contains("service.ui"), "{text}");
+}
+
+/// **An upgrade must never fail an existing daemon's start.** `auth.oauth`
+/// unset follows `auth.mcp` where the UI is served, and it is load-bearing
+/// that the two guards above never trip on a value the config layer derived
+/// itself: a shared instance that only ever set `auth.mcp` true - the whole
+/// point of the derivation - has to keep starting on this build exactly as
+/// it did before `auth.oauth` existed. `service.ui` here is left at its
+/// default (on) on purpose, the other half of the condition the derivation
+/// checks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_derived_oauth_value_never_trips_the_daemon_guards() {
+    let (tmp, engine) = build_engine_with(
+        AuthOptions {
+            mcp: Some(true),
+            ..AuthOptions::default()
+        },
+        &[],
+    )
+    .await;
+    let auth = Arc::new(
+        AuthStore::open(&tmp.path().join("web-auth.db"))
+            .await
+            .unwrap(),
+    );
+    let _ = http_router(engine, Arc::new(AtomicUsize::new(0)), &[], auth, None)
+        .expect("auth.mcp on with auth.oauth unset must derive rather than refuse to start");
 }
 
 /// Logout is a mutating request, so it carries the CSRF token the session was

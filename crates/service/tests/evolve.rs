@@ -16,6 +16,7 @@ use crystalline_core::config::{DomainEntry, GlobalConfig, OriginConfig};
 use crystalline_index::TursoStore;
 use crystalline_remote::state::OriginState;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::EvolveParams;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -219,10 +220,13 @@ fn files() -> Vec<(String, String)> {
 /// wrapper has its own tests at the end of this file.
 async fn sweep(engine: &Engine, today: &str, p: EvolveParams) -> Value {
     engine
-        .evolve_detect(&EvolveParams {
-            today: Some(today.to_string()),
-            ..p
-        })
+        .evolve_detect(
+            &EvolveParams {
+                today: Some(today.to_string()),
+                ..p
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap()
 }
@@ -264,6 +268,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V004", // 65
             "V105", // 60
             "V006", // 58, base 50 plus the human-authored boost
+            "V010", // 55
             "V101", // 55
             "V202", // 55
             "V102", // 50
@@ -274,8 +279,8 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
             "V003", // 25
         ]
     );
-    assert_eq!(v["total"], 15);
-    assert_eq!(v["count"], 15);
+    assert_eq!(v["total"], 16);
+    assert_eq!(v["count"], 16);
     assert_eq!(v["engrams_scanned"], 19);
     assert_eq!(v["unparsed"], 0);
     assert_eq!(v["scope"]["today"], TODAY);
@@ -292,7 +297,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(
         v["families"],
         serde_json::json!([
-            { "family": "temporal", "findings": 6 },
+            { "family": "temporal", "findings": 7 },
             { "family": "structure", "findings": 6 },
             { "family": "redundancy", "findings": 3 },
         ])
@@ -300,7 +305,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 
     // The prose instruction rides the legend once per rule, never a row.
     let actions = v["actions"].as_array().unwrap();
-    assert_eq!(actions.len(), 15);
+    assert_eq!(actions.len(), 16);
     assert_eq!(actions[0]["rule"], "V001");
     assert!(
         actions
@@ -330,6 +335,10 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
     assert_eq!(by_rule("V201")["permalink"], "dup-a");
     assert_eq!(by_rule("V202")["permalink"], "deploy-checklist");
     assert_eq!(by_rule("V105")["permalink"], "huge-doc");
+    // The retired engram whose one observation turns up in no live engram of
+    // the domain: `- [context] the successor was never captured`.
+    assert_eq!(by_rule("V010")["permalink"], "retired-thing");
+    assert_eq!(by_rule("V010")["class"], "judgment");
 
     // V006 reads the `generated.by` actor the engine put on the facts, so this
     // is what catches the fact assembly dropping write provenance: the rule
@@ -369,7 +378,7 @@ async fn every_rule_fires_once_and_the_queue_ranks_by_priority() {
 async fn paging_walks_the_same_ranked_queue() {
     let (_tmp, engine) = fixture().await;
     let mut walked: Vec<String> = Vec::new();
-    for page in 1..=3 {
+    for page in 1..=4 {
         let v = sweep(
             &engine,
             TODAY,
@@ -380,10 +389,14 @@ async fn paging_walks_the_same_ranked_queue() {
             },
         )
         .await;
-        assert_eq!(v["total"], 15);
+        assert_eq!(v["total"], 16);
         assert_eq!(v["limit"], 5);
         assert_eq!(v["page"], page);
-        assert_eq!(v["count"], 5, "fifteen findings fill three whole pages");
+        assert_eq!(
+            v["count"],
+            if page == 4 { 1 } else { 5 },
+            "sixteen findings fill three whole pages and one more row"
+        );
         for (i, row) in v["queue"].as_array().unwrap().iter().enumerate() {
             assert_eq!(row["n"].as_u64().unwrap() as usize, (page - 1) * 5 + i + 1);
         }
@@ -413,7 +426,7 @@ async fn paging_walks_the_same_ranked_queue() {
         },
     )
     .await;
-    assert_eq!(past["total"], 15);
+    assert_eq!(past["total"], 16);
     assert_eq!(past["count"], 0);
     assert!(past["queue"].as_array().unwrap().is_empty());
 }
@@ -421,7 +434,8 @@ async fn paging_walks_the_same_ranked_queue() {
 /// The `today` override moves the temporal comparisons and nothing else, which
 /// is what makes a run reproducible. Evaluated before every planted date, the
 /// age and window rules go silent while the structural and redundancy rules are
-/// unchanged.
+/// unchanged - and so are the three temporal rules that compare no date at all
+/// (`V004`, `V005` and `V010`, which read the graph and the text).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_today_override_moves_only_the_temporal_rules() {
     let (_tmp, engine) = fixture().await;
@@ -440,7 +454,7 @@ async fn the_today_override_moves_only_the_temporal_rules() {
     assert_eq!(
         fired,
         vec![
-            "V004", "V005", "V101", "V102", "V103", "V105", "V106", "V201", "V202", "V203"
+            "V004", "V005", "V010", "V101", "V102", "V103", "V105", "V106", "V201", "V202", "V203"
         ]
     );
     assert_eq!(v["scope"]["today"], BEFORE_EVERYTHING);
@@ -478,9 +492,9 @@ async fn family_and_rule_filters_narrow_the_queue() {
     .await;
     assert_eq!(
         rules(&temporal),
-        vec!["V005", "V001", "V002", "V004", "V006", "V003"]
+        vec!["V005", "V001", "V002", "V004", "V006", "V010", "V003"]
     );
-    assert_eq!(temporal["total"], 6);
+    assert_eq!(temporal["total"], 7);
     assert_eq!(
         temporal["scope"]["families"],
         serde_json::json!(["temporal"])
@@ -547,17 +561,20 @@ async fn min_priority_drops_the_low_scoring_tail() {
 }
 
 /// An unknown domain, family or rule errors naming the valid set, so a caller
-/// recovers in one step. The reserved `V3xx` range is not in the catalog, so
-/// asking for it errors rather than returning silence.
+/// recovers in one step. An id outside the catalog errors rather than
+/// returning silence.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     let (_tmp, engine) = fixture().await;
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            domains: vec!["nope".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["nope".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -565,10 +582,13 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     assert!(e.contains("eng"), "{e}");
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            families: vec!["lifecycle".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                families: vec!["lifecycle".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -578,24 +598,31 @@ async fn unknown_domain_family_and_rule_error_with_the_valid_set() {
     );
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            rules: vec!["V301".to_string()],
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                rules: vec!["V999".to_string()],
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
     assert!(
-        e.starts_with("unknown rule 'V301'; valid rules: V001, V002"),
+        e.starts_with("unknown rule 'V999'; valid rules: V001, V002"),
         "{e}"
     );
-    assert!(e.ends_with("V203"), "{e}");
+    // The catalog's last id, so the error names the whole of it.
+    assert!(e.ends_with("V301"), "{e}");
 
     let e = engine
-        .evolve_engrams(&EvolveParams {
-            today: Some("last tuesday".to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                today: Some("last tuesday".to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err()
         .to_string();
@@ -622,7 +649,7 @@ async fn an_unreadable_engram_is_counted_rather_than_aborting_the_sweep() {
     .await;
     assert_eq!(v["unparsed"], 1);
     assert_eq!(v["engrams_scanned"], 18);
-    assert_eq!(v["total"], 14);
+    assert_eq!(v["total"], 15);
     assert!(!rules(&v).contains(&"V106".to_string()));
 }
 
@@ -715,11 +742,14 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     // Detection changes nothing at all, which is what lets a queue view show
     // this page without claiming anybody worked it.
     engine
-        .evolve_detect(&EvolveParams {
-            domains: vec!["eng".to_string()],
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_detect(
+            &EvolveParams {
+                domains: vec!["eng".to_string()],
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -729,11 +759,14 @@ async fn the_run_recorder_stamps_a_sweep_and_leaves_detection_pure() {
     );
 
     let v = engine
-        .evolve_engrams(&EvolveParams {
-            domains: vec!["eng".to_string()],
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                domains: vec!["eng".to_string()],
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(v["scope"]["domains"], serde_json::json!(["eng"]));
@@ -776,10 +809,13 @@ async fn an_unscoped_run_settles_the_whole_backlog_including_a_ghost() {
     crystalline_service::maintenance::record_pending("ghost");
 
     let v = engine
-        .evolve_engrams(&EvolveParams {
-            today: Some(TODAY.to_string()),
-            ..EvolveParams::default()
-        })
+        .evolve_engrams(
+            &EvolveParams {
+                today: Some(TODAY.to_string()),
+                ..EvolveParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -1186,6 +1222,84 @@ async fn an_ack_whose_evidence_changed_comes_back_stale() {
     assert_eq!(after["acknowledged"]["total"], 1);
 }
 
+/// A single-scope rule keeps exactly one acknowledgment however often its
+/// evidence moves, so the drift row survives a re-acknowledgment: acknowledge,
+/// drift, re-acknowledge, drift again, and the finding is still stale and still
+/// carries the note somebody wrote for it.
+///
+/// The pair-scoped `V301` is the one rule that stores a second entry, and it
+/// stores it per pair. Every other rule replacing its entry is what keeps this
+/// path working: two entries for one rule would leave the second drift with no
+/// entry to point at and downgrade it to a fresh finding, losing "somebody
+/// ruled this intentional and the evidence has since changed" for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_acknowledged_rule_keeps_one_entry_and_stays_stale_on_the_next_drift() {
+    let (tmp, engine) = fixture().await;
+    acknowledge(&engine, "live-doc", "V101 lineage citation, keep").await;
+
+    // First drift: a second retired target.
+    let path = tmp.path().join("eng/live-doc.md");
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Retired thing]]",
+            "- relates_to [[Retired thing]]\n- relates_to [[Old deploy pipeline]]",
+        ),
+    )
+    .unwrap();
+    let old = tmp.path().join("eng/deploy/old-pipeline.md");
+    let source = std::fs::read_to_string(&old).unwrap();
+    std::fs::write(&old, source.replace("status: stable", "status: deprecated")).unwrap();
+    engine.sync(None).await.unwrap();
+
+    // Re-acknowledged on the new evidence: one entry in the file, the fresh one.
+    acknowledge(&engine, "live-doc", "V101 both are deliberate").await;
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(
+        on_disk.matches("rule: V101").count(),
+        1,
+        "one entry per single-scope rule: {on_disk}"
+    );
+
+    // Second drift: a third retired target.
+    std::fs::write(
+        tmp.path().join("eng/legacy-note.md"),
+        "---\ntype: engram\ntitle: Legacy note\npermalink: legacy-note\ntags:\n  - legacy-notes\nstatus: superseded\nrecorded_at: 2026-07-25\n---\n\nKept only for the record.\n\n- [context] nothing points here any more\n",
+    )
+    .unwrap();
+    let source = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        source.replace(
+            "- relates_to [[Old deploy pipeline]]",
+            "- relates_to [[Old deploy pipeline]]\n- relates_to [[Legacy note]]",
+        ),
+    )
+    .unwrap();
+    engine.sync(None).await.unwrap();
+
+    let v = sweep(
+        &engine,
+        TODAY,
+        EvolveParams {
+            domains: vec!["eng".to_string()],
+            rules: vec!["V101".to_string()],
+            limit: Some(100),
+            ..EvolveParams::default()
+        },
+    )
+    .await;
+    let row = rows_on(&v, "live-doc")[0];
+    assert_eq!(row["ack_stale"], true, "{row}");
+    assert_eq!(row["ack_note"], "both are deliberate");
+    assert_eq!(
+        row["ack_scope"], "eng/deploy/old-pipeline, eng/retired-thing",
+        "the row says what was acknowledged, not what it fires on now"
+    );
+    assert_eq!(v["acknowledged"]["total"], 0, "nothing was suppressed");
+}
+
 /// A hand-written entry with no scope suppresses whatever the rule finds, and
 /// withdrawing it brings the finding straight back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1217,7 +1331,7 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
     assert_eq!(v["acknowledged"]["total"], 1);
 
     let removed = engine
-        .unacknowledge_finding_as("eng", "live-doc", "v101", Some("human:jordi"))
+        .unacknowledge_finding_as("eng", "live-doc", "v101", None, Some("human:jordi"))
         .await
         .unwrap();
     assert!(removed);
@@ -1241,7 +1355,7 @@ async fn a_hand_written_ack_holds_until_it_is_withdrawn() {
     // rewrite that changed nothing.
     assert!(
         !engine
-            .unacknowledge_finding_as("eng", "live-doc", "V101", None)
+            .unacknowledge_finding_as("eng", "live-doc", "V101", None, None)
             .await
             .unwrap()
     );
@@ -1444,7 +1558,7 @@ async fn a_lowercase_hand_written_rule_id_can_still_be_withdrawn() {
 
     assert!(
         engine
-            .unacknowledge_finding_as("eng", "live-doc", "V101", Some("human:jordi"))
+            .unacknowledge_finding_as("eng", "live-doc", "V101", None, Some("human:jordi"))
             .await
             .unwrap()
     );

@@ -42,6 +42,7 @@ import { CreateEngramDialog } from "../components/CreateEngramDialog";
 import { EngramList } from "../components/EngramList";
 import { FilterFields, TagChips } from "../components/FilterControls";
 import { ImportArchiveDialog } from "../components/ImportArchiveDialog";
+import { MembersCard } from "../components/MembersCard";
 import { ProposalsCard } from "../components/ProposalsCard";
 import { Skeleton } from "../components/Skeleton";
 import { SyncCard } from "../components/SyncCard";
@@ -100,7 +101,6 @@ export default function DomainHome() {
     queryKey: vocabularyKey(domain),
     queryFn: () => fetchTags(domain),
   });
-
   // A domain nobody registered is a wrong address, not an empty shelf. The
   // tree is what says so: a 404 from the manifest also means a domain that
   // simply has not been introduced yet.
@@ -168,7 +168,10 @@ export default function DomainHome() {
   useRegisterCommands(commands);
 
   const unregister = useMutation({
-    mutationFn: () => unregisterDomain(domain),
+    // A virtual domain's engrams are deleted with it and the server refuses to
+    // guess that the loss was intended, so the second press is what carries
+    // `purge`: this dialog is the confirmation the flag stands for.
+    mutationFn: () => unregisterDomain(domain, summary?.kind === "virtual"),
     onSuccess: () => {
       // The listing is what every sidebar, card and switcher draws from, and
       // the domain this screen is about is no longer in it.
@@ -208,7 +211,24 @@ export default function DomainHome() {
   return (
     <div className="flex flex-col gap-8">
       <header>
-        <h1 className="text-display">{domain}</h1>
+        <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-display">{domain}</h1>
+          {/*
+            A sibling of the heading rather than inside it: the heading's own
+            accessible name stays exactly the domain's name, and the badge is
+            a separate piece of content beside it rather than text silently
+            appended to what a screen reader announces as the page's title.
+            Off the listing every other chip here draws from, which is the
+            same read the sidebar and the home cards badge from: one fact,
+            one source, and a header that cannot disagree with the two places
+            that named this domain on the way here. It used to ride on
+            `MembersCard`'s membership read, which said the same thing a
+            request later and only once that request had landed. A domain
+            nobody has made private draws nothing, the same way a kind-less
+            domain draws no chip either.
+          */}
+          {summary?.private === true && <Chip variant="accent">private</Chip>}
+        </div>
         {summary && (
           <p className="mt-1 flex flex-wrap items-center gap-2 text-sm text-slate-500 dark:text-slate-400">
             {summary.engrams !== null && (
@@ -242,6 +262,19 @@ export default function DomainHome() {
         its header, and that is exactly the moment somebody reaches for it.
       */}
       {capabilities.canShare && <ProposalsCard domain={domain} />}
+
+      {/*
+        No capability gate here: `GET /members` is served to any account that
+        may see the domain at all, and the card itself decides what it may
+        offer from what that read says (its own row, the owner, the admin
+        flag) rather than from an instance-wide capability. On a shared
+        domain it still draws something for every account there - the shared
+        state, and an admin's own way to close it - so it is page furniture
+        on any domain nobody ever made private, not only on a private one;
+        it draws nothing only while the read is in flight or was refused -
+        see its own module doc.
+      */}
+      <MembersCard domain={domain} />
 
       <section aria-labelledby="domain-manifest">
         <h2 id="domain-manifest" className="mb-2 text-section">
@@ -539,7 +572,7 @@ function UnregisterDomain({
           </button>
           <span className="text-sm text-slate-500 dark:text-slate-400">
             {kind === "virtual"
-              ? "This domain's engrams live in the database and will be removed from search; download the archive first if you need a copy."
+              ? "This domain's engrams live in the database and will be deleted with it; this cannot be undone, so download the archive first if you need a copy."
               : "The files stay on disk. This instance forgets the domain and drops it from search; registering the folder again brings it back."}
           </span>
         </>

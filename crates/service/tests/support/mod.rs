@@ -55,9 +55,25 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "POST /api/v1/auth/logout",
     "GET /api/v1/auth/me",
     "POST /api/v1/auth/setup",
+    "GET /api/v1/auth/oidc/login",
+    "POST /api/v1/auth/oidc/login",
+    "GET /api/v1/auth/oidc/callback",
+    "GET /api/v1/auth/providers",
+    "POST /api/v1/oauth/register",
+    "GET /api/v1/oauth/authorize",
+    "GET /api/v1/oauth/authorizations/{id}",
+    "POST /api/v1/oauth/authorizations/{id}",
+    "POST /api/v1/oauth/token",
+    "GET /api/v1/me/identity-links",
+    "DELETE /api/v1/me/identity-links/{issuer}",
     "GET /api/v1/domains",
     "POST /api/v1/domains",
     "DELETE /api/v1/domains/{domain}",
+    "PUT /api/v1/domains/{domain}/visibility",
+    "GET /api/v1/domains/{domain}/members",
+    "PUT /api/v1/domains/{domain}/members/{principal}",
+    "DELETE /api/v1/domains/{domain}/members/{principal}",
+    "PUT /api/v1/domains/{domain}/owner",
     "GET /api/v1/domains/{domain}/sync",
     "POST /api/v1/domains/{domain}/sync",
     "GET /api/v1/domains/{domain}/sync/changes",
@@ -107,6 +123,12 @@ pub const MOUNTED_OPERATIONS: &[&str] = &[
     "DELETE /api/v1/me/github-identity",
     "POST /api/v1/me/github-identity/connect",
     "PUT /api/v1/me/github-identity/token",
+    "GET /api/v1/me/mcp-tokens",
+    "POST /api/v1/me/mcp-tokens",
+    "POST /api/v1/me/mcp-tokens/{id}/rotate",
+    "DELETE /api/v1/me/mcp-tokens/{id}",
+    "GET /api/v1/me/oauth-grants",
+    "DELETE /api/v1/me/oauth-grants/{id}",
 ];
 
 /// The lowercase hex SHA-256 digest of `bytes`.
@@ -1017,6 +1039,153 @@ impl EmbeddingProvider for CountingEmbedder {
     }
 }
 
+/// The marker words that decide an engram's axis under [`TopicEmbedder`].
+pub const TOPICS: [&[&str]; 3] = [
+    &["retry", "retries", "backoff", "queue", "dead-letter", "ttl"],
+    &["docking", "clamp", "clamps", "thrust", "seats", "bay"],
+    &["token", "login", "session", "auth", "cookie", "csrf"],
+];
+
+/// A deterministic provider that embeds by topic: every marker word adds to
+/// its topic's axis, everything else lands on a fourth "none" axis when no
+/// marker appears at all. Two texts about one topic are identical vectors;
+/// texts about different topics are orthogonal; a manifest or a random note
+/// is orthogonal to every topic. That is what makes "a neighbour appears" and
+/// "the receipt stays quiet" both assertable, where a hash-bucket provider
+/// makes unrelated prose look alike.
+pub struct TopicEmbedder;
+
+impl TopicEmbedder {
+    pub fn embed_one(text: &str) -> Vec<f32> {
+        let mut v = [0f32; 4];
+        for word in text
+            .split(|c: char| !c.is_alphanumeric() && c != '-')
+            .filter(|w| !w.is_empty())
+        {
+            let w = word.to_lowercase();
+            for (axis, words) in TOPICS.iter().enumerate() {
+                if words.contains(&w.as_str()) {
+                    v[axis] += 1.0;
+                }
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm == 0.0 {
+            return vec![0.0, 0.0, 0.0, 1.0];
+        }
+        v.iter().map(|x| x / norm).collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for TopicEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+/// A provider that answers like [`TopicEmbedder`] after sleeping `delay`, for
+/// the probe timeout path.
+pub struct SleepyEmbedder {
+    pub delay: std::time::Duration,
+}
+
+#[async_trait::async_trait]
+impl EmbeddingProvider for SleepyEmbedder {
+    async fn embed(&self, texts: &[String]) -> crystalline_index::Result<Vec<Vec<f32>>> {
+        tokio::time::sleep(self.delay).await;
+        Ok(texts.iter().map(|t| TopicEmbedder::embed_one(t)).collect())
+    }
+
+    fn model_id(&self) -> &str {
+        "topic-model"
+    }
+
+    fn dims(&self) -> usize {
+        4
+    }
+
+    fn max_input_tokens(&self) -> usize {
+        512
+    }
+}
+
+// --- tracing capture --------------------------------------------------------
+
+/// Every `tracing` event emitted while this is the thread's default
+/// subscriber, rendered as `LEVEL message field=value ...` lines.
+///
+/// Held behind an `Arc` so the layer installed in the subscriber and the test
+/// reading the lines are the same buffer. Thread-local rather than global on
+/// purpose: `#[tokio::test]` runs its whole future, spawned tasks included, on
+/// the one thread, so the guard covers a background device flow too, and two
+/// tests in the same binary cannot capture each other's lines.
+#[derive(Clone, Default)]
+pub struct CapturedLogs(Arc<Mutex<Vec<String>>>);
+
+impl CapturedLogs {
+    /// The captured lines so far, oldest first.
+    pub fn lines(&self) -> Vec<String> {
+        self.0.lock().unwrap().clone()
+    }
+
+    /// Whether some captured line contains `needle`.
+    pub fn any_contains(&self, needle: &str) -> bool {
+        self.lines().iter().any(|l| l.contains(needle))
+    }
+}
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CapturedLogs {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        use std::fmt::Write as _;
+
+        struct Fields<'a>(&'a mut String);
+        impl tracing::field::Visit for Fields<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                if field.name() == "message" {
+                    let _ = write!(self.0, " {value:?}");
+                } else {
+                    let _ = write!(self.0, " {}={value:?}", field.name());
+                }
+            }
+        }
+
+        let mut line = String::new();
+        let _ = write!(line, "{}", event.metadata().level());
+        event.record(&mut Fields(&mut line));
+        self.0.lock().unwrap().push(line);
+    }
+}
+
+/// Installs [`CapturedLogs`] as this thread's default subscriber, returning
+/// the buffer and the guard that keeps it installed. Drop the guard (or let
+/// the test end) to restore the previous default.
+pub fn capture_logs() -> (CapturedLogs, tracing::subscriber::DefaultGuard) {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::registry().with(logs.clone());
+    let guard = tracing::subscriber::set_default(subscriber);
+    (logs, guard)
+}
+
 // --- GitHub connect auth: shared test double --------------------------------
 
 /// A fake [`ConnectAuth`] for the `configure` tool's connect actions and the
@@ -1031,7 +1200,11 @@ impl EmbeddingProvider for CountingEmbedder {
 /// narrower convenience constructors for tests that only need a
 /// token-validate acceptor or a device flow that always fails once released.
 pub struct StubConnectAuth {
-    start_result: Mutex<Option<Result<DeviceFlowStart, RemoteError>>>,
+    /// The device-flow starts to hand out, in order, one per call. A queue
+    /// rather than a single one-shot because a restart asks the same double
+    /// for a SECOND code, and the test that proves the code changed needs the
+    /// two to differ (see [`StubConnectAuth::queue_start`]).
+    start_results: Mutex<std::collections::VecDeque<Result<DeviceFlowStart, RemoteError>>>,
     /// Gates `run_device_flow`'s completion; a test releases it with
     /// `auth.run_gate.notify_one()` once it has observed the "still waiting
     /// on the user" state.
@@ -1042,6 +1215,33 @@ pub struct StubConnectAuth {
     /// consuming `validate_result`, so a connect in any test never panics on
     /// a used-up one-shot outcome. Backs [`StubConnectAuth::accepting`].
     accept_any: Option<String>,
+    /// Set when a `run_device_flow` future is dropped before it produced an
+    /// answer - which is exactly what an abandoned flow's aborted task looks
+    /// like from inside the double. Read with
+    /// [`StubConnectAuth::run_was_abandoned`]. A future that runs to
+    /// completion disarms its witness first, so a normal landing never sets
+    /// this.
+    run_abandoned: Arc<std::sync::atomic::AtomicBool>,
+    /// Set the moment a `run_device_flow` future is first polled, so a test
+    /// that wants to abandon a flow can first wait until there is something
+    /// to abandon - a spawned task that has never been polled would be
+    /// aborted before it entered the double at all.
+    run_entered: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Set on drop unless disarmed: how [`StubConnectAuth`] notices that the
+/// engine abandoned a device flow instead of letting it finish.
+struct RunWitness {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    armed: bool,
+}
+
+impl Drop for RunWitness {
+    fn drop(&mut self) {
+        if self.armed {
+            self.flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 /// The general one-shot double (the original `FakeConnectAuth` constructor):
@@ -1053,11 +1253,13 @@ pub fn fake_auth(
     validate: Result<String, RemoteError>,
 ) -> Arc<StubConnectAuth> {
     Arc::new(StubConnectAuth {
-        start_result: Mutex::new(Some(start)),
+        start_results: Mutex::new(std::collections::VecDeque::from([start])),
         run_gate: Arc::new(tokio::sync::Notify::new()),
         run_result: Mutex::new(Some(run)),
         validate_result: Mutex::new(Some(validate)),
         accept_any: None,
+        run_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        run_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     })
 }
 
@@ -1079,11 +1281,15 @@ impl StubConnectAuth {
     /// device path.
     pub fn accepting(user: &str) -> Self {
         Self {
-            start_result: Mutex::new(Some(Err(RemoteError::NotConnected))),
+            start_results: Mutex::new(std::collections::VecDeque::from([Err(
+                RemoteError::NotConnected,
+            )])),
             run_gate: Arc::new(tokio::sync::Notify::new()),
             run_result: Mutex::new(Some(Err(RemoteError::NotConnected))),
             validate_result: Mutex::new(None),
             accept_any: Some(user.to_string()),
+            run_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -1100,13 +1306,13 @@ impl StubConnectAuth {
     pub fn denying(reason: &str) -> (Self, Arc<tokio::sync::Notify>) {
         let gate = Arc::new(tokio::sync::Notify::new());
         let auth = Self {
-            start_result: Mutex::new(Some(Ok(DeviceFlowStart {
+            start_results: Mutex::new(std::collections::VecDeque::from([Ok(DeviceFlowStart {
                 device_code: "devcode".to_string(),
                 user_code: "ABCD-1234".to_string(),
                 verification_url: "https://github.example/device".to_string(),
                 interval_secs: 0,
                 expires_in_secs: 900,
-            }))),
+            })])),
             run_gate: gate.clone(),
             run_result: Mutex::new(Some(Err(RemoteError::Api {
                 status: 403,
@@ -1114,8 +1320,42 @@ impl StubConnectAuth {
             }))),
             validate_result: Mutex::new(None),
             accept_any: None,
+            run_abandoned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            run_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         (auth, gate)
+    }
+
+    /// Queues one more device-flow start, handed out after the ones already
+    /// queued. What a restart test uses to give the second sign-in a code
+    /// that differs from the first.
+    pub fn queue_start(&self, start: Result<DeviceFlowStart, RemoteError>) {
+        self.start_results.lock().unwrap().push_back(start);
+    }
+
+    /// Re-arm the one-shot run and validate outcomes.
+    ///
+    /// The constructors set each once, which is right for a test that drives
+    /// exactly one sign-in. A test whose flow may legitimately run a second
+    /// time - a restart that abandons the first and starts again - would
+    /// otherwise panic inside the double on the used-up outcome, and a panic in
+    /// a double reads as a bug in the code under test. Pairs with
+    /// [`StubConnectAuth::queue_start`], which does the same for the code.
+    pub fn rearm(&self, run: Result<String, RemoteError>, validate: Result<String, RemoteError>) {
+        *self.run_result.lock().unwrap() = Some(run);
+        *self.validate_result.lock().unwrap() = Some(validate);
+    }
+
+    /// Whether a `run_device_flow` future was dropped before it answered -
+    /// the shape an abandoned flow's aborted task has from in here. Polled
+    /// rather than awaited: an abort takes effect at the task's next poll.
+    pub fn run_was_abandoned(&self) -> bool {
+        self.run_abandoned.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Whether a `run_device_flow` future has been polled at least once.
+    pub fn run_was_entered(&self) -> bool {
+        self.run_entered.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -1133,10 +1373,10 @@ impl ConnectAuth for StubConnectAuth {
             // panic on a used-up one-shot.
             return Err(RemoteError::NotConnected);
         }
-        self.start_result
+        self.start_results
             .lock()
             .unwrap()
-            .take()
+            .pop_front()
             .expect("start_device_flow result not set")
     }
 
@@ -1146,12 +1386,21 @@ impl ConnectAuth for StubConnectAuth {
         _client_id: &str,
         _start: &DeviceFlowStart,
     ) -> Result<String, RemoteError> {
+        self.run_entered
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut witness = RunWitness {
+            flag: self.run_abandoned.clone(),
+            armed: true,
+        };
         self.run_gate.notified().await;
-        self.run_result
+        let answer = self
+            .run_result
             .lock()
             .unwrap()
             .take()
-            .expect("run_device_flow result not set")
+            .expect("run_device_flow result not set");
+        witness.armed = false;
+        answer
     }
 
     async fn validate_token(

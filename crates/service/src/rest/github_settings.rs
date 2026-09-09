@@ -69,7 +69,7 @@ pub struct GithubStatusResponse {
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 #[schema(description = "The half of a running device flow a browser has to \
                         show: the short code the user types in, where they \
-                        type it, and how long the code stays valid.")]
+                        type it, and how long is left to do so.")]
 pub struct GithubPendingView {
     /// The short code the user confirms at `verification_url`.
     #[schema(example = "ABCD-1234")]
@@ -77,8 +77,11 @@ pub struct GithubPendingView {
     /// Where the user confirms the code.
     #[schema(example = "https://github.com/login/device")]
     pub verification_url: String,
-    /// How many seconds from the flow's start the code stays valid.
-    #[schema(example = 900)]
+    /// Seconds REMAINING before the code expires, recomputed on every read
+    /// and saturating at 0 - not the flow's original lifetime. Poll this
+    /// route and the number falls, which is how a live sign-in is told apart
+    /// from a wedged one; a countdown just starts from this value.
+    #[schema(example = 870)]
     pub expires_in_secs: u64,
 }
 
@@ -226,7 +229,11 @@ pub async fn connect(
     refuse_read_only(&state)?;
     ensure_enabled(&state).await?;
     // Starts a flow, or returns the one already pending (engine behavior).
-    state.engine.start_device_connect(None).await?;
+    // No restart flag on the instance route: the settings screen's Connect
+    // button is the machine's one sign-in and has no second caller to race,
+    // where a person's own connect (see `github_identity`) can be started
+    // from Fluid and a terminal both.
+    state.engine.start_device_connect(None, false).await?;
     let status = view(state.engine.github_connection().await?);
     Ok((StatusCode::ACCEPTED, Json(status)).into_response())
 }

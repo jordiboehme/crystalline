@@ -81,9 +81,73 @@ export interface paths {
          *     mutations, whether it has any accounts at all, whether this session may
          *     drive the share surfaces, and which server version it is talking to, so a
          *     mismatched UI can say so instead of failing later.
-         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and a trusted-header identity is minted a session on the first call, which is the only way that mode obtains a token.
+         * @description Who the caller is, whether it is being served anonymously, whether this instance refuses content mutations, whether it has no accounts yet and so still needs its first admin (`needs_setup`, which is what opens `POST /auth/setup`), whether this session may drive the share surfaces (`can_share`: an admin always, an editor when `github.share_identity` is `personal`), and which server version it is talking to. Also issues the CSRF token every later mutating request must echo in `x-csrf-token`: a cookie session has its token reissued here, and an identity a proxy asserts (`auth.trusted_header` or `auth.proxy_headers`) is minted a session on the first call, which is the only way those modes obtain a token.
          */
         get: operations["get_me"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/oidc/callback": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Finish a single sign-on the provider sent back.
+         * @description Matches the state against the `fluid_oidc_state` cookie and the server-side record, exchanges the code with the client secret and the PKCE verifier, validates the ID token (issuer, audience, expiry, signature, nonce) and signs the account in. The account is the one linked to the token's `(issuer, sub)` pair, or a fresh one provisioned at `auth.oidc.default_role`; a matching address never reaches an existing account. A sign-on started by `POST /auth/oidc/login` instead ties the identity to the account that started it, which has to be the account finishing it too. The provider's own error text never reaches this response.
+         */
+        get: operations["oidc_callback"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/oidc/login": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start a single sign-on against the configured provider.
+         * @description Redirects to the provider's authorization endpoint with PKCE (S256), a server-generated state and a server-generated nonce, and sets the short-lived `fluid_oidc_state` cookie that binds the sign-in to this browser. Public, like the password login: there is no session yet. Linking a provider identity to an existing account is the POST on this same path, not a flag here: a GET carrying `link=true` is refused with a 400 that says so, because a GET could be sent by another origin. `return_to` names where the callback should land the browser once the sign-in completes - the OAuth consent page is what it exists for. It must be a path on this instance (starts with `/`, not `//`, no backslash, at most 512 printable ASCII characters); anything else is dropped and the sign-in lands on `/`.
+         */
+        get: operations["oidc_login"];
+        put?: never;
+        /**
+         * Start a single sign-on that links its identity to this account.
+         * @description Starts the same authorization-code flow the GET does, and records that it is for the calling account: the callback ties the provider identity to that account rather than signing in as whoever it turns out to be. Needs a signed-in account and the session's CSRF token, because starting a link is an unsafe act - a GET would be startable by another origin. Answers the authorization endpoint in `location`; navigate the whole page to it. Served on a read-only instance: an identity link is account state rather than knowledge.
+         */
+        post: operations["oidc_start_link"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/auth/providers": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Which ways into this instance exist.
+         * @description Read by the sign-in screen before anyone is signed in, so it is public like the login route. Carries whether a single sign-on provider is configured and the label for its button, and nothing else about it: no issuer, no client id, no secret.
+         */
+        get: operations["auth_providers"];
         put?: never;
         post?: never;
         delete?: never;
@@ -199,7 +263,7 @@ export interface paths {
         post?: never;
         /**
          * Unregister a domain. Files on disk are never touched.
-         * @description Admin only. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its knowledge is gone - a client must confirm that difference in words. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
+         * @description An instance admin, or a private domain's owner. The registration and the domain's index rows go; a file domain's files stay exactly where they are (re-adding the folder adopts them again), which is what `files_kept` reports. A virtual domain has no files, so `files_kept` is false and its engrams are DELETED with it: that case is refused 409 unless the request carries `?purge=true`, so a client confirms the loss in words before it sends. Any open co-editing rooms in the domain are saved and closed first; `rooms_closed` counts them.
          */
         delete: operations["unregister_domain"];
         options?: never;
@@ -374,12 +438,12 @@ export interface paths {
         put?: never;
         /**
          * Acknowledge one evolve finding on one engram.
-         * @description Records `evolve_ack` on the engram: the rule, the evidence the server computed it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`.
+         * @description Records `evolve_ack` on the engram: the rule, the evidence it fired on, the note, the acknowledging user and the instant. A matching acknowledgment keeps the finding out of the queue and counted in `acknowledged`; when the evidence changes the finding returns marked `ack_stale`. The evidence is the server's, either picked by running detection or - when the body names the row's `scope`, which is how a caller says which of an engram's two `V301` findings it read - checked against it.
          */
         post: operations["acknowledge_finding"];
         /**
          * Withdraw an acknowledgment.
-         * @description Removes the engram's `evolve_ack` entry for that rule, leaving its other entries alone. 404 when the engram carries none for the rule, rather than reporting a removal that did not happen.
+         * @description Removes the engram's `evolve_ack` entries for that rule, leaving the other rules' alone. A rule has one entry, except `V301`, which has one per twin pair: name the row's `scope` to take one pair back and leave the engram's other pairs silenced, or send none to take every pair at once. 404 when the engram carries no entry the body names, rather than reporting a removal that did not happen.
          */
         delete: operations["unacknowledge_finding"];
         options?: never;
@@ -467,6 +531,56 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/members": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Who owns this domain and who is invited into it.
+         * @description Served to any account that may see the domain, which on a private one means its owner, its members at every level, and instance admins. A caller who may not see the domain is answered 404, exactly as for a domain nobody registered.
+         *
+         *     A shared domain answers `shared` with no owner and no members: membership only decides anything while a domain is private.
+         */
+        get: operations["list_domain_members"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/members/{principal}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Invite an account to a private domain, or change its level.
+         * @description Needs manager access on the domain: its own manager, its owner, or an instance admin. The same call invites and re-levels, since both state what the membership should be.
+         *
+         *     Refused on a shared domain (409): membership only decides anything while a domain is private. The owner cannot be named here either - it already holds every level - and an account that does not exist, or is disabled, is a 422 rather than a row waiting for somebody to claim the name.
+         */
+        put: operations["set_domain_member"];
+        post?: never;
+        /**
+         * Remove a membership, or leave a domain.
+         * @description Needs manager access on the domain - its manager, its owner, or an instance admin - OR that the principal is the caller itself, which is how a member leaves.
+         *
+         *     Refused on a shared domain (409), which has no membership to remove. The owner cannot be removed here: hand the domain on with `PUT /domains/{domain}/owner` first. A name that is not a member of this domain is a 404.
+         */
+        delete: operations["remove_domain_member"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/domains/{domain}/move": {
         parameters: {
             query?: never;
@@ -483,6 +597,28 @@ export interface paths {
          *     The permalink rides in the body for the same reason `RetireBody`'s does: the engram route's wildcard cannot be followed by an action segment.
          */
         post: operations["move_engram"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/domains/{domain}/owner": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Hand a private domain to a different account.
+         * @description The domain's owner or an instance admin. A manager may not: handing a domain on decides who holds it, which is the same reason a manager may not change visibility.
+         *
+         *     The old owner keeps nothing - they are a stranger to the domain afterwards unless the new owner invites them back. The new owner's own membership row, if it had one, is dropped, since an owner already holds every level. Refused on a shared domain (409), which has no owner to hand on.
+         */
+        put: operations["set_domain_owner"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -659,6 +795,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/domains/{domain}/visibility": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Make a domain private, or share it with the instance again.
+         * @description Making a domain PRIVATE is admin only: it gives the domain an owner - the calling account - and hides it from every account that is not invited into it. A domain nobody may see is answered exactly as a domain nobody registered, so a stranger's request for it is a 404 rather than a 403.
+         *
+         *     Making a domain SHARED again is served to the domain's own owner as well as to an admin: they already see everything in it, and opening what they closed takes nothing from anybody.
+         *
+         *     Privatizing a domain that is already private changes nothing: it keeps the owner and the members it has, and does not become the caller's. Transfer ownership with PUT /domains/{domain}/owner.
+         *
+         *     A manager may do neither. It may invite people and change their levels; deciding who holds the domain is not one domain's administration to settle.
+         *
+         *     Making a domain shared again forgets its membership list.
+         */
+        put: operations["set_domain_visibility"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/evolve": {
         parameters: {
             query?: never;
@@ -698,6 +862,12 @@ export interface paths {
          *     `ack_stale`, the old `ack_note` and the `ack_scope` it was given for. Pass
          *     `include_acknowledged` to see the suppressed rows themselves, each marked
          *     `acknowledged` and carrying the same two fields.
+         *
+         *     A `V301` row carries one column the others do not: its own `scope`, the
+         *     twin pair it fired on. It is the one rule that fires more than once on an
+         *     engram, so naming the engram and the rule does not name the finding - send
+         *     this value back on the acknowledgment route to silence the pair that was
+         *     read rather than whichever one the server would have picked.
          *
          *     `today` is not exposed. The temporal rules are evaluated as of now, which is
          *     the only question a page asks; the tool takes a pinned date for a run that
@@ -782,7 +952,7 @@ export interface paths {
         put?: never;
         /**
          * Start a device-code sign-in for the caller's own identity.
-         * @description Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow; one made while another identity's sign-in is in flight is refused 409. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.
+         * @description Editors and admins only, and refused on a read-only instance. Answers 202 with the short code to confirm in a browser; the flow runs in the background and its outcome is read from `GET /me/github-identity`. A second call from the same account reports that same flow, unless `restart=true` is given, which abandons it and issues a fresh code; one made while another identity's sign-in is in flight is refused 409 either way. Unlike the instance connect, this does not turn `github.enabled` on: enabling collaboration is an admin's instance-wide decision.
          */
         post: operations["connect_my_github_identity_device"];
         delete?: never;
@@ -805,6 +975,234 @@ export interface paths {
          */
         put: operations["connect_my_github_identity_token"];
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/identity-links": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The single sign-on identities the caller's account holds.
+         * @description Every signed-in account has this surface, viewers included. A row carries the issuer, the provider's stable subject, when the link was made and who made it - `jit` for a link a first sign-on created along with its account, `cli` for one an administrator made, otherwise the account that linked it to itself. `has_password` says whether the account has a second way in, which is what decides whether the last link may be given up. Served on a read-only instance: an identity link is account state rather than knowledge.
+         */
+        get: operations["list_my_identity_links"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/identity-links/{issuer}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Unlink one single sign-on identity from the caller's account.
+         * @description Removes the identity this account holds at that issuer. A later sign-on from it then provisions a new account rather than reaching this one. Refused with 409 when it is this account's last way in - no password and no other identity - because unlinking would leave an account nobody can sign in to; the refusal names `crystalline users passwd`, which is what gives the account a password first. An administrator can force it from the command line, for the repair where a provider re-issued its subjects.
+         */
+        delete: operations["unlink_my_identity"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/mcp-tokens": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's own MCP tokens, newest first.
+         * @description Every signed-in account has this, viewers included: an agent acts as the account that issued its token, so a viewer's agent is read-only by construction. The rows carry the label, when the token was issued and when it was last presented - never the token, which exists in the clear only in the reply that issued it. Served on a read-only instance like the rest of this surface: a token is account state rather than knowledge.
+         */
+        get: operations["list_my_mcp_tokens"];
+        put?: never;
+        /**
+         * Issue an MCP token for the caller's own account.
+         * @description Every signed-in account may issue one, viewers included. The reply is the only place the token is ever readable: only its hash is stored, so a lost token is revoked and replaced rather than looked up. Send it from the agent's MCP registration as `Authorization: Bearer <token>`. Served on a read-only instance too: that setting protects the knowledge, and a token is account state rather than knowledge - a read-only server is where an agent most needs one.
+         */
+        post: operations["issue_my_mcp_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/mcp-tokens/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one of the caller's own MCP tokens.
+         * @description The token stops resolving at once: the next request carrying it is refused at the door. Only the caller's own tokens can be named - any other id is 404, the same answer an unknown one gets, so another account's tokens cannot be probed for.
+         */
+        delete: operations["revoke_my_mcp_token"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/mcp-tokens/{id}/rotate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Replace one of the caller's MCP tokens with a fresh one.
+         * @description The old secret stops working and the new one exists in the same step, so a token that may have leaked is replaced without a window in which the agent holds none. The label rides along and the reply carries a new `id`. Only the caller's own tokens can be named: any other id is 404, so another account's cannot be probed for.
+         */
+        post: operations["rotate_my_mcp_token"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/oauth-grants": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * The caller's own OAuth grants, newest first.
+         * @description Every signed-in account has this, viewers included: a hosted client acts as the account that consented to it, so a viewer's connected client is read-only by construction. The rows carry the client's name, the host it redirects back to, when the grant was made, when it was last used and until when it may keep refreshing - never a token, which the store keeps only hashed. A grant that can no longer refresh is left out rather than shown as dead weight. Served on a read-only instance like the rest of this surface: a grant is account state rather than knowledge.
+         */
+        get: operations["list_my_oauth_grants"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/me/oauth-grants/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Revoke one of the caller's own connected clients.
+         * @description Both of the grant's tokens stop resolving at once: the next request either presents at the MCP gate is refused at the door. Only the caller's own grants can be named - any other id is 404, the same answer an unknown one gets, so another account's connections cannot be probed for.
+         */
+        delete: operations["revoke_my_oauth_grant"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/oauth/authorizations/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * What an MCP client is asking this account to grant.
+         * @description The consent screen's own read: the client's name and home page, the host the answer will be sent to and whether it is this machine, the account that would be granted, and how long is left. Never the authorization code, the PKCE challenge or the client's `state` - none of them is anything a person decides with. Needs a signed-in account, any role.
+         */
+        get: operations["oauth_authorization"];
+        put?: never;
+        /**
+         * Allow or deny what an MCP client is asking for.
+         * @description Takes the pending request - once, so a second answer finds nothing - and answers where to send the browser. On `allow` that is the client's redirect uri carrying a single-use authorization code, the client's `state` and `iss`; the code is bound to this account, this client, this redirect uri, the PKCE challenge and this resource, and lives sixty seconds. On `deny` it is the same uri carrying `error=access_denied`. A grant is the whole account's rights until it is revoked from the profile page. Needs a signed-in account, any role, and the session's CSRF token; served on a read-only instance, like the personal token surface.
+         */
+        post: operations["oauth_decide"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/oauth/authorize": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Start an authorization for an MCP client.
+         * @description The authorization endpoint the metadata advertises. `response_type=code` and PKCE `S256` are required - this server registers public clients only, so the challenge is what makes an intercepted code worthless. A good request answers 302 to the consent screen `/authorize?request=<id>`, where a signed-in person allows or denies it. An unknown `client_id`, or a `redirect_uri` the registration did not name, is answered here as a problem detail and is never redirected anywhere; every other refusal goes back to the client's redirect uri with `error`, `state` and `iss`.
+         */
+        get: operations["oauth_authorize"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/oauth/register": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Register an MCP client as a public OAuth client.
+         * @description RFC 7591 dynamic client registration, the endpoint the authorization server metadata advertises. Open to any caller, because a client registers before it can authenticate as anything. The answer carries a `client_id` and no secret: every client here is a public client, so `token_endpoint_auth_method` is always `none` and the proof of possession at the token endpoint is PKCE. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`. Bounded four ways: a 64 KiB body, 30 registrations per 10 minutes per process, 1000 stored registrations, and a prune that collects a registration which never authorized within the hour and one that has gone 30 days since its last authorization.
+         */
+        post: operations["register_oauth_client"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/v1/oauth/token": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Exchange an authorization code, or rotate a refresh token.
+         * @description The token endpoint the metadata advertises, form-encoded in and JSON out. `grant_type=authorization_code` takes the single-use `code` the consent screen issued, the `redirect_uri` it was issued for, the PKCE `code_verifier` and the `client_id`; `grant_type=refresh_token` takes a `refresh_token` and the `client_id`. Both may name a `resource`: on an exchange it must be this instance, and on a refresh it must be the audience the grant already holds, which on a deployment reached under two names is not the same sentence. The answer is an access token good for an hour and a refresh token good for thirty days; every refresh rotates both, and presenting a refresh token that was already rotated away revokes the whole grant. Errors are OAuth JSON rather than problem details - see `OauthErrorBody`.
+         */
+        post: operations["oauth_token"];
         delete?: never;
         options?: never;
         head?: never;
@@ -1092,7 +1490,7 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
-        /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired and an optional note saying why it is intentional. The scope an acknowledgment holds for is never sent - the server computes it by running detection. */
+        /** @description Acknowledge one finding on one engram: the engram by permalink, the rule id that fired, an optional note saying why it is intentional and, for a rule that fires more than once on an engram, the row's own `scope`. Omit the scope and the server picks the finding by running detection, which is the right answer for every rule that fires once. */
         AckBody: {
             /**
              * @description Why the finding is intentional. Ignored on `DELETE`.
@@ -1109,6 +1507,22 @@ export interface components {
              * @example V101
              */
             rule: string;
+            /**
+             * @description The evidence this acknowledgment is for, copied from the queue row's
+             *     own `scope`.
+             *
+             *     Only `V301` sends one: it is the one rule that fires more than once on
+             *     an engram (an engram can be the semantic twin of several others), so it
+             *     is the one where naming the rule does not name the finding. On `POST`
+             *     the server checks the scope is really firing and refuses with a 422 if
+             *     it is not, which is what a queue read too long ago looks like; on
+             *     `DELETE` it takes back that pair's entry and leaves the engram's other
+             *     pairs silenced. Every other rule ignores it, and omitting it on `V301`
+             *     means the whole rule: the server's own pick on `POST`, every pair at
+             *     once on `DELETE`.
+             * @example notes/backoff-lesson, notes/retry-queue-gotcha
+             */
+            scope?: string | null;
         };
         /** @description One entry of an uploaded archive and what became of it. A preview reports `new`, `collides`, `invalid` or `ignored`; an import reports `created`, `overwritten`, `skipped`, `invalid` or `ignored`. */
         ArchiveEntryReport: {
@@ -1212,6 +1626,53 @@ export interface components {
             attachments: components["schemas"]["AttachmentView"][];
         };
         /**
+         * @description What the consent page shows: who is asking, where the answer goes, and who
+         *     is about to grant it.
+         *
+         *     Deliberately not the protocol: no code, no challenge, no state, no client
+         *     id. A person deciding whether to trust something is helped by the client's
+         *     name and the address the answer will be sent to, and by nothing else on
+         *     this list. `Debug` is derived because there is nothing here to redact,
+         *     which is the property rather than an accident.
+         */
+        AuthorizationView: {
+            /**
+             * @description The account that will be granted. A client acts as the person who
+             *     consented, so this is what is actually being handed over.
+             * @example ada
+             */
+            account: string;
+            /**
+             * @description The client's name as it registered it, at most 100 characters of
+             *     printable text.
+             * @example Claude
+             */
+            client_name: string;
+            /**
+             * @description The client's home page, when it registered one.
+             * @example https://claude.ai
+             */
+            client_uri?: string | null;
+            /**
+             * Format: int64
+             * @description Seconds until the request expires and has to be started again from the
+             *     client.
+             * @example 587
+             */
+            expires_in: number;
+            /**
+             * @description Whether that address is this machine, so the page can say that the
+             *     client is a program on this computer rather than a service elsewhere.
+             */
+            loopback: boolean;
+            /**
+             * @description The host (and port, when it names one) the browser will be sent to.
+             *     The one fact that says where an authorization actually goes.
+             * @example claude.ai
+             */
+            redirect_host: string;
+        };
+        /**
          * @description The wire form of a 412: a problem detail carrying the version the server
          *     holds now, so a client can show a merge view instead of just failing.
          */
@@ -1276,6 +1737,13 @@ export interface components {
              */
             path?: string | null;
             /**
+             * @description Register the domain private, owned by the calling account. Applies to
+             *     every mode; defaults to false, which is a domain the whole instance
+             *     shares.
+             * @example false
+             */
+            private?: boolean;
+            /**
              * @description owner/name; github mode only.
              * @example acme/knowledge
              */
@@ -1316,6 +1784,58 @@ export interface components {
              */
             type?: string | null;
         };
+        /**
+         * @description Allow or deny, and there is nothing else to choose: a grant here is the
+         *     whole account's rights until it is revoked.
+         * @enum {string}
+         */
+        Decision: "allow" | "deny";
+        /** @description What `POST /oauth/authorizations/{id}` takes. */
+        DecisionBody: {
+            /**
+             * @description `allow` or `deny`. Anything else is not a decision and is refused
+             *     before the pending request is touched, so an unreadable answer leaves
+             *     it there to be answered again.
+             */
+            decision: components["schemas"]["Decision"];
+        };
+        /**
+         * @description Where to send the browser once the decision is made.
+         *
+         *     A body rather than a redirect, for the reason `POST /auth/oidc/login`
+         *     answers one: only a script can send the session's CSRF token, and a script
+         *     cannot read where a redirect went, so a 302 here would hand the browser
+         *     somewhere the page could not learn. Fluid navigates the whole page to it.
+         *
+         *     `Debug` is written rather than derived: on an allow this location carries
+         *     the authorization code.
+         */
+        DecisionResponse: {
+            /**
+             * @description The client's redirect uri with the answer on it: `code`, `state` and
+             *     `iss` on an allow, `error=access_denied`, `state` and `iss` on a deny.
+             * @example https://claude.ai/api/mcp/auth_callback?code=...&state=...&iss=https://kb.example
+             */
+            location: string;
+        };
+        /**
+         * @description One membership row: who was invited to a private domain, at what level, by
+         *     whom and when.
+         */
+        DomainMember: {
+            /** @description RFC 3339, when this row was last written. */
+            added_at: string;
+            /**
+             * @description Who added or last changed this row. An audit field, stored as given:
+             *     it is usually a login name but may name a non-account actor, the same
+             *     latitude the identity-link plan gives `linked_by`.
+             */
+            added_by: string;
+            /** @description What this member may do here. */
+            level: components["schemas"]["MemberLevel"];
+            /** @description The member's login name, folded by [`normalize_account_name`]. */
+            principal: string;
+        };
         /** @description One account's own GitHub identity: whose it is, whether a credential is on file, the login it authenticated as, since when and where it lives. No token material, ever. */
         GithubIdentityResponse: {
             /**
@@ -1351,12 +1871,15 @@ export interface components {
              */
             token_store?: string | null;
         };
-        /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long the code stays valid. */
+        /** @description The half of a running device flow a browser has to show: the short code the user types in, where they type it, and how long is left to do so. */
         GithubPendingView: {
             /**
              * Format: int64
-             * @description How many seconds from the flow's start the code stays valid.
-             * @example 900
+             * @description Seconds REMAINING before the code expires, recomputed on every read
+             *     and saturating at 0 - not the flow's original lifetime. Poll this
+             *     route and the number falls, which is how a live sign-in is told apart
+             *     from a wedged one; a countdown just starts from this value.
+             * @example 870
              */
             expires_in_secs: number;
             /**
@@ -1398,6 +1921,77 @@ export interface components {
              * @example octo
              */
             user?: string | null;
+        };
+        /**
+         * @description One identity an external provider asserts, tied to one account.
+         *
+         *     `(issuer, subject)` is the durable key: a username, an address and a
+         *     display name are all mutable presentation data, and none of them may move
+         *     an account. An account may hold several links (one per issuer), and a link
+         *     points at exactly one account.
+         */
+        IdentityLink: {
+            /**
+             * @description The provider that asserts this identity, as its ID tokens spell it.
+             * @example https://login.microsoftonline.com/<tenant>/v2.0
+             */
+            issuer: string;
+            /**
+             * @description When the link was made, RFC 3339.
+             * @example 2026-09-07T09:14:22Z
+             */
+            linked_at: string;
+            /**
+             * @description Who made it: the account that linked it, an admin's name, or `jit` for
+             *     a link a first sign-in created along with its account.
+             * @example jit
+             */
+            linked_by: string;
+            /**
+             * @description The provider's stable identifier for the person.
+             * @example 0f8fad5b-d9cb-469f-a165-70867728950e
+             */
+            subject: string;
+        };
+        /** @description The single sign-on identities this account holds, and whether it has a password to fall back on. The two together are what the profile card needs: an account with no password and one identity cannot unlink it, because that link is its only way in. */
+        IdentityLinksResponse: {
+            /**
+             * @description Whether this account can also sign in with a password. False for an
+             *     account a first sign-on provisioned, which has none until
+             *     `crystalline users passwd` gives it one.
+             * @example true
+             */
+            has_password: boolean;
+            /** @description Every identity this account holds, by issuer. */
+            links: components["schemas"]["IdentityLink"][];
+        };
+        /** @description A new MCP token. The label is what the listing shows: name the machine or the agent it is for, since the token itself is never shown again. */
+        IssueBody: {
+            /**
+             * @description What this token is for. Required and non-empty: an unlabeled row is
+             *     one nobody dares revoke.
+             * @example laptop
+             */
+            label: string;
+        };
+        /** @description A freshly issued MCP token. `token` is shown here and nowhere else, ever: only its hash is stored. Send it as `Authorization: Bearer <token>` from the agent's MCP registration. */
+        IssuedTokenResponse: {
+            /**
+             * Format: int64
+             * @description The row id, used to rotate or revoke this token later.
+             * @example 3
+             */
+            id: number;
+            /**
+             * @description The label it was issued under, echoed so the reply is self-describing.
+             * @example laptop
+             */
+            label: string;
+            /**
+             * @description The token itself, this once.
+             * @example cmt_1f3c...
+             */
+            token: string;
         };
         /** @description What `POST /auth/login` takes. */
         LoginBody: {
@@ -1442,6 +2036,27 @@ export interface components {
             ok: boolean;
         };
         /**
+         * @description One row of an account's MCP token list, for a management UI or CLI. Never
+         *     carries the token itself - only the hash is stored, so there is nothing to
+         *     show back after issuance.
+         */
+        McpTokenInfo: {
+            /** @description RFC 3339, when this token was issued. */
+            created_at: string;
+            /**
+             * Format: int64
+             * @description The row id, used to revoke or rotate this token.
+             */
+            id: number;
+            /** @description The caller-chosen label. */
+            label: string;
+            /**
+             * @description RFC 3339, when this token last resolved a request. `None` if it has
+             *     never been used.
+             */
+            last_used?: string | null;
+        };
+        /**
          * @description What `GET /auth/me` answers with: everything a client needs before it draws
          *     anything.
          */
@@ -1479,10 +2094,10 @@ export interface components {
              *     belongs.
              *
              *     Null only for the anonymous viewer, which has no account and can never
-             *     write; a trusted-header identity is given a session here on the first
-             *     call and handed that same session's token on every later one, so every
-             *     identity that can mutate anything carries a token. See the `check_csrf`
-             *     rule.
+             *     write; an identity a proxy asserts (`auth.trusted_header` or
+             *     `auth.proxy_headers`) is given a session here on the first call and
+             *     handed that same session's token on every later one, so every identity
+             *     that can mutate anything carries a token. See the `check_csrf` rule.
              *
              *     Handing the token back on a `GET` is safe for the same reason handing it
              *     back from login is: no CORS layer exists on this surface, so another
@@ -1502,6 +2117,25 @@ export interface components {
              *     the state itself is what makes `POST /auth/setup` answer at all.
              */
             needs_setup: boolean;
+            /**
+             * @description Whether this instance serves OAuth for MCP clients, from the effective
+             *     `auth.oauth` setting.
+             *
+             *     A rendering signal for the profile's connected-clients card, the same
+             *     role `can_share` plays for the share surfaces above: an instance that
+             *     never turned OAuth on draws no card asking somebody to manage clients
+             *     that can never exist. It is not a gate: every `/oauth/*` route refuses
+             *     on its own, off `auth.oauth` itself, regardless of what this probe
+             *     says, so a stale or forged `true` costs a 404 rather than access.
+             *
+             *     `/me/oauth-grants` deliberately does not refuse on the setting. A grant
+             *     is the caller's own account state, served like the personal MCP token
+             *     surface beside it, so an operator who turns OAuth off leaves every
+             *     account still able to see and revoke what it granted - and the grants
+             *     are inert at the gate meanwhile. Forging this flag reaches nothing
+             *     there either: the route answers the caller's own rows and no others.
+             */
+            oauth: boolean;
             /** @description Whether this instance refuses content mutations. */
             read_only: boolean;
             user?: null | components["schemas"]["User"];
@@ -1510,6 +2144,41 @@ export interface components {
              * @example 0.12.0
              */
             version: string;
+        };
+        /** @description The level to invite this account at, or to move it to: `viewer` reads, `editor` writes, `manager` also administers the membership. */
+        MemberBody: {
+            /** @description viewer | editor | manager */
+            level: components["schemas"]["MemberLevel"];
+        };
+        /**
+         * @description What a member may do on one private domain. Ordered least to most
+         *     privileged, exactly as [`Role`] is, and deliberately a separate ladder: an
+         *     account's instance role says what it may do on the installation, this says
+         *     what it may do on one domain somebody invited it to.
+         *
+         *     `Manager` is the level that may invite and change other members' levels. It
+         *     may not flip the domain back to shared, and it may not hand the domain to
+         *     someone else: those two stay with the owner (and with an admin), which is
+         *     what keeps "who can see this at all" a decision the owner made.
+         * @enum {string}
+         */
+        MemberLevel: "viewer" | "editor" | "manager";
+        /** @description Who may reach one domain. `visibility` is `private` or `shared`; a shared domain has no owner and no members, because membership only decides anything while a domain is private. */
+        MembersResponse: {
+            /** @description Everyone invited, by name. Empty for a shared domain. */
+            members: components["schemas"]["DomainMember"][];
+            /**
+             * @description The account that owns this domain, or `null`: a shared domain has no
+             *     owner, and a private one whose owner's account was removed has none
+             *     either.
+             * @example ada
+             */
+            owner?: string | null;
+            /**
+             * @description `private` or `shared`.
+             * @example private
+             */
+            visibility: string;
         };
         /** @description Move an engram to a new path, or into another registered domain. Inbound bare links are rewritten to the domain-prefixed form on a cross-domain move. */
         MoveBody: {
@@ -1528,6 +2197,73 @@ export interface components {
              * @example notes/beta
              */
             permalink: string;
+        };
+        /** @description An OAuth error, sent as `application/json`. The only failures on this surface that are not RFC 9457 problem details: the client reading them speaks OAuth and branches on `error`. */
+        OauthErrorBody: {
+            /**
+             * @description The registered error code.
+             * @example invalid_redirect_uri
+             */
+            error: string;
+            /**
+             * @description What is wrong, in words.
+             * @example a redirect uri must be an https url, or an http url on a loopback address
+             */
+            error_description: string;
+        };
+        /**
+         * @description One row of an account's OAuth grant list: which client is connected, since
+         *     when, and until when it may keep refreshing. Never carries a token - only
+         *     hashes are stored, so there is nothing to show back.
+         */
+        OauthGrantInfo: {
+            /** @description The registration this grant belongs to. */
+            client_id: string;
+            /**
+             * @description The name that registration gave for itself, or a stand-in when the
+             *     registration is gone.
+             */
+            client_name: string;
+            /** @description RFC 3339, when the grant was created. */
+            created_at: string;
+            /**
+             * Format: int64
+             * @description The grant's id, which is what revokes it.
+             */
+            id: number;
+            /** @description RFC 3339, when one of its access tokens last resolved a request. */
+            last_used?: string | null;
+            /**
+             * @description The host the client is redirected back to, for a person deciding
+             *     whether they recognize this connection.
+             */
+            redirect_host: string;
+            /**
+             * @description RFC 3339, when the refresh token stops working unless it is rotated
+             *     before then.
+             */
+            refresh_expires_at: string;
+        };
+        /** @description The configured single sign-on provider as the sign-in screen needs it: whether to draw the button and what to write on it. Never the issuer, the client id or the secret. */
+        OidcProviderView: {
+            /**
+             * @description Whether a provider is configured and usable.
+             * @example true
+             */
+            enabled: boolean;
+            /**
+             * @description The label for the button, when enabled.
+             * @example Contoso
+             */
+            name?: string | null;
+        };
+        /** @description The account to hand this private domain to. It must be an existing, enabled account; its own membership row, if it had one, is dropped, since an owner holds every level already. */
+        OwnerBody: {
+            /**
+             * @description The new owner's login name.
+             * @example ada
+             */
+            owner: string;
         };
         /** @description The replacement password. Setting it revokes every session the account holds, this admin's own included when they reset themselves. */
         PasswordBody: {
@@ -1590,6 +2326,102 @@ export interface components {
              * @example about:blank
              */
             type: string;
+        };
+        /** @description Which ways into this instance exist, for the sign-in screen to draw. Public: it is read before anyone is signed in, and it carries no configuration beyond the button's label. */
+        ProvidersResponse: {
+            /**
+             * @description Whether local name-and-password accounts are offered. Always true: they
+             *     are the accounts single sign-on is layered on top of.
+             * @example true
+             */
+            local: boolean;
+            /** @description The single sign-on provider, if one is configured. */
+            oidc: components["schemas"]["OidcProviderView"];
+        };
+        /** @description RFC 7591 client metadata. Members this server does not implement (`application_type`, `scope`, `contacts`, `logo_uri` and the rest) are accepted and ignored. */
+        RegisterBody: {
+            /**
+             * @description What to call this client on the consent screen. Trimmed, at most 100
+             *     characters, and defaulted when it is absent or blank.
+             * @example Claude
+             */
+            client_name?: string | null;
+            /**
+             * @description The client's own home page, shown beside the name. Absolute https.
+             * @example https://claude.ai
+             */
+            client_uri?: string | null;
+            /**
+             * @description The grants this client will use, within `authorization_code` and
+             *     `refresh_token`.
+             */
+            grant_types?: string[] | null;
+            /**
+             * @description Where this client may be redirected back to. At least one, at most ten,
+             *     each an https url or an http url on a loopback address, carrying no
+             *     fragment and no user information, and sent in the form a url parser
+             *     leaves it in (a lowercase scheme and host, no default port, no dot
+             *     segments, and a path of at least `/`), because what is registered is
+             *     matched exactly.
+             * @example [
+             *       "https://claude.ai/api/mcp/auth_callback"
+             *     ]
+             */
+            redirect_uris?: string[];
+            /** @description The response types this client will ask for, within `code`. */
+            response_types?: string[] | null;
+            /**
+             * @description How the client authenticates at the token endpoint. Absent or `none`:
+             *     this server registers public clients only.
+             * @example none
+             */
+            token_endpoint_auth_method?: string | null;
+        };
+        /**
+         * @description What a registration answers with: the identifier, and the metadata as
+         *     stored.
+         *
+         *     No `client_secret` and no `registration_access_token`. Both would be
+         *     credentials handed to a caller that proved nothing, and this server has no
+         *     use for either: every client is public, and a registration is managed by
+         *     being left to expire rather than by a management API. `Debug` is derived
+         *     because there is nothing here to redact - a client id authorizes nothing on
+         *     its own.
+         */
+        RegisteredClient: {
+            /**
+             * @description The identifier this client names itself with from now on: `coc_` plus
+             *     32 hex characters.
+             * @example coc_9f2c1d7e4b6a80351c8e0d2f4a6b8c1e
+             */
+            client_id: string;
+            /**
+             * Format: int64
+             * @description When the registration was made, in seconds since the epoch.
+             * @example 1767225600
+             */
+            client_id_issued_at: number;
+            /**
+             * @description The name as stored, which is what a consent screen shows.
+             * @example Claude
+             */
+            client_name: string;
+            /**
+             * @description The home page as stored, absent when the registration named none.
+             * @example https://claude.ai
+             */
+            client_uri?: string | null;
+            /** @description Always `authorization_code` and `refresh_token`. */
+            grant_types: string[];
+            /** @description The redirect uris as stored, in the order they were sent. */
+            redirect_uris: string[];
+            /** @description Always `code`. */
+            response_types: string[];
+            /**
+             * @description Always `none`: a public client presents no secret.
+             * @example none
+             */
+            token_endpoint_auth_method: string;
         };
         /** @description How to settle the conflict: keep `mine`, take `theirs`, or write `merged` content of your own. `content` belongs to `merged` and to nothing else. */
         ResolveBody: {
@@ -1715,6 +2547,14 @@ export interface components {
              */
             title?: string | null;
         };
+        /** @description Where to send the browser to link a provider identity to the caller's account. Navigate the whole page to it: what follows is a redirect to the provider and a redirect back, so a background fetch would land nowhere anybody can authenticate. */
+        StartLinkResponse: {
+            /**
+             * @description The provider's authorization endpoint, with PKCE, state and nonce.
+             * @example https://idp.example/authorize?client_id=...
+             */
+            location: string;
+        };
         /** @description A GitHub personal access token to connect with. Write-only: no response on this surface ever echoes it, and the status shape carries only where the credential lives and whose it is. */
         TokenBody: {
             /**
@@ -1722,6 +2562,85 @@ export interface components {
              * @example ghp_xxxxxxxxxxxxxxxxxxxx
              */
             token: string;
+        };
+        /** @description A token request, sent as `application/x-www-form-urlencoded`. Which members are required depends on `grant_type`: `authorization_code` takes `code`, `redirect_uri`, `code_verifier` and `client_id`, `refresh_token` takes `refresh_token` and `client_id`. `resource` is optional on both. */
+        TokenForm: {
+            /**
+             * @description The registration this request is made under. Required by both grant
+             *     types.
+             * @example coc_0f1e2d3c4b5a69788796a5b4c3d2e1f0
+             */
+            client_id?: string | null;
+            /**
+             * @description The single-use code the consent screen issued, for
+             *     `grant_type=authorization_code`.
+             */
+            code?: string | null;
+            /**
+             * @description The PKCE verifier: 43 to 128 unreserved characters whose `S256` is the
+             *     challenge the authorization was started with.
+             */
+            code_verifier?: string | null;
+            /**
+             * @description `authorization_code` or `refresh_token`. Anything else is
+             *     `unsupported_grant_type`.
+             * @example authorization_code
+             */
+            grant_type?: string | null;
+            /**
+             * @description The redirect uri the code was issued for, compared exactly. For a
+             *     native client that is the address it PRESENTED at the authorize leg -
+             *     the port it managed to bind - and not necessarily the one it
+             *     registered.
+             */
+            redirect_uri?: string | null;
+            /** @description The refresh token to rotate, for `grant_type=refresh_token`. */
+            refresh_token?: string | null;
+            /**
+             * @description Which resource the token is for (RFC 8707): absent, or this instance's
+             *     own identifier, a trailing slash tolerated.
+             * @example https://kb.example
+             */
+            resource?: string | null;
+        };
+        /**
+         * @description What a successful token request answers: RFC 6749 section 5.1, with the two
+         *     members this server always sends and none of the ones it has no use for.
+         *
+         *     No `scope`, because a grant here is the whole account's rights until it is
+         *     revoked and there was never anything to narrow; no `id_token`, because this
+         *     is not OpenID Connect and the account a token acts for is a fact of this
+         *     instance rather than a claim about a person.
+         *
+         *     `Debug` is written rather than derived: both tokens are live credentials the
+         *     moment this struct exists, and a derived one is a single `tracing` call away
+         *     from putting them in a file.
+         */
+        TokenResponse: {
+            /**
+             * @description The bearer token an MCP request presents. `coa_` plus 64 hex, and the
+             *     only copy: the server keeps its sha256.
+             * @example coa_...
+             */
+            access_token: string;
+            /**
+             * Format: int64
+             * @description Seconds the access token lives, which is an hour.
+             * @example 3600
+             */
+            expires_in: number;
+            /**
+             * @description The token that mints the next pair. `cor_` plus 64 hex, good for thirty
+             *     days, and rotated by every use: the one presented is dead the moment
+             *     this one exists, and presenting it again revokes the whole grant.
+             * @example cor_...
+             */
+            refresh_token: string;
+            /**
+             * @description Always `Bearer`.
+             * @example Bearer
+             */
+            token_type: string;
         };
         /** @description The attachment as stored: the path to reference it by, the mime it will be served under, its size and the checksum a read's `ETag` will carry. */
         UploadedAttachment: {
@@ -1856,6 +2775,14 @@ export interface components {
             errors: number;
             /** @description Every finding, format and temporal families, default severities. */
             findings: components["schemas"]["ValidateFinding"][];
+        };
+        /** @description Whether the domain is private. `true` closes it to its owner and the people invited into it; `false` opens it to every account again and forgets the membership list. */
+        VisibilityBody: {
+            /**
+             * @description `true` makes the domain private, `false` makes it shared again.
+             * @example true
+             */
+            private: boolean;
         };
         /** @description Whether withdrawing also puts the shared files back the way the team has them. Absent means false: the proposal closes and the working tree is left alone. */
         WithdrawBody: {
@@ -2001,7 +2928,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The trusted-header identity names a disabled account. */
+            /** @description The identity a proxy asserted names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2052,7 +2979,7 @@ export interface operations {
                     "application/json": components["schemas"]["LogoutResponse"];
                 };
             };
-            /** @description The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the trusted-header identity names a disabled account. */
+            /** @description The identity did not echo its CSRF token, or carries none yet and must call `/auth/me` first, or the identity a proxy asserted names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2077,7 +3004,7 @@ export interface operations {
                 headers: {
                     /** @description `no-store`. Always set: this answer names the caller and carries their CSRF token, and a shared cache is allowed to store a GET 200 heuristically, which behind an SSO proxy would hand the next user the previous one's identity. */
                     "cache-control"?: string;
-                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from a trusted-header identity whose account holds none; a later probe reuses that session and sets no cookie. */
+                    /** @description The `fluid_session` session cookie, HttpOnly and SameSite=Lax. Set only when this call issues a session, which is the first call from an identity a proxy asserted (`auth.trusted_header` or `auth.proxy_headers`) whose account holds none; a later probe reuses that session and sets no cookie. */
                     "set-cookie"?: string;
                     [name: string]: unknown;
                 };
@@ -2085,13 +3012,266 @@ export interface operations {
                     "application/json": components["schemas"]["MeResponse"];
                 };
             };
-            /** @description The trusted-header identity names a disabled account. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one. */
+            /** @description The identity a proxy asserted names a disabled account, or its headers arrived in a shape this instance will not believe. The guard resolves identity ahead of routing, so this answer reaches even the paths that are served without one. */
             403: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oidc_callback: {
+        parameters: {
+            query?: {
+                /** @description The authorization code, on success. */
+                code?: string;
+                /** @description The state this instance generated, echoed back. */
+                state?: string;
+                /** @description The provider's error code, when it refused. */
+                error?: string;
+                /** @description The provider's human-readable reason, when it refused. */
+                error_description?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Signed in. The session cookie is set and `location` is the application root. */
+            302: {
+                headers: {
+                    /** @description `/`. */
+                    location?: string;
+                    /** @description The `fluid_session` cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The provider refused, the state did not match, the ID token did not validate, or a link was finished after its session was signed out. One message for every way the protocol can fail. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The identity names a disabled account, or a new account would pass `auth.max_users`. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No provider is configured on this instance. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The sign-in was started to link an identity and could not be: it was finished on another account's session, the identity belongs to another account (which is never named), or this account already holds one at that provider. Nothing was linked and no account was created. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The provider could not be reached for the token exchange. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oidc_login: {
+        parameters: {
+            query?: {
+                /**
+                 * @description Recognized so that a request meaning to link is told where linking
+                 *     lives, rather than quietly started as an ordinary sign-in. Starting a
+                 *     link is `POST /auth/oidc/login`; see [`start_link`] for why it cannot
+                 *     be a GET.
+                 */
+                link?: boolean;
+                /**
+                 * @description Where to send the browser once the sign-in completes: a path on this
+                 *     instance, which the callback 302s to instead of `/`.
+                 *
+                 *     The OAuth consent page is what this exists for. A client sends a
+                 *     browser to `/authorize?request=<id>`, Fluid finds nobody signed in and
+                 *     carries the intended location to the login page, and a provider sign-in
+                 *     has to come back to that exact request: the pending authorization is
+                 *     only reachable by its id, so landing anywhere else loses it.
+                 *
+                 *     Anything [`safe_return_path`] does not accept is dropped rather than
+                 *     refused, and the sign-in lands on `/`: the person did sign in, and only
+                 *     the destination was unusable.
+                 */
+                return_to?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Follow `location` to the provider. */
+            302: {
+                headers: {
+                    /** @description The provider's authorization endpoint. */
+                    location?: string;
+                    /** @description The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `link=true`, which is the POST's job; or a request with no Host header, or one that is not a bare host and port, so no redirect uri can be derived. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No provider is configured on this instance. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The provider's discovery document could not be fetched, or it names a tenant-independent issuer. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Too many sign-ins are in flight to start another. Wait a moment and try again. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oidc_start_link: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Navigate to `location`. */
+            200: {
+                headers: {
+                    /** @description The `fluid_oidc_state` cookie, HttpOnly and SameSite=Lax. */
+                    "set-cookie"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["StartLinkResponse"];
+                };
+            };
+            /** @description The request carries no Host header, or one that is not a bare host and port, so no redirect uri can be derived. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No signed-in account to link to. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The session's CSRF token was missing or wrong. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No provider is configured on this instance. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The provider's discovery document could not be fetched, or it names a tenant-independent issuer. */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description Too many sign-ins are in flight to start another. Wait a moment and try again. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    auth_providers: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The ways in. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProvidersResponse"];
                 };
             };
         };
@@ -2385,6 +3565,7 @@ export interface operations {
                      *           "name": "eng",
                      *           "observations": 12,
                      *           "path": "/Users/ada/Documents/Crystalline/eng",
+                     *           "private": false,
                      *           "relations": 3,
                      *           "when_to_use": [
                      *             "Route here for eng questions."
@@ -2496,7 +3677,14 @@ export interface operations {
     };
     unregister_domain: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Confirm that a virtual domain's engrams are to be deleted with it.
+                 *     Required for a virtual domain that holds any; ignored otherwise.
+                 * @example true
+                 */
+                purge?: boolean;
+            };
             header?: never;
             path: {
                 /** @description The registered domain. */
@@ -2533,7 +3721,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The caller is not an admin, the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            /** @description The caller may see the domain and may not end it (an instance admin can, and so can a private domain's owner), the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
             403: {
                 headers: {
                     [name: string]: unknown;
@@ -2542,7 +3730,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description No such domain. */
+            /** @description No such domain, or one this caller may not see. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -2551,7 +3739,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The domain is defined by an environment variable, which owns it: unset the variable instead. */
+            /** @description The domain is defined by an environment variable, which owns it (unset the variable instead), or it is a virtual domain holding engrams and the request did not carry `purge=true`. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -2959,7 +4147,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own read payload for the new engram. */
+            /** @description The engine's own read payload for the new engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. */
             201: {
                 headers: {
                     /** @description The quoted checksum of the engram as written, the token a later save carries in `If-Match`. */
@@ -3163,7 +4351,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The engine's own read payload for the saved engram. */
+            /** @description The engine's own read payload for the saved engram, plus - when the `capture.similar` advisory found neighbours - a `similar` list of up to three engrams {domain, permalink, title, status, type} and a `guidance` string. */
             200: {
                 headers: {
                     /** @description The quoted checksum of the engram as saved, the token the next save carries. */
@@ -3413,7 +4601,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description The rule id is not one the sweep catalog holds. */
+            /** @description The rule id is not one the sweep catalog holds, or the `scope` names evidence the rule is not firing on here. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -3465,7 +4653,7 @@ export interface operations {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
                 };
             };
-            /** @description No such domain or engram, or no acknowledgment for that rule on it. */
+            /** @description No such domain or engram, or no acknowledgment the body names on it. */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -4041,6 +5229,187 @@ export interface operations {
             };
         };
     };
+    list_domain_members: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The domain's owner and members. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MembersResponse"];
+                };
+            };
+            /** @description No identity. The anonymous viewer, where `auth.anonymous` allows one, is served: it sees the shared domains it can already read, and no private one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /** @description The account's login name. */
+                principal: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MemberBody"];
+            };
+        };
+        responses: {
+            /** @description The account is a member at that level. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is not a manager here, the request did not echo its CSRF token, or this instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is shared, or the principal owns it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description An unknown level, or a principal that names no enabled account. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    remove_domain_member: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+                /** @description The account's login name. */
+                principal: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description That account is no longer a member. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller is neither a manager here nor the principal itself, the request did not echo its CSRF token, or this instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, none this caller may see, or an account that is not a member of it. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is shared, or the principal owns it. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     move_engram: {
         parameters: {
             query?: never;
@@ -4135,6 +5504,85 @@ export interface operations {
                 };
             };
             /** @description The destination path is empty, or resolves to one of the reserved OKF names (`index.md`, `log.md`). */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    set_domain_owner: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["OwnerBody"];
+            };
+        };
+        responses: {
+            /** @description The domain has that owner now. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller neither owns this domain nor is an admin, the request did not echo its CSRF token, or this instance is read-only. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The domain is shared, so it has no owner. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The owner names no enabled account. */
             422: {
                 headers: {
                     [name: string]: unknown;
@@ -4920,6 +6368,58 @@ export interface operations {
             };
         };
     };
+    set_domain_visibility: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The registered domain. */
+                domain: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["VisibilityBody"];
+            };
+        };
+        responses: {
+            /** @description The visibility is now what was asked for. Answered for a domain that already held it too: privatizing an already-private domain changes nothing at all, its owner and its members included. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The caller may not make this change - not an admin when privatizing, neither the owner nor an admin when re-sharing - the request did not echo its CSRF token, this instance is read-only, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such domain, or none this caller may see. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
     get_evolve_queue: {
         parameters: {
             query?: {
@@ -5290,7 +6790,13 @@ export interface operations {
     };
     connect_my_github_identity_device: {
         parameters: {
-            query?: never;
+            query?: {
+                /**
+                 * @description Abandon this account's pending sign-in and start a fresh code.
+                 *     Defaults to false, which reports the outstanding code instead.
+                 */
+                restart?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -5409,6 +6915,716 @@ export interface operations {
                 };
                 content: {
                     "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_my_identity_links: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This account's links. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IdentityLinksResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one: the anonymous viewer has no account. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    unlink_my_identity: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The provider's issuer url, percent-encoded as one path segment. */
+                issuer: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The link is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This account holds no identity at that issuer. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description That link is the account's last way in. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_my_mcp_tokens: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This account's tokens. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["McpTokenInfo"][];
+                };
+            };
+            /** @description No identity, or an anonymous one: the anonymous viewer has no account and so holds no tokens. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    issue_my_mcp_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IssueBody"];
+            };
+        };
+        responses: {
+            /** @description The token, this once. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuedTokenResponse"];
+                };
+            };
+            /** @description The body is not JSON. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `application/json`. */
+            415: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The label is empty. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    revoke_my_mcp_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description One of the caller's own token ids. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The token is gone. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No token of the caller's carries that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    rotate_my_mcp_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description One of the caller's own token ids. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The new token, this once. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuedTokenResponse"];
+                };
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No token of the caller's carries that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    list_my_oauth_grants: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description This account's connected clients. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthGrantInfo"][];
+                };
+            };
+            /** @description No identity, or an anonymous one: the anonymous viewer has no account and so holds no grants. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    revoke_my_oauth_grant: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description One of the caller's own grant ids. */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The grant is gone; both its tokens are dead. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No identity, or an anonymous one. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token, or the trusted-header identity names a disabled account. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No grant of the caller's carries that id. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oauth_authorization: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The pending authorization, from the consent screen's `request` parameter. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The request, as the consent screen shows it. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AuthorizationView"];
+                };
+            };
+            /** @description No signed-in account: there is nobody to grant anything. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such pending request: it expired, it was already decided, or this instance serves no OAuth. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oauth_decide: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The pending authorization being decided. */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DecisionBody"];
+            };
+        };
+        responses: {
+            /** @description Navigate the whole page to `location`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DecisionResponse"];
+                };
+            };
+            /** @description No signed-in account: there is nobody to grant anything. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The session's CSRF token was missing or wrong. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description No such pending request: it expired, it was already decided, or this instance serves no OAuth. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The body is not `{"decision": "allow"}` or `{"decision": "deny"}`. The request is left undecided, because the body is read before it is taken. */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    oauth_authorize: {
+        parameters: {
+            query?: {
+                /** @description Always `code`: this server answers no other response type. */
+                response_type?: string;
+                /** @description The registration this request is made under. */
+                client_id?: string;
+                /**
+                 * @description Where to send the browser with the answer. Must be one the
+                 *     registration named, port-agnostically for a loopback client.
+                 */
+                redirect_uri?: string;
+                /** @description The PKCE challenge: 43 to 128 unreserved characters. */
+                code_challenge?: string;
+                /** @description Always `S256`. */
+                code_challenge_method?: string;
+                /** @description The client's own value, carried back on the answer. */
+                state?: string;
+                /** @description Accepted and ignored. See the struct's documentation. */
+                scope?: string;
+                /**
+                 * @description Which resource a token is being asked for: absent, or this instance's
+                 *     own identifier (a trailing slash is tolerated).
+                 */
+                resource?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Follow `location`: the consent screen for a good request, or the client's redirect uri carrying `error`, `state` and `iss`. */
+            302: {
+                headers: {
+                    /** @description `no-store`. */
+                    "cache-control"?: string;
+                    /** @description The consent screen, or the client's redirect uri. */
+                    location?: string;
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No usable `client_id` or `redirect_uri`, so there is nowhere this server is willing to send an error. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The request's `Host` is not one this instance answers to, so it names no resource to authorize for: `service.allowed_hosts` decides, and an unlisted `Host` is refused before the request is looked at. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance does not serve OAuth: `auth.oauth` is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The accounts database could not be reached. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+        };
+    };
+    register_oauth_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RegisterBody"];
+            };
+        };
+        responses: {
+            /** @description The registration, as stored. */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RegisteredClient"];
+                };
+            };
+            /** @description The body is not the JSON client metadata (`invalid_request`), a redirect uri may not be stored (`invalid_redirect_uri`), or the metadata describes a client this server does not register (`invalid_client_metadata`). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance does not serve OAuth: `auth.oauth` is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The burst is spent. `Retry-After` says when to come back. */
+            429: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description This instance is holding as many registrations as it will, and none are old enough to collect. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+        };
+    };
+    oauth_token: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description The token request. */
+        requestBody: {
+            content: {
+                "application/x-www-form-urlencoded": components["schemas"]["TokenForm"];
+            };
+        };
+        responses: {
+            /** @description The grant: an access token, its lifetime and the refresh token that mints the next pair. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TokenResponse"];
+                };
+            };
+            /** @description The body is not a form or a parameter is missing (`invalid_request`), the code or refresh token cannot be exchanged (`invalid_grant`), the `grant_type` is not served here (`unsupported_grant_type`), or the `resource` names another server (`invalid_target`). */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description The `client_id` names no registration here (`invalid_client`). */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
+                };
+            };
+            /** @description A cookie session did not echo its CSRF token. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description This instance does not serve OAuth: `auth.oauth` is off. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/problem+json": components["schemas"]["ProblemDetail"];
+                };
+            };
+            /** @description The accounts database could not be reached. */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OauthErrorBody"];
                 };
             };
         };

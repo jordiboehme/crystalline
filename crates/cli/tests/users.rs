@@ -385,6 +385,202 @@ fn a_password_is_required_and_a_non_terminal_run_must_pass_password_stdin() {
     assert!(err.contains("password"), "{err}");
 }
 
+/// The two identity verbs: an administrator ties a provider identity to an
+/// account and takes it away again. This is the surface the spec calls the
+/// repair for a provider that re-issued its subjects, so the messages have to
+/// say what happened to which account.
+#[test]
+fn users_link_and_unlink_move_an_identity() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let out = users_ok(
+        home.path(),
+        &[
+            "link",
+            "ada",
+            "--issuer",
+            "https://idp.example",
+            "--subject",
+            "sub-1",
+        ],
+        None,
+    );
+    assert!(out.contains("ada"), "{out}");
+    assert!(out.contains("https://idp.example"), "{out}");
+
+    // The same pair again is refused, naming who holds it: the operator at
+    // the command line is exactly who may know that.
+    let err = users_err(
+        home.path(),
+        &[
+            "link",
+            "ada",
+            "--issuer",
+            "https://idp.example",
+            "--subject",
+            "sub-1",
+        ],
+        None,
+    );
+    assert!(err.contains("already linked"), "{err}");
+    assert!(err.contains("ada"), "{err}");
+
+    // One identity per provider per account: the stale one goes first, which
+    // is the re-registration repair.
+    let err = users_err(
+        home.path(),
+        &[
+            "link",
+            "ada",
+            "--issuer",
+            "https://idp.example",
+            "--subject",
+            "sub-2",
+        ],
+        None,
+    );
+    assert!(err.contains("already holds"), "{err}");
+
+    let out = users_ok(
+        home.path(),
+        &["unlink", "ada", "--issuer", "https://idp.example"],
+        None,
+    );
+    assert!(out.contains("ada"), "{out}");
+    let err = users_err(
+        home.path(),
+        &["unlink", "ada", "--issuer", "https://idp.example"],
+        None,
+    );
+    assert!(err.contains("no identity"), "{err}");
+
+    // And the repair completes: the new subject links once the old one is gone.
+    users_ok(
+        home.path(),
+        &[
+            "link",
+            "ada",
+            "--issuer",
+            "https://idp.example",
+            "--subject",
+            "sub-2",
+        ],
+        None,
+    );
+}
+
+/// Linking to a name that is nobody is refused rather than creating anything:
+/// the account is what the identity is tied to, so it has to exist first.
+#[test]
+fn users_link_refuses_a_name_that_is_nobody() {
+    let home = tempfile::tempdir().unwrap();
+    let err = users_err(
+        home.path(),
+        &[
+            "link",
+            "ghost",
+            "--issuer",
+            "https://idp.example",
+            "--subject",
+            "sub-1",
+        ],
+        None,
+    );
+    assert!(err.contains("no such user"), "{err}");
+}
+
+/// The last-way-in guard, met from the command line: an account a first
+/// sign-on provisioned has no password, so unlinking its only identity is
+/// refused until `--force` says the operator means it - which is what makes
+/// the re-registration repair possible without leaving a stranded account by
+/// accident.
+///
+/// Unix only, and for a different reason than the cross-process test below:
+/// there is no CLI verb that creates a passwordless account (`users add`
+/// always sets one), so this opens the auth database in the test process to
+/// create what a first sign-on would have. The store is dropped before any
+/// child runs, but a second open of the same file is refused outright on
+/// Windows, so the whole test stays here with its siblings.
+#[cfg(unix)]
+#[test]
+fn users_unlink_refuses_the_last_way_in_unless_forced() {
+    let home = tempfile::tempdir().unwrap();
+    // Creates the database in the isolated home, which is what the direct
+    // open below then finds.
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "admin", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    let db = find_auth_db(home.path()).expect("the add created the auth database");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let store = crystalline_service::rest::AuthStore::open(&db)
+            .await
+            .unwrap();
+        store
+            .provision_linked_user(
+                "https://idp.example",
+                "sub-1",
+                "grace",
+                None,
+                None,
+                crystalline_service::rest::Role::Viewer,
+                100,
+            )
+            .await
+            .expect("a first sign-on provisions an account with no password");
+    });
+
+    let err = users_err(
+        home.path(),
+        &["unlink", "grace", "--issuer", "https://idp.example"],
+        None,
+    );
+    assert!(err.contains("crystalline users passwd"), "{err}");
+
+    let out = users_ok(
+        home.path(),
+        &[
+            "unlink",
+            "grace",
+            "--issuer",
+            "https://idp.example",
+            "--force",
+        ],
+        None,
+    );
+    assert!(
+        out.contains("crystalline users passwd"),
+        "the forced unlink says what it left behind: {out}"
+    );
+}
+
+/// The `web-auth.db` somewhere under an isolated home, whatever base-directory
+/// layout this platform resolves to.
+#[cfg(unix)]
+fn find_auth_db(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(home).ok()? {
+        let path = entry.ok()?.path();
+        if path.is_dir() {
+            if let Some(found) = find_auth_db(&path) {
+                return Some(found);
+            }
+        } else if path.file_name().is_some_and(|name| name == "web-auth.db") {
+            return Some(path);
+        }
+    }
+    None
+}
+
 // Everything from here to the end of the file is the cross-process test and
 // its machinery, and all of it is `#[cfg(unix)]`, because the promise it pins
 // is unix-only today.
@@ -542,6 +738,137 @@ fn users_add_works_while_another_process_holds_the_auth_db() {
     assert!(
         status.success(),
         "the holder's own assertions must have passed: {status}"
+    );
+}
+
+/// The MCP token verb end to end: issue, list, rotate, revoke.
+///
+/// The token itself is asserted on twice over - the prefix and the shape - and
+/// the teaching line is asserted verbatim, because it is what tells the
+/// operator where the token goes; the MCP gate's own refusal names the same
+/// header, so the two must keep saying the same thing.
+#[test]
+fn mcp_token_is_issued_once_then_listed_rotated_and_revoked() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "editor", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+
+    let out = users_ok(home.path(), &["mcp-token", "ada", "--label", "ci"], None);
+    let token = out
+        .split_whitespace()
+        .find(|word| word.starts_with("cmt_"))
+        .unwrap_or_else(|| panic!("the token is printed: {out}"))
+        .to_string();
+    assert_eq!(
+        token.len(),
+        68,
+        "the prefix plus 64 hex characters: {token}"
+    );
+    assert!(token[4..].chars().all(|c| c.is_ascii_hexdigit()), "{token}");
+    assert!(
+        out.contains(
+            "Add it to the agent's MCP registration as header \
+             'Authorization: Bearer <token>'."
+        ),
+        "the token is useless without knowing where it goes: {out}"
+    );
+    assert!(out.contains("ci"), "the label is confirmed: {out}");
+
+    let listed = users_ok(home.path(), &["mcp-token", "ada", "--list"], None);
+    assert!(listed.contains("ci"), "the one token is listed: {listed}");
+    assert!(listed.contains("never"), "never presented yet: {listed}");
+    assert!(
+        !listed.contains(&token) && !listed.contains("cmt_"),
+        "and never the token itself, which is stored only as a hash: {listed}"
+    );
+    let id = listed
+        .lines()
+        .nth(1)
+        .and_then(|row| row.split_whitespace().next())
+        .expect("the listing has a row")
+        .to_string();
+
+    let rotated = users_ok(home.path(), &["mcp-token", "ada", "--rotate", &id], None);
+    let fresh = rotated
+        .split_whitespace()
+        .find(|word| word.starts_with("cmt_"))
+        .unwrap_or_else(|| panic!("the replacement is printed: {rotated}"));
+    assert_ne!(fresh, token, "rotation mints a new secret");
+    let listed = users_ok(home.path(), &["mcp-token", "ada", "--list"], None);
+    assert!(listed.contains("ci"), "keeping the label: {listed}");
+    let new_id = listed
+        .lines()
+        .nth(1)
+        .and_then(|row| row.split_whitespace().next())
+        .expect("the listing has a row")
+        .to_string();
+    assert_ne!(new_id, id, "under a new id: {listed}");
+
+    // The retired id is gone, and saying so is the point: a revoke that
+    // silently did nothing would leave a live token behind.
+    let refused = users_err(home.path(), &["mcp-token", "ada", "--revoke", &id], None);
+    assert!(refused.contains("holds no MCP token"), "{refused}");
+
+    users_ok(
+        home.path(),
+        &["mcp-token", "ada", "--revoke", &new_id],
+        None,
+    );
+    let listed = users_ok(home.path(), &["mcp-token", "ada", "--list"], None);
+    assert!(
+        listed.contains("holds no MCP tokens"),
+        "the account is back to none: {listed}"
+    );
+}
+
+/// A token is minted against an account, so a mistyped name is refused rather
+/// than stranding a row nothing can resolve - on every branch of the verb,
+/// because "'ghsot' holds no MCP tokens" would read as a fact about an account
+/// that does not exist.
+#[test]
+fn an_mcp_token_for_an_unknown_account_is_refused() {
+    let home = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["mcp-token", "ghost"],
+        vec!["mcp-token", "ghost", "--list"],
+        vec!["mcp-token", "ghost", "--revoke", "1"],
+        vec!["mcp-token", "ghost", "--rotate", "1"],
+    ] {
+        let err = users_err(home.path(), &args, None);
+        assert!(err.contains("no such user"), "{args:?}: {err}");
+    }
+}
+
+/// `--json` puts the object on stdout and the teaching line on stderr, so a
+/// provisioning script can pipe stdout straight into a parser. Asserted by
+/// parsing it: a stray `println!` on that path would break scripts silently.
+#[test]
+fn an_mcp_token_issued_with_json_leaves_stdout_parseable() {
+    let home = tempfile::tempdir().unwrap();
+    users_ok(
+        home.path(),
+        &["add", "ada", "--role", "editor", "--password-stdin"],
+        Some("s3cret\n"),
+    );
+    let out = users_ok(
+        home.path(),
+        &["--json", "mcp-token", "ada", "--label", "ci"],
+        None,
+    );
+    let issued: serde_json::Value =
+        serde_json::from_str(out.trim()).unwrap_or_else(|e| panic!("stdout is JSON: {e}: {out}"));
+    assert!(
+        issued["token"].as_str().unwrap().starts_with("cmt_"),
+        "{issued}"
+    );
+    assert_eq!(issued["label"], "ci");
+    assert!(issued["id"].as_i64().is_some(), "{issued}");
+    assert!(
+        !out.contains("Authorization"),
+        "the teaching line goes to stderr: {out}"
     );
 }
 

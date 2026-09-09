@@ -88,3 +88,80 @@ export type ValidateFinding = components["schemas"]["ValidateFinding"];
 
 /** What `POST /validate` answers with. */
 export type ValidateResponse = components["schemas"]["ValidateResponse"];
+
+/**
+ * One row of the caller's own MCP token list: label, when it was issued, when
+ * it last resolved a request. Never the token itself - only its hash is
+ * stored, so there is nothing to show back after issuance.
+ */
+export type McpTokenInfo = components["schemas"]["McpTokenInfo"];
+
+/** What `POST /me/mcp-tokens` takes. */
+export type IssueMcpTokenBody = components["schemas"]["IssueBody"];
+
+/**
+ * What issuing or rotating an MCP token answers with: the secret, readable
+ * here and nowhere else, ever.
+ */
+export type IssuedMcpToken = components["schemas"]["IssuedTokenResponse"];
+
+/**
+ * Which ways into this instance exist, for the sign-in screen to draw. Public:
+ * it is read before anybody is signed in, and it carries the button's label
+ * and no configuration beyond it.
+ */
+export type ProvidersResponse = components["schemas"]["ProvidersResponse"];
+
+/** What `POST /auth/oidc/login` answers with: where to navigate to link an identity. */
+export type StartLinkResponse = components["schemas"]["StartLinkResponse"];
+
+/** The single sign-on provider's half of that: whether to draw it, and what to write on it. */
+export type OidcProviderView = components["schemas"]["OidcProviderView"];
+
+/**
+ * One provider identity an account holds. The pair of issuer and subject is
+ * the durable key; `linked_by` says who made it - `jit` for a link a first
+ * sign-on created with its account, `cli` for one an administrator made,
+ * otherwise the account that linked it to itself.
+ */
+export type IdentityLink = components["schemas"]["IdentityLink"];
+
+/** What `GET /me/identity-links` answers with: the links, and whether a password backs them up. */
+export type IdentityLinksResponse =
+  components["schemas"]["IdentityLinksResponse"];
+
+/** What `GET /domains/{domain}/members` answers with: who owns and is invited into a domain. */
+export type MembersResponse = components["schemas"]["MembersResponse"];
+
+/** One membership row: who, at what level, added by whom and when. */
+export type DomainMember = components["schemas"]["DomainMember"];
+
+/** What a member may do on one private domain: `viewer`, `editor` or `manager`. */
+export type MemberLevel = components["schemas"]["MemberLevel"];
+
+/** What `PUT /domains/{domain}/members/{principal}` takes. */
+export type MemberBody = components["schemas"]["MemberBody"];
+
+/** What `PUT /domains/{domain}/owner` takes. */
+export type OwnerBody = components["schemas"]["OwnerBody"];
+
+/** What `PUT /domains/{domain}/visibility` takes. */
+export type VisibilityBody = components["schemas"]["VisibilityBody"];
+
+/**
+ * What the consent screen shows: the client name, the redirect host (with
+ * the loopback marker), and the account that is about to grant it. Never the
+ * protocol - no code, no challenge, no state, no client id.
+ */
+export type AuthorizationView = components["schemas"]["AuthorizationView"];
+
+/** What deciding a pending authorization answers with: where to navigate next. */
+export type DecisionResponse = components["schemas"]["DecisionResponse"];
+
+/**
+ * One row of an account's connected OAuth clients: which client, since when,
+ * when it was last used, and until when its refresh token may keep rotating.
+ * Never a token - only hashes are stored on the server, so there is nothing
+ * to show back.
+ */
+export type OauthGrantInfo = components["schemas"]["OauthGrantInfo"];

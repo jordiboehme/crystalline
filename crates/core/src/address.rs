@@ -5,7 +5,7 @@
 //! Link resolution runs over a caller-supplied lookup table so this crate never
 //! needs a database.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::attachment::ASSETS_PREFIX;
 use crate::engram::LinkTarget;
@@ -167,6 +167,13 @@ pub trait LinkResolver {
     fn by_permalink(&self, domain: &str, permalink: &str) -> Option<ResolvedRef>;
     /// Resolve a title within a domain to a reference.
     fn by_title(&self, domain: &str, title: &str) -> Option<ResolvedRef>;
+    /// Whether this name is one of the domains the caller knows about.
+    ///
+    /// The one question the parser cannot answer for itself. `[[Log: Weekly
+    /// Garden Notes]]` and `[[gardening: Composting Basics]]` are the same
+    /// shape, and only the registry says which of the two words before the
+    /// colon is a domain. See [`resolve`] for what the answer decides.
+    fn is_domain(&self, name: &str) -> bool;
 }
 
 /// Resolve a link target relative to the current domain.
@@ -175,6 +182,17 @@ pub trait LinkResolver {
 /// then title match in the current domain. Bare titles never resolve
 /// cross-domain. An explicit `[[domain:Target]]` resolves only within the named
 /// domain (permalink first, then title).
+///
+/// **A prefix that names no domain is not a prefix.** The parse
+/// ([`LinkTarget::parse`]) is domain-agnostic by design, so an engram titled
+/// `Log: Weekly Garden Notes` produces a link that splits exactly like a
+/// cross-domain one. When the named domain is not a domain this resolver knows
+/// ([`LinkResolver::is_domain`]), the whole bracket text as written
+/// ([`LinkTarget::raw`]) is tried as a permalink and then a title in the
+/// current domain before the link is called broken. A prefix that does name a
+/// domain keeps its meaning whatever the current domain happens to hold: the
+/// registry decides, and a title that merely looks like a prefix never wins
+/// against a real one.
 pub fn resolve<R: LinkResolver + ?Sized>(
     target: &LinkTarget,
     current_domain: &str,
@@ -184,6 +202,18 @@ pub fn resolve<R: LinkResolver + ?Sized>(
         Some(domain) => lookup
             .by_permalink(domain, &target.target)
             .or_else(|| lookup.by_title(domain, &target.target))
+            .or_else(|| {
+                // Only for a prefix nobody registered: a known domain that
+                // simply does not hold the target is a broken cross-domain
+                // link, and reading it as a title would hide that.
+                (!lookup.is_domain(domain))
+                    .then(|| {
+                        lookup
+                            .by_permalink(current_domain, &target.raw)
+                            .or_else(|| lookup.by_title(current_domain, &target.raw))
+                    })
+                    .flatten()
+            })
             .map(Resolution::Resolved)
             .unwrap_or(Resolution::CrossDomainUnresolved {
                 domain: domain.clone(),
@@ -203,6 +233,8 @@ pub struct LookupTable {
     permalinks: HashMap<(String, String), ResolvedRef>,
     // (domain, lowercased title) -> ref
     titles: HashMap<(String, String), ResolvedRef>,
+    // Every domain the caller registered, including one holding nothing.
+    domains: HashSet<String>,
 }
 
 impl LookupTable {
@@ -211,8 +243,16 @@ impl LookupTable {
         LookupTable::default()
     }
 
+    /// Declare a domain the table knows, whether or not anything in it was
+    /// registered. [`LookupTable::insert`] declares one too; this is for a
+    /// domain that holds nothing a link could land on and is still a domain.
+    pub fn register_domain(&mut self, domain: &str) {
+        self.domains.insert(domain.to_string());
+    }
+
     /// Register an Engram's domain, permalink and title.
     pub fn insert(&mut self, domain: &str, permalink: &str, title: &str) {
+        self.domains.insert(domain.to_string());
         let reference = ResolvedRef {
             domain: domain.to_string(),
             permalink: permalink.to_string(),
@@ -237,5 +277,9 @@ impl LinkResolver for LookupTable {
         self.titles
             .get(&(domain.to_string(), title.to_lowercase()))
             .cloned()
+    }
+
+    fn is_domain(&self, name: &str) -> bool {
+        self.domains.contains(name)
     }
 }

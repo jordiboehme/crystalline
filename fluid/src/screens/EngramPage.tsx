@@ -111,10 +111,21 @@ export default function EngramPage() {
     enabled: detail.isSuccess,
   });
 
+  // The names alone, and only once the listing has landed: the resolver reads
+  // a missing list as "this caller cannot tell whether a prefix is a domain"
+  // and an empty one as "none of them is", so handing it an empty array while
+  // the request is in flight would answer a question nobody can answer yet.
+  const domainNames = useMemo(
+    () => domains.data?.domains.map((entry) => entry.name),
+    [domains.data],
+  );
+
   const wikilinks = useMemo(
     () =>
-      detail.data ? buildWikilinkResolver(detail.data, graph.data) : undefined,
-    [detail.data, graph.data],
+      detail.data
+        ? buildWikilinkResolver(detail.data, graph.data, domainNames)
+        : undefined,
+    [detail.data, graph.data, domainNames],
   );
 
   /*
@@ -405,11 +416,17 @@ export default function EngramPage() {
  * One direction of the supersedes chain.
  *
  * Both halves of it, because either end may be the one that wrote the relation
- * down: this engram saying `- superseded_by [[Beta]]`, or Beta saying
- * `- supersedes [[Alpha]]` from its own side. Only the first is in this
+ * down: this engram saying `- superseded_by [[beta]]`, or Beta saying
+ * `- supersedes [[alpha]]` from its own side. Only the first is in this
  * engram's payload, so the second is read off the inbound edges of the graph,
  * where the direction is inverted: an inbound `supersedes` means the other
  * engram replaced this one, which is this engram's `superseded_by`.
+ *
+ * Both halves are labelled with the successor's title. The engine writes these
+ * bullets by permalink - the stable identity, and the one spelling that cannot
+ * be misread as a cross-domain prefix - so the outbound half takes its label
+ * from the resolution rather than from the bracket text, which is where the
+ * inbound half has always taken it from.
  *
  * An engram whose successor states it from both sides appears once, because
  * both halves key by the same address.
@@ -426,7 +443,12 @@ function chain(
     .map((relation) => {
       const resolution = resolve(innerOf(relation.target));
       return {
-        label: relation.target.target,
+        // The bracket text only until the graph places it: a permalink is a
+        // worse name than a title and a better one than nothing.
+        label:
+          resolution?.kind === "resolved"
+            ? resolution.label
+            : relation.target.target,
         href: resolution?.kind === "resolved" ? resolution.href : null,
         state: referenceState(resolution, relation.resolved),
       };

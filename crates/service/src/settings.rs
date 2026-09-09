@@ -10,14 +10,31 @@
 use std::path::PathBuf;
 
 use crystalline_core::config::{
-    AuthConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig, HttpSetting,
-    IdentityConfig, IndexConfig, ResponseFormat, SearchConfig, ServiceConfig, ShareIdentityMode,
-    SkillsConfig, SkillsServe,
+    AuthConfig, CaptureConfig, DatabaseBackend, DatabaseConfig, GitHubConfig, GlobalConfig,
+    HttpSetting, IdentityConfig, IndexConfig, OidcConfig, ResponseFormat, SearchConfig,
+    ServiceConfig, ShareIdentityMode, SkillsConfig, SkillsServe,
 };
 use crystalline_index::{DEFAULT_RETIRED_WEIGHT, DEFAULT_SALIENCE_WEIGHT};
 use crystalline_remote::{MAX_IDENTITY_NAME_BYTES, valid_identity_name};
 
 use crate::overlay::EnvOverlay;
+use crate::rest::Role;
+
+/// What a credential-carrying setting renders as instead of its value:
+/// whether one is configured, and nothing more. The core marker, re-exported
+/// so [`crate::overlay::EnvOverlay::active_overrides`] and the config's own
+/// `Debug` render a secret the same way wherever it is displayed.
+pub use crystalline_core::config::SECRET_DISPLAY;
+
+/// Whether a settings key carries a credential, so nothing may render its
+/// value. Read off the registry, where [`SettingSpec::secret`] is declared
+/// beside the key it belongs to: one flag makes a value invisible in
+/// `config show`, the `configure` tool, `crystalline doctor` and the
+/// overlay's `Debug` alike, and a key the registry does not know is not a
+/// secret.
+pub fn is_secret_key(key: &str) -> bool {
+    registry().iter().any(|s| s.key == key && s.secret)
+}
 
 /// An error applying, resetting or looking up a setting. The message is
 /// actionable and safe to show an agent or a terminal as-is.
@@ -69,6 +86,13 @@ pub struct SettingSpec {
     /// starts (a running daemon keeps reading its old value), as opposed to
     /// one a running daemon picks up immediately. Drives [`change_note`].
     pub startup_effective: bool,
+    /// Whether the value is a credential. A secret setting is stored like any
+    /// other, but every display of it goes through [`SettingSpec::display`]
+    /// and renders [`SECRET_DISPLAY`] instead of the value: an operator learns
+    /// whether one is configured, and nothing more. Declared here, beside the
+    /// key, so masking is one flag rather than a hand-written `effective`
+    /// per key and a matching list somewhere else.
+    pub secret: bool,
     /// Parse and validate a string value, then write it into `config`.
     apply: fn(&mut GlobalConfig, &str) -> Result<(), SettingsError>,
     /// Reset this setting to its default, removing it from `config` (and its
@@ -80,6 +104,19 @@ pub struct SettingSpec {
 }
 
 impl SettingSpec {
+    /// The value to show for this setting and whether it is a default: the
+    /// effective value, masked to [`SECRET_DISPLAY`] when the setting is a
+    /// secret and something is configured. The only path from a config to a
+    /// rendered value, which is what makes [`SettingSpec::secret`] sufficient.
+    pub fn display(&self, config: &GlobalConfig) -> (String, bool) {
+        let (value, is_default) = (self.effective)(config);
+        if self.secret && !value.is_empty() {
+            (SECRET_DISPLAY.to_string(), is_default)
+        } else {
+            (value, is_default)
+        }
+    }
+
     /// The environment variable this setting maps to, mechanically derived
     /// from its key: `github.enabled` becomes `CRYSTALLINE_GITHUB_ENABLED`.
     /// Unused before the environment overlay lands; kept beside the key it
@@ -114,6 +151,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The default root folder new file domains are created under (default ~/Documents/Crystalline)",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_domains_root,
             clear: clear_domains_root,
             effective: domains_root_effective,
@@ -123,6 +161,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Turn GitHub team collaboration on or off",
             kind: SettingKind::Bool,
             startup_effective: false,
+            secret: false,
             apply: set_enabled,
             clear: clear_enabled,
             effective: enabled_effective,
@@ -132,6 +171,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Stack a new proposal on the open one when sharing again, where the forge serves stacked pull requests (default true); false keeps a single proposal per domain, updated in place",
             kind: SettingKind::Bool,
             startup_effective: false,
+            secret: false,
             apply: set_stacks,
             clear: clear_stacks,
             effective: stacks_effective,
@@ -141,6 +181,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Whose GitHub identity shares run under: instance (default) uses the one connected token for everything; personal requires each person to connect their own GitHub identity for sharing, while pulling stays on the instance token",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_share_identity,
             clear: clear_share_identity,
             effective: share_identity_effective,
@@ -150,6 +191,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The crystalline account whose connected GitHub identity agent shares over HTTP MCP run under when share_identity is personal; unset means those shares are refused",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_agent_identity,
             clear: clear_agent_identity,
             effective: agent_identity_effective,
@@ -159,6 +201,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How often the daemon polls GitHub for changes, in seconds (minimum 60)",
             kind: SettingKind::U64,
             startup_effective: false,
+            secret: false,
             apply: set_poll_secs,
             clear: clear_poll_secs,
             effective: poll_secs_effective,
@@ -168,6 +211,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The GitHub API base url, for a GitHub Enterprise Server instance",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_api_url,
             clear: clear_api_url,
             effective: api_url_effective,
@@ -177,6 +221,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "A self-hosted OAuth App client id, overriding the embedded default",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_oauth_client_id,
             clear: clear_oauth_client_id,
             effective: oauth_client_id_effective,
@@ -186,6 +231,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve knowledge read-only, hiding every tool that writes (applies at the next daemon start)",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_read_only,
             clear: clear_read_only,
             effective: read_only_effective,
@@ -195,6 +241,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The HTTP endpoint: on at 127.0.0.1:7411 by default; false turns it off, true spells the default, or bind a host:port address; the serve --http flag wins when given (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_http,
             clear: clear_http,
             effective: http_effective,
@@ -204,6 +251,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve the embedded Fluid web UI on the HTTP endpoint (default true); false serves the API and MCP only, the shape a separate Fluid deployment fronts. Read once when the HTTP surface starts",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_ui,
             clear: clear_ui,
             effective: ui_effective,
@@ -213,6 +261,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve the JSON API under /api/v1 on the HTTP endpoint (default true); false also disables the web UI, leaving MCP and /health only. Read once when the HTTP surface starts",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_api,
             clear: clear_api,
             effective: api_effective,
@@ -222,6 +271,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Comma-separated Host header values the HTTP transport accepts (DNS-rebinding guard); loopback is always allowed and a single * allows any Host; the serve --allowed-host flag wins when given (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_allowed_hosts,
             clear: clear_allowed_hosts,
             effective: allowed_hosts_effective,
@@ -231,6 +281,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How list-shaped MCP tool results are encoded: toon (token-efficient, default) or json",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_response_format,
             clear: clear_response_format,
             effective: response_format_effective,
@@ -240,6 +291,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve the shipped agent skills over MCP: the skills tool, skill:// resources and the onboarding and connector prompts. auto (default) serves them to every client except a stdio session spawned by a harness this machine's install receipt already onboarded with session hooks, which has the skills as files already; true always serves them, false never does. Applies at the next daemon start",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_skills_serve,
             clear: clear_skills_serve,
             effective: skills_serve_effective,
@@ -249,15 +301,17 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Which storage backend serves the derived index, turso or postgres (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_database_backend,
             clear: clear_database_backend,
             effective: database_backend_effective,
         },
         SettingSpec {
             key: "database.url",
-            doc: "The Postgres connection URL (or a file-path override for the embedded backend); applies at the next daemon start",
+            doc: "The Postgres connection URL (or a file-path override for the embedded backend); it may carry a password, so it is always treated as a secret: whatever it holds, a file path included, is only ever shown as (set) and never echoed back (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: true,
             apply: set_database_url,
             clear: clear_database_url,
             effective: database_url_effective,
@@ -267,6 +321,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "How strongly a salient engram is lifted in hybrid ranking, 0.0 to 1.0 (default 0.15); a soft prior that reorders within a relevance band and never filters",
             kind: SettingKind::F64,
             startup_effective: false,
+            secret: false,
             apply: set_salience_weight,
             clear: clear_salience_weight,
             effective: salience_weight_effective,
@@ -276,6 +331,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The ranking multiplier for engrams whose status is deprecated, superseded, archived or legacy, 0.0 to 1.0 (default 0.6, 1.0 disables); a soft fade that reorders results and never filters",
             kind: SettingKind::F64,
             startup_effective: false,
+            secret: false,
             apply: set_retired_weight,
             clear: clear_retired_weight,
             effective: retired_weight_effective,
@@ -285,15 +341,27 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Keep a generated index.md in every folder of a file domain, so the knowledge navigates statically without Crystalline (default true)",
             kind: SettingKind::Bool,
             startup_effective: false,
+            secret: false,
             apply: set_index_files,
             clear: clear_index_files,
             effective: index_files_effective,
+        },
+        SettingSpec {
+            key: "capture.similar",
+            doc: "Attach the nearest existing engrams to every write_engram and content edit_engram receipt as a similar list with guidance to merge, supersede, link or ignore them (default true); false switches the advisory off everywhere, MCP and Fluid alike",
+            kind: SettingKind::Bool,
+            startup_effective: false,
+            secret: false,
+            apply: set_capture_similar,
+            clear: clear_capture_similar,
+            effective: capture_similar_effective,
         },
         SettingSpec {
             key: "identity.actor",
             doc: "Who is recorded as the writer of an engram (generated.by), for example team-bot/1.0 or human:jordi; unset means the connected client is used",
             kind: SettingKind::String,
             startup_effective: false,
+            secret: false,
             apply: set_identity_actor,
             clear: clear_identity_actor,
             effective: identity_actor_effective,
@@ -303,6 +371,7 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "The request header a trusted reverse proxy sets to name the authenticated user, for example X-Forwarded-User; unset means no header is believed (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_trusted_header,
             clear: clear_trusted_header,
             effective: trusted_header_effective,
@@ -312,18 +381,120 @@ pub fn registry() -> &'static [SettingSpec] {
             doc: "Serve requests that carry no identity at all (default false) (applies at the next daemon start)",
             kind: SettingKind::Bool,
             startup_effective: true,
+            secret: false,
             apply: set_anonymous,
             clear: clear_anonymous,
             effective: anonymous_effective,
         },
         SettingSpec {
+            key: "auth.mcp",
+            doc: "Require every MCP connection over HTTP to authenticate with a personal MCP token (issue one in Fluid under profile > Agent access); off means the legacy open HTTP tier. Turning this on also serves OAuth for MCP clients wherever the UI is served, unless auth.oauth says otherwise (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            secret: false,
+            apply: set_mcp,
+            clear: clear_mcp,
+            effective: mcp_effective,
+        },
+        SettingSpec {
+            key: "auth.oauth",
+            doc: "Serve OAuth for MCP clients: the well-known metadata, dynamic client registration, authorization with a consent page and a token endpoint, so a hosted client such as Claude.ai connects without a pasted token. Unset, it follows auth.mcp: on a shared instance where agents must authenticate and the UI is served, OAuth is on. Set false to serve tokens only. Set true to insist, and fail the daemon start when auth.mcp, service.api or service.ui is off (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            secret: false,
+            apply: set_oauth,
+            clear: clear_oauth,
+            effective: oauth_effective,
+        },
+        SettingSpec {
             key: "auth.max_users",
-            doc: "How many accounts trusted-header provisioning may mint in total (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
+            doc: "How many accounts external provisioning may mint in total - the trusted header, the forward-auth headers and single sign-on all count against it (default 100); the crystalline users CLI is never capped (applies at the next daemon start)",
             kind: SettingKind::String,
             startup_effective: true,
+            secret: false,
             apply: set_max_users,
             clear: clear_max_users,
             effective: max_users_effective,
+        },
+        SettingSpec {
+            key: "auth.proxy_headers",
+            doc: "Trust the reverse proxy's Remote-User, Remote-Name, Remote-Email and Remote-Groups headers to name the signed-in user - ONLY safe when crystalline is unreachable except through that proxy and the proxy strips client-supplied copies of those headers (default false); an account is provisioned on first sight at the auth.oidc.default_role role, viewer when that is unset (applies at the next daemon start)",
+            kind: SettingKind::Bool,
+            startup_effective: true,
+            secret: false,
+            apply: set_proxy_headers,
+            clear: clear_proxy_headers,
+            effective: proxy_headers_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.issuer",
+            doc: "The single sign-on provider's issuer url, the one discovery appends /.well-known/openid-configuration to, for example https://login.microsoftonline.com/<your-tenant-id>/v2.0; unset means SSO is off and only the local accounts sign in (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_issuer,
+            clear: clear_oidc_issuer,
+            effective: oidc_issuer_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.client_id",
+            doc: "The client id (application id) the single sign-on provider issued for this Crystalline instance (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_client_id,
+            clear: clear_oidc_client_id,
+            effective: oidc_client_id_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.client_secret",
+            doc: "The client secret that goes with auth.oidc.client_id; a credential, so it is only ever shown as (set) and never echoed back - prefer supplying it through CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET, which keeps it out of the config file and out of the shell history a value typed at config set lands in (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: true,
+            apply: set_oidc_client_secret,
+            clear: clear_oidc_client_secret,
+            effective: oidc_client_secret_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.name",
+            doc: "The single sign-on provider's display name, the label on the sign-in button; unset means the generic wording (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_name,
+            clear: clear_oidc_name,
+            effective: oidc_name_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.scopes",
+            doc: "The scopes requested at authorization, space separated; unset means the standard set (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_scopes,
+            clear: clear_oidc_scopes,
+            effective: oidc_scopes_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.default_role",
+            doc: "The role an account provisioned through single sign-on is created at: viewer, editor or admin; unset means viewer, the least privileged one (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_default_role,
+            clear: clear_oidc_default_role,
+            effective: oidc_default_role_effective,
+        },
+        SettingSpec {
+            key: "auth.oidc.redirect_uri",
+            doc: "The address the single sign-on provider sends the browser back to, used verbatim instead of the one derived from a request's Host and forwarded scheme; an absolute https url (http only on loopback) ending in /api/v1/auth/oidc/callback, registered with the provider in exactly that spelling - set it where a proxy rewrites the Host, unset it to derive the address per request (applies at the next daemon start)",
+            kind: SettingKind::String,
+            startup_effective: true,
+            secret: false,
+            apply: set_oidc_redirect_uri,
+            clear: clear_oidc_redirect_uri,
+            effective: oidc_redirect_uri_effective,
         },
     ]
 }
@@ -354,10 +525,10 @@ pub fn snapshot(file: &GlobalConfig, overlay: &EnvOverlay) -> Vec<SettingView> {
     registry()
         .iter()
         .map(|spec| {
-            let (value, _) = (spec.effective)(&effective);
+            let (value, _) = spec.display(&effective);
             let source = if overlay.overrides_key(spec.key) {
                 SettingSource::Env
-            } else if (spec.effective)(file).1 {
+            } else if spec.display(file).1 {
                 SettingSource::Default
             } else {
                 SettingSource::Config
@@ -486,6 +657,15 @@ fn drop_search_if_empty(config: &mut GlobalConfig) {
 fn drop_index_if_empty(config: &mut GlobalConfig) {
     if config.index.as_ref() == Some(&IndexConfig::default()) {
         config.index = None;
+    }
+}
+
+/// Drop the `capture` block once every field in it has been cleared, so an
+/// unset config round-trips to exactly the pre-feature shape (no empty
+/// `capture: {}` line).
+fn drop_capture_if_empty(config: &mut GlobalConfig) {
+    if config.capture.as_ref() == Some(&CaptureConfig::default()) {
+        config.capture = None;
     }
 }
 
@@ -1158,6 +1338,33 @@ fn index_files_effective(config: &GlobalConfig) -> (String, bool) {
     (config.index_files().to_string(), is_default)
 }
 
+// --- capture.similar --------------------------------------------------------
+
+fn set_capture_similar(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "capture.similar must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .capture
+        .get_or_insert_with(CaptureConfig::default)
+        .similar = Some(parsed);
+    Ok(())
+}
+
+fn clear_capture_similar(config: &mut GlobalConfig) {
+    if let Some(c) = config.capture.as_mut() {
+        c.similar = None;
+    }
+    drop_capture_if_empty(config);
+}
+
+fn capture_similar_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.capture.as_ref().and_then(|c| c.similar).is_none();
+    (config.capture_similar().to_string(), is_default)
+}
+
 // --- identity.actor ---------------------------------------------------------
 
 fn set_identity_actor(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1266,6 +1473,77 @@ fn anonymous_effective(config: &GlobalConfig) -> (String, bool) {
     (config.auth_anonymous().to_string(), is_default)
 }
 
+// --- auth.mcp -----------------------------------------------------------
+
+fn set_mcp(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("auth.mcp must be true or false, got '{value}'")))?;
+    config.auth.get_or_insert_with(AuthConfig::default).mcp = Some(parsed);
+    Ok(())
+}
+
+fn clear_mcp(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.mcp = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn mcp_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.mcp).is_none();
+    (config.auth_mcp().to_string(), is_default)
+}
+
+// --- auth.oauth -----------------------------------------------------------
+
+fn set_oauth(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value
+        .parse()
+        .map_err(|_| SettingsError(format!("auth.oauth must be true or false, got '{value}'")))?;
+    config.auth.get_or_insert_with(AuthConfig::default).oauth = Some(parsed);
+    Ok(())
+}
+
+fn clear_oauth(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.oauth = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn oauth_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.oauth).is_none();
+    (config.auth_oauth().to_string(), is_default)
+}
+
+// --- auth.proxy_headers -------------------------------------------------------
+
+fn set_proxy_headers(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let parsed: bool = value.parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.proxy_headers must be true or false, got '{value}'"
+        ))
+    })?;
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .proxy_headers = Some(parsed);
+    Ok(())
+}
+
+fn clear_proxy_headers(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut() {
+        a.proxy_headers = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+fn proxy_headers_effective(config: &GlobalConfig) -> (String, bool) {
+    let is_default = config.auth.as_ref().and_then(|a| a.proxy_headers).is_none();
+    (config.auth_proxy_headers().to_string(), is_default)
+}
+
 // --- auth.max_users -----------------------------------------------------------
 
 fn set_max_users(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
@@ -1297,6 +1575,287 @@ fn clear_max_users(config: &mut GlobalConfig) {
 fn max_users_effective(config: &GlobalConfig) -> (String, bool) {
     let is_default = config.auth.as_ref().and_then(|a| a.max_users).is_none();
     (config.auth_max_users().to_string(), is_default)
+}
+
+// --- auth.oidc.* --------------------------------------------------------------
+
+/// The placeholder in the tenant-independent Entra discovery url, lowercased
+/// so a `{tenantId}` copied off a portal page matches too.
+///
+/// Shared with the relying party rather than spelled twice: `set_oidc_issuer`
+/// is one way the issuer reaches the config and `CRYSTALLINE_AUTH_OIDC_ISSUER`
+/// is another, and a guard that only one of them applies is a guard that does
+/// not hold.
+pub const ENTRA_TEMPLATE_MARKER: &str = "{tenantid}";
+
+/// What to say when the template turns up, wherever it turns up.
+pub const ENTRA_TEMPLATE_HELP: &str = "this is the tenant-independent Entra discovery template, not your issuer - use the \
+     tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0";
+
+/// What to say when one of the tenant-independent Entra endpoints turns up.
+/// They are worse than the template: they discover cleanly and then refuse
+/// every token as an issuer mismatch, which nobody can read back to this.
+pub const ENTRA_TENANT_INDEPENDENT_HELP: &str = "common, organizations and consumers are the tenant-independent Entra endpoints, not \
+     your issuer - they discover fine and then refuse every token as an issuer mismatch; use \
+     the tenant-specific URL https://login.microsoftonline.com/<your-tenant-id>/v2.0";
+
+/// Why `issuer` cannot be an issuer, when it is one of the Entra values an
+/// operator pastes off a portal page: the `{tenantid}` template, or the
+/// `common`, `organizations` and `consumers` endpoints. `None` means it may
+/// still be wrong, but not in a way this guard knows about.
+///
+/// One function for both places the issuer can arrive through - the settings
+/// registry and the environment overlay - so the two guards cannot drift.
+pub fn entra_issuer_problem(issuer: &str) -> Option<&'static str> {
+    let lower = issuer.to_ascii_lowercase();
+    if lower.contains(ENTRA_TEMPLATE_MARKER) {
+        return Some(ENTRA_TEMPLATE_HELP);
+    }
+    let (_, after_host) = lower.split_once("login.microsoftonline.com/")?;
+    let first_segment = after_host.split('/').next().unwrap_or("");
+    matches!(first_segment, "common" | "organizations" | "consumers")
+        .then_some(ENTRA_TENANT_INDEPENDENT_HELP)
+}
+
+/// The `auth.oidc` block, created on demand so the first `auth.oidc.*` write
+/// materializes it and every later one reuses it.
+fn oidc_mut(config: &mut GlobalConfig) -> &mut OidcConfig {
+    config
+        .auth
+        .get_or_insert_with(AuthConfig::default)
+        .oidc
+        .get_or_insert_with(OidcConfig::default)
+}
+
+/// Drop an emptied `auth.oidc` block, then an `auth` block emptied by that.
+/// Unsetting the last oidc key must leave the config exactly as it was before
+/// the first one was set, not a file carrying two empty maps.
+fn drop_oidc_if_empty(config: &mut GlobalConfig) {
+    if let Some(a) = config.auth.as_mut()
+        && a.oidc.as_ref() == Some(&OidcConfig::default())
+    {
+        a.oidc = None;
+    }
+    drop_auth_if_empty(config);
+}
+
+/// Trim and reject an empty `auth.oidc.*` string, the shape every key in the
+/// block shares. `unset` is how a key is removed; an empty string would
+/// otherwise write a present-but-blank value the relying party would have to
+/// second-guess.
+fn oidc_value(key: &str, value: &str) -> Result<String, SettingsError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(SettingsError(format!(
+            "{key} must not be empty - unset it instead to turn it off"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// One `auth.oidc.*` string field's effective value: the configured value, or
+/// empty and flagged as a default when the block or the field is absent.
+fn oidc_effective(
+    config: &GlobalConfig,
+    field: fn(&OidcConfig) -> Option<&String>,
+) -> (String, bool) {
+    match config.auth_oidc().and_then(field) {
+        Some(v) => (v.clone(), false),
+        None => (String::new(), true),
+    }
+}
+
+/// Clear one `auth.oidc.*` field, then drop the block (and the `auth` block
+/// above it) if that emptied it. The write-side twin of [`oidc_effective`].
+fn clear_oidc(config: &mut GlobalConfig, field: fn(&mut OidcConfig) -> &mut Option<String>) {
+    if let Some(o) = config.auth.as_mut().and_then(|a| a.oidc.as_mut()) {
+        *field(o) = None;
+    }
+    drop_oidc_if_empty(config);
+}
+
+fn set_oidc_issuer(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let issuer = oidc_value("auth.oidc.issuer", value)?;
+    // The tenant-independent Entra discovery template is the one wrong value
+    // people paste from a portal page, and it fails much later as an issuer
+    // mismatch on a token nobody can read. Refuse it here, where the fix is a
+    // sentence away.
+    if let Some(help) = entra_issuer_problem(&issuer) {
+        return Err(SettingsError(help.to_string()));
+    }
+    oidc_mut(config).issuer = Some(issuer);
+    Ok(())
+}
+
+fn clear_oidc_issuer(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.issuer);
+}
+
+fn oidc_issuer_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.issuer.as_ref())
+}
+
+fn set_oidc_client_id(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let id = oidc_value("auth.oidc.client_id", value)?;
+    oidc_mut(config).client_id = Some(id);
+    Ok(())
+}
+
+fn clear_oidc_client_id(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.client_id);
+}
+
+fn oidc_client_id_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.client_id.as_ref())
+}
+
+fn set_oidc_client_secret(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let secret = oidc_value("auth.oidc.client_secret", value)?;
+    oidc_mut(config).client_secret = Some(secret);
+    Ok(())
+}
+
+fn clear_oidc_client_secret(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.client_secret);
+}
+
+/// Raw like every sibling: the registry entry is `secret: true`, and
+/// [`SettingSpec::display`] is what turns this into [`SECRET_DISPLAY`]
+/// before it reaches `config show`, the `configure` tool result or `doctor`.
+fn oidc_client_secret_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.client_secret.as_ref())
+}
+
+fn set_oidc_name(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let name = oidc_value("auth.oidc.name", value)?;
+    oidc_mut(config).name = Some(name);
+    Ok(())
+}
+
+fn clear_oidc_name(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.name);
+}
+
+fn oidc_name_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.name.as_ref())
+}
+
+fn set_oidc_scopes(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    // Scopes are space separated on the wire, so the stored form is the wire
+    // form with its internal spacing normalized: a value pasted with newlines
+    // or double spaces still produces one valid scope parameter.
+    let scopes = oidc_value("auth.oidc.scopes", value)?;
+    let normalized = scopes.split_whitespace().collect::<Vec<_>>().join(" ");
+    oidc_mut(config).scopes = Some(normalized);
+    Ok(())
+}
+
+fn clear_oidc_scopes(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.scopes);
+}
+
+fn oidc_scopes_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.scopes.as_ref())
+}
+
+fn set_oidc_default_role(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let raw = oidc_value("auth.oidc.default_role", value)?;
+    // Parsed through the one role type the accounts database uses, so this key
+    // can never name a role that does not exist, and stored in that type's own
+    // spelling so casing is canonical on the way in.
+    let role: Role = raw.parse().map_err(|_| {
+        SettingsError(format!(
+            "auth.oidc.default_role must be viewer, editor or admin, got '{value}'"
+        ))
+    })?;
+    oidc_mut(config).default_role = Some(role.as_str().to_string());
+    Ok(())
+}
+
+fn clear_oidc_default_role(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.default_role);
+}
+
+fn oidc_default_role_effective(config: &GlobalConfig) -> (String, bool) {
+    match config.auth_oidc().and_then(|o| o.default_role.as_ref()) {
+        Some(role) => (role.clone(), false),
+        // The same constant the relying party provisions at, so what this key
+        // says it does when unset and what a sign-in then does cannot drift.
+        None => (crate::rest::DEFAULT_OIDC_ROLE.as_str().to_string(), true),
+    }
+}
+
+/// The path the callback is served at, absolute on this instance's HTTP
+/// surface. A configured `auth.oidc.redirect_uri` has to end here, because
+/// that is where the browser the provider redirects actually lands.
+///
+/// Spelled once, and pinned against the router's own constant by
+/// `rest::oidc`'s `the_validated_callback_path_is_the_one_this_router_serves`.
+pub const OIDC_CALLBACK_PATH: &str = "/api/v1/auth/oidc/callback";
+
+/// Why `value` cannot be the address a provider sends a browser back to, or
+/// `None` when it can.
+///
+/// One function for both places the key arrives through - the settings
+/// registry and the environment overlay - so the two guards cannot drift,
+/// exactly as [`entra_issuer_problem`] does for the issuer.
+///
+/// Three rules, and each one is a mistake an operator makes rather than a
+/// theoretical shape: the value has to be an absolute url (a path alone is
+/// what somebody writes who expects the host to be filled in), it has to be
+/// https unless it is a development server on loopback (an identity crossing
+/// plaintext is the one thing this whole flow exists to avoid), and it has to
+/// end at the callback this instance actually serves (anything else registers
+/// an address the browser never reaches).
+pub fn oidc_redirect_uri_problem(value: &str) -> Option<String> {
+    let key = "auth.oidc.redirect_uri";
+    let Ok(url) = openidconnect::url::Url::parse(value.trim()) else {
+        return Some(format!(
+            "{key} must be an absolute url, for example \
+             https://knowledge.example.com{OIDC_CALLBACK_PATH}, got '{value}'"
+        ));
+    };
+    let loopback = match url.host() {
+        Some(openidconnect::url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(openidconnect::url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(openidconnect::url::Host::Ipv6(ip)) => ip.is_loopback(),
+        None => false,
+    };
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        _ => {
+            return Some(format!(
+                "{key} must be an https url - an identity is what comes back to it; \
+                 http is allowed only on loopback, for a development server"
+            ));
+        }
+    }
+    if url.path() != OIDC_CALLBACK_PATH || url.query().is_some() || url.fragment().is_some() {
+        return Some(format!(
+            "{key} must end in {OIDC_CALLBACK_PATH}, with no query and no fragment - \
+             that is the one address this instance serves the callback at, and the \
+             provider has to have it registered in exactly that spelling"
+        ));
+    }
+    None
+}
+
+fn set_oidc_redirect_uri(config: &mut GlobalConfig, value: &str) -> Result<(), SettingsError> {
+    let uri = oidc_value("auth.oidc.redirect_uri", value)?;
+    if let Some(problem) = oidc_redirect_uri_problem(&uri) {
+        return Err(SettingsError(problem));
+    }
+    oidc_mut(config).redirect_uri = Some(uri);
+    Ok(())
+}
+
+fn clear_oidc_redirect_uri(config: &mut GlobalConfig) {
+    clear_oidc(config, |o| &mut o.redirect_uri);
+}
+
+fn oidc_redirect_uri_effective(config: &GlobalConfig) -> (String, bool) {
+    oidc_effective(config, |o| o.redirect_uri.as_ref())
 }
 
 // --- domains_root ----------------------------------------------------------
@@ -1332,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_lists_exactly_the_twenty_four_keys_in_order() {
+    fn registry_lists_exactly_the_thirty_five_keys_in_order() {
         assert_eq!(
             known_keys(),
             vec![
@@ -1356,10 +1915,21 @@ mod tests {
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
+                "capture.similar",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.mcp",
+                "auth.oauth",
                 "auth.max_users",
+                "auth.proxy_headers",
+                "auth.oidc.issuer",
+                "auth.oidc.client_id",
+                "auth.oidc.client_secret",
+                "auth.oidc.name",
+                "auth.oidc.scopes",
+                "auth.oidc.default_role",
+                "auth.oidc.redirect_uri",
             ]
         );
     }
@@ -1421,13 +1991,45 @@ mod tests {
                     "CRYSTALLINE_SEARCH_RETIRED_WEIGHT".to_string()
                 ),
                 ("index.files", "CRYSTALLINE_INDEX_FILES".to_string()),
+                ("capture.similar", "CRYSTALLINE_CAPTURE_SIMILAR".to_string()),
                 ("identity.actor", "CRYSTALLINE_IDENTITY_ACTOR".to_string()),
                 (
                     "auth.trusted_header",
                     "CRYSTALLINE_AUTH_TRUSTED_HEADER".to_string()
                 ),
                 ("auth.anonymous", "CRYSTALLINE_AUTH_ANONYMOUS".to_string()),
+                ("auth.mcp", "CRYSTALLINE_AUTH_MCP".to_string()),
+                ("auth.oauth", "CRYSTALLINE_AUTH_OAUTH".to_string()),
                 ("auth.max_users", "CRYSTALLINE_AUTH_MAX_USERS".to_string()),
+                (
+                    "auth.proxy_headers",
+                    "CRYSTALLINE_AUTH_PROXY_HEADERS".to_string()
+                ),
+                (
+                    "auth.oidc.issuer",
+                    "CRYSTALLINE_AUTH_OIDC_ISSUER".to_string()
+                ),
+                (
+                    "auth.oidc.client_id",
+                    "CRYSTALLINE_AUTH_OIDC_CLIENT_ID".to_string()
+                ),
+                (
+                    "auth.oidc.client_secret",
+                    "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET".to_string()
+                ),
+                ("auth.oidc.name", "CRYSTALLINE_AUTH_OIDC_NAME".to_string()),
+                (
+                    "auth.oidc.scopes",
+                    "CRYSTALLINE_AUTH_OIDC_SCOPES".to_string()
+                ),
+                (
+                    "auth.oidc.default_role",
+                    "CRYSTALLINE_AUTH_OIDC_DEFAULT_ROLE".to_string()
+                ),
+                (
+                    "auth.oidc.redirect_uri",
+                    "CRYSTALLINE_AUTH_OIDC_REDIRECT_URI".to_string()
+                ),
             ]
         );
     }
@@ -1451,6 +2053,7 @@ mod tests {
         assert!(change_note("search.salience_weight", &no_env).is_none());
         assert!(change_note("search.retired_weight", &no_env).is_none());
         assert!(change_note("index.files", &no_env).is_none());
+        assert!(change_note("capture.similar", &no_env).is_none());
         assert!(change_note("identity.actor", &no_env).is_none());
         // The effective value is snapshotted at engine construction
         // (`Engine::skills_serve`), so a write really does wait for the next
@@ -1459,6 +2062,14 @@ mod tests {
         assert!(change_note("auth.trusted_header", &no_env).is_some());
         assert!(change_note("auth.anonymous", &no_env).is_some());
         assert!(change_note("auth.max_users", &no_env).is_some());
+        assert!(change_note("auth.oidc.issuer", &no_env).is_some());
+        assert!(change_note("auth.oidc.client_id", &no_env).is_some());
+        assert!(change_note("auth.oidc.client_secret", &no_env).is_some());
+        assert!(change_note("auth.oidc.name", &no_env).is_some());
+        assert!(change_note("auth.oidc.scopes", &no_env).is_some());
+        assert!(change_note("auth.oidc.default_role", &no_env).is_some());
+        assert!(change_note("auth.oidc.redirect_uri", &no_env).is_some());
+        assert!(change_note("auth.proxy_headers", &no_env).is_some());
         assert!(change_note("github.bogus", &no_env).is_none());
     }
 
@@ -1911,7 +2522,7 @@ mod tests {
         apply(&mut cfg, "github.enabled", "true").unwrap();
 
         let views = snapshot(&cfg, &EnvOverlay::default());
-        assert_eq!(views.len(), 24);
+        assert_eq!(views.len(), 35);
         assert_eq!(
             views.iter().map(|v| v.key.as_str()).collect::<Vec<_>>(),
             vec![
@@ -1935,10 +2546,21 @@ mod tests {
                 "search.salience_weight",
                 "search.retired_weight",
                 "index.files",
+                "capture.similar",
                 "identity.actor",
                 "auth.trusted_header",
                 "auth.anonymous",
+                "auth.mcp",
+                "auth.oauth",
                 "auth.max_users",
+                "auth.proxy_headers",
+                "auth.oidc.issuer",
+                "auth.oidc.client_id",
+                "auth.oidc.client_secret",
+                "auth.oidc.name",
+                "auth.oidc.scopes",
+                "auth.oidc.default_role",
+                "auth.oidc.redirect_uri",
             ]
         );
 
@@ -2035,15 +2657,19 @@ mod tests {
         assert_eq!(index_files.value, "true");
         assert_eq!(index_files.source, SettingSource::Default);
 
-        let identity_actor = &views[20];
+        let capture_similar = &views[20];
+        assert_eq!(capture_similar.value, "true");
+        assert_eq!(capture_similar.source, SettingSource::Default);
+
+        let identity_actor = &views[21];
         assert_eq!(identity_actor.value, "");
         assert_eq!(identity_actor.source, SettingSource::Default);
 
-        let trusted_header = &views[21];
+        let trusted_header = &views[22];
         assert_eq!(trusted_header.value, "");
         assert_eq!(trusted_header.source, SettingSource::Default);
 
-        let anonymous = &views[22];
+        let anonymous = &views[23];
         assert_eq!(anonymous.value, "false");
         assert_eq!(anonymous.source, SettingSource::Default);
     }
@@ -2344,6 +2970,22 @@ mod tests {
         assert!(cfg.index.is_none(), "a rejected value must not be written");
     }
 
+    // --- capture.similar --------------------------------------------------------
+
+    #[test]
+    fn capture_similar_round_trips_and_defaults_on() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.capture_similar(), "absent means on");
+        apply(&mut cfg, "capture.similar", "false").unwrap();
+        assert!(!cfg.capture_similar());
+        let (value, is_default) = capture_similar_effective(&cfg);
+        assert_eq!((value.as_str(), is_default), ("false", false));
+        assert!(apply(&mut cfg, "capture.similar", "maybe").is_err());
+        unset(&mut cfg, "capture.similar").unwrap();
+        assert!(cfg.capture.is_none(), "an unset block is dropped whole");
+        assert!(cfg.capture_similar());
+    }
+
     // --- domains_root ----------------------------------------------------------
 
     #[test]
@@ -2590,6 +3232,139 @@ mod tests {
         assert!(!cfg.auth_anonymous());
     }
 
+    // --- auth.mcp -----------------------------------------------------------
+
+    #[test]
+    fn auth_mcp_round_trips_and_defaults_off() {
+        let mut config = GlobalConfig::default();
+        apply(&mut config, "auth.mcp", "true").unwrap();
+        assert!(config.auth_mcp());
+        unset(&mut config, "auth.mcp").unwrap();
+        assert!(!config.auth_mcp());
+    }
+
+    // --- auth.oauth -----------------------------------------------------------
+
+    #[test]
+    fn auth_oauth_round_trips_and_needs_auth_mcp() {
+        let mut config = GlobalConfig::default();
+        assert!(!config.auth_oauth());
+        apply(&mut config, "auth.oauth", "true").unwrap();
+        assert!(config.auth_oauth());
+        assert_eq!(oauth_effective(&config), ("true".to_string(), false));
+
+        let no_env = EnvOverlay::default();
+        assert!(change_note("auth.oauth", &no_env).is_some());
+
+        let err = crate::rest::AuthCfg::resolve(&config)
+            .expect_err("auth.oauth without auth.mcp must refuse to resolve");
+        assert!(err.to_string().contains("auth.mcp"), "{err}");
+
+        unset(&mut config, "auth.oauth").unwrap();
+        assert!(!config.auth_oauth());
+        assert!(
+            config.auth.is_none(),
+            "the block this key created goes with it"
+        );
+    }
+
+    #[test]
+    fn auth_oauth_follows_auth_mcp_when_unset() {
+        let mut config = GlobalConfig::default();
+        assert!(!config.auth_oauth());
+
+        apply(&mut config, "auth.mcp", "true").unwrap();
+        assert!(
+            config.auth_oauth(),
+            "auth.mcp on with the UI served turns OAuth on unasked"
+        );
+        assert_eq!(oauth_effective(&config), ("true".to_string(), true));
+
+        apply(&mut config, "auth.oauth", "false").unwrap();
+        let (value, is_default) = oauth_effective(&config);
+        assert_eq!(value, "false");
+        assert!(!is_default, "an explicit false is no longer derived");
+
+        unset(&mut config, "auth.oauth").unwrap();
+        assert!(
+            config.auth_oauth(),
+            "unset returns to following auth.mcp, still true"
+        );
+
+        apply(&mut config, "service.ui", "false").unwrap();
+        assert!(
+            !config.auth_oauth(),
+            "a derived value never turns on where it cannot be served"
+        );
+        crate::rest::AuthCfg::resolve(&config)
+            .expect("a derived oauth value must never trip the auth.mcp guard");
+        // The daemon guards in `http_base` (`service.api`, `service.ui`) are
+        // private to `daemon.rs` and not reachable from here;
+        // `a_derived_oauth_value_never_trips_the_daemon_guards` in
+        // `tests/rest_api.rs` pins the property this config algebra implies -
+        // an instance that only ever set `auth.mcp` true keeps starting.
+    }
+
+    // --- auth.proxy_headers ---------------------------------------------------
+
+    #[test]
+    fn proxy_headers_round_trips_and_defaults_off() {
+        let mut config = GlobalConfig::default();
+        assert!(
+            !config.auth_proxy_headers(),
+            "trust-the-proxy is off unless an operator turns it on"
+        );
+        apply(&mut config, "auth.proxy_headers", "true").unwrap();
+        assert!(config.auth_proxy_headers());
+        assert_eq!(
+            proxy_headers_effective(&config),
+            ("true".to_string(), false)
+        );
+        unset(&mut config, "auth.proxy_headers").unwrap();
+        assert!(!config.auth_proxy_headers());
+        assert!(
+            config.auth.is_none(),
+            "the block this key created goes with it"
+        );
+    }
+
+    #[test]
+    fn proxy_headers_refuses_anything_but_a_boolean() {
+        let mut config = GlobalConfig::default();
+        let err = apply(&mut config, "auth.proxy_headers", "yes").unwrap_err();
+        assert!(err.to_string().contains("true or false"), "{err}");
+        assert!(config.auth.is_none(), "a rejected value is not written");
+    }
+
+    /// The teaching text is the feature here as much as the flag is: an
+    /// operator who turns this on is trusting every header their proxy does
+    /// not strip, and the doc string has to say so where they read it.
+    #[test]
+    fn proxy_headers_teaches_the_trust_boundary() {
+        let spec = find("auth.proxy_headers").unwrap();
+        assert!(
+            spec.startup_effective,
+            "resolved once, like the other modes"
+        );
+        assert!(!spec.secret);
+        assert!(matches!(spec.kind, SettingKind::Bool));
+        for phrase in [
+            "Remote-User",
+            "Remote-Name",
+            "Remote-Email",
+            "Remote-Groups",
+            "ONLY safe",
+            "unreachable except through",
+            "strips",
+        ] {
+            assert!(
+                spec.doc.contains(phrase),
+                "the doc must teach the trust boundary, missing '{phrase}': {}",
+                spec.doc
+            );
+        }
+    }
+
     // --- auth.max_users -----------------------------------------------------------
 
     #[test]
@@ -2632,5 +3407,428 @@ mod tests {
             !yaml.contains("auth"),
             "an emptied auth block must not round-trip into the yaml: {yaml}"
         );
+    }
+
+    // --- secrets ------------------------------------------------------------
+
+    /// Every key the registry flags as a secret is invisible on every display
+    /// path, and the flag is the only thing that makes it so: a value is
+    /// applied, then looked for in the snapshot and in the overlay's doctor
+    /// listing and `Debug`. Registry-driven, so the next credential-shaped
+    /// key is covered by setting its flag and nothing else.
+    #[test]
+    fn every_secret_key_is_masked_on_every_display_path() {
+        let secrets: Vec<&SettingSpec> = registry().iter().filter(|s| s.secret).collect();
+        assert_eq!(
+            secrets.iter().map(|s| s.key).collect::<Vec<_>>(),
+            vec!["database.url", "auth.oidc.client_secret"],
+        );
+
+        for spec in secrets {
+            assert!(is_secret_key(spec.key), "{}", spec.key);
+            let marker = format!("marker-{}", spec.key.replace('.', "-"));
+
+            // Unset: empty and a default, so `(set)` really means set.
+            let unset = snapshot(&GlobalConfig::default(), &EnvOverlay::default())
+                .into_iter()
+                .find(|v| v.key == spec.key)
+                .unwrap();
+            assert_eq!(unset.value, "", "{}", spec.key);
+            assert_eq!(unset.source, SettingSource::Default, "{}", spec.key);
+
+            // Set in the file: masked, stored, and the marker is nowhere.
+            let mut config = GlobalConfig::default();
+            apply(&mut config, spec.key, &marker).unwrap();
+            let views = snapshot(&config, &EnvOverlay::default());
+            let view = views.iter().find(|v| v.key == spec.key).unwrap();
+            assert_eq!(view.value, SECRET_DISPLAY, "{}", spec.key);
+            assert_eq!(view.source, SettingSource::Config, "{}", spec.key);
+            assert!(
+                !views.iter().any(|v| v.value.contains(&marker)),
+                "{} leaked into the snapshot",
+                spec.key
+            );
+            assert_eq!(spec.display(&config).0, SECRET_DISPLAY);
+
+            // Set by the environment: masked in the snapshot, in doctor's
+            // override listing and in the overlay's own render.
+            let overlay = EnvOverlay::from_vars([(spec.env_var(), marker.clone())]).unwrap();
+            let view = snapshot(&GlobalConfig::default(), &overlay)
+                .into_iter()
+                .find(|v| v.key == spec.key)
+                .unwrap();
+            assert_eq!(view.value, SECRET_DISPLAY, "{}", spec.key);
+            assert_eq!(view.source, SettingSource::Env, "{}", spec.key);
+            let (_, _, shown) = overlay
+                .active_overrides()
+                .into_iter()
+                .find(|(_, key, _)| key == spec.key)
+                .unwrap();
+            assert_eq!(shown, SECRET_DISPLAY, "{}", spec.key);
+            let rendered = format!("{overlay:?}");
+            assert!(!rendered.contains(&marker), "{rendered}");
+        }
+    }
+
+    /// A key that is not flagged shows its value, so the flag is not
+    /// accidentally masking everything.
+    #[test]
+    fn a_plain_key_is_not_a_secret_and_shows_its_value() {
+        assert!(!is_secret_key("auth.oidc.client_id"));
+        assert!(!is_secret_key("no.such.key"));
+        let mut config = GlobalConfig::default();
+        apply(&mut config, "auth.oidc.client_id", "app-1234").unwrap();
+        let view = snapshot(&config, &EnvOverlay::default())
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_id")
+            .unwrap();
+        assert_eq!(view.value, "app-1234");
+    }
+
+    // --- auth.oidc.* --------------------------------------------------------
+
+    /// One key of the oidc block for the round-trip table: its setting key, a
+    /// representative value and the field that value must land in.
+    type OidcCase = (
+        &'static str,
+        &'static str,
+        fn(&OidcConfig) -> Option<&String>,
+    );
+
+    /// Every key in the block round-trips through its own accessor and leaves
+    /// no residue behind: unsetting the one key that was set drops the oidc
+    /// block and the auth block that only existed to hold it.
+    #[test]
+    fn every_oidc_key_round_trips_and_unsets_back_to_nothing() {
+        let cases: [OidcCase; 6] = [
+            ("auth.oidc.issuer", "https://login.example.com/v2.0", |o| {
+                o.issuer.as_ref()
+            }),
+            ("auth.oidc.client_id", "app-1234", |o| o.client_id.as_ref()),
+            ("auth.oidc.client_secret", "hunter2", |o| {
+                o.client_secret.as_ref()
+            }),
+            ("auth.oidc.name", "Example SSO", |o| o.name.as_ref()),
+            ("auth.oidc.scopes", "openid profile email", |o| {
+                o.scopes.as_ref()
+            }),
+            ("auth.oidc.default_role", "editor", |o| {
+                o.default_role.as_ref()
+            }),
+        ];
+
+        for (key, value, field) in cases {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, key, value).unwrap();
+            assert_eq!(
+                cfg.auth_oidc().and_then(field).map(String::as_str),
+                Some(value),
+                "{key} should round-trip"
+            );
+
+            unset(&mut cfg, key).unwrap();
+            assert!(
+                cfg.auth.is_none(),
+                "{key} was the only set field, so both blocks should vanish"
+            );
+            let yaml = serde_yaml_ng::to_string(&cfg).unwrap();
+            assert!(
+                !yaml.contains("oidc"),
+                "an emptied oidc block must not round-trip into the yaml: {yaml}"
+            );
+        }
+    }
+
+    /// Unsetting one key of several leaves the rest of the block standing:
+    /// the collapse is about an emptied block, not about any unset.
+    #[test]
+    fn unsetting_one_oidc_key_keeps_the_rest_of_the_block() {
+        let mut cfg = GlobalConfig::default();
+        apply(
+            &mut cfg,
+            "auth.oidc.issuer",
+            "https://login.example.com/v2.0",
+        )
+        .unwrap();
+        apply(&mut cfg, "auth.oidc.client_id", "app-1234").unwrap();
+
+        unset(&mut cfg, "auth.oidc.client_id").unwrap();
+        assert_eq!(
+            cfg.auth_oidc().and_then(|o| o.issuer.as_deref()),
+            Some("https://login.example.com/v2.0")
+        );
+    }
+
+    /// An absent block is SSO off, and that is what the accessor says.
+    #[test]
+    fn auth_oidc_is_absent_until_a_key_is_set() {
+        let mut cfg = GlobalConfig::default();
+        assert!(cfg.auth_oidc().is_none());
+        apply(&mut cfg, "auth.mcp", "true").unwrap();
+        assert!(
+            cfg.auth_oidc().is_none(),
+            "an auth block without oidc is still SSO off"
+        );
+    }
+
+    /// `common`, `organizations` and `consumers` are the tenant-independent
+    /// Entra endpoints. They discover fine and then fail as an issuer mismatch
+    /// on the first token, so they are refused here with the same correction
+    /// the template gets.
+    #[test]
+    fn oidc_issuer_refuses_the_tenant_independent_entra_endpoints() {
+        for endpoint in ["common", "organizations", "consumers"] {
+            let mut config = GlobalConfig::default();
+            let err = apply(
+                &mut config,
+                "auth.oidc.issuer",
+                &format!("https://login.microsoftonline.com/{endpoint}/v2.0"),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("tenant-specific"),
+                "{endpoint}: {err}"
+            );
+            assert!(config.auth.is_none(), "{endpoint} must not be written");
+            // Case and a trailing slash do not get it past the guard.
+            let err = apply(
+                &mut config,
+                "auth.oidc.issuer",
+                &format!(
+                    "https://LOGIN.microsoftonline.com/{}/v2.0/",
+                    endpoint.to_uppercase()
+                ),
+            )
+            .unwrap_err();
+            assert!(
+                err.to_string().contains("tenant-specific"),
+                "{endpoint}: {err}"
+            );
+        }
+        // A tenant whose id merely starts with one of those words is a tenant.
+        let mut config = GlobalConfig::default();
+        apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/commonwealth-corp/v2.0",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn oidc_issuer_refuses_the_entra_template() {
+        let mut config = GlobalConfig::default();
+        let err = apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/{tenantid}/v2.0",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant-specific"), "{err}");
+        assert!(
+            config.auth.is_none(),
+            "a rejected issuer must not be written"
+        );
+
+        // The casing a portal page actually shows is refused too.
+        let err = apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/{tenantId}/v2.0",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("tenant-specific"), "{err}");
+
+        // The tenant-specific url the message points at is accepted.
+        apply(
+            &mut config,
+            "auth.oidc.issuer",
+            "https://login.microsoftonline.com/9f1c-tenant/v2.0",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn oidc_client_secret_never_echoes() {
+        let mut config = GlobalConfig::default();
+        apply(&mut config, "auth.oidc.client_secret", "hunter2").unwrap();
+
+        let view = snapshot(&config, &EnvOverlay::default())
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_secret")
+            .unwrap();
+        assert!(!view.value.contains("hunter2"), "{}", view.value);
+        assert_eq!(view.value, SECRET_DISPLAY);
+        assert_eq!(view.source, SettingSource::Config);
+        // The secret is still stored: only the display is redacted.
+        assert_eq!(
+            config.auth_oidc().and_then(|o| o.client_secret.as_deref()),
+            Some("hunter2")
+        );
+    }
+
+    /// An unset secret shows nothing at all, so `(set)` really does mean set.
+    #[test]
+    fn oidc_client_secret_shows_empty_when_unset() {
+        let config = GlobalConfig::default();
+        let view = snapshot(&config, &EnvOverlay::default())
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_secret")
+            .unwrap();
+        assert_eq!(view.value, "");
+        assert_eq!(view.source, SettingSource::Default);
+    }
+
+    /// A secret supplied by the environment is redacted on the same terms as
+    /// one in the file, and the source still says where it came from.
+    #[test]
+    fn an_env_supplied_oidc_secret_is_redacted_too() {
+        let overlay = EnvOverlay::from_vars([(
+            "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET".to_string(),
+            "env-hunter2".to_string(),
+        )])
+        .unwrap();
+        let view = snapshot(&GlobalConfig::default(), &overlay)
+            .into_iter()
+            .find(|v| v.key == "auth.oidc.client_secret")
+            .unwrap();
+        assert_eq!(view.value, SECRET_DISPLAY);
+        assert_eq!(view.source, SettingSource::Env);
+    }
+
+    #[test]
+    fn oidc_default_role_accepts_the_three_roles_and_canonicalizes_casing() {
+        let mut cfg = GlobalConfig::default();
+        for (typed, stored) in [
+            ("viewer", "viewer"),
+            ("Editor", "editor"),
+            ("ADMIN", "admin"),
+        ] {
+            apply(&mut cfg, "auth.oidc.default_role", typed).unwrap();
+            assert_eq!(
+                cfg.auth_oidc().and_then(|o| o.default_role.as_deref()),
+                Some(stored)
+            );
+        }
+    }
+
+    // --- auth.oidc.redirect_uri -----------------------------------------------
+
+    #[test]
+    fn oidc_redirect_uri_round_trips_and_unsets_back_to_nothing() {
+        let mut cfg = GlobalConfig::default();
+        let configured = "https://kb.example.test/api/v1/auth/oidc/callback";
+        apply(&mut cfg, "auth.oidc.redirect_uri", configured).unwrap();
+        assert_eq!(
+            cfg.auth_oidc().and_then(|o| o.redirect_uri.as_deref()),
+            Some(configured)
+        );
+        assert_eq!(
+            oidc_redirect_uri_effective(&cfg),
+            (configured.to_string(), false)
+        );
+        unset(&mut cfg, "auth.oidc.redirect_uri").unwrap();
+        assert!(cfg.auth.is_none(), "the emptied blocks go with it");
+        assert_eq!(oidc_redirect_uri_effective(&cfg), (String::new(), true));
+    }
+
+    /// The address the provider sends the browser back to has to be one this
+    /// instance actually serves the callback at, and one an identity may
+    /// safely cross: https everywhere except a loopback development server.
+    #[test]
+    fn oidc_redirect_uri_is_validated_where_it_is_set() {
+        for good in [
+            "https://kb.example.test/api/v1/auth/oidc/callback",
+            "https://kb.example.test:8443/api/v1/auth/oidc/callback",
+            "http://localhost:8787/api/v1/auth/oidc/callback",
+            "http://127.0.0.1:8787/api/v1/auth/oidc/callback",
+        ] {
+            let mut cfg = GlobalConfig::default();
+            apply(&mut cfg, "auth.oidc.redirect_uri", good).unwrap_or_else(|e| {
+                panic!("{good} should be accepted: {e}");
+            });
+            assert!(oidc_redirect_uri_problem(good).is_none());
+        }
+
+        let cases = [
+            ("http://kb.example.test/api/v1/auth/oidc/callback", "https"),
+            (
+                "https://kb.example.test/callback",
+                "/api/v1/auth/oidc/callback",
+            ),
+            ("/api/v1/auth/oidc/callback", "absolute"),
+            ("not a url at all", "absolute"),
+        ];
+        for (bad, phrase) in cases {
+            let mut cfg = GlobalConfig::default();
+            let err = apply(&mut cfg, "auth.oidc.redirect_uri", bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(phrase),
+                "{bad} must be refused with teaching text naming '{phrase}', got: {err}"
+            );
+            assert!(cfg.auth.is_none(), "a rejected value is not written");
+        }
+    }
+
+    #[test]
+    fn oidc_redirect_uri_names_the_setting_in_every_refusal() {
+        for bad in ["http://kb.example.test/api/v1/auth/oidc/callback", "junk"] {
+            let problem = oidc_redirect_uri_problem(bad).unwrap();
+            assert!(
+                problem.contains("auth.oidc.redirect_uri"),
+                "the refusal must name the key it is about: {problem}"
+            );
+        }
+    }
+
+    #[test]
+    fn oidc_default_role_refuses_an_unknown_role() {
+        let mut cfg = GlobalConfig::default();
+        let err = apply(&mut cfg, "auth.oidc.default_role", "owner").unwrap_err();
+        assert!(err.to_string().contains("viewer, editor or admin"), "{err}");
+        assert!(cfg.auth.is_none(), "a rejected role must not be written");
+    }
+
+    /// Unset is how a key is turned off; an empty string would leave a
+    /// present-but-blank value behind, so it is refused with that instruction.
+    #[test]
+    fn an_empty_oidc_value_is_refused_with_the_unset_instruction() {
+        let mut cfg = GlobalConfig::default();
+        for key in [
+            "auth.oidc.issuer",
+            "auth.oidc.client_id",
+            "auth.oidc.client_secret",
+            "auth.oidc.name",
+            "auth.oidc.scopes",
+            "auth.oidc.default_role",
+        ] {
+            let err = apply(&mut cfg, key, "   ").unwrap_err();
+            assert!(err.to_string().contains("unset it instead"), "{key}: {err}");
+        }
+        assert!(cfg.auth.is_none());
+    }
+
+    #[test]
+    fn oidc_scopes_normalize_to_one_space_separated_parameter() {
+        let mut cfg = GlobalConfig::default();
+        apply(&mut cfg, "auth.oidc.scopes", "  openid   profile\n email ").unwrap();
+        assert_eq!(
+            cfg.auth_oidc().and_then(|o| o.scopes.as_deref()),
+            Some("openid profile email")
+        );
+    }
+
+    /// Every oidc key is startup-effective: the relying party is built once
+    /// when the HTTP surface comes up, so a change waits for the next start.
+    #[test]
+    fn every_oidc_key_is_startup_effective() {
+        for spec in registry()
+            .iter()
+            .filter(|s| s.key.starts_with("auth.oidc."))
+        {
+            assert!(spec.startup_effective, "{}", spec.key);
+        }
     }
 }

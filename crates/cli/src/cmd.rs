@@ -799,37 +799,30 @@ fn provision_action_label(status: &str) -> &str {
 
 // --- domain remove -----------------------------------------------------------
 
-/// Remove a domain from the global config. Leaves its files and index rows
-/// untouched; the rows are only dropped by a later full reindex.
-pub fn domain_remove(name: &str, config_override: Option<&Path>, json: bool) -> Result<()> {
-    let loaded = load(config_override)?;
-    let mut cfg = loaded.file;
-    if cfg.domains.shift_remove(name).is_none() {
-        // A miss in the file config may be an env-defined domain: those are
-        // immune to `domain remove` (the variable is their source of truth).
-        if let Some(env) = loaded.overlay.env_domain(name) {
-            bail!(
-                "domain '{name}' is defined by the environment variable {}; unset it to manage this domain in the config file",
-                env.var
-            );
-        }
-        bail!("no domain named '{name}' is registered");
-    }
-    config::save_yaml(&loaded.path, &cfg)
-        .map_err(|e| anyhow!("failed to save config {}: {e}", loaded.path.display()))?;
+/// Render the engine's own unregistration report.
+///
+/// The removal itself is `crystalline_service::domain_remove`, the entry point
+/// every surface calls; this only says what happened. The two sentences it can
+/// print are the two things that differ by kind, and the difference is the
+/// whole reason a virtual domain needs `--purge`: a file or team domain's files
+/// were left exactly where they are and registering the folder again re-adopts
+/// them, while a virtual domain's engrams were in the database and are gone.
+pub fn print_domain_remove(name: &str, report: &serde_json::Value, json: bool) {
     if json {
-        println!(
-            "{}",
-            serde_json::json!({
-                "removed": name,
-                "note": "index rows for this domain remain until the next full reindex",
-            })
-        );
-    } else {
-        println!("Removed domain '{name}' (files and index rows left untouched)");
-        println!("Run: crystalline reindex --full to drop its rows from the index");
+        println!("{report}");
+        return;
     }
-    Ok(())
+    let files_kept = report["files_kept"].as_bool().unwrap_or(true);
+    println!("Unregistered domain '{name}' and cleared its rows from the index.");
+    if files_kept {
+        println!("Its files were left untouched: register the folder again to re-adopt them.");
+    } else {
+        println!("It was a virtual domain, so its engrams went with it.");
+    }
+    let rooms = report["rooms_closed"].as_u64().unwrap_or(0);
+    if rooms > 0 {
+        println!("{rooms} open co-editing session(s) were saved and closed.");
+    }
 }
 
 // --- domain list -------------------------------------------------------------
@@ -1003,7 +996,66 @@ pub async fn sync(
         let store = store.lock().await;
         store.checkpoint_wal().await?;
     }
+
+    // A file that failed to read, parse or upsert is a real failure, not a
+    // shrug: `doctor` exits 1 on a problem and `verify` exits 2, so a sync
+    // that printed a `failed:` line and still exited 0 was the outlier, and a
+    // CI step piping through it could not see the partial failure at all.
+    // The full report (JSON included) has already printed above, so a
+    // `--json` consumer still gets the complete document before this fails
+    // the process. The direct path has no equivalent of a whole domain
+    // skipped by a scan error: `scan_domain` above is called with `?`, so
+    // that class already aborts the whole command immediately rather than
+    // being collected here - `scan_failed` is always empty on this path, and
+    // only the daemon-routed path in `sync_dispatch` (`main.rs`) passes one.
+    if let Some(err) = sync_failure(&reports, &[]) {
+        return Err(err);
+    }
     Ok(())
+}
+
+/// The error `sync` fails with when either failure class is present, or
+/// `None` when both are empty. Shared by both ways a sync can run - directly,
+/// above, and daemon-routed through `sync_dispatch` in `main.rs`, which reads
+/// both classes back out of the daemon's own JSON and calls this too - so the
+/// wording and the trigger condition can never drift apart between the two
+/// paths, and a user cannot tell which one handled their command from the
+/// failure alone.
+///
+/// The two classes mean different things to a person, so a combined failure
+/// names both rather than merging them into one count: a file in `reports[].failed`
+/// is theirs to edit (bad frontmatter, most often), while a domain in
+/// `scan_failed` could not be scanned at all, which is usually a path or
+/// permission problem - not something a file edit fixes.
+pub(crate) fn sync_failure(
+    reports: &[crystalline_index::SyncReport],
+    scan_failed: &[(String, String)],
+) -> Option<anyhow::Error> {
+    let failed_count: usize = reports.iter().map(|r| r.failed.len()).sum();
+    if failed_count == 0 && scan_failed.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if failed_count > 0 {
+        let domains: Vec<&str> = reports
+            .iter()
+            .filter(|r| !r.failed.is_empty())
+            .map(|r| r.domain.as_str())
+            .collect();
+        parts.push(format!(
+            "{failed_count} file(s) failed to sync in domain(s): {}",
+            domains.join(", ")
+        ));
+    }
+    if !scan_failed.is_empty() {
+        let domains: Vec<&str> = scan_failed.iter().map(|(name, _)| name.as_str()).collect();
+        parts.push(format!(
+            "{} domain(s) could not be scanned at all, usually a path or permission problem: {}",
+            scan_failed.len(),
+            domains.join(", ")
+        ));
+    }
+    Some(anyhow!(parts.join("; ")))
 }
 
 // --- reindex -----------------------------------------------------------------
@@ -1825,20 +1877,32 @@ async fn device_flow_sign_in(
     let start = crystalline_remote::github::auth::start_device_flow(auth_base, client_id)
         .await
         .map_err(|e| anyhow!("{e}"))?;
-    print_device_code(&start);
+    print_device_code(&start, auth_base);
 
     let ticker = tokio::spawn(async {
+        let mut ticks: u32 = 0;
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             eprint!(".");
             let _ = std::io::Write::flush(&mut std::io::stderr());
+            ticks += 1;
+            // A minute of dots and still nothing: the most common reason is
+            // the person entered the code and closed the tab without
+            // clicking Authorize, so say so once rather than dotting forever.
+            if ticks == 60 {
+                eprintln!();
+                eprintln!(
+                    "Still waiting - did the page after the code show an Authorize button? The sign-in lands when it is clicked."
+                );
+                eprint!("Waiting for confirmation");
+            }
         }
     });
     let poll =
         crystalline_remote::github::auth::run_device_flow(auth_base, client_id, &start).await;
     ticker.abort();
     eprintln!();
-    let access_token = poll.map_err(|e| anyhow!("{e}"))?;
+    let access_token = poll.map_err(|e| device_flow_error(auth_base, e))?;
 
     let login = crystalline_remote::github::auth::validate_token(api_url, &access_token)
         .await
@@ -1847,14 +1911,61 @@ async fn device_flow_sign_in(
 }
 
 /// Prints the device flow's user code and verification url unmissably: this
-/// is the moment a non-engineer copies a code into a browser.
-fn print_device_code(start: &crystalline_remote::DeviceFlowStart) {
+/// is the moment a non-engineer copies a code into a browser. The line under
+/// the box is the confirmation guidance's first sentence - what to do next,
+/// not just where to type the code - so the same warning that trips people
+/// up (closing the tab instead of clicking Authorize) is in view up front.
+fn print_device_code(start: &crystalline_remote::DeviceFlowStart, auth_base: &str) {
     eprintln!();
     eprintln!("================================================");
     eprintln!("  Go to: {}", start.verification_url);
     eprintln!("  Enter this code: {}", start.user_code);
     eprintln!("================================================");
+    eprintln!(
+        "{}",
+        first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
+            auth_base
+        ))
+    );
     eprint!("Waiting for confirmation");
+}
+
+/// The first sentence of `text`, period included - `confirmation_guidance`'s
+/// opening sentence is the one line of it that fits under the code box; the
+/// rest (the applications url, the enterprise policy note) is repeated in
+/// full elsewhere rather than crammed in here.
+fn first_sentence(text: &str) -> &str {
+    match text.find(". ") {
+        Some(period) => &text[..=period],
+        None => text,
+    }
+}
+
+/// Maps a `run_device_flow` outcome to the error `crystalline connect
+/// github` prints. `RemoteError::AuthExpired` means the device code expired
+/// before the browser side finished - GitHub's own reason for that says
+/// nothing about Authorize, so this says it: what happened, the Authorize
+/// reminder repeated, and where to check whether an earlier attempt already
+/// landed. Every other error passes through unchanged; a declined sign-in,
+/// offline and the rest already carry their own actionable message.
+fn device_flow_error(auth_base: &str, e: crystalline_remote::RemoteError) -> anyhow::Error {
+    if matches!(e, crystalline_remote::RemoteError::AuthExpired) {
+        // "Next time:" frames the repeated Authorize sentence as advice for
+        // the retry rather than an instruction to act on a code that no
+        // longer exists - the sentence itself is reused verbatim from
+        // `confirmation_guidance` (via `first_sentence`) rather than
+        // reworded here, so there is still exactly one place that wording
+        // lives.
+        anyhow!(
+            "The code expired before it was authorized. Next time: {} Check {} to see whether an earlier attempt already landed.",
+            first_sentence(&crystalline_remote::github::auth::confirmation_guidance(
+                auth_base
+            )),
+            crystalline_remote::github::auth::authorized_apps_url(auth_base)
+        )
+    } else {
+        anyhow!("{e}")
+    }
 }
 
 /// The bare host `TokenStore::save_resolving` and `resolve_and_load` address,
@@ -2168,6 +2279,73 @@ mod connect_identity_tests {
             "{:?}",
             path(&machine)
         );
+    }
+}
+
+#[cfg(test)]
+mod first_sentence_tests {
+    use super::first_sentence;
+
+    #[test]
+    fn the_period_is_included_and_nothing_after_it() {
+        assert_eq!(first_sentence("One. Two. Three."), "One.");
+    }
+
+    #[test]
+    fn text_with_no_period_space_comes_back_whole() {
+        assert_eq!(
+            first_sentence("No sentence break here"),
+            "No sentence break here"
+        );
+    }
+}
+
+#[cfg(test)]
+mod device_flow_error_tests {
+    use super::device_flow_error;
+
+    /// The one mapped case: an expired code gets the Authorize reminder and
+    /// the applications url, not GitHub's bare "device_code expired".
+    #[test]
+    fn auth_expired_repeats_the_authorize_sentence_and_the_applications_url() {
+        let err = device_flow_error(
+            "https://github.com",
+            crystalline_remote::RemoteError::AuthExpired,
+        )
+        .to_string();
+        assert!(err.contains("expired"), "{err}");
+        assert!(err.contains("Authorize"), "{err}");
+        assert!(
+            err.contains("https://github.com/settings/connections/applications"),
+            "{err}"
+        );
+    }
+
+    /// A GHES auth base carries through to the applications url in the
+    /// mapped message, same as everywhere else this is derived.
+    #[test]
+    fn auth_expired_derives_the_applications_url_from_a_ghes_auth_base() {
+        let err = device_flow_error(
+            "https://github.example.com",
+            crystalline_remote::RemoteError::AuthExpired,
+        )
+        .to_string();
+        assert!(
+            err.contains("https://github.example.com/settings/connections/applications"),
+            "{err}"
+        );
+    }
+
+    /// Every other error passes through unchanged - it already carries its
+    /// own actionable message.
+    #[test]
+    fn every_other_error_passes_through_unchanged() {
+        let err = device_flow_error(
+            "https://github.com",
+            crystalline_remote::RemoteError::Offline,
+        )
+        .to_string();
+        assert_eq!(err, crystalline_remote::RemoteError::Offline.to_string());
     }
 }
 

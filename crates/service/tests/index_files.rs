@@ -12,6 +12,7 @@ use std::sync::Arc;
 use crystalline_core::config::{DomainEntry, GlobalConfig, IndexConfig};
 use crystalline_index::TursoStore;
 use crystalline_service::Engine;
+use crystalline_service::Scope;
 use crystalline_service::params::*;
 use tokio::sync::Mutex;
 
@@ -105,13 +106,16 @@ async fn a_move_and_a_delete_keep_both_folders_in_step() {
 
     // Moving the only engram out of a folder removes that folder's listing.
     engine
-        .move_engram(&MoveParams {
-            identifier: "runbooks/restart".to_string(),
-            domain: "notes".to_string(),
-            destination: "archive/restart.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &MoveParams {
+                identifier: "runbooks/restart".to_string(),
+                domain: "notes".to_string(),
+                destination: "archive/restart.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert!(!root.join("runbooks/index.md").exists());
@@ -160,6 +164,7 @@ async fn an_edit_that_changes_the_title_updates_the_listing() {
             expected_replacements: None,
             include_subsections: false,
             expected_checksum: None,
+            ack_scope: None,
         })
         .await
         .unwrap();
@@ -217,21 +222,27 @@ async fn a_dropped_in_index_or_log_file_is_never_indexed() {
     engine.sync(None).await.unwrap();
 
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("reservedlogtoken".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("reservedlogtoken".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 0, "a reserved file never reaches search");
 
     let browsed = engine
-        .browse_domain(&BrowseParams {
-            domain: "notes".to_string(),
-            path: None,
-            depth: None,
-            glob: None,
-        })
+        .browse_domain(
+            &BrowseParams {
+                domain: "notes".to_string(),
+                path: None,
+                depth: None,
+                glob: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     let paths: Vec<&str> = browsed["engrams"]
@@ -274,13 +285,16 @@ async fn a_reserved_destination_is_refused_with_an_actionable_error() {
         .await
         .unwrap();
     let err = engine
-        .move_engram(&MoveParams {
-            identifier: "keeper".to_string(),
-            domain: "notes".to_string(),
-            destination: "runbooks/index.md".to_string(),
-            destination_domain: None,
-            update_links: None,
-        })
+        .move_engram(
+            &MoveParams {
+                identifier: "keeper".to_string(),
+                domain: "notes".to_string(),
+                destination: "runbooks/index.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("reserved"), "{err}");
@@ -309,10 +323,13 @@ async fn the_setting_turned_off_generates_nothing_and_leaves_existing_files_alon
     );
     // It stays out of the index either way.
     let hits = engine
-        .search_engrams(&SearchParams {
-            query: Some("hand".to_string()),
-            ..SearchParams::default()
-        })
+        .search_engrams(
+            &SearchParams {
+                query: Some("hand".to_string()),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
         .await
         .unwrap();
     assert_eq!(hits["total"], 0);

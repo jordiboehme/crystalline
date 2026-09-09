@@ -79,6 +79,109 @@ describe("the login screen", () => {
     expect(screen.getByRole("heading", { name: "Fluid" })).toBeVisible();
   });
 
+  it("offers the provider's own button beside the credentials form", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp("/login");
+
+    // Labelled with the provider's own name, so somebody told "sign in with
+    // Contoso" reads the word they were told. A link rather than a button:
+    // what follows is a redirect to the provider's own domain and a redirect
+    // back, which a background fetch would walk invisibly.
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+    // And the local form is still the way in it always was: single sign-on is
+    // layered over local accounts, never in place of them.
+    expect(screen.getByLabelText("Name")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Log in" })).toBeVisible();
+  });
+
+  it("draws no provider button on an instance that has none", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({ local: true, oidc: { enabled: false } }),
+    });
+
+    renderApp("/login");
+
+    await screen.findByLabelText("Name");
+    expect(screen.queryByRole("link", { name: /sign in with/i })).toBeNull();
+  });
+
+  it("the provider link carries the intended destination as return_to", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    // Not `/login` directly: this is the OAuth consent screen `RequireAuth`
+    // intercepted, and the destination it carries along is what the button
+    // has to echo as `return_to`, so a provider sign-in started from here
+    // comes back to the exact pending authorization rather than the home
+    // screen.
+    renderApp("/authorize?request=req-1");
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute(
+      "href",
+      "/api/v1/auth/oidc/login?return_to=%2Fauthorize%3Frequest%3Dreq-1",
+    );
+  });
+
+  it("carries no return_to when nothing redirected here", async () => {
+    serve({
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp("/login");
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+  });
+
+  it("carries no return_to when the interrupted journey was already the home screen", async () => {
+    serve({
+      // Anonymous stays false: an identity-less request to `/` is exactly
+      // what `RequireAuth` intercepts and sends here with `from` set, so
+      // this is the "root, but via an interrupted journey" case - distinct
+      // from the direct-visit case above, where `from` is unset entirely.
+      "/auth/me": () => meResponse(),
+      "/auth/providers": () => ({
+        local: true,
+        oidc: { enabled: true, name: "Contoso" },
+      }),
+    });
+
+    renderApp("/");
+
+    const button = await screen.findByRole("link", {
+      name: "Sign in with Contoso",
+    });
+    // The destination is `/`, the server's own default, so there is nothing
+    // for `return_to` to add - this is the bare href the e2e smoke test
+    // pins for a plain sign-in.
+    expect(button).toHaveAttribute("href", "/api/v1/auth/oidc/login");
+  });
+
   it("shows the server's own words when the credentials are refused", async () => {
     serve({
       "/auth/me": () => meResponse(),

@@ -42,7 +42,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo nextest run
-        run: cargo nextest run --workspace
+        # The `ci` profile is the default one plus a single retry, so an
+        # environmental failure on a hosted runner reports FLAKY instead of
+        # turning a green change red. A test that fails twice still fails.
+        run: cargo nextest run --workspace --profile ci
 
       - name: cargo test --doc
         run: cargo test --workspace --doc
@@ -206,8 +209,9 @@ jobs:
         working-directory: fluid
 
       # Stands up the daemon on a scratch state directory with the fixture
-      # domain and one account, checks the UI the daemon serves out of the
-      # binary, rebuilds the bundle and runs Playwright against `vite preview`.
+      # domains and three accounts (one of those domains private to the first
+      # of them), checks the UI the daemon serves out of the binary, rebuilds
+      # the bundle and runs Playwright against `vite preview`.
       # The script is the whole sequence, so a local run is the same run.
       - name: Run the browser smoke
         run: bash fluid/e2e/run-smoke.sh

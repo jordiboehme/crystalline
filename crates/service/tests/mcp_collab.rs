@@ -495,7 +495,7 @@ async fn configure_with_no_args_reports_the_settings_snapshot_and_github_block()
 
     let out = call(peer, "configure", json!({})).await.unwrap();
     let settings = out["settings"].as_array().unwrap();
-    assert_eq!(settings.len(), 24, "{settings:?}");
+    assert_eq!(settings.len(), 35, "{settings:?}");
     assert!(settings.iter().any(|s| s["key"] == "github.enabled"));
     assert!(settings.iter().any(|s| s["key"] == "github.stacks"));
     assert!(settings.iter().any(|s| s["key"] == "domains_root"));
@@ -880,7 +880,7 @@ async fn device_flow_refuses_when_the_environment_owns_the_token() {
     );
     let eng = engine_for_connect_with_env_token(false, auth, tmp.path(), "gho_SECRETSECRET").await;
 
-    let err = eng.start_device_connect(None).await.unwrap_err();
+    let err = eng.start_device_connect(None, false).await.unwrap_err();
     assert!(matches!(err, EngineError::EnvTokenConnect));
     assert!(
         err.to_string().contains("CRYSTALLINE_GITHUB_TOKEN"),
@@ -923,7 +923,7 @@ async fn device_flow_second_connect_reports_the_same_pending_code_then_lands_con
     );
     let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
-    let first = eng.start_device_connect(None).await.unwrap();
+    let first = eng.start_device_connect(None, false).await.unwrap();
     assert_eq!(first["github"]["connected"], json!(false));
     assert_eq!(first["github"]["pending_connect"]["pending"], json!(true));
     assert_eq!(
@@ -933,7 +933,7 @@ async fn device_flow_second_connect_reports_the_same_pending_code_then_lands_con
 
     // A second connect call while the flow is still waiting on the user
     // reports the same pending code rather than starting a second flow.
-    let second = eng.start_device_connect(None).await.unwrap();
+    let second = eng.start_device_connect(None, false).await.unwrap();
     assert_eq!(
         second["github"]["pending_connect"]["user_code"],
         json!("ABCD-1234")
@@ -970,7 +970,7 @@ async fn device_flow_start_reports_github_enabled_and_a_note_when_disabled() {
     // explicitly rather than leaving an agent to infer it from tool wording.
     let eng = engine_for_connect(auth, tmp.path()).await;
 
-    let result = eng.start_device_connect(None).await.unwrap();
+    let result = eng.start_device_connect(None, false).await.unwrap();
     assert_eq!(result["github"]["github_enabled"], json!(false));
     assert_eq!(
         result["github"]["note"],
@@ -990,7 +990,7 @@ async fn device_flow_start_reports_github_enabled_and_a_note_when_enabled() {
     );
     let eng = engine_for_connect_with(true, auth, tmp.path()).await;
 
-    let result = eng.start_device_connect(None).await.unwrap();
+    let result = eng.start_device_connect(None, false).await.unwrap();
     assert_eq!(result["github"]["github_enabled"], json!(true));
     assert_eq!(
         result["github"]["note"],
@@ -1000,8 +1000,345 @@ async fn device_flow_start_reports_github_enabled_and_a_note_when_enabled() {
     );
 }
 
+/// The pending view tells the caller what to do after the code is entered
+/// and where to check it landed - not just where to type the code - so a
+/// model relaying the result has the whole story, not half of it.
 #[tokio::test]
-async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears() {
+async fn device_flow_pending_view_carries_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng.start_device_connect(None, false).await.unwrap();
+    let next_steps = result["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
+    assert!(
+        next_steps.contains("https://github.com/settings/connections/applications"),
+        "{next_steps}"
+    );
+}
+
+/// A second `configure` call while the same flow is still pending reports
+/// the same code (see the double-click behavior above) and, with it, the
+/// same guidance - it is stored once at flow start, not recomputed.
+#[tokio::test]
+async fn a_second_call_while_pending_carries_the_same_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    let second = eng.configure_snapshot().await.unwrap();
+    let first_next_steps = first["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    // Pinned on substance, not just equal to the second call's value: two
+    // absent keys would also be equal, and would still pass a bare
+    // `assert_eq!` between the two views.
+    assert!(first_next_steps.contains("Authorize"), "{first_next_steps}");
+    assert!(
+        first_next_steps.contains("https://github.com/settings/connections/applications"),
+        "{first_next_steps}"
+    );
+    assert_eq!(
+        first["github"]["pending_connect"]["next_steps"],
+        second["github"]["pending_connect"]["next_steps"]
+    );
+}
+
+/// A GitHub Enterprise Server host derives its own applications url, not
+/// github.com's - the device flow talks to the GHES host directly.
+#[tokio::test]
+async fn a_ghes_host_yields_the_ghes_applications_url_in_next_steps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let result = eng
+        .start_device_connect(Some("github.example.com"), false)
+        .await
+        .unwrap();
+    let next_steps = result["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(
+        next_steps.contains("https://github.example.com/settings/connections/applications"),
+        "{next_steps}"
+    );
+}
+
+/// A pending view reports what is LEFT of the code's life, not the expiry
+/// the flow started with. The frozen number was the bug: a colleague's live
+/// sign-in read `900` on every poll and so looked frozen, which is what sent
+/// five rounds of trace gathering after a flow that was fine.
+///
+/// Driven on the runtime's paused clock, which is why `started_at` is a
+/// `tokio::time::Instant`: nothing here sleeps through two real minutes.
+#[tokio::test]
+async fn a_pending_view_counts_down_instead_of_repeating_the_original_expiry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    tokio::time::pause();
+    let started = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        started["github"]["pending_connect"]["expires_in_secs"],
+        json!(900),
+        "a code issued this instant has its whole life left"
+    );
+
+    tokio::time::advance(std::time::Duration::from_secs(120)).await;
+
+    let later = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        later["github"]["pending_connect"]["expires_in_secs"],
+        json!(780),
+        "two minutes on, two minutes fewer: a caller that polls watches it fall"
+    );
+
+    // Past the code's whole life the countdown saturates rather than wrapping
+    // around a `u64` subtraction.
+    tokio::time::advance(std::time::Duration::from_secs(5_000)).await;
+    let expired = eng.configure_snapshot().await.unwrap();
+    assert_eq!(
+        expired["github"]["pending_connect"]["expires_in_secs"],
+        json!(0),
+        "a run-out code reports nothing left, never a wrapped number"
+    );
+}
+
+/// A second connect while one is pending still reports the outstanding code -
+/// the double-click behavior - and now also says how to give up on it. The
+/// way out used to exist nowhere: the slot answered with the same unusable
+/// code forever.
+#[tokio::test]
+async fn a_second_connect_while_pending_names_restart_as_the_way_out() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth, tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    let first_next_steps = first["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        !first_next_steps.contains("restart"),
+        "a first connect does not advertise abandoning a code nobody has tried: {first_next_steps}"
+    );
+
+    let second = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        second["github"]["pending_connect"]["user_code"],
+        json!("ABCD-1234"),
+        "the outstanding code, not a second one"
+    );
+    let second_next_steps = second["github"]["pending_connect"]["next_steps"]
+        .as_str()
+        .unwrap();
+    assert!(
+        second_next_steps.starts_with(&first_next_steps),
+        "the guidance is extended, not replaced: {second_next_steps}"
+    );
+    assert!(
+        second_next_steps.contains("restart"),
+        "the second call names the way out: {second_next_steps}"
+    );
+}
+
+/// `restart` abandons the pending flow and issues a fresh code: the response
+/// carries the NEW code, the old background task is dropped rather than left
+/// to land on top of the new sign-in, and the flow that finally lands is the
+/// second one.
+#[tokio::test]
+async fn a_restart_abandons_the_pending_flow_and_issues_a_fresh_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
+        device_code: "devcode-two".to_string(),
+        user_code: "WXYZ-9876".to_string(),
+        verification_url: "https://github.com/login/device".to_string(),
+        interval_secs: 0,
+        expires_in_secs: 900,
+    }));
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    let first = eng.start_device_connect(None, false).await.unwrap();
+    assert_eq!(
+        first["github"]["pending_connect"]["user_code"],
+        json!("ABCD-1234")
+    );
+    // Abandoning a task that has never been polled would prove nothing, so
+    // wait until the flow is actually running before restarting it.
+    wait_until(|| async { auth.run_was_entered().then_some(()) }).await;
+
+    let restarted = eng.start_device_connect(None, true).await.unwrap();
+    assert_eq!(
+        restarted["github"]["pending_connect"]["user_code"],
+        json!("WXYZ-9876"),
+        "a restart issues a fresh code rather than repeating the old one"
+    );
+
+    // The abort takes effect at the task's next poll, so this is polled.
+    wait_until(|| async { auth.run_was_abandoned().then_some(()) }).await;
+
+    // The gate releases exactly one flow, and the one still standing is the
+    // second: the abandoned task can neither consume the outcome nor write
+    // into the slot the fresh flow now owns.
+    auth.run_gate.notify_one();
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["connected"] == json!(true)).then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+    assert!(landed["github"]["pending_connect"].is_null());
+}
+
+/// A `restart` against a sign-in that has already LANDED reports the outcome
+/// rather than throwing it away.
+///
+/// The restart arm used to be matched first, so `restart: true` on a flow that
+/// had finished dropped its one-shot report and answered with a fresh code
+/// beside `connected: true` - a code for a sign-in nobody needed any more. The
+/// landed outcome is drained and reported first now, and the slot is clear
+/// afterwards, so a caller who really does want a new sign-in asks again.
+#[tokio::test]
+async fn a_restart_after_the_flow_landed_reports_it_instead_of_starting_over() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    // Spare codes, because the loop below may ask for one: a restart that
+    // arrives before the outcome has landed is the ordinary abandon-and-start
+    // case, and the double must have a code left to answer it with.
+    for n in 2..=6 {
+        auth.queue_start(Ok(crystalline_remote::DeviceFlowStart {
+            device_code: format!("devcode-{n}"),
+            user_code: format!("WXYZ-000{n}"),
+            verification_url: "https://github.com/login/device".to_string(),
+            interval_secs: 0,
+            expires_in_secs: 900,
+        }));
+    }
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    // The state under test is "landed in the slot and not read yet", and every
+    // read that would confirm it also DRAINS it - so the restart call is the
+    // observation. Asking again is safe and is what keeps this deterministic
+    // under load: a restart that lands first abandons the flow and starts a
+    // fresh one, which is released here and asked about on the next turn.
+    let landed = wait_until(|| async {
+        let snap = eng.start_device_connect(None, true).await.unwrap();
+        if snap["github"]["connected"] == json!(true) {
+            return Some(snap);
+        }
+        auth.run_gate.notify_one();
+        auth.rearm(Ok("device-token".to_string()), Ok("octocat".to_string()));
+        None
+    })
+    .await;
+    assert_eq!(
+        landed["github"]["user"],
+        json!("octocat"),
+        "the restart reports the sign-in that landed"
+    );
+    assert!(
+        landed["github"]["pending_connect"].is_null(),
+        "and issues no code for a sign-in that is already done: {landed}"
+    );
+}
+
+/// A sign-in that lands narrates itself: one line per step, so the next
+/// "it looks stuck" report is answered from one daemon log rather than five
+/// rounds of trace gathering. And nothing secret is in any of them - the
+/// short code the user is being told to type is deliberate, the device code
+/// and the access token never appear.
+#[tokio::test]
+async fn a_landed_device_sign_in_logs_every_step_and_no_secret() {
+    let (logs, _guard) = support::capture_logs();
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Ok("device-token".to_string()),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (snap["github"]["connected"] == json!(true)).then_some(snap)
+    })
+    .await;
+
+    for expected in [
+        // started, with the identity, the code and the code's life
+        "github device sign-in started",
+        "user_code=ABCD-1234",
+        "expires_in_secs=900",
+        "identity=instance",
+        // the three that follow it
+        "access token received from GitHub",
+        "token validated",
+        "login=octocat",
+        // and where the token came to rest
+        "github token saved",
+        "store=\"file\"",
+    ] {
+        assert!(
+            logs.any_contains(expected),
+            "the success path never logged {expected}: {:#?}",
+            logs.lines()
+        );
+    }
+
+    for secret in ["device-token", "devcode"] {
+        assert!(
+            !logs.any_contains(secret),
+            "a secret reached the log: {secret} in {:#?}",
+            logs.lines()
+        );
+    }
+}
+
+/// A flow that ends badly says so once, naming the step it died at and the
+/// error - the other half of answering "it looks stuck" from the log.
+#[tokio::test]
+async fn a_failed_device_sign_in_logs_the_step_it_failed_at() {
+    let (logs, _guard) = support::capture_logs();
     let tmp = tempfile::tempdir().unwrap();
     let auth = fake_auth(
         Ok(device_flow_start()),
@@ -1010,20 +1347,112 @@ async fn device_flow_failure_is_reported_once_as_an_error_then_the_slot_clears()
     );
     let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
 
-    eng.start_device_connect(None).await.unwrap();
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+    wait_until(|| async {
+        logs.any_contains("github device sign-in failed")
+            .then_some(())
+    })
+    .await;
+
+    assert!(
+        logs.any_contains("step=\"poll\""),
+        "the warn names the step: {:#?}",
+        logs.lines()
+    );
+    assert!(
+        logs.any_contains("WARN"),
+        "a failed flow is a warning, not an info line: {:#?}",
+        logs.lines()
+    );
+}
+
+#[tokio::test]
+async fn device_flow_failure_is_reported_once_with_next_steps_then_the_slot_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Err(RemoteError::AuthExpired),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    eng.start_device_connect(None, false).await.unwrap();
     auth.run_gate.notify_one();
 
-    let landed_err = wait_until(|| async { eng.configure_snapshot().await.err() }).await;
+    // A landed failure is a report, not a bare error: the real credential
+    // state (here, never connected, so connected: false) with both the
+    // reason and actionable next_steps beside it, so a model relaying the
+    // result has something to tell the person rather than a dead end. See
+    // the sibling test below for the already-connected case.
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (!snap["github"]["error"].is_null()).then_some(snap)
+    })
+    .await;
+    assert_eq!(landed["github"]["connected"], json!(false));
+    assert_eq!(
+        landed["github"]["error"],
+        json!("The GitHub connection has expired or was revoked. Use configure to sign in again.")
+    );
+    let next_steps = landed["github"]["next_steps"].as_str().unwrap();
+    assert!(next_steps.contains("expired"), "{next_steps}");
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
     assert!(
-        matches!(landed_err, EngineError::Remote(RemoteError::AuthExpired)),
-        "{landed_err}"
+        next_steps.contains("settings/connections/applications"),
+        "{next_steps}"
     );
 
     // Reported once: the slot is now clear and a plain snapshot no longer
-    // errors, reporting the ordinary (never-connected) state.
+    // carries an error, reporting the ordinary (never-connected) state.
     let after = eng.configure_snapshot().await.unwrap();
     assert_eq!(after["github"]["connected"], json!(false));
     assert!(after["github"]["pending_connect"].is_null());
+    assert!(after["github"]["error"].is_null());
+}
+
+/// A landed failure is built from the same credential read as a successful
+/// one - the working token is not thrown away just because a re-connect
+/// attempt on top of it expired. Without this, an instance that is already
+/// connected would see `connected: false` for one call (a lie) and then
+/// `connected: true` again on the next, purely because the slot cleared.
+#[tokio::test]
+async fn a_landed_failure_reports_the_real_credential_state_beside_the_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let auth = fake_auth(
+        Ok(device_flow_start()),
+        Err(RemoteError::AuthExpired),
+        Ok("octocat".to_string()),
+    );
+    let eng = engine_for_connect_with(true, auth.clone(), tmp.path()).await;
+
+    // A working credential is already on file...
+    let connected = eng.connect_with_token("pat-123", None).await.unwrap();
+    assert_eq!(connected["github"]["connected"], json!(true));
+
+    // ...then a re-connect's device flow expires.
+    eng.start_device_connect(None, false).await.unwrap();
+    auth.run_gate.notify_one();
+
+    let landed = wait_until(|| async {
+        let snap = eng.configure_snapshot().await.unwrap();
+        (!snap["github"]["error"].is_null()).then_some(snap)
+    })
+    .await;
+    assert_eq!(
+        landed["github"]["connected"],
+        json!(true),
+        "the stored credential must not be reported lost: {landed}"
+    );
+    assert_eq!(landed["github"]["user"], json!("octocat"));
+    assert_eq!(landed["github"]["token_store"], json!("file"));
+    assert_eq!(
+        landed["github"]["error"],
+        json!("The GitHub connection has expired or was revoked. Use configure to sign in again.")
+    );
+    assert!(landed["github"]["pending_connect"].is_null());
+    let next_steps = landed["github"]["next_steps"].as_str().unwrap();
+    assert!(next_steps.contains("Authorize"), "{next_steps}");
 }
 
 /// The gate sits ABOVE the pending drain, so on a disabled instance a bare
@@ -1040,7 +1469,7 @@ async fn a_disabled_snapshot_leaves_a_landed_outcome_for_the_settings_surface() 
     );
     let eng = engine_for_connect(auth.clone(), tmp.path()).await;
 
-    eng.start_device_connect(None).await.unwrap();
+    eng.start_device_connect(None, false).await.unwrap();
     auth.run_gate.notify_one();
 
     // The snapshot call sits INSIDE the poll loop deliberately. Nothing can
@@ -1165,7 +1594,7 @@ async fn a_landed_device_flow_refreshes_the_cached_credential() {
     // Populate the cache with the stale identity, then start the flow.
     let before = eng.configure_snapshot().await.unwrap();
     assert_eq!(before["github"]["user"], json!("olduser"));
-    eng.start_device_connect(None).await.unwrap();
+    eng.start_device_connect(None, false).await.unwrap();
 
     // Let the background task run to completion; its save (moved into the
     // task as a TokenSavePlan) must refresh the cache with the new identity.
@@ -1817,6 +2246,8 @@ async fn origin_status_tool_wires_through_to_origin_status() {
     .await
     .unwrap();
 
+    std::fs::write(root.join("gone.md"), engram("Gone", "gone", "local only")).unwrap();
+
     let (client, _server) = connect(eng).await;
     let peer = client.peer();
     let out = call(peer, "origin_status", json!({})).await.unwrap();
@@ -1824,6 +2255,23 @@ async fn origin_status_tool_wires_through_to_origin_status() {
     let domains = out["domains"].as_array().unwrap();
     assert_eq!(domains.len(), 1);
     assert_eq!(domains[0]["domain"], json!("brand"));
+    assert_eq!(domains[0]["local_changes"], json!(1));
+    assert!(
+        domains[0].get("detail").is_none(),
+        "nobody asked for detail: {}",
+        domains[0]
+    );
+
+    // The parameter an agent has to be able to reach, all the way through the
+    // tool and back out past the lean trim.
+    let named = call(peer, "origin_status", json!({ "detail": true }))
+        .await
+        .unwrap();
+    assert_eq!(
+        named["domains"][0]["detail"]["added"],
+        json!(["gone.md"]),
+        "detail: true must reach the engine and survive the trim: {named}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1857,7 +2305,9 @@ async fn resolve_conflict_tool_wires_through_to_origin_resolve() {
         ("notes/a.md", engram("A", "a", "line one UPSTREAM")),
     ]));
     mock.set_branch("main", &c2);
-    eng.origin_update(Some("brand")).await.unwrap();
+    eng.origin_update(Some("brand"), &crystalline_service::Scope::Unrestricted)
+        .await
+        .unwrap();
 
     let (client, _server) = connect(eng).await;
     let peer = client.peer();

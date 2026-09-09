@@ -1,17 +1,25 @@
 ```
-                                   ·              *
-                                 ▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄▄
-                                ▐░░░▒▒▒▒▓▓▓█▓▓▓▒▒▒▒░░░▌
-                                 ▀█░░░▒▒▒▓▓█▓▓▒▒▒░░░█▀   ·
-                                   ▀█░░▒▒▒▓█▓▒▒▒░░█▀
-                            *        ▀█░▒▒▓█▓▒▒░█▀
-                                       ▀█▒▒█▒▒█▀
-                                         ▀███▀     ·
-                                           ▀
+                                             ◆───◆───◆
+                                            ╱ ╲ ╱ ╲ ╱ ╲
+                                           ◆───◆───◆───◇
+                                          ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                                 ◆───◆───◆╌╌╌◆╌╌╌◆───◇───◇
+                                ╱ ╲ ╱ ╲ ╱ · · · · · ╱ ╲ ╱
+                               ◆───◆───◆───◇╌╌╌·╌╌╌◇───◇
+                              ╱ ╲ ╱ ╲ ╱ ╲ ╱ · · · · · ╱
+                             ◆╌╌╌◆╌╌╌◆───◇───◆╌╌╌◆╌╌╌◆
+                              · · · · · ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                               ·╌╌╌·╌╌╌◇───◆───◆───◆───◇
+                                · · · · · ╱ ╲ ╱ ╲ ╱ ╲ ╱ ╲
+                                 ·╌╌╌·╌╌╌◆╌╌╌◆╌╌╌◆───◇───◇
+                                          · · · · · ╱ ╲ ╱
+                                           ·╌╌╌·╌╌╌◇───◇
+                                            · · · · · ╱
+                                             ·╌╌╌·╌╌╌◇
 
- ██████╗██████╗ ██╗   ██╗███████╗████████╗ █████╗ ██╗     ██╗     ██╗███╗   ██╗███████╗
-██╔════╝██╔══██╗╚██╗ ██╔╝██╔════╝╚══██╔══╝██╔══██╗██║     ██║     ██║████╗  ██║██╔════╝
-██║     ██████╔╝ ╚████╔╝ ███████╗   ██║   ███████║██║     ██║     ██║██╔██╗ ██║█████╗
+ ░░░░░░╗░░░░░░╗ ░░╗   ░░╗░░░░░░░╗░░░░░░░░╗ ░░░░░╗ ░░╗     ░░╗     ░░╗░░░╗   ░░╗░░░░░░░╗
+▒▒╔════╝▒▒╔══▒▒╗╚▒▒╗ ▒▒╔╝▒▒╔════╝╚══▒▒╔══╝▒▒╔══▒▒╗▒▒║     ▒▒║     ▒▒║▒▒▒▒╗  ▒▒║▒▒╔════╝
+▓▓║     ▓▓▓▓▓▓╔╝ ╚▓▓▓▓╔╝ ▓▓▓▓▓▓▓╗   ▓▓║   ▓▓▓▓▓▓▓║▓▓║     ▓▓║     ▓▓║▓▓╔▓▓╗ ▓▓║▓▓▓▓▓╗
 ██║     ██╔══██╗  ╚██╔╝  ╚════██║   ██║   ██╔══██║██║     ██║     ██║██║╚██╗██║██╔══╝
 ╚██████╗██║  ██║   ██║   ███████║   ██║   ██║  ██║███████╗███████╗██║██║ ╚████║███████╗
  ╚═════╝╚═╝  ╚═╝   ╚═╝   ╚══════╝   ╚═╝   ╚═╝  ╚═╝╚══════╝╚══════╝╚═╝╚═╝  ╚═══╝╚══════╝
@@ -283,14 +291,16 @@ The reminder costs about 120 tokens, at most once per session. Remove it with `c
 
 ## Teach and learn
 
-The MCP server exposes 18 tools on a default writable instance - 17 in a harness whose install already carries the skills as files, 10 serving read-only - and the five collaboration tools appear beside them once `github.enabled` is turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)), which takes a read-only instance to 12 rather than 15, since only `update_domain` and `origin_status` read without writing; the list is the same for every client connected at that moment; capturing knowledge as a byproduct of work is the core loop:
+The MCP server exposes 20 tools on a default writable instance - 19 in a harness whose install already carries the skills as files, 10 serving read-only - and the five collaboration tools appear beside them once `github.enabled` is turned on (see [Share knowledge with a team](#share-knowledge-with-a-team)), which takes a read-only instance to 12 rather than 15, since only `update_domain` and `origin_status` read without writing; the list is the same for every client connected at that moment; capturing knowledge as a byproduct of work is the core loop:
 
-- **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you.
+- **`write_engram`** - capture a new engram. `domain` is always required (there is no default domain for writes, so an agent never writes into the wrong place). `permalink`, `status` and `recorded_at` are filled in for you. The receipt may name the three existing engrams closest in meaning to what was written, so the write is also a search.
 - **`search_engrams`** - search before writing, and search to recall what is already known. Defaults to hybrid text-plus-semantic ranking across every domain; pass `domains` to narrow it, or filter by `type`, `tags`, `status` or arbitrary `metadata_filters` with no query text at all.
 - **`edit_engram`** - refine an engram in place (`append`, `prepend`, `find_replace`, `replace_section`, `insert_before_section`, `insert_after_section`, `set_frontmatter`) instead of creating a duplicate for the same topic. `set_frontmatter` assigns one lifecycle field by name - `status`, `valid_from`, `valid_to`, `stale_after`, `source_date`, `salience` or `verified` - so retiring an engram or recording a re-check is a field assignment rather than a text substitution.
+- **`split_engram`** - move part of an engram into a new engram of its own, in one step. Validity is set per engram rather than per bullet, so when one fact in a bundle stops holding while the rest still does, split before you retire: name the observation lines or the section headings that move, and the call writes the new engram with the source's tags and a `stable` status and links the pair with `derived_from` and `split_into`, leaving the source holding exactly what expired and the facts that still hold addressable on their own.
 - **`build_context`** - given a `crystalline://domain/permalink` anchor, follow its relations and links (across domains too) to assemble the neighbourhood around a task before diving in - the neighbourhood comes back ranked by how strongly each engram connects to the anchor, salience-aware, so `max_related` keeps the most relevant.
 - **`vocabulary`** - list the tags, observation categories, relation types and engram types and statuses already in use, with counts, and reuse an existing term before coining a near-duplicate.
-- **`evolve_engrams`** - ask what the archive needs instead of waiting to trip over it: a read-only sweep of one domain or all of them that returns a ranked maintenance queue, every finding carrying the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, a replacement that landed while the retirement was never finished), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs) and redundancy (near-duplicate clusters, drifted tags). A finding marked `mechanical` completes intent the archive already records; one marked `judgment` changes what the archive claims and wants a yes first. It is the tool behind `crystalline evolve` below.
+- **`remove_domain`** - unregister a domain the agent should stop learning from, the counterpart to `add_domain`. The registration and the search index rows go and the knowledge does not: a folder domain's markdown stays on disk (point `add_domain` at the folder again and it is re-adopted) and a team domain's GitHub repository is never touched. A team domain is reconnected with its repository rather than with its folder, which is what the confirmation says. A virtual domain is the exception, since its engrams live in the database and are deleted with it, so every surface refuses until the removal says `purge`. On your own machine you may remove any domain; on a shared instance it takes an instance admin, or a private domain's owner.
+- **`evolve_engrams`** - ask what the archive needs instead of waiting to trip over it: a read-only sweep of one domain or all of them that returns a ranked maintenance queue, every finding carrying the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, a replacement that landed while the retirement was never finished), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs), the still-valid observations a retirement is about to take down with it, and redundancy (near-duplicate clusters, semantic twins - the same knowledge in different words - and drifted tags). A finding marked `mechanical` completes intent the archive already records; one marked `judgment` changes what the archive claims and wants a yes first. It is the tool behind `crystalline evolve` below.
 
 Attachments run the same loop in the other direction: files enter through Fluid (or a domain archive), never through an agent write, and reach an agent as resource links on `read_engram` that `resources/read` fetches by URI - so the slide deck a person drops onto an engram is something the next session reads and learns from rather than an opaque blob, and `evolve_engrams` raises a finding whenever a fresh or changed file still needs capturing.
 
@@ -300,7 +310,7 @@ Temporal fields are plain and easy to get wrong by overthinking them: an absent 
 
 Exceptionally valuable knowledge can carry a numeric `salience` key (0 to 10) in `metadata`, the way a memory formed during an exceptional event encodes more strongly: hybrid search adds a small bounded lift for it, so a salient engram ranks above equally relevant unmarked ones while relevance keeps the upper hand and nothing is ever filtered out by it. An agent raises it later on an engram that proved to be the key to a task; the lift's strength is the `search.salience_weight` setting (0.0 to 1.0, default 0.15, 0 disables it). The counterpart on the way out is `search.retired_weight` (0.0 to 1.0, default 0.6, 1.0 disables it): an engram whose `status` is `deprecated`, `superseded`, `archived` or `legacy` is softly faded by it in ranking, never filtered out.
 
-The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `delete`, `search`, `context`, `recent` and `vocabulary` take the same parameters as their MCP counterparts.
+The CLI mirrors the mutating and read tools directly for scripting and quick edits outside an agent session: `crystalline write`, `read`, `edit`, `move`, `split`, `delete`, `search`, `context`, `recent` and `vocabulary` take the same parameters as their MCP counterparts.
 
 Tag identity is case-folded, so `Foo` and `foo` are the same tag; the files keep whatever case you wrote. For the rest of tag drift - a separator swap or a plural - `crystalline vocabulary` and `crystalline doctor` surface near-duplicate clusters, and two CLI-only commands consolidate them: `crystalline tags rename <old> <new>` and `crystalline tags merge <old> <into>`. Both rewrite only the tag tokens, preview before writing and take `--dry-run`, `--yes` and `--domain`; a merge also records the fold in the MANIFEST's `## Tag Aliases` section, so a search for the old name keeps resolving forever. Bulk rewrites are deliberate maintenance, which is why these live on the CLI rather than as MCP tools.
 
@@ -389,7 +399,7 @@ crystalline domain add design --origin acme/design-knowledge --branch main
 
 From there, `crystalline origin` covers the team domain lifecycle:
 
-- **`origin status [--domain <name>]`** - where a team domain stands: ahead, behind, open and declined proposals, unresolved conflicts, and which GitHub identity this machine reads and shares as.
+- **`origin status [--domain <name>] [--files]`** - where a team domain stands: ahead (by change kind, so deletions never read as new notes), behind, open and declined proposals, unresolved conflicts, and which GitHub identity this machine reads and shares as. `--files` names the unshared paths under each domain instead of only counting them.
 - **`origin update [--domain <name>]`** - bring a team domain (or every one) up to date with what the team has merged.
 - **`origin share <name> [--title <t>] [--message <m>] [--proposal <n>] [--file <path>]`** - share local changes as a proposal the team reviews on GitHub; refuses while a conflict is unresolved so the team always reviews a clean proposal. Sharing again while a proposal is open stacks a new proposal on top of it, `--proposal <n>` amends that layer instead, and `--file` (repeatable) shares only the paths you name.
 - **`origin resolve <name> <path> --keep mine|theirs`** (or `--content-file <f>` for a hand-merged result) - settle a flagged conflict.
@@ -399,7 +409,7 @@ Where the forge serves stacked pull requests - github.com does, and Crystalline 
 
 A share carries the domain's whole unshared delta by default, and can be narrowed to a subset of it: `--file <path>` on the CLI, repeated for several; a `files` array on the `share_changes` tool; per-file checkboxes in Fluid's share dialog. The generated `index.md` of each chosen file's own folder rides along so the repository stays browsable and no listing disagrees with the folder it describes, while a folder with nothing selected keeps its refresh for a later share; a path that is not among the domain's unshared changes refuses and names itself rather than being quietly dropped. Whatever you leave out simply stays an unshared local change. On an instance several people work in, Fluid's dialog opens with your own changes ticked, matched by the last writer each file's frontmatter records - a correctable heuristic rather than authorship enforcement, so anyone may tick or untick anything - and the line beneath the list counts what it left out, with unattributed changes and deletions counted as somebody else's; the share button carries the same count as a badge, its tooltip spelling it out as "2 of 5 unshared changes are yours" where that attribution exists. Be clear-eyed about what scoping is for on such an instance: a local edit is visible to everyone using the instance the moment it is written, because the working tree is what they all read, so choosing files decides what the team is asked to review on GitHub, not what colleagues can see.
 
-By default every share, amend and withdrawal goes out on the one GitHub credential this machine is connected with. Set `github.share_identity` to `personal` and each of those writes goes out on the identity of the person doing it instead: proposals carry their GitHub name, so an approval is never an approval of your own identity's work, while pulls and every other read stay on the instance credential. Each person connects once, on the surface they share from: Fluid's profile card under GitHub identity for shares made in Fluid, or `crystalline connect github --personal` for the machine owner's shares from the CLI and locally attached agents (`--token <PAT>` skips the browser sign-in, and an admin sets up a bot account with `--as <account>`); until they do, sharing and withdrawing refuse with that instruction instead of falling back to the instance credential. An agent reaching the instance over HTTP MCP belongs to no session, so it shares as the account `github.agent_identity` names - usually that bot - and its shares are refused while the setting is unset. Personal mode asks one thing of the repository: every sharer needs write access to it, since proposals are branches in the same repository and never forks, so a maintainer adds each person as a collaborator once.
+By default every share, amend and withdrawal goes out on the one GitHub credential this machine is connected with. Set `github.share_identity` to `personal` and each of those writes goes out on the identity of the person doing it instead: proposals carry their GitHub name, so an approval is never an approval of your own identity's work, while pulls and every other read stay on the instance credential. Each person connects once, on the surface they share from: Fluid's profile card under GitHub identity for shares made in Fluid, or `crystalline connect github --personal` for the machine owner's shares from the CLI and locally attached agents (`--token <PAT>` skips the browser sign-in, and an admin sets up a bot account with `--as <account>`); until they do, sharing and withdrawing refuse with that instruction instead of falling back to the instance credential. An agent reaching the instance over HTTP MCP shares as the account it authenticated as, so where agents authenticate (`auth.mcp`) each agent's proposals carry the name of the person whose token it holds. Where they do not, the agent belongs to nobody, so it shares as the account `github.agent_identity` names - usually that bot - and its shares are refused while the setting is unset. Personal mode asks one thing of the repository: every sharer needs write access to it, since proposals are branches in the same repository and never forks, so a maintainer adds each person as a collaborator once.
 
 The same actions are MCP tools an agent calls directly: `update_domain`, `origin_status`, `share_changes`, `resolve_conflict` and `withdraw_proposal`, plus `configure` for settings and connecting. Review feedback flows back through `update_domain`, which returns each open proposal's review state and the reviewers' comments, so the agent can refine the engrams and share again into the layer that feedback belongs to. These five need `github.enabled` turned on: while it is off they are not listed at all, so an install that never uses team domains carries none of them in its context. Turning the setting on makes them appear - from the tool, from `crystalline config set` or from Fluid's Connect button, all the same - and a client subscribed to change notifications is told the list moved. The setting is one shared switch rather than a per-client one, so every client connected at any given moment sees the same list. A client holding a list cached from before the switch went off still gets taught rather than confused: calling one of the five answers with the reason and the `configure` call that turns collaboration back on. `add_domain` is not among them: it creates domains of every kind (local, virtual, team) and is always available, though its team-domain branch still needs `github.enabled`. Sharing always ends with the agent relaying the proposal's review URL to the person it is working with, since review and merging happen on GitHub, by a person, never by the agent.
 
@@ -418,29 +428,33 @@ github:
   enabled: true                     # turns team domains on; absent means off
   stacks: true                      # stack each share on the open proposal where the forge supports it; absent means on
   share_identity: personal          # instance (default) shares on this machine's credential; personal shares on each person's own
-  agent_identity: share-bot         # the account whose connected identity HTTP agents share as in personal mode; absent refuses those shares
+  agent_identity: share-bot         # the account whose connected identity unauthenticated HTTP agents share as in personal mode; absent refuses those shares
   poll_secs: 300                    # background poll interval in seconds; minimum 60
   api_url: https://github.example.com/api/v3   # GitHub Enterprise Server only
   oauth_client_id: abc123                       # a self-hosted OAuth App, GitHub Enterprise Server only
 ```
+
+### Private domains
+
+A domain does not have to be shared with the whole team to exist on a team instance. Make one private - from its Members card in Fluid, or `crystalline domain visibility <domain> private --owner <account>` from the CLI - and only its owner, the accounts invited into it and instance admins can see it at all; everyone else gets the same answer a domain nobody registered gets. Be honest about what that protects: private is a wall between accounts, not from whoever operates the machine - the CLI, running on the host, administers every domain, invited or not, exactly the way a GitHub organization owner sees every repository in it. See [Private domains](docs/deployment.md#private-domains) for membership levels and the full command set.
 
 ## Keep knowledge honest
 
 `crystalline verify` statically checks one or more domains against the full rule catalog - malformed frontmatter, broken links, missing MANIFEST sections, schema drift - with no database, service or network connection involved. Its usual home is CI/CD on the GitHub repositories that hold a team's knowledge: every proposal is verified before the team merges it, so nothing malformed ever lands on the branch everyone pulls from. The bundled GitHub Action wires that up:
 
 ```yaml
-- uses: jordiboehme/crystalline/action@v0.17.0
+- uses: jordiboehme/crystalline/action@v0.18.0
   with:
     paths: knowledge/       # space-separated domain roots, default '.'
     strict: 'false'         # promote Warning rules to Error
-    version: v0.17.0        # crystalline binary tag to download, or 'latest'
+    version: v0.18.0        # crystalline binary tag to download, or 'latest'
 ```
 
-The action ref (`@v0.17.0`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
+The action ref (`@v0.18.0`) pins the action's own code; `version` pins the crystalline binary it downloads, so pinning both gives a fully reproducible check. The binary is checksum-verified, then the action runs `crystalline verify`, annotates the run and, on a pull request, posts a single summary comment kept up to date in place.
 
 Verify is one of three checks, and each asks a different question. `crystalline verify` asks whether the format holds. `crystalline doctor` asks whether the machinery around it - the index, the registered domains, the service - is healthy. `crystalline evolve` asks the question neither of the other two can: is the knowledge itself still true, and is it still well organized? A fourth command, the importer, brings an existing knowledge base under Crystalline in the first place:
 
-- **`crystalline evolve`** sweeps one domain or every domain for the maintenance the knowledge needs and prints a ranked queue, each finding naming the engram, the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, long-unverified knowledge, a retirement whose replacement landed but whose old engram was never flipped, substantive work that has sat unshared in a team domain for a week), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs) and redundancy (near-duplicate clusters, drifted tags). Narrow it with `--domain`, `--family`, `--rule` or `--min-priority`, and pass `--today` to evaluate the temporal rules as of a fixed date so a run reproduces. It is read-only and detects by dates, links and graph shape, never by meaning, so it hands over work to do rather than rewriting knowledge on its own - the same sweep the `evolve_engrams` tool gives an agent.
+- **`crystalline evolve`** sweeps one domain or every domain for the maintenance the knowledge needs and prints a ranked queue, each finding naming the engram, the evidence it fired on and the exact next action. It sees temporal and lifecycle debt (a `valid_to` that elapsed while the status still reads current, a `stale_after` past due, long-unverified knowledge, a retirement whose replacement landed but whose old engram was never flipped, substantive work that has sat unshared in a team domain for a week), structural gaps (unresolved `[[links]]`, one-sided relation pairs, orphans, oversized engrams and stubs), the still-valid observations a retirement is about to take down with it, and redundancy (near-duplicate clusters, semantic twins - the same knowledge in different words - and drifted tags). Narrow it with `--domain`, `--family`, `--rule` or `--min-priority`, and pass `--today` to evaluate the temporal rules as of a fixed date so a run reproduces. It is read-only and detects by dates, links, graph shape and embedding similarity, never confirming a contradiction, so it hands over work to do rather than rewriting knowledge on its own - the same sweep the `evolve_engrams` tool gives an agent.
 - **`crystalline doctor`** diagnoses the index, registered domains and service state (orphan index rows, encoding issues, stale service locks) and repairs what it safely can with `--fix`. Once team domains are turned on it also reports whether this machine is connected to GitHub and whether each team domain's local origin state is intact. When a domain ships provisioned artifacts, it reports every declaring domain's decision and shipped counts and every installed harness's drift, locally edited and orphaned counts against what was last reconciled - that part, like the GitHub checks, is always report-only, `--fix` never reconciles a harness.
 - **`crystalline import <src> --domain <name>`** brings an existing markdown-plus-frontmatter knowledge base under Crystalline: normalizes legacy `type` values, backfills `status` and temporal metadata, drops sentinel far-future dates in favor of leaving the field open-ended, and records write provenance where a file carries none - all as a pure file transformation, with `--dry-run` to preview first.
 
@@ -464,8 +478,12 @@ Crystalline runs the same way in every scenario: a daemon in the middle keeps on
 | [Linux server with systemd](docs/deployment.md#linux-server-with-systemd) | The .deb ships a unit, disabled by default; enable it once and agents connect over HTTP |
 | [Published read-only domains](docs/deployment.md#published-read-only-domains) | Knowledge curated in a git repository, served read-only to agents |
 | [Air-gapped or egress-restricted](docs/deployment.md#air-gapped-or-egress-restricted) | The `with-model` image or a pre-fetched model directory; nothing at runtime needs the network |
-| [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all |
+| [Shared database collaboration](docs/deployment.md#shared-database-collaboration) | Several instances share one PostgreSQL index, so every capture is visible to all of them that registered the domain |
 | [Team knowledge on GitHub](docs/deployment.md#team-knowledge-on-github) | A domain tracks a GitHub repository; sharing goes through reviewed proposals |
+| [Authenticated agents](docs/deployment.md#authenticated-agents) | HTTP MCP requires a personal token per agent, issued in Fluid or from the CLI |
+| [MCP clients over OAuth](docs/deployment.md#mcp-clients-over-oauth) | A hosted client such as Claude.ai signs the person in and consents once; no token is pasted |
+| [Enterprise SSO](docs/deployment.md#enterprise-sso) | Sign in through an OpenID Connect provider; an account is provisioned on first sign-in |
+| [Proxy forward auth](docs/deployment.md#proxy-forward-auth) | A forward-auth proxy (Authelia, oauth2-proxy) names the signed-in person in a header quartet |
 
 ## Virtual domains
 
@@ -479,6 +497,8 @@ crystalline domain add decisions --virtual
 crystalline write decisions "First decision" --content "captured straight into the database"
 crystalline search "captured"
 ```
+
+Unregistering one is the one removal that deletes knowledge, since there is no folder left behind: `crystalline domain remove decisions --purge`, `?purge=true` on the JSON API and `purge: true` on the `remove_domain` tool all say the same thing, and without it the removal refuses and says so. Export first if you want a copy.
 
 Two commands move engrams between the two kinds of truth:
 

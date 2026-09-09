@@ -865,3 +865,127 @@ fn domain_add_without_a_path_registers_at_the_default_domains_root() {
         "config persists the domain rooted at the default: {saved}"
     );
 }
+
+#[test]
+fn split_moves_observations_into_a_new_engram_and_links_the_pair() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = seed_two_engrams(work.path());
+
+    bin()
+        .args([
+            "write",
+            "eng",
+            "Coolant Bundle",
+            "--content",
+            "# Coolant Bundle\n\n\
+             - [decision] Run the coolant loop on glycol mix B\n\
+             - [fact] The loop needs a 40 minute purge before a mix swap\n\
+             - [fact] The purge pump is rated for 12 bar\n\
+             - [convention] Log every mix swap in the ship register",
+            "--tags",
+            "coolant",
+        ])
+        .args(["--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+
+    // The line numbers a caller reads off `crystalline read`, which are the
+    // ones `--observation` takes.
+    let read = bin()
+        .args(["read", "coolant-bundle", "--json", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(read.status.success());
+    let read: serde_json::Value = serde_json::from_slice(&read.stdout).unwrap();
+    let lines: Vec<String> = read["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|o| {
+            let text = o["content"].as_str().unwrap_or_default();
+            text.contains("purge") || text.contains("12 bar")
+        })
+        .map(|o| o["line"].to_string())
+        .collect();
+    assert_eq!(lines.len(), 2, "two bullets are about the purge: {read}");
+
+    // The flag repeats, one line per occurrence, which is what its help text
+    // promises: a second --observation adds to the selection rather than
+    // replacing the first.
+    let out = bin()
+        .args([
+            "split",
+            "coolant-bundle",
+            "eng",
+            "Purge Procedure",
+            "--observation",
+            &lines[0],
+            "--observation",
+            &lines[1],
+            "--json",
+            "--config",
+        ])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "split failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let receipt: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(receipt["new"]["permalink"], "purge-procedure");
+    assert_eq!(receipt["source"]["permalink"], "coolant-bundle");
+    assert_eq!(
+        receipt["moved_observations"], 2,
+        "both occurrences of --observation moved a bullet"
+    );
+
+    // Both halves, read back through the CLI: the content moved and the pair
+    // points both ways.
+    let new = bin()
+        .args(["read", "purge-procedure", "--json", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let new: serde_json::Value = serde_json::from_slice(&new.stdout).unwrap();
+    let new_content = new["content"].as_str().unwrap();
+    assert!(new_content.contains("40 minute purge"), "{new_content}");
+    assert!(new_content.contains("12 bar"), "{new_content}");
+    assert!(
+        new_content.contains("- derived_from [[coolant-bundle]]"),
+        "{new_content}"
+    );
+
+    let source = bin()
+        .args(["read", "coolant-bundle", "--json", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .output()
+        .unwrap();
+    let source: serde_json::Value = serde_json::from_slice(&source.stdout).unwrap();
+    let source_content = source["content"].as_str().unwrap();
+    assert!(
+        !source_content.contains("40 minute purge"),
+        "{source_content}"
+    );
+    assert!(
+        source_content.contains("- split_into [[purge-procedure]]"),
+        "{source_content}"
+    );
+    assert!(
+        source_content.contains("- [decision] Run the coolant loop on glycol mix B"),
+        "{source_content}"
+    );
+}

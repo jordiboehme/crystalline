@@ -36,6 +36,31 @@ pub enum RemoteError {
     #[error("The GitHub connection has expired or was revoked. Use configure to sign in again.")]
     AuthExpired,
 
+    /// A SAML-enforced organization refused the token until the OAuth app is
+    /// authorized for it (GitHub 403 with an `X-GitHub-SSO: required` header).
+    #[error(
+        "GitHub requires single sign-on for the {org} organization before this token can reach it. Authorize the Crystalline app for {org}: open {url}, sign in through your identity provider, then retry. No collaborator change and no reconnect is needed."
+    )]
+    SsoAuthorizationRequired {
+        /// The organization that enforces single sign-on, or `this` when
+        /// neither the SSO url nor the repository named one.
+        org: String,
+        /// Where the person authorizes the app: GitHub's own `X-GitHub-SSO`
+        /// url when it sent one, else the authorized-apps page.
+        url: String,
+    },
+
+    /// An organization with OAuth App access restrictions has not approved
+    /// the app (GitHub 403 whose message names the restriction).
+    #[error(
+        "The {org} organization restricts third-party OAuth apps and has not approved Crystalline yet. Ask an organization owner to approve it under the organization's Settings > Third-party access > OAuth app policy, or request it yourself under GitHub > Settings > Applications > Authorized OAuth Apps > Crystalline (Request next to {org}); then retry."
+    )]
+    OauthAppRestricted {
+        /// The organization that restricts third-party apps, or `this` when
+        /// the request named no repository owner.
+        org: String,
+    },
+
     /// GitHub is rate limiting requests from this machine.
     #[error("GitHub is rate limiting this machine; trying again later. Nothing is lost.")]
     RateLimited {
@@ -293,6 +318,35 @@ mod tests {
         }
     }
 
+    /// The single sign-on refusal is the one 403 the person can clear alone,
+    /// so its message has to carry the org, the exact url and the two things
+    /// that are NOT the fix: no collaborator change, no reconnect.
+    #[test]
+    fn sso_authorization_required_names_the_org_the_url_and_what_is_not_needed() {
+        let err = RemoteError::SsoAuthorizationRequired {
+            org: "acme".to_string(),
+            url: "https://github.com/orgs/acme/sso?authorization_request=abc".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "GitHub requires single sign-on for the acme organization before this token can reach it. Authorize the Crystalline app for acme: open https://github.com/orgs/acme/sso?authorization_request=abc, sign in through your identity provider, then retry. No collaborator change and no reconnect is needed."
+        );
+    }
+
+    /// The OAuth App restriction is the one 403 somebody ELSE has to clear,
+    /// so the message names the owner's page and the person's own request
+    /// path rather than any retry-and-hope instruction.
+    #[test]
+    fn oauth_app_restricted_names_both_the_owner_page_and_the_request_path() {
+        let err = RemoteError::OauthAppRestricted {
+            org: "acme".to_string(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "The acme organization restricts third-party OAuth apps and has not approved Crystalline yet. Ask an organization owner to approve it under the organization's Settings > Third-party access > OAuth app policy, or request it yourself under GitHub > Settings > Applications > Authorized OAuth Apps > Crystalline (Request next to acme); then retry."
+        );
+    }
+
     #[test]
     fn repo_not_found_names_the_repo_and_hints_at_access() {
         let err = RemoteError::RepoNotFound {
@@ -465,6 +519,15 @@ mod tests {
             RemoteError::AuthExpired.to_string(),
             RemoteError::Offline.to_string(),
             RemoteError::RateLimited { reset: None }.to_string(),
+            RemoteError::SsoAuthorizationRequired {
+                org: "acme".to_string(),
+                url: "https://github.com/orgs/acme/sso".to_string(),
+            }
+            .to_string(),
+            RemoteError::OauthAppRestricted {
+                org: "acme".to_string(),
+            }
+            .to_string(),
             RemoteError::RepoNotFound {
                 repo: "acme/brand-knowledge".to_string(),
             }

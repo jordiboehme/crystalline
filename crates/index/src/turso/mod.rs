@@ -34,9 +34,9 @@ use crate::store::{
     AttachmentRow, BrowseLevel, ChunkJob, ChunkModelCount, DomainHost, DomainId, DomainKind,
     DomainStats, EdgeKind, EmbeddingCoverage, EmbeddingRow, EngramDescriptor, EngramId,
     EngramRecord, EngramSummary, FileStamp, FtsMode, GraphSlice, HostClaim, InboundHit,
-    InboundPage, InboundQuery, InboundRef, LINKS_TO, NamedCount, NewChunk, OutboundRef, Page,
-    RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram, Vocabulary,
-    build_vocabulary, folder_slash, page_window,
+    InboundPage, InboundQuery, InboundRef, LINKS_TO, LeadVector, NamedCount, NewChunk, OutboundRef,
+    Page, RecentFilter, SearchHit, SearchMode, SearchQuery, Store, StoreInfo, StoredEngram,
+    Vocabulary, build_vocabulary, folder_slash, page_window, reference_match,
 };
 use crate::sweep::UnresolvedRef;
 
@@ -433,6 +433,33 @@ fn cell_real(row: &Row, idx: usize) -> Option<f64> {
     }
 }
 
+fn cell_blob(row: &Row, idx: usize) -> Option<Vec<u8>> {
+    match row.get_value(idx) {
+        Ok(Value::Blob(b)) => Some(b),
+        _ => None,
+    }
+}
+
+/// The inverse of the little-endian f32 packing `store_embeddings` writes (and
+/// of `search::pack_vector`, which packs a query the same way). Turso scores
+/// vectors in SQL through `vector_distance_cos`, so this is the only place a
+/// stored embedding is read back into Rust.
+///
+/// A blob whose length is not a whole number of floats cannot come from that
+/// packing, so it is not one of ours and decodes to nothing at all rather than
+/// to its leading whole floats. Dropping just the trailing bytes would not be
+/// safe to hand back: `4 * dims + r` bytes with `0 < r < 4` yields exactly
+/// `dims` floats, which passes the caller's width check and returns a row built
+/// from a blob that is demonstrably not the vector that was written. An empty
+/// vector can never match a positive `dims`, so the caller skips and warns.
+fn unpack_vector(bytes: &[u8]) -> Vec<f32> {
+    let (quads, partial) = bytes.as_chunks::<4>();
+    if !partial.is_empty() {
+        return Vec::new();
+    }
+    quads.iter().copied().map(f32::from_le_bytes).collect()
+}
+
 fn opt_text(o: &Option<String>) -> Value {
     match o {
         Some(s) => Value::Text(s.clone()),
@@ -687,7 +714,7 @@ impl Store for TursoStore {
         }
 
         for batch in record.relations.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 6);
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 7);
             for rel in batch {
                 params.push(Value::Integer(engram_id));
                 params.push(Value::Integer(domain.0));
@@ -695,26 +722,28 @@ impl Store for TursoStore {
                 params.push(Value::Text(rel.rel_type.clone()));
                 params.push(Value::Text(rel.to_target.clone()));
                 params.push(opt_text(&rel.to_domain));
+                params.push(Value::Text(rel.to_raw.clone()));
             }
             let sql = format!(
-                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_id) VALUES {}",
-                value_rows(6, batch.len(), Some("NULL"))
+                "INSERT INTO relation(engram_id, domain_id, line, rel_type, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(7, batch.len(), Some("NULL"))
             );
             self.conn.execute(&sql, params).await?;
         }
 
         for batch in record.links.chunks(INSERT_CHUNK) {
-            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 5);
+            let mut params: Vec<Value> = Vec::with_capacity(batch.len() * 6);
             for link in batch {
                 params.push(Value::Integer(engram_id));
                 params.push(Value::Integer(domain.0));
                 params.push(Value::Integer(link.line as i64));
                 params.push(Value::Text(link.to_target.clone()));
                 params.push(opt_text(&link.to_domain));
+                params.push(Value::Text(link.to_raw.clone()));
             }
             let sql = format!(
-                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_id) VALUES {}",
-                value_rows(5, batch.len(), Some("NULL"))
+                "INSERT INTO link(engram_id, domain_id, line, to_target, to_domain, to_raw, to_id) VALUES {}",
+                value_rows(6, batch.len(), Some("NULL"))
             );
             self.conn.execute(&sql, params).await?;
         }
@@ -888,19 +917,13 @@ impl Store for TursoStore {
 
     async fn resolve_pending_relations(&self, domain: DomainId) -> Result<u64> {
         // One statement. Target domain is `to_domain` when set, else the
-        // relation's own domain. Prefer a permalink match, then a title match.
-        let tgt_dom = "COALESCE((SELECT d.id FROM domain d WHERE d.name = relation.to_domain), relation.domain_id)";
-        let by_perma = format!(
-            "(SELECT e.id FROM engram e WHERE e.permalink = relation.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
-        let by_title = format!(
-            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(relation.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
+        // relation's own domain. Prefer a permalink match, then a title match,
+        // then the whole bracket text at home - see `reference_match`.
         let sql = format!(
-            "UPDATE relation SET to_id = COALESCE({by_perma}, {by_title}) \
+            "UPDATE relation SET to_id = {resolved} \
              WHERE relation.to_id IS NULL AND relation.domain_id = ?1 \
-             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = relation.to_target AND e.domain_id = {tgt_dom}) \
-                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(relation.to_target) AND e.domain_id = {tgt_dom}))"
+             AND {resolved} IS NOT NULL",
+            resolved = reference_match("relation")
         );
         let n = self
             .conn
@@ -910,22 +933,13 @@ impl Store for TursoStore {
     }
 
     async fn resolve_pending_links(&self, domain: DomainId) -> Result<u64> {
-        // The wikilink twin of resolve_pending_relations over the `link` table.
-        // Target domain is `to_domain` when set, else the link's own domain.
-        // Prefer a permalink match, then a title match. Links carry no rel_type.
-        let tgt_dom =
-            "COALESCE((SELECT d.id FROM domain d WHERE d.name = link.to_domain), link.domain_id)";
-        let by_perma = format!(
-            "(SELECT e.id FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
-        let by_title = format!(
-            "(SELECT e.id FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom} LIMIT 1)"
-        );
+        // The wikilink twin of resolve_pending_relations over the `link` table,
+        // matching by the same rule. Links carry no rel_type.
         let sql = format!(
-            "UPDATE link SET to_id = COALESCE({by_perma}, {by_title}) \
+            "UPDATE link SET to_id = {resolved} \
              WHERE link.to_id IS NULL AND link.domain_id = ?1 \
-             AND (EXISTS (SELECT 1 FROM engram e WHERE e.permalink = link.to_target AND e.domain_id = {tgt_dom}) \
-                  OR EXISTS (SELECT 1 FROM engram e WHERE lower(e.title) = lower(link.to_target) AND e.domain_id = {tgt_dom}))"
+             AND {resolved} IS NOT NULL",
+            resolved = reference_match("link")
         );
         let n = self
             .conn
@@ -1222,13 +1236,13 @@ impl Store for TursoStore {
         ];
         let rows = query_all(
             &self.conn,
-            "SELECT d.name, r.domain_id, e.path, r.to_target, 0 \
+            "SELECT d.name, r.domain_id, e.path, r.to_target, 0, r.to_domain \
              FROM relation r JOIN engram e ON e.id=r.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE r.to_id=?1 \
                 OR (r.to_id IS NULL AND r.domain_id=?2 AND r.to_domain IS NULL \
                     AND (r.to_target=?3 OR lower(r.to_target)=lower(?4))) \
              UNION ALL \
-             SELECT d.name, l.domain_id, e.path, l.to_target, 1 \
+             SELECT d.name, l.domain_id, e.path, l.to_target, 1, l.to_domain \
              FROM link l JOIN engram e ON e.id=l.engram_id JOIN domain d ON d.id=e.domain_id \
              WHERE l.to_id=?1 \
                 OR (l.to_id IS NULL AND l.domain_id=?2 AND l.to_domain IS NULL \
@@ -1244,6 +1258,7 @@ impl Store for TursoStore {
                 src_domain_id: DomainId(cell_i64(r, 1).unwrap_or(0)),
                 src_path: cell_text(r, 2).unwrap_or_default(),
                 to_target: cell_text(r, 3).unwrap_or_default(),
+                to_domain: cell_text(r, 5),
                 kind: if cell_i64(r, 4).unwrap_or(0) == 0 {
                     EdgeKind::Relation
                 } else {
@@ -1289,10 +1304,31 @@ impl Store for TursoStore {
             ]
         };
 
-        // The filters, appended after the four the target always binds.
+        // The visibility exclusion, bound first so the summary below - which
+        // takes no reader-chosen filter - can bind exactly this prefix.
         let mut params = target();
-        let mut clauses: Vec<String> = Vec::new();
         let mut n = 5;
+        let mut exclude_sql = String::new();
+        if !query.exclude_domains.is_empty() {
+            let holes: Vec<String> = query
+                .exclude_domains
+                .iter()
+                .enumerate()
+                .map(|(i, _)| format!("?{}", n + i))
+                .collect();
+            exclude_sql = format!("i.domain NOT IN ({})", holes.join(", "));
+            for domain in query.exclude_domains {
+                params.push(Value::Text(domain.clone()));
+            }
+            n += query.exclude_domains.len();
+        }
+        let excluded = params.clone();
+
+        // The filters, appended after the target and the exclusion.
+        let mut clauses: Vec<String> = Vec::new();
+        if !exclude_sql.is_empty() {
+            clauses.push(exclude_sql.clone());
+        }
         if let Some(rel) = query.rel.filter(|r| !r.is_empty()) {
             clauses.push(format!("i.rel=?{n}"));
             params.push(Value::Text(rel.to_string()));
@@ -1357,11 +1393,20 @@ impl Store for TursoStore {
             .collect();
 
         // The summary, deliberately over the unfiltered set: the caller filters
-        // *with* it. One grouped pass, no page.
+        // *with* it. One grouped pass, no page. The visibility exclusion is
+        // the one narrowing it does honor - see the trait's doc comment.
+        let summary_sql = if exclude_sql.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {exclude_sql}")
+        };
         let summary = query_all(
             &self.conn,
-            &format!("SELECT i.rel, COUNT(*) FROM ({source}) i GROUP BY i.rel ORDER BY 2 DESC, 1"),
-            target(),
+            &format!(
+                "SELECT i.rel, COUNT(*) FROM ({source}) i{summary_sql} \
+                 GROUP BY i.rel ORDER BY 2 DESC, 1"
+            ),
+            excluded,
         )
         .await?;
         let types = summary
@@ -1726,6 +1771,42 @@ impl Store for TursoStore {
         Ok(cov)
     }
 
+    async fn lead_vectors(&self, domain: DomainId, model: &str) -> Result<Vec<LeadVector>> {
+        let rows = query_all(
+            &self.conn,
+            "SELECT c.engram_id, c.dims, c.embedding FROM chunk c \
+             JOIN engram e ON e.id=c.engram_id \
+             WHERE e.domain_id=?1 AND c.seq=0 AND c.model=?2 AND c.embedding IS NOT NULL \
+             ORDER BY c.engram_id ASC",
+            vec![Value::Integer(domain.0), Value::Text(model.to_string())],
+        )
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            let (Some(id), Some(dims), Some(blob)) =
+                (cell_i64(r, 0), cell_i64(r, 1), cell_blob(r, 2))
+            else {
+                continue;
+            };
+            let vector = unpack_vector(&blob);
+            if vector.len() != dims as usize {
+                tracing::warn!(
+                    engram_id = id,
+                    dims,
+                    stored = vector.len(),
+                    "skipping a lead vector whose stored width disagrees with its dims column"
+                );
+                continue;
+            }
+            out.push(LeadVector {
+                engram_id: EngramId(id),
+                dims: dims as usize,
+                vector,
+            });
+        }
+        Ok(out)
+    }
+
     async fn wipe(&self) -> Result<()> {
         // Deletes every chunk, so the coverage snapshot is now stale.
         self.invalidate_coverage();
@@ -1759,6 +1840,33 @@ impl Store for TursoStore {
         Ok(())
     }
 
+    async fn stamp_registered(&self, names: &[&str], when: &str) -> Result<()> {
+        // `IN ()` is a syntax error, and an empty configuration is a legitimate
+        // one, so stamping nothing touches no SQL at all.
+        if names.is_empty() {
+            return Ok(());
+        }
+        let mut params: Vec<Value> = vec![Value::Text(when.to_string())];
+        let placeholders: Vec<String> = names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                params.push(Value::Text((*name).to_string()));
+                format!("?{}", i + 2)
+            })
+            .collect();
+        self.conn
+            .execute(
+                &format!(
+                    "UPDATE domain SET last_registered=?1 WHERE name IN ({})",
+                    placeholders.join(",")
+                ),
+                params,
+            )
+            .await?;
+        Ok(())
+    }
+
     async fn store_info(&self) -> Result<StoreInfo> {
         // The active full-text path in this milestone is always the candidate
         // scan. `fts_native` records the probe outcome for diagnostics; when a
@@ -1787,7 +1895,8 @@ impl Store for TursoStore {
              (SELECT count(*) FROM relation r WHERE r.domain_id=d.id AND r.to_id IS NULL), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id), \
              (SELECT count(*) FROM link l WHERE l.domain_id=d.id AND l.to_id IS NULL), \
-             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at \
+             dl.holder_instance_id, dl.holder_label, dl.heartbeat_at, \
+             d.last_registered \
              FROM domain d LEFT JOIN domain_lock dl ON dl.domain_id=d.id ORDER BY d.id",
             vec![],
         )
@@ -1808,8 +1917,14 @@ impl Store for TursoStore {
                 host_instance_id: cell_text(r, 11),
                 host_label: cell_text(r, 12),
                 host_heartbeat_at: cell_text(r, 13),
+                last_registered: cell_text(r, 14),
             })
             .collect())
+    }
+
+    async fn domain_names(&self) -> Result<Vec<String>> {
+        let rows = query_all(&self.conn, "SELECT name FROM domain ORDER BY name", vec![]).await?;
+        Ok(rows.iter().filter_map(|r| cell_text(r, 0)).collect())
     }
 
     async fn vocabulary(&self, domain: Option<&str>) -> Result<Vocabulary> {

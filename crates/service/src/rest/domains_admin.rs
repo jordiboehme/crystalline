@@ -14,8 +14,13 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 
 use super::auth::Identity;
-use super::{ApiError, ApiJson, ApiPath, Caller, ProblemDetail, RestState, refuse_read_only};
+use super::auth_store::VisibilityWrite;
+use super::{
+    ApiError, ApiJson, ApiPath, ApiQuery, Caller, ProblemDetail, RestState, refuse_read_only,
+    require_domain_read, require_domain_write,
+};
 use crate::engine::{EngineError, PreviewCredential, ShareActor};
+use crate::scope::DomainRight;
 
 /// The caller, when they may drive this instance's share surfaces - the status
 /// report, the preview, the share, a withdrawal, and reading or resolving a
@@ -99,6 +104,12 @@ pub struct CreateDomainBody {
     #[serde(default)]
     #[schema(example = "domains/eng")]
     pub path: Option<String>,
+    /// Register the domain private, owned by the calling account. Applies to
+    /// every mode; defaults to false, which is a domain the whole instance
+    /// shares.
+    #[serde(default)]
+    #[schema(example = false)]
+    pub private: bool,
 }
 
 /// A domain name that is safe as a path segment under the domains root, in
@@ -289,7 +300,7 @@ pub async fn create(
     identity: Identity,
     ApiJson(body): ApiJson<CreateDomainBody>,
 ) -> Result<Response, ApiError> {
-    identity.require_admin()?;
+    let caller = identity.require_admin()?;
     refuse_read_only(&state)?;
     // Serialized against a concurrent unregister of the same name: see
     // [`RestState::domain_admin`] for the engine-level race this closes.
@@ -356,13 +367,75 @@ pub async fn create(
         }
     };
     match report {
-        Ok(report) => Ok((StatusCode::CREATED, Json(report)).into_response()),
+        Ok(report) => {
+            if body.private {
+                close_new_domain(&state, &report, caller.name()).await?;
+            }
+            Ok((StatusCode::CREATED, Json(report)).into_response())
+        }
         // A taken name (or an already-registered folder) is a conflict on
         // this surface, as on engram create; the generic From keeps 422 for
         // MCP's classification.
         Err(EngineError::Conflict(detail)) => Err(ApiError::conflict(detail)),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Close a freshly registered domain, naming its creator as the owner.
+///
+/// The order is the whole point and it is the opposite of the visibility
+/// route's: there the domain exists and the acl row is the new thing, here the
+/// acl row is written for a domain this request has just registered. Writing
+/// it first would mint a record for a name that might never become a domain -
+/// the orphan the registry check on `set_visibility` exists to prevent.
+///
+/// A failure here leaves a REGISTERED domain that is not private, which is
+/// visible to everybody - the opposite of what was asked for - so the
+/// registration is rolled back rather than left standing, and the error names
+/// both halves. Best effort on the rollback itself: if that fails too, the
+/// message still says what state the instance is in, which is the one thing an
+/// operator needs in order to finish the job by hand.
+async fn close_new_domain(state: &RestState, report: &Value, owner: &str) -> Result<(), ApiError> {
+    // The engine's own report is the authority on the resulting name: the
+    // github mode defaults it from the repository, so the request body cannot
+    // be trusted to say what was registered.
+    let name = report
+        .get("domain")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApiError::internal(
+                "the domain was registered but its report does not name it, so \
+                 it could not be made private",
+            )
+        })?
+        .to_string();
+    let e = match state.auth.set_domain_visibility(&name, true, owner).await {
+        Ok(VisibilityWrite::Written) => return Ok(()),
+        // The name already carried a visibility record: a domain that was
+        // private under an earlier registration whose records outlived it, or
+        // one closed against a name nobody had registered yet. Owned by the
+        // caller it is exactly what was asked for. Owned by somebody else it is
+        // NOT - the domain would be private to a stranger, invisible to the
+        // person who just created it - and this write no longer takes it over,
+        // so the registration is rolled back like any other failure here.
+        Ok(VisibilityWrite::AlreadyPrivate { owner: held }) if held == owner => return Ok(()),
+        Ok(VisibilityWrite::AlreadyPrivate { owner: held }) => anyhow::anyhow!(
+            "the name already carries a private-domain record owned by another \
+             account, so it was not made yours"
+        )
+        .context(format!("owner on file: '{held}'")),
+        Err(e) => e,
+    };
+    let rolled_back = state.engine.domain_remove(&name).await.is_ok();
+    Err(ApiError::internal(format!(
+        "domain '{name}' could not be made private: {e:#}{}",
+        if rolled_back {
+            "; the registration was rolled back, so nothing was left shared"
+        } else {
+            "; it is REGISTERED AND SHARED - unregister it or make it private \
+             from the `crystalline` CLI on the server"
+        }
+    )))
 }
 
 /// A mode-mismatched field is a 422 up front, not silently ignored.
@@ -375,23 +448,39 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
     }
 }
 
+/// The query string `DELETE /domains/{domain}` takes.
+///
+/// One flag, and it exists because this route's principal set widened: it used
+/// to be admin-only, and the whole "a virtual domain's engrams go with it"
+/// story could be left to whichever client drew the confirmation. A private
+/// domain's owner reaches it now, so the rule lives in the engine and this is
+/// how a client says the loss was confirmed. Inert on a file or team domain,
+/// whose files a removal never touches.
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct RemoveQuery {
+    /// Confirm that a virtual domain's engrams are to be deleted with it.
+    /// Required for a virtual domain that holds any; ignored otherwise.
+    #[serde(default)]
+    #[param(example = true)]
+    purge: bool,
+}
+
 /// `DELETE /domains/{domain}` - unregister a domain: the registration and the
 /// index rows go, the files do not.
 ///
-/// The order of the three steps below is the whole content of this handler,
-/// and it is not free to rearrange (see [`crate::collab::session::CollabSessions::dispose_domain`],
-/// which records the argument in full):
+/// A thin call onto [`crate::Engine::unregister_domain`], which holds the whole
+/// of it: who may end a domain, the join fence, the co-editing sweep, the
+/// unregistration and the retirement of the domain's visibility and membership
+/// records, in that order and for the reasons stated there. This handler used
+/// to carry the ordering itself and used to gate the call with `require_admin`;
+/// both moved into the engine so this surface and the `remove_domain` MCP tool
+/// cannot drift apart.
 ///
-/// 1. The join fence goes up first, so no socket can open a room in this
-///    domain from here on. Without it the sweep would close what is open and
-///    a join arriving one instant later would open a fresh room over a domain
-///    that is about to vanish.
-/// 2. The rooms are swept while the domain is STILL registered, so each
-///    room's final save lands in the file that stays on disk.
-/// 3. Only then is the domain unregistered. Inverted, those final saves would
-///    be refused outright or - inside the window between the config write and
-///    the index clear - resolve as virtual and land in the DATABASE rather
-///    than in the file `files_kept` promises was left alone.
+/// Who may call it: an instance admin, or - new here - the owner of a private
+/// domain, which is the rule the private-domains design always stated and this
+/// route did not implement. A caller who may not SEE the domain is answered 404
+/// like anyone naming a domain nobody registered, never 403.
 ///
 /// The response is the engine's report plus `rooms_closed`, so a client can
 /// say how many co-editing sessions it just ended.
@@ -401,15 +490,20 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
     tag = "domains",
     operation_id = "unregister_domain",
     summary = "Unregister a domain. Files on disk are never touched.",
-    description = "Admin only. The registration and the domain's index rows \
+    description = "An instance admin, or a private domain's owner. The \
+                   registration and the domain's index rows \
                    go; a file domain's files stay exactly where they are \
                    (re-adding the folder adopts them again), which is what \
                    `files_kept` reports. A virtual domain has no files, so \
-                   `files_kept` is false and its knowledge is gone - a client \
-                   must confirm that difference in words. Any open \
-                   co-editing rooms in the domain are saved and closed first; \
-                   `rooms_closed` counts them.",
-    params(("domain" = String, Path, description = "The registered domain.")),
+                   `files_kept` is false and its engrams are DELETED with it: \
+                   that case is refused 409 unless the request carries \
+                   `?purge=true`, so a client confirms the loss in words \
+                   before it sends. Any open co-editing rooms in the domain \
+                   are saved and closed first; `rooms_closed` counts them.",
+    params(
+        ("domain" = String, Path, description = "The registered domain."),
+        RemoveQuery,
+    ),
     responses(
         (
             status = 200,
@@ -432,23 +526,26 @@ fn require_absent(field: &Option<String>, field_name: &str, mode: &str) -> Resul
         ),
         (
             status = 403,
-            description = "The caller is not an admin, the request did not \
-                           echo its CSRF token, this instance is read-only, or \
-                           the trusted-header identity names a disabled \
-                           account.",
+            description = "The caller may see the domain and may not end it (an \
+                           instance admin can, and so can a private domain's \
+                           owner), the request did not echo its CSRF token, \
+                           this instance is read-only, or the trusted-header \
+                           identity names a disabled account.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 404,
-            description = "No such domain.",
+            description = "No such domain, or one this caller may not see.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
         (
             status = 409,
             description = "The domain is defined by an environment variable, \
-                           which owns it: unset the variable instead.",
+                           which owns it (unset the variable instead), or it \
+                           is a virtual domain holding engrams and the \
+                           request did not carry `purge=true`.",
             body = ProblemDetail,
             content_type = "application/problem+json",
         ),
@@ -458,26 +555,28 @@ pub async fn remove(
     State(state): State<RestState>,
     identity: Identity,
     ApiPath(domain): ApiPath<String>,
+    ApiQuery(query): ApiQuery<RemoveQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    identity.require_admin()?;
+    // The role check this route used to make is gone: who may end a domain is
+    // the engine's rule now, so this surface and MCP cannot answer it
+    // differently. What stays here is the one thing the engine cannot see -
+    // that an anonymous identity has no account to be a member of anything, so
+    // it is told to log in (401) rather than that it is forbidden (403).
+    identity.require_account()?;
     refuse_read_only(&state)?;
-    // Step 1 and step 2 of this handler's ordering; see the doc comment.
-    let _admin = state.domain_admin().await;
-    let _fence = state.fence_joins().await;
-    let rooms_closed = state.collab.dispose_domain(&domain).await;
-    // Step 3, still behind both guards.
-    let mut report = state.engine.domain_remove(&domain).await.map_err(|e| {
-        match e {
-            // An env-defined domain cannot be unregistered by anyone but the
-            // environment: a conflict on this surface rather than the generic
-            // 422, since no version of this request would succeed.
-            EngineError::Conflict(detail) => ApiError::conflict(detail),
-            other => other.into(),
-        }
-    })?;
-    if let Value::Object(map) = &mut report {
-        map.insert("rooms_closed".to_string(), Value::from(rooms_closed));
-    }
+    let report = state
+        .engine
+        .unregister_domain(&domain, &identity.scope(), query.purge)
+        .await
+        .map_err(|e| {
+            match e {
+                // An env-defined domain cannot be unregistered by anyone but
+                // the environment: a conflict on this surface rather than the
+                // generic 422, since no version of this request would succeed.
+                EngineError::Conflict(detail) => ApiError::conflict(detail),
+                other => other.into(),
+            }
+        })?;
     Ok(Json(report))
 }
 
@@ -681,8 +780,17 @@ pub async fn sync_status(
     // No refuse_read_only: this is a read. See the doc comment.
     // No connection check either: this route reports the connection rather
     // than refusing over it. See the doc comment.
+    // A domain the caller may not see is refused as one nobody registered,
+    // before anything about its origin is read. The share role is not the
+    // admin role in every mode - with `github.share_identity = personal` an
+    // instance editor reaches these routes - so this is a real gate here
+    // rather than a no-op over an admin.
+    require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
-    let aggregate = state.engine.origin_status(Some(&domain)).await?;
+    let aggregate = state
+        .engine
+        .origin_status(Some(&domain), false, &identity.scope())
+        .await?;
     // Lifted before `single_domain` takes the per-domain entry, which is all
     // that survives of the aggregate.
     let connection = aggregate.get("connection").cloned();
@@ -850,13 +958,42 @@ pub async fn sync_summary(
     if !state.engine.github_enabled() {
         return Err(github_off_conflict());
     }
-    let aggregate = state.engine.origin_status(None).await?;
+    let aggregate = state
+        .engine
+        .origin_status(None, false, &identity.scope())
+        .await?;
+    // This one route enumerates domains rather than addressing one, and a team
+    // domain the caller may not see must be absent from the rows AND from the
+    // errors - a failure naming a domain would name it just as well as a
+    // success. `origin_status` now takes the caller's scope and skips those
+    // domains before it probes anything, so nothing is fetched for a domain
+    // nobody may read and the aggregate arrives already narrowed. (The ctl and
+    // stdio paths are the machine owner and pass `Scope::Unrestricted`, which
+    // is what they always were.)
+    //
+    // The filter below therefore has nothing left to remove on any input this
+    // route can produce. It stays as belt and braces: it is the last thing
+    // between a regression in the engine sweep and a private domain's name in
+    // a response, and it costs one pass over a short array.
+    let hidden = state
+        .engine
+        .hidden_domains(&identity.scope())
+        .await?
+        .unwrap_or_default();
+    let visible = |entry: &Value| {
+        entry
+            .get("domain")
+            .and_then(Value::as_str)
+            .is_none_or(|name| !hidden.contains(name))
+    };
     let mut domains: Vec<Value> = Vec::new();
     for entry in aggregate
         .get("domains")
         .and_then(Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or_default()
+        .iter()
+        .filter(|entry| visible(entry))
     {
         // Per row rather than per request: the picker offers one domain at a
         // time, so the count that decides which row a reader recognizes as
@@ -872,8 +1009,15 @@ pub async fn sync_summary(
         "domains": domains,
         "errors": aggregate
             .get("errors")
-            .cloned()
-            .unwrap_or_else(|| Value::Array(Vec::new())),
+            .and_then(Value::as_array)
+            .map(|errors| {
+                errors
+                    .iter()
+                    .filter(|e| visible(e))
+                    .cloned()
+                    .collect::<Vec<Value>>()
+            })
+            .unwrap_or_default(),
     })))
 }
 
@@ -1036,7 +1180,10 @@ pub async fn sync_now(
         ));
     }
     let report = single_domain(
-        state.engine.origin_update(Some(&domain)).await?,
+        state
+            .engine
+            .origin_update(Some(&domain), &identity.scope())
+            .await?,
         &domain,
         "the pull",
     )?;
@@ -1167,6 +1314,9 @@ pub async fn share_changes_preview(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The domain gate `sync_status` explains: a domain the caller may not see
+    // is refused as one nobody registered.
+    require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
@@ -1355,6 +1505,9 @@ pub async fn share_now(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The same gate one rung higher: this acts on the domain, so a caller who
+    // may only read it is refused by level rather than served.
+    require_domain_write(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
@@ -1491,6 +1644,9 @@ pub async fn withdraw_proposal(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The same gate one rung higher: this acts on the domain, so a caller who
+    // may only read it is refused by level rather than served.
+    require_domain_write(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     if !state.engine.github_ready().await {
         return Err(ApiError::conflict(
@@ -1593,6 +1749,9 @@ pub async fn conflict_detail(
     require_share_role(&state, &identity)?;
     // No connection check: every side of a conflict is already on this
     // machine. See the doc comment.
+    // The domain gate `sync_status` explains: a domain the caller may not see
+    // is refused as one nobody registered.
+    require_domain_read(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Missing)?;
     Ok(Json(
         state
@@ -1709,6 +1868,9 @@ pub async fn resolve_conflict(
 ) -> Result<Json<Value>, ApiError> {
     let caller = require_share_role(&state, &identity)?;
     refuse_read_only(&state)?;
+    // The same gate one rung higher: this acts on the domain, so a caller who
+    // may only read it is refused by level rather than served.
+    require_domain_write(&state, &identity, &domain).await?;
     require_team_domain(&state, &domain, Refusal::Conflict)?;
     // Resolve BY ID: look the path up first, then run the path-based verb.
     let detail = state
@@ -1805,6 +1967,171 @@ fn github_off_conflict() -> ApiError {
         "GitHub is switched off on this instance, so no origin can be \
          reached: turn it on under Settings > GitHub",
     )
+}
+
+/// What `PUT /domains/{domain}/visibility` takes.
+#[derive(Debug, serde::Deserialize, utoipa::ToSchema)]
+#[schema(description = "Whether the domain is private. `true` closes it to \
+                        its owner and the people invited into it; `false` \
+                        opens it to every account again and forgets the \
+                        membership list.")]
+pub struct VisibilityBody {
+    /// `true` makes the domain private, `false` makes it shared again.
+    #[schema(example = true)]
+    pub private: bool,
+}
+
+/// `PUT /domains/{domain}/visibility` - make a domain private, or share it
+/// with the whole instance again.
+///
+/// **The two directions are not the same decision, and they are not gated the
+/// same way.**
+///
+/// Making a domain PRIVATE is admin only. It hands the domain an owner - the
+/// account that made the call - and drops that account's own membership row,
+/// so a shared domain would be *taken* by whoever asked first. There is no
+/// owner on a shared domain to ask, so the instance decides.
+///
+/// Making a domain SHARED again is the owner's to make, or an admin's. The
+/// domain already has an owner, that owner already sees everything in it, and
+/// opening what they closed takes nothing from anybody who was not already
+/// dependent on their goodwill. A MANAGER may do neither: both directions
+/// decide who holds the domain, and inviting people and changing their levels
+/// is where a manager's authority ends (see [`super::members`]).
+///
+/// The name is resolved against the ENGINE's registry before the accounts
+/// database is touched. The visibility records are keyed by domain name and
+/// know nothing about which domains exist, so a typo would otherwise mint an
+/// acl row for a domain nobody registered - a private domain with no content,
+/// invisible until someone registered that name and found it already closed.
+///
+/// Refused on a read-only instance like every other mutation on this surface.
+/// The membership records are not knowledge, but what they decide is who may
+/// read it, and the recovery path is the same `crystalline` CLI the refusal
+/// already names.
+///
+/// Making a domain shared again forgets its membership list: there is no
+/// half-private state where the rows survive an opening, and re-closing the
+/// domain starts from the owner alone.
+///
+/// Privatizing a domain that is already private is a no-op, answered `204` like
+/// the change itself: the owner it has and every membership row survive
+/// untouched. A `PUT` states a visibility, and this one already holds; handing
+/// the domain to somebody else is `PUT /domains/{domain}/owner`, which is a
+/// verb of its own so that a retried request cannot do it by accident. See
+/// [`AuthStore::set_domain_visibility`].
+#[utoipa::path(
+    put,
+    path = "/api/v1/domains/{domain}/visibility",
+    tag = "domains",
+    operation_id = "set_domain_visibility",
+    summary = "Make a domain private, or share it with the instance again.",
+    description = "Making a domain PRIVATE is admin only: it gives the domain \
+                   an owner - the calling account - and hides it from every \
+                   account that is not invited into it. A domain nobody may \
+                   see is answered exactly as a domain nobody registered, so a \
+                   stranger's request for it is a 404 rather than a \
+                   403.\n\nMaking a domain SHARED again is served to the \
+                   domain's own owner as well as to an admin: they already see \
+                   everything in it, and opening what they closed takes \
+                   nothing from anybody.\n\nPrivatizing a domain that is \
+                   already private changes nothing: it keeps the owner and the \
+                   members it has, and does not become the caller's. Transfer \
+                   ownership with PUT /domains/{domain}/owner.\n\nA manager may do neither. It may \
+                   invite people and change their levels; deciding who holds \
+                   the domain is not one domain's administration to \
+                   settle.\n\nMaking a domain shared again forgets its \
+                   membership list.",
+    params(("domain" = String, Path, description = "The registered domain.")),
+    request_body = VisibilityBody,
+    responses(
+        (
+            status = 204,
+            description = "The visibility is now what was asked for. Answered \
+                           for a domain that already held it too: privatizing \
+                           an already-private domain changes nothing at all, \
+                           its owner and its members included.",
+        ),
+        (
+            status = 401,
+            description = "No identity, or an anonymous one.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 403,
+            description = "The caller may not make this change - not an admin \
+                           when privatizing, neither the owner nor an admin \
+                           when re-sharing - the request did not echo its CSRF \
+                           token, this instance is read-only, or the \
+                           trusted-header identity names a disabled account.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+        (
+            status = 404,
+            description = "No such domain, or none this caller may see.",
+            body = ProblemDetail,
+            content_type = "application/problem+json",
+        ),
+    ),
+)]
+pub async fn set_visibility(
+    State(state): State<RestState>,
+    identity: Identity,
+    ApiPath(domain): ApiPath<String>,
+    ApiJson(body): ApiJson<VisibilityBody>,
+) -> Result<StatusCode, ApiError> {
+    if body.private {
+        let caller = identity.require_admin()?;
+        refuse_read_only(&state)?;
+        // The registry check, before anything is written to the accounts
+        // database. An admin sees every domain, so the scope here only ever
+        // refuses a name nobody registered - which is exactly what it is for.
+        // It runs AFTER the role gate on purpose: a non-admin is refused
+        // without a lookup, so this direction cannot be used to ask whether a
+        // hidden domain exists.
+        state
+            .engine
+            .require_domain(&domain, &identity.scope())
+            .await?;
+        state
+            .auth
+            .set_domain_visibility(&domain, true, caller.name())
+            .await
+            .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+        return Ok(StatusCode::NO_CONTENT);
+    }
+    // Re-sharing: the owner or an admin. The domain gate comes FIRST here,
+    // because this direction has to resolve who the owner is before it can
+    // answer, and a stranger asking about a hidden domain must get the 404 an
+    // unregistered name gets rather than a 403 that confirms it exists. It
+    // also runs ahead of the read-only refusal, the ordering
+    // [`refuse_read_only`] documents, so that answer does not move with a
+    // setting the caller can observe.
+    let caller = identity.require_account()?;
+    require_domain_read(&state, &identity, &domain).await?;
+    refuse_read_only(&state)?;
+    let right = state
+        .access
+        .right(&identity.scope(), &domain)
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("this domain's membership is unreadable: {e:#}"))
+        })?;
+    if right < DomainRight::Own {
+        return Err(ApiError::forbidden(format!(
+            "your membership on this domain is {}, and only its owner or an \
+             instance admin may share it with everyone again",
+            super::member_level_word(right)
+        )));
+    }
+    state
+        .auth
+        .set_domain_visibility(&domain, false, caller.name.as_str())
+        .await
+        .map_err(|e| ApiError::internal(format!("setting the domain's visibility: {e:#}")))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[cfg(test)]

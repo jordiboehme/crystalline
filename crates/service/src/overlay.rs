@@ -143,14 +143,34 @@ pub struct EnvOverlay {
     config_path: Option<PathBuf>,
 }
 
-/// Redacts `github_token`: an `EnvOverlay` is long-lived on `Engine` and far
-/// more likely to reach a log line or a test failure message via `Debug` than
-/// via any deliberate print, so the secret is masked unconditionally rather
-/// than trusting every future caller to remember not to print it.
+/// The settings pairs with every credential value replaced, for `Debug`. An
+/// overlay reaches a log line or a panic message as a whole struct, and a
+/// secret must not ride along when it does. Which keys are credentials is
+/// the registry's call ([`settings::is_secret_key`]), so this list never
+/// drifts from what `config show` masks.
+fn redacted_settings(pairs: &[(String, String)]) -> Vec<(&str, &str)> {
+    pairs
+        .iter()
+        .map(|(key, value)| {
+            let shown = if settings::is_secret_key(key) {
+                settings::SECRET_DISPLAY
+            } else {
+                value.as_str()
+            };
+            (key.as_str(), shown)
+        })
+        .collect()
+}
+
+/// Redacts `github_token` and every secret setting: an `EnvOverlay` is
+/// long-lived on `Engine` and far more likely to reach a log line or a test
+/// failure message through `Debug` than through any deliberate print, so the
+/// secrets are masked unconditionally rather than trusting every future caller
+/// to remember not to print them.
 impl std::fmt::Debug for EnvOverlay {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("EnvOverlay")
-            .field("settings", &self.settings)
+            .field("settings", &redacted_settings(&self.settings))
             .field("domains", &self.domains)
             .field(
                 "github_token",
@@ -364,17 +384,22 @@ impl EnvOverlay {
     /// Every active override as `(variable, key, display value)`, for surfacing
     /// in `doctor` and the like: first the setting overrides, then the
     /// env-defined domains (keyed `domain.<name>`, their path as the display
-    /// value), then the GitHub token, if set (keyed `github.token`). The
-    /// `database.url` value and the GitHub token are both rendered as `(set)`
-    /// rather than shown, since either may be a credential; a domain path
-    /// carries no secret and is shown as-is.
+    /// value), then the GitHub token, if set (keyed `github.token`).
+    ///
+    /// Every credential is rendered as `(set)` rather than shown: which keys
+    /// those are is the registry's call ([`settings::is_secret_key`], the same
+    /// answer `config show` masks by), so this list never drifts from it -
+    /// `database.url` and the OIDC client secret are two of them today, and a
+    /// key added to the registry as a secret is masked here without this
+    /// sentence being touched. A domain path carries no secret and is shown
+    /// as-is.
     pub fn active_overrides(&self) -> Vec<(String, String, String)> {
         let mut out: Vec<(String, String, String)> = self
             .settings
             .iter()
             .map(|(key, value)| {
-                let display = if key == "database.url" {
-                    "(set)".to_string()
+                let display = if settings::is_secret_key(key) {
+                    settings::SECRET_DISPLAY.to_string()
                 } else {
                     value.clone()
                 };
@@ -727,6 +752,24 @@ mod tests {
         assert!(ov.is_empty());
     }
 
+    /// The `auth.oidc.*` setters refuse an empty value, because `unset` is how
+    /// a key is turned off. That refusal must never reach a blanked compose
+    /// variable: the empty-is-unset filter runs first, so `VAR=` skips the key
+    /// rather than failing startup. Pinned separately because reordering the
+    /// two would turn a blank line in a compose file into a daemon that does
+    /// not come up.
+    #[test]
+    fn a_blanked_oidc_variable_is_unset_rather_than_a_startup_failure() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_ISSUER", ""),
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", ""),
+        ])
+        .unwrap();
+        assert!(!ov.overrides_key("auth.oidc.issuer"));
+        assert!(!ov.overrides_key("auth.oidc.client_secret"));
+        assert!(ov.is_empty());
+    }
+
     #[test]
     fn an_invalid_value_errors_naming_the_variable() {
         let err = overlay(&[("CRYSTALLINE_GITHUB_POLL_SECS", "10")]).unwrap_err();
@@ -816,6 +859,56 @@ mod tests {
             .find(|(_, key, _)| key == "database.backend")
             .expect("database.backend override present");
         assert_eq!(backend.2, "postgres", "a non-secret value is shown as-is");
+    }
+
+    /// The single sign-on client secret is a credential on the same terms as
+    /// the database url: `crystalline doctor` lists which variables are
+    /// active, and it must be able to say "this one is set" without printing
+    /// what it is set to.
+    #[test]
+    fn active_overrides_masks_the_oidc_client_secret() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_ID", "app-1234"),
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", "hunter2"),
+        ])
+        .unwrap();
+        let overrides = ov.active_overrides();
+
+        let secret = overrides
+            .iter()
+            .find(|(_, key, _)| key == "auth.oidc.client_secret")
+            .expect("auth.oidc.client_secret override present");
+        assert_eq!(secret.0, "CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET");
+        assert_eq!(secret.2, settings::SECRET_DISPLAY);
+
+        let id = overrides
+            .iter()
+            .find(|(_, key, _)| key == "auth.oidc.client_id")
+            .expect("auth.oidc.client_id override present");
+        assert_eq!(id.2, "app-1234", "the client id is not a secret");
+    }
+
+    /// An overlay reaches a log line or a panic message as a whole struct, so
+    /// its `Debug` redacts every credential it carries, not only the token.
+    #[test]
+    fn debug_redacts_every_credential_in_the_overlay() {
+        let ov = overlay(&[
+            ("CRYSTALLINE_AUTH_OIDC_CLIENT_SECRET", "hunter2"),
+            ("CRYSTALLINE_DATABASE_BACKEND", "postgres"),
+            (
+                "CRYSTALLINE_DATABASE_URL",
+                "postgres://u:secret@db/crystalline",
+            ),
+            ("CRYSTALLINE_GITHUB_TOKEN", "ghp_notreal"),
+        ])
+        .unwrap();
+
+        let rendered = format!("{ov:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("postgres://"), "{rendered}");
+        assert!(!rendered.contains("ghp_notreal"), "{rendered}");
+        // The keys themselves still show, so the render stays diagnosable.
+        assert!(rendered.contains("auth.oidc.client_secret"), "{rendered}");
     }
 
     #[test]

@@ -132,6 +132,24 @@ describe("the markdown renderer", () => {
     expect(container.querySelector("code.hljs")).not.toBeNull();
   });
 
+  it("colors the individual tokens inside a fenced code block", async () => {
+    // rehype-highlight wraps each token in its own `<span class="hljs-*">`,
+    // and the custom `span` renderer above has one job for any span that is
+    // not an unresolved wikilink marker: pass its incoming class through
+    // rather than drop it. A prior version dropped it for every span,
+    // silently coloring every fenced code block the page's plain text color
+    // in both themes - the outer `code.hljs` check above could not catch
+    // that, since it never looks at what is inside.
+    const { container } = await renderMarkdown(
+      ["```python", 'value = "a string token"', "```", ""].join("\n"),
+    );
+
+    expect(container.querySelector(".hljs-string")).not.toBeNull();
+    expect(container.querySelector(".hljs-string")?.textContent).toContain(
+      "a string token",
+    );
+  });
+
   it("renders a mermaid fence as a diagram, not as code", async () => {
     const { container } = await renderMarkdown(
       ["```mermaid", "graph TD;", "  A-->B;", "```", ""].join("\n"),
