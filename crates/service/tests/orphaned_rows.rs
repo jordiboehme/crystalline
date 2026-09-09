@@ -100,6 +100,36 @@ async fn fixture() -> (tempfile::TempDir, Arc<Engine>, Arc<Mutex<dyn Store>>) {
     (tmp, engine, store)
 }
 
+/// The same instance with `keep` and nothing else: one domain registered, one
+/// domain indexed, no orphan anywhere.
+///
+/// The control for [`an_orphan_changes_nothing_about_what_is_served`]. Screening
+/// something out moves several reads off their unfiltered fast path and onto a
+/// narrowed one - the vocabulary sweep in particular stops being one store query
+/// and becomes one per domain, merged - and those two paths have to produce the
+/// same bytes, or an orphan in the index would quietly change the answer for
+/// reads that have nothing to do with it.
+async fn clean_fixture() -> (tempfile::TempDir, Arc<Engine>) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let keep = write_domain(&root, "keep", KEEP_MANIFEST, KEEP_NOTE);
+
+    let config_path = root.join("config.yaml");
+    let mut cfg = GlobalConfig {
+        domains_root: Some(root.join("domains-root")),
+        ..GlobalConfig::default()
+    };
+    cfg.domains
+        .insert("keep".to_string(), DomainEntry::file(keep));
+    crystalline_core::config::save_yaml(&config_path, &cfg).unwrap();
+
+    let store: Arc<Mutex<dyn Store>> =
+        Arc::new(Mutex::new(TursoStore::open_in_memory().await.unwrap()));
+    let engine = Arc::new(Engine::new(store, cfg, None, Some(config_path)));
+    engine.sync(None).await.unwrap();
+    (tmp, engine)
+}
+
 fn read(identifier: &str, domain: Option<&str>) -> ReadParams {
     ReadParams {
         identifier: identifier.to_string(),
@@ -479,5 +509,130 @@ async fn a_domain_registered_after_the_engine_started_is_served() {
     assert!(
         !hits.to_string().contains("gone-note"),
         "and the removed one still is not: {hits}"
+    );
+}
+
+/// An orphan in the index changes nothing at all about the domain that is
+/// served - not one field of one envelope.
+///
+/// Worth its own test because the screen is what decides whether a read takes
+/// its unfiltered fast path or a narrowed one, and those are not always the same
+/// query. The vocabulary sweep is the sharp case: with nothing screened out it
+/// is a single all-domain store query, and with something screened out it
+/// becomes one query per served domain merged back together. Two shapes for one
+/// answer is how they drift, so this pins them equal, field for field, against
+/// an instance that has `keep` and has never heard of `gone`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_orphan_changes_nothing_about_what_is_served() {
+    let (_tmp, orphaned, _store) = fixture().await;
+    let (_clean_tmp, clean) = clean_fixture().await;
+
+    for (what, a, b) in [
+        (
+            "the vocabulary sweep",
+            orphaned
+                .vocabulary(&VocabularyParams { domain: None }, &Scope::Unrestricted)
+                .await
+                .unwrap(),
+            clean
+                .vocabulary(&VocabularyParams { domain: None }, &Scope::Unrestricted)
+                .await
+                .unwrap(),
+        ),
+        (
+            "an unfiltered search",
+            orphaned
+                .search_engrams(&keyword("protocol"), &Scope::Unrestricted)
+                .await
+                .unwrap(),
+            clean
+                .search_engrams(&keyword("protocol"), &Scope::Unrestricted)
+                .await
+                .unwrap(),
+        ),
+        (
+            "a search with no query at all",
+            orphaned
+                .search_engrams(&SearchParams::default(), &Scope::Unrestricted)
+                .await
+                .unwrap(),
+            clean
+                .search_engrams(&SearchParams::default(), &Scope::Unrestricted)
+                .await
+                .unwrap(),
+        ),
+        (
+            "the activity feed",
+            orphaned
+                .recent_activity(
+                    &RecentParams {
+                        domains: Vec::new(),
+                        timeframe: Some("100y".to_string()),
+                        types: Vec::new(),
+                    },
+                    &Scope::Unrestricted,
+                )
+                .await
+                .unwrap(),
+            clean
+                .recent_activity(
+                    &RecentParams {
+                        domains: Vec::new(),
+                        timeframe: Some("100y".to_string()),
+                        types: Vec::new(),
+                    },
+                    &Scope::Unrestricted,
+                )
+                .await
+                .unwrap(),
+        ),
+    ] {
+        assert_eq!(a, b, "{what} answers the same with an orphan in the index");
+    }
+}
+
+/// `total` is the count the query reports, not the length of the page it
+/// returned, so a filter that narrowed the rows and left the count alone would
+/// show here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_total_is_the_query_count_and_not_the_page_length() {
+    let (_tmp, engine, _store) = fixture().await;
+    let hits = engine
+        .search_engrams(
+            &SearchParams {
+                limit: Some(1),
+                ..SearchParams::default()
+            },
+            &Scope::Unrestricted,
+        )
+        .await
+        .unwrap();
+    let total = hits["total"].as_i64().expect("a total");
+    assert_eq!(
+        hits["count"], 1,
+        "the page is capped at the limit asked for: {hits}"
+    );
+    assert!(
+        total > 1,
+        "and the total counts past it, so it is the query's own count: {hits}"
+    );
+    assert!(
+        !hits.to_string().contains("gone"),
+        "with the removed domain in neither: {hits}"
+    );
+
+    // The same total, unpaged, is exactly what the served domain holds - two
+    // engrams, the MANIFEST and the note - and not the four the index stores.
+    let all = engine
+        .search_engrams(&SearchParams::default(), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert_eq!(
+        all["total"], total,
+        "paging does not change the total: {all}"
+    );
+    assert_eq!(
+        all["total"], 2,
+        "the served domain's engrams, not the index's: {all}"
     );
 }
