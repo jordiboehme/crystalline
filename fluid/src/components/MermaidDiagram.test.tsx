@@ -228,7 +228,11 @@ describe("MermaidDiagram", () => {
         screen.getByRole("button", { name: "Show at full width" }),
       );
       const svg = container.querySelector("svg");
-      expect(svg?.getAttribute("width")).toBe("600px");
+      // As wide as the column allows: the viewBox fills whatever room there is,
+      // and the floor keeps a column narrower than the drawing from squeezing
+      // it back down.
+      expect(svg?.getAttribute("width")).toBe("100%");
+      expect(svg?.getAttribute("style") ?? "").toContain("min-width: 600px");
       expect(svg?.getAttribute("style") ?? "").not.toContain("max-width");
       // The same scroll region the measured wide path uses: a diagram wider
       // than the column has to be reachable, not merely unclamped.

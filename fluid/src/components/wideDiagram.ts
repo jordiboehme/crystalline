@@ -49,15 +49,22 @@ export function unclampWideDiagram(svg: string): {
 }
 
 /**
- * The same unclamp, asked for rather than measured: the diagram gets its own
- * width back whatever that width is, because the reader has said they want
- * this one wide and the threshold only ever answered a different question -
- * whether scaling it down would have made it unreadable on its own.
+ * The same unclamp, asked for rather than measured, and with a different
+ * answer: as wide as the column allows.
  *
- * A diagram whose natural width cannot be read gets `width="100%"` instead of
- * being left alone: there is no number to hand back, and filling the column is
- * still more room than mermaid's clamp allows. Running it twice changes
- * nothing, so it is safe over markup the measured path has already rewritten.
+ * The measured form answers "would scaling this down make it unreadable" and
+ * hands a diagram past the threshold its own width back. This one answers a
+ * reader who said "show me this one wide", and wide means the room there is.
+ * So the root takes `width="100%"` with mermaid's clamp gone, which lets the
+ * viewBox scale a small diagram UP to fill a wide column, and an inline
+ * `min-width` of the drawing's own width, which stops a column narrower than
+ * the drawing from squeezing it: there the scroll container carries it at its
+ * natural size, exactly as the measured path does.
+ *
+ * A diagram whose natural width cannot be read gets `width="100%"` and no
+ * floor, because there is no number to hold it up with. Running this twice
+ * changes nothing, so it is safe over markup the measured path has already
+ * rewritten.
  */
 export function unclampDiagram(svg: string): string {
   const root = findRootTag(svg);
@@ -66,9 +73,9 @@ export function unclampDiagram(svg: string): string {
   }
   const tag = svg.slice(root.start, root.end);
   const width = naturalWidth(tag);
-  const unclamped = withoutClamp(
-    withWidth(tag, width === null ? "100%" : `${width}px`),
-  );
+  const widened = withWidth(tag, "100%");
+  const unclamped =
+    width === null ? withoutClamp(widened) : withFloor(widened, width);
   return svg.slice(0, root.start) + unclamped + svg.slice(root.end);
 }
 
@@ -177,4 +184,33 @@ function withoutClamp(tag: string): string {
     return before + after;
   }
   return `${before}${match[1]}"${declarations.join("; ")};"${after}`;
+}
+
+/**
+ * Drop the clamp and put a floor in its place: the drawing's own width as an
+ * inline `min-width`, replacing any that was already there so a second pass
+ * leaves the markup exactly as the first one did. The floor goes last, which
+ * is what makes that true of the whole declaration string and not only of the
+ * value.
+ */
+function withFloor(tag: string, width: number): string {
+  const style = /(\sstyle\s*=\s*)(?:"([^"]*)"|'([^']*)')/i;
+  const match = style.exec(tag);
+  const declarations = (match === null ? "" : (match[2] ?? match[3] ?? ""))
+    .split(";")
+    .map((declaration) => declaration.trim())
+    .filter(
+      (declaration) =>
+        declaration !== "" &&
+        !/^max-width\s*:/i.test(declaration) &&
+        !/^min-width\s*:/i.test(declaration),
+    );
+  declarations.push(`min-width: ${width}px`);
+  const written = `${declarations.join("; ")};`;
+  if (match === null) {
+    return tag.replace(/^<svg/i, `<svg style="${written}"`);
+  }
+  const before = tag.slice(0, match.index);
+  const after = tag.slice(match.index + match[0].length);
+  return `${before}${match[1]}"${written}"${after}`;
 }
