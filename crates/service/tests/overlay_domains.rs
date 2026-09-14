@@ -1503,3 +1503,309 @@ async fn a_browse_level_is_drawn_from_the_readers_own_drafts() {
         "while it is still in everybody else's"
     );
 }
+
+// --- a mirror that fails never unsays a row that landed ---------------------
+
+/// A second base engram, so a test can move one path and delete another
+/// without the two getting in each other's way.
+const NOTES: &str = "---\ntype: engram\ntitle: Notes\npermalink: notes\ntags:\n  - team\nstatus: stable\nrecorded_at: 2026-01-02\n---\n\n# Notes\n\n- [decision] the notes as the team has them #team\n";
+
+/// An engram with enough observations to split one out of.
+const RICH_BODY: &str = "- [decision] the first thing #team\n- [decision] the second thing #team\n- [idea] the third thing #team\n- [idea] the fourth thing #team";
+
+/// A file where the domain's journal folder belongs, so every mirror write
+/// under it fails. Deterministic, and portable in a way a `chmod` is not: root
+/// ignores a mode and Windows has no such mode, while nothing anywhere can
+/// create a folder inside a file.
+fn break_the_mirror(state: &std::path::Path, domain: &str) {
+    std::fs::create_dir_all(state.join("overlays")).unwrap();
+    std::fs::write(state.join("overlays").join(domain), b"not a folder").unwrap();
+}
+
+/// The invariant a routed write cannot be trusted without: **a row that landed
+/// is never reported as unwritten.**
+///
+/// The journal is written after the row, so a mirror that fails leaves a draft
+/// in the index with no copy the next `reindex --wipe` could bring back. That
+/// is worth saying out loud and it is not worth unsaying the write for: a verb
+/// that reported failure would have three callers act on a lie - a split would
+/// delete the engram holding the moved observations, a move's rollback would
+/// undo a move that happened, and a delete would be unretryable because the
+/// tombstone it claims it did not write is there.
+///
+/// So the row's success is the answer and the mirror's failure rides along as a
+/// warning, on the receipt and in the log. Four verbs here, one each for the
+/// two row shapes a draft has: create and edit write a draft, move writes a
+/// tombstone and an entry, delete writes a tombstone.
+#[tokio::test]
+async fn a_mirror_that_fails_never_unsays_a_draft_that_landed() {
+    let f = review_fixture().await;
+    std::fs::write(f.domain_root("team").join("notes.md"), NOTES).unwrap();
+    f.engine.sync(None).await.unwrap();
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+    break_the_mirror(&f.state, "team");
+
+    let warns = |receipt: &serde_json::Value, path: &str| {
+        let text = receipt["draft_warning"]
+            .as_str()
+            .unwrap_or_else(|| panic!("the receipt carries the mirror's failure: {receipt}"))
+            .to_string();
+        assert!(
+            text.contains(path) && text.contains("reindex --wipe"),
+            "and the warning names the draft and what it costs: {text}"
+        );
+    };
+
+    // -- create --
+    let created = f
+        .engine
+        .write_engram_as(
+            &write_params("team", "Fresh", "- [idea] a page only alice has #team"),
+            who,
+            &alice,
+        )
+        .await
+        .expect("a draft whose mirror failed still landed");
+    assert_eq!(created["draft"], serde_json::json!(true));
+    warns(&created, "fresh.md");
+
+    // -- edit --
+    let edited = f
+        .engine
+        .edit_engram_as(
+            &EditParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                operation: "append".to_string(),
+                content: Some("- [decision] and alice would add this #team".to_string()),
+                key: None,
+                value: None,
+                find_text: None,
+                expected_replacements: None,
+                section: None,
+                include_subsections: false,
+                expected_checksum: None,
+                ack_scope: None,
+            },
+            who,
+            &alice,
+        )
+        .await
+        .expect("an edit whose mirror failed still landed");
+    warns(&edited, "plan.md");
+
+    // -- move: a tombstone at the source and an entry at the destination --
+    let moved = f
+        .engine
+        .move_engram(
+            &crystalline_service::params::MoveParams {
+                identifier: "plan".to_string(),
+                domain: "team".to_string(),
+                destination: "archive/plan.md".to_string(),
+                destination_domain: None,
+                update_links: None,
+            },
+            &alice,
+        )
+        .await
+        .expect("a move whose mirror failed still landed");
+    warns(&moved, "archive/plan.md");
+
+    // -- delete --
+    let deleted = f
+        .engine
+        .delete_engram_as(
+            &DeleteParams {
+                identifier: "notes".to_string(),
+                domain: "team".to_string(),
+                expected_checksum: None,
+            },
+            who,
+            &alice,
+        )
+        .await
+        .expect("a deletion whose mirror failed still landed");
+    assert_eq!(deleted["deleted"], serde_json::json!(true));
+    warns(&deleted, "notes.md");
+
+    // Every row is where the receipts said it is.
+    let held = f.held("team", "alice").await;
+    let shape: Vec<(&str, bool)> = held
+        .iter()
+        .map(|(path, _, tomb)| (path.as_str(), *tomb))
+        .collect();
+    assert_eq!(
+        shape,
+        vec![
+            ("archive/plan.md", false),
+            ("fresh.md", false),
+            ("notes.md", true),
+            ("plan.md", true),
+        ],
+        "four writes, four rows: {held:?}"
+    );
+    assert!(
+        f.reads("notes", &alice).await.is_err() && f.reads("plan", &alice).await.is_err(),
+        "and the two deletions are deletions for her"
+    );
+
+    // And nothing at all was mirrored, which the journal says rather than
+    // reporting an empty one as nobody drafting.
+    let mirrored = overlay_journal::journal_entries(&f.state, "team");
+    assert!(mirrored.entries.is_empty());
+    assert!(
+        mirrored.unreadable,
+        "the journal says it could not be read rather than that nobody is drafting"
+    );
+}
+
+/// The one path in review mode that can lose a user's content, pinned: a split
+/// whose source edit reports failure makes the split take the new engram back,
+/// and the moved observations are then in neither engram.
+///
+/// The mirror is broken for the SOURCE's own entry alone, so the new engram's
+/// write succeeds and the rollback is reachable - which a mirror broken for the
+/// whole domain would not be, since the split would fail at its first write.
+#[tokio::test]
+async fn a_split_whose_mirror_fails_never_takes_the_new_engram_back() {
+    let f = review_fixture().await;
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+
+    f.engine
+        .write_engram_as(&write_params("team", "Rich", RICH_BODY), who, &alice)
+        .await
+        .unwrap();
+    // A folder where the source draft's mirror file belongs: this one entry
+    // cannot be written and every other one can.
+    let mirror = f.state.join("overlays/team/alice/rich.md");
+    std::fs::remove_file(&mirror).unwrap();
+    std::fs::create_dir_all(&mirror).unwrap();
+
+    let source = f.engine.read_engram(&read("rich"), &alice).await.unwrap();
+    let lines: Vec<usize> = source["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["line"].as_u64().unwrap() as usize)
+        .take(1)
+        .collect();
+    let checksum = source["checksum"].as_str().unwrap().to_string();
+
+    let split = f
+        .engine
+        .split_engram_as(
+            &crystalline_service::params::SplitParams {
+                domain: "team".to_string(),
+                identifier: "rich".to_string(),
+                title: "The Split Out Part".to_string(),
+                folder: None,
+                observations: lines,
+                sections: Vec::new(),
+                expected_checksum: Some(checksum),
+            },
+            who,
+            &alice,
+        )
+        .await
+        .expect("a split whose source mirror failed still landed both engrams");
+    assert_eq!(
+        split["draft"],
+        serde_json::json!(true),
+        "and its receipt says the split landed in a draft: {split}"
+    );
+
+    // Both engrams are alice's, and the moved observations are in exactly one
+    // of them - which is the whole point: taking the new one back would have
+    // left them in neither.
+    let new = f
+        .reads("the-split-out-part", &alice)
+        .await
+        .expect("the new engram is still there");
+    assert!(
+        new.contains("the first thing"),
+        "the moved observation is in the new engram: {new}"
+    );
+    let rest = f.reads("rich", &alice).await.unwrap();
+    assert!(
+        !rest.contains("the first thing") && rest.contains("the second thing"),
+        "and out of the source, which kept the rest: {rest}"
+    );
+}
+
+/// Split is the fifth write verb, and in review mode both of its writes are
+/// drafts: the engram it creates and the source it edits. Its receipt says so,
+/// the tree does not move, and both rows are the splitter's alone.
+#[tokio::test]
+async fn a_split_in_review_mode_lands_both_engrams_as_drafts() {
+    let f = review_fixture().await;
+    let before = f.tree("team");
+    let alice = account("alice");
+    let who = Some("claude-code/2.0-for-alice");
+
+    f.engine
+        .write_engram_as(&write_params("team", "Rich", RICH_BODY), who, &alice)
+        .await
+        .unwrap();
+    let source = f.engine.read_engram(&read("rich"), &alice).await.unwrap();
+    let lines: Vec<usize> = source["observations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["line"].as_u64().unwrap() as usize)
+        .take(1)
+        .collect();
+
+    let split = f
+        .engine
+        .split_engram_as(
+            &crystalline_service::params::SplitParams {
+                domain: "team".to_string(),
+                identifier: "rich".to_string(),
+                title: "The Split Out Part".to_string(),
+                folder: None,
+                observations: lines,
+                sections: Vec::new(),
+                expected_checksum: Some(source["checksum"].as_str().unwrap().to_string()),
+            },
+            who,
+            &alice,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        split["draft"],
+        serde_json::json!(true),
+        "the receipt says the split landed in a draft: {split}"
+    );
+    assert!(
+        split.get("draft_warning").is_none(),
+        "and says nothing about a mirror, because both were mirrored: {split}"
+    );
+
+    assert_eq!(f.tree("team"), before, "neither write reached the tree");
+    let held = f.held("team", "alice").await;
+    let paths: Vec<&str> = held.iter().map(|(p, _, _)| p.as_str()).collect();
+    assert_eq!(
+        paths,
+        vec!["rich.md", "the-split-out-part.md"],
+        "both engrams are alice's own drafts: {held:?}"
+    );
+    assert!(
+        f.reads("the-split-out-part", &account("bob"))
+            .await
+            .is_err(),
+        "and nobody else has either of them"
+    );
+    let mirrored: Vec<String> = overlay_journal::journal_entries(&f.state, "team")
+        .entries
+        .into_iter()
+        .map(|e| e.path)
+        .collect();
+    assert_eq!(
+        mirrored,
+        vec!["rich.md".to_string(), "the-split-out-part.md".to_string()],
+        "and both are mirrored"
+    );
+}

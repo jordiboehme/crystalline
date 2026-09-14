@@ -2306,11 +2306,27 @@ impl Engine {
     /// rows do: no file on disk holds a draft, so the row is the only place the
     /// document lives and a body-only row would lose the frontmatter for good.
     ///
-    /// The row goes down before the mirror, and the state directory is resolved
-    /// before either: a mirror with no row is a draft that appears out of
-    /// nowhere at the next restore, where a row with no mirror is a draft that
-    /// a wipe would lose - and the caller is told about that one rather than
-    /// left believing it is safe.
+    /// **The row goes down before the mirror, and a mirror that fails does not
+    /// unsay the row.** The answer is `Some(warning)`: the write landed, and
+    /// this machine could not copy it where a `reindex --wipe` would find it.
+    ///
+    /// The ordering is what keeps the restore honest under Task 2's rule that
+    /// store rows win. A mirror with no row is a GAP, so the next restore
+    /// fills it - which would mean a write the caller was told had failed
+    /// appearing as a draft later, and, for a tombstone, a deletion taking
+    /// effect after the fact. A row with no mirror is not a gap, so the restore
+    /// does nothing with it: the journal never holds anything the index did not
+    /// accept, and the only loss is the one a wipe takes, which is exactly what
+    /// the warning names.
+    ///
+    /// Reporting it as a failure instead would be worse than silent, because
+    /// three callers act on that answer: a split would delete the engram
+    /// holding the observations it just moved, a move's rollback would undo a
+    /// move that happened, and a delete would be unretryable - its next attempt
+    /// answering "no engram" against the tombstone it claims it did not write.
+    /// The state directory is resolved before anything else, so an engine with
+    /// no journal at all still refuses before it writes a row it could never
+    /// mirror.
     async fn write_overlay_entry(
         &self,
         domain: &str,
@@ -2318,20 +2334,22 @@ impl Engine {
         actor: &str,
         path: &str,
         text: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let state_dir = self.journal_state_dir()?;
         let engram = parse_engram(text).map_err(|e| EngineError::Invalid(e.to_string()))?;
         let mut record = EngramRecord::from_engram(&engram, path, virtual_stamp(text));
         record.content = text.to_string();
         self.commit_overlay_row(domain_id, actor, &record).await?;
-        crate::overlay_journal::journal_write(&state_dir, domain, actor, path, text).map_err(
-            |source| EngineError::Io {
-                path: state_dir.display().to_string(),
-                source,
-            },
-        )?;
+        let warning =
+            match crate::overlay_journal::journal_write(&state_dir, domain, actor, path, text) {
+                Ok(()) => None,
+                Err(e) => Some(unmirrored(domain, actor, path, &e)),
+            };
+        if let Some(text) = &warning {
+            tracing::warn!(domain, actor, path, "{text}");
+        }
         self.nudge_embed();
-        Ok(())
+        Ok(warning)
     }
 
     /// Write one actor's deletion of a base row: a tombstone row standing at
@@ -2343,13 +2361,16 @@ impl Engine {
     /// a draft they had been writing must not leave that draft's chunks behind.
     /// [`Store::upsert_overlay`] keeps the row id stable across rewrites, so
     /// the chunks are cleared explicitly rather than left keyed to it.
+    ///
+    /// Answers `Some(warning)` for a mirror that failed after the row landed,
+    /// for the reason [`Engine::write_overlay_entry`] gives at length.
     async fn write_overlay_tombstone(
         &self,
         domain: &str,
         actor: &str,
         desc: &EngramDescriptor,
         base_text: &str,
-    ) -> Result<()> {
+    ) -> Result<Option<String>> {
         let state_dir = self.journal_state_dir()?;
         let record = EngramRecord {
             path: desc.path.clone(),
@@ -2383,13 +2404,16 @@ impl Engine {
         };
         self.commit_overlay_row(desc.domain_id, actor, &record)
             .await?;
-        crate::overlay_journal::journal_tombstone(&state_dir, domain, actor, &desc.path).map_err(
-            |source| EngineError::Io {
-                path: state_dir.display().to_string(),
-                source,
-            },
-        )?;
-        Ok(())
+        let warning = match crate::overlay_journal::journal_tombstone(
+            &state_dir, domain, actor, &desc.path,
+        ) {
+            Ok(()) => None,
+            Err(e) => Some(unmirrored(domain, actor, &desc.path, &e)),
+        };
+        if let Some(text) = &warning {
+            tracing::warn!(domain, actor, path = desc.path.as_str(), "{text}");
+        }
+        Ok(warning)
     }
 
     /// The row half of both overlay writers, in one transaction: the row, its
@@ -2434,6 +2458,13 @@ impl Engine {
 
     /// Drop one actor's draft at a path, row and mirror together, so a verb
     /// that undoes a draft leaves nothing for a later restore to resurrect.
+    ///
+    /// **The mirror goes first here**, which is the opposite order to the two
+    /// writers above and is the same rule read from the other end: a mirror
+    /// that outlived its row is a gap the next restore fills, so clearing the
+    /// row first and failing on the mirror would resurrect a draft its author
+    /// dropped. Failing on the mirror before the row has moved refuses a call
+    /// that did nothing, which is the honest answer and the retryable one.
     async fn drop_overlay_entry(
         &self,
         domain: &str,
@@ -2442,16 +2473,14 @@ impl Engine {
         path: &str,
     ) -> Result<()> {
         let state_dir = self.journal_state_dir()?;
-        {
-            let store = self.store.lock().await;
-            store.clear_overlay_entry(domain_id, actor, path).await?;
-        }
         crate::overlay_journal::journal_clear(&state_dir, domain, actor, path).map_err(
             |source| EngineError::Io {
                 path: state_dir.display().to_string(),
                 source,
             },
         )?;
+        let store = self.store.lock().await;
+        store.clear_overlay_entry(domain_id, actor, path).await?;
         Ok(())
     }
 
@@ -3375,9 +3404,11 @@ impl Engine {
         // domain in review mode the folder and the database both stay as the
         // team left them, so neither arm below may run.
         if let Some(actor) = &overlay {
-            self.write_overlay_entry(&p.domain, domain_id, actor, &rel, &markdown)
+            let warning = self
+                .write_overlay_entry(&p.domain, domain_id, actor, &rel, &markdown)
                 .await?;
             receipt["draft"] = json!(true);
+            note_unmirrored(&mut receipt, warning);
             return Ok(receipt);
         }
 
@@ -3515,7 +3546,8 @@ impl Engine {
                     &found,
                 )));
             }
-            self.write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &p.content)
+            let warning = self
+                .write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &p.content)
                 .await?;
             // Where the draft now answers, derived exactly as the row's own
             // permalink is: an author who edited the frontmatter's permalink
@@ -3526,13 +3558,15 @@ impl Engine {
                         .permalink
                 })
                 .unwrap_or_else(|_| desc.permalink.clone());
-            return Ok(json!({
+            let mut receipt = json!({
                 "domain": desc.domain,
                 "permalink": permalink,
                 "path": desc.path,
                 "checksum": sha256_hex(p.content.as_bytes()),
                 "draft": true,
-            }));
+            });
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
         }
 
         match &source {
@@ -3685,20 +3719,23 @@ impl Engine {
         // document is this actor's draft of the path, never a file written
         // back into what the team reviewed.
         if let Some(who) = &overlay {
-            self.write_overlay_entry(domain, domain_id, who, path, content)
+            let warning = self
+                .write_overlay_entry(domain, domain_id, who, path, content)
                 .await?;
             let permalink = parse_engram(content)
                 .map(|engram| {
                     EngramRecord::from_engram(&engram, path, virtual_stamp(content)).permalink
                 })
                 .unwrap_or_else(|_| path.trim_end_matches(".md").to_string());
-            return Ok(json!({
+            let mut receipt = json!({
                 "domain": domain,
                 "permalink": permalink,
                 "path": path,
                 "checksum": sha256_hex(content.as_bytes()),
                 "draft": true,
-            }));
+            });
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
         }
         match &source {
             ContentSource::File { root } => {
@@ -4505,8 +4542,10 @@ impl Engine {
                 &actor,
             ))
         };
+        let mut warning = None;
         if let Some(who) = &overlay {
-            self.apply_source_edit(&desc, &source, Some(who), None, &actor, retire_target)
+            warning = self
+                .apply_source_edit(&desc, &source, Some(who), None, &actor, retire_target)
                 .await?;
         } else {
             match &source {
@@ -4601,10 +4640,12 @@ impl Engine {
                         ))
                     })?;
                 if !already(&current) {
-                    self.apply_source_edit(succ_desc, succ_source, Some(who), None, &actor, |c| {
-                        Ok(append_body(c, &line))
-                    })
-                    .await?;
+                    let succ_warning = self
+                        .apply_source_edit(succ_desc, succ_source, Some(who), None, &actor, |c| {
+                            Ok(append_body(c, &line))
+                        })
+                        .await?;
+                    warning = warning.or(succ_warning);
                 }
             } else {
                 match succ_source {
@@ -4684,6 +4725,7 @@ impl Engine {
         if overlay.is_some() {
             receipt["draft"] = json!(true);
         }
+        note_unmirrored(&mut receipt, warning);
         Ok(receipt)
     }
 
@@ -4904,47 +4946,50 @@ impl Engine {
                 move |_| Ok(remaining),
             )
             .await;
-        if let Err(failure) = edited {
-            if failure.wrote {
-                // The source's bytes are the edited ones, so the moved
-                // observations live in the new engram and nowhere else.
-                // Deleting it here is the one thing that would lose them.
-                return Err(EngineError::Internal(format!(
-                    "the split wrote both engrams but the index update for '{}' failed: {}. Both are kept and neither was undone ({} and {}); the index row for '{}' may be stale until the next sync or reindex picks it up",
-                    desc.permalink, failure.error, desc.path, new_path, desc.permalink
-                )));
-            }
-            // The source is untouched, so the new engram is knowledge the
-            // archive now holds twice. Take it back, and report the underlying
-            // failure rather than the cleanup: what the caller has to act on is
-            // that the source moved under them.
-            match new_permalink {
-                Some(permalink) => {
-                    let _ = self
-                        .delete_engram_as(
-                            &DeleteParams {
-                                identifier: permalink,
-                                domain: p.domain.clone(),
-                                expected_checksum: None,
-                            },
-                            client,
-                            // The splitter's own scope again: in review mode
-                            // the engram to take back is in the splitter's
-                            // draft, and the owner wrapper would look for it
-                            // in the owner's.
-                            scope,
-                        )
-                        .await;
+        let source_warning = match edited {
+            Ok(warning) => warning,
+            Err(failure) => {
+                if failure.wrote {
+                    // The source's bytes are the edited ones, so the moved
+                    // observations live in the new engram and nowhere else.
+                    // Deleting it here is the one thing that would lose them.
+                    return Err(EngineError::Internal(format!(
+                        "the split wrote both engrams but the index update for '{}' failed: {}. Both are kept and neither was undone ({} and {}); the index row for '{}' may be stale until the next sync or reindex picks it up",
+                        desc.permalink, failure.error, desc.path, new_path, desc.permalink
+                    )));
                 }
-                None => tracing::warn!(
-                    receipt = %created,
-                    "split rollback skipped: the capture receipt named no permalink"
-                ),
+                // The source is untouched, so the new engram is knowledge the
+                // archive now holds twice. Take it back, and report the underlying
+                // failure rather than the cleanup: what the caller has to act on is
+                // that the source moved under them.
+                match new_permalink {
+                    Some(permalink) => {
+                        let _ = self
+                            .delete_engram_as(
+                                &DeleteParams {
+                                    identifier: permalink,
+                                    domain: p.domain.clone(),
+                                    expected_checksum: None,
+                                },
+                                client,
+                                // The splitter's own scope again: in review mode
+                                // the engram to take back is in the splitter's
+                                // draft, and the owner wrapper would look for it
+                                // in the owner's.
+                                scope,
+                            )
+                            .await;
+                    }
+                    None => tracing::warn!(
+                        receipt = %created,
+                        "split rollback skipped: the capture receipt named no permalink"
+                    ),
+                }
+                return Err(failure.error);
             }
-            return Err(failure.error);
-        }
+        };
 
-        Ok(json!({
+        let mut receipt = json!({
             "domain": desc.domain,
             "source": {
                 "permalink": desc.permalink,
@@ -4958,7 +5003,26 @@ impl Engine {
             },
             "moved_observations": plan.observations,
             "moved_sections": plan.sections,
-        }))
+        });
+        // A split is two writes, and in review mode both of them are drafts:
+        // the engram it created and the source it edited. Its receipt says so
+        // like every other routed verb's, or a caller reads a split of the
+        // folder the team reviewed.
+        if overlay.is_some() {
+            receipt["draft"] = json!(true);
+        }
+        // Either write's mirror can fail on its own, and the create's warning
+        // is already on the receipt this verb built its own from.
+        note_unmirrored(
+            &mut receipt,
+            source_warning.or_else(|| {
+                created
+                    .get("draft_warning")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            }),
+        );
+        Ok(receipt)
     }
 
     /// Work out what a split would move and what it would leave, or refuse.
@@ -5407,15 +5471,16 @@ impl Engine {
         // write lock is taken, so a sweep never runs while a file is held.
         let ack = self.ack_draft(p, &desc, &actor).await?;
 
-        self.apply_source_edit(
-            &desc,
-            &source,
-            overlay.as_deref(),
-            p.expected_checksum.as_deref(),
-            &actor,
-            |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
-        )
-        .await?;
+        let warning = self
+            .apply_source_edit(
+                &desc,
+                &source,
+                overlay.as_deref(),
+                p.expected_checksum.as_deref(),
+                &actor,
+                |current| self.apply_edit(current, p, &desc.permalink, &actor, ack.as_ref()),
+            )
+            .await?;
 
         let mut response = json!({
             "domain": desc.domain,
@@ -5426,6 +5491,7 @@ impl Engine {
         if overlay.is_some() {
             response["draft"] = json!(true);
         }
+        note_unmirrored(&mut response, warning);
         match &ack {
             Some(AckDraft::Record(entry)) => response["evolve_ack"] = ack_json(entry),
             Some(AckDraft::Remove(rule)) => response["evolve_ack_removed"] = json!(rule),
@@ -5453,7 +5519,7 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         apply: F,
-    ) -> Result<()>
+    ) -> Result<Option<String>>
     where
         F: FnOnce(&str) -> Result<String>,
     {
@@ -5480,7 +5546,7 @@ impl Engine {
         expected_checksum: Option<&str>,
         actor: &str,
         apply: F,
-    ) -> std::result::Result<(), SourceEditFailure>
+    ) -> std::result::Result<Option<String>, SourceEditFailure>
     where
         F: FnOnce(&str) -> Result<String>,
     {
@@ -5532,14 +5598,15 @@ impl Engine {
                     "reindex failed (test seam)".to_string(),
                 )));
             }
-            self.write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &edited)
+            let warning = self
+                .write_overlay_entry(&desc.domain, desc.domain_id, who, &desc.path, &edited)
                 .await
                 .map_err(SourceEditFailure::before)?;
             // Neither tail below runs. A draft of the MANIFEST is one actor's
             // proposal about the domain's routing, not the domain's routing,
             // and a draft belongs in no folder's generated index - both of
             // those are properties of what the team reviewed.
-            return Ok(());
+            return Ok(warning);
         }
 
         match source {
@@ -5646,7 +5713,8 @@ impl Engine {
         // reached only when the arm that ran committed its bytes, so a refused
         // edit never schedules a pass for a chunk that was not rewritten.
         self.nudge_embed();
-        Ok(())
+        // A direct write has no mirror to fail, so it has nothing to warn about.
+        Ok(None)
     }
 
     /// Apply one edit operation to an engram's markdown, returning the edited
@@ -6010,57 +6078,74 @@ impl Engine {
                 .into_iter()
                 .find(|found| found.path == src.path)
         };
+        let mut warnings: Vec<String> = Vec::new();
         match &base {
             // A draft of a path no file holds was only ever this actor's, so
             // the move takes it with them; a tombstone over nothing would
             // leave a deletion of an engram the team never had.
             None => {
                 self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
-                    .await?
+                    .await?;
             }
             Some(base) => {
                 let base_text = self.load_content(src_source, base).await?;
-                self.write_overlay_tombstone(&p.domain, actor, base, &base_text)
-                    .await?
+                warnings.extend(
+                    self.write_overlay_tombstone(&p.domain, actor, base, &base_text)
+                        .await?,
+                );
             }
         }
-        if let Err(e) = self
+        match self
             .write_overlay_entry(&p.domain, src.domain_id, actor, dest_rel, &text)
             .await
         {
-            // Back to exactly what this actor held: their own draft when they
-            // had one, and otherwise nothing of their own at all, which is the
-            // base row showing through again.
-            let undo = if held_draft {
-                self.write_overlay_entry(&p.domain, src.domain_id, actor, &src.path, &text)
-                    .await
-            } else {
-                self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
-                    .await
-            };
-            if let Err(undo) = undo {
-                tracing::error!(
-                    domain = p.domain.as_str(),
-                    path = src.path.as_str(),
-                    "the move could not write the destination and could not put the source back \
-                     either: {undo}"
-                );
+            Ok(warning) => warnings.extend(warning),
+            Err(e) => {
+                // The destination's ROW did not land - a mirror that failed
+                // would have come back as a warning above - so there is nothing
+                // at the destination to collide with, and the source goes back
+                // to exactly what this actor held: their own draft when they
+                // had one, and otherwise nothing of their own at all, which is
+                // the base row showing through again.
+                let undo = if held_draft {
+                    self.write_overlay_entry(&p.domain, src.domain_id, actor, &src.path, &text)
+                        .await
+                        .map(|_| ())
+                } else {
+                    self.drop_overlay_entry(&p.domain, src.domain_id, actor, &src.path)
+                        .await
+                };
+                if let Err(undo) = undo {
+                    tracing::error!(
+                        domain = p.domain.as_str(),
+                        path = src.path.as_str(),
+                        "the move could not write the destination and could not put the source \
+                         back either: {undo}"
+                    );
+                }
+                return Err(e);
             }
-            return Err(e);
         }
         let dest_permalink = parse_engram(&text)
             .map(|engram| {
                 EngramRecord::from_engram(&engram, dest_rel, virtual_stamp(&text)).permalink
             })
             .unwrap_or_else(|_| src.permalink.clone());
-        Ok(json!({
+        let mut receipt = json!({
             "from": { "domain": p.domain, "permalink": src.permalink, "path": src.path },
             "to": { "domain": p.domain, "permalink": dest_permalink, "path": dest_rel },
             "cross_domain": false,
             "links_rewritten": 0,
             "attachment_warnings": Vec::<String>::new(),
             "draft": true,
-        }))
+        });
+        // A move is two writes and either mirror can fail on its own, so the
+        // receipt carries whichever of them did rather than the first.
+        note_unmirrored(
+            &mut receipt,
+            (!warnings.is_empty()).then(|| warnings.join(" ")),
+        );
+        Ok(receipt)
     }
 
     /// Move an engram to a new path or domain, rewriting inbound bare links on a
@@ -6772,6 +6857,7 @@ impl Engine {
                     p.identifier, p.domain
                 )));
             }
+            let mut warning = None;
             // A draft of a path no file holds is this actor's alone, so
             // deleting it takes the draft and its mirror away rather than
             // standing a tombstone over a base row that was never there.
@@ -6791,17 +6877,20 @@ impl Engine {
                     // wipe, and the two have to be one shape or a restored
                     // deletion says something different from a written one.
                     let base_text = self.load_content(&source, &desc).await?;
-                    self.write_overlay_tombstone(&desc.domain, who, &desc, &base_text)
+                    warning = self
+                        .write_overlay_tombstone(&desc.domain, who, &desc, &base_text)
                         .await?;
                 }
             }
-            return Ok(json!({
+            let mut receipt = json!({
                 "domain": desc.domain,
                 "permalink": desc.permalink,
                 "path": desc.path,
                 "deleted": true,
                 "draft": true,
-            }));
+            });
+            note_unmirrored(&mut receipt, warning);
+            return Ok(receipt);
         }
 
         if let ContentSource::File { root } = &source {
@@ -9141,6 +9230,8 @@ impl Engine {
         if !has_ack(&current, &rule, scope) {
             return Ok(false);
         }
+        // The answer here is a bool, so a mirror warning has nowhere to ride
+        // out; `write_overlay_entry` has already logged it.
         self.apply_source_edit(
             &desc,
             &source,
@@ -16824,6 +16915,34 @@ fn assets_reserved_error(rel: &str) -> String {
 /// content byte length and its SHA-256. The sha doubles as the CAS token, so a
 /// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
 /// without ever touching a filesystem.
+/// Put a mirror's failure on a draft's receipt, when there was one.
+///
+/// One field on every routed verb, so a caller learns the same thing the same
+/// way whichever verb it called, and a receipt with no such field means the
+/// draft is mirrored.
+fn note_unmirrored(receipt: &mut Value, warning: Option<String>) {
+    if let Some(text) = warning {
+        receipt["draft_warning"] = json!(text);
+    }
+}
+
+/// What a draft's receipt says when the row landed and this machine could not
+/// mirror it under the state directory.
+///
+/// Teaching text rather than a diagnostic: the draft is there and usable, the
+/// one thing that would lose it is named, and so is the way to make the copy
+/// exist again. The underlying error rides along because the cause is almost
+/// always a state directory that is not writable, which the reader can see and
+/// fix.
+fn unmirrored(domain: &str, actor: &str, path: &str, reason: &std::io::Error) -> String {
+    format!(
+        "the draft of '{path}' landed in the index, but this machine could not mirror it under \
+         its state directory ({reason}), so a 'crystalline reindex --wipe' would lose it; make \
+         the overlays folder for domain '{domain}' writable and write again to mirror it, or \
+         share the change while it is still here. Nobody but '{actor}' can see it either way."
+    )
+}
+
 /// A browse prefix as a lowercased folder prefix: empty for the root, and
 /// otherwise ending in the slash that makes it a folder. The Rust counterpart
 /// of the backends' own `folder_slash`, used to cut draft paths to the level
