@@ -2273,8 +2273,13 @@ impl Engine {
 
     /// Forget a domain removed by `domain remove` while this engine is live:
     /// drop it from the discovered overlay and, on the daemon, tell the
-    /// watcher to stop watching its root. The index rows are never touched
-    /// here; they are left for the next full reindex.
+    /// watcher to stop watching its root.
+    ///
+    /// The index rows are not touched here because they are not this
+    /// function's business: `domain_remove` clears them in the same removal,
+    /// and any that outlive it (a removal on another instance, an upgrade that
+    /// inherited them) are the orphan collector's, which ages them out on the
+    /// daemon's sweep. A reindex is never the remedy for a row.
     pub fn forget_domain(&self, name: &str) {
         self.discovered_domains.write().unwrap().remove(name);
         if let Some(tx) = &self.watch_tx {
@@ -10430,14 +10435,21 @@ impl Engine {
 
             // Why this domain was kept, as a word a caller can branch on and a
             // sentence one can print. `None` is the only outcome that deletes.
-            let kept: Option<(&str, &str)> = if self.read_only {
-                Some(("read_only", "this instance is read-only"))
-            } else if matches!(row.kind, DomainKind::Virtual) {
+            // Virtual is tested before read-only, and the order is the
+            // message rather than the outcome: neither collects anything. A
+            // read-only instance that reported `read_only` for a virtual
+            // domain would have the doctor print "this instance is read-only",
+            // which is true and useless - the rows are the domain's only copy
+            // on every instance, and `domain remove --purge` is the one way
+            // out wherever the reader is standing.
+            let kept: Option<(&str, &str)> = if matches!(row.kind, DomainKind::Virtual) {
                 Some((
                     "virtual",
                     "a virtual domain's engram rows are its only copy; end it with \
                      'domain remove --purge', which asks first",
                 ))
+            } else if self.read_only {
+                Some(("read_only", "this instance is read-only"))
             } else if self.hosted_elsewhere(row, now) {
                 Some((
                     "hosted_elsewhere",

@@ -1328,6 +1328,52 @@ async fn a_virtual_domains_rows_are_never_collected() {
     );
 }
 
+/// A read-only instance meets the same virtual orphan, and says the same
+/// thing about it.
+///
+/// Read-only and virtual both keep every row, so which word the report
+/// carries changes nothing about what happens - it changes what a person is
+/// told to do. "This instance is read-only" points at a writable instance that
+/// would collect these rows, and no instance ever will: the rows are the
+/// domain's only copy everywhere. So virtual wins, and the doctor names the
+/// one command that ends a virtual domain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_virtual_orphan_is_virtual_even_on_a_read_only_instance() {
+    let (tmp, _engine, store) = fixture().await;
+    let config_path = tmp.path().join("config.yaml");
+    let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
+    store
+        .lock()
+        .await
+        .upsert_domain("gone", None, crystalline_core::config::DomainKind::Virtual)
+        .await
+        .unwrap();
+    plant_stamp(&store, "gone", chrono::Duration::days(400)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let report = read_only
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), false)
+        .await
+        .unwrap();
+
+    let row = considered(&report, "gone").expect("it is reported rather than hidden");
+    assert_eq!(
+        row["kept"], "virtual",
+        "the reason that names a remedy wins over the one that names this instance: {report}"
+    );
+    assert_eq!(row["collected"], false);
+    assert!(
+        collected(&report).is_empty(),
+        "and a read-only instance still collects nothing: {report}"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "with its only copy untouched"
+    );
+}
+
 /// The on-demand path, and the one rule it waives. A person asking is the
 /// signal the grace period exists to wait for, so `None` waits for nothing: a
 /// never-stamped orphan - which is every row an index inherits from a version
