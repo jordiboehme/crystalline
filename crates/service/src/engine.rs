@@ -619,6 +619,9 @@ pub struct Engine {
     // the caller on the model. `None` when no worker is wired (standalone
     // one-shot commands and most tests), which keeps the inline pass.
     embed_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
+    // One embedding pass at a time, whoever asks: the worker, a verb that just
+    // wrote, the daemon's startup task or the self-heal tick. See [`EmbedGate`].
+    embed_gate: Arc<std::sync::Mutex<EmbedGate>>,
     // Swappable so the daemon can build the (possibly downloading) provider in the
     // background without blocking readiness or text search.
     provider: std::sync::RwLock<Option<Arc<dyn EmbeddingProvider>>>,
@@ -1101,6 +1104,79 @@ impl Drop for ActivityGuard {
     }
 }
 
+/// The single-flight state of the engine's embedding pass.
+///
+/// `running` says a pass is walking the backlog; `again` says a request
+/// arrived while it was. Two passes over one backlog do not share it - each
+/// keeps its own cursor, so the second re-embeds whatever the first has in
+/// flight, splitting the CPU and doubling the in-flight pages for no extra
+/// coverage. One pass at a time is therefore an engine invariant rather than a
+/// call-site convention, and it holds for callers with no worker wired too.
+///
+/// Both flips happen under the one mutex, which is what keeps the invariant
+/// from costing work: a caller either finds the pass running and hands it
+/// `again`, or finds it finished and claims the next pass itself. There is no
+/// instant where a request is neither served by the running pass nor able to
+/// start its own.
+#[derive(Default)]
+pub(crate) struct EmbedGate {
+    running: bool,
+    again: bool,
+}
+
+/// Holds the claim on the embedding pass, releasing it on drop so a store
+/// error, a panic or a dropped future cannot strand it.
+pub(crate) struct EmbedPass {
+    gate: Arc<std::sync::Mutex<EmbedGate>>,
+    released: bool,
+}
+
+impl EmbedPass {
+    /// Claim the pass, or `None` when one is already running - in which case
+    /// the running pass is told to walk the backlog once more, so the caller's
+    /// work is served by that walk instead of being dropped.
+    fn claim(gate: &Arc<std::sync::Mutex<EmbedGate>>) -> Option<EmbedPass> {
+        let mut state = gate.lock().unwrap();
+        if state.running {
+            state.again = true;
+            return None;
+        }
+        state.running = true;
+        // A walk starts at the head of the backlog, so it already covers
+        // whatever an earlier request was asking for.
+        state.again = false;
+        drop(state);
+        Some(EmbedPass {
+            gate: Arc::clone(gate),
+            released: false,
+        })
+    }
+
+    /// Called once per walk: `true` to walk again because a request arrived
+    /// during the one just finished, `false` to end the pass - which releases
+    /// the claim there and then, in the same critical section a fresh caller
+    /// checks.
+    fn walk_again(&mut self) -> bool {
+        let mut state = self.gate.lock().unwrap();
+        if state.again {
+            state.again = false;
+            true
+        } else {
+            state.running = false;
+            self.released = true;
+            false
+        }
+    }
+}
+
+impl Drop for EmbedPass {
+    fn drop(&mut self) {
+        if !self.released {
+            self.gate.lock().unwrap().running = false;
+        }
+    }
+}
+
 impl Engine {
     /// Build an engine around an already-open store, an optional provider and a
     /// config. A `None` provider can be installed later with [`Engine::set_provider`].
@@ -1129,6 +1205,7 @@ impl Engine {
             discovered_domains: std::sync::RwLock::new(HashMap::new()),
             watch_tx: None,
             embed_tx: None,
+            embed_gate: Arc::default(),
             provider: std::sync::RwLock::new(provider),
             model_id,
             chunk_params,
@@ -9175,16 +9252,53 @@ impl Engine {
     /// keep no embedding and stay in the backlog, visible in `status`, for a
     /// later pass, so one poisoned batch cannot starve the whole queue. Only
     /// store errors abort the pass.
+    ///
+    /// One pass runs at a time. A caller that arrives while another pass is
+    /// walking the backlog returns `Ok(0)` at once instead of walking it a
+    /// second time with its own cursor: two passes do not share a backlog, they
+    /// shadow each other. Nothing is dropped by that - the running pass is told
+    /// to walk again, and a walk starts at the head of the backlog, so it picks
+    /// up whatever the second caller had just written. `Ok(0)` from a skipped
+    /// call therefore means "another pass is doing this", not "there was
+    /// nothing to do"; [`Engine::embed_in_flight`] tells the two apart.
     pub async fn embed_pending_with_page(&self, page_size: usize) -> Result<usize> {
+        if self.provider().is_none() {
+            return Ok(0);
+        }
+        let Some(mut pass) = EmbedPass::claim(&self.embed_gate) else {
+            tracing::debug!("an embed pass is already running; it walks the backlog again");
+            return Ok(0);
+        };
+        let page_size = page_size.max(1);
+        let mut embedded = 0usize;
+        let mut activity: Option<ActivityGuard> = None;
+        loop {
+            embedded += self.embed_one_walk(page_size, &mut activity).await?;
+            if !pass.walk_again() {
+                break;
+            }
+        }
+        Ok(embedded)
+    }
+
+    /// One walk of the backlog, head to tail, for [`Self::embed_pending_with_page`].
+    /// The activity is the caller's so a pass that walks twice stays one
+    /// operation in `status`.
+    async fn embed_one_walk(
+        &self,
+        page_size: usize,
+        activity: &mut Option<ActivityGuard>,
+    ) -> Result<usize> {
         let Some(provider) = self.provider() else {
             return Ok(0);
         };
         let model = self.model_id.clone();
-        let page_size = page_size.max(1);
         // In collaboration mode the scan is scoped to the file domains this
         // instance hosts plus all virtual domains, so a non-host does not
         // wastefully re-embed a chunk another instance owns; standalone it
-        // embeds everything. The scope holds for the whole pass.
+        // embeds everything. The scope holds for the whole walk and is read
+        // again for the next one, so a domain this instance took over while the
+        // pass ran is covered by it.
         let scope = {
             let store = self.store.lock().await;
             self.embed_scope(&*store).await?
@@ -9194,7 +9308,6 @@ impl Engine {
         // pull a page and to write vectors, never across the embed call.
         let mut embedded = 0usize;
         let mut cursor: Option<(i64, i64)> = None;
-        let mut activity: Option<ActivityGuard> = None;
         loop {
             let mut jobs = {
                 let store = self.store.lock().await;
@@ -9214,7 +9327,7 @@ impl Engine {
             // land in the same batch.
             order_jobs_for_batching(&mut jobs);
             if activity.is_none() {
-                activity = Some(ActivityState::begin(&self.activity, "embed", None));
+                *activity = Some(ActivityState::begin(&self.activity, "embed", None));
             }
             for batch in jobs.chunks(EMBED_BATCH) {
                 let texts: Vec<String> = batch.iter().map(|j| j.text.clone()).collect();
@@ -9260,9 +9373,20 @@ impl Engine {
         Ok(embedded)
     }
 
+    /// Whether an embedding pass is walking the backlog right now. Cheap: one
+    /// flag behind the single-flight gate, no store round trip. A periodic
+    /// trigger reads it so it does not chain a fresh full-backlog walk onto the
+    /// end of every long pass, since "the backlog is non-empty" stays true for
+    /// the whole life of one.
+    pub fn embed_in_flight(&self) -> bool {
+        self.embed_gate.lock().unwrap().running
+    }
+
     /// Schedules a background embedding pass when a worker is wired,
     /// returning whether it was scheduled; callers run an inline pass when
-    /// it was not.
+    /// it was not. "Scheduled" is all it reports: the signal is queued, and
+    /// whether the pass then runs, coalesces into a running one or finds the
+    /// backlog already drained is the worker's business, never the caller's.
     pub fn request_embed(&self) -> bool {
         match &self.embed_tx {
             Some(tx) => tx.send(()).is_ok(),
@@ -13925,7 +14049,13 @@ pub async fn run_embed_worker(
         while rx.try_recv().is_ok() {}
         match engine.embed_pending().await {
             Ok(0) => {}
-            Ok(_) => {
+            Ok(n) => {
+                // The count the daemon's startup pass used to log itself. It
+                // belongs here now that every pass comes through the worker,
+                // and stays at info: the worker coalesces a burst of requests
+                // into one pass, so a large first index is one line, not
+                // thousands.
+                tracing::info!("embedded {n} chunk(s)");
                 // The engine passive-checkpoints on its own past a hardcoded
                 // un-backfilled-frame threshold, so this is disk reclamation
                 // of the post-bulk-embed high-water mark, not growth control.

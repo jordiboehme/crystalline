@@ -411,10 +411,15 @@ pub async fn run_serve(
             e.bootstrap_env_origins().await;
             if let Some(provider) = crate::engine::build_provider(&cfg).await {
                 e.set_provider(provider);
-                match e.embed_pending().await {
-                    Ok(n) if n > 0 => tracing::info!("embedded {n} chunks on startup"),
-                    Ok(_) => {}
-                    Err(err) => tracing::warn!("initial embed failed: {err}"),
+                // Schedule on the worker, like every other caller: an inline
+                // pass here runs beside the worker's, and two passes walk one
+                // backlog with separate cursors, each re-embedding what the
+                // other has in flight. The inline fallback is for an engine
+                // with no worker wired, which a daemon never is.
+                if !e.request_embed()
+                    && let Err(err) = e.embed_pending().await
+                {
+                    tracing::warn!("initial embed failed: {err}");
                 }
             }
         });
@@ -1718,8 +1723,14 @@ const EMBED_TICK: Duration = Duration::from_secs(300);
 /// falls back to an inline embed when no worker is wired (an inline pass on this
 /// timer would reintroduce the request-path stall the worker exists to
 /// prevent), so an unwired tick is a silent no-op. The cadence is a parameter so
-/// a test can drive it fast; production passes [`EMBED_TICK`]. The first tick is
-/// consumed so a self-heal never races the startup embed.
+/// a test can drive it fast; production passes [`EMBED_TICK`].
+///
+/// "A backlog remains" is not on its own the condition to fire: it stays true
+/// for the whole life of a pass that is working through one, so a first index
+/// of any size would be signalled every cadence. A pass in flight is therefore
+/// checked first, and only an outstanding backlog nobody is walking fires the
+/// worker. The interval's first tick is immediate and is consumed, so the first
+/// live tick lands one cadence in rather than the moment the daemon starts.
 pub async fn run_embed_tick(
     engine: Arc<Engine>,
     cadence: Duration,
@@ -1730,13 +1741,18 @@ pub async fn run_embed_tick(
     loop {
         tokio::select! {
             _ = wait_true(&mut shutdown) => break,
-            _ = ticker.tick() => match engine.embedding_backlog().await {
-                Ok(0) => {}
-                Ok(_) => {
-                    engine.request_embed();
+            _ = ticker.tick() => {
+                if engine.embed_in_flight() {
+                    continue;
                 }
-                Err(err) => tracing::warn!("embed self-heal backlog probe failed: {err}"),
-            },
+                match engine.embedding_backlog().await {
+                    Ok(0) => {}
+                    Ok(_) => {
+                        engine.request_embed();
+                    }
+                    Err(err) => tracing::warn!("embed self-heal backlog probe failed: {err}"),
+                }
+            }
         }
     }
 }
