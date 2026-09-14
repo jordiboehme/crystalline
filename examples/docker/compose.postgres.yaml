@@ -59,8 +59,11 @@ services:
     image: ghcr.io/jordiboehme/crystalline:latest
     # Alternative with the embedding model baked in (no first-start download):
     # image: ghcr.io/jordiboehme/crystalline:with-model
-    command: ["serve", "--http", "0.0.0.0:7411"]
+    # The image already defaults to serve with CRYSTALLINE_SERVICE_HTTP set, so
+    # there is nothing to pass here. Exposure is configuration so that every
+    # daemon on the host binds the same way, whoever started it.
     environment:
+      CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
       CRYSTALLINE_DATABASE_BACKEND: postgres
       CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
     depends_on:
@@ -83,8 +86,8 @@ services:
   #
   # crystalline-b:
   #   image: ghcr.io/jordiboehme/crystalline:latest
-  #   command: ["serve", "--http", "0.0.0.0:7411"]
   #   environment:
+  #     CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
   #     CRYSTALLINE_DATABASE_BACKEND: postgres
   #     CRYSTALLINE_DATABASE_URL: postgres://crystalline:crystalline@db:5432/crystalline
   #   depends_on:

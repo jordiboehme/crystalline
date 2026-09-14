@@ -49,10 +49,11 @@ services:
     # first start (see docs/deployment.md#run-in-a-container):
     # image: ghcr.io/jordiboehme/crystalline:with-model
     #
-    # 0.0.0.0 because a container has to bind every interface to be reachable
-    # at all: 127.0.0.1 inside a container is reachable only from inside that
-    # same container, and Fluid is a different one.
-    command: ["serve", "--http", "0.0.0.0:7411"]
+    # The image already defaults to serve with CRYSTALLINE_SERVICE_HTTP set to
+    # 0.0.0.0:7411: a container has to bind every interface to be reachable at
+    # all, since 127.0.0.1 inside a container is reachable only from inside
+    # that same container, and Fluid is a different one. Named explicitly below
+    # anyway, so every daemon on the host binds the same way whoever started it.
     # The daemon is not published to the host here: Fluid is the only thing
     # that needs it, and it reaches it over this compose network. Publish it
     # too when agents should connect to the MCP endpoint as well, and add the
@@ -60,15 +61,16 @@ services:
     # validates the Host header (the JSON API Fluid uses does not).
     # ports:
     #   - "7411:7411"
-    # environment:
-    #   CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
-    #   # Let anyone who can reach Fluid read without an account, at viewer
-    #   # level. Pair it with --read-only for a published, browsable archive.
-    #   CRYSTALLINE_AUTH_ANONYMOUS: "true"
-    #   # Or take the already-authenticated user from an SSO proxy's header.
-    #   # Only safe when that proxy sets the header itself and strips whatever
-    #   # a client sent, and it must sit in front of Fluid, not behind it.
-    #   CRYSTALLINE_AUTH_TRUSTED_HEADER: "remote-user"
+    environment:
+      CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
+      # CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
+      # Let anyone who can reach Fluid read without an account, at viewer
+      # level. Pair it with --read-only for a published, browsable archive.
+      # CRYSTALLINE_AUTH_ANONYMOUS: "true"
+      # Or take the already-authenticated user from an SSO proxy's header.
+      # Only safe when that proxy sets the header itself and strips whatever
+      # a client sent, and it must sit in front of Fluid, not behind it.
+      # CRYSTALLINE_AUTH_TRUSTED_HEADER: "remote-user"
     volumes:
       - ./knowledge:/knowledge
       - crystalline-data:/data

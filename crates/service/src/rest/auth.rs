@@ -1521,8 +1521,9 @@ fn authorize_setup(
     let Some(expected) = state.setup_token().filter(|token| !token.trim().is_empty()) else {
         return Err(ApiError::forbidden(
             "first-run setup is open to this instance's own machine only: run \
-             it from there, or restart `crystalline serve` on a network \
-             address and use the one-time setup token it prints",
+             it from there, or run `crystalline config set service.http \
+             0.0.0.0:7411` (or bind the address you need), restart the \
+             daemon and use the one-time setup token it prints",
         ));
     };
     if constant_time_eq(

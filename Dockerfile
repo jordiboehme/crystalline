@@ -79,8 +79,14 @@ USER nonroot
 WORKDIR /data
 WORKDIR /
 
+# The bind address is configuration, not a flag: every daemon on a host reads
+# the same setting however it was started, so an autostarted one binds what
+# this one binds. 0.0.0.0 because a container has to bind every interface to
+# be reachable at all - 127.0.0.1 inside a container is reachable only from
+# inside that same container.
+ENV CRYSTALLINE_SERVICE_HTTP=0.0.0.0:7411
 ENTRYPOINT ["/usr/local/bin/crystalline"]
-CMD ["serve", "--http", "0.0.0.0:7411"]
+CMD ["serve"]
 
 # The `-with-model` variant: the embedding model pre-fetched at build time so
 # semantic search works from the first daemon start, with no runtime egress.

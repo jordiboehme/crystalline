@@ -2247,11 +2247,12 @@ mod tests {
         );
     }
 
-    // These pin down the exact `--http` semantics containers rely on: a
+    // These pin down the exact resolution semantics containers rely on: a
     // container must bind 0.0.0.0 (not the 127.0.0.1 default) to be reachable
-    // from outside its network namespace, so `serve --http 0.0.0.0:7411` has
-    // to pass the address through unchanged rather than only accepting the
-    // bare toggle spellings.
+    // from outside its network namespace, so an explicit address such as
+    // 0.0.0.0:7411 has to pass through unchanged rather than only accepting
+    // the bare toggle spellings, whichever way it arrives - a flag or
+    // CRYSTALLINE_SERVICE_HTTP.
 
     #[test]
     fn resolve_http_passes_through_an_explicit_non_loopback_address() {

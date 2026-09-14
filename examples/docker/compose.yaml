@@ -36,17 +36,20 @@ services:
     # ready on its very first start, or when this host has no egress to
     # huggingface.co (air-gapped or otherwise offline deployments):
     # image: ghcr.io/jordiboehme/crystalline:with-model
-    command: ["serve", "--http", "0.0.0.0:7411"]
-    # Read-only variant: hide and refuse the four content-mutating tools so
-    # agents can only search and read this deployment's knowledge. Sync,
-    # watching and embedding still run, so the index keeps following external
-    # edits to ./knowledge. Swap the command line above for:
-    # command: ["serve", "--http", "0.0.0.0:7411", "--read-only"]
-    # environment:
-    #   # Reach the daemon by hostname / compose service-name / reverse proxy,
-    #   # not just http://localhost:7411. Loopback is always allowed; list the
-    #   # extra Host values (comma-separated), or "*" behind a trusted proxy.
-    #   CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
+    # The image already defaults to serve with CRYSTALLINE_SERVICE_HTTP set, so
+    # there is nothing to pass here. Exposure is configuration so that every
+    # daemon on the host binds the same way, whoever started it.
+    # Read-only variant: hide and refuse the content-mutating tools so agents
+    # can only search and read this deployment's knowledge. Sync, watching and
+    # embedding still run, so the index keeps following external edits to
+    # ./knowledge. Uncomment:
+    # command: ["serve", "--read-only"]
+    environment:
+      CRYSTALLINE_SERVICE_HTTP: "0.0.0.0:7411"
+      # Reach the daemon by hostname / compose service-name / reverse proxy,
+      # not just http://localhost:7411. Loopback is always allowed; list the
+      # extra Host values (comma-separated), or "*" behind a trusted proxy.
+      # CRYSTALLINE_SERVICE_ALLOWED_HOSTS: "crystalline,muthur.lan"
     ports:
       - "7411:7411"
     volumes:
