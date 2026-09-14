@@ -1716,6 +1716,163 @@ fn status_refuses_readably_when_the_index_cannot_be_reached() {
     assert!(stderr.contains("crystalline doctor --fix"), "{stderr}");
 }
 
+/// A daemon that is not one: a live pid, a published record and a socket that
+/// answers every ctl request with the same canned line. Enough for a client to
+/// attach and read a reply, which is all a test of "what does a bad answer look
+/// like to a person" needs - a real daemon cannot be made to fail its own
+/// `status` on demand.
+struct FakeDaemon {
+    stand_in: Child,
+}
+
+impl FakeDaemon {
+    /// `reply` is written back verbatim for every request, newline added.
+    /// `None` closes the connection having written nothing, which is the
+    /// truncated answer a daemon dying mid-exchange leaves behind.
+    fn spawn(env: &Env, reply: Option<&'static str>) -> FakeDaemon {
+        std::fs::create_dir_all(env.state_dir()).unwrap();
+        // A disposable child stands in for the daemon's pid, the same trick
+        // `status_notes_an_unreachable_daemon_on_stderr` uses. A far-future
+        // version keeps a client from trying to displace it.
+        let stand_in = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        std::fs::write(
+            env.lock_path(),
+            serde_json::to_string(&json!({
+                "pid": stand_in.id(),
+                "socket_path": env.sock_path().display().to_string(),
+                "version": "99.0.0",
+                "started_at": "2026-01-01T00:00:00Z",
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let sock = env.sock_path();
+        let _ = std::fs::remove_file(&sock);
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                // The `ctl` handshake line, then the request line.
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line);
+                line.clear();
+                let _ = reader.read_line(&mut line);
+                if let Some(reply) = reply {
+                    let _ = stream.write_all(format!("{reply}\n").as_bytes());
+                    let _ = stream.flush();
+                }
+            }
+        });
+        FakeDaemon { stand_in }
+    }
+}
+
+impl Drop for FakeDaemon {
+    fn drop(&mut self) {
+        let _ = self.stand_in.kill();
+        let _ = self.stand_in.wait();
+    }
+}
+
+/// The daemon is reachable and its answer is not usable. `domain list` still
+/// answers: the registrations come from configuration, and only the counts
+/// ride on the daemon. Letting the ctl error fail the command would have put
+/// the daemon's bare error where the listing belongs, which is the raw text
+/// this routing exists to stop showing a person.
+#[test]
+fn domain_list_degrades_when_the_daemon_answers_with_an_error() {
+    let env = Env::new("list-ctl-err");
+    env.setup_domain("eng");
+    let _fake = FakeDaemon::spawn(&env, Some(r#"{"ok":false,"error":"domain_stats failed"}"#));
+
+    let (ok, stdout, stderr) = env.run_full(&["domain", "list"]);
+    assert!(ok, "the listing still answers: {stdout}{stderr}");
+    assert!(stdout.contains("eng\t"), "{stdout}");
+    assert!(stdout.contains("(counts not read)"), "{stdout}");
+    assert!(
+        stderr.contains("engram counts were not read"),
+        "the note says which half is missing: {stderr}"
+    );
+    assert!(
+        stderr.contains("crystalline doctor --fix"),
+        "and names a remedy: {stderr}"
+    );
+    assert!(
+        stderr.contains("domain_stats failed"),
+        "with the daemon's own words at the end: {stderr}"
+    );
+
+    let (ok, stdout, _) = env.run_full(&["--json", "domain", "list"]);
+    assert!(ok);
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["counts"]["read"], json!(false), "{value}");
+    assert_eq!(value["domains"][0]["name"], json!("eng"), "{value}");
+}
+
+/// The same, for a daemon that dies mid-exchange and leaves a truncated line.
+/// A different failure inside `ctl_exchange`, the same thing to say about it.
+#[test]
+fn domain_list_degrades_when_the_daemon_answers_nothing_at_all() {
+    let env = Env::new("list-ctl-cut");
+    env.setup_domain("eng");
+    let _fake = FakeDaemon::spawn(&env, None);
+
+    let (ok, stdout, stderr) = env.run_full(&["domain", "list"]);
+    assert!(ok, "the listing still answers: {stdout}{stderr}");
+    assert!(stdout.contains("eng\t"), "{stdout}");
+    assert!(stdout.contains("(counts not read)"), "{stdout}");
+    assert!(stderr.contains("crystalline doctor --fix"), "{stderr}");
+}
+
+/// `status` is the verb a person reaches for when something is broken, and a
+/// configuration this binary cannot parse is one of the things that can be
+/// broken. The daemon is asked before the file is read, so its report still
+/// arrives, and the config problem travels as a note beside it.
+#[test]
+fn status_still_answers_over_a_config_it_cannot_parse() {
+    let env = Env::new("status-bad-config");
+    env.setup_domain("eng");
+
+    let mut client = Mcp::spawn(&env);
+    client.initialize();
+    env.wait_ready();
+
+    // The daemon read a good config on the way up; this breaks the copy on
+    // disk underneath it, which is exactly the state a person is in when they
+    // reach for `status`.
+    std::fs::write(
+        env.config_path(),
+        "domains: [unclosed
+",
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) = env.run_full(&["status"]);
+    assert!(ok, "status answers: {stdout}{stderr}");
+    assert!(stdout.starts_with("Daemon: running (pid "), "{stdout}");
+    assert!(
+        stderr.contains("configuration did not load"),
+        "the config problem is named, not swallowed: {stderr}"
+    );
+
+    let (ok, stdout, _) = env.run_full(&["status", "--json"]);
+    assert!(ok);
+    let value: Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(value["pid"].as_u64().is_some(), "{value}");
+    assert!(
+        value["config_error"]
+            .as_str()
+            .is_some_and(|e| !e.is_empty()),
+        "--json carries the same note as a field: {value}"
+    );
+}
+
 /// `--db`/`--config` overrides bypass the daemon on purpose; the first line
 /// says so instead of pretending to be the daemon's view.
 #[test]

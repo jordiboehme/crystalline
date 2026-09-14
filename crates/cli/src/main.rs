@@ -1749,29 +1749,52 @@ async fn status_dispatch(
 ) -> anyhow::Result<()> {
     use serde_json::json;
     let bypassed = db.is_some() || config.is_some();
-    let cfg = cmd::load(config.as_deref())?.effective;
-    let route = cmd::reach_index(
-        Some(json!({ "v": 1, "cmd": "status" })),
-        &cfg,
-        config.as_deref(),
-        db.as_deref(),
-        cmd::OpenAs::Read,
-    )
-    .await?;
-    if let cmd::IndexRoute::Daemon(data) = &route {
+    // The daemon is asked before `config.yaml` is read, and `status` is the
+    // only verb that does it in this order. It is the command a person reaches
+    // for when something is broken, and a configuration this binary cannot
+    // parse is one of the things that can be broken: refusing to answer then
+    // would withhold the daemon's report exactly when it is wanted most. The
+    // config problem travels as a note beside the answer instead. `sync` and
+    // `reindex` keep the plain order, because they act on the domains the
+    // config names and cannot sensibly do that from a file they cannot read.
+    if !bypassed
+        && let Some(data) =
+            crystalline_service::ctl_if_running(json!({ "v": 1, "cmd": "status" })).await?
+    {
+        let config_error = cmd::load(config.as_deref()).err().map(|e| e.to_string());
         if json {
+            let mut data = data;
+            if let (Some(err), serde_json::Value::Object(map)) = (&config_error, &mut data) {
+                map.insert("config_error".to_string(), json!(err));
+            }
             println!("{data}");
         } else {
+            if let Some(err) = &config_error {
+                eprintln!(
+                    "note: the daemon answered, but this machine's configuration did not load: {err}"
+                );
+            }
             let note = format!(
                 "running (pid {}, v{}, up {})",
                 data["pid"].as_u64().unwrap_or(0),
                 data["version"].as_str().unwrap_or("unknown"),
                 format_uptime(data["uptime_secs"].as_u64().unwrap_or(0)),
             );
-            cmd::render_status(data, &note);
+            cmd::render_status(&data, &note);
         }
         return Ok(());
     }
+    // Nothing answered, so the numbers have to come from the index here, and
+    // that needs the config the probe above could do without.
+    let cfg = cmd::load(config.as_deref())?.effective;
+    let route = cmd::reach_index(
+        None,
+        &cfg,
+        config.as_deref(),
+        db.as_deref(),
+        cmd::OpenAs::Read,
+    )
+    .await?;
     if !bypassed {
         // Nothing answered. Diagnose the lock holder before falling back:
         // `status` is read-only and never signals anything, but a wedged
@@ -1894,14 +1917,14 @@ async fn sync_dispatch(
         }
         return Ok(());
     }
-    match route {
-        cmd::IndexRoute::Direct(store) => {
-            cmd::sync(store, &cfg, domain.as_deref(), embed, json).await
-        }
-        cmd::IndexRoute::Absent(db) => Err(cmd::index_absent("sync", &db)),
-        cmd::IndexRoute::Unreachable(why) => Err(cmd::index_unreachable("sync", &why)),
-        cmd::IndexRoute::Daemon(_) => unreachable!("the daemon's reply is handled above"),
-    }
+    cmd::sync(
+        cmd::local_store(route, "sync")?,
+        &cfg,
+        domain.as_deref(),
+        embed,
+        json,
+    )
+    .await
 }
 
 /// `reindex`: route to the daemon when one owns the index and no explicit
@@ -1936,9 +1959,7 @@ async fn reindex_dispatch(
             print_value(&data, json);
             Ok(())
         }
-        cmd::IndexRoute::Direct(store) => cmd::reindex(store, &cfg, full, embed, json).await,
-        cmd::IndexRoute::Absent(db) => Err(cmd::index_absent("reindex", &db)),
-        cmd::IndexRoute::Unreachable(why) => Err(cmd::index_unreachable("reindex", &why)),
+        other => cmd::reindex(cmd::local_store(other, "reindex")?, &cfg, full, embed, json).await,
     }
 }
 

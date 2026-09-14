@@ -177,20 +177,53 @@ pub(crate) async fn reach_index(
 /// it can see and one command to run, and appends the underlying error rather
 /// than leading with it.
 fn unreachable_words(location: &str, error: &str, bypassed: bool) -> String {
-    let live = crystalline_service::instance::read_lock_info()
-        .filter(|info| crystalline_service::instance::process_alive(info.pid));
-    match (live, bypassed) {
-        (Some(info), true) => format!(
-            "the running Crystalline daemon (pid {}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}",
-            info.pid
+    let holder = crystalline_service::instance::read_lock_info()
+        .filter(|info| crystalline_service::instance::process_alive(info.pid))
+        .map(|info| info.pid);
+    words_for_holder(holder, location, error, bypassed)
+}
+
+/// [`unreachable_words`] with the holder already looked up, so the three
+/// sentences can be read back in a test without a daemon on the machine.
+fn words_for_holder(holder: Option<u32>, location: &str, error: &str, bypassed: bool) -> String {
+    match (holder, bypassed) {
+        (Some(pid), true) => format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {location}, and --db or --config told this command to read that file directly instead of asking the daemon. Run it again without --db and --config so the daemon answers, or stop the daemon first with: crystalline ctl shutdown. The index reported: {error}"
         ),
-        (Some(info), false) => format!(
-            "the running Crystalline daemon (pid {}) owns the index at {location} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}",
-            info.pid
+        (Some(pid), false) => format!(
+            "the running Crystalline daemon (pid {pid}) owns the index at {location} and did not answer this command. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The index reported: {error}"
         ),
         (None, _) => format!(
             "the index at {location} could not be opened, and no Crystalline daemon is running to ask instead. Check that the file is readable and that no other process is holding it; crystalline doctor --fix clears a lock or socket file a killed daemon left behind. The index reported: {error}"
         ),
+    }
+}
+
+/// The words a listing uses when the daemon it asked answered badly: an error
+/// envelope, or a reply that did not arrive whole. Its own sentence rather
+/// than [`words_for_holder`]'s, because nothing here is about a lock: the
+/// daemon is reachable and the answer is not usable.
+fn daemon_answered_badly(what: &str, error: &str) -> String {
+    format!(
+        "the running Crystalline daemon answered {what} with an error instead of the counts. Look at it with: crystalline doctor --fix, or stop it with: crystalline ctl shutdown and run this again. The daemon reported: {error}"
+    )
+}
+
+/// The opened store a verb needs, or the error it fails with. Total over
+/// every route, so no caller has to write a panicking arm for a variant its
+/// own call cannot produce: a verb that sent no ctl request never sees
+/// `Daemon`, and one whose dispatch already rendered the daemon's reply never
+/// reaches here with it, but a future caller that does gets a sentence rather
+/// than a crash.
+pub(crate) fn local_store(route: IndexRoute, verb: &str) -> Result<Arc<TokioMutex<dyn Store>>> {
+    match route {
+        IndexRoute::Direct(store) => Ok(store),
+        IndexRoute::Absent(db) => Err(index_absent(verb, &db)),
+        IndexRoute::Unreachable(why) => Err(index_unreachable(verb, &why)),
+        IndexRoute::Daemon(_) => Err(index_unreachable(
+            verb,
+            "a running Crystalline daemon answered a request this command does not know how to read. Look at it with: crystalline doctor --fix",
+        )),
     }
 }
 
@@ -429,13 +462,8 @@ pub(crate) async fn sync_domain_direct(
     db_override: Option<&Path>,
 ) -> Result<crystalline_index::SyncReport> {
     let cfg = load(config_override)?.effective;
-    let store = match reach_index(None, &cfg, config_override, db_override, OpenAs::Write).await? {
-        IndexRoute::Direct(store) => store,
-        IndexRoute::Absent(db) => return Err(index_absent("domain add", &db)),
-        IndexRoute::Unreachable(why) => return Err(index_unreachable("domain add", &why)),
-        // Never asked for, so never answered.
-        IndexRoute::Daemon(_) => unreachable!("sync_domain_direct sends no ctl request"),
-    };
+    let route = reach_index(None, &cfg, config_override, db_override, OpenAs::Write).await?;
+    let store = local_store(route, "domain add")?;
     let params = chunk_params(&cfg);
     // First lock window: resolve the domain id and snapshot its stamps. The scan
     // then runs with no lock held; the second window applies transactionally.
@@ -1010,61 +1038,77 @@ pub async fn domain_list(
     // Why the counts are missing when they are, in the helper's words; `None`
     // once they were read, whichever route delivered them.
     let mut not_read: Option<String> = None;
-    let stats: Option<Vec<ListedStats>> = match reach_index(
+    // The one verb that must answer whatever the index does, so the route is
+    // matched rather than propagated with `?`. A daemon that replies with an
+    // error envelope, or dies mid-exchange leaving a truncated line, makes
+    // `ctl_if_running` fail, and letting that fail the command would put the
+    // daemon's bare error where this listing's registrations belong - the raw
+    // backend text this whole task exists to stop showing a person.
+    let route = match reach_index(
         Some(serde_json::json!({ "v": 1, "cmd": "status" })),
         &cfg,
         config_override,
         db_override,
         OpenAs::Read,
     )
-    .await?
+    .await
     {
-        // The daemon's own `domain_stats`, annotated with a `hosted_here`
-        // field this command has no use for. A reply that carries no counts,
-        // or a row that does not read back, is a count nobody read: saying so
-        // is the point, and rendering it as an empty set would put every
-        // domain back on the "(not indexed)" line this routing exists to end.
-        IndexRoute::Daemon(data) => {
-            match data.get("domains").and_then(serde_json::Value::as_array) {
-                Some(rows) => {
-                    let parsed: Vec<ListedStats> =
-                        rows.iter().filter_map(ListedStats::from_json).collect();
-                    if parsed.len() == rows.len() {
-                        Some(parsed)
-                    } else {
-                        not_read = Some(
+        Ok(route) => Some(route),
+        Err(e) => {
+            not_read = Some(daemon_answered_badly("this listing", &e.to_string()));
+            None
+        }
+    };
+    let stats: Option<Vec<ListedStats>> = match route {
+        None => None,
+        Some(route) => match route {
+            // The daemon's own `domain_stats`, annotated with a `hosted_here`
+            // field this command has no use for. A reply that carries no counts,
+            // or a row that does not read back, is a count nobody read: saying so
+            // is the point, and rendering it as an empty set would put every
+            // domain back on the "(not indexed)" line this routing exists to end.
+            IndexRoute::Daemon(data) => {
+                match data.get("domains").and_then(serde_json::Value::as_array) {
+                    Some(rows) => {
+                        let parsed: Vec<ListedStats> =
+                            rows.iter().filter_map(ListedStats::from_json).collect();
+                        if parsed.len() == rows.len() {
+                            Some(parsed)
+                        } else {
+                            not_read = Some(
                             "the running Crystalline daemon answered, but its per-domain counts did not read back in the shape this listing expects. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
                         );
+                            None
+                        }
+                    }
+                    None => {
+                        not_read = Some(
+                        "the running Crystalline daemon answered without the per-domain counts this listing reads. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
+                    );
                         None
                     }
                 }
-                None => {
-                    not_read = Some(
-                        "the running Crystalline daemon answered without the per-domain counts this listing reads. Check the daemon and the CLI are the same version with: crystalline status".to_string(),
-                    );
+            }
+            IndexRoute::Direct(store) => match store.lock().await.domain_stats().await {
+                Ok(rows) => Some(rows.iter().map(ListedStats::from_stats).collect()),
+                // Open, and still no counts: the index answered the open and not
+                // the question, which is a different state from both "unreachable"
+                // and "never synced" and must not be rendered as either.
+                Err(e) => {
+                    not_read = Some(format!(
+                        "the index opened, but its per-domain counts could not be read. Look at it with: crystalline doctor --fix. The index reported: {e}"
+                    ));
                     None
                 }
-            }
-        }
-        IndexRoute::Direct(store) => match store.lock().await.domain_stats().await {
-            Ok(rows) => Some(rows.iter().map(ListedStats::from_stats).collect()),
-            // Open, and still no counts: the index answered the open and not
-            // the question, which is a different state from both "unreachable"
-            // and "never synced" and must not be rendered as either.
-            Err(e) => {
-                not_read = Some(format!(
-                    "the index opened, but its per-domain counts could not be read. Look at it with: crystalline doctor --fix. The index reported: {e}"
-                ));
+            },
+            // No index yet is not a failure to read one: a registered domain that
+            // was never synced is exactly the "(not indexed)" case below.
+            IndexRoute::Absent(_) => Some(Vec::new()),
+            IndexRoute::Unreachable(why) => {
+                not_read = Some(why);
                 None
             }
         },
-        // No index yet is not a failure to read one: a registered domain that
-        // was never synced is exactly the "(not indexed)" case below.
-        IndexRoute::Absent(_) => Some(Vec::new()),
-        IndexRoute::Unreachable(why) => {
-            not_read = Some(why);
-            None
-        }
     };
     if let Some(why) = &not_read
         && !json
@@ -1420,8 +1464,10 @@ pub async fn status_value(route: IndexRoute, cfg: &GlobalConfig) -> Result<serde
             }));
         }
         IndexRoute::Unreachable(why) => return Err(index_unreachable("status", &why)),
-        // The dispatch renders the daemon's own report; it never arrives here.
-        IndexRoute::Daemon(_) => unreachable!("the daemon's status report renders on its own"),
+        // The dispatch renders the daemon's own report and never sends one
+        // here, but the daemon's report IS this function's return shape, so
+        // handing it straight back is the honest total answer.
+        IndexRoute::Daemon(data) => return Ok(data),
     };
     let store = store.lock().await;
     let info = store
@@ -2447,6 +2493,85 @@ fn print_report(r: &crystalline_index::SyncReport) {
     );
     for (path, err) in &r.failed {
         println!("  failed: {path}: {err}");
+    }
+}
+
+#[cfg(test)]
+mod index_reach_words_tests {
+    use super::{daemon_answered_badly, words_for_holder};
+
+    /// The raw backend error is the tail of the sentence, never its head, and
+    /// never the whole of it.
+    fn assert_error_is_only_the_tail(words: &str, raw: &str) {
+        let marker = "The index reported: ";
+        let at = words
+            .find(marker)
+            .unwrap_or_else(|| panic!("no error marker in: {words}"));
+        assert!(
+            !words.starts_with(raw),
+            "a lock error must not lead the sentence: {words}"
+        );
+        assert_eq!(
+            words.match_indices(raw).map(|(i, _)| i).collect::<Vec<_>>(),
+            vec![at + marker.len()],
+            "the raw error appears once, after the marker: {words}"
+        );
+    }
+
+    /// A daemon holds the index and answered nothing: name it by pid, and name
+    /// the two commands that do something about it.
+    #[test]
+    fn a_silent_holder_is_named_with_its_pid_and_a_remedy() {
+        let raw = "Locking error: File is locked by another process";
+        let words = words_for_holder(Some(4242), "/tmp/index.db", raw, false);
+        assert!(words.contains("(pid 4242)"), "{words}");
+        assert!(words.contains("/tmp/index.db"), "{words}");
+        assert!(words.contains("crystalline doctor --fix"), "{words}");
+        assert!(words.contains("crystalline ctl shutdown"), "{words}");
+        assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// The same holder, reached past by `--db`: the remedy is to stop reaching
+    /// past it, so that is what the sentence says first.
+    #[test]
+    fn a_bypassed_holder_is_told_to_drop_the_override() {
+        let raw = "Locking error: File is locked by another process";
+        let words = words_for_holder(Some(77), "/tmp/index.db", raw, true);
+        assert!(words.contains("(pid 77)"), "{words}");
+        assert!(words.contains("--db or --config"), "{words}");
+        assert!(
+            words.contains("without --db and --config"),
+            "the first remedy is the one that costs nothing: {words}"
+        );
+        assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// No holder to name, so the sentence says that rather than implying one.
+    #[test]
+    fn with_no_daemon_the_absence_is_stated() {
+        let raw = "unable to open database file";
+        let words = words_for_holder(None, "/tmp/index.db", raw, false);
+        assert!(!words.contains("pid"), "{words}");
+        assert!(
+            words.contains("no Crystalline daemon is running"),
+            "{words}"
+        );
+        assert!(words.contains("crystalline doctor --fix"), "{words}");
+        assert_error_is_only_the_tail(&words, raw);
+    }
+
+    /// A daemon that answered badly is a different state from a locked file,
+    /// and says so without borrowing the lock sentence.
+    #[test]
+    fn a_bad_answer_names_the_daemon_not_a_lock() {
+        let words = daemon_answered_badly("this listing", "domain_stats failed");
+        assert!(words.contains("running Crystalline daemon"), "{words}");
+        assert!(words.contains("crystalline doctor --fix"), "{words}");
+        assert!(
+            words.ends_with("The daemon reported: domain_stats failed"),
+            "{words}"
+        );
+        assert!(!words.contains("owns the index at"), "{words}");
     }
 }
 
