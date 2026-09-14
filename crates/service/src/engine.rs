@@ -8904,7 +8904,8 @@ impl Engine {
         // A domain with nothing mirrored never reaches the store: the sync pass
         // calls this for every domain on every pass, and resolving a domain id
         // is a write.
-        if crate::overlay_journal::journal_entries(&state_dir, domain).is_empty() {
+        let counts = crate::overlay_journal::journal_counts(&state_dir, domain);
+        if counts.total == 0 && !counts.unreadable {
             return Ok(0);
         }
         let entry = self.domain_entry(domain)?;
@@ -10223,15 +10224,13 @@ impl Engine {
         let Ok(state_dir) = self.journal_state_dir() else {
             return (Vec::new(), true);
         };
-        let mut per_actor: BTreeMap<String, u64> = BTreeMap::new();
-        for entry in crate::overlay_journal::journal_entries(&state_dir, name) {
-            *per_actor.entry(entry.actor).or_default() += 1;
-        }
-        let rows = per_actor
+        let counts = crate::overlay_journal::journal_counts(&state_dir, name);
+        let rows = counts
+            .per_actor
             .into_iter()
             .map(|(actor, entries)| json!({ "actor": actor, "entries": entries }))
             .collect();
-        (rows, false)
+        (rows, counts.unreadable)
     }
 
     /// Sweep a domain's overlay journal as part of ending it, answering with
@@ -10762,15 +10761,22 @@ impl Engine {
         // a sweep that cannot see the journal keeps a domain rather than
         // collecting one.
         let journal_dir = self.journal_state_dir().ok();
-        let mirrored = |name: &str| -> u64 {
-            journal_dir
-                .as_deref()
-                .map(|dir| crate::overlay_journal::journal_entries(dir, name).len() as u64)
-                .unwrap_or(0)
+        let mirrored = |name: &str| -> (u64, bool) {
+            match journal_dir.as_deref() {
+                Some(dir) => {
+                    let counts = crate::overlay_journal::journal_counts(dir, name);
+                    (counts.total, counts.unreadable)
+                }
+                // No state directory at all is the narrowest answer there is:
+                // nothing counted, and nothing known either.
+                None => (0, true),
+            }
         };
 
         let mut drafts_swept: u64 = 0;
         for row in stats.iter().filter(|d| !registered.contains(&d.name)) {
+            // Once per row, not once per use: this is a directory walk.
+            let (drafts, drafts_unknown) = mirrored(&row.name);
             let age = row
                 .last_registered
                 .as_deref()
@@ -10800,7 +10806,7 @@ impl Engine {
                     "another instance holds this domain's host lock and is still \
                      heartbeating; its registration is a registration",
                 ))
-            } else if row.engrams == 0 && mirrored(&row.name) == 0 {
+            } else if row.engrams == 0 && drafts == 0 {
                 // `DomainStats::engrams` counts base rows only, so a domain
                 // holding nothing but one actor's private drafts reads as empty
                 // here. It is not: it holds rows the removal would clear and a
@@ -10809,7 +10815,21 @@ impl Engine {
                 // having nothing to collect. Counted from the journal because
                 // the row count is the one thing a candidate's id cannot be
                 // resolved for without writing, and a dry run writes nothing.
-                Some(("no_rows", "no engram rows to collect"))
+                //
+                // A journal that could not be read counts zero and lands here
+                // too, and that is the safe direction rather than an accident:
+                // this branch KEEPS the domain, so a sweep that cannot see what
+                // is mirrored collects nothing instead of deleting rows it
+                // cannot account for. The reason says which of the two it was.
+                Some((
+                    "no_rows",
+                    if drafts_unknown {
+                        "no engram rows to collect, and the overlay journal could not be read, \
+                         so nothing here is collected until it can be"
+                    } else {
+                        "no engram rows to collect"
+                    },
+                ))
             } else {
                 match grace {
                     // A person asking is the signal the grace period exists to
@@ -10880,7 +10900,10 @@ impl Engine {
                 // different knowledge. `engrams` is what the domain's files
                 // say, `drafts` is what people hold privately on top of it, and
                 // a domain can have none of the first and some of the second.
-                "drafts": mirrored(&row.name),
+                "drafts": drafts,
+                // The same honesty `drafts_unknown` carries on the removal
+                // preview: a zero that nothing could confirm is not a zero.
+                "drafts_unknown": drafts_unknown,
                 "last_registered": row.last_registered,
                 "age_seconds": age.map(|a| a.num_seconds()),
                 "age_days": age.map(|a| a.num_days()),

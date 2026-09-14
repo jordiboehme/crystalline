@@ -322,12 +322,79 @@ async fn removing_a_domain_sweeps_every_actors_journal_and_names_the_counts() {
         "the receipt says how many mirrored drafts went with it: {report}"
     );
     assert!(
-        overlay_journal::journal_entries(&f.state, "team").is_empty(),
+        overlay_journal::journal_entries(&f.state, "team")
+            .entries
+            .is_empty(),
         "no actor's mirror is left behind"
     );
     assert!(
         !f.state.join("overlays/team").exists(),
         "and the domain's journal folder is gone"
+    );
+}
+
+/// An empty answer and an unanswerable one are not the same thing, and a
+/// destructive confirmation is the last place to confuse them.
+///
+/// A journal folder that cannot be enumerated used to come back as an empty
+/// list, which the preview reported as an affirmative "nobody is drafting
+/// here" - in front of a removal that then deletes whatever was really in
+/// there. The same blindness reached the orphan sweep, where "no drafts"
+/// decides whether a domain has anything to collect at all.
+#[tokio::test]
+async fn an_unreadable_journal_is_never_read_as_nobody_drafting() {
+    let f = fixture().await;
+    // The journal folder is not a folder. Portable, deterministic, and exactly
+    // as unreadable as a permission problem.
+    std::fs::create_dir_all(f.state.join("overlays")).unwrap();
+    std::fs::write(f.state.join("overlays/team"), "not a folder").unwrap();
+
+    let preview = f
+        .engine
+        .domain_remove_preview("team", &Scope::Unrestricted, false)
+        .await
+        .unwrap();
+    assert_eq!(preview["drafts"], serde_json::json!([]));
+    assert_eq!(
+        preview["drafts_unknown"],
+        serde_json::json!(true),
+        "a count nothing could read is not a count of zero: {preview}"
+    );
+
+    // The orphan sweep, same rule. `solo` holds one actor's draft and no base
+    // row, so what the journal says is the whole of what it has to collect -
+    // and with the journal unreadable it keeps the domain rather than deleting
+    // rows it cannot account for.
+    f.draft("solo", "alice", "fresh.md", ALICE_NEW).await;
+    std::fs::remove_dir_all(f.state.join("overlays/solo")).unwrap();
+    std::fs::write(f.state.join("overlays/solo"), "not a folder either").unwrap();
+
+    let report = f.engine.collect_orphaned_domains(None, false).await.unwrap();
+    assert_eq!(
+        report["collected"],
+        serde_json::json!([]),
+        "nothing is collected while the journal cannot be read: {report}"
+    );
+    let solo = report["considered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["domain"] == "solo")
+        .cloned()
+        .unwrap();
+    assert_eq!(solo["kept"], serde_json::json!("no_rows"));
+    assert_eq!(solo["drafts_unknown"], serde_json::json!(true));
+    assert!(
+        solo["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("could not be read"),
+        "and the report says why it was kept: {solo}"
+    );
+    assert_eq!(
+        f.held("solo", "alice").await.len(),
+        1,
+        "the draft row is still there, uncollected"
     );
 }
 
@@ -372,7 +439,9 @@ async fn an_orphan_collection_sweeps_the_journal_and_nothing_is_resurrected() {
         "the rows went with the domain"
     );
     assert!(
-        overlay_journal::journal_entries(&f.state, "solo").is_empty(),
+        overlay_journal::journal_entries(&f.state, "solo")
+            .entries
+            .is_empty(),
         "and so did the mirror"
     );
     assert_eq!(

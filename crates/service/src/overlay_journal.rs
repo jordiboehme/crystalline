@@ -46,6 +46,7 @@
 //! and `actor` must additionally be a single segment, since neither names a
 //! tree.
 
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -213,23 +214,104 @@ fn prune_empty(from: Option<&Path>, stop: &Path) {
     }
 }
 
-/// Every draft mirrored for one domain, ordered by actor and then by path.
+/// What one domain's journal holds, with the honesty flag beside it.
 ///
-/// Answers with what it could read and never with an error: a journal that
-/// cannot be read is a mirror that has nothing to say, and every caller here
-/// either restores what it finds or counts it. Anything that is not a mirrored
-/// entry is skipped - a file that does not end in `.md` or `.md.tombstone`
-/// (the atomic write's temporary sibling among them) and a draft whose bytes
-/// are not UTF-8.
-pub fn journal_entries(state_dir: &Path, domain: &str) -> Vec<JournalEntry> {
+/// `unreadable` is the whole reason this is a struct rather than a `Vec`: an
+/// empty answer means "nobody is drafting here" only when nothing failed on the
+/// way to it, and the callers act on that difference in front of a destructive
+/// removal. A read that could not enumerate a folder, or could not read a file
+/// it enumerated, comes back with what it did get and this flag set.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalRead {
+    /// Every mirrored entry that could be read, ordered by actor then path.
+    pub entries: Vec<JournalEntry>,
+    /// Whether anything the read tried to reach could not be reached.
+    pub unreadable: bool,
+}
+
+/// How many drafts one domain's journal holds per actor, without reading a
+/// single draft's markdown.
+///
+/// The counting twin of [`journal_entries`], for the callers that only ever
+/// needed a number: the removal preview, the orphan sweep and the two
+/// restore early-outs. `unreadable` here covers enumeration alone, which is the
+/// only way a COUNT can come out short - a file whose bytes cannot be read is
+/// still a draft this domain holds, and it is still counted.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JournalCounts {
+    /// Drafts per actor, ordered by actor.
+    pub per_actor: BTreeMap<String, u64>,
+    /// Drafts across every actor.
+    pub total: u64,
+    /// Whether a folder this count needed could not be enumerated.
+    pub unreadable: bool,
+}
+
+/// Every draft mirrored for one domain, markdown included, ordered by actor and
+/// then by path.
+///
+/// Answers with what it could read and never with an error, and says whether
+/// that was everything. Anything that is not a mirrored entry is skipped
+/// silently - a file that does not end in `.md` or `.md.tombstone`, the atomic
+/// write's temporary sibling among them - but a file that IS one and could not
+/// be read is logged and sets `unreadable`.
+pub fn journal_entries(state_dir: &Path, domain: &str) -> JournalRead {
+    let (entries, unreadable) = walk(state_dir, domain, true);
+    JournalRead {
+        entries,
+        unreadable,
+    }
+}
+
+/// How many drafts each actor holds in one domain, reading no markdown at all.
+pub fn journal_counts(state_dir: &Path, domain: &str) -> JournalCounts {
+    let (entries, unreadable) = walk(state_dir, domain, false);
+    let mut per_actor: BTreeMap<String, u64> = BTreeMap::new();
+    for entry in &entries {
+        *per_actor.entry(entry.actor.clone()).or_default() += 1;
+    }
+    JournalCounts {
+        per_actor,
+        total: entries.len() as u64,
+        unreadable,
+    }
+}
+
+/// The one walk both readers run. `read_content` is the only difference: with
+/// it off, every entry comes back with `content: None` and no file is opened,
+/// so a tombstone and a draft are indistinguishable in the result - which is
+/// exactly what a count needs and nothing else may use.
+fn walk(state_dir: &Path, domain: &str, read_content: bool) -> (Vec<JournalEntry>, bool) {
     let Ok(dir) = domain_dir(state_dir, domain) else {
-        return Vec::new();
+        // A name that cannot address a journal folder is not a journal that is
+        // empty: nothing was read, and a caller about to delete may not be told
+        // otherwise.
+        return (Vec::new(), true);
     };
-    let Ok(actors) = std::fs::read_dir(&dir) else {
-        return Vec::new();
+    let actors = match std::fs::read_dir(&dir) {
+        Ok(actors) => actors,
+        // A domain nobody has drafted in has no folder, and that is a certain
+        // answer rather than an unknown one. Every other failure is unknown.
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return (Vec::new(), false),
+        Err(e) => {
+            tracing::warn!(
+                domain = domain,
+                "the overlay journal folder could not be read: {e}"
+            );
+            return (Vec::new(), true);
+        }
     };
     let mut out: Vec<JournalEntry> = Vec::new();
-    for actor in actors.flatten() {
+    let mut unreadable = false;
+    for actor in actors {
+        let actor = match actor {
+            Ok(actor) => actor,
+            Err(e) => {
+                tracing::warn!(domain = domain, "an overlay journal entry was skipped: {e}");
+                unreadable = true;
+                continue;
+            }
+        };
         if !actor.path().is_dir() {
             continue;
         }
@@ -240,7 +322,7 @@ pub fn journal_entries(state_dir: &Path, domain: &str) -> Vec<JournalEntry> {
             continue;
         }
         let mut found: Vec<JournalEntry> = Vec::new();
-        collect(&actor.path(), "", &name, &mut found);
+        unreadable |= collect(&actor.path(), "", &name, read_content, &mut found);
         out.extend(found);
     }
     // `read_dir` order is unspecified, and a restore that ran in a different
@@ -263,15 +345,38 @@ pub fn journal_entries(state_dir: &Path, domain: &str) -> Vec<JournalEntry> {
             false
         }
     });
-    out
+    (out, unreadable)
 }
 
-/// Walk one actor's folder, appending every mirrored entry under it.
-fn collect(dir: &Path, prefix: &str, actor: &str, out: &mut Vec<JournalEntry>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
+/// Walk one actor's folder, appending every mirrored entry under it. Answers
+/// whether anything under it could not be read.
+fn collect(
+    dir: &Path,
+    prefix: &str,
+    actor: &str,
+    read_content: bool,
+    out: &mut Vec<JournalEntry>,
+) -> bool {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            tracing::warn!(
+                actor = actor,
+                "an overlay journal folder could not be read: {e}"
+            );
+            return true;
+        }
     };
-    for entry in entries.flatten() {
+    let mut unreadable = false;
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                tracing::warn!(actor = actor, "an overlay journal entry was skipped: {e}");
+                unreadable = true;
+                continue;
+            }
+        };
         let Some(name) = entry.file_name().to_str().map(str::to_string) else {
             continue;
         };
@@ -282,14 +387,25 @@ fn collect(dir: &Path, prefix: &str, actor: &str, out: &mut Vec<JournalEntry>) {
         };
         let path = entry.path();
         if path.is_dir() {
-            collect(&path, &rel, actor, out);
+            unreadable |= collect(&path, &rel, actor, read_content, out);
             continue;
         }
         let (rel, content) = match rel.strip_suffix(TOMBSTONE_SUFFIX) {
             Some(base) => (base.to_string(), None),
+            None if !read_content => (rel, None),
             None => match std::fs::read_to_string(&path) {
                 Ok(text) => (rel, Some(text)),
-                Err(_) => continue,
+                Err(e) => {
+                    // The mirror is the only copy a draft has, so a file that is
+                    // there and cannot be read is never passed over in silence.
+                    tracing::warn!(
+                        actor = actor,
+                        path = rel.as_str(),
+                        "a mirrored draft could not be read and stays out of the restore: {e}"
+                    );
+                    unreadable = true;
+                    continue;
+                }
             },
         };
         if !is_within_domain(&rel) || !is_md(&rel) {
@@ -301,6 +417,7 @@ fn collect(dir: &Path, prefix: &str, actor: &str, out: &mut Vec<JournalEntry>) {
             content,
         });
     }
+    unreadable
 }
 
 /// Drop a whole domain's journal, answering with how many entries it held.
@@ -310,11 +427,24 @@ fn collect(dir: &Path, prefix: &str, actor: &str, out: &mut Vec<JournalEntry>) {
 /// the next sync resurrects drafts for a domain that no longer exists.
 pub fn journal_remove_domain(state_dir: &Path, domain: &str) -> io::Result<u64> {
     let dir = domain_dir(state_dir, domain)?;
-    let held = journal_entries(state_dir, domain).len() as u64;
+    let held = journal_counts(state_dir, domain).total;
     match std::fs::remove_dir_all(&dir) {
         Ok(()) => Ok(held),
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(0),
-        Err(e) => Err(e),
+        // A sweep can fail part of the way through, with some actors' folders
+        // already gone. The error is the caller's to report, and so is the
+        // number that did go: what is left is counted again so nothing claims a
+        // removal took nothing when it took some of it.
+        Err(e) => {
+            let left = journal_counts(state_dir, domain).total;
+            Err(io::Error::new(
+                e.kind(),
+                format!(
+                    "{e} ({} of {held} mirrored draft(s) went)",
+                    held - left.min(held)
+                ),
+            ))
+        }
     }
 }
 
@@ -353,7 +483,15 @@ pub async fn restore_into(
     chunk_params: &ChunkParams,
 ) -> crystalline_index::Result<u64> {
     let mut restored = 0u64;
-    for entry in journal_entries(state_dir, domain_name) {
+    let read = journal_entries(state_dir, domain_name);
+    if read.unreadable {
+        tracing::warn!(
+            domain = domain_name,
+            "part of the overlay journal could not be read; the drafts it mirrors there stay \
+             out of the index"
+        );
+    }
+    for entry in read.entries {
         if store
             .overlay_entry(domain, &entry.actor, &entry.path)
             .await?
@@ -504,7 +642,7 @@ mod tests {
             "a tombstone is a sidecar beside the path it deletes"
         );
 
-        let entries = journal_entries(state, "team");
+        let entries = journal_entries(state, "team").entries;
         assert_eq!(
             entries,
             vec![
@@ -530,7 +668,7 @@ mod tests {
         // A tombstone over a draft replaces it rather than joining it.
         journal_tombstone(state, "team", "alice", "top.md").unwrap();
         assert!(!state.join("overlays/team/alice/top.md").exists());
-        let entries = journal_entries(state, "team");
+        let entries = journal_entries(state, "team").entries;
         assert_eq!(entries.len(), 3, "still one entry per (actor, path)");
         assert_eq!(entries[1].content, None, "alice's draft became a deletion");
 
@@ -538,7 +676,7 @@ mod tests {
         journal_write(state, "team", "alice", "top.md", DRAFT).unwrap();
         assert!(!state.join("overlays/team/alice/top.md.tombstone").exists());
         assert_eq!(
-            journal_entries(state, "team")[1].content.as_deref(),
+            journal_entries(state, "team").entries[1].content.as_deref(),
             Some(DRAFT)
         );
 
@@ -550,7 +688,7 @@ mod tests {
             "an actor holding nothing leaves no folder behind"
         );
         assert_eq!(
-            journal_entries(state, "team"),
+            journal_entries(state, "team").entries,
             vec![JournalEntry {
                 actor: "alice".to_string(),
                 path: "top.md".to_string(),
@@ -561,12 +699,64 @@ mod tests {
 
         // The whole domain goes, count and all.
         assert_eq!(journal_remove_domain(state, "team").unwrap(), 1);
-        assert!(journal_entries(state, "team").is_empty());
+        assert!(journal_entries(state, "team").entries.is_empty());
         assert_eq!(
             journal_remove_domain(state, "team").unwrap(),
             0,
             "a domain with no journal sweeps to nothing"
         );
+    }
+
+    /// A read that could not see everything says so, and the two readers
+    /// differ in what they even try to read.
+    #[test]
+    fn journal_reads_report_what_they_could_not_read() {
+        let tmp = dir();
+        let state = tmp.path();
+
+        journal_write(state, "team", "alice", "good.md", DRAFT).unwrap();
+        // A draft whose bytes are not text. The count can still see it - it is
+        // enumerated like any other file - but the entry reader cannot hand it
+        // to a restore, and that difference is the whole point of the pair.
+        std::fs::write(
+            state.join("overlays/team/alice/bad.md"),
+            [0xff, 0xfe, 0x00, 0x9f],
+        )
+        .unwrap();
+
+        let counts = journal_counts(state, "team");
+        assert_eq!(counts.total, 2, "both files are enumerated");
+        assert_eq!(counts.per_actor.get("alice"), Some(&2));
+        assert!(
+            !counts.unreadable,
+            "nothing failed to enumerate, so the count is not in doubt"
+        );
+
+        let read = journal_entries(state, "team");
+        assert_eq!(read.entries.len(), 1, "only the readable draft comes back");
+        assert_eq!(read.entries[0].path, "good.md");
+        assert!(
+            read.unreadable,
+            "and the reader says it could not read everything it tried to"
+        );
+
+        // A domain folder that is not a folder: nothing can be enumerated, and
+        // an empty answer must not read as `nobody is drafting here`.
+        std::fs::remove_dir_all(state.join("overlays/solo")).ok();
+        std::fs::write(state.join("overlays/solo"), "not a folder").unwrap();
+        let counts = journal_counts(state, "solo");
+        assert_eq!(counts.total, 0);
+        assert!(
+            counts.unreadable,
+            "an unreadable journal is not an empty one"
+        );
+        assert!(journal_entries(state, "solo").unreadable);
+
+        // A domain nobody has ever drafted in is a different answer: empty and
+        // certain.
+        let counts = journal_counts(state, "never");
+        assert_eq!(counts.total, 0);
+        assert!(!counts.unreadable);
     }
 
     /// Every one of the three names is screened, because every one of them
@@ -606,7 +796,7 @@ mod tests {
         );
         assert!(journal_remove_domain(state, "../escape").is_err());
         assert!(
-            journal_entries(state, "../escape").is_empty(),
+            journal_entries(state, "../escape").entries.is_empty(),
             "a refused domain reads as an empty journal rather than a folder above the root"
         );
     }

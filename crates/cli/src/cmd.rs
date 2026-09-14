@@ -1499,7 +1499,8 @@ async fn restore_overlay_journals(
         // usual reindex a read of one directory per domain, and - since the
         // driver has already checkpointed the WAL by the time this runs - keeps
         // it from dirtying the WAL again with a write nobody needed.
-        if crystalline_service::overlay_journal::journal_entries(&state_dir, name).is_empty() {
+        let counts = crystalline_service::overlay_journal::journal_counts(&state_dir, name);
+        if counts.total == 0 && !counts.unreadable {
             continue;
         }
         let store = store.lock().await;
