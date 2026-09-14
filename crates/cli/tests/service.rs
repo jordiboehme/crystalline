@@ -2174,3 +2174,62 @@ fn an_autostarted_daemon_reports_itself_as_autostarted() {
     drop(client);
     let _ = env.run(&["ctl", "shutdown"]);
 }
+
+/// The daemon route for the rows of a domain nobody registers any more: they
+/// are reported, and `--fix` collects them, through the daemon that owns the
+/// index. Nothing is stopped to do it - which is the whole difference between
+/// this and the orphan *file* rows doctor also reports, where a removal is a
+/// write the daemon's read verb cannot make.
+///
+/// The 0.17.0 shape is reproduced by a config edit rather than by `domain
+/// remove`, which clears the rows itself: a test built on the removal would
+/// assert on an index with no orphan in it.
+#[test]
+fn doctor_collects_orphaned_rows_through_the_running_daemon() {
+    let env = Env::new("orphanrows");
+    env.setup_domain("eng");
+    env.setup_domain("retired");
+    let mut cfg: GlobalConfig = config::load_yaml(&env.config_path()).unwrap();
+    cfg.domains.shift_remove("retired");
+    config::save_yaml(&env.config_path(), &cfg).unwrap();
+
+    // The daemon starts after the edit, so the removed domain is in no tier of
+    // its registered set: not the startup snapshot, not the file.
+    let client = Mcp::spawn(&env);
+    env.wait_ready();
+
+    let (_, out) = env.run(&["--json", "doctor"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        report["index"]["source"], "daemon",
+        "the daemon owns the index and answered: {report}"
+    );
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "the orphan is named: {report}");
+    assert!(
+        rows[0]["engrams"].as_i64().unwrap() >= 2,
+        "with the rows at stake: {report}"
+    );
+    assert_eq!(
+        rows[0]["collected"], false,
+        "and a look removes nothing: {report}"
+    );
+
+    let (_, out) = env.run(&["--json", "doctor", "--fix"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        report["orphaned_rows"]["domains"][0]["collected"], true,
+        "the daemon that owns the index does the collecting: {report}"
+    );
+
+    let (_, out) = env.run(&["--json", "doctor"]);
+    let report: Value = serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"));
+    assert_eq!(
+        report["orphaned_rows"]["domains"],
+        json!([]),
+        "and the next look has nothing left to report: {report}"
+    );
+
+    drop(client);
+    let _ = env.run(&["ctl", "shutdown"]);
+}

@@ -1773,3 +1773,227 @@ fn sync_still_succeeds_when_nothing_failed() {
         .assert()
         .success();
 }
+
+// --- rows whose domain nobody registers any more -----------------------------
+//
+// The 0.17.0 shape, reproduced by hand: two domains indexed, then one of them
+// unregistered with its rows left behind. The removal is a config edit rather
+// than `domain remove`, because 0.18.0's removal already clears the rows - a
+// test built on it would assert on an index with no orphan in it at all.
+
+/// Drop `name` from the config file without touching the index, which is
+/// exactly what a 0.17.0 removal left behind.
+fn unregister(config: &Path, name: &str) {
+    let mut cfg: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(config).unwrap();
+    cfg.domains.shift_remove(name);
+    crystalline_core::config::save_yaml(config, &cfg).unwrap();
+}
+
+/// Two domains synced, one unregistered afterwards.
+fn orphan_fixture(work: &Path) -> (PathBuf, PathBuf) {
+    let config = work.join("config.yaml");
+    let db = work.join("index.db");
+    let kept = setup_domain(work, "eng", &config);
+    let gone = setup_domain(work, "retired", &config);
+    write(&kept, "a.md", &engram("A", "a"));
+    write(&gone, "b.md", &engram("B", "b"));
+    bin()
+        .args(["sync", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success();
+    unregister(&config, "retired");
+    (config, db)
+}
+
+/// The report: the rows are named, counted and counted as a problem, and not
+/// one of them is removed by a run that was only asked to look.
+#[test]
+fn reports_the_rows_of_a_domain_nobody_registers() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = orphan_fixture(work.path());
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "the orphan is named: {report}");
+    assert!(
+        rows[0]["engrams"].as_i64().unwrap() >= 2,
+        "with the rows at stake: {report}"
+    );
+    assert_eq!(
+        rows[0]["age_days"],
+        Value::Null,
+        "an index inherited from a version that never stamped has no age: {report}"
+    );
+    assert_eq!(rows[0]["collected"], false, "nothing was removed: {report}");
+    assert_eq!(rows[0]["collectable"], true, "and --fix would: {report}");
+
+    // The human render says what is true of them and names the one command
+    // that ends them now. A full reindex is never the advice.
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let human = cmd
+        .args(["doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("retired") && human.contains("never seen registered"),
+        "the render names the domain and how long it has been gone: {human}"
+    );
+    assert!(
+        human.contains("crystalline doctor --fix"),
+        "and names the immediate path: {human}"
+    );
+    assert!(
+        !human.to_lowercase().contains("reindex"),
+        "and never the heaviest command in the tool: {human}"
+    );
+
+    // A second look finds the same rows: looking removes nothing.
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let again = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let again: Value = serde_json::from_slice(&again).unwrap();
+    assert_eq!(
+        again["orphaned_rows"]["domains"][0]["engrams"], rows[0]["engrams"],
+        "every row is where it was: {again}"
+    );
+}
+
+/// The fix: a person asking is the signal the grace period waits for, so the
+/// rows go on the run that was asked, not a week later.
+#[test]
+fn fix_collects_the_rows_of_a_domain_nobody_registers() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = orphan_fixture(work.path());
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "{report}");
+    assert_eq!(
+        rows[0]["collected"], true,
+        "the never-stamped orphan is collected on the run a person asked for: {report}"
+    );
+
+    // And it is gone: the next look has nothing left to report.
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let after = cmd
+        .args(["--json", "doctor", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let after: Value = serde_json::from_slice(&after).unwrap();
+    assert_eq!(
+        after["orphaned_rows"]["domains"],
+        serde_json::json!([]),
+        "a domain with no rows left is nothing to report: {after}"
+    );
+}
+
+/// A read-only instance collects nothing and says so, with the rows it would
+/// have collected still named: that operator is exactly the one who wants to
+/// know what is sitting in their index, and a `--fix` that silently did
+/// nothing would tell them the opposite.
+#[test]
+fn a_read_only_instance_reports_the_rows_and_collects_none_of_them() {
+    let work = tempfile::tempdir().unwrap();
+    let (config, db) = orphan_fixture(work.path());
+    let mut cfg: crystalline_core::config::GlobalConfig =
+        crystalline_core::config::load_yaml(&config).unwrap();
+    cfg.service = Some(crystalline_core::config::ServiceConfig {
+        read_only: Some(true),
+        ..crystalline_core::config::ServiceConfig::default()
+    });
+    crystalline_core::config::save_yaml(&config, &cfg).unwrap();
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let out = cmd
+        .args(["--json", "doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let report: Value = serde_json::from_slice(&out).unwrap();
+    let rows = &report["orphaned_rows"]["domains"];
+    assert_eq!(rows[0]["name"], "retired", "the rows are named: {report}");
+    assert_eq!(rows[0]["collected"], false, "and not collected: {report}");
+    assert_eq!(rows[0]["kept"], "read_only", "{report}");
+    assert!(
+        report["orphaned_rows"]["skipped"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"),
+        "and the report says why: {report}"
+    );
+
+    let mut cmd = bin();
+    let _home = shield_ambient_home(&mut cmd);
+    let human = cmd
+        .args(["doctor", "--fix", "--config"])
+        .arg(&config)
+        .args(["--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let human = String::from_utf8(human).unwrap();
+    assert!(
+        human.contains("nothing was collected: this instance is read-only"),
+        "the render says it too: {human}"
+    );
+}

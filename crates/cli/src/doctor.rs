@@ -433,6 +433,57 @@ pub struct ProvisioningDoctor {
     pub pending: Vec<ProvisioningPendingDoctor>,
 }
 
+/// One domain the index still holds rows for and nobody registers any more:
+/// what a 0.17.0 removal left behind, and what any row that outlives its
+/// registration becomes.
+///
+/// Its rows are already unanswerable - search, counts and facets all skip a
+/// domain this instance has no registration for - so this section is about
+/// reclaiming the disk they sit on, never about what an answer contains.
+#[derive(Debug, Clone, Serialize)]
+pub struct OrphanedDomainDoctor {
+    /// The domain name the index knows the rows under.
+    pub name: String,
+    /// The domain kind, `file` or `virtual`.
+    pub kind: String,
+    /// How many engram rows are at stake.
+    pub engrams: i64,
+    /// How long this domain has been absent from the configuration, in whole
+    /// days. `None` when the index has never recorded it as registered, which
+    /// is every row inherited from a version that did not stamp them: no age
+    /// rather than an age of nothing.
+    pub age_days: Option<i64>,
+    /// Whether `--fix` would collect these rows, and did when this run
+    /// carried it. False for the rows nothing collects: a virtual domain's,
+    /// and every domain's on a read-only instance.
+    pub collectable: bool,
+    /// Whether this run actually collected them.
+    pub collected: bool,
+    /// Why a row that was kept was kept, one of `virtual` or `read_only` on
+    /// this path. `None` when it was collected or would be.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kept: Option<String>,
+}
+
+/// Rows whose domain nobody registers any more, and, when the whole check
+/// declined, why.
+///
+/// `None` on [`DoctorReport::orphaned_rows`] when the check did not run at
+/// all: a `--domain` run (an unregistered domain can never be the one named),
+/// a machine with no index yet, or no route to the one it has.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct OrphanedRowsDoctor {
+    /// One entry per domain the index holds rows for and the configuration
+    /// does not name. A domain whose rows are already gone is not listed:
+    /// there is nothing at stake and nothing to do.
+    pub domains: Vec<OrphanedDomainDoctor>,
+    /// Why nothing was collected, when nothing could be: a read-only
+    /// instance, or a configuration that could not be read (and a domain
+    /// cannot be shown absent from a file nobody can read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skipped: Option<String>,
+}
+
 /// Advisory tag-hygiene diagnostics: near-duplicate tag clusters across the
 /// whole index. Purely informational, the same stance provisioning takes:
 /// never feeds [`DoctorReport::remaining_problems`], since consolidating tags is
@@ -468,6 +519,9 @@ pub struct DoctorReport {
     /// Provisioning diagnostics. `None` when no registered domain declares a
     /// `Provisioning` section at all.
     pub provisioning: Option<ProvisioningDoctor>,
+    /// Rows whose domain nobody registers any more. `None` when the check
+    /// did not run: a `--domain` run, no index yet, or no route to it.
+    pub orphaned_rows: Option<OrphanedRowsDoctor>,
     /// Advisory tag-hygiene diagnostics. `None` when there is no index yet;
     /// present (possibly with an empty cluster list) once one exists.
     pub tags: Option<TagsDoctor>,
@@ -538,6 +592,18 @@ impl DoctorReport {
                 .filter(|h| h.settings_parse_error.is_some())
                 .count();
         }
+        // Rows whose domain is gone count only while something can be done
+        // about them: a collectable set nobody has collected yet. A virtual
+        // domain's rows, and every row on a read-only instance, are reported
+        // and never counted - no `--fix` collects them, so counting them
+        // would fail doctor forever over a state that has no remedy here.
+        if let Some(o) = &self.orphaned_rows {
+            n += o
+                .domains
+                .iter()
+                .filter(|d| d.collectable && !d.collected)
+                .count();
+        }
         // Provisioning never contributes here, the same stance environment
         // takes: an undecided domain is a normal state awaiting a person's
         // answer, and drift, edited and orphaned rows all self-heal at the
@@ -567,6 +633,14 @@ pub async fn run(
     // fail with a locking error before `--fix` ever got the chance to dislodge
     // the process causing it - the one state where doctor matters most.
     let service = check_service(fix).await?;
+
+    // Ahead of doctor's own store, and deliberately: the collection needs the
+    // index too, and it asks the daemon first or opens the file itself. Doing
+    // it while doctor holds its own handle (and its own lock, taken a few
+    // lines below and held to the end of the pass) would be a second opener
+    // of the same file waiting on the first.
+    let orphaned_rows =
+        check_orphaned_rows(domain_filter, fix, config_override, db_override, &db).await;
 
     // The index read, socket-first, in the same shape `sync_dispatch` uses. A
     // healthy daemon holds the index file, so asking it for the stamps is the
@@ -648,8 +722,93 @@ pub async fn run(
         embeddings,
         harnesses,
         provisioning,
+        orphaned_rows,
         tags,
         fix,
+    })
+}
+
+/// Rows whose domain nobody registers any more, asked of the daemon that owns
+/// the index and otherwise read from the index directly - the same
+/// daemon-first shape the file stamps above take, with the difference that
+/// this one *writes* when `fix` is set, and can, because the daemon that owns
+/// the index does the writing.
+///
+/// The grace period an unattended sweep waits out is never applied here: a
+/// person running `doctor` is the signal it waits for, so an index inherited
+/// from a version that stranded its rows clears on the first `--fix` rather
+/// than a week after it.
+///
+/// Never an error. A daemon that did not answer and an index that would not
+/// open both leave the section out, and [`DoctorReport::index`] says why in
+/// the run's own words.
+async fn check_orphaned_rows(
+    domain_filter: Option<&str>,
+    fix: bool,
+    config_override: Option<&Path>,
+    db_override: Option<&Path>,
+    db: &Path,
+) -> Option<OrphanedRowsDoctor> {
+    // A `--domain` run answers about the domain it names, and an unregistered
+    // one can never be that: `select_domains` resolves registered names only.
+    // Collecting here would act on domains the reader did not name.
+    if domain_filter.is_some() {
+        return None;
+    }
+    // No index file: on a machine that has never synced there is nothing to
+    // read, and the direct route would create the file to find that out.
+    if !db.is_file() {
+        return None;
+    }
+    let report = crystalline_service::collect_orphaned_domains(!fix, db_override, config_override)
+        .await
+        .ok()?;
+    let dry_run = report.get("dry_run").and_then(serde_json::Value::as_bool) != Some(false);
+    let mut domains = Vec::new();
+    for row in report
+        .get("considered")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+    {
+        let kept = row.get("kept").and_then(serde_json::Value::as_str);
+        // A domain whose rows are already gone has nothing at stake and
+        // nothing to do, and it stays in the index forever (the domain row
+        // outlives its engrams by design), so reporting it would be a line
+        // that never goes away and never means anything.
+        if kept == Some("no_rows") {
+            continue;
+        }
+        let collectable = row.get("collected").and_then(serde_json::Value::as_bool) == Some(true);
+        domains.push(OrphanedDomainDoctor {
+            name: row
+                .get("domain")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            kind: row
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("file")
+                .to_string(),
+            engrams: row
+                .get("engrams")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0),
+            age_days: row.get("age_days").and_then(serde_json::Value::as_i64),
+            collectable,
+            // On a preview `collected` is what a real run would take; only a
+            // run that was allowed to write actually took it.
+            collected: collectable && !dry_run,
+            kept: kept.map(str::to_string),
+        });
+    }
+    Some(OrphanedRowsDoctor {
+        domains,
+        skipped: report
+            .get("skipped")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -1644,6 +1803,54 @@ pub fn render_human(report: &DoctorReport) -> String {
         }
     }
 
+    // Domains the index still holds rows for and the configuration does not
+    // name. Kept apart from the per-domain sections above, and worded apart
+    // from them: an "orphan row" there is one indexed file whose file is
+    // gone, and these are whole domains. The one thing every line must say is
+    // what 0.17.0's message did not, which is that the rows answer nothing
+    // any more and that there is a proportionate way to end them.
+    if let Some(o) = &report.orphaned_rows
+        && (!o.domains.is_empty() || o.skipped.is_some())
+    {
+        let _ = writeln!(out, "domains no longer registered:");
+        for d in &o.domains {
+            let age = match d.age_days {
+                Some(days) => format!("last seen registered {days} day(s) ago"),
+                // Not an age of zero: an index inherited from a version that
+                // never recorded a registration has no evidence either way.
+                None => "never seen registered by this version".to_string(),
+            };
+            if d.collected {
+                let _ = writeln!(
+                    out,
+                    "  collected {} engram row(s) of '{}' ({age}); the files on disk are untouched",
+                    d.engrams, d.name
+                );
+            } else if d.collectable {
+                let _ = writeln!(
+                    out,
+                    "  [problem] {}: {} engram row(s), {age}. They are not served any more and will be collected; to clear them now run: crystalline doctor --fix",
+                    d.name, d.engrams
+                );
+            } else if d.kept.as_deref() == Some("virtual") {
+                let _ = writeln!(
+                    out,
+                    "  {}: {} engram row(s) in a virtual domain, {age}. They are not served any more, and a virtual domain's rows are its only copy, so nothing collects them on its own: end it with `crystalline domain remove {} --purge`, which asks first",
+                    d.name, d.engrams, d.name
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  {}: {} engram row(s), {age}. They are not served any more and will be collected",
+                    d.name, d.engrams
+                );
+            }
+        }
+        if let Some(skipped) = &o.skipped {
+            let _ = writeln!(out, "  nothing was collected: {skipped}");
+        }
+    }
+
     let s = &report.service;
     let _ = writeln!(out, "service:");
     if s.lock_stale {
@@ -2224,5 +2431,133 @@ mod tests {
         // path and a plain re-walked one would produce.
         let p = real_root.join("a").join("b").join("c.md");
         assert_eq!(relative_slash_path(&linked_root, &p), "a/b/c.md");
+    }
+
+    // --- rows whose domain nobody registers any more --------------------------
+
+    /// A report carrying nothing but one orphaned-domain section, which is
+    /// what the render and the problem count are read on below. The binary
+    /// tests cover the never-stamped case a real 0.17.0 index produces; these
+    /// cover the branches a fixture cannot age into.
+    fn orphan_report(
+        domains: Vec<OrphanedDomainDoctor>,
+        skipped: Option<String>,
+        fix: bool,
+    ) -> DoctorReport {
+        DoctorReport {
+            orphaned_rows: Some(OrphanedRowsDoctor { domains, skipped }),
+            fix,
+            ..DoctorReport::default()
+        }
+    }
+
+    fn orphan(name: &str, engrams: i64, age_days: Option<i64>) -> OrphanedDomainDoctor {
+        OrphanedDomainDoctor {
+            name: name.to_string(),
+            kind: "file".to_string(),
+            engrams,
+            age_days,
+            collectable: true,
+            collected: false,
+            kept: None,
+        }
+    }
+
+    /// The message 0.17.0 got wrong: it told the truth about the rows and then
+    /// named the heaviest command in the tool as the only way out. The honest
+    /// text says the rows answer nothing any more and names the one command
+    /// that ends them now.
+    #[test]
+    fn an_aged_orphan_is_named_with_its_age_and_a_proportionate_remedy() {
+        let report = orphan_report(vec![orphan("gone", 30, Some(13))], None, false);
+        let out = render_human(&report);
+        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
+        assert!(out.contains("last seen registered 13 day(s) ago"), "{out}");
+        assert!(out.contains("not served any more"), "{out}");
+        assert!(out.contains("crystalline doctor --fix"), "{out}");
+        assert!(
+            !out.to_lowercase().contains("reindex"),
+            "a full reindex is never the advice: {out}"
+        );
+        assert_eq!(
+            report.remaining_problems(),
+            1,
+            "rows nobody has collected yet are one problem apiece"
+        );
+    }
+
+    /// Collected is not a problem: the run that was asked did the work, and it
+    /// says what it did without claiming anything about the files on disk,
+    /// which it never touched.
+    #[test]
+    fn a_collected_orphan_is_reported_and_not_counted() {
+        let mut row = orphan("gone", 30, Some(13));
+        row.collected = true;
+        let report = orphan_report(vec![row], None, true);
+        let out = render_human(&report);
+        assert!(
+            out.contains("collected 30 engram row(s) of 'gone'"),
+            "{out}"
+        );
+        assert!(out.contains("files on disk are untouched"), "{out}");
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A virtual domain's rows are the knowledge itself rather than a copy of
+    /// it, so no sweep and no `--fix` ends them: the line names the command
+    /// that asks first, and counting it a problem would fail doctor forever
+    /// over a state with no remedy here.
+    #[test]
+    fn a_virtual_orphan_is_reported_and_never_counted() {
+        let row = OrphanedDomainDoctor {
+            name: "vault".to_string(),
+            kind: "virtual".to_string(),
+            engrams: 12,
+            age_days: Some(409),
+            collectable: false,
+            collected: false,
+            kept: Some("virtual".to_string()),
+        };
+        let report = orphan_report(vec![row], None, false);
+        let out = render_human(&report);
+        assert!(
+            out.contains("vault: 12 engram row(s) in a virtual domain"),
+            "{out}"
+        );
+        assert!(
+            out.contains("crystalline domain remove vault --purge"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("crystalline doctor --fix"),
+            "a --fix that would do nothing is not offered: {out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
+    }
+
+    /// A read-only instance collects nothing and says so, with the rows it
+    /// would have collected still named: that operator is exactly the one who
+    /// wants to know what is sitting there.
+    #[test]
+    fn a_read_only_instance_lists_the_rows_and_says_nothing_was_collected() {
+        let row = OrphanedDomainDoctor {
+            collectable: false,
+            kept: Some("read_only".to_string()),
+            ..orphan("gone", 30, Some(13))
+        };
+        let report = orphan_report(
+            vec![row],
+            Some(
+                "this instance is read-only; nothing was stamped and nothing collected".to_string(),
+            ),
+            false,
+        );
+        let out = render_human(&report);
+        assert!(out.contains("gone: 30 engram row(s)"), "{out}");
+        assert!(
+            out.contains("nothing was collected: this instance is read-only"),
+            "{out}"
+        );
+        assert_eq!(report.remaining_problems(), 0);
     }
 }
