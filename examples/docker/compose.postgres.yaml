@@ -5,12 +5,13 @@
 # through CRYSTALLINE_DATABASE_BACKEND and CRYSTALLINE_DATABASE_URL, no mounted
 # config file needed. Every instance searches and reads every domain it has
 # registered, so register the same domains on each instance that should answer
-# for them; a domain an instance has no registration for is not served there. Writes follow the single-writer rule: each file domain has
-# exactly one hosting instance that syncs and watches it (arbitrated by a host
-# lock with a heartbeat), while a virtual domain keeps its engrams in the
-# database itself, so any instance may write to it under a per-engram
-# compare-and-swap guard. A second instance is included commented out below to
-# show the collaboration shape.
+# for them; a domain an instance has no registration for is not served there.
+# Writes follow the single-writer rule: each file domain has exactly one hosting
+# instance that syncs and watches it (arbitrated by a host lock with a
+# heartbeat), while a virtual domain keeps its engrams in the database itself,
+# so any instance may write to it under a per-engram compare-and-swap guard. A
+# second instance is included commented out below to show the collaboration
+# shape.
 #
 # The vector extension is created by Crystalline on first open, so the stock
 # pgvector image needs no init SQL. Losing the Postgres volume loses virtual

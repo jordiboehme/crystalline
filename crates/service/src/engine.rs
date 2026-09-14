@@ -1401,20 +1401,33 @@ impl Engine {
     /// domain ([`Store::domain_names`], deliberately not `domain_stats`, whose
     /// per-domain counts this would pay for and never look at).
     ///
-    /// "Registered" is [`Engine::known_domain_names`]: the startup snapshot plus
-    /// whatever has been discovered since, which is the same set
-    /// [`Engine::sync_targets`] syncs and [`Engine::domain_entry`] resolves
-    /// against. So a domain this instance does not index is also one it does not
-    /// serve, and the named and unnamed answers agree.
+    /// "Registered" is [`Engine::registered_domain_names`], all three tiers
+    /// [`Engine::domain_entry`] resolves a name through, so the named and the
+    /// unnamed answer agree: a domain a named read would resolve by re-reading
+    /// the configuration file is one an unnamed sweep serves.
+    ///
+    /// The file is only re-read when it can change the answer - when the index
+    /// holds a name the snapshot and the overlay do not know - and then once
+    /// for the whole call rather than once per name. An installation with no
+    /// orphan (every installation, once Part B has collected) pays the cheap
+    /// in-memory check and no file read at all.
     ///
     /// [`Store::domain_names`]: crystalline_index::Store::domain_names
     async fn unregistered_domains(&self) -> Result<HashSet<String>> {
-        let registered: HashSet<String> = self.known_domain_names().into_iter().collect();
+        let known: HashSet<String> = self.known_domain_names().into_iter().collect();
         let names = {
             let store = self.store.lock().await;
             store.domain_names().await?
         };
-        Ok(names
+        let unknown: HashSet<String> = names
+            .into_iter()
+            .filter(|name| !known.contains(name))
+            .collect();
+        if unknown.is_empty() {
+            return Ok(unknown);
+        }
+        let registered = self.registered_domain_names();
+        Ok(unknown
             .into_iter()
             .filter(|name| !registered.contains(name))
             .collect())
@@ -2127,8 +2140,49 @@ impl Engine {
         Ok(targets)
     }
 
-    /// Every domain name this engine currently knows about: the startup
-    /// snapshot plus anything discovered since.
+    /// Every domain name this instance has a registration for, resolved the way
+    /// a *named* lookup resolves one: the startup snapshot, the discovered
+    /// overlay, then a re-read of the configuration file on disk - the three
+    /// tiers of [`Engine::domain_entry`], so what one verb calls registered
+    /// another cannot call an orphan.
+    ///
+    /// A union of the three and not a replacement by the newest: the file is
+    /// not a superset of the snapshot (an engine can be built over a
+    /// configuration that was never written to that file, which is what a
+    /// one-shot command and every test engine are), and `domain_entry` is an OR
+    /// across the tiers, so this is too.
+    ///
+    /// One file read per call, never one per name, and never a write: unlike
+    /// [`Engine::refresh_domain`] nothing found here is cached into the
+    /// discovered overlay and no watch is armed for it, because merely asking
+    /// whether a domain is registered must not start indexing it. The file read
+    /// failing is read as no further registrations, so the answer narrows and
+    /// never widens on an unreadable configuration.
+    ///
+    /// **This is the set collection may key on.** A caller deciding that rows
+    /// are collectable, or stamping `last_registered` for one that is not, must
+    /// resolve "registered" through here rather than through
+    /// [`Engine::known_domain_names`], whose two tiers miss a registration this
+    /// process has never been asked about by name.
+    pub fn registered_domain_names(&self) -> HashSet<String> {
+        let mut names: HashSet<String> = self.known_domain_names().into_iter().collect();
+        if let Some(fresh) = self.reread_config() {
+            names.extend(fresh.domains.keys().cloned());
+        }
+        names
+    }
+
+    /// Every domain name this engine has been *told* about: the startup
+    /// snapshot plus anything a named lookup has discovered since.
+    ///
+    /// Two of the three tiers [`Engine::domain_entry`] resolves through, so it
+    /// is not the registered set and must not be used as one: a domain the
+    /// configuration file gained since startup, and that nothing has named
+    /// here yet, is registered and absent from this. It names what this
+    /// instance is currently syncing and what an error message may list, both
+    /// of which want the cheap in-memory answer. Use
+    /// [`Engine::registered_domain_names`] to decide whether a domain is
+    /// registered at all.
     fn known_domain_names(&self) -> Vec<String> {
         let mut names: Vec<String> = self
             .config

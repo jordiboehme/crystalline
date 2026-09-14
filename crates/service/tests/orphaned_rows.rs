@@ -508,8 +508,12 @@ async fn the_listing_the_routing_block_and_the_sweep_leave_out_an_unregistered_d
 /// unregistered.
 ///
 /// `domain add` writes the config file and then asks the running daemon to sync
-/// the new domain by name, which is what teaches the engine about it. This
-/// walks that sequence: the sweep that follows must find it.
+/// the new domain by name. This walks that sequence, and the sweep that follows
+/// must find it. What makes it servable is the registration in the file, which
+/// the screen resolves either way - see
+/// [`a_domain_the_config_file_gains_is_registered_and_served`], the same
+/// question with the by-name sync taken out - so what the named sync adds here
+/// is the sync target and the watch rather than the right to be served.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_domain_registered_after_the_engine_started_is_served() {
     let (tmp, engine, _store) = fixture().await;
@@ -757,5 +761,85 @@ async fn a_rename_neither_lists_nor_rewrites_an_unregistered_domains_engrams() {
     assert_eq!(
         served["rewritten"], 1,
         "the served domain's engram is renamed: {served}"
+    );
+}
+
+/// The third tier of a named lookup, which an unnamed sweep has to resolve
+/// through too: a domain the configuration *file* gains while this engine runs,
+/// which nothing has ever named here.
+///
+/// `Engine::domain_entry` re-reads the file for a name it does not know, so a
+/// named read has always answered for such a domain. An unnamed sweep screening
+/// it out as unregistered would be the same named-versus-unnamed disagreement
+/// this rule exists to end, pointing the other way - and a collector keyed on
+/// the same set would delete a registered domain's rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_domain_the_config_file_gains_is_registered_and_served() {
+    let (tmp, engine, store) = fixture().await;
+    let root = tmp.path().to_path_buf();
+    let later = write_domain(
+        &root,
+        "later",
+        &GONE_MANIFEST.replace("gone", "later"),
+        &GONE_NOTE
+            .replace("Gone Note", "Later Note")
+            .replace("permalink: gone-note", "permalink: later-note"),
+    );
+
+    // Its rows are indexed by a throwaway engine over the same store, so the
+    // engine under test is never told the name by anything but the file.
+    let config_path = root.join("config.yaml");
+    let mut with_later: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    with_later
+        .domains
+        .insert("later".to_string(), DomainEntry::file(later));
+    let indexer = Engine::new(
+        store.clone(),
+        with_later.clone(),
+        None,
+        Some(config_path.clone()),
+    );
+    indexer.sync(Some("later")).await.unwrap();
+    drop(indexer);
+
+    // The control, and it is the rule: rows with no registration anywhere are
+    // not served and the name is not registered.
+    assert!(
+        !engine.registered_domain_names().contains("later"),
+        "rows alone are not a registration"
+    );
+    let before = engine
+        .search_engrams(&keyword("protocol"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        !before.to_string().contains("later-note"),
+        "nor are they served: {before}"
+    );
+
+    // The registration, written to the file and nowhere else.
+    crystalline_core::config::save_yaml(&config_path, &with_later).unwrap();
+
+    let registered = engine.registered_domain_names();
+    assert!(
+        registered.contains("later") && registered.contains("keep"),
+        "the file's registrations are registrations: {registered:?}"
+    );
+    assert!(
+        !registered.contains("gone"),
+        "and the removed domain is still not one: {registered:?}"
+    );
+
+    let hits = engine
+        .search_engrams(&keyword("protocol"), &Scope::Unrestricted)
+        .await
+        .unwrap();
+    assert!(
+        hits.to_string().contains("later-note"),
+        "an unnamed sweep answers for it, as a named read always has: {hits}"
+    );
+    assert!(
+        !hits.to_string().contains("gone-note"),
+        "and still not for the removed one: {hits}"
     );
 }
