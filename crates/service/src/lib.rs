@@ -22,6 +22,7 @@ pub mod mcp;
 pub mod mcp_gate;
 mod origin;
 pub mod overlay;
+pub mod overlay_journal;
 pub mod params;
 mod poller;
 pub mod rest;

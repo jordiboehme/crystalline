@@ -14491,7 +14491,7 @@ fn join_rel(root: &Path, rel: &str) -> PathBuf {
 /// file, so a save, a move or a restore addressing that engram has to keep
 /// working. [`is_contained_rel`] adds the character rules on top, for the paths
 /// that arrive from outside.
-fn is_within_domain(rel: &str) -> bool {
+pub(crate) fn is_within_domain(rel: &str) -> bool {
     !rel.is_empty()
         && !Path::new(rel).is_absolute()
         && rel
@@ -15357,7 +15357,7 @@ fn assets_reserved_error(rel: &str) -> String {
 /// content byte length and its SHA-256. The sha doubles as the CAS token, so a
 /// virtual engram gets the same `(mtime, size, sha256)` shape a file write would
 /// without ever touching a filesystem.
-fn virtual_stamp(content: &str) -> FileStamp {
+pub(crate) fn virtual_stamp(content: &str) -> FileStamp {
     FileStamp {
         mtime: chrono::Utc::now().timestamp(),
         size: content.len() as u64,
