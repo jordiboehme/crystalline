@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use crystalline_core::{config, parse_engram};
 use crystalline_index::{ChunkParams, DomainId, EngramRecord, Store, chunk_engram};
 
-use crate::engine::{is_within_domain, virtual_stamp};
+use crate::engine::{is_contained_rel, is_within_domain, virtual_stamp};
 
 /// The folder under the state directory the journal lives in.
 pub const JOURNAL_DIR: &str = "overlays";
@@ -102,8 +102,19 @@ fn entry_path(state_dir: &Path, domain: &str, actor: &str, path: &str) -> io::Re
 /// A name that must be one contained segment: a domain and an actor each name
 /// one folder, so a separator in either is a traversal whatever the segments
 /// around it say.
+///
+/// The screen is [`crate::engine::is_contained_rel`], the repo's rule for a
+/// path that arrived from outside, and not the plain containment rule the entry
+/// path uses. Two of the three names here are chosen by somebody else - a
+/// domain by the local configuration, an actor by whoever holds the account -
+/// and a backslash or a colon inside a segment is a separator, a drive marker
+/// or a stream marker on Windows. A drive-shaped name is the sharp one: `C:` is
+/// a path PREFIX, so `PathBuf::join` replaces the path built so far instead of
+/// appending to it, which would point `journal_remove_domain`'s recursive
+/// delete at a whole volume. The entry path keeps the looser rule on purpose,
+/// because an engram file is whatever a person named it.
 fn one_segment<'a>(name: &'a str, what: &str) -> io::Result<&'a str> {
-    if !is_within_domain(name) || name.contains('/') || name.contains('\\') {
+    if !is_contained_rel(name) || name.contains('/') {
         return Err(refused(what, name));
     }
     Ok(name)
@@ -509,22 +520,38 @@ pub async fn restore_into(
                 None => continue,
             },
         };
-        let id = store.upsert_overlay(domain, &entry.actor, &record).await?;
-        // A draft is chunked exactly as a write verb chunks one
-        // (`Engine::index_markdown`'s tail), or it comes back as a row nothing
-        // can ever embed: chunks are written at write time and nothing
+        // The row and its chunks in ONE transaction, exactly as
+        // `Engine::index_markdown` writes a draft in the first place. A draft is
+        // chunked the way a write verb chunks one or it comes back as a row
+        // nothing can ever embed: chunks are written at write time and nothing
         // downstream creates them later, and `chunks_needing_embedding` is
-        // unscoped by actor precisely so a draft's chunks reach the same
-        // backlog a base row's do. A tombstone is left chunkless on purpose - a
-        // deletion's content does not belong in the embedding backlog.
-        if !record.tombstone {
-            let chunks = chunk_engram(
-                &record.title,
-                record.description.as_deref(),
-                &record.content,
-                chunk_params,
-            );
-            store.replace_chunks(id, &chunks).await?;
+        // unscoped by actor precisely so a draft's chunks reach the same backlog
+        // a base row's do. Without the transaction a failure between the two
+        // strands the row present and chunkless - and "store rows win" then
+        // makes every later restore skip it, so one transient database error
+        // costs a draft its embeddings for good. A tombstone is left chunkless
+        // on purpose: a deletion's content does not belong in the backlog.
+        store.begin().await?;
+        let written = async {
+            let id = store.upsert_overlay(domain, &entry.actor, &record).await?;
+            if !record.tombstone {
+                let chunks = chunk_engram(
+                    &record.title,
+                    record.description.as_deref(),
+                    &record.content,
+                    chunk_params,
+                );
+                store.replace_chunks(id, &chunks).await?;
+            }
+            Ok::<(), crystalline_index::IndexError>(())
+        }
+        .await;
+        match written {
+            Ok(()) => store.commit().await?,
+            Err(e) => {
+                let _ = store.rollback().await;
+                return Err(e);
+            }
         }
         restored += 1;
     }
@@ -774,6 +801,14 @@ mod tests {
             ("team", "a/b", "plan.md"),
             ("team", "alice", "../escape.md"),
             ("team", "alice", "notes/../../escape.md"),
+            // A drive-shaped name is a path PREFIX on Windows, so `PathBuf::join`
+            // would replace the accumulated path with it rather than append -
+            // pointing a recursive delete at a whole volume. The actor key comes
+            // from an account name somebody else chose, so both names take the
+            // repo's rule for untrusted input rather than containment alone.
+            ("C:", "alice", "plan.md"),
+            ("team", "C:", "plan.md"),
+            ("team", "a:b", "plan.md"),
             ("team", "alice", "/absolute.md"),
             ("team", "alice", ""),
             // Not a traversal, but the invariant the sidecar rests on: an

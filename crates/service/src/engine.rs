@@ -14768,7 +14768,7 @@ pub(crate) fn is_within_domain(rel: &str) -> bool {
 /// filename here. A backslash or a colon inside a segment is refused because
 /// both are separators or drive and stream markers on Windows, where a name
 /// that looks contained on one platform escapes on another.
-fn is_contained_rel(rel: &str) -> bool {
+pub(crate) fn is_contained_rel(rel: &str) -> bool {
     is_within_domain(rel) && rel.split('/').all(|seg| !seg.contains(['\\', ':']))
 }
 
