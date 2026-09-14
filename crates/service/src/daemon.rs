@@ -203,9 +203,14 @@ pub async fn run_serve(
         let from_config = describe_http(resolve_http(None, &loaded.effective).as_ref());
         let from_flag = describe_http(http_addr.as_ref());
         let set_value = http_addr.clone().unwrap_or_else(|| "false".to_string());
-        if let Some(line) =
-            exposure_override_notice("service.http", &from_flag, &from_config, &set_value)
-        {
+        if let Some(line) = exposure_override_notice(
+            "service.http",
+            "binds",
+            "binds",
+            &from_flag,
+            &from_config,
+            &set_value,
+        ) {
             tracing::warn!("{line}");
         }
     }
@@ -213,6 +218,8 @@ pub async fn run_serve(
         let from_config = describe_hosts(&resolve_allowed_hosts(&[], &loaded.effective));
         if let Some(line) = exposure_override_notice(
             "service.allowed_hosts",
+            "accepts the Host values",
+            "accepts",
             &describe_hosts(&allowed_hosts),
             &from_config,
             &allowed_hosts.join(","),
@@ -2106,18 +2113,28 @@ fn resolve_allowed_hosts(flag: &[String], config: &GlobalConfig) -> Vec<String> 
 /// passes them. What this says is the thing the 2026-09-10 outage turned on:
 /// a flag configures one process, while every other daemon on the machine -
 /// an autostarted one included - binds whatever configuration says.
+///
+/// One template, two keys, so the verb comes from the caller: an address is
+/// *bound* and a `Host` allow-list is *accepted*, and a line that told an
+/// operator their serve "binds muthur.lan" would be describing something the
+/// daemon does not do. `verb_phrase` opens the sentence ("binds", "accepts the
+/// Host values") and `verb` repeats it for the other daemons ("binds",
+/// "accepts"); the repo's own wording for an allow-list lives in
+/// `lock_held_message`, in `instance.rs`.
 fn exposure_override_notice(
     key: &str,
+    verb_phrase: &str,
+    verb: &str,
     from_flag: &str,
     from_config: &str,
     set_value: &str,
 ) -> Option<String> {
     (from_flag != from_config).then(|| {
         format!(
-            "this serve binds {from_flag} because a flag asked for it, for this invocation only. \
-             {key} says {from_config}, and that is what every other daemon on this machine binds, \
-             including one a connecting agent starts. Make it the machine's answer with: \
-             crystalline config set {key} {set_value}"
+            "this serve {verb_phrase} {from_flag} because a flag asked for it, for this \
+             invocation only. {key} says {from_config}, and that is what every other daemon on \
+             this machine {verb}, including one a connecting agent starts. Make it the machine's \
+             answer with: crystalline config set {key} {set_value}"
         )
     })
 }
@@ -2499,6 +2516,8 @@ mod tests {
         assert_eq!(
             exposure_override_notice(
                 "service.http",
+                "binds",
+                "binds",
                 "127.0.0.1:7411",
                 "127.0.0.1:7411",
                 "127.0.0.1:7411"
@@ -2514,6 +2533,8 @@ mod tests {
     fn exposure_override_notice_names_both_values_and_the_key() {
         let line = exposure_override_notice(
             "service.http",
+            "binds",
+            "binds",
             "0.0.0.0:7411",
             "127.0.0.1:7411",
             "0.0.0.0:7411",
@@ -2542,12 +2563,21 @@ mod tests {
     fn exposure_override_notice_uses_the_settable_spelling_for_the_allow_list() {
         let line = exposure_override_notice(
             "service.allowed_hosts",
+            "accepts the Host values",
+            "accepts",
             "muthur.lan, host.docker.internal",
             "loopback only",
             "muthur.lan,host.docker.internal",
         )
         .expect("a difference is worth a line");
         assert!(line.contains("loopback only"), "{line}");
+        // An allow-list is accepted, never bound: one template serves both
+        // keys, so the verb has to come from the key rather than from the
+        // address case that happened to be written first.
+        assert!(
+            line.contains("accepts the Host values muthur.lan, host.docker.internal"),
+            "a Host allow-list is accepted, not bound: {line}"
+        );
         assert!(
             line.contains(
                 "crystalline config set service.allowed_hosts muthur.lan,host.docker.internal"
