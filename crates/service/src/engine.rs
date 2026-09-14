@@ -1512,6 +1512,56 @@ impl Engine {
         })
     }
 
+    /// The vocabulary in scope for a screened caller: the tags, categories,
+    /// types and statuses of everything it may be answered from, and of nothing
+    /// else.
+    ///
+    /// Named, the screened domain reports the empty vocabulary an unregistered
+    /// name reports. Unnamed, the sweep cannot be one store query with a filter
+    /// laid over its answer, because a [`crystalline_index::Vocabulary`] is
+    /// aggregated counts with no domain on them: it is one query per served
+    /// domain, merged back into one answer. With nothing screened out - the
+    /// ordinary installation - it is the single unfiltered query it always was.
+    ///
+    /// Shared by [`Engine::vocabulary`], which reports it, and
+    /// [`Engine::retag`], which prechecks a rename or a merge against it. Keep
+    /// the two on this one seam: a tag the listing says is not there must not
+    /// be a tag the merge says exists.
+    async fn scoped_vocabulary(
+        &self,
+        domain: Option<&str>,
+        hidden: &HashSet<String>,
+    ) -> Result<crystalline_index::Vocabulary> {
+        Ok(match (domain, hidden.is_empty()) {
+            (_, true) => {
+                let store = self.store.lock().await;
+                store.vocabulary(domain).await?
+            }
+            (Some(domain), false) if hidden.contains(domain) => {
+                crystalline_index::Vocabulary::default()
+            }
+            (Some(domain), false) => {
+                let store = self.store.lock().await;
+                store.vocabulary(Some(domain)).await?
+            }
+            (None, false) => {
+                let names = match self.scoped_domains(&[], hidden).await? {
+                    ScopedDomains::Only(names) => names,
+                    // `AsAsked` cannot arrive with something hidden, and
+                    // `Nothing` means there is no domain to sweep.
+                    _ => Vec::new(),
+                };
+                let store = self.store.lock().await;
+                let mut parts = Vec::with_capacity(names.len());
+                for name in &names {
+                    parts.push(store.vocabulary(Some(name)).await?);
+                }
+                drop(store);
+                crystalline_index::merge_vocabularies(parts)
+            }
+        })
+    }
+
     /// Turn on shared-database collaboration for this engine by giving it a
     /// stable instance id (the `serve` daemon supplies the persisted one from
     /// `config::read_or_create_instance_id`). With an id set, syncing a file
@@ -5163,11 +5213,20 @@ impl Engine {
             ));
         }
 
+        // What this instance has no registration for is not part of this verb's
+        // world: not a tag that exists, not an engram to list, not a file to
+        // rewrite. Resolved once, before the first store lock (the lock is not
+        // reentrant), and threaded through both reads below.
+        //
+        // The privacy half of `hidden_for` is deliberately absent: renaming a
+        // tag is `Scope::Unrestricted` only, so there is no caller here with a
+        // narrower view than the machine's own.
+        let unregistered = self.unregistered_domains().await?;
+
         // Precheck against the vocabulary in scope: a rename must not collide
         // with an existing tag, a merge must land on one.
         let new_exists = {
-            let store = self.store.lock().await;
-            let vocab = store.vocabulary(domain).await?;
+            let vocab = self.scoped_vocabulary(domain, &unregistered).await?;
             vocab.tags.iter().any(|t| t.name == new_f)
         };
         let scope = match domain {
@@ -5186,10 +5245,17 @@ impl Engine {
             )));
         }
 
-        // The engrams carrying the old tag, ordered by domain then path.
+        // The engrams carrying the old tag, ordered by domain then path, with
+        // every unregistered domain's dropped here at the single point where
+        // the list is built: `listed`, the dry run, the rewrite loop, the count
+        // and the alias recording all read from it, so one filter covers all of
+        // them and no later addition can forget it.
         let targets = {
             let store = self.store.lock().await;
-            store.engrams_with_tag(&old_f, domain).await?
+            let mut found = store.engrams_with_tag(&old_f, domain).await?;
+            drop(store);
+            found.retain(|d| !unregistered.contains(&d.domain));
+            found
         };
         let listed: Vec<Value> = targets
             .iter()
@@ -7950,34 +8016,7 @@ impl Engine {
         scope: &crate::scope::Scope,
     ) -> Result<Value> {
         let hidden = self.hidden_for(scope).await?;
-        let vocab = match (&p.domain, hidden.is_empty()) {
-            (_, true) => {
-                let store = self.store.lock().await;
-                store.vocabulary(p.domain.as_deref()).await?
-            }
-            (Some(domain), false) if hidden.contains(domain) => {
-                crystalline_index::Vocabulary::default()
-            }
-            (Some(domain), false) => {
-                let store = self.store.lock().await;
-                store.vocabulary(Some(domain)).await?
-            }
-            (None, false) => {
-                let names = match self.scoped_domains(&[], &hidden).await? {
-                    ScopedDomains::Only(names) => names,
-                    // `AsAsked` cannot arrive with something hidden, and
-                    // `Nothing` means there is no domain to sweep.
-                    _ => Vec::new(),
-                };
-                let store = self.store.lock().await;
-                let mut parts = Vec::with_capacity(names.len());
-                for name in &names {
-                    parts.push(store.vocabulary(Some(name)).await?);
-                }
-                drop(store);
-                crystalline_index::merge_vocabularies(parts)
-            }
-        };
+        let vocab = self.scoped_vocabulary(p.domain.as_deref(), &hidden).await?;
         // Every count list is present unconditionally, empty when nothing is in
         // use, so a client reads a list rather than testing for a missing key.
         // Only the two advisory keys below (clusters, aliases) are omitted when

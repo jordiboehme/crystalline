@@ -137,6 +137,25 @@ fn read(identifier: &str, domain: Option<&str>) -> ReadParams {
     }
 }
 
+/// The domain of every row in one array-valued field of an envelope, so an
+/// assertion can name the field that carries the claim instead of scanning the
+/// whole envelope for a string. Panics when the field is not an array of rows
+/// with a domain on them, because an assertion that quietly found nothing to
+/// check is worse than no assertion.
+fn domains_in(envelope: &serde_json::Value, field: &str) -> Vec<String> {
+    envelope[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("'{field}' is an array here: {envelope}"))
+        .iter()
+        .map(|row| {
+            row["domain"]
+                .as_str()
+                .unwrap_or_else(|| panic!("every row in '{field}' names its domain: {envelope}"))
+                .to_string()
+        })
+        .collect()
+}
+
 fn keyword(query: &str) -> SearchParams {
     SearchParams {
         query: Some(query.to_string()),
@@ -158,9 +177,10 @@ async fn an_unregistered_domain_is_not_a_hit_and_not_a_count() {
         hits["total"], 1,
         "the total counts what is served, not what is stored: {hits}"
     );
-    assert!(
-        hits.to_string().contains("keep-note") && !hits.to_string().contains("gone"),
-        "the removed domain is not an answer: {hits}"
+    assert_eq!(
+        domains_in(&hits, "hits"),
+        vec!["keep".to_string()],
+        "the one hit is the registered domain's, and the removed domain has none: {hits}"
     );
 
     // Nothing was deleted to make that true. The rows the search declined to
@@ -305,9 +325,10 @@ async fn recent_activity_leaves_out_an_unregistered_domain() {
         )
         .await
         .unwrap();
-    assert!(
-        recent.to_string().contains("keep-note") && !recent.to_string().contains("gone-note"),
-        "the feed covers what is served: {recent}"
+    assert_eq!(
+        domains_in(&recent, "engrams"),
+        vec!["keep".to_string(); 2],
+        "the feed covers what is served and nothing else: {recent}"
     );
 }
 
@@ -341,7 +362,17 @@ async fn no_reference_or_neighbour_reaches_out_of_an_unregistered_domain() {
         inbound["total"], 0,
         "and the paged verb agrees with the count it draws from: {inbound}"
     );
-    assert!(!inbound.to_string().contains("gone"), "{inbound}");
+    assert_eq!(
+        inbound["hits"],
+        serde_json::json!([]),
+        "no referrer out of it is listed: {inbound}"
+    );
+    assert_eq!(
+        inbound["types"],
+        serde_json::json!([]),
+        "and its relation is not in the per-relation summary either, which is \
+         counted by its own query: {inbound}"
+    );
 
     let context = engine
         .build_context(
@@ -356,8 +387,9 @@ async fn no_reference_or_neighbour_reaches_out_of_an_unregistered_domain() {
         )
         .await
         .unwrap();
-    assert!(
-        !context.to_string().contains("gone"),
+    assert_eq!(
+        domains_in(&context, "nodes"),
+        vec!["keep".to_string()],
         "the neighbour in the removed domain is cut out of the slice: {context}"
     );
     assert_eq!(
@@ -370,8 +402,9 @@ async fn no_reference_or_neighbour_reaches_out_of_an_unregistered_domain() {
         .graph_neighborhood("crystalline://keep/keep-note", 2, 100, &Scope::Unrestricted)
         .await
         .unwrap();
-    assert!(
-        !graph.to_string().contains("gone"),
+    assert_eq!(
+        domains_in(&graph, "nodes"),
+        vec!["keep".to_string()],
         "the graph view answers the same: {graph}"
     );
 
@@ -634,5 +667,95 @@ async fn the_total_is_the_query_count_and_not_the_page_length() {
     assert_eq!(
         all["total"], 2,
         "the served domain's engrams, not the index's: {all}"
+    );
+}
+
+/// The tag verbs are a door into a removed domain's content that never names
+/// it: `crystalline tags merge` with no `--domain` prechecks against the whole
+/// index, so a tag only the removed domain carries still counts as a tag that
+/// exists.
+///
+/// It must not. A merge has to land on a tag something served carries, which is
+/// exactly what merging into a tag nobody ever wrote is refused for, so the two
+/// refusals are the same refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_merge_cannot_land_on_a_tag_only_an_unregistered_domain_carries() {
+    let (_tmp, engine, _store) = fixture().await;
+
+    let into_the_orphans_tag = engine
+        .retag("current", "retiredteam", None, true, false, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    let into_a_tag_nobody_wrote = engine
+        .retag("current", "never-written", None, true, false, false)
+        .await
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        into_the_orphans_tag,
+        into_a_tag_nobody_wrote.replace("never-written", "retiredteam"),
+        "a tag only the removed domain carries is a tag that is not there: {into_the_orphans_tag}"
+    );
+}
+
+/// The other half of the same door, and the one that writes: a rename with no
+/// `--domain` used to list the removed domain's engrams by name and path and
+/// then rewrite them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rename_neither_lists_nor_rewrites_an_unregistered_domains_engrams() {
+    let (tmp, engine, store) = fixture().await;
+    let note = tmp.path().join("gone").join("gone-note.md");
+    let before = store
+        .lock()
+        .await
+        .domain_stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "gone")
+        .expect("the removed domain still has its row");
+
+    let renamed = engine
+        .retag("retiredteam", "archived", None, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        renamed["engrams"],
+        serde_json::json!([]),
+        "nothing in the removed domain is listed: {renamed}"
+    );
+    assert_eq!(
+        renamed["rewritten"], 0,
+        "and nothing in it is rewritten: {renamed}"
+    );
+    assert!(
+        std::fs::read_to_string(&note)
+            .unwrap()
+            .contains("retiredteam"),
+        "its file on disk still carries the tag"
+    );
+
+    // Its rows are where the removal left them, down to every count.
+    let after = store
+        .lock()
+        .await
+        .domain_stats()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.name == "gone")
+        .expect("the removed domain still has its row");
+    assert_eq!(before, after, "not one row of it moved");
+
+    // And the registered domain is still renamed, so this narrows rather than
+    // refuses.
+    let served = engine
+        .retag("current", "archived", None, false, false, false)
+        .await
+        .unwrap();
+    assert_eq!(
+        served["rewritten"], 1,
+        "the served domain's engram is renamed: {served}"
     );
 }

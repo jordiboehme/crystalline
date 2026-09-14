@@ -637,7 +637,7 @@ pub async fn run(
 
     let provisioning = check_provisioning(cfg, &loaded.overlay, &targets)?;
 
-    let tags = check_tags(store_ref).await?;
+    let tags = check_tags(store_ref, cfg).await?;
 
     Ok(DoctorReport {
         index,
@@ -1332,18 +1332,52 @@ fn check_provisioning(
     }))
 }
 
-/// Advisory tag-hygiene check: the near-duplicate tag clusters across the whole
-/// index. Read-only, mirroring `check_provisioning`'s stance - it reads the
-/// vocabulary and groups it, never touching a file. `None` when there is no
-/// index to read.
-async fn check_tags(store: Option<&dyn Store>) -> Result<Option<TagsDoctor>> {
+/// Advisory tag-hygiene check: the near-duplicate tag clusters across every
+/// domain this machine has registered. Read-only, mirroring
+/// `check_provisioning`'s stance - it reads the vocabulary and groups it, never
+/// touching a file. `None` when there is no index to read.
+///
+/// A domain the index holds rows for and the configuration does not register is
+/// left out, because the advice is to run `crystalline tags merge` and that verb
+/// will not touch such a domain: a cluster only its rows produce would be a
+/// finding nobody can act on. The registrations come from `cfg`, the whole
+/// effective configuration and deliberately not the `--domain` selection, which
+/// would narrow this whole-index check into a different one.
+///
+/// The sweep is the single all-domain query it has always been unless an
+/// unregistered domain is actually there; only then does it become one query
+/// per registered domain, merged - the shape `Engine::vocabulary` takes for the
+/// same reason, since a `Vocabulary` is aggregated counts with no domain on
+/// them to filter by afterwards.
+async fn check_tags(store: Option<&dyn Store>, cfg: &GlobalConfig) -> Result<Option<TagsDoctor>> {
     let Some(store) = store else {
         return Ok(None);
     };
-    let vocab = store
-        .vocabulary(None)
+    let indexed = store
+        .domain_names()
         .await
-        .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?;
+        .map_err(|e| anyhow!("could not read the domain list: {e}"))?;
+    let registered: Vec<&String> = indexed
+        .iter()
+        .filter(|name| cfg.domains.contains_key(*name))
+        .collect();
+    let vocab = if registered.len() == indexed.len() {
+        store
+            .vocabulary(None)
+            .await
+            .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?
+    } else {
+        let mut parts = Vec::with_capacity(registered.len());
+        for name in registered {
+            parts.push(
+                store
+                    .vocabulary(Some(name))
+                    .await
+                    .map_err(|e| anyhow!("could not read the vocabulary: {e}"))?,
+            );
+        }
+        crystalline_index::merge_vocabularies(parts)
+    };
     Ok(Some(TagsDoctor {
         // Fold declared aliases out first, so a cluster an alias already explains
         // is never surfaced as tag drift.
@@ -1952,7 +1986,59 @@ mod tests {
         let store = TursoStore::open_in_memory().await.unwrap();
         sync_domain(&store, "kb", root).await.unwrap();
         let store_ref: &dyn Store = &store;
-        check_tags(Some(store_ref)).await.unwrap().unwrap()
+        let mut cfg = GlobalConfig::default();
+        cfg.domains
+            .insert("kb".to_string(), DomainEntry::file(root.to_path_buf()));
+        check_tags(Some(store_ref), &cfg).await.unwrap().unwrap()
+    }
+
+    /// The tag check's advice points the reader at `crystalline tags merge`,
+    /// and that verb will not touch a domain this instance has no registration
+    /// for - so a cluster drawn from one is advice that cannot be taken.
+    #[tokio::test]
+    async fn an_unregistered_domains_tags_are_not_advised_on() {
+        fn engram(tag: &str) -> String {
+            format!(
+                "---\ntype: engram\ntitle: {tag}\npermalink: {tag}\ntags:\n  - {tag}\nstatus: current\nrecorded_at: 2026-01-01\n---\n\nbody\n"
+            )
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let kept = dir.path().join("kept");
+        let orphan = dir.path().join("orphan");
+        for (root, pair) in [
+            (&kept, ["colours", "colour"]),
+            (&orphan, ["flavours", "flavour"]),
+        ] {
+            std::fs::create_dir_all(root).unwrap();
+            for tag in pair {
+                std::fs::write(root.join(format!("{tag}.md")), engram(tag)).unwrap();
+            }
+        }
+        let store = TursoStore::open_in_memory().await.unwrap();
+        sync_domain(&store, "kept", &kept).await.unwrap();
+        sync_domain(&store, "orphan", &orphan).await.unwrap();
+        let mut cfg = GlobalConfig::default();
+        cfg.domains
+            .insert("kept".to_string(), DomainEntry::file(kept.clone()));
+
+        let store_ref: &dyn Store = &store;
+        let doctor = check_tags(Some(store_ref), &cfg).await.unwrap().unwrap();
+        assert!(
+            doctor
+                .clusters
+                .iter()
+                .any(|c| c.tags.contains(&"colours".to_string())),
+            "the registered domain's tag drift is still reported: {:?}",
+            doctor.clusters
+        );
+        assert!(
+            !doctor
+                .clusters
+                .iter()
+                .any(|c| c.tags.iter().any(|t| t.starts_with("flavour"))),
+            "the unregistered domain's is not: {:?}",
+            doctor.clusters
+        );
     }
 
     #[tokio::test]
