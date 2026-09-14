@@ -1128,8 +1128,12 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
     assert!(
         report["skipped"]
             .as_str()
-            .is_some_and(|s| s.contains("read-only")),
-        "in words, and with the reason: {report}"
+            .is_some_and(|s| s.contains("read-only") && s.contains("were stamped")),
+        "in words, with the reason, and saying what this run did do: {report}"
+    );
+    assert!(
+        report["stamped"].as_u64().is_some_and(|n| n > 0),
+        "which is stamp the domains it serves: {report}"
     );
     assert!(
         collected(&report).is_empty(),
@@ -1144,6 +1148,52 @@ async fn a_read_only_instance_collects_nothing_and_says_so() {
         stamp_of(&store, "keep").await.expect("it is stamped"),
         ancient,
         "and the domains it serves were defended: their stamp moved"
+    );
+}
+/// The same instance asked to look rather than to act. A read-only preview
+/// writes nothing at all - not a removal and not a stamp - so the sentence it
+/// hands a reader may not claim the stamp the real run makes. This is the
+/// mirror of the sentence above, and the two are the only two shapes there
+/// are.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_read_only_preview_says_nothing_was_changed() {
+    let (tmp, _engine, store) = fixture().await;
+    let config_path = tmp.path().join("config.yaml");
+    let cfg: GlobalConfig = crystalline_core::config::load_yaml(&config_path).unwrap();
+    let read_only = Engine::new(store.clone(), cfg, None, Some(config_path)).with_read_only(true);
+    let ancient = plant_stamp(&store, "keep", chrono::Duration::days(400)).await;
+    let before = engrams_of(&store, "gone").await.unwrap();
+
+    let report = read_only
+        .collect_orphaned_domains(Some(chrono::Duration::days(7)), true)
+        .await
+        .unwrap();
+
+    assert_eq!(report["read_only"], true, "{report}");
+    assert_eq!(
+        report["stamped"], 0,
+        "a preview writes nothing, so nothing was stamped: {report}"
+    );
+    let skipped = report["skipped"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a read-only run says so: {report}"));
+    assert!(
+        skipped.contains("read-only") && skipped.contains("nothing was changed"),
+        "and the sentence says what this run did: {report}"
+    );
+    assert!(
+        !skipped.contains("were stamped"),
+        "never a stamp this run did not make: {report}"
+    );
+    assert_eq!(
+        stamp_of(&store, "keep").await.expect("it is stamped"),
+        ancient,
+        "the stamp really did not move"
+    );
+    assert_eq!(
+        engrams_of(&store, "gone").await,
+        Some(before),
+        "and no row was touched"
     );
 }
 

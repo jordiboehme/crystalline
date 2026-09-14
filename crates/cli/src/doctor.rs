@@ -2687,7 +2687,7 @@ mod tests {
             vec![row],
             Some(
                 "this instance is read-only; the registered domains were stamped and nothing was \
-                 collected"
+                 removed"
                     .to_string(),
             ),
             false,

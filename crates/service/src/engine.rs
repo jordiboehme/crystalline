@@ -10535,10 +10535,18 @@ impl Engine {
             "engrams_removed": engrams_removed,
         });
         if self.read_only {
-            report["skipped"] = json!(
+            // Each path says exactly what it did. A read-only instance stamps
+            // and never removes, so a real run has stamped by the time this is
+            // written - but a preview has written nothing at all, `stamped` is
+            // zero on it, and a sentence claiming otherwise is the same lie in
+            // the other direction.
+            report["skipped"] = json!(if dry_run {
+                "this instance is read-only; nothing was changed, and a real run here would \
+                 stamp the registered domains and still remove nothing"
+            } else {
                 "this instance is read-only; the registered domains were stamped and nothing \
-                 was collected"
-            );
+                 was removed"
+            });
         }
         Ok(report)
     }
