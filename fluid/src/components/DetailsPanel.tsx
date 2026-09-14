@@ -161,6 +161,12 @@ function Row({
  * the `crystalline://` name. One component rather than two, so the name a
  * reader hears cannot drift between the two places it is heard.
  *
+ * That name says the scheme. In this panel the address is written out in the
+ * row above the button, so "Copy address" would have an antecedent; in the
+ * header it stands beside "Share link" with neither string on screen, and two
+ * generic verbs for two different strings is a guess a reader should not have
+ * to make. One name for both places, and it is the unambiguous one.
+ *
  * The outcome is announced in a live region beside the button rather than
  * written into the button's own label. A control that renames itself is a
  * control a reader navigating by name loses track of, and a label that changes
@@ -185,7 +191,7 @@ export function CopyAddress({ address }: { address: string }) {
   return (
     <span className="inline-flex items-center gap-1">
       <IconButton
-        label="Copy address"
+        label="Copy crystalline:// address"
         icon={Copy}
         onClick={() => {
           void (async () => {

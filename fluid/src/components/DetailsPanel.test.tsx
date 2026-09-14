@@ -110,7 +110,7 @@ describe("DetailsPanel", () => {
       screen.getByText("crystalline://playground/lantern-protocol"),
     ).toBeInTheDocument();
     expect(
-      screen.getByRole("button", { name: "Copy address" }),
+      screen.getByRole("button", { name: "Copy crystalline:// address" }),
     ).toBeInTheDocument();
     // The outcome is announced beside the control rather than written into
     // its label, so the control keeps the name a reader navigates by.

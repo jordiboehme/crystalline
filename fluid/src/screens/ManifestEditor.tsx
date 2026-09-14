@@ -50,8 +50,8 @@ import {
 import { tableContextListener } from "../editor/tableVerbs";
 import { formattingKeymap } from "../editor/toolbar";
 import { useCloseFlow, useExitRequest } from "../editor/useCloseFlow";
-import { useFullWidth } from "../layoutWidth";
 import { saveKeymap, useEditorSession } from "../editor/useEditorSession";
+import { useFullWidth } from "../layoutWidth";
 import { manifestRoute } from "../paths";
 import { useTheme } from "../theme/context";
 import NotFound from "./NotFound";

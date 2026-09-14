@@ -52,7 +52,6 @@ import {
 import { EditorToolbar } from "../editor/EditorToolbar";
 import { fenceMono } from "../editor/fenceMono";
 import { fencePreviews } from "../editor/fencePreviews";
-import { useFullWidth } from "../layoutWidth";
 import { imagePreviews } from "../editor/imagePreviews";
 import { imageContextListener } from "../editor/imageVerbs";
 import { FindingsPanel, jumpToLine } from "../editor/FindingsPanel";
@@ -75,6 +74,7 @@ import {
   wikilinkCompletions,
   wikilinkResolverFacet,
 } from "../editor/wikilinkChips";
+import { useFullWidth } from "../layoutWidth";
 import { domainRoute, editRoute, engramRoute } from "../paths";
 import { ENGRAM_PREFETCH } from "../prefetch";
 import { useTheme } from "../theme/context";

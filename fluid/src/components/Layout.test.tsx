@@ -4,7 +4,7 @@
  * the sidebar becomes once a domain is open.
  */
 
-import { screen, waitFor, within } from "@testing-library/react";
+import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -1110,6 +1110,49 @@ describe("the content's own width", () => {
     expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
 
     await user.keyboard("\\");
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("answers it on a keyboard where the backslash needs a modifier", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("main");
+
+    // Synthesized rather than typed: jsdom's keyboard has one layout, and
+    // these are the events other layouts send. On a German, French, Spanish,
+    // Italian or Nordic keyboard the backslash IS a modified key - AltGr on
+    // Windows and Linux, which a browser reports as Ctrl and Alt together,
+    // and Shift+Option on macOS. The key is "\\" in every one of them, so
+    // the shortcut the help overlay advertises has to fire.
+    fireEvent.keyDown(document.body, {
+      key: "\\",
+      ctrlKey: true,
+      altKey: true,
+    });
+
+    expect(screen.getByRole("main")).toHaveAttribute("data-width", "full");
+
+    fireEvent.keyDown(document.body, {
+      key: "\\",
+      shiftKey: true,
+      altKey: true,
+    });
+
+    expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
+  });
+
+  it("leaves Cmd and Ctrl on the backslash to whoever owns them", async () => {
+    serveSignedIn();
+
+    renderApp("/");
+    await screen.findByRole("main");
+
+    // Without Alt beside it, a modified backslash is the browser's or the
+    // system's rather than this app's.
+    fireEvent.keyDown(document.body, { key: "\\", metaKey: true });
+    fireEvent.keyDown(document.body, { key: "\\", ctrlKey: true });
 
     expect(screen.getByRole("main")).not.toHaveAttribute("data-width");
   });

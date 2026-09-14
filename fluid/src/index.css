@@ -207,8 +207,9 @@
    * Unless the frame says the content has the whole width. Here rather than
    * on any screen: the measure is one rule about every rendered document in
    * the app, and a screen that had to lift its own would be a screen that can
-   * forget to. The frame sets the attribute on `main`; everything under it
-   * follows, including the editor's preview.
+   * forget to. The frame sets the attribute on `main`, and every rendered
+   * document under it follows: the engram page, the MANIFEST page and the
+   * domain home, which are what carry `.measured`.
    *
    * On screens only. The print sheet below widens `main` and leaves the
    * measure on the document's own children, which is the typography of the

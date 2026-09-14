@@ -552,12 +552,14 @@ export function Layout() {
       }
       // Not while somebody is writing one. A bare key is only a shortcut
       // where no field has the focus, which includes the editor's own
-      // contenteditable surface as much as it does a search box. One guard
+      // contenteditable surface as much as it does a search box, and a
+      // dropdown that jumps to the option a typed letter names. One guard
       // for both keys, because it is the same rule about the same thing.
       const target = event.target;
       if (
         target instanceof HTMLElement &&
-        target.closest("input, textarea, [contenteditable=true]") !== null
+        target.closest("input, textarea, select, [contenteditable=true]") !==
+          null
       ) {
         return;
       }
@@ -565,10 +567,14 @@ export function Layout() {
         setHelpOpen(true);
         return;
       }
-      // "?" arrives shifted on most layouts and asks for nothing else here,
-      // but a backslash is a plain character key: held under a modifier it is
-      // the browser's or the system's shortcut, not this one.
-      if (event.metaKey || event.ctrlKey || event.altKey) {
+      // Cmd+\\ and Ctrl+\\ belong to the browser or to the system rather than
+      // to this app, so those are refused. Alt is NOT a modifier to refuse
+      // on: on a German, French, Spanish, Italian or Nordic layout the
+      // backslash IS an Alt key - AltGr+ß or AltGr+8 on Windows and Linux,
+      // which a browser reports as Ctrl and Alt together, and Shift+Option+7
+      // on macOS. Refusing Alt would advertise a shortcut in the help
+      // overlay that never fires on half the keyboards in Europe.
+      if (event.metaKey || (event.ctrlKey && !event.altKey)) {
         return;
       }
       toggleFullWidth();

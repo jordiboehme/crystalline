@@ -534,7 +534,9 @@ describe("the engram page", () => {
 
     renderApp("/d/eng/e/alpha");
 
-    const button = await screen.findByRole("button", { name: "Copy address" });
+    const button = await screen.findByRole("button", {
+      name: "Copy crystalline:// address",
+    });
     await userEvent.click(button);
 
     expect(writeText).toHaveBeenCalledWith("crystalline://eng/alpha");
@@ -546,7 +548,7 @@ describe("the engram page", () => {
     });
     // And the control keeps its name, so it is not silently renamed under a
     // reader navigating by control.
-    expect(button).toHaveAccessibleName("Copy address");
+    expect(button).toHaveAccessibleName("Copy crystalline:// address");
   });
 
   it("says so when the browser refuses the clipboard", async () => {
@@ -561,7 +563,9 @@ describe("the engram page", () => {
     renderApp("/d/eng/e/alpha");
 
     await userEvent.click(
-      await screen.findByRole("button", { name: "Copy address" }),
+      await screen.findByRole("button", {
+        name: "Copy crystalline:// address",
+      }),
     );
 
     const outcome = screen.getByRole("status", { name: "Copy address result" });
@@ -885,7 +889,9 @@ describe("the engram page at full width", () => {
     // The address control moves into the header strip beside the other
     // utilities rather than disappearing with the panel that held it: "Share
     // link" beside it copies the browser's URL, which is a different string.
-    const copy = screen.getByRole("button", { name: "Copy address" });
+    const copy = screen.getByRole("button", {
+      name: "Copy crystalline:// address",
+    });
     expect(copy.closest("header")).not.toBeNull();
     // And the files the engram carries stand under the body, where the graph
     // and the agent's eye already stand.
@@ -906,7 +912,7 @@ describe("the engram page at full width", () => {
     expect(main.querySelector('[class*="lg:grid-cols-"]')).not.toBeNull();
     // Exactly one of it either way: the panel's copy is the only copy here.
     expect(
-      screen.getAllByRole("button", { name: "Copy address" }),
+      screen.getAllByRole("button", { name: "Copy crystalline:// address" }),
     ).toHaveLength(1);
   });
 });
